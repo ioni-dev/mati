@@ -31,6 +31,8 @@ use uuid::Uuid;
 /// Stamps every record write for Lamport-clock conflict resolution.
 ///
 /// Requires the `uuid` crate with `features = ["v4", "v7"]`.
+/// NOTE: v7 generation is deferred to M-05 (`mati init`). Until then,
+/// callers use `Uuid::new_v4()` as a placeholder.
 pub type DeviceId = Uuid;
 
 // ─────────────────────────────────────────────
@@ -179,7 +181,9 @@ impl QualityScore {
     /// [0.9, 1.0] → Excellent
     /// ```
     pub fn tier_from_value(value: f32) -> QualityTier {
-        if value < 0.2 {
+        // Non-finite values (NaN, ±∞) would pass all comparisons silently
+        // and land in the else-Excellent branch — a hook-injection security bug.
+        if !value.is_finite() || value < 0.2 {
             QualityTier::Suppressed
         } else if value < 0.4 {
             QualityTier::Poor
@@ -608,6 +612,9 @@ pub struct ContextPacket {
     /// Current `stage:current` record, if set.
     pub stage: Option<Record>,
     /// Gotchas sorted by `confidence × severity`. Only `confirmed: true` records.
+    /// Type is [`Record`] (not `GotchaRecord`) — the base record is the storage
+    /// unit. `mem_bootstrap` callers must look up the typed detail via
+    /// `mati_core::store::GotchaRecord` when the rule/reason fields are needed.
     pub critical_gotchas: Vec<Record>,
     /// File records for the requested context files.
     pub file_records: Vec<FileRecord>,
@@ -943,4 +950,393 @@ mod tests {
         let rec = sample_record();
         assert_eq!(rec.device_id(), rec.version.device_id);
     }
+
+    // ── Quality tier: out-of-range & non-finite ──────────────────────────────
+
+    #[test]
+    fn quality_tier_non_finite_is_suppressed() {
+        // NaN, +∞, and -∞ must never reach Excellent — they would satisfy the
+        // hook injection gate (quality >= 0.4) and inject untrusted records.
+        assert_eq!(QualityScore::tier_from_value(f32::NAN), QualityTier::Suppressed);
+        assert_eq!(QualityScore::tier_from_value(f32::INFINITY), QualityTier::Suppressed);
+        assert_eq!(QualityScore::tier_from_value(f32::NEG_INFINITY), QualityTier::Suppressed);
+    }
+
+    #[test]
+    fn quality_tier_out_of_range_finite_saturates() {
+        // Finite values outside [0, 1] saturate without panicking.
+        assert_eq!(QualityScore::tier_from_value(-1.0), QualityTier::Suppressed);
+        assert_eq!(QualityScore::tier_from_value(-0.001), QualityTier::Suppressed);
+        assert_eq!(QualityScore::tier_from_value(1.001), QualityTier::Excellent);
+        assert_eq!(QualityScore::tier_from_value(100.0), QualityTier::Excellent);
+    }
+
+    #[test]
+    fn layer0_default_quality_is_suppressed_tier() {
+        let q = QualityScore::layer0_default();
+        assert_eq!(q.tier, QualityTier::Suppressed);
+        assert_eq!(q.value, 0.10);
+        assert!(q.signals.is_empty());
+        assert_eq!(q.computed_at, 0, "0 = not yet computed sentinel");
+    }
+
+    // ── Confidence: all sources ───────────────────────────────────────────────
+
+    #[test]
+    fn confidence_for_new_record_all_sources_correct() {
+        let cases: &[(RecordSource, f32)] = &[
+            (RecordSource::DeveloperManual, 0.80),
+            (RecordSource::Import, 0.70),
+            (RecordSource::ClaudeEnrich, 0.60),
+            (RecordSource::SessionHook, 0.50),
+            (RecordSource::StaticAnalysis, 0.10),
+        ];
+        for (source, expected) in cases {
+            let score = ConfidenceScore::for_new_record(source);
+            assert!(
+                (score.value - expected).abs() < f32::EPSILON,
+                "{source:?}: expected {expected}, got {}",
+                score.value
+            );
+            assert_eq!(score.confirmation_count, 0);
+            assert_eq!(score.contributor_count, 1);
+            assert!(score.last_challenged.is_none());
+            assert_eq!(score.challenge_count, 0);
+        }
+    }
+
+    #[test]
+    fn confidence_base_scores_are_all_distinct() {
+        let scores: Vec<f32> = [
+            RecordSource::DeveloperManual,
+            RecordSource::Import,
+            RecordSource::ClaudeEnrich,
+            RecordSource::SessionHook,
+            RecordSource::StaticAnalysis,
+        ]
+        .iter()
+        .map(ConfidenceScore::base_for_source)
+        .collect();
+
+        for i in 0..scores.len() {
+            for j in (i + 1)..scores.len() {
+                assert!(
+                    (scores[i] - scores[j]).abs() > f32::EPSILON,
+                    "sources {i} and {j} have identical base score {}", scores[i]
+                );
+            }
+        }
+    }
+
+    // ── Priority: exhaustive ordering ─────────────────────────────────────────
+
+    #[test]
+    fn priority_exhaustive_pairwise_ordering() {
+        use std::cmp::Ordering::*;
+        let pairs = [
+            (Priority::Low, Priority::Normal, Less),
+            (Priority::Low, Priority::High, Less),
+            (Priority::Low, Priority::Critical, Less),
+            (Priority::Normal, Priority::High, Less),
+            (Priority::Normal, Priority::Critical, Less),
+            (Priority::High, Priority::Critical, Less),
+            (Priority::Low, Priority::Low, Equal),
+            (Priority::Normal, Priority::Normal, Equal),
+            (Priority::High, Priority::High, Equal),
+            (Priority::Critical, Priority::Critical, Equal),
+        ];
+        for (a, b, expected) in pairs {
+            assert_eq!(a.cmp(&b), expected, "{a:?}.cmp({b:?}) should be {expected:?}");
+            // Antisymmetry: if a < b then b > a
+            if expected == Less {
+                assert_eq!(b.cmp(&a), std::cmp::Ordering::Greater, "{b:?}.cmp({a:?})");
+            }
+        }
+    }
+
+    // ── StalenessSignal: all variants round-trip ──────────────────────────────
+
+    #[test]
+    fn staleness_all_signal_variants_serde() {
+        let signals: Vec<StalenessSignal> = vec![
+            StalenessSignal::NotAccessedDays(30),
+            StalenessSignal::LinesChangedPct(0.75),
+            StalenessSignal::EntryPointsChanged(2),
+            StalenessSignal::ImportsChanged(5),
+            StalenessSignal::FileDeleted,
+            StalenessSignal::FileRenamed { new_path: "src/foo.rs".to_string() },
+            StalenessSignal::DependencyBumped {
+                dep: "tokio".to_string(),
+                old_ver: "1.40".to_string(),
+                new_ver: "1.50".to_string(),
+            },
+            StalenessSignal::LinkedFileChanged { path: "src/bar.rs".to_string() },
+            StalenessSignal::CascadeFromDecision("decision:arch".to_string()),
+        ];
+        for signal in &signals {
+            let json = serde_json::to_string(signal).expect("serialize");
+            let restored: StalenessSignal =
+                serde_json::from_str(&json).expect("deserialize");
+            let json2 = serde_json::to_string(&restored).expect("re-serialize");
+            assert_eq!(json, json2, "roundtrip failed for: {json}");
+        }
+    }
+
+    // ── TombstoneReason: all variants ────────────────────────────────────────
+
+    #[test]
+    fn tombstone_reason_all_variants_serde() {
+        let reasons = vec![
+            TombstoneReason::FileDeleted,
+            TombstoneReason::FileRenamed { new_path: "src/new.rs".to_string() },
+            TombstoneReason::ManualDeletion,
+            TombstoneReason::Superseded,
+        ];
+        for reason in &reasons {
+            assert_serde_roundtrip(reason);
+        }
+    }
+
+    // ── Serde snake_case contracts ────────────────────────────────────────────
+
+    #[test]
+    fn category_serializes_as_snake_case() {
+        let cases = [
+            (Category::Gotcha, "\"gotcha\""),
+            (Category::File, "\"file\""),
+            (Category::Decision, "\"decision\""),
+            (Category::Stage, "\"stage\""),
+            (Category::Dependency, "\"dependency\""),
+            (Category::DevNote, "\"dev_note\""),
+            (Category::Session, "\"session\""),
+            (Category::Analytics, "\"analytics\""),
+        ];
+        for (cat, expected_json) in cases {
+            let json = serde_json::to_string(&cat).unwrap();
+            assert_eq!(json, expected_json, "Category::{cat:?}");
+        }
+    }
+
+    #[test]
+    fn record_source_serializes_as_snake_case() {
+        let cases = [
+            (RecordSource::StaticAnalysis, "\"static_analysis\""),
+            (RecordSource::ClaudeEnrich, "\"claude_enrich\""),
+            (RecordSource::SessionHook, "\"session_hook\""),
+            (RecordSource::DeveloperManual, "\"developer_manual\""),
+            (RecordSource::Import, "\"import\""),
+        ];
+        for (src, expected_json) in cases {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(json, expected_json, "RecordSource::{src:?}");
+        }
+    }
+
+    #[test]
+    fn staleness_tier_serializes_as_snake_case() {
+        // Sync merge rule depends on the wire format being stable.
+        let cases = [
+            (StalenessTier::Fresh, "\"fresh\""),
+            (StalenessTier::Aging, "\"aging\""),
+            (StalenessTier::Stale, "\"stale\""),
+            (StalenessTier::Liability, "\"liability\""),
+            (StalenessTier::Tombstone, "\"tombstone\""),
+        ];
+        for (tier, expected_json) in cases {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(json, expected_json, "StalenessTier::{tier:?}");
+        }
+    }
+
+    // ── GotchaRecord: confirmed flag ─────────────────────────────────────────
+
+    #[test]
+    fn gotcha_record_layer0_stub_is_unconfirmed() {
+        // Layer 0 stubs must start unconfirmed; the hook decision matrix never
+        // injects confirmed:false records regardless of confidence or quality.
+        let stub = GotchaRecord {
+            rule: "Do not call .await inside rayon::spawn.".to_string(),
+            reason: "rayon threads have no tokio runtime.".to_string(),
+            severity: Priority::Critical,
+            affected_files: vec!["src/analysis/walker.rs".to_string()],
+            ref_url: None,
+            discovered_session: 0,
+            confirmed: false,
+        };
+        assert!(!stub.confirmed, "Layer 0 stubs must be unconfirmed on construction");
+
+        // Serde roundtrip preserves the flag
+        let json = serde_json::to_string(&stub).unwrap();
+        let restored: GotchaRecord = serde_json::from_str(&json).unwrap();
+        assert!(!restored.confirmed, "confirmed flag must survive serde roundtrip");
+        // The JSON wire format must contain "confirmed":false explicitly
+        assert!(json.contains("\"confirmed\":false"), "wire format: {json}");
+    }
+
+    #[test]
+    fn gotcha_record_confirmed_true_roundtrips() {
+        let confirmed = GotchaRecord {
+            rule: "Use SurrealKV::with_versioning(true, 0) for indefinite retention.".to_string(),
+            reason: "0 means retain all versions forever, not disabled.".to_string(),
+            severity: Priority::High,
+            affected_files: vec!["src/store/db.rs".to_string()],
+            ref_url: Some("https://github.com/example/issue/5".to_string()),
+            discovered_session: 1_710_520_800,
+            confirmed: true,
+        };
+        assert_serde_roundtrip(&confirmed);
+        let json = serde_json::to_string(&confirmed).unwrap();
+        assert!(json.contains("\"confirmed\":true"));
+    }
+
+
+    // ─── Complex serde round-trips ────────────────────────────────────────────
+
+    #[test]
+    fn staleness_score_fully_populated_serde() {
+        let s = StalenessScore {
+            value: 0.87,
+            tier: StalenessTier::Liability,
+            signals: vec![
+                StalenessSignal::NotAccessedDays(90),
+                StalenessSignal::LinesChangedPct(0.6),
+                StalenessSignal::EntryPointsChanged(3),
+                StalenessSignal::FileRenamed { new_path: "src/store/backend.rs".to_string() },
+            ],
+            computed_at: 1_710_520_800,
+            last_record_sha: "deadbeefcafe0123".to_string(),
+        };
+        assert_serde_roundtrip(&s);
+        let json = serde_json::to_string(&s).unwrap();
+        let restored: StalenessScore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tier, StalenessTier::Liability);
+        assert_eq!(restored.signals.len(), 4);
+        assert_eq!(restored.last_record_sha, "deadbeefcafe0123");
+    }
+
+    #[test]
+    fn quality_score_with_all_positive_signals_serde() {
+        let q = QualityScore {
+            value: 0.92,
+            tier: QualityTier::Excellent,
+            signals: vec![
+                QualitySignal::HasImperativeVerb,
+                QualitySignal::HasCausality,
+                QualitySignal::HasSeveritySet,
+                QualitySignal::HasReference,
+                QualitySignal::RuleLengthAdequate,
+                QualitySignal::ReasonLengthAdequate,
+                QualitySignal::AffectedFilesSpecified,
+                QualitySignal::HasSpecificIdentifier,
+            ],
+            computed_at: 1_710_520_800,
+        };
+        assert_serde_roundtrip(&q);
+        let json = serde_json::to_string(&q).unwrap();
+        let restored: QualityScore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.tier, QualityTier::Excellent);
+        assert_eq!(restored.signals.len(), 8);
+    }
+
+    #[test]
+    fn confidence_score_with_challenge_history_serde() {
+        // last_challenged: Some(u64) — a real production state for a disputed record.
+        let c = ConfidenceScore {
+            value: 0.45,
+            confirmation_count: 1,
+            contributor_count: 3,
+            last_challenged: Some(1_710_500_000),
+            challenge_count: 2,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let restored: ConfidenceScore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.last_challenged, Some(1_710_500_000));
+        assert_eq!(restored.challenge_count, 2);
+        assert_eq!(restored.contributor_count, 3);
+        let json2 = serde_json::to_string(&restored).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn record_ref_url_none_does_not_become_some() {
+        // ref_url: None must not silently become Some("") or Some("null").
+        let mut r = sample_record();
+        r.ref_url = None;
+        let json = serde_json::to_string(&r).unwrap();
+        let restored: Record = serde_json::from_str(&json).unwrap();
+        assert!(restored.ref_url.is_none(), "ref_url: None must not become Some after roundtrip");
+        assert!(json.contains("\"ref_url\":null"), "wire format must encode None as null");
+    }
+
+    #[test]
+    fn context_packet_zero_knowledge_case_serde() {
+        // The "blank slate" scenario: mati installed but nothing indexed yet.
+        let empty = ContextPacket {
+            stage: None,
+            critical_gotchas: vec![],
+            file_records: vec![],
+            related_decisions: vec![],
+            recent_session: None,
+            token_estimate: 0,
+            stale_warnings: vec![],
+            unconfirmed_candidates: vec![],
+            knowledge_gaps: vec![],
+            compliance_rate: None,
+            injection_string: String::new(),
+        };
+        assert_serde_roundtrip(&empty);
+        let json = serde_json::to_string(&empty).unwrap();
+        let restored: ContextPacket = serde_json::from_str(&json).unwrap();
+        assert!(restored.critical_gotchas.is_empty());
+        assert!(restored.file_records.is_empty());
+        assert!(restored.stage.is_none());
+        assert_eq!(restored.token_estimate, 0);
+    }
+
+    #[test]
+    fn record_tags_empty_and_many_both_survive_serde() {
+        let mut r = sample_record();
+
+        r.tags = vec![];
+        let json_empty = serde_json::to_string(&r).unwrap();
+        let restored_empty: Record = serde_json::from_str(&json_empty).unwrap();
+        assert!(restored_empty.tags.is_empty(), "empty tags must remain empty");
+
+        r.tags = (0..50).map(|i| format!("tag-{i:03}")).collect();
+        let json_many = serde_json::to_string(&r).unwrap();
+        let restored_many: Record = serde_json::from_str(&json_many).unwrap();
+        assert_eq!(restored_many.tags.len(), 50);
+        assert_eq!(restored_many.tags[0], "tag-000");
+        assert_eq!(restored_many.tags[49], "tag-049");
+    }
+
+    #[test]
+    fn file_record_layer0_stub_serde() {
+        // Layer 0: file exists, but purpose and entry_points are empty.
+        let stub = FileRecord {
+            path: "src/analysis/walker.rs".to_string(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec!["ignore".to_string(), "rayon".to_string()],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 3,
+            change_frequency: 17,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+        };
+        assert_serde_roundtrip(&stub);
+        let json = serde_json::to_string(&stub).unwrap();
+        let restored: FileRecord = serde_json::from_str(&json).unwrap();
+        assert!(restored.purpose.is_empty(), "empty purpose must remain empty");
+        assert!(restored.entry_points.is_empty());
+        assert!(restored.last_author.is_none());
+        assert!(restored.is_hotspot);
+        assert_eq!(restored.unwrap_count, 3);
+    }
+
 }

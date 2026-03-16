@@ -90,4 +90,116 @@ mod tests {
             Durability::Immediate
         );
     }
+
+    // ── Key shape edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn graph_edge_key_is_immediate() {
+        // Multi-colon key — not in the eventual list, must be Immediate.
+        assert_eq!(
+            Durability::for_key("graph:edge:src/main.rs:HasGotcha:gotcha:inference-async"),
+            Durability::Immediate
+        );
+    }
+
+    #[test]
+    fn empty_key_defaults_to_immediate() {
+        // Empty string matches no eventual prefix → safe fallback.
+        assert_eq!(Durability::for_key(""), Durability::Immediate);
+    }
+
+    #[test]
+    fn key_without_colon_defaults_to_immediate() {
+        // A bare word with no colon cannot match any "prefix:" pattern.
+        assert_eq!(Durability::for_key("gotcha"), Durability::Immediate);
+        assert_eq!(Durability::for_key("session"), Durability::Immediate);
+    }
+
+    #[test]
+    fn prefix_only_eventual_keys_are_eventual() {
+        // The bare prefix (no timestamp/slug suffix) still routes correctly.
+        assert_eq!(Durability::for_key("session:"), Durability::Eventual);
+        assert_eq!(Durability::for_key("analytics:"), Durability::Eventual);
+        assert_eq!(Durability::for_key("hook_event:"), Durability::Eventual);
+        assert_eq!(Durability::for_key("compliance:"), Durability::Eventual);
+    }
+
+    #[test]
+    fn all_immediate_prefixes_from_architecture_doc() {
+        // Every Immediate prefix listed in ARCHITECTURE.md §4 must route correctly.
+        let cases = [
+            "gotcha:inference-async",
+            "decision:storage-engine",
+            "file:src/store/db.rs",
+            "stage:current",
+            "dev_note:no-refactor",
+            "graph:edge:a:HasGotcha:b",
+            "dep:tokio",
+        ];
+        for key in cases {
+            assert_eq!(
+                Durability::for_key(key),
+                Durability::Immediate,
+                "expected Immediate for '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn eventual_prefix_requires_exact_colon_boundary() {
+        // "session_v2:x" starts with "session" but NOT "session:" → Immediate.
+        // This guards against accidental prefix collision with future namespaces.
+        assert_eq!(
+            Durability::for_key("session_v2:something"),
+            Durability::Immediate
+        );
+        assert_eq!(
+            Durability::for_key("analytics_v2:something"),
+            Durability::Immediate
+        );
+        assert_eq!(
+            Durability::for_key("hook_event_extra:x"),
+            Durability::Immediate
+        );
+    }
+
+    #[test]
+    fn all_eventual_prefixes_from_architecture_doc() {
+        let cases = [
+            "session:1710520800",
+            "analytics:tokens_saved_total",
+            "hook_event:pre_read",
+            "compliance:2026-03-15",
+        ];
+        for key in cases {
+            assert_eq!(
+                Durability::for_key(key),
+                Durability::Eventual,
+                "expected Eventual for '{key}'"
+            );
+        }
+    }
+
+
+    #[test]
+    fn key_containing_eventual_prefix_as_embedded_substring_is_immediate() {
+        // "gotcha:session:something" contains "session:" but does NOT start_with it.
+        // Must route to Immediate (knowledge tree), not Eventual (sessions tree).
+        assert_eq!(
+            Durability::for_key("gotcha:session:something"),
+            Durability::Immediate,
+            "embedded 'session:' must not trigger Eventual routing"
+        );
+        assert_eq!(
+            Durability::for_key("file:analytics:performance.rs"),
+            Durability::Immediate,
+            "embedded 'analytics:' must not trigger Eventual routing"
+        );
+        assert_eq!(
+            Durability::for_key("decision:hook_event:design"),
+            Durability::Immediate,
+            "embedded 'hook_event:' must not trigger Eventual routing"
+        );
+    }
+
 }
