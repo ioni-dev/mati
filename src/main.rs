@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use mati_core::store::Store;
 
 mod cli;
 
@@ -106,7 +107,13 @@ async fn main() -> Result<()> {
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
         Commands::Stale => Err(anyhow::anyhow!("stale not yet implemented (M-08-O)")),
-        Commands::Ping => Err(anyhow::anyhow!("ping not yet implemented (M-03-H)")),
+        Commands::Ping => {
+            let cwd = std::env::current_dir()?;
+            let store = Store::open(&cwd)?;
+            let latency_us = store.ping().await?;
+            println!("mati ok  {latency_us}µs");
+            Ok(())
+        }
         Commands::Serve => Err(anyhow::anyhow!(
             "MCP stdio server not yet implemented (M-07)"
         )),

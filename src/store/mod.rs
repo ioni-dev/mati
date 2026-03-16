@@ -1,17 +1,16 @@
 //! Storage layer — SurrealKV (M-03)
 //!
 //! Two trees:
-//! -  — all user-visible records, versioning enabled
-//! -  — session analytics and hook events, 90-day retention
+//! - `knowledge.db` — all user-visible records, versioning enabled
+//! - `sessions.db`  — session analytics and hook events, 90-day retention
 //!
-//! Path:  and
-//!
-//! , , ,
-//! implemented in M-03. Types are available now via  and .
+//! Path: `~/.mati/<slug>/knowledge.db` and `sessions.db`
 
+pub mod db;
 pub mod durability;
 pub mod record;
 
+pub use db::Store;
 pub use durability::Durability;
 pub use record::{
     Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType, GotchaRecord,
