@@ -94,14 +94,22 @@ async fn main() -> Result<()> {
         Commands::Ls(args) => cli::show::run_ls(args).await,
         Commands::History(args) => cli::show::run_history(args).await,
         Commands::Gotcha(args) => cli::gotcha::run(args).await,
-        Commands::QualityCheck => Err(anyhow::anyhow!("quality-check not yet implemented (M-08-J)")),
-        Commands::Improve { key } => Err(anyhow::anyhow!("improve {key} not yet implemented (M-08-K)")),
-        Commands::Note { text } => Err(anyhow::anyhow!("note not yet implemented (M-08-L): {text}")),
+        Commands::QualityCheck => Err(anyhow::anyhow!(
+            "quality-check not yet implemented (M-08-J)"
+        )),
+        Commands::Improve { key } => Err(anyhow::anyhow!(
+            "improve {key} not yet implemented (M-08-K)"
+        )),
+        Commands::Note { text } => {
+            Err(anyhow::anyhow!("note not yet implemented (M-08-L): {text}"))
+        }
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
         Commands::Stale => Err(anyhow::anyhow!("stale not yet implemented (M-08-O)")),
         Commands::Ping => Err(anyhow::anyhow!("ping not yet implemented (M-03-H)")),
-        Commands::Serve => Err(anyhow::anyhow!("MCP stdio server not yet implemented (M-07)")),
+        Commands::Serve => Err(anyhow::anyhow!(
+            "MCP stdio server not yet implemented (M-07)"
+        )),
         Commands::LogMiss { key: _ } => Ok(()),
         Commands::LogHit { key: _ } => Ok(()),
         Commands::LogComplianceMiss { key: _ } => Ok(()),

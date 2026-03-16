@@ -228,9 +228,17 @@ pub enum StalenessSignal {
     EntryPointsChanged(u32),
     ImportsChanged(u32),
     FileDeleted,
-    FileRenamed { new_path: String },
-    DependencyBumped { dep: String, old_ver: String, new_ver: String },
-    LinkedFileChanged { path: String },
+    FileRenamed {
+        new_path: String,
+    },
+    DependencyBumped {
+        dep: String,
+        old_ver: String,
+        new_ver: String,
+    },
+    LinkedFileChanged {
+        path: String,
+    },
     /// Another decision or gotcha this record depends on was modified.
     CascadeFromDecision(String),
 }
@@ -673,8 +681,7 @@ mod tests {
     fn sample_record() -> Record {
         Record {
             key: "gotcha:inference-async".to_string(),
-            value: "Never call .await inside a rayon::spawn closure — it panics."
-                .to_string(),
+            value: "Never call .await inside a rayon::spawn closure — it panics.".to_string(),
             category: Category::Gotcha,
             priority: Priority::Critical,
             tags: vec!["async".to_string(), "rayon".to_string()],
@@ -708,8 +715,7 @@ mod tests {
     fn sample_file_record() -> FileRecord {
         FileRecord {
             path: "src/store/db.rs".to_string(),
-            purpose: "Initialises SurrealKV trees and exposes the Store handle."
-                .to_string(),
+            purpose: "Initialises SurrealKV trees and exposes the Store handle.".to_string(),
             entry_points: vec!["Store::open".to_string()],
             imports: vec!["surrealkv".to_string()],
             gotcha_keys: vec!["gotcha:inference-async".to_string()],
@@ -782,8 +788,7 @@ mod tests {
     fn gotcha_record_serde_roundtrip() {
         let gotcha = GotchaRecord {
             rule: "Never hold a write transaction across an await point.".to_string(),
-            reason: "SurrealKV write txns are not Send; the future will not compile."
-                .to_string(),
+            reason: "SurrealKV write txns are not Send; the future will not compile.".to_string(),
             severity: Priority::Critical,
             affected_files: vec!["src/store/db.rs".to_string()],
             ref_url: Some("https://github.com/example/issue/99".to_string()),
@@ -891,7 +896,10 @@ mod tests {
             ConfidenceScore::base_for_source(&RecordSource::DeveloperManual),
             0.80
         );
-        assert_eq!(ConfidenceScore::base_for_source(&RecordSource::Import), 0.70);
+        assert_eq!(
+            ConfidenceScore::base_for_source(&RecordSource::Import),
+            0.70
+        );
         assert_eq!(
             ConfidenceScore::base_for_source(&RecordSource::ClaudeEnrich),
             0.60

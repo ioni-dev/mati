@@ -4,9 +4,9 @@
 //! -  — all user-visible records, versioning enabled
 //! -  — session analytics and hook events, 90-day retention
 //!
-//! Path:  and 
+//! Path:  and
 //!
-//! , , , 
+//! , , ,
 //! implemented in M-03. Types are available now via  and .
 
 pub mod durability;

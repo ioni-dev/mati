@@ -44,23 +44,50 @@ mod tests {
 
     #[test]
     fn immediate_keys() {
-        assert_eq!(Durability::for_key("gotcha:inference-async"), Durability::Immediate);
-        assert_eq!(Durability::for_key("decision:storage-engine"), Durability::Immediate);
-        assert_eq!(Durability::for_key("file:src/main.rs"), Durability::Immediate);
+        assert_eq!(
+            Durability::for_key("gotcha:inference-async"),
+            Durability::Immediate
+        );
+        assert_eq!(
+            Durability::for_key("decision:storage-engine"),
+            Durability::Immediate
+        );
+        assert_eq!(
+            Durability::for_key("file:src/main.rs"),
+            Durability::Immediate
+        );
         assert_eq!(Durability::for_key("stage:current"), Durability::Immediate);
-        assert_eq!(Durability::for_key("dev_note:dont-refactor"), Durability::Immediate);
+        assert_eq!(
+            Durability::for_key("dev_note:dont-refactor"),
+            Durability::Immediate
+        );
     }
 
     #[test]
     fn eventual_keys() {
-        assert_eq!(Durability::for_key("session:1710520800"), Durability::Eventual);
-        assert_eq!(Durability::for_key("analytics:tokens_saved_total"), Durability::Eventual);
-        assert_eq!(Durability::for_key("hook_event:pre_read"), Durability::Eventual);
-        assert_eq!(Durability::for_key("compliance:2026-03-15"), Durability::Eventual);
+        assert_eq!(
+            Durability::for_key("session:1710520800"),
+            Durability::Eventual
+        );
+        assert_eq!(
+            Durability::for_key("analytics:tokens_saved_total"),
+            Durability::Eventual
+        );
+        assert_eq!(
+            Durability::for_key("hook_event:pre_read"),
+            Durability::Eventual
+        );
+        assert_eq!(
+            Durability::for_key("compliance:2026-03-15"),
+            Durability::Eventual
+        );
     }
 
     #[test]
     fn unknown_prefix_defaults_to_immediate() {
-        assert_eq!(Durability::for_key("unknown:something"), Durability::Immediate);
+        assert_eq!(
+            Durability::for_key("unknown:something"),
+            Durability::Immediate
+        );
     }
 }
