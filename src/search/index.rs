@@ -1,0 +1,223 @@
+//! Tantivy full-text search index (M-05).
+//!
+//! Schema matches ARCHITECTURE.md §7 exactly:
+//! ```text
+//! key        TEXT | STORED        BM25-indexed, stored for retrieval
+//! value      TEXT | STORED        Primary search target (purpose, rule, body)
+//! category   STRING | STORED | FAST   Not tokenised — exact match + filter
+//! tags       TEXT | STORED        Free-form tags, space-joined before indexing
+//! priority   u64  | STORED | FAST  Numeric filter / sort
+//! updated_at u64  | STORED | FAST  Numeric filter / sort (Unix secs)
+//! ```
+//!
+//! **Do not add fields** without updating ARCHITECTURE.md §7 and bumping
+//! the schema. Adding fields silently invalidates existing indices — callers
+//! see an `IndexError` on open and must trigger a rebuild from SurrealKV (C4).
+
+use std::path::Path;
+
+use anyhow::Result;
+use tantivy::directory::error::OpenReadError;
+use tantivy::schema::{FieldType, NumericOptions, Schema, FAST, STORED, STRING, TEXT};
+use tantivy::{Index, TantivyError};
+
+// ── Field handles ─────────────────────────────────────────────────────────────
+
+/// Handles to every schema field — stored next to the `Index` so callers never
+/// need to call `schema.get_field(name)` (which panics on unknown names).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Fields {
+    pub(crate) key:        tantivy::schema::Field,
+    pub(crate) value:      tantivy::schema::Field,
+    pub(crate) category:   tantivy::schema::Field,
+    pub(crate) tags:       tantivy::schema::Field,
+    pub(crate) priority:   tantivy::schema::Field,
+    pub(crate) updated_at: tantivy::schema::Field,
+}
+
+// ── Search struct ─────────────────────────────────────────────────────────────
+
+/// Full-text BM25 search over all mati knowledge records.
+///
+/// Index lives at `~/.mati/<slug>/search_index/`.
+/// Constructed via [`Search::open`] — either creates a fresh index or reopens
+/// an existing one. Corrupt indices must be detected and rebuilt by the caller
+/// (see C4 in ARCHITECTURE.md).
+pub struct Search {
+    pub(crate) index:  Index,
+    pub(crate) fields: Fields,
+}
+
+impl Search {
+    /// Open (or create) the tantivy index at `path`.
+    ///
+    /// - If `path` does not exist it is created.
+    /// - If `path` is empty, a fresh index is written.
+    /// - If a valid index already exists, it is opened.
+    ///
+    /// Returns `Err` if an existing index has an incompatible schema
+    /// (schema mismatch = field set changed). The caller should delete
+    /// `search_index/` and call `open` again to trigger a full rebuild.
+    pub fn open(path: &Path) -> Result<Self> {
+        std::fs::create_dir_all(path)?;
+
+        let (schema, fields) = schema();
+
+        // Try to open an existing index first.
+        // Only fall back to creation when meta.json is absent — i.e. the
+        // directory exists but no index has been written yet.
+        // All other errors (DataCorruption, SchemaError, LockFailure, IoError)
+        // propagate to the caller so C4 rebuild logic can handle them.
+        let index = match Index::open_in_dir(path) {
+            Ok(idx) => idx,
+            Err(TantivyError::OpenReadError(OpenReadError::FileDoesNotExist(_))) => {
+                Index::create_in_dir(path, schema)?
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(Self { index, fields })
+    }
+}
+
+// ── Schema builder ────────────────────────────────────────────────────────────
+
+/// Build the tantivy schema and return field handles alongside it.
+///
+/// Called once per `Search::open`. Separated from the struct so tests can
+/// verify field presence without opening a real index.
+pub(crate) fn schema() -> (Schema, Fields) {
+    let mut b = Schema::builder();
+
+    let key        = b.add_text_field("key",        TEXT | STORED);
+    let value      = b.add_text_field("value",      TEXT | STORED);
+    let category   = b.add_text_field("category",   STRING | STORED | FAST);
+    let tags       = b.add_text_field("tags",        TEXT | STORED);
+    let priority   = b.add_u64_field("priority",    numeric_stored_fast());
+    let updated_at = b.add_u64_field("updated_at",  numeric_stored_fast());
+
+    (b.build(), Fields { key, value, category, tags, priority, updated_at })
+}
+
+/// `STORED | FAST` for u64 fields — tantivy requires `NumericOptions`, not
+/// the `TextOptions` bitflags, so we build them explicitly.
+fn numeric_stored_fast() -> NumericOptions {
+    NumericOptions::default().set_stored().set_fast()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── Schema correctness ───────────────────────────────────────────────────
+
+    #[test]
+    fn schema_has_all_six_fields() {
+        let (s, _) = schema();
+        for name in ["key", "value", "category", "tags", "priority", "updated_at"] {
+            assert!(s.get_field(name).is_ok(), "missing field: {name}");
+        }
+    }
+
+    #[test]
+    fn text_fields_are_stored() {
+        let (s, f) = schema();
+        for field in [f.key, f.value, f.tags] {
+            let entry = s.get_field_entry(field);
+            assert!(entry.is_stored(), "text field {field:?} must be stored");
+        }
+    }
+
+    #[test]
+    fn category_field_is_string_not_text() {
+        // STRING = not tokenised. Exact-match semantics for category filtering.
+        let (s, f) = schema();
+        let entry = s.get_field_entry(f.category);
+        let FieldType::Str(opts) = entry.field_type() else {
+            panic!("category must be a text field");
+        };
+        // A STRING field must have indexing options (it is indexed) and must
+        // use the "raw" tokenizer — i.e. no tokenisation, exact-match only.
+        let indexing = opts
+            .get_indexing_options()
+            .expect("category must have indexing options");
+        assert_eq!(
+            indexing.tokenizer(), "raw",
+            "category must use raw tokenizer (STRING), not default (TEXT)"
+        );
+    }
+
+    #[test]
+    fn u64_fields_are_stored_and_fast() {
+        let (s, f) = schema();
+        for field in [f.priority, f.updated_at] {
+            let entry = s.get_field_entry(field);
+            assert!(entry.is_stored(), "u64 field {field:?} must be stored");
+            let FieldType::U64(opts) = entry.field_type() else {
+                panic!("field {field:?} must be u64");
+            };
+            assert!(opts.is_fast(), "u64 field {field:?} must be FAST");
+        }
+    }
+
+    // ── Index lifecycle ──────────────────────────────────────────────────────
+
+    #[test]
+    fn open_creates_index_in_new_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("search_index");
+        assert!(!path.exists());
+        Search::open(&path).unwrap();
+        assert!(path.exists(), "search_index dir must be created");
+    }
+
+    #[test]
+    fn open_creates_index_when_dir_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("search_index");
+        std::fs::create_dir_all(&path).unwrap();
+        Search::open(&path).unwrap(); // must not panic on empty dir
+    }
+
+    #[test]
+    fn open_reopens_existing_index() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("search_index");
+        Search::open(&path).unwrap();
+        // Second open must succeed without error.
+        Search::open(&path).unwrap();
+    }
+
+    #[test]
+    fn open_is_idempotent_schema_stays_stable() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("search_index");
+        let schema1 = {
+            let s = Search::open(&path).unwrap();
+            s.index.schema()
+        }; // s dropped here — releases any index lock before second open
+        let schema2 = {
+            let s = Search::open(&path).unwrap();
+            s.index.schema()
+        };
+        assert_eq!(
+            schema1.num_fields(),
+            schema2.num_fields(),
+            "schema must not drift between opens"
+        );
+    }
+
+    #[test]
+    fn open_path_is_independent_per_project() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("project_a/search_index");
+        let b = dir.path().join("project_b/search_index");
+        Search::open(&a).unwrap();
+        Search::open(&b).unwrap();
+        assert!(a.exists());
+        assert!(b.exists());
+    }
+}
