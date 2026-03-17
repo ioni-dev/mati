@@ -250,7 +250,7 @@ mod tests {
 
     async fn temp_graph() -> (Graph, TempDir) {
         let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
         (graph, dir)
     }
@@ -310,7 +310,7 @@ mod tests {
     #[tokio::test]
     async fn add_edge_duplicate_does_not_write_store() {
         let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
         let mut g = Graph::load(store).await.unwrap();
         g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
         g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
@@ -323,13 +323,13 @@ mod tests {
     async fn edges_survive_reload() {
         let dir = TempDir::new().unwrap();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             g.add_edge("file:src/a.rs", EdgeKind::CoChanges, "file:src/b.rs")
                 .await.unwrap();
             g.close().await.unwrap();
         }
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         assert_eq!(g2.edge_count(), 1);
         let neighbors = g2.neighbors("file:src/a.rs", &EdgeKind::CoChanges);
@@ -395,14 +395,14 @@ mod tests {
     async fn remove_edge_after_reload() {
         let dir = TempDir::new().unwrap();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:x").await.unwrap();
             g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:y").await.unwrap();
             g.close().await.unwrap();
         }
         // Reload and remove one of the edges.
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let mut g2 = Graph::load(store2).await.unwrap();
         assert_eq!(g2.edge_count(), 2);
         g2.remove_edge("file:a", &EdgeKind::HasGotcha, "gotcha:x").await.unwrap();
@@ -412,7 +412,7 @@ mod tests {
 
         // Reload again — the removed edge must not come back.
         g2.close().await.unwrap();
-        let store3 = Store::open(dir.path()).unwrap();
+        let store3 = Store::open(dir.path()).await.unwrap();
         let g3 = Graph::load(store3).await.unwrap();
         assert_eq!(g3.edge_count(), 1);
         assert!(g3.neighbors("file:a", &EdgeKind::HasGotcha).contains(&"gotcha:y".to_string()));
@@ -580,12 +580,12 @@ mod tests {
     async fn add_edge_idempotent_across_sessions() {
         let dir = TempDir::new().unwrap();
         for _ in 0..2 {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
             g.close().await.unwrap();
         }
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
         let g = Graph::load(store).await.unwrap();
         assert_eq!(g.edge_count(), 1);
         // Store should also contain exactly one edge record.
@@ -617,7 +617,7 @@ mod tests {
     async fn load_skips_unparseable_edge_keys() {
         let dir = TempDir::new().unwrap();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
 
             // Add one legitimate edge.
@@ -632,7 +632,7 @@ mod tests {
             g.close().await.unwrap();
         }
         // Reload — must not panic, must skip the corrupt key.
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         assert_eq!(g2.edge_count(), 1, "only the valid edge should be loaded");
         assert_eq!(g2.neighbors("file:a", &EdgeKind::Imports), vec!["file:b"]);
@@ -644,7 +644,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let n = 100usize;
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             for i in 0..n {
                 g.add_edge(
@@ -656,7 +656,7 @@ mod tests {
             }
             g.close().await.unwrap();
         }
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         assert_eq!(g2.edge_count(), n);
         assert_eq!(g2.node_count(), n * 2);
@@ -703,7 +703,7 @@ mod tests {
     async fn add_edges_batch_survives_reload() {
         let dir = TempDir::new().unwrap();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..50)
                 .map(|i| (format!("file:a{i}"), EdgeKind::Imports, format!("file:b{i}")))
@@ -711,7 +711,7 @@ mod tests {
             g.add_edges_batch(&batch).await.unwrap();
             g.close().await.unwrap();
         }
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         assert_eq!(g2.edge_count(), 50);
     }
@@ -725,7 +725,7 @@ mod tests {
 
         // Sequential baseline.
         let dir_seq = TempDir::new().unwrap();
-        let store_seq = Store::open(dir_seq.path()).unwrap();
+        let store_seq = Store::open(dir_seq.path()).await.unwrap();
         let mut g_seq = Graph::load(store_seq).await.unwrap();
         let seq_start = Instant::now();
         for (from, kind, to) in &edges {
@@ -735,7 +735,7 @@ mod tests {
 
         // Batch.
         let dir_bat = TempDir::new().unwrap();
-        let store_bat = Store::open(dir_bat.path()).unwrap();
+        let store_bat = Store::open(dir_bat.path()).await.unwrap();
         let mut g_bat = Graph::load(store_bat).await.unwrap();
         let bat_start = Instant::now();
         g_bat.add_edges_batch(&edges).await.unwrap();
@@ -774,7 +774,7 @@ mod tests {
         // ── Session 1: build the graph via add_edges_batch ──────────────────
         let build_start = Instant::now();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
                 .flat_map(|i| {
@@ -794,7 +794,7 @@ mod tests {
 
         // ── Session 2: reload and verify ─────────────────────────────────────
         let load_start = Instant::now();
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         let load_ms = load_start.elapsed().as_millis();
 
@@ -816,7 +816,7 @@ mod tests {
 
         // ── Duplicate rejection at scale ─────────────────────────────────────
         // Re-adding all 1,200 edges must be a no-op — edge_count stays at 1,200.
-        let store3 = Store::open(dir.path()).unwrap();
+        let store3 = Store::open(dir.path()).await.unwrap();
         let mut g3 = Graph::load(store3).await.unwrap();
         for i in 0..n_files {
             for kind in &all_kinds {
@@ -885,7 +885,7 @@ mod tests {
         // ── Session 1: build the graph via add_edges_batch ──────────────────
         let build_start = Instant::now();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
                 .flat_map(|i| {
@@ -905,7 +905,7 @@ mod tests {
 
         // ── Session 2: reload and verify ─────────────────────────────────────
         let load_start = Instant::now();
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         let load_ms = load_start.elapsed().as_millis();
 
@@ -927,7 +927,7 @@ mod tests {
 
         // ── Duplicate rejection at scale ─────────────────────────────────────
         // Re-adding the same batch must be a no-op.
-        let store3 = Store::open(dir.path()).unwrap();
+        let store3 = Store::open(dir.path()).await.unwrap();
         let mut g3 = Graph::load(store3).await.unwrap();
         let dup_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
             .flat_map(|i| {
@@ -994,7 +994,7 @@ mod tests {
         // ── Session 1: build the graph via add_edges_batch ──────────────────
         let build_start = Instant::now();
         {
-            let store = Store::open(dir.path()).unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
                 .flat_map(|i| {
@@ -1014,7 +1014,7 @@ mod tests {
 
         // ── Session 2: reload and verify ─────────────────────────────────────
         let load_start = Instant::now();
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let g2 = Graph::load(store2).await.unwrap();
         let load_ms = load_start.elapsed().as_millis();
 
@@ -1035,7 +1035,7 @@ mod tests {
         g2.close().await.unwrap();
 
         // ── Duplicate rejection at scale ─────────────────────────────────────
-        let store3 = Store::open(dir.path()).unwrap();
+        let store3 = Store::open(dir.path()).await.unwrap();
         let mut g3 = Graph::load(store3).await.unwrap();
         let dup_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
             .flat_map(|i| {
@@ -1113,7 +1113,7 @@ mod tests {
 
         // ── Step 2: Store::open + Graph::load (empty) ───────────────────────
         let t1 = Instant::now();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
         let mut g = Graph::load(store).await.unwrap();
         let open_ms = t1.elapsed().as_millis();
 
@@ -1130,7 +1130,7 @@ mod tests {
 
         // ── Step 5: Store::open (cold reopen) ───────────────────────────────
         let t4 = Instant::now();
-        let store2 = Store::open(dir.path()).unwrap();
+        let store2 = Store::open(dir.path()).await.unwrap();
         let reopen_ms = t4.elapsed().as_millis();
 
         // ── Step 6: Graph::load (scan_keys + petgraph rebuild) ───────────────
@@ -1154,7 +1154,7 @@ mod tests {
         }
         g2.close().await.unwrap();
 
-        let store3 = Store::open(dir.path()).unwrap();
+        let store3 = Store::open(dir.path()).await.unwrap();
         let mut g3 = Graph::load(store3).await.unwrap();
         let hub_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
             .map(|i| (

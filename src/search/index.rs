@@ -72,8 +72,9 @@ pub struct Search {
     /// `Store::put`'s immutable receiver) while `commit` needs `&mut`.
     writer: Mutex<IndexWriter>,
     /// Reader held open for the session lifetime.
-    /// `ReloadPolicy::OnCommit` means each `commit()` in the writer
-    /// automatically makes new documents visible to the next `searcher()`.
+    /// `ReloadPolicy::Manual` — we call `reader.reload()` explicitly at the
+    /// start of `query_keys`, guaranteeing read-after-write without a background
+    /// watcher thread.
     reader: IndexReader,
 }
 

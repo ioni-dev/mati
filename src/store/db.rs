@@ -52,8 +52,7 @@ const SESSION_NAMESPACES: &[&str] = &[
 /// - `knowledge` — user-visible records (gotchas, files, decisions, …)
 /// - `sessions`  — analytics, hook events, compliance logs
 ///
-/// All public methods are synchronous wrappers; `commit` inside SurrealKV
-/// is `async`, so callers must be in a `tokio` context.
+/// All public methods are `async`; callers must be in a `tokio` context.
 pub struct Store {
     knowledge: Tree,
     sessions: Tree,
@@ -77,7 +76,7 @@ impl Store {
     /// return `true` in that case — call [`Store::rebuild_search_index`] before
     /// issuing any search queries, or use [`Store::open_and_rebuild`] which
     /// handles this automatically.
-    pub fn open(repo_root: &Path) -> Result<Self> {
+    pub async fn open(repo_root: &Path) -> Result<Self> {
         let slug = derive_slug(repo_root);
         let home = dirs::home_dir().context("cannot determine home directory")?;
         let root = home.join(".mati").join(&slug);
@@ -123,17 +122,20 @@ impl Store {
     /// call when the index was corrupt or missing (C4). Search queries are safe
     /// to issue immediately on the returned store.
     pub async fn open_and_rebuild(repo_root: &Path) -> Result<Self> {
-        let store = Self::open(repo_root)?;
-        if store.index_needs_rebuild {
+        let store = Self::open(repo_root).await?;
+        if store.index_needs_rebuild() {
             store.rebuild_search_index().await?;
         }
         Ok(store)
     }
 
-    /// True when the search index was corrupt or missing on open and
-    /// [`rebuild_search_index`] has not yet been called.
+    /// True when the search index was corrupt or missing on open.
     ///
-    /// [`rebuild_search_index`]: Store::rebuild_search_index
+    /// This flag reflects the state detected at open time and is not reset
+    /// after [`Store::rebuild_search_index`] completes. Use it only to decide
+    /// whether to call `rebuild_search_index` — not as a post-rebuild status.
+    /// [`Store::open_and_rebuild`] handles this automatically.
+    #[must_use]
     pub fn index_needs_rebuild(&self) -> bool {
         self.index_needs_rebuild
     }
@@ -148,24 +150,21 @@ impl Store {
     ///
     /// Returns the total number of records committed to the index.
     pub async fn rebuild_search_index(&self) -> Result<usize> {
-        let mut records: Vec<Record> = Vec::new();
+        // Scan and index one namespace at a time — avoids loading all records
+        // into memory simultaneously. Peak RSS is bounded by the largest single
+        // namespace (typically `file:`) rather than the entire corpus.
+        let mut committed = 0usize;
 
-        for ns in KNOWLEDGE_NAMESPACES {
-            records.extend(self.scan_prefix(ns).await?);
+        for ns in KNOWLEDGE_NAMESPACES.iter().chain(SESSION_NAMESPACES) {
+            let records = self.scan_prefix(ns).await?;
+            if records.is_empty() {
+                continue;
+            }
+            let refs: Vec<&Record> = records.iter().collect();
+            committed += self.search.add_records(&refs)?;
         }
-        for ns in SESSION_NAMESPACES {
-            records.extend(self.scan_prefix(ns).await?);
-        }
 
-        let total = records.len();
-        let refs: Vec<&Record> = records.iter().collect();
-        let committed = self.search.add_records(&refs)?;
-
-        tracing::info!(
-            committed,
-            total,
-            "search index rebuilt from SurrealKV"
-        );
+        tracing::info!(committed, "search index rebuilt from SurrealKV");
 
         Ok(committed)
     }
