@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
         Commands::Stale => Err(anyhow::anyhow!("stale not yet implemented (M-08-O)")),
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
-            let store = Store::open(&cwd)?;
+            let store = Store::open(&cwd).await?;
             let latency_us = store.ping().await?;
             println!("mati ok  {latency_us}µs");
             Ok(())
