@@ -2,3 +2,7 @@
 // Parallel file walker (ignore + rayon), tree-sitter parsing,
 // git2 history mining, dependency parsing (Cargo.toml, package.json, go.mod)
 // Target: <200ms on a 250-file Rust project
+
+pub mod walker;
+
+pub use walker::{Language, WalkedFile, Walker};
