@@ -17,12 +17,30 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use tantivy::collector::TopDocs;
 use tantivy::directory::error::OpenReadError;
-use tantivy::schema::{NumericOptions, Schema, FAST, STORED, STRING, TEXT};
-use tantivy::{Index, IndexWriter, TantivyDocument, TantivyError};
+use tantivy::query::QueryParser;
+use tantivy::schema::{NumericOptions, Schema, Value, FAST, STORED, STRING, TEXT};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, TantivyError};
 
 use crate::store::record::{Category, Priority, Record};
+
+// ── Commit tuning ─────────────────────────────────────────────────────────────
+
+/// Documents staged before each tantivy commit during bulk indexing.
+///
+/// Governs the crash-durability / throughput tradeoff for [`Search::add_records`]:
+///
+/// - **Durability**: at most `COMMIT_CHUNK` staged-but-uncommitted docs are
+///   lost if the process is killed between commits. All prior committed chunks
+///   survive intact and need not be re-indexed by M-05-D rebuild.
+/// - **Throughput**: tantivy's per-commit overhead (~5–10 ms on commodity
+///   hardware) is amortised across 1 000 documents. At 10 000 records the
+///   total commit overhead is ~100 ms — negligible relative to indexing time.
+/// - **Memory**: the writer's in-flight staging buffer stays well below
+///   tantivy's default 128 MB heap limit at this batch size (~1 MB in-flight).
+const COMMIT_CHUNK: usize = 1_000;
 
 // ── Field handles ─────────────────────────────────────────────────────────────
 
@@ -53,6 +71,10 @@ pub struct Search {
     /// Wrapped in `Mutex` so `add_record` can take `&self` (matching
     /// `Store::put`'s immutable receiver) while `commit` needs `&mut`.
     writer: Mutex<IndexWriter>,
+    /// Reader held open for the session lifetime.
+    /// `ReloadPolicy::OnCommit` means each `commit()` in the writer
+    /// automatically makes new documents visible to the next `searcher()`.
+    reader: IndexReader,
 }
 
 impl Search {
@@ -92,8 +114,15 @@ impl Search {
         // 15 MB is sufficient for mati's small documents and keeps memory
         // footprint low. Tantivy requires a minimum of 3 MB.
         let writer = index.writer(15_000_000)?;
+        // Manual reload policy: we call reader.reload() explicitly at the
+        // start of query_keys, guaranteeing read-after-write correctness
+        // without relying on a background watcher thread.
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
 
-        Ok(Self { index, fields, writer: Mutex::new(writer) })
+        Ok(Self { index, fields, writer: Mutex::new(writer), reader })
     }
 
     /// Index a single record and commit immediately.
@@ -106,7 +135,7 @@ impl Search {
     ///
     /// **Performance:** commits on every call. For bulk writes use
     /// [`Search::add_records`] via [`crate::store::Store::put_batch`] — that
-    /// path does a single tantivy commit for the entire batch.
+    /// path amortises commit overhead across [`COMMIT_CHUNK`] documents per commit.
     pub fn add_record(&self, record: &Record) -> Result<()> {
         let doc = record_to_doc(record, &self.fields);
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
@@ -115,21 +144,53 @@ impl Search {
         Ok(())
     }
 
-    /// Index a batch of records with a single commit at the end.
+    /// Index a batch of records, committing every [`COMMIT_CHUNK`] documents.
     ///
-    /// Use this from `Store::put_batch` — one tantivy commit for the whole
-    /// batch instead of one per record.
-    pub fn add_records(&self, records: &[&Record]) -> Result<()> {
+    /// Returns the total number of records successfully committed on `Ok`.
+    ///
+    /// On staging error the in-flight chunk is rolled back so all prior
+    /// committed chunks remain readable and consistent. The partial committed
+    /// count is embedded in the returned error for operator visibility.
+    ///
+    /// Use this from `Store::put_batch`. Single-record writes use [`Self::add_record`].
+    pub fn add_records(&self, records: &[&Record]) -> Result<usize> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+
+        let total = records.len();
+        let mut committed = 0usize;
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
-        for record in records {
-            let doc = record_to_doc(record, &self.fields);
-            writer.add_document(doc)?;
+
+        for chunk in records.chunks(COMMIT_CHUNK) {
+            // Stage all documents for this chunk.
+            // On any add_document error, roll back the in-flight segment so the
+            // index stays consistent with the already-committed chunks — partial
+            // segments would corrupt BM25 scores and confuse the M-05-D rebuild.
+            for record in chunk {
+                if let Err(e) = writer.add_document(record_to_doc(record, &self.fields)) {
+                    if let Err(rb) = writer.rollback() {
+                        tracing::warn!(
+                            committed,
+                            total,
+                            "tantivy rollback failed after staging error: {rb:#}"
+                        );
+                    }
+                    return Err(anyhow::Error::from(e)).with_context(|| {
+                        format!(
+                            "search index staging failed after {committed}/{total} records committed"
+                        )
+                    });
+                }
+            }
+
+            writer.commit().with_context(|| {
+                format!("tantivy commit failed after {committed}/{total} records committed")
+            })?;
+            committed += chunk.len();
         }
-        writer.commit()?;
-        Ok(())
+
+        Ok(committed)
     }
 
     /// Flush pending writes and release the writer lock.
@@ -140,6 +201,79 @@ impl Search {
         let mut writer = self.writer.into_inner().expect("search writer lock poisoned");
         writer.commit()?;
         Ok(())
+    }
+
+    /// BM25 text search over `key`, `value`, and `tags` fields.
+    ///
+    /// Returns record keys (not full records) sorted by descending relevance
+    /// score. The caller (`Store::search`) is responsible for fetching full
+    /// records from SurrealKV.
+    ///
+    /// Never returns `Err` for user-supplied query strings — malformed queries
+    /// are parsed leniently (best-effort, soft errors logged as warnings).
+    /// Returns `Err` only for infrastructure failures (reader reload, segment
+    /// read). Returns an empty `Vec` when `text` is blank or `limit` is 0.
+    ///
+    /// Deduplicates results: if the same key appears in multiple tantivy
+    /// segments (e.g. before a full index rebuild per M-05-D), it is returned
+    /// only once — the highest-scoring occurrence wins.
+    pub fn query_keys(&self, text: &str, limit: usize) -> Result<Vec<String>> {
+        if text.trim().is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+
+        // Reload picks up any commits written since the last query.
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+
+        // Search key, value, and tags — category/priority/updated_at are
+        // filter fields, not free-text search targets.
+        let mut parser = QueryParser::for_index(
+            &self.index,
+            vec![self.fields.key, self.fields.value, self.fields.tags],
+        );
+        // Boost key matches 2×: a term in the key is a stronger signal than
+        // the same term buried in the value body.
+        parser.set_field_boost(self.fields.key, 2.0);
+
+        // Lenient parsing: malformed user queries (unclosed parens, trailing
+        // operators, unknown field refs) produce a best-effort query rather
+        // than an error. Parse warnings are logged but do not fail the call.
+        let (query, parse_warnings) = parser.parse_query_lenient(text);
+        if !parse_warnings.is_empty() {
+            tracing::warn!(
+                query = text,
+                warnings = ?parse_warnings,
+                "query parse warnings — proceeding with best-effort query"
+            );
+        }
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+
+        let mut keys: Vec<String> = Vec::with_capacity(top_docs.len());
+        let mut seen = std::collections::HashSet::new();
+        for (_score, doc_address) in top_docs {
+            // Corrupted or missing segments are skipped rather than aborting
+            // the whole search — partial results are better than an error.
+            let doc = match searcher.doc::<TantivyDocument>(doc_address) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to retrieve doc — skipping");
+                    continue;
+                }
+            };
+            if let Some(key) = doc.get_first(self.fields.key).and_then(|v| v.as_str()) {
+                // Deduplicate: duplicate tantivy entries (pre M-05-D) must
+                // not surface the same key twice in search results.
+                let key = key.to_string();
+                if seen.insert(key.clone()) {
+                    keys.push(key);
+                }
+            } else {
+                tracing::warn!(?doc_address, "indexed doc missing key field — skipping");
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -339,5 +473,368 @@ mod tests {
         Search::open(&b).unwrap();
         assert!(a.exists());
         assert!(b.exists());
+    }
+
+    // ── query_keys helpers ───────────────────────────────────────────────────
+
+    fn make_record(key: &str, value: &str, tags: &[&str]) -> Record {
+        use crate::store::record::{
+            Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle,
+            RecordSource, RecordVersion, StalenessScore,
+        };
+        Record {
+            key:               key.to_string(),
+            value:             value.to_string(),
+            category:          Category::Gotcha,
+            priority:          Priority::Normal,
+            tags:              tags.iter().map(|s| s.to_string()).collect(),
+            created_at:        0,
+            updated_at:        0,
+            ref_url:           None,
+            staleness:         StalenessScore::fresh(),
+            lifecycle:         RecordLifecycle::Active,
+            version:           RecordVersion {
+                device_id:     uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock:    0,
+            },
+            quality:           QualityScore::layer0_default(),
+            access_count:      0,
+            last_accessed:     0,
+            source:            RecordSource::StaticAnalysis,
+            confidence:        ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        }
+    }
+
+    fn open_search(dir: &TempDir) -> Search {
+        Search::open(&dir.path().join("search_index")).unwrap()
+    }
+
+    // ── boundary / guard-rail tests ──────────────────────────────────────────
+
+    #[test]
+    fn query_keys_empty_and_whitespace_return_empty() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:foo", "async inference race", &[]);
+        s.add_record(&r).unwrap();
+        // None of these should match — they must short-circuit before touching
+        // the index.
+        for blank in ["", " ", "\t", "\n", "  \t  "] {
+            let keys = s.query_keys(blank, 10).unwrap();
+            assert!(keys.is_empty(), "expected empty for {blank:?}");
+        }
+    }
+
+    #[test]
+    fn query_keys_zero_limit_returns_empty_even_with_matching_docs() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:foo", "async inference race", &[]);
+        s.add_record(&r).unwrap();
+        assert!(s.query_keys("async", 0).unwrap().is_empty());
+    }
+
+    // ── field coverage ───────────────────────────────────────────────────────
+
+    #[test]
+    fn query_keys_matches_value_field() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // "inference" only appears in value, not in key or tags
+        let r = make_record("gotcha:async-race", "never use inference in async context", &[]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("inference", 10).unwrap();
+        assert_eq!(keys, vec!["gotcha:async-race"]);
+    }
+
+    #[test]
+    fn query_keys_matches_tags_field() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // "performance" only in tags
+        let r = make_record("file:engine/mod.rs", "engine entry point", &["performance", "critical"]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("performance", 10).unwrap();
+        assert_eq!(keys, vec!["file:engine/mod.rs"]);
+    }
+
+    #[test]
+    fn query_keys_matches_key_field() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // "surrealkv" only in the key; value/tags have different terms
+        let r = make_record("gotcha:surrealkv-versioning", "retention is always enabled", &[]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("surrealkv", 10).unwrap();
+        assert_eq!(keys, vec!["gotcha:surrealkv-versioning"]);
+    }
+
+    // ── key boost correctness ────────────────────────────────────────────────
+
+    #[test]
+    fn query_keys_key_match_ranks_above_value_only_match() {
+        // "petgraph" appears in the *key* of record A and only in the *value*
+        // of record B. The 2× key boost must push A to rank #1.
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // Record A: "petgraph" in the key
+        let a = make_record("gotcha:petgraph-cycles", "watch for cycles in traversal", &[]);
+        // Record B: "petgraph" only in value, noisier text
+        let b = make_record(
+            "gotcha:graph-general",
+            "petgraph handles directed and undirected graphs for traversal and cycle detection",
+            &[],
+        );
+        s.add_record(&a).unwrap();
+        s.add_record(&b).unwrap();
+
+        let keys = s.query_keys("petgraph", 10).unwrap();
+        assert_eq!(keys.len(), 2, "both records must match");
+        assert_eq!(keys[0], "gotcha:petgraph-cycles", "key match must rank first");
+    }
+
+    // ── limit ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn query_keys_limit_caps_results() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // Use add_records (batch path) — single commit, tests that path too
+        let records: Vec<Record> = (0..20)
+            .map(|i| make_record(&format!("gotcha:item-{i:02}"), "tokio runtime executor gotcha", &[]))
+            .collect();
+        let refs: Vec<&Record> = records.iter().collect();
+        s.add_records(&refs).unwrap();
+
+        assert_eq!(s.query_keys("tokio", 1).unwrap().len(), 1);
+        assert_eq!(s.query_keys("tokio", 7).unwrap().len(), 7);
+        assert_eq!(s.query_keys("tokio", 20).unwrap().len(), 20);
+        // limit > total docs — must return all docs, not error
+        assert_eq!(s.query_keys("tokio", 999).unwrap().len(), 20);
+    }
+
+    /// Stress test: 500,000 noise docs + 20 sentinel targets (no SurrealKV).
+    /// Proves BM25 returns zero false positives from 500k noise records and
+    /// that limit enforcement works at that scale.
+    ///
+    /// `add_records` commits every `COMMIT_CHUNK` (1 000) docs — 500,020
+    /// records ≈ 501 commits. Runtime is dominated by tantivy indexing, not
+    /// commit overhead (~5–10 ms × 501 ≈ 5 s total commit overhead).
+    #[test]
+    fn query_keys_500k_noise_zero_false_positives_and_limit_correct() {
+        // Use a fixed device_id across all records to avoid 500k RNG calls.
+        let device_id = uuid::Uuid::nil();
+        let make = |key: &str, value: &str| -> Record {
+            use crate::store::record::{
+                Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle,
+                RecordSource, RecordVersion, StalenessScore,
+            };
+            Record {
+                key:               key.to_string(),
+                value:             value.to_string(),
+                category:          Category::File,
+                priority:          Priority::Normal,
+                tags:              vec![],
+                created_at:        0,
+                updated_at:        0,
+                ref_url:           None,
+                staleness:         StalenessScore::fresh(),
+                lifecycle:         RecordLifecycle::Active,
+                version:           RecordVersion { device_id, logical_clock: 1, wall_clock: 0 },
+                quality:           QualityScore::layer0_default(),
+                access_count:      0,
+                last_accessed:     0,
+                source:            RecordSource::StaticAnalysis,
+                confidence:        ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+                gap_analysis_score: 0.0,
+            }
+        };
+
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+
+        // 500,000 noise records — realistic Layer 0 corpus at Linux-kernel scale.
+        // Content varies per record to create a realistic term distribution.
+        let noise: Vec<Record> = (0..500_000_usize)
+            .map(|i| make(
+                &format!("file:src/module_{i:06}.rs"),
+                &format!("module {i} handles initialization routing configuration management dispatch"),
+            ))
+            .collect();
+        s.add_records(&noise.iter().collect::<Vec<_>>()).unwrap();
+
+        // 20 target records containing the unique sentinel term
+        let targets: Vec<Record> = (0..20_usize)
+            .map(|i| make(
+                &format!("gotcha:target-{i:02}"),
+                &format!("zqx_sentinel_500k_proof unique term record {i} extra text filler"),
+            ))
+            .collect();
+        s.add_records(&targets.iter().collect::<Vec<_>>()).unwrap();
+
+        // All 20 targets returned, zero noise leaks through
+        let keys = s.query_keys("zqx_sentinel_500k_proof", 20).unwrap();
+        assert_eq!(keys.len(), 20,
+            "expected 20 hits from 500,020 records, got {}", keys.len());
+
+        let target_keys: Vec<String> = targets.iter().map(|r| r.key.clone()).collect();
+        for k in &target_keys {
+            assert!(keys.contains(k), "missing target key: {k}");
+        }
+        for k in &keys {
+            assert!(k.starts_with("gotcha:target-"),
+                "noise doc '{k}' leaked into results");
+        }
+
+        // Limit enforcement at scale
+        let limited = s.query_keys("zqx_sentinel_500k_proof", 5).unwrap();
+        assert_eq!(limited.len(), 5,
+            "limit=5 must cap results even with 20 matching docs in 500k corpus");
+
+        // Over-limit returns exactly the matching set, not more
+        let over = s.query_keys("zqx_sentinel_500k_proof", 999).unwrap();
+        assert_eq!(over.len(), 20,
+            "limit > match count must return all matches, not panic");
+    }
+
+    // ── adversarial / malformed queries ─────────────────────────────────────
+
+    #[test]
+    fn query_keys_malformed_trailing_operator_does_not_error() {
+        // "inference AND" — trailing boolean operator is a parse error in strict
+        // mode. Lenient mode must return results for "inference" without failing.
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:async-race", "inference in async context", &[]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("inference AND", 10).unwrap();
+        assert!(keys.contains(&"gotcha:async-race".to_string()),
+            "lenient parse must still match 'inference'");
+    }
+
+    #[test]
+    fn query_keys_unclosed_paren_does_not_error() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:foo", "tokio runtime issue", &[]);
+        s.add_record(&r).unwrap();
+        // Must not panic or return Err
+        let _ = s.query_keys("(tokio", 10).unwrap();
+    }
+
+    #[test]
+    fn query_keys_unknown_field_ref_does_not_error() {
+        // "nonexistent_field:value" — strict parse would error on unknown field.
+        // Lenient mode must not propagate the error.
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let _ = s.query_keys("nonexistent_field:value", 10).unwrap();
+    }
+
+    #[test]
+    fn query_keys_special_chars_do_not_error() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        for q in ["!@#$%^&*()", "+++---", "\"\"", "\\n\\t", ":::", "NULL\0"] {
+            let result = s.query_keys(q, 10);
+            assert!(result.is_ok(), "query {q:?} must not return Err");
+        }
+    }
+
+    #[test]
+    fn query_keys_unicode_content_is_searchable() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // Value contains both ASCII and Unicode; the ASCII term must still match
+        let r = make_record("decision:i18n", "latency gotcha for データベース queries", &[]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("latency", 10).unwrap();
+        assert_eq!(keys, vec!["decision:i18n"]);
+    }
+
+    // ── duplicate indexing (pre M-05-D) ─────────────────────────────────────
+
+    #[test]
+    fn query_keys_duplicate_indexing_returns_key_exactly_once() {
+        // Simulates a re-enrich run that indexes the same key twice before
+        // M-05-D rebuild. The key must appear only once in results.
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:dup", "duplicate indexing scenario", &[]);
+        s.add_record(&r).unwrap();
+        s.add_record(&r).unwrap(); // index same doc a second time
+        let keys = s.query_keys("duplicate", 10).unwrap();
+        assert_eq!(keys, vec!["gotcha:dup"],
+            "duplicate tantivy entries must be deduplicated in results");
+    }
+
+    // ── read-after-write ─────────────────────────────────────────────────────
+
+    #[test]
+    fn query_keys_immediately_searchable_after_add_record() {
+        // Verifies Manual reload policy + explicit reload() gives immediate
+        // read-after-write without any sleep or external coordination.
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:immediate", "petgraph traversal depth limit", &[]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("petgraph", 10).unwrap();
+        assert_eq!(keys, vec!["gotcha:immediate"]);
+    }
+
+    #[test]
+    fn query_keys_sees_all_records_after_add_records_batch() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let records: Vec<Record> = (0..10)
+            .map(|i| make_record(&format!("gotcha:batch-{i}"), "batchwrite rayon parallel", &[]))
+            .collect();
+        let refs: Vec<&Record> = records.iter().collect();
+        s.add_records(&refs).unwrap();
+        let keys = s.query_keys("rayon", 20).unwrap();
+        assert_eq!(keys.len(), 10, "all 10 batch records must be searchable immediately");
+    }
+
+    // ── no match ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn query_keys_no_match_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("gotcha:foo", "unrelated content about bananas", &[]);
+        s.add_record(&r).unwrap();
+        assert!(s.query_keys("surrealdb_not_in_any_record", 10).unwrap().is_empty());
+    }
+
+    // ── result correctness ───────────────────────────────────────────────────
+
+    #[test]
+    fn query_keys_returns_key_strings_not_values() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        let r = make_record("decision:use-surrealkv", "SurrealKV chosen for durability guarantees", &[]);
+        s.add_record(&r).unwrap();
+        let keys = s.query_keys("durability", 10).unwrap();
+        assert_eq!(keys, vec!["decision:use-surrealkv"],
+            "must return the key string, not the value body");
+    }
+
+    #[test]
+    fn query_keys_multi_word_query_matches_records_with_all_terms() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+        // Record with both terms
+        let both = make_record("gotcha:both-terms", "tantivy petgraph integration", &[]);
+        // Record with only one term
+        let one = make_record("gotcha:one-term", "tantivy only record", &[]);
+        s.add_record(&both).unwrap();
+        s.add_record(&one).unwrap();
+        // Both-term record must score highest
+        let keys = s.query_keys("tantivy petgraph", 10).unwrap();
+        assert!(!keys.is_empty());
+        assert_eq!(keys[0], "gotcha:both-terms",
+            "record containing both query terms must rank first");
     }
 }

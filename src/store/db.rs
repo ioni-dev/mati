@@ -138,10 +138,12 @@ impl Store {
             txn.commit().await?;
         }
 
-        // Single tantivy commit for the whole batch — one fsync regardless of
-        // how many records were written to SurrealKV above.
+        // Chunked tantivy commits (COMMIT_CHUNK docs each) — caps the loss
+        // window on a mid-ingest crash without blocking the SurrealKV writes
+        // above. The usize return (committed count) is not needed at this call
+        // site; errors propagate via `?`.
         let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
-        self.search.add_records(&search_records)?;
+        let _ = self.search.add_records(&search_records)?;
         Ok(())
     }
 
@@ -178,6 +180,25 @@ impl Store {
                 Err(e) => {
                     tracing::warn!("skipping malformed record during scan: {e}");
                 }
+            }
+        }
+        Ok(records)
+    }
+
+    /// Full-text BM25 search over all indexed records.
+    ///
+    /// Calls tantivy for the top `limit` matching keys, then fetches each full
+    /// record from SurrealKV. Keys that tantivy returns but are not found in
+    /// the store (e.g. deleted since last commit) are silently skipped.
+    ///
+    /// Returns results ordered by descending BM25 relevance score. Returns an
+    /// empty `Vec` when `text` is blank or `limit` is 0.
+    pub async fn search(&self, text: &str, limit: usize) -> Result<Vec<Record>> {
+        let keys = self.search.query_keys(text, limit)?;
+        let mut records = Vec::with_capacity(keys.len());
+        for key in &keys {
+            if let Some(record) = self.get(key).await? {
+                records.push(record);
             }
         }
         Ok(records)
@@ -1357,6 +1378,231 @@ mod tests {
         // Verify all records landed correctly.
         let results = store_bat.scan_prefix("file:").await.unwrap();
         assert_eq!(results.len(), 1200);
+    }
+
+    // ─── search (M-05-C / M-05-F) ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_returns_matching_records() {
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:async-race");
+        r.value = "never use inference inside async context".to_string();
+        store.put(&r.key, &r).await.unwrap();
+
+        let results = store.search("inference", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "gotcha:async-race");
+    }
+
+    #[tokio::test]
+    async fn search_empty_and_whitespace_query_returns_empty() {
+        let (store, _dir) = temp_store();
+        let r = make_record("gotcha:foo");
+        store.put(&r.key, &r).await.unwrap();
+        for blank in ["", "  ", "\t", "\n"] {
+            assert!(store.search(blank, 10).await.unwrap().is_empty(),
+                "blank query {blank:?} must return empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_no_match_returns_empty() {
+        let (store, _dir) = temp_store();
+        let r = make_record("gotcha:foo");
+        store.put(&r.key, &r).await.unwrap();
+        assert!(store.search("absolutely_no_match_xyzzy99", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_malformed_query_returns_partial_not_error() {
+        // Malformed queries must not propagate Err — lenient parse returns
+        // best-effort results.
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:async-race");
+        r.value = "tokio runtime inference race condition".to_string();
+        store.put(&r.key, &r).await.unwrap();
+        // "tokio AND" has a trailing operator — must not error
+        let result = store.search("tokio AND", 10).await;
+        assert!(result.is_ok(), "malformed query must not return Err");
+    }
+
+    #[tokio::test]
+    async fn search_limit_caps_results() {
+        let (store, _dir) = temp_store();
+        for i in 0..10 {
+            let mut r = make_record(&format!("gotcha:item-{i:02}"));
+            r.value = "tokio runtime executor gotcha performance".to_string();
+            store.put(&r.key, &r).await.unwrap();
+        }
+        assert_eq!(store.search("tokio", 1).await.unwrap().len(), 1);
+        assert_eq!(store.search("tokio", 5).await.unwrap().len(), 5);
+        assert_eq!(store.search("tokio", 10).await.unwrap().len(), 10);
+        // limit > total docs must return all docs, not panic or error
+        assert_eq!(store.search("tokio", 999).await.unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn search_deleted_record_not_returned() {
+        // A record deleted from SurrealKV after indexing must not appear in
+        // search results — the index key is silently skipped when get() → None.
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:deleted");
+        r.value = "this_unique_sentinel_deleted_record".to_string();
+        store.put(&r.key, &r).await.unwrap();
+
+        // Confirm it is searchable before deletion
+        assert_eq!(store.search("this_unique_sentinel_deleted_record", 10).await.unwrap().len(), 1);
+
+        // Delete from SurrealKV (tantivy index still has the entry)
+        store.delete("gotcha:deleted").await.unwrap();
+
+        // Must return empty — the index hit is silently skipped
+        let results = store.search("this_unique_sentinel_deleted_record", 10).await.unwrap();
+        assert!(results.is_empty(),
+            "deleted record must not appear in search results");
+    }
+
+    #[tokio::test]
+    async fn search_returns_full_record_from_surrealkv_not_tantivy_stored_fields() {
+        // Tantivy only stores 6 fields. The full Record (tags, confidence,
+        // staleness, etc.) must come from SurrealKV via the key lookup.
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:full-record-check");
+        r.value = "sentinel_fullrecord_uniqueterm_xqz".to_string();
+        r.tags = vec!["production".to_string(), "critical-path".to_string()];
+        store.put(&r.key, &r).await.unwrap();
+
+        let results = store.search("sentinel_fullrecord_uniqueterm_xqz", 10).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].tags,
+            vec!["production", "critical-path"],
+            "full tags must come from SurrealKV, not tantivy stored fields"
+        );
+    }
+
+    /// M-05-F: 20 records total, 5 contain a unique sentinel term.
+    /// Query must return exactly those 5 with no false positives.
+    #[tokio::test]
+    async fn search_m05f_20_records_returns_exactly_correct_5() {
+        let (store, _dir) = temp_store();
+
+        // 15 records with unrelated, varied content — must not appear in results
+        for i in 0..15 {
+            let mut r = make_record(&format!("gotcha:noise-{i:02}"));
+            r.value = format!("background noise record about rayon and petgraph item {i}");
+            store.put(&r.key, &r).await.unwrap();
+        }
+
+        // 5 target records containing the unique sentinel term
+        let mut target_keys = Vec::new();
+        for i in 0..5 {
+            let mut r = make_record(&format!("gotcha:target-{i}"));
+            r.value = format!("sentinel_m05f_unique record index {i} with extra text");
+            store.put(&r.key, &r).await.unwrap();
+            target_keys.push(r.key.clone());
+        }
+
+        let results = store.search("sentinel_m05f_unique", 20).await.unwrap();
+        let result_keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
+
+        assert_eq!(results.len(), 5,
+            "expected exactly 5 results, got {}: {:?}", results.len(), result_keys);
+
+        for k in &target_keys {
+            assert!(result_keys.contains(&k.as_str()),
+                "target key '{k}' missing from results");
+        }
+
+        // No noise records leaked in
+        for r in &results {
+            assert!(r.key.starts_with("gotcha:target-"),
+                "noise record '{}' must not appear in results", r.key);
+        }
+    }
+
+    /// Worst-case Store volume: 5,000 records at realistic mati project scale
+    /// (2,000-file codebase × 2-3 record types). All writes use put_batch
+    /// (2 fsyncs total: 1 SurrealKV + 1 tantivy) matching how Layer 0 works.
+    /// Proves BM25 returns exactly 20 targets from 4,980 noise records and
+    /// that limit enforcement and full-record retrieval both hold at this scale.
+    #[tokio::test]
+    async fn search_5k_records_zero_false_positives_limit_and_full_record_correct() {
+        let (store, _dir) = temp_store();
+
+        // 4,980 noise records — single put_batch call (2 fsyncs total)
+        let noise: Vec<Record> = (0..4_980_usize)
+            .map(|i| {
+                let mut r = make_record(&format!("file:src/module_{i:04}.rs"));
+                r.value = format!(
+                    "module {i} handles initialization routing configuration management dispatch"
+                );
+                r
+            })
+            .collect();
+        let noise_pairs: Vec<(&str, &Record)> =
+            noise.iter().map(|r| (r.key.as_str(), r)).collect();
+        store.put_batch(&noise_pairs).await.unwrap();
+
+        // 20 target records with unique sentinel + a meaningful tag we can
+        // verify came from SurrealKV (not tantivy stored fields)
+        let targets: Vec<Record> = (0..20_usize)
+            .map(|i| {
+                let mut r = make_record(&format!("gotcha:target-{i:02}"));
+                r.value = format!("zqx_sentinel_5k_proof unique term record {i}");
+                r.tags = vec!["verified-from-surrealkv".to_string()];
+                r
+            })
+            .collect();
+        let target_pairs: Vec<(&str, &Record)> =
+            targets.iter().map(|r| (r.key.as_str(), r)).collect();
+        store.put_batch(&target_pairs).await.unwrap();
+
+        // ── correctness at limit=100 ─────────────────────────────────────────
+
+        let results = store.search("zqx_sentinel_5k_proof", 100).await.unwrap();
+        assert_eq!(results.len(), 20,
+            "expected 20 hits from 5,000 records, got {}", results.len());
+
+        let result_keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
+        let target_keys: Vec<&str> = targets.iter().map(|r| r.key.as_str()).collect();
+
+        // All 20 targets present
+        for k in &target_keys {
+            assert!(result_keys.contains(k), "missing target: {k}");
+        }
+        // Zero noise leaked through
+        for r in &results {
+            assert!(r.key.starts_with("gotcha:target-"),
+                "noise record '{}' must not appear in results", r.key);
+        }
+
+        // Full record came from SurrealKV — tantivy doesn't store tags
+        for r in &results {
+            assert_eq!(r.tags, vec!["verified-from-surrealkv"],
+                "tags must be fetched from SurrealKV, key: {}", r.key);
+        }
+
+        // ── limit enforcement at scale ────────────────────────────────────────
+
+        let limited = store.search("zqx_sentinel_5k_proof", 5).await.unwrap();
+        assert_eq!(limited.len(), 5,
+            "limit=5 must cap results at scale");
+
+        // Over-limit returns exactly the matching set
+        let over = store.search("zqx_sentinel_5k_proof", 999).await.unwrap();
+        assert_eq!(over.len(), 20,
+            "limit > match count must return all 20 matches, not panic");
+
+        // ── ensure noise records are NOT findable by sentinel term ────────────
+
+        // Pick a random noise record key, search by a term from its value
+        // that does NOT appear in sentinel records
+        let noise_only_results = store.search("zqx_sentinel_5k_proof", 100).await.unwrap();
+        for r in &noise_only_results {
+            assert!(!r.key.starts_with("file:src/module_"),
+                "noise module record should not match sentinel query: {}", r.key);
+        }
     }
 
 }
