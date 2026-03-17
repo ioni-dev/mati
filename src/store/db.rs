@@ -87,6 +87,8 @@ impl Store {
             .with_context(|| format!("failed to serialize record for key '{key}'"))?;
         txn.set(key.as_bytes(), bytes)?;
         txn.commit().await?;
+        // Commits the tantivy index immediately — one fsync per call.
+        // For bulk writes use `put_batch` to collapse this to a single commit.
         self.search.add_record(record)?;
         Ok(())
     }
@@ -138,7 +140,8 @@ impl Store {
 
         // Single tantivy commit for the whole batch — one fsync regardless of
         // how many records were written to SurrealKV above.
-        self.search.add_records(records)?;
+        let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
+        self.search.add_records(&search_records)?;
         Ok(())
     }
 

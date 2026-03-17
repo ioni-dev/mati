@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use tantivy::directory::error::OpenReadError;
-use tantivy::schema::{FieldType, NumericOptions, Schema, FAST, STORED, STRING, TEXT};
+use tantivy::schema::{NumericOptions, Schema, FAST, STORED, STRING, TEXT};
 use tantivy::{Index, IndexWriter, TantivyDocument, TantivyError};
 
 use crate::store::record::{Category, Priority, Record};
@@ -68,8 +68,6 @@ impl Search {
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
 
-        let (schema, fields) = schema();
-
         // Try to open an existing index first.
         // Only fall back to creation when meta.json is absent — i.e. the
         // directory exists but no index has been written yet.
@@ -78,10 +76,18 @@ impl Search {
         let index = match Index::open_in_dir(path) {
             Ok(idx) => idx,
             Err(TantivyError::OpenReadError(OpenReadError::FileDoesNotExist(_))) => {
+                let (schema, _) = schema();
                 Index::create_in_dir(path, schema)?
             }
             Err(e) => return Err(e.into()),
         };
+
+        // Derive field handles from the stored schema by name, not by ordinal.
+        // This is correct for both the create path (schema we just wrote) and
+        // the reopen path (schema read from disk). If a field is missing
+        // (schema changed between binary versions), get_field returns Err
+        // and the caller must delete search_index/ and rebuild (C4).
+        let fields = fields_from_schema(&index.schema())?;
 
         // 15 MB is sufficient for mati's small documents and keeps memory
         // footprint low. Tantivy requires a minimum of 3 MB.
@@ -94,9 +100,13 @@ impl Search {
     ///
     /// Writes are additive — tantivy has no update primitive. If the same key
     /// is indexed twice (e.g. on `mati enrich` re-run), both versions exist
-    /// in the index until a full rebuild (M-05-D / C4). Search results remain
-    /// correct because tantivy returns the latest committed version first;
-    /// duplicates are a space issue, not a correctness issue.
+    /// in the index until a full rebuild (M-05-D / C4). Duplicates inflate BM25
+    /// scores and can cause the same key to appear twice in results. Use a full
+    /// rebuild (M-05-D) to de-duplicate after bulk re-indexing.
+    ///
+    /// **Performance:** commits on every call. For bulk writes use
+    /// [`Search::add_records`] via [`crate::store::Store::put_batch`] — that
+    /// path does a single tantivy commit for the entire batch.
     pub fn add_record(&self, record: &Record) -> Result<()> {
         let doc = record_to_doc(record, &self.fields);
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
@@ -109,12 +119,12 @@ impl Search {
     ///
     /// Use this from `Store::put_batch` — one tantivy commit for the whole
     /// batch instead of one per record.
-    pub fn add_records(&self, records: &[(&str, &Record)]) -> Result<()> {
+    pub fn add_records(&self, records: &[&Record]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
-        for (_, record) in records {
+        for record in records {
             let doc = record_to_doc(record, &self.fields);
             writer.add_document(doc)?;
         }
@@ -197,11 +207,29 @@ fn numeric_stored_fast() -> NumericOptions {
     NumericOptions::default().set_stored().set_fast()
 }
 
+/// Derive `Fields` from a stored `Schema` by field name.
+///
+/// Used in [`Search::open`] after obtaining an `Index` — both on create
+/// (schema we just wrote) and on reopen (schema read from disk). Resolving
+/// by name rather than relying on builder ordinals makes field access
+/// correct even if field insertion order ever changes across binary versions.
+fn fields_from_schema(s: &Schema) -> Result<Fields> {
+    Ok(Fields {
+        key:        s.get_field("key")?,
+        value:      s.get_field("value")?,
+        category:   s.get_field("category")?,
+        tags:       s.get_field("tags")?,
+        priority:   s.get_field("priority")?,
+        updated_at: s.get_field("updated_at")?,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tantivy::schema::FieldType;
     use tempfile::TempDir;
 
     // ── Schema correctness ───────────────────────────────────────────────────
@@ -290,7 +318,7 @@ mod tests {
         let schema1 = {
             let s = Search::open(&path).unwrap();
             s.index.schema()
-        }; // s dropped here — releases any index lock before second open
+        }; // s dropped here — releases the index writer before second open
         let schema2 = {
             let s = Search::open(&path).unwrap();
             s.index.schema()
