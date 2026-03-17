@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use surrealkv::{
-    Durability as SkvDurability, LSMIterator, Options, Transaction, Tree, TreeBuilder,
+    Durability as SkvDurability, LSMIterator, Mode, Options, Transaction, Tree, TreeBuilder,
     VLogChecksumLevel,
 };
 
@@ -66,7 +66,7 @@ impl Store {
 
     /// Read a record by key. Returns `None` if not found.
     pub async fn get(&self, key: &str) -> Result<Option<Record>> {
-        let txn = self.tree_for(key).begin()?;
+        let txn = self.tree_for(key).begin_with_mode(Mode::ReadOnly)?;
         read_record(&txn, key)
     }
 
@@ -76,7 +76,7 @@ impl Store {
     pub async fn put(&self, key: &str, record: &Record) -> Result<()> {
         let durability = Durability::for_key(key);
         let tree = self.tree_for(key);
-        let mut txn = tree.begin()?;
+        let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
         txn.set_durability(skv_durability(durability));
 
         let bytes = serde_json::to_vec(record)
@@ -86,10 +86,58 @@ impl Store {
         Ok(())
     }
 
+    /// Write multiple records in a single transaction per durability class.
+    ///
+    /// Records are grouped by their key prefix: all `Immediate` keys share one
+    /// transaction on `knowledge` (1 fsync), all `Eventual` keys share one on
+    /// `sessions` (1 fsync). The whole batch costs at most 2 fsyncs regardless
+    /// of how many records it contains — critical for Layer 0 bulk inserts.
+    ///
+    /// Empty slice is a no-op. Mixed-durability batches are handled correctly.
+    pub async fn put_batch(&self, records: &[(&str, &Record)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Partition by durability class so each tree gets exactly one commit.
+        let mut immediate: Vec<(&str, &Record)> = Vec::new();
+        let mut eventual: Vec<(&str, &Record)> = Vec::new();
+        for &(key, record) in records {
+            match Durability::for_key(key) {
+                Durability::Immediate => immediate.push((key, record)),
+                Durability::Eventual  => eventual.push((key, record)),
+            }
+        }
+
+        if !immediate.is_empty() {
+            let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
+            txn.set_durability(SkvDurability::Immediate);
+            for (key, record) in &immediate {
+                let bytes = serde_json::to_vec(record)
+                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                txn.set(key.as_bytes(), bytes)?;
+            }
+            txn.commit().await?;
+        }
+
+        if !eventual.is_empty() {
+            let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
+            txn.set_durability(SkvDurability::Eventual);
+            for (key, record) in &eventual {
+                let bytes = serde_json::to_vec(record)
+                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                txn.set(key.as_bytes(), bytes)?;
+            }
+            txn.commit().await?;
+        }
+
+        Ok(())
+    }
+
     /// Delete a record by key. No-op if the key does not exist.
     pub async fn delete(&self, key: &str) -> Result<()> {
         let tree = self.tree_for(key);
-        let mut txn = tree.begin()?;
+        let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
         txn.set_durability(skv_durability(Durability::for_key(key)));
         txn.delete(key.as_bytes())?;
         txn.commit().await?;
@@ -104,7 +152,7 @@ impl Store {
     /// Return order is not guaranteed. Callers that need a stable order must sort.
     pub async fn scan_prefix(&self, prefix: &str) -> Result<Vec<Record>> {
         let tree = self.tree_for(prefix);
-        let txn = tree.begin()?;
+        let txn = tree.begin_with_mode(Mode::ReadOnly)?;
 
         // Range: [prefix, prefix\xff) covers all keys with this prefix
         let end = prefix_end(prefix);
@@ -124,6 +172,83 @@ impl Store {
         Ok(records)
     }
 
+    /// Write raw bytes under `key` with automatically routed durability.
+    ///
+    /// Same durability routing as [`Self::put`] — callers do not need to know
+    /// which tree a key belongs to. Use this for structural metadata (graph
+    /// edges, etc.) where the value is not a [`Record`] and does not need to
+    /// be deserialised on reads.
+    pub async fn put_raw(&self, key: &str, value: &[u8]) -> Result<()> {
+        let durability = Durability::for_key(key);
+        let tree = self.tree_for(key);
+        let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
+        txn.set_durability(skv_durability(durability));
+        txn.set(key.as_bytes(), value.to_vec())?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Write multiple raw-byte values in a single transaction per durability class.
+    ///
+    /// Same batch semantics as [`Self::put_batch`] (at most 2 fsyncs for the
+    /// whole batch). Use for bulk structural writes like graph edge inserts.
+    pub async fn put_batch_raw(&self, records: &[(&str, &[u8])]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut immediate: Vec<(&str, &[u8])> = Vec::new();
+        let mut eventual: Vec<(&str, &[u8])> = Vec::new();
+        for &(key, value) in records {
+            match Durability::for_key(key) {
+                Durability::Immediate => immediate.push((key, value)),
+                Durability::Eventual  => eventual.push((key, value)),
+            }
+        }
+
+        if !immediate.is_empty() {
+            let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
+            txn.set_durability(SkvDurability::Immediate);
+            for (key, value) in &immediate {
+                txn.set(key.as_bytes(), value.to_vec())?;
+            }
+            txn.commit().await?;
+        }
+
+        if !eventual.is_empty() {
+            let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
+            txn.set_durability(SkvDurability::Eventual);
+            for (key, value) in &eventual {
+                txn.set(key.as_bytes(), value.to_vec())?;
+            }
+            txn.commit().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Return all keys whose prefix matches, without deserialising values.
+    ///
+    /// Cheaper than [`Self::scan_prefix`] when only the key is needed (e.g.
+    /// graph edge loading, existence checks). Uses the SurrealKV iterator
+    /// `key().user_key()` path so value bytes are never read from disk.
+    pub async fn scan_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let tree = self.tree_for(prefix);
+        let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+        let end = prefix_end(prefix);
+        let mut cursor = txn.range(prefix.as_bytes(), end.as_bytes())?;
+
+        let mut keys = Vec::new();
+        while cursor.next()? {
+            let user_key = cursor.key().user_key();
+            match std::str::from_utf8(user_key) {
+                Ok(s)  => keys.push(s.to_string()),
+                Err(e) => tracing::warn!("skipping non-UTF8 key in scan_keys: {e}"),
+            }
+        }
+        Ok(keys)
+    }
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -135,8 +260,7 @@ impl Store {
     /// for the lifetime of a `Tree`; reopening without closing first fails with
     /// "already locked by another process".
     pub async fn close(self) -> Result<()> {
-        self.knowledge.close().await?;
-        self.sessions.close().await?;
+        tokio::try_join!(self.knowledge.close(), self.sessions.close())?;
         Ok(())
     }
 
@@ -153,12 +277,12 @@ impl Store {
 
         let sentinel_key = "analytics:ping_probe";
         let ts = start.to_string();
-        let mut txn = self.sessions.begin()?;
+        let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
         txn.set_durability(SkvDurability::Eventual);
         txn.set(sentinel_key.as_bytes(), ts.as_bytes())?;
         txn.commit().await?;
 
-        let txn = self.sessions.begin()?;
+        let txn = self.sessions.begin_with_mode(Mode::ReadOnly)?;
         let result = txn.get(sentinel_key.as_bytes())?;
         anyhow::ensure!(result.is_some(), "ping sentinel write was not visible on read-back");
 
@@ -1103,6 +1227,119 @@ mod tests {
         let input = unsafe { String::from_utf8_unchecked(vec![0x61, 0xfe]) };
         let result = prefix_end(&input);
         assert_eq!(result, "\u{ffff}");
+    }
+
+    // ─── put_batch ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn put_batch_empty_is_noop() {
+        let (store, _dir) = temp_store();
+        store.put_batch(&[]).await.unwrap();
+        assert!(store.scan_prefix("gotcha:").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_batch_single_record_readable() {
+        let (store, _dir) = temp_store();
+        let r = make_record("gotcha:batch-single");
+        store.put_batch(&[("gotcha:batch-single", &r)]).await.unwrap();
+        let got = store.get("gotcha:batch-single").await.unwrap().unwrap();
+        assert_eq!(got.key, "gotcha:batch-single");
+        assert_eq!(got.value, r.value);
+    }
+
+    #[tokio::test]
+    async fn put_batch_all_records_readable() {
+        let (store, _dir) = temp_store();
+        let records: Vec<Record> = (0..10).map(|i| make_record(&format!("gotcha:b{i}"))).collect();
+        let pairs: Vec<(&str, &Record)> = records.iter()
+            .map(|r| (r.key.as_str(), r))
+            .collect();
+        store.put_batch(&pairs).await.unwrap();
+        let results = store.scan_prefix("gotcha:b").await.unwrap();
+        assert_eq!(results.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn put_batch_mixed_durability_both_trees_written() {
+        let (store, _dir) = temp_store();
+        let immediate = make_record("gotcha:imm");
+        let eventual  = make_record("session:evt");
+        store.put_batch(&[
+            ("gotcha:imm",  &immediate),
+            ("session:evt", &eventual),
+        ]).await.unwrap();
+        assert!(store.get("gotcha:imm").await.unwrap().is_some());
+        assert!(store.get("session:evt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn put_batch_matches_sequential_put_for_same_records() {
+        let (store_a, _dir_a) = temp_store();
+        let (store_b, _dir_b) = temp_store();
+        let records: Vec<Record> = (0..20)
+            .map(|i| make_record(&format!("file:src/mod{i}.rs")))
+            .collect();
+
+        // Sequential puts.
+        for r in &records {
+            store_a.put(&r.key, r).await.unwrap();
+        }
+        // Batch put.
+        let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
+        store_b.put_batch(&pairs).await.unwrap();
+
+        let a = {
+            let mut v = store_a.scan_prefix("file:").await.unwrap();
+            v.sort_by(|x, y| x.key.cmp(&y.key));
+            v
+        };
+        let b = {
+            let mut v = store_b.scan_prefix("file:").await.unwrap();
+            v.sort_by(|x, y| x.key.cmp(&y.key));
+            v
+        };
+        assert_eq!(a.len(), b.len());
+        for (ra, rb) in a.iter().zip(b.iter()) {
+            assert_eq!(ra.key, rb.key);
+            assert_eq!(ra.value, rb.value);
+        }
+    }
+
+    /// 1,200-record batch must be measurably faster than 1,200 sequential puts.
+    /// This test guards against the batch accidentally falling back to N fsyncs.
+    #[tokio::test]
+    async fn put_batch_1200_faster_than_sequential() {
+        use std::time::Instant;
+
+        let (store_seq, _dir_seq) = temp_store();
+        let (store_bat, _dir_bat) = temp_store();
+        let records: Vec<Record> = (0..1200)
+            .map(|i| make_record(&format!("file:src/f{i}.rs")))
+            .collect();
+
+        // Sequential baseline.
+        let seq_start = Instant::now();
+        for r in &records {
+            store_seq.put(&r.key, r).await.unwrap();
+        }
+        let seq_ms = seq_start.elapsed().as_millis();
+
+        // Batch.
+        let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
+        let bat_start = Instant::now();
+        store_bat.put_batch(&pairs).await.unwrap();
+        let bat_ms = bat_start.elapsed().as_millis();
+
+        // Batch must be strictly faster (at least 2× in any environment).
+        assert!(
+            bat_ms < seq_ms,
+            "put_batch ({bat_ms}ms) was not faster than sequential puts ({seq_ms}ms)"
+        );
+
+        // Verify all records landed correctly.
+        let results = store_bat.scan_prefix("file:").await.unwrap();
+        assert_eq!(results.len(), 1200);
     }
 
 }

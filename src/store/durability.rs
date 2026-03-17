@@ -7,8 +7,12 @@
 //! Assignment by key prefix (from ARCHITECTURE.md §4):
 //! ```text
 //! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*
-//! Eventual   session:*  analytics:*  hook_event:*  compliance:*
+//! Eventual   session:*  analytics:*  hook_event:*  compliance:*  graph:edge:*
 //! ```
+//!
+//! `graph:edge:*` is Eventual because edges are derived data (re-computed from
+//! source on `mati init`) — they are not irreplaceable like user-authored records.
+//! Losing a few edges on an OS crash costs one `mati init` re-run, not lost knowledge.
 
 /// Controls whether a `Store::put` call fsyncs before returning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +21,7 @@ pub enum Durability {
     /// Correct for: `gotcha:*`, `decision:*`, `file:*`, `stage:*`, `dev_note:*`.
     Immediate,
     /// OS write buffer only. Fast path for high-frequency internal writes.
-    /// Correct for: `session:*`, `analytics:*`, `hook_event:*`, `compliance:*`.
+    /// Correct for: `session:*`, `analytics:*`, `hook_event:*`, `compliance:*`, `graph:edge:*`.
     Eventual,
 }
 
@@ -30,6 +34,7 @@ impl Durability {
             || key.starts_with("analytics:")
             || key.starts_with("hook_event:")
             || key.starts_with("compliance:")
+            || key.starts_with("graph:edge:")
         {
             Self::Eventual
         } else {
@@ -94,11 +99,11 @@ mod tests {
     // ── Key shape edge cases ─────────────────────────────────────────────────
 
     #[test]
-    fn graph_edge_key_is_immediate() {
-        // Multi-colon key — not in the eventual list, must be Immediate.
+    fn graph_edge_key_is_eventual() {
+        // Edges are derived data — Eventual so bulk init avoids per-edge fsyncs.
         assert_eq!(
             Durability::for_key("graph:edge:src/main.rs:HasGotcha:gotcha:inference-async"),
-            Durability::Immediate
+            Durability::Eventual
         );
     }
 
@@ -133,7 +138,6 @@ mod tests {
             "file:src/store/db.rs",
             "stage:current",
             "dev_note:no-refactor",
-            "graph:edge:a:HasGotcha:b",
             "dep:tokio",
         ];
         for key in cases {
@@ -170,6 +174,7 @@ mod tests {
             "analytics:tokens_saved_total",
             "hook_event:pre_read",
             "compliance:2026-03-15",
+            "graph:edge:file:src/main.rs:imports:file:src/lib.rs",
         ];
         for key in cases {
             assert_eq!(
