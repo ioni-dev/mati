@@ -15,11 +15,14 @@
 //! see an `IndexError` on open and must trigger a rebuild from SurrealKV (C4).
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use tantivy::directory::error::OpenReadError;
 use tantivy::schema::{FieldType, NumericOptions, Schema, FAST, STORED, STRING, TEXT};
-use tantivy::{Index, TantivyError};
+use tantivy::{Index, IndexWriter, TantivyDocument, TantivyError};
+
+use crate::store::record::{Category, Priority, Record};
 
 // ── Field handles ─────────────────────────────────────────────────────────────
 
@@ -46,6 +49,10 @@ pub(crate) struct Fields {
 pub struct Search {
     pub(crate) index:  Index,
     pub(crate) fields: Fields,
+    /// Tantivy index writer — held open for the session lifetime.
+    /// Wrapped in `Mutex` so `add_record` can take `&self` (matching
+    /// `Store::put`'s immutable receiver) while `commit` needs `&mut`.
+    writer: Mutex<IndexWriter>,
 }
 
 impl Search {
@@ -76,7 +83,92 @@ impl Search {
             Err(e) => return Err(e.into()),
         };
 
-        Ok(Self { index, fields })
+        // 15 MB is sufficient for mati's small documents and keeps memory
+        // footprint low. Tantivy requires a minimum of 3 MB.
+        let writer = index.writer(15_000_000)?;
+
+        Ok(Self { index, fields, writer: Mutex::new(writer) })
+    }
+
+    /// Index a single record and commit immediately.
+    ///
+    /// Writes are additive — tantivy has no update primitive. If the same key
+    /// is indexed twice (e.g. on `mati enrich` re-run), both versions exist
+    /// in the index until a full rebuild (M-05-D / C4). Search results remain
+    /// correct because tantivy returns the latest committed version first;
+    /// duplicates are a space issue, not a correctness issue.
+    pub fn add_record(&self, record: &Record) -> Result<()> {
+        let doc = record_to_doc(record, &self.fields);
+        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+        writer.add_document(doc)?;
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Index a batch of records with a single commit at the end.
+    ///
+    /// Use this from `Store::put_batch` — one tantivy commit for the whole
+    /// batch instead of one per record.
+    pub fn add_records(&self, records: &[(&str, &Record)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+        for (_, record) in records {
+            let doc = record_to_doc(record, &self.fields);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Flush pending writes and release the writer lock.
+    ///
+    /// Must be called before dropping `Search` to ensure all indexed documents
+    /// are committed. After `close`, the index is safe to reopen.
+    pub fn close(self) -> Result<()> {
+        let mut writer = self.writer.into_inner().expect("search writer lock poisoned");
+        writer.commit()?;
+        Ok(())
+    }
+}
+
+// ── Document construction ─────────────────────────────────────────────────────
+
+/// Convert a `Record` into a tantivy document ready for indexing.
+fn record_to_doc(record: &Record, fields: &Fields) -> TantivyDocument {
+    let mut doc = TantivyDocument::default();
+    doc.add_text(fields.key,        &record.key);
+    doc.add_text(fields.value,      &record.value);
+    doc.add_text(fields.category,   category_str(&record.category));
+    doc.add_text(fields.tags,       &record.tags.join(" "));
+    doc.add_u64(fields.priority,    priority_u64(&record.priority));
+    doc.add_u64(fields.updated_at,  record.updated_at);
+    doc
+}
+
+/// Map `Category` to its snake_case string — matches serde representation
+/// so tantivy category values are consistent with JSON serialization.
+fn category_str(cat: &Category) -> &'static str {
+    match cat {
+        Category::Gotcha     => "gotcha",
+        Category::File       => "file",
+        Category::Decision   => "decision",
+        Category::Stage      => "stage",
+        Category::Dependency => "dependency",
+        Category::DevNote    => "dev_note",
+        Category::Session    => "session",
+        Category::Analytics  => "analytics",
+    }
+}
+
+/// Map `Priority` to a sortable u64 — matches the derived `Ord` ordering.
+fn priority_u64(p: &Priority) -> u64 {
+    match p {
+        Priority::Low      => 0,
+        Priority::Normal   => 1,
+        Priority::High     => 2,
+        Priority::Critical => 3,
     }
 }
 

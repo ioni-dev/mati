@@ -24,6 +24,7 @@ use surrealkv::{
 
 use super::record::Record;
 use super::Durability;
+use crate::search::Search;
 
 // 90 days expressed as nanoseconds — retention period for sessions.db
 const SESSIONS_RETENTION_NS: u64 = 90 * 24 * 60 * 60 * 1_000_000_000u64;
@@ -39,6 +40,8 @@ const SESSIONS_RETENTION_NS: u64 = 90 * 24 * 60 * 60 * 1_000_000_000u64;
 pub struct Store {
     knowledge: Tree,
     sessions: Tree,
+    /// Tantivy full-text index — kept open for the session lifetime.
+    search: Search,
     /// Absolute path to `~/.mati/<slug>/`
     pub root: PathBuf,
 }
@@ -55,9 +58,10 @@ impl Store {
             .with_context(|| format!("cannot create mati dir at {}", root.display()))?;
 
         let knowledge = open_knowledge_tree(root.join("knowledge.db"))?;
-        let sessions = open_sessions_tree(root.join("sessions.db"))?;
+        let sessions  = open_sessions_tree(root.join("sessions.db"))?;
+        let search    = Search::open(&root.join("search_index"))?;
 
-        Ok(Self { knowledge, sessions, root })
+        Ok(Self { knowledge, sessions, search, root })
     }
 
     // -------------------------------------------------------------------------
@@ -83,6 +87,7 @@ impl Store {
             .with_context(|| format!("failed to serialize record for key '{key}'"))?;
         txn.set(key.as_bytes(), bytes)?;
         txn.commit().await?;
+        self.search.add_record(record)?;
         Ok(())
     }
 
@@ -131,6 +136,9 @@ impl Store {
             txn.commit().await?;
         }
 
+        // Single tantivy commit for the whole batch — one fsync regardless of
+        // how many records were written to SurrealKV above.
+        self.search.add_records(records)?;
         Ok(())
     }
 
@@ -261,6 +269,7 @@ impl Store {
     /// "already locked by another process".
     pub async fn close(self) -> Result<()> {
         tokio::try_join!(self.knowledge.close(), self.sessions.close())?;
+        self.search.close()?;
         Ok(())
     }
 
@@ -427,8 +436,9 @@ mod tests {
         let root = dir.path().join("mati_test");
         std::fs::create_dir_all(&root).unwrap();
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-        let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
-        let store = Store { knowledge, sessions, root: root.clone() };
+        let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
+        let search    = Search::open(&root.join("search_index")).unwrap();
+        let store = Store { knowledge, sessions, search, root: root.clone() };
         (store, dir)
     }
 
@@ -608,8 +618,9 @@ mod tests {
         // Write 100 records, then explicitly close to release LOCK.
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let store = Store { knowledge, sessions, root: root.clone() };
+            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search    = Search::open(&root.join("search_index")).unwrap();
+            let store = Store { knowledge, sessions, search, root: root.clone() };
             for i in 0..100 {
                 let r = make_record(i);
                 store.put(&r.key, &r).await.unwrap();
@@ -620,8 +631,9 @@ mod tests {
         // Reopen and verify all 100 are present.
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let store = Store { knowledge, sessions, root: root.clone() };
+            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search    = Search::open(&root.join("search_index")).unwrap();
+            let store = Store { knowledge, sessions, search, root: root.clone() };
             let results = store.scan_prefix("gotcha:").await.unwrap();
             assert_eq!(results.len(), 100, "expected 100 records after reopen, got {}", results.len());
             store.close().await.unwrap();
@@ -1087,8 +1099,9 @@ mod tests {
 
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let store = Store { knowledge, sessions, root: root.clone() };
+            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search    = Search::open(&root.join("search_index")).unwrap();
+            let store = Store { knowledge, sessions, search, root: root.clone() };
             for i in 0..10 {
                 let key = format!("session:{i:04}");
                 store.put(&key, &make_record(&key)).await.unwrap();
@@ -1098,8 +1111,9 @@ mod tests {
 
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let store = Store { knowledge, sessions, root: root.clone() };
+            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search    = Search::open(&root.join("search_index")).unwrap();
+            let store = Store { knowledge, sessions, search, root: root.clone() };
             let results = store.scan_prefix("session:").await.unwrap();
             assert_eq!(results.len(), 10,
                 "Eventual session records must survive a clean close+reopen");
