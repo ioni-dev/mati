@@ -3,3 +3,14 @@
 /target/
 .DS_Store
 *.db
+
+# Internal docs — local only, never commit
+TASKS.md
+ARCHITECTURE.md
+mati\ -\ architecture.md
+BENCHMARKS.md
+GOTCHAS.md
+ROADMAP.md
+DECISIONS.md
+CLAUDE.md
+mati\ -\ readme.md
