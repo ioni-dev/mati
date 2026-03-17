@@ -142,7 +142,8 @@ impl Walker {
 
         let (tx, rx) = mpsc::channel::<WalkedFile>();
 
-        let walk_root = self.root.clone();
+        // One clone, used for both WalkBuilder::new and as the root reference
+        // passed to every FileVisitor via VisitorBuilder.
         let root_arc = Arc::new(self.root.clone());
         let max_file_size = self.max_file_size;
         let follow_symlinks = self.follow_symlinks;
@@ -152,7 +153,7 @@ impl Walker {
         // runtime (tokio) — always call walk_channel from a spawn_blocking
         // context when used from async code.
         std::thread::spawn(move || {
-            let walk = WalkBuilder::new(&walk_root)
+            let walk = WalkBuilder::new(root_arc.as_path())
                 // Include hidden files — .gitignore is the authority on what
                 // to skip; hiding .github/, .claude/ etc. would lose coverage.
                 .hidden(false)
@@ -279,9 +280,13 @@ impl ParallelVisitor for FileVisitor {
             None => return WalkState::Continue, // stdin / unknown — skip
         };
 
-        // Directories are walk nodes, not files. The ignore crate handles
-        // pruning gitignored directories via WalkState::Skip internally.
-        if file_type.is_dir() {
+        // Only process regular files. This explicitly skips:
+        //   • directories (walk nodes — the ignore crate descends them)
+        //   • symlinks — even with follow_links(false), ignore still yields
+        //     symlink entries; opening a symlink path follows it implicitly,
+        //     which violates the follow_symlinks=false contract
+        //   • device files, pipes, sockets
+        if !file_type.is_file() {
             return WalkState::Continue;
         }
 
