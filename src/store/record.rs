@@ -460,6 +460,43 @@ impl Record {
     pub fn device_id(&self) -> DeviceId {
         self.version.device_id
     }
+
+    /// Construct a layer-0 file stub for `file:<path>`.
+    ///
+    /// This is the persisted companion to [`FileRecord::layer0_stub`].
+    /// Layer 0 file records start empty on purpose/value, but still get the
+    /// suppressed quality default so they never surface in Claude-facing
+    /// injection paths until enrichment raises them.
+    pub fn layer0_file_stub(
+        key: impl Into<String>,
+        device_id: DeviceId,
+        logical_clock: u64,
+        wall_clock: u64,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            value: String::new(),
+            category: Category::File,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: wall_clock,
+            updated_at: wall_clock,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id,
+                logical_clock,
+                wall_clock,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -506,7 +543,7 @@ pub struct FileRecord {
     pub todos: Vec<TodoComment>,
     pub unsafe_count: u32,
     pub unwrap_count: u32,
-    /// Commit count touching this file in the last 90 days (from git2).
+    /// Commit count touching this file (from git2, capped at 5 000 most recent non-merge commits).
     pub change_frequency: u32,
     pub last_author: Option<String>,
     /// True when `change_frequency` puts this file in the top 10% of the repo.
@@ -515,6 +552,44 @@ pub struct FileRecord {
     pub token_cost_estimate: u32,
     /// Session timestamp of the last time this record was updated.
     pub last_modified_session: u64,
+}
+
+impl FileRecord {
+    /// Construct a layer-0 file stub from static-analysis signals.
+    ///
+    /// `purpose`, `gotcha_keys`, and `decision_keys` intentionally start empty.
+    /// The Layer 0 pipeline only records structural facts; enrichment fills in
+    /// the human-readable purpose later.
+    pub fn layer0_stub(
+        path: impl Into<String>,
+        entry_points: Vec<String>,
+        imports: Vec<String>,
+        todos: Vec<TodoComment>,
+        unsafe_count: u32,
+        unwrap_count: u32,
+        change_frequency: u32,
+        last_author: Option<String>,
+        is_hotspot: bool,
+        token_cost_estimate: u32,
+        last_modified_session: u64,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            purpose: String::new(),
+            entry_points,
+            imports,
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos,
+            unsafe_count,
+            unwrap_count,
+            change_frequency,
+            last_author,
+            is_hotspot,
+            token_cost_estimate,
+            last_modified_session,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -1313,22 +1388,19 @@ mod tests {
     #[test]
     fn file_record_layer0_stub_serde() {
         // Layer 0: file exists, but purpose and entry_points are empty.
-        let stub = FileRecord {
-            path: "src/analysis/walker.rs".to_string(),
-            purpose: String::new(),
-            entry_points: vec![],
-            imports: vec!["ignore".to_string(), "rayon".to_string()],
-            gotcha_keys: vec![],
-            decision_keys: vec![],
-            todos: vec![],
-            unsafe_count: 0,
-            unwrap_count: 3,
-            change_frequency: 17,
-            last_author: None,
-            is_hotspot: true,
-            token_cost_estimate: 0,
-            last_modified_session: 0,
-        };
+        let stub = FileRecord::layer0_stub(
+            "src/analysis/walker.rs",
+            vec![],
+            vec!["ignore".to_string(), "rayon".to_string()],
+            vec![],
+            0,
+            3,
+            17,
+            None,
+            true,
+            0,
+            0,
+        );
         assert_serde_roundtrip(&stub);
         let json = serde_json::to_string(&stub).unwrap();
         let restored: FileRecord = serde_json::from_str(&json).unwrap();
@@ -1337,6 +1409,20 @@ mod tests {
         assert!(restored.last_author.is_none());
         assert!(restored.is_hotspot);
         assert_eq!(restored.unwrap_count, 3);
+    }
+
+    #[test]
+    fn layer0_file_record_builder_sets_suppressed_quality() {
+        let record = Record::layer0_file_stub("file:src/analysis/walker.rs", device_id(), 7, 1_710_520_800);
+
+        assert_eq!(record.key, "file:src/analysis/walker.rs");
+        assert_eq!(record.category, Category::File);
+        assert!(record.value.is_empty());
+        assert_eq!(record.quality.value, 0.10);
+        assert_eq!(record.quality.tier, QualityTier::Suppressed);
+        assert_eq!(record.source, RecordSource::StaticAnalysis);
+        assert_eq!(record.confidence.value, 0.10);
+        assert_eq!(record.confidence.contributor_count, 1);
     }
 
 }
