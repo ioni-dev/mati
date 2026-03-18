@@ -26,21 +26,24 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Ta
 
 use crate::store::record::{Category, Priority, Record};
 
-// ── Commit tuning ─────────────────────────────────────────────────────────────
+// ── Writer tuning ─────────────────────────────────────────────────────────────
 
-/// Documents staged before each tantivy commit during bulk indexing.
+/// Writer heap budget in bytes.
 ///
-/// Governs the crash-durability / throughput tradeoff for [`Search::add_records`]:
+/// Tantivy divides this equally among worker threads (up to 8). Each thread
+/// needs at least 15 MB (`MEMORY_BUDGET_NUM_BYTES_MIN`). At 50 MB on a
+/// multi-core machine this yields 3 threads × ~16.7 MB each — a sweet spot
+/// between thread coordination overhead (which hurts small batches) and
+/// parallelism (which helps large batches).
 ///
-/// - **Durability**: at most `COMMIT_CHUNK` staged-but-uncommitted docs are
-///   lost if the process is killed between commits. All prior committed chunks
-///   survive intact and need not be re-indexed by M-05-D rebuild.
-/// - **Throughput**: tantivy's per-commit overhead (~5–10 ms on commodity
-///   hardware) is amortised across 1 000 documents. At 10 000 records the
-///   total commit overhead is ~100 ms — negligible relative to indexing time.
-/// - **Memory**: the writer's in-flight staging buffer stays well below
-///   tantivy's default 128 MB heap limit at this batch size (~1 MB in-flight).
-const COMMIT_CHUNK: usize = 1_000;
+/// When a thread's share fills up, tantivy auto-flushes the in-memory segment
+/// to disk (cheap — no meta update, no merge). Larger per-thread budgets mean
+/// fewer auto-flushes and fewer intermediate segments to merge after commit.
+///
+/// Benchmarked: 50 MB + single commit gives 7.6× speedup at 10k records
+/// (1.55s → 203ms) with only 2× overhead at 250 records (91ms → 193ms).
+/// 120 MB (8 threads) was slower at both sizes due to coordination overhead.
+const WRITER_HEAP_BYTES: usize = 50_000_000;
 
 // ── Field handles ─────────────────────────────────────────────────────────────
 
@@ -112,9 +115,7 @@ impl Search {
         // and the caller must delete search_index/ and rebuild (C4).
         let fields = fields_from_schema(&index.schema())?;
 
-        // 15 MB is sufficient for mati's small documents and keeps memory
-        // footprint low. Tantivy requires a minimum of 3 MB.
-        let writer = index.writer(15_000_000)?;
+        let writer = index.writer(WRITER_HEAP_BYTES)?;
         // Manual reload policy: we call reader.reload() explicitly at the
         // start of query_keys, guaranteeing read-after-write correctness
         // without relying on a background watcher thread.
@@ -136,7 +137,7 @@ impl Search {
     ///
     /// **Performance:** commits on every call. For bulk writes use
     /// [`Search::add_records`] via [`crate::store::Store::put_batch`] — that
-    /// path amortises commit overhead across [`COMMIT_CHUNK`] documents per commit.
+    /// path stages the entire batch and commits once.
     pub fn add_record(&self, record: &Record) -> Result<()> {
         let doc = record_to_doc(record, &self.fields);
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
@@ -145,13 +146,19 @@ impl Search {
         Ok(())
     }
 
-    /// Index a batch of records, committing every [`COMMIT_CHUNK`] documents.
+    /// Index a batch of records with a single commit at the end.
     ///
-    /// Returns the total number of records successfully committed on `Ok`.
+    /// Returns the total number of records successfully staged and committed.
     ///
-    /// On staging error the in-flight chunk is rolled back so all prior
-    /// committed chunks remain readable and consistent. The partial committed
-    /// count is embedded in the returned error for operator visibility.
+    /// All documents are staged first, then a single `commit()` makes them
+    /// searchable. Tantivy's worker threads auto-flush in-memory segments to
+    /// disk when their heap share fills up — those flushes are cheap (no meta
+    /// update) and transparent. The single explicit commit at the end is the
+    /// only expensive operation (~140 ms for meta persistence + merge policy).
+    ///
+    /// On staging error, the batch is rolled back — no partial state is
+    /// committed. This is safe because the primary caller (`mati init`) is
+    /// idempotent: a failed init is simply re-run.
     ///
     /// Use this from `Store::put_batch`. Single-record writes use [`Self::add_record`].
     pub fn add_records(&self, records: &[&Record]) -> Result<usize> {
@@ -160,38 +167,31 @@ impl Search {
         }
 
         let total = records.len();
-        let mut committed = 0usize;
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
 
-        for chunk in records.chunks(COMMIT_CHUNK) {
-            // Stage all documents for this chunk.
-            // On any add_document error, roll back the in-flight segment so the
-            // index stays consistent with the already-committed chunks — partial
-            // segments would corrupt BM25 scores and confuse the M-05-D rebuild.
-            for record in chunk {
-                if let Err(e) = writer.add_document(record_to_doc(record, &self.fields)) {
-                    if let Err(rb) = writer.rollback() {
-                        tracing::warn!(
-                            committed,
-                            total,
-                            "tantivy rollback failed after staging error: {rb:#}"
-                        );
-                    }
-                    return Err(anyhow::Error::from(e)).with_context(|| {
-                        format!(
-                            "search index staging failed after {committed}/{total} records committed"
-                        )
-                    });
+        // Stage all documents. Tantivy worker threads handle auto-flushing
+        // when their heap share fills up — no explicit chunking needed.
+        for (i, record) in records.iter().enumerate() {
+            if let Err(e) = writer.add_document(record_to_doc(record, &self.fields)) {
+                if let Err(rb) = writer.rollback() {
+                    tracing::warn!(
+                        staged = i,
+                        total,
+                        "tantivy rollback failed after staging error: {rb:#}"
+                    );
                 }
+                return Err(anyhow::Error::from(e)).with_context(|| {
+                    format!("search index staging failed at record {i}/{total}")
+                });
             }
-
-            writer.commit().with_context(|| {
-                format!("tantivy commit failed after {committed}/{total} records committed")
-            })?;
-            committed += chunk.len();
         }
 
-        Ok(committed)
+        // Single commit — makes all staged documents searchable.
+        writer.commit().with_context(|| {
+            format!("tantivy commit failed after staging {total} records")
+        })?;
+
+        Ok(total)
     }
 
     /// Flush pending writes and release the writer lock.

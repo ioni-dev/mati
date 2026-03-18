@@ -147,6 +147,27 @@ tempfile    = "3.27.0"        # temp SurrealKV trees in tests
 assert_cmd  = "2.2.0"        # CLI integration tests
 predicates  = "3.1.4"        # assert_cmd matchers
 insta       = "1.46.3"        # snapshot testing for mati stats output
+criterion   = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "parser_bench"
+harness = false
+
+[[bench]]
+name = "store_bench"
+harness = false
+
+[[bench]]
+name = "graph_bench"
+harness = false
+
+[[bench]]
+name = "search_bench"
+harness = false
+
+[[bench]]
+name = "layer0_bench"
+harness = false
 
 # ─────────────────────────────────────────────
 # Build profiles

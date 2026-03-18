@@ -10,7 +10,7 @@ pub mod db;
 pub mod durability;
 pub mod record;
 
-pub use db::Store;
+pub use db::{derive_slug, Store};
 pub use durability::Durability;
 pub use record::{
     Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType, GotchaRecord,
