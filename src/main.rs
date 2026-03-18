@@ -71,6 +71,8 @@ enum Commands {
     Serve,
     // ── Internal hook commands (hidden from --help) ─────────────────────
     #[command(hide = true)]
+    Get { key: String },
+    #[command(hide = true)]
     LogMiss { key: String },
     #[command(hide = true)]
     LogHit { key: String },
@@ -121,12 +123,15 @@ async fn main() -> Result<()> {
         Commands::Serve => Err(anyhow::anyhow!(
             "MCP stdio server not yet implemented (M-07)"
         )),
-        Commands::LogMiss { key: _ } => Ok(()),
-        Commands::LogHit { key: _ } => Ok(()),
-        Commands::LogComplianceMiss { key: _ } => Ok(()),
-        Commands::SessionCheckConsulted { key: _ } => Ok(()),
-        Commands::SessionFlush => Ok(()),
-        Commands::SessionHarvest => Ok(()),
+        Commands::Get { key } => cli::hooks::run_get(&key).await,
+        Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
+        Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,
+        Commands::LogComplianceMiss { key } => cli::hooks::run_log_compliance_miss(&key).await,
+        Commands::SessionCheckConsulted { key } => {
+            cli::hooks::run_session_check_consulted(&key).await
+        }
+        Commands::SessionFlush => cli::hooks::run_session_flush().await,
+        Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
     }
 }
 

@@ -81,28 +81,17 @@ const SETTINGS_JSON: &str = r#"{
 }
 "#;
 
-/// Pass-through stub that unconditionally allows the operation.
-/// Real logic is implemented in M-09.
-const STUB_PRE_HOOK: &str = r#"#!/usr/bin/env bash
-# mati stub — pass-through until M-09 implements real logic
-cat > /dev/null
-jq -n '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "allow"}}'
-"#;
-
-/// Pass-through stub for post-tool hooks (no output needed).
-const STUB_POST_HOOK: &str = r#"#!/usr/bin/env bash
-# mati stub — pass-through until M-09 implements real logic
-cat > /dev/null
-"#;
-
 /// All hook scripts to install, with their content.
+///
+/// Each script is a Rust string constant defined in `crate::hooks::*`.
+/// Replaces the pass-through stubs from M-06-J with real hook logic (M-09).
 const HOOK_SCRIPTS: &[(&str, &str)] = &[
-    ("pre-read.sh",             STUB_PRE_HOOK),
-    ("pre-bash.sh",             STUB_PRE_HOOK),
-    ("post-read-compliance.sh", STUB_POST_HOOK),
-    ("post-edit.sh",            STUB_POST_HOOK),
-    ("pre-compact.sh",          STUB_POST_HOOK),
-    ("session-end.sh",          STUB_POST_HOOK),
+    ("pre-read.sh",             crate::hooks::pre_read::SCRIPT),
+    ("pre-bash.sh",             crate::hooks::pre_bash::SCRIPT),
+    ("post-read-compliance.sh", crate::hooks::post_compliance::SCRIPT),
+    ("post-edit.sh",            crate::hooks::post_edit::SCRIPT),
+    ("pre-compact.sh",          crate::hooks::pre_compact::SCRIPT),
+    ("session-end.sh",          crate::hooks::session_end::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -301,10 +290,10 @@ mod tests {
     }
 
     #[test]
-    fn pre_hooks_output_allow_json() {
-        // Verify the stub content contains the correct allow JSON.
-        assert!(STUB_PRE_HOOK.contains("permissionDecision"));
-        assert!(STUB_PRE_HOOK.contains("allow"));
+    fn pre_hooks_contain_decision_json() {
+        // Verify the real hook scripts contain the permissionDecision protocol.
+        assert!(crate::hooks::pre_read::SCRIPT.contains("permissionDecision"));
+        assert!(crate::hooks::pre_bash::SCRIPT.contains("permissionDecision"));
     }
 
     #[test]
