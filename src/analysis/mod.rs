@@ -7,12 +7,16 @@ use std::collections::HashSet;
 
 use crate::store::record::FileRecord;
 
+pub mod claude_md;
 pub mod deps;
+pub mod edges;
 pub mod git;
 pub mod parser;
 pub mod walker;
 
+pub use claude_md::{import_claude_md, ClaudeMdImport};
 pub use deps::{parse_dependencies, DepEntry, DepSignals, DepVersion, ManifestKind};
+pub use edges::{build_edges, Layer0Edges};
 pub use git::{mine_git_history, GitSignals};
 pub use parser::{parse_file, parse_files_parallel, StaticFileAnalysis};
 pub use walker::{Language, WalkedFile, Walker};
