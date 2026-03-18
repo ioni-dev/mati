@@ -198,6 +198,12 @@ impl Graph {
         self.traverse_incoming(node, kind, 1)
     }
 
+    /// Borrow the underlying store — used by CLI commands that need both
+    /// graph traversal and record reads in the same operation.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
     /// Flush pending writes and close the underlying store.
     pub async fn close(self) -> Result<()> {
         self.store.close().await
