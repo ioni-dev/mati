@@ -2160,6 +2160,7 @@ dependencies = [
  "predicates",
  "rayon",
  "rmcp",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",
