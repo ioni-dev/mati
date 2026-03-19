@@ -1,11 +1,12 @@
 use anyhow::Result;
 use clap::Args;
+use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use mati_core::store::{
-    Category, ConfidenceScore, Priority, QualitySignal, QualityTier, Record, RecordLifecycle,
-    RecordSource, StalenessTier, Store,
+    Category, ConfidenceScore, FileRecord, Priority, QualitySignal, QualityTier, Record,
+    RecordLifecycle, RecordSource, StalenessTier, Store,
 };
 
 use super::colors;
@@ -59,7 +60,6 @@ pub async fn run_show(args: ShowArgs) -> Result<()> {
 
     let record = match store.get(&args.key).await? {
         Some(r) => r,
-        // Fix 1: anyhow::bail! instead of process::exit — allows Store drop to run.
         None => anyhow::bail!("no record found for key '{}'", args.key),
     };
 
@@ -69,8 +69,6 @@ pub async fn run_show(args: ShowArgs) -> Result<()> {
 }
 
 fn print_record(record: &Record, use_color: bool) {
-    // Fix 3: rebind colour names to empty strings when stdout is not a TTY so
-    // piped output (mati show key | grep ...) is free of escape sequences.
     let (red, yellow, _green, blue, _purple, gray, cyan, white, bold, reset) = if use_color {
         (
             colors::RED,
@@ -88,7 +86,6 @@ fn print_record(record: &Record, use_color: bool) {
         ("", "", "", "", "", "", "", "", "", "")
     };
 
-    // Wrap colour helpers so they also respect use_color.
     let sc = |v: f32| -> &'static str {
         if use_color { score_color(v) } else { "" }
     };
@@ -106,9 +103,11 @@ fn print_record(record: &Record, use_color: bool) {
 
     let cat_label = category_label(&record.category);
     let cat_color = cc(&record.category);
-    println!("\n{bold}{cat_color}{cat_label}{reset}  {bold}{white}{key}{reset}", key = record.key);
+    println!(
+        "\n{bold}{cat_color}{cat_label}{reset}  {bold}{white}{key}{reset}",
+        key = record.key
+    );
 
-    // Fix 2: use imported RecordLifecycle consistently across all arms.
     match &record.lifecycle {
         RecordLifecycle::Active => {}
         RecordLifecycle::Tombstoned { reason, .. } => {
@@ -145,8 +144,14 @@ fn print_record(record: &Record, use_color: bool) {
         ConfidenceScore::base_for_source(&record.source),
         source = source_label(&record.source),
     );
-    println!("    confirmations  {white}{}{reset}", conf.confirmation_count);
-    println!("    contributors   {white}{}{reset}", conf.contributor_count);
+    println!(
+        "    confirmations  {white}{}{reset}",
+        conf.confirmation_count
+    );
+    println!(
+        "    contributors   {white}{}{reset}",
+        conf.contributor_count
+    );
     if conf.challenge_count > 0 {
         println!("    challenges     {yellow}{}{reset}", conf.challenge_count);
     }
@@ -167,7 +172,6 @@ fn print_record(record: &Record, use_color: bool) {
         qual.value
     );
     if !qual.signals.is_empty() {
-        // Fix 4: human-readable signal labels instead of Debug formatting.
         let sigs: Vec<&str> = qual.signals.iter().map(signal_label).collect();
         println!("    signals  {gray}{}{reset}", sigs.join(", "));
     }
@@ -180,7 +184,10 @@ fn print_record(record: &Record, use_color: bool) {
     let stale_tier = staleness_tier_label(&stale.tier);
 
     println!("{blue}  staleness{reset}");
-    println!("    value  {stale_color}{:.2}{reset}  {gray}({stale_tier}){reset}", stale.value);
+    println!(
+        "    value  {stale_color}{:.2}{reset}  {gray}({stale_tier}){reset}",
+        stale.value
+    );
     if !stale.last_record_sha.is_empty() {
         println!(
             "    last sha  {gray}{}{reset}",
@@ -194,9 +201,18 @@ fn print_record(record: &Record, use_color: bool) {
     let prio_color = pc(&record.priority);
     println!("{blue}  metadata{reset}");
     println!("    priority    {prio_color}{:?}{reset}", record.priority);
-    println!("    source      {gray}{}{reset}", source_label(&record.source));
-    println!("    created     {gray}{}{reset}", format_ts(record.created_at));
-    println!("    updated     {gray}{}{reset}", format_ts(record.updated_at));
+    println!(
+        "    source      {gray}{}{reset}",
+        source_label(&record.source)
+    );
+    println!(
+        "    created     {gray}{}{reset}",
+        format_ts(record.created_at)
+    );
+    println!(
+        "    updated     {gray}{}{reset}",
+        format_ts(record.updated_at)
+    );
     if record.last_accessed > 0 {
         println!(
             "    accessed    {gray}{}{reset}  {gray}(x{}){reset}",
@@ -211,9 +227,15 @@ fn print_record(record: &Record, use_color: bool) {
         println!("    tags        {gray}{}{reset}", record.tags.join(", "));
     }
     if record.gap_analysis_score > 0.0 {
-        println!("    gap score   {yellow}{:.3}{reset}", record.gap_analysis_score);
+        println!(
+            "    gap score   {yellow}{:.3}{reset}",
+            record.gap_analysis_score
+        );
     }
-    println!("    device      {gray}{}{reset}", record.version.device_id);
+    println!(
+        "    device      {gray}{}{reset}",
+        record.version.device_id
+    );
     println!(
         "    clock       {gray}logical={} wall={}{reset}",
         record.version.logical_clock,
@@ -222,13 +244,327 @@ fn print_record(record: &Record, use_color: bool) {
     println!();
 }
 
-// ── Display helpers ───────────────────────────────────────────────────────────
+// ── run_ls (M-08-C/D/E) ─────────────────────────────────────────────────────
 
-/// Hook injection tier label — confidence axis only.
-///
-/// For `gotcha:*` records, injection additionally requires `confirmed=true`
-/// and `quality >= 0.4` (CLAUDE.md Hook Decision Matrix).
-fn hook_tier_label(value: f32) -> &'static str {
+pub async fn run_ls(args: LsArgs) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+    let use_color = std::io::stdout().is_terminal();
+
+    match args.category.as_deref() {
+        Some("files") => ls_files(&store, use_color).await?,
+        Some("gotchas") => ls_gotchas(&store, use_color).await?,
+        Some("decisions") => ls_decisions(&store, use_color).await?,
+        Some(other) => anyhow::bail!(
+            "unknown category '{other}'. Valid: files, gotchas, decisions"
+        ),
+        None => {
+            ls_files(&store, use_color).await?;
+            println!();
+            ls_gotchas(&store, use_color).await?;
+            println!();
+            ls_decisions(&store, use_color).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ls_files(store: &Store, _use_color: bool) -> Result<()> {
+    let records = store.scan_prefix("file:").await?;
+    if records.is_empty() {
+        println!("No file records found.");
+        return Ok(());
+    }
+
+    // Parse FileRecord from each record's value for display purposes.
+    // Sort: hotspots first, then by path.
+    let mut rows: Vec<(String, String, usize, f32, f32, bool)> = Vec::new();
+    for r in &records {
+        let path = r.key.strip_prefix("file:").unwrap_or(&r.key);
+        let (purpose, entry_count, is_hotspot) = match serde_json::from_str::<FileRecord>(&r.value)
+        {
+            Ok(fr) => {
+                let purpose = if fr.purpose.is_empty() {
+                    "(pending enrichment)".to_string()
+                } else {
+                    truncate(&fr.purpose, 40)
+                };
+                (purpose, fr.entry_points.len(), fr.is_hotspot)
+            }
+            Err(_) => {
+                let purpose = if r.value.is_empty() {
+                    "(pending enrichment)".to_string()
+                } else {
+                    truncate(&r.value, 40)
+                };
+                (purpose, 0, false)
+            }
+        };
+        rows.push((
+            path.to_string(),
+            purpose,
+            entry_count,
+            r.confidence.value,
+            r.quality.value,
+            is_hotspot,
+        ));
+    }
+
+    // Sort: hotspots first, then alphabetical by path
+    rows.sort_by(|a, b| b.5.cmp(&a.5).then_with(|| a.0.cmp(&b.0)));
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Path"),
+            Cell::new("Purpose"),
+            Cell::new("Entries"),
+            Cell::new("Conf"),
+            Cell::new("Qual"),
+            Cell::new("Hot"),
+        ]);
+
+    for (path, purpose, entries, conf, qual, hot) in &rows {
+        table.add_row(vec![
+            Cell::new(path),
+            Cell::new(purpose),
+            Cell::new(entries),
+            Cell::new(format!("{conf:.2}")).fg(score_comfy_color(*conf)),
+            Cell::new(format!("{qual:.2}")).fg(score_comfy_color(*qual)),
+            Cell::new(if *hot { "*" } else { "" }),
+        ]);
+    }
+
+    println!("{table}");
+    println!("  {} file records", records.len());
+    Ok(())
+}
+
+async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
+    let mut records = store.scan_prefix("gotcha:").await?;
+    if records.is_empty() {
+        println!("No gotcha records found.");
+        return Ok(());
+    }
+
+    // Sort by confidence * priority_weight descending
+    records.sort_by(|a, b| {
+        let score_a = a.confidence.value * priority_weight(&a.priority);
+        let score_b = b.confidence.value * priority_weight(&b.priority);
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Key"),
+            Cell::new("Rule"),
+            Cell::new("Sev"),
+            Cell::new("Conf"),
+            Cell::new("Qual"),
+            Cell::new("Confirmed"),
+        ]);
+
+    for r in &records {
+        let key_short = r.key.strip_prefix("gotcha:").unwrap_or(&r.key);
+        let (rule, confirmed) = match serde_json::from_str::<mati_core::store::GotchaRecord>(&r.value) {
+            Ok(gr) => (truncate(&gr.rule, 40), gr.confirmed),
+            Err(_) => (truncate(&r.value, 40), false),
+        };
+        let sev = priority_short(&r.priority);
+        table.add_row(vec![
+            Cell::new(key_short),
+            Cell::new(&rule),
+            Cell::new(sev).fg(priority_comfy_color(&r.priority)),
+            Cell::new(format!("{:.2}", r.confidence.value)).fg(score_comfy_color(r.confidence.value)),
+            Cell::new(format!("{:.2}", r.quality.value)).fg(score_comfy_color(r.quality.value)),
+            Cell::new(if confirmed { "Y" } else { "-" }),
+        ]);
+    }
+
+    println!("{table}");
+    println!("  {} gotcha records", records.len());
+    Ok(())
+}
+
+async fn ls_decisions(store: &Store, _use_color: bool) -> Result<()> {
+    let mut records = store.scan_prefix("decision:").await?;
+    if records.is_empty() {
+        println!("No decision records found.");
+        return Ok(());
+    }
+
+    // Sort by updated_at descending
+    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Key"),
+            Cell::new("Value"),
+            Cell::new("Pri"),
+            Cell::new("Conf"),
+            Cell::new("Qual"),
+            Cell::new("Updated"),
+        ]);
+
+    for r in &records {
+        let key_short = r.key.strip_prefix("decision:").unwrap_or(&r.key);
+        table.add_row(vec![
+            Cell::new(key_short),
+            Cell::new(truncate(&r.value, 40)),
+            Cell::new(priority_short(&r.priority)).fg(priority_comfy_color(&r.priority)),
+            Cell::new(format!("{:.2}", r.confidence.value)).fg(score_comfy_color(r.confidence.value)),
+            Cell::new(format!("{:.2}", r.quality.value)).fg(score_comfy_color(r.quality.value)),
+            Cell::new(format_date(r.updated_at)),
+        ]);
+    }
+
+    println!("{table}");
+    println!("  {} decision records", records.len());
+    Ok(())
+}
+
+// ── run_export (M-08-M) ─────────────────────────────────────────────────────
+
+pub async fn run_export(args: ExportArgs) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+
+    let output = match args.format.as_str() {
+        "json" => export_json(&store).await?,
+        "md" => export_md(&store).await?,
+        other => anyhow::bail!("unknown format '{other}'. Valid: md, json"),
+    };
+
+    match args.output {
+        Some(path) => std::fs::write(&path, &output)?,
+        None => print!("{output}"),
+    }
+    Ok(())
+}
+
+async fn export_json(store: &Store) -> Result<String> {
+    let mut all: Vec<Record> = Vec::new();
+    for prefix in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
+        all.extend(store.scan_prefix(prefix).await?);
+    }
+    Ok(serde_json::to_string_pretty(&all)?)
+}
+
+async fn export_md(store: &Store) -> Result<String> {
+    let mut out = String::from("# mati knowledge export\n\n");
+
+    let sections: &[(&str, &str)] = &[
+        ("gotcha:", "Gotchas"),
+        ("decision:", "Decisions"),
+        ("file:", "Files"),
+        ("dev_note:", "Notes"),
+        ("dep:", "Dependencies"),
+    ];
+
+    for &(prefix, heading) in sections {
+        let records = store.scan_prefix(prefix).await?;
+        if records.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("## {heading}\n\n"));
+        for r in &records {
+            out.push_str(&format!("### {}\n\n", r.key));
+            if !r.value.is_empty() {
+                out.push_str(&r.value);
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!(
+                "- priority: {:?}\n- confidence: {:.2}\n- quality: {:.2}\n- source: {:?}\n\n",
+                r.priority, r.confidence.value, r.quality.value, r.source
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+// ── run_import (M-08-N) ─────────────────────────────────────────────────────
+
+pub async fn run_import(args: ImportArgs) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+
+    let path = &args.file;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    match ext {
+        "json" => {
+            let content = std::fs::read_to_string(path)?;
+            let records: Vec<Record> = serde_json::from_str(&content)?;
+            let pairs: Vec<(&str, &Record)> =
+                records.iter().map(|r| (r.key.as_str(), r)).collect();
+            store.put_batch(&pairs).await?;
+            println!("Imported {} records from JSON.", records.len());
+        }
+        "md" => {
+            let device_id = uuid::Uuid::new_v4();
+            let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
+            let pairs: Vec<(&str, &Record)> = import
+                .records
+                .iter()
+                .map(|r| (r.key.as_str(), r))
+                .collect();
+            store.put_batch(&pairs).await?;
+            println!(
+                "Imported {} records from CLAUDE.md.",
+                import.records.len()
+            );
+        }
+        _ => {
+            // Try JSON first, fall back to CLAUDE.md import
+            let content = std::fs::read_to_string(path)?;
+            if content.trim_start().starts_with('[') || content.trim_start().starts_with('{') {
+                let records: Vec<Record> = serde_json::from_str(&content)?;
+                let pairs: Vec<(&str, &Record)> =
+                    records.iter().map(|r| (r.key.as_str(), r)).collect();
+                store.put_batch(&pairs).await?;
+                println!("Imported {} records from JSON.", records.len());
+            } else {
+                let device_id = uuid::Uuid::new_v4();
+                let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
+                let pairs: Vec<(&str, &Record)> = import
+                    .records
+                    .iter()
+                    .map(|r| (r.key.as_str(), r))
+                    .collect();
+                store.put_batch(&pairs).await?;
+                println!(
+                    "Imported {} records from CLAUDE.md.",
+                    import.records.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── run_history (M-14-C stub) ────────────────────────────────────────────────
+
+pub async fn run_history(_args: HistoryArgs) -> Result<()> {
+    Err(anyhow::anyhow!("mati history not yet implemented (M-14-C)"))
+}
+
+// ── Display helpers (pub(crate) for reuse by status, quality-check, etc.) ────
+
+pub(crate) fn hook_tier_label(value: f32) -> &'static str {
     if value >= 0.6 {
         "injects — deny file read (gotcha: also needs confirmed + quality>=0.4)"
     } else if value >= 0.3 {
@@ -238,11 +574,17 @@ fn hook_tier_label(value: f32) -> &'static str {
     }
 }
 
-fn score_color(v: f32) -> &'static str {
-    if v >= 0.6 { colors::GREEN } else if v >= 0.3 { colors::YELLOW } else { colors::RED }
+pub(crate) fn score_color(v: f32) -> &'static str {
+    if v >= 0.6 {
+        colors::GREEN
+    } else if v >= 0.3 {
+        colors::YELLOW
+    } else {
+        colors::RED
+    }
 }
 
-fn staleness_color(tier: &StalenessTier) -> &'static str {
+pub(crate) fn staleness_color(tier: &StalenessTier) -> &'static str {
     match tier {
         StalenessTier::Fresh | StalenessTier::Aging => colors::GREEN,
         StalenessTier::Stale => colors::YELLOW,
@@ -250,7 +592,7 @@ fn staleness_color(tier: &StalenessTier) -> &'static str {
     }
 }
 
-fn staleness_tier_label(tier: &StalenessTier) -> &'static str {
+pub(crate) fn staleness_tier_label(tier: &StalenessTier) -> &'static str {
     match tier {
         StalenessTier::Fresh => "Fresh",
         StalenessTier::Aging => "Aging",
@@ -260,7 +602,7 @@ fn staleness_tier_label(tier: &StalenessTier) -> &'static str {
     }
 }
 
-fn quality_tier_label(tier: &QualityTier) -> &'static str {
+pub(crate) fn quality_tier_label(tier: &QualityTier) -> &'static str {
     match tier {
         QualityTier::Suppressed => "Suppressed — never injected",
         QualityTier::Poor => "Poor — injected with caveat",
@@ -270,7 +612,7 @@ fn quality_tier_label(tier: &QualityTier) -> &'static str {
     }
 }
 
-fn category_label(cat: &Category) -> &'static str {
+pub(crate) fn category_label(cat: &Category) -> &'static str {
     match cat {
         Category::Gotcha => "gotcha",
         Category::File => "file",
@@ -283,7 +625,7 @@ fn category_label(cat: &Category) -> &'static str {
     }
 }
 
-fn category_color(cat: &Category) -> &'static str {
+pub(crate) fn category_color(cat: &Category) -> &'static str {
     match cat {
         Category::Gotcha => colors::RED,
         Category::File => colors::CYAN,
@@ -295,7 +637,7 @@ fn category_color(cat: &Category) -> &'static str {
     }
 }
 
-fn priority_color(p: &Priority) -> &'static str {
+pub(crate) fn priority_color(p: &Priority) -> &'static str {
     match p {
         Priority::Critical => colors::RED,
         Priority::High => colors::YELLOW,
@@ -304,7 +646,7 @@ fn priority_color(p: &Priority) -> &'static str {
     }
 }
 
-fn source_label(src: &RecordSource) -> &'static str {
+pub(crate) fn source_label(src: &RecordSource) -> &'static str {
     match src {
         RecordSource::StaticAnalysis => "StaticAnalysis (Layer 0)",
         RecordSource::ClaudeEnrich => "ClaudeEnrich (Layer 1)",
@@ -314,10 +656,7 @@ fn source_label(src: &RecordSource) -> &'static str {
     }
 }
 
-/// Fix 4: human-readable label for each QualitySignal variant.
-/// Penalty signals are suffixed with "[penalty]" to distinguish them from
-/// positive signals at a glance.
-fn signal_label(sig: &QualitySignal) -> &'static str {
+pub(crate) fn signal_label(sig: &QualitySignal) -> &'static str {
     match sig {
         QualitySignal::HasImperativeVerb => "imperative verb",
         QualitySignal::HasCausality => "causality",
@@ -337,7 +676,7 @@ fn signal_label(sig: &QualitySignal) -> &'static str {
 
 /// Format a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM:SS UTC`.
 /// Returns `"—"` for the sentinel value `0`.
-fn format_ts(ts: u64) -> String {
+pub(crate) fn format_ts(ts: u64) -> String {
     if ts == 0 {
         return "\u{2014}".to_string();
     }
@@ -350,14 +689,18 @@ fn format_ts(ts: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
+/// Format a Unix timestamp as just `YYYY-MM-DD`.
+pub(crate) fn format_date(ts: u64) -> String {
+    if ts == 0 {
+        return "\u{2014}".to_string();
+    }
+    let days = ts / 86400;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}")
+}
+
 /// Convert days since Unix epoch to `(year, month, day)`.
-///
-/// Uses the proleptic Gregorian algorithm from
-/// <http://howardhinnant.github.io/date_algorithms.html>.
-/// Only valid for dates >= 1970-01-01 (all mati timestamps are `u64`).
 fn days_to_ymd(days: u64) -> (u32, u32, u32) {
-    // z is always >= 719468 for Unix-epoch inputs, so all divisions are
-    // positive and Rust's truncating integer division equals floor division.
     let z = days as i64 + 719_468;
     let era = z / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -371,25 +714,55 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     (y as u32, m as u32, d as u32)
 }
 
-// ── Stubs for future milestones ───────────────────────────────────────────────
+// ── Table helper functions ───────────────────────────────────────────────────
 
-pub async fn run_ls(_args: LsArgs) -> Result<()> {
-    Err(anyhow::anyhow!("mati ls not yet implemented (M-08-C/D/E)"))
+fn truncate(s: &str, max: usize) -> String {
+    let first_line = s.lines().next().unwrap_or(s);
+    if first_line.len() <= max {
+        first_line.to_string()
+    } else {
+        format!("{}...", &first_line[..max - 3])
+    }
 }
 
-pub async fn run_history(_args: HistoryArgs) -> Result<()> {
-    Err(anyhow::anyhow!("mati history not yet implemented (M-14-C)"))
+fn priority_weight(p: &Priority) -> f32 {
+    match p {
+        Priority::Low => 0.5,
+        Priority::Normal => 1.0,
+        Priority::High => 1.5,
+        Priority::Critical => 2.0,
+    }
 }
 
-pub async fn run_export(_args: ExportArgs) -> Result<()> {
-    Err(anyhow::anyhow!("mati export not yet implemented (M-08-M)"))
+fn priority_short(p: &Priority) -> &'static str {
+    match p {
+        Priority::Low => "Low",
+        Priority::Normal => "Norm",
+        Priority::High => "High",
+        Priority::Critical => "Crit",
+    }
 }
 
-pub async fn run_import(_args: ImportArgs) -> Result<()> {
-    Err(anyhow::anyhow!("mati import not yet implemented (M-08-N)"))
+fn score_comfy_color(v: f32) -> Color {
+    if v >= 0.6 {
+        Color::Green
+    } else if v >= 0.3 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
 }
 
-// ── Tests — Fix 6 ─────────────────────────────────────────────────────────────
+fn priority_comfy_color(p: &Priority) -> Color {
+    match p {
+        Priority::Critical => Color::Red,
+        Priority::High => Color::Yellow,
+        Priority::Normal => Color::White,
+        Priority::Low => Color::Grey,
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -414,13 +787,11 @@ mod tests {
 
     #[test]
     fn format_ts_known_date_2024_01_15() {
-        // 2024-01-15 00:00:00 UTC = 19737 * 86400
         assert_eq!(format_ts(19737 * 86400), "2024-01-15 00:00:00 UTC");
     }
 
     #[test]
     fn format_ts_hms_components() {
-        // 1970-01-01 01:02:03 UTC = 3600 + 120 + 3 = 3723
         assert_eq!(format_ts(3723), "1970-01-01 01:02:03 UTC");
     }
 
@@ -438,22 +809,16 @@ mod tests {
 
     #[test]
     fn days_to_ymd_leap_day_2024_02_29() {
-        // 2024 is a leap year: Jan(31) + 29 days into Feb = day 59 from Jan 1.
-        // Jan 1 2024 = day 19723; Feb 29 = 19723 + 59 = 19782.
         assert_eq!(days_to_ymd(19782), (2024, 2, 29));
     }
 
     #[test]
     fn days_to_ymd_post_feb_non_leap_2023_03_01() {
-        // 2023 is not a leap year. Mar 1 = Jan 1 + 31 + 28 = day 59 from Jan 1.
-        // Jan 1 2023 = day 19358; Mar 1 = 19358 + 59 = 19417.
         assert_eq!(days_to_ymd(19417), (2023, 3, 1));
     }
 
     #[test]
     fn days_to_ymd_year_boundary_dec_31() {
-        // 2023-12-31 = day before 2024-01-01.
-        // Jan 1 2024 = day 19723, so Dec 31 2023 = day 19722.
         assert_eq!(days_to_ymd(19722), (2023, 12, 31));
     }
 
@@ -464,10 +829,36 @@ mod tests {
 
     #[test]
     fn days_to_ymd_consistent_with_format_ts() {
-        // Cross-check: days_to_ymd and format_ts agree on 2024-01-15.
         let ts = 19737_u64 * 86400;
         let (y, mo, d) = days_to_ymd(ts / 86400);
         assert_eq!((y, mo, d), (2024, 1, 15));
         assert!(format_ts(ts).starts_with("2024-01-15"));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        assert_eq!(truncate("hello world this is long", 10), "hello w...");
+    }
+
+    #[test]
+    fn truncate_multiline() {
+        assert_eq!(truncate("first line\nsecond line", 40), "first line");
+    }
+
+    #[test]
+    fn format_date_zero() {
+        assert_eq!(format_date(0), "\u{2014}");
+    }
+
+    #[test]
+    fn format_date_known() {
+        assert_eq!(format_date(19737 * 86400), "2024-01-15");
     }
 }

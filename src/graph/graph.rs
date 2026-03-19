@@ -203,7 +203,9 @@ impl Graph {
     /// MCP tools need both Store reads and Graph traversal. This accessor
     /// avoids splitting ownership — the Graph owns the Store, and callers
     /// borrow it through this method.
-    pub fn store(&self) -> &Store { &self.store }
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
 
     /// Flush pending writes and close the underlying store.
     pub async fn close(self) -> Result<()> {
