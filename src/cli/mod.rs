@@ -2,6 +2,7 @@ pub mod colors;
 pub mod enrich;
 pub mod gaps;
 pub mod gotcha;
+pub mod hooks;
 pub mod init;
 pub mod show;
 pub mod stats;

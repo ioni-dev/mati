@@ -1,6 +1,16 @@
+use std::io::{self, BufRead, IsTerminal, Write as _};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mati_core::store::Store;
+use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
+use slugify::slugify;
+
+use mati_core::health::quality;
+use mati_core::store::{
+    Category, ConfidenceScore, QualityScore, QualityTier, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore, StalenessTier, Store,
+};
 
 mod cli;
 
@@ -61,6 +71,8 @@ enum Commands {
     Serve,
     // ── Internal hook commands (hidden from --help) ─────────────────────
     #[command(hide = true)]
+    Get { key: String },
+    #[command(hide = true)]
     LogMiss { key: String },
     #[command(hide = true)]
     LogHit { key: String },
@@ -95,18 +107,12 @@ async fn main() -> Result<()> {
         Commands::Ls(args) => cli::show::run_ls(args).await,
         Commands::History(args) => cli::show::run_history(args).await,
         Commands::Gotcha(args) => cli::gotcha::run(args).await,
-        Commands::QualityCheck => Err(anyhow::anyhow!(
-            "quality-check not yet implemented (M-08-J)"
-        )),
-        Commands::Improve { key } => Err(anyhow::anyhow!(
-            "improve {key} not yet implemented (M-08-K)"
-        )),
-        Commands::Note { text } => {
-            Err(anyhow::anyhow!("note not yet implemented (M-08-L): {text}"))
-        }
+        Commands::QualityCheck => run_quality_check().await,
+        Commands::Improve { key } => run_improve(&key).await,
+        Commands::Note { text } => run_note(&text).await,
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
-        Commands::Stale => Err(anyhow::anyhow!("stale not yet implemented (M-08-O)")),
+        Commands::Stale => run_stale().await,
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
             let store = Store::open(&cwd).await?;
@@ -118,11 +124,317 @@ async fn main() -> Result<()> {
             let cwd = std::env::current_dir()?;
             mati_core::mcp::serve(&cwd).await
         }
-        Commands::LogMiss { key: _ } => Ok(()),
-        Commands::LogHit { key: _ } => Ok(()),
-        Commands::LogComplianceMiss { key: _ } => Ok(()),
-        Commands::SessionCheckConsulted { key: _ } => Ok(()),
-        Commands::SessionFlush => Ok(()),
-        Commands::SessionHarvest => Ok(()),
+        Commands::Get { key } => cli::hooks::run_get(&key).await,
+        Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
+        Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,
+        Commands::LogComplianceMiss { key } => cli::hooks::run_log_compliance_miss(&key).await,
+        Commands::SessionCheckConsulted { key } => {
+            cli::hooks::run_session_check_consulted(&key).await
+        }
+        Commands::SessionFlush => cli::hooks::run_session_flush().await,
+        Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+    }
+}
+
+// ── M-08-L: mati note ────────────────────────────────────────────────────────
+
+async fn run_note(text: &str) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let slug = slugify!(text, max_length = 30);
+    let key = format!("dev_note:{slug}-{now}");
+
+    let device_id = uuid::Uuid::new_v4();
+    let mut record = Record {
+        key: key.clone(),
+        value: text.to_string(),
+        category: Category::DevNote,
+        priority: mati_core::store::Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id,
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::DeveloperManual,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+        gap_analysis_score: 0.0,
+    };
+
+    // Run quality analyzer (display score, but no gate for notes)
+    let score = quality::analyze(&record);
+    record.quality = score.clone();
+
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+    store.put(&key, &record).await?;
+
+    println!("Created {key}  (quality: {:.2})", score.value);
+    Ok(())
+}
+
+// ── M-08-J: mati quality-check ──────────────────────────────────────────────
+
+async fn run_quality_check() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+
+    let mut all: Vec<Record> = Vec::new();
+    for prefix in &["gotcha:", "decision:", "dev_note:"] {
+        all.extend(store.scan_prefix(prefix).await?);
+    }
+
+    if all.is_empty() {
+        println!("No knowledge records found. Run `mati init` first.");
+        return Ok(());
+    }
+
+    // Re-analyze quality for each record
+    for r in &mut all {
+        let score = quality::analyze(r);
+        r.quality = score;
+    }
+
+    // Group by tier
+    let tiers = [
+        QualityTier::Suppressed,
+        QualityTier::Poor,
+        QualityTier::Acceptable,
+        QualityTier::Good,
+        QualityTier::Excellent,
+    ];
+
+    for tier in &tiers {
+        let tier_records: Vec<&Record> = all
+            .iter()
+            .filter(|r| r.quality.tier == *tier)
+            .collect();
+
+        if tier_records.is_empty() {
+            continue;
+        }
+
+        let tier_label = match tier {
+            QualityTier::Suppressed => "Suppressed (< 0.2)",
+            QualityTier::Poor => "Poor (0.2 – 0.4)",
+            QualityTier::Acceptable => "Acceptable (0.4 – 0.7)",
+            QualityTier::Good => "Good (0.7 – 0.9)",
+            QualityTier::Excellent => "Excellent (>= 0.9)",
+        };
+
+        println!("\n{tier_label}  ({} records)", tier_records.len());
+
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL_CONDENSED)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_header(vec![
+                Cell::new("Key"),
+                Cell::new("Score"),
+                Cell::new("Signals"),
+            ]);
+
+        for r in &tier_records {
+            let sigs: Vec<&str> = r
+                .quality
+                .signals
+                .iter()
+                .map(|s| cli::show::signal_label(s))
+                .collect();
+            table.add_row(vec![
+                Cell::new(&r.key),
+                Cell::new(format!("{:.2}", r.quality.value)),
+                Cell::new(sigs.join(", ")),
+            ]);
+        }
+        println!("{table}");
+
+        // Show improvement hints for Suppressed/Poor
+        if *tier == QualityTier::Suppressed || *tier == QualityTier::Poor {
+            if let Some(first) = tier_records.first() {
+                let hints = quality::generate_improvement_hints(&first.quality);
+                if !hints.is_empty() {
+                    println!("  Hints:");
+                    for hint in hints {
+                        println!("    - {hint}");
+                    }
+                }
+            }
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+// ── M-08-K: mati improve ────────────────────────────────────────────────────
+
+async fn run_improve(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+    let use_color = io::stderr().is_terminal();
+
+    let mut record = match store.get(key).await? {
+        Some(r) => r,
+        None => anyhow::bail!("no record found for key '{key}'"),
+    };
+
+    // Display current state
+    let score = quality::analyze(&record);
+    println!("Current quality: {:.2} ({:?})", score.value, score.tier);
+    println!("Current value:\n  {}\n", record.value);
+
+    let hints = quality::generate_improvement_hints(&score);
+    if !hints.is_empty() {
+        println!("Improvement hints:");
+        for hint in &hints {
+            println!("  - {hint}");
+        }
+        println!();
+    }
+
+    // Read new value from stdin
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    eprint_prompt("New value (empty to keep current): ", use_color);
+    let new_value = read_line(&mut lines)?;
+
+    if !new_value.is_empty() {
+        record.value = new_value;
+    }
+
+    // Re-analyze
+    let new_score = quality::analyze(&record);
+
+    // Quality gate
+    if quality::below_quality_gate(&new_score) {
+        quality::print_quality_gate_error(&new_score, use_color);
+        anyhow::bail!(
+            "record rejected by quality gate (score {:.2})",
+            new_score.value
+        );
+    }
+
+    // Quality caveat
+    if new_score.value < 0.4 {
+        quality::print_quality_caveat(&new_score, use_color);
+    }
+
+    // Update record
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    record.quality = new_score.clone();
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    store.put(key, &record).await?;
+
+    println!(
+        "Updated {key}  (quality: {:.2} -> {:.2})",
+        score.value, new_score.value
+    );
+    Ok(())
+}
+
+// ── M-08-O: mati stale ──────────────────────────────────────────────────────
+
+async fn run_stale() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+
+    let mut stale: Vec<Record> = Vec::new();
+    for prefix in &["gotcha:", "decision:", "file:", "dev_note:"] {
+        let records = store.scan_prefix(prefix).await?;
+        for r in records {
+            match r.staleness.tier {
+                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
+                    stale.push(r);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if stale.is_empty() {
+        println!("No stale records found.");
+        return Ok(());
+    }
+
+    // Sort by staleness descending
+    stale.sort_by(|a, b| {
+        b.staleness
+            .value
+            .partial_cmp(&a.staleness.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Key"),
+            Cell::new("Staleness"),
+            Cell::new("Tier"),
+            Cell::new("Updated"),
+        ]);
+
+    for r in &stale {
+        let tier_label = match r.staleness.tier {
+            StalenessTier::Stale => "Stale",
+            StalenessTier::Liability => "Liability",
+            StalenessTier::Tombstone => "Tombstone",
+            _ => "?",
+        };
+        table.add_row(vec![
+            Cell::new(&r.key),
+            Cell::new(format!("{:.2}", r.staleness.value)),
+            Cell::new(tier_label),
+            Cell::new(cli::show::format_date(r.updated_at)),
+        ]);
+    }
+
+    println!("{table}");
+    println!("  {} stale records", stale.len());
+    Ok(())
+}
+
+// ── Shared helpers ───────────────────────────────────────────────────────────
+
+fn eprint_prompt(msg: &str, use_color: bool) {
+    if use_color {
+        eprint!(
+            "{}{}{}",
+            cli::colors::BLUE,
+            msg,
+            cli::colors::RESET
+        );
+    } else {
+        eprint!("{msg}");
+    }
+    let _ = io::stderr().flush();
+}
+
+fn read_line(lines: &mut io::Lines<io::StdinLock<'_>>) -> Result<String> {
+    match lines.next() {
+        Some(Ok(line)) => Ok(line.trim().to_string()),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(String::new()),
     }
 }
