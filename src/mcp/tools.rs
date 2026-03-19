@@ -213,6 +213,8 @@ pub async fn assemble_context_packet(
     let mut file_records = Vec::new();
     let mut context_gotcha_keys = HashSet::new();
     let mut decision_keys = HashSet::new();
+    // Collect nudge candidates during this pass to avoid N+1 re-lookups later.
+    let mut unconfirmed_candidates = Vec::new();
 
     for file_path in context_files {
         let file_key = if file_path.starts_with("file:") {
@@ -220,13 +222,6 @@ pub async fn assemble_context_packet(
         } else {
             format!("file:{file_path}")
         };
-
-        // Get file record
-        if let Ok(Some(record)) = store.get(&file_key).await {
-            if let Ok(fr) = serde_json::from_str::<FileRecord>(&record.value) {
-                file_records.push(fr);
-            }
-        }
 
         // 1-hop: direct gotchas
         for key in graph.neighbors(&file_key, &EdgeKind::HasGotcha) {
@@ -243,6 +238,20 @@ pub async fn assemble_context_packet(
         // Decisions via AffectedBy
         for key in graph.neighbors(&file_key, &EdgeKind::AffectedBy) {
             decision_keys.insert(key);
+        }
+
+        // Get file record (after graph traversal so file_key can be moved)
+        if let Ok(Some(record)) = store.get(&file_key).await {
+            if let Ok(fr) = serde_json::from_str::<FileRecord>(&record.value) {
+                // Nudge detection: hot file (access_count >= 3) with no gotchas
+                let is_nudge_candidate =
+                    record.access_count >= 3 && fr.gotcha_keys.is_empty();
+                file_records.push(fr);
+                if is_nudge_candidate {
+                    unconfirmed_candidates.push(file_key);
+                    continue;
+                }
+            }
         }
     }
 
@@ -341,6 +350,31 @@ pub async fn assemble_context_packet(
         }
     }
 
+    // M-12-E: Passive nudge — detect hot files with no gotchas.
+    // NOTE: This is a deliberate exception to P2 ("inject nothing by default").
+    // Nudges are advisory suggestions, not knowledge injection, and are only
+    // emitted when token budget allows after all knowledge sections.
+    // unconfirmed_candidates were collected during the context-file traversal
+    // above (step 3), so no additional store lookups are needed here.
+    if !unconfirmed_candidates.is_empty() {
+        let mut nudge_section = String::from("## Suggested Actions\n");
+        for key in &unconfirmed_candidates {
+            let path = key.strip_prefix("file:").unwrap_or(key);
+            let line = format!(
+                "- `{path}` is read frequently but has no recorded gotchas. The developer may want to run `mati gotcha add {path}`.\n"
+            );
+            let tokens = estimate_tokens(&line);
+            if used_tokens + tokens > available_tokens {
+                break;
+            }
+            nudge_section.push_str(&line);
+            used_tokens += tokens;
+        }
+        if nudge_section.len() > "## Suggested Actions\n".len() {
+            sections.push(nudge_section);
+        }
+    }
+
     let mut injection_string = sections.join("\n");
     injection_string.push_str(VECTOR_B);
 
@@ -354,7 +388,7 @@ pub async fn assemble_context_packet(
         recent_session: None,
         token_estimate,
         stale_warnings: vec![],
-        unconfirmed_candidates: vec![],
+        unconfirmed_candidates,
         knowledge_gaps: vec![],
         compliance_rate: None,
         injection_string,
@@ -656,6 +690,151 @@ mod tests {
             packet.injection_string.contains("gotcha:important")
                 || packet.critical_gotchas.iter().any(|g| g.key == "gotcha:important"),
             "graph-connected gotcha must appear in context packet"
+        );
+    }
+
+    // ── M-12-E: nudge detection ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn nudge_shown_for_hot_file_with_no_gotchas() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/hot.rs".to_string(),
+            purpose: "Hot module".to_string(),
+            entry_points: vec!["run".to_string()],
+            imports: vec![],
+            gotcha_keys: vec![], // no gotchas
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 10,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 100,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/hot.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.access_count = 5; // >= 3 threshold
+        store.put("file:src/hot.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/hot.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.unconfirmed_candidates.contains(&"file:src/hot.rs".to_string()),
+            "hot file with no gotchas should be in unconfirmed_candidates"
+        );
+        assert!(
+            packet.injection_string.contains("Suggested Actions"),
+            "nudge section should appear in injection string"
+        );
+        assert!(
+            packet.injection_string.contains("mati gotcha add"),
+            "nudge should suggest gotcha add command"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_nudge_for_file_with_low_access_count() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/cold.rs".to_string(),
+            purpose: "Cold module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/cold.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.access_count = 1; // < 3 threshold
+        store.put("file:src/cold.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/cold.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.unconfirmed_candidates.is_empty(),
+            "low-access file should not trigger nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_nudge_for_file_with_gotchas() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/covered.rs".to_string(),
+            purpose: "Covered module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec!["gotcha:existing".to_string()],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 10,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 100,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/covered.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.access_count = 10;
+        store.put("file:src/covered.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/covered.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.unconfirmed_candidates.is_empty(),
+            "file with gotchas should not trigger nudge"
         );
     }
 }

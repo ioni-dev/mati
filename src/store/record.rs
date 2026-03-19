@@ -245,6 +245,12 @@ pub enum StalenessSignal {
     },
     /// Another decision or gotcha this record depends on was modified.
     CascadeFromDecision(String),
+    /// TODOs were added, removed, or changed.
+    TodosChanged,
+    /// Net change in `unsafe` block count (positive = added, negative = removed).
+    UnsafeCountChanged(i32),
+    /// Net change in `.unwrap()` call count (positive = added, negative = removed).
+    UnwrapCountChanged(i32),
 }
 
 /// Replaces the flat `stale: bool` with a scored, tiered system.
@@ -286,6 +292,32 @@ impl StalenessScore {
             signals: vec![],
             computed_at: 0,
             last_record_sha: String::new(),
+        }
+    }
+
+    /// Derive `StalenessTier` from a raw score value (half-open intervals).
+    ///
+    /// ```text
+    /// [0.0, 0.2) → Fresh
+    /// [0.2, 0.4) → Aging
+    /// [0.4, 0.7) → Stale
+    /// [0.7, 0.9) → Liability
+    /// [0.9, 1.0] → Tombstone
+    /// ```
+    pub fn tier_from_value(value: f32) -> StalenessTier {
+        if !value.is_finite() {
+            return StalenessTier::Stale;
+        }
+        if value < 0.2 {
+            StalenessTier::Fresh
+        } else if value < 0.4 {
+            StalenessTier::Aging
+        } else if value < 0.7 {
+            StalenessTier::Stale
+        } else if value < 0.9 {
+            StalenessTier::Liability
+        } else {
+            StalenessTier::Tombstone
         }
     }
 }

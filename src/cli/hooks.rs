@@ -243,6 +243,13 @@ pub async fn run_session_harvest() -> Result<()> {
 async fn session_harvest_impl(store: &Store) -> Result<()> {
     let now = now_secs();
 
+    // M-12-D: promote gotcha candidates before archiving
+    match promote_gotcha_candidates(store).await {
+        Ok(n) if n > 0 => tracing::info!(promoted = n, "gotcha candidates auto-promoted"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "gotcha promotion failed"),
+    }
+
     // Read session:current (written by session-flush)
     let session_value = match store.get("session:current").await? {
         Some(r) => r.value,
@@ -281,6 +288,51 @@ async fn session_harvest_impl(store: &Store) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── M-12-D: Gotcha auto-promotion ───────────────────────────────────────
+
+/// Minimum access count before an unconfirmed gotcha is auto-promoted.
+const GOTCHA_PROMOTION_ACCESS_THRESHOLD: u32 = 3;
+
+/// Promote gotcha candidates with sufficient access to confirmed status.
+///
+/// Scans `gotcha:*` records. For each with `confirmed == false` AND
+/// `access_count >= 3`: sets `confirmed = true`, bumps `confirmation_count`.
+/// Returns the number of promoted records.
+async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
+    let gotchas = store.scan_prefix("gotcha:").await?;
+    let now = now_secs();
+    let mut promoted = 0u32;
+
+    for mut record in gotchas {
+        if record.access_count < GOTCHA_PROMOTION_ACCESS_THRESHOLD {
+            continue;
+        }
+
+        let mut gotcha: GotchaRecord = match serde_json::from_str(&record.value) {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        if gotcha.confirmed {
+            continue;
+        }
+
+        gotcha.confirmed = true;
+        record.value = serde_json::to_string(&gotcha)?;
+        // NOTE: confirmation_count includes auto-promotions. Downstream consumers
+        // should not assume this counter reflects only human confirmations.
+        record.confidence.confirmation_count += 1;
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+
+        store.put(&record.key, &record).await?;
+        promoted += 1;
+    }
+
+    Ok(promoted)
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -984,6 +1036,75 @@ mod tests {
         let comp = store.get(&compliance_key).await.unwrap().unwrap();
         let comp_agg: DailyAgg = serde_json::from_str(&comp.value).unwrap();
         assert_eq!(comp_agg.count, 1);
+
+        store.close().await.unwrap();
+    }
+
+    // ── promote_gotcha_candidates ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn promote_gotcha_candidates_promotes_when_access_count_sufficient() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        // Unconfirmed gotcha with access_count >= 3
+        let mut record = make_gotcha_record("gotcha:candidate", false);
+        record.access_count = 5;
+        store.put("gotcha:candidate", &record).await.unwrap();
+
+        let promoted = promote_gotcha_candidates(&store).await.unwrap();
+        assert_eq!(promoted, 1);
+
+        let updated = store.get("gotcha:candidate").await.unwrap().unwrap();
+        let gotcha: GotchaRecord = serde_json::from_str(&updated.value).unwrap();
+        assert!(gotcha.confirmed);
+        assert_eq!(updated.confidence.confirmation_count, 1);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promote_gotcha_candidates_skips_already_confirmed() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let mut record = make_gotcha_record("gotcha:already-confirmed", true);
+        record.access_count = 10;
+        store.put("gotcha:already-confirmed", &record).await.unwrap();
+
+        let promoted = promote_gotcha_candidates(&store).await.unwrap();
+        assert_eq!(promoted, 0);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promote_gotcha_candidates_skips_low_access_count() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let mut record = make_gotcha_record("gotcha:low-access", false);
+        record.access_count = 2;
+        store.put("gotcha:low-access", &record).await.unwrap();
+
+        let promoted = promote_gotcha_candidates(&store).await.unwrap();
+        assert_eq!(promoted, 0);
+
+        // Should still be unconfirmed
+        let unchanged = store.get("gotcha:low-access").await.unwrap().unwrap();
+        let gotcha: GotchaRecord = serde_json::from_str(&unchanged.value).unwrap();
+        assert!(!gotcha.confirmed);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promote_gotcha_candidates_handles_empty_store() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let promoted = promote_gotcha_candidates(&store).await.unwrap();
+        assert_eq!(promoted, 0);
 
         store.close().await.unwrap();
     }
