@@ -14,6 +14,7 @@ use rmcp::tool_router;
 
 use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
+use crate::health::confidence;
 use crate::store::record::{
     ContextPacket, FileRecord, GotchaRecord, Priority, QualityTier, Record,
 };
@@ -77,9 +78,17 @@ impl MatiServer {
         let graph = self.graph.read().await;
         let store = graph.store();
         match store.get(&params.key).await {
-            Ok(Some(record)) => serde_json::to_string_pretty(&record).unwrap_or_else(|e| {
-                format!("{{\"error\": \"serialization failed: {e}\"}}")
-            }),
+            Ok(Some(mut record)) => {
+                let new_confidence = confidence::recompute(&record);
+                if (new_confidence.value - record.confidence.value).abs() > 1e-4 {
+                    record.confidence = new_confidence;
+                    // Best-effort write-back; don't fail the read on write error.
+                    let _ = store.put(&params.key, &record).await;
+                }
+                serde_json::to_string_pretty(&record).unwrap_or_else(|e| {
+                    format!("{{\"error\": \"serialization failed: {e}\"}}")
+                })
+            }
             Ok(None) => "null".to_string(),
             Err(e) => format!("{{\"error\": \"{e}\"}}"),
         }
