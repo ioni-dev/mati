@@ -120,9 +120,10 @@ async fn main() -> Result<()> {
             println!("mati ok  {latency_us}µs");
             Ok(())
         }
-        Commands::Serve => Err(anyhow::anyhow!(
-            "MCP stdio server not yet implemented (M-07)"
-        )),
+        Commands::Serve => {
+            let cwd = std::env::current_dir()?;
+            mati_core::mcp::serve(&cwd).await
+        }
         Commands::Get { key } => cli::hooks::run_get(&key).await,
         Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
         Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,

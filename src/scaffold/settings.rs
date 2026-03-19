@@ -12,7 +12,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-/// Hook registration for `.claude/settings.json` (from ARCHITECTURE.md §10).
+/// Hook and MCP server registration for `.claude/settings.json`.
+///
+/// Contains two top-level keys:
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / SessionEnd (ARCHITECTURE.md §10)
+/// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 const SETTINGS_JSON: &str = r#"{
   "hooks": {
     "PreToolUse": [
@@ -77,6 +81,12 @@ const SETTINGS_JSON: &str = r#"{
         ]
       }
     ]
+  },
+  "mcpServers": {
+    "mati": {
+      "command": "mati",
+      "args": ["serve"]
+    }
   }
 }
 "#;
@@ -146,13 +156,13 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
     })
 }
 
-/// Merge mati's hook registration into an existing settings.json.
+/// Merge mati's hook and MCP server registration into an existing settings.json.
 ///
 /// If the file doesn't exist, writes the full settings. If it exists,
-/// parses it, replaces only the `hooks` key, and writes back — preserving
-/// all other user settings.
+/// parses it, replaces only the `hooks` and `mcpServers` keys, and writes
+/// back — preserving all other user settings.
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
-    let mati_hooks: Value = serde_json::from_str(SETTINGS_JSON)?;
+    let mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -160,11 +170,21 @@ fn merge_hooks_into_settings(path: &Path) -> Result<()> {
             .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
 
         if let Value::Object(ref mut map) = existing {
-            map.insert("hooks".to_string(), mati_hooks["hooks"].clone());
+            map.insert("hooks".to_string(), mati_settings["hooks"].clone());
+            // Merge mcpServers: add "mati" entry without clobbering other servers.
+            let mati_server = mati_settings["mcpServers"]["mati"].clone();
+            if let Some(Value::Object(ref mut servers)) = map.get_mut("mcpServers") {
+                servers.insert("mati".to_string(), mati_server);
+            } else {
+                map.insert(
+                    "mcpServers".to_string(),
+                    mati_settings["mcpServers"].clone(),
+                );
+            }
         }
         existing
     } else {
-        mati_hooks
+        mati_settings
     };
 
     let output = serde_json::to_string_pretty(&merged)?;
@@ -244,6 +264,9 @@ mod tests {
         assert!(parsed["hooks"]["PostToolUse"].is_array());
         assert!(parsed["hooks"]["PreCompact"].is_array());
         assert!(parsed["hooks"]["SessionEnd"].is_array());
+        // MCP server registered.
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
+        assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
     }
 
     #[test]
@@ -266,6 +289,30 @@ mod tests {
         assert_eq!(parsed["env"]["DEBUG"], "true");
         // Hooks added.
         assert!(parsed["hooks"]["PreToolUse"].is_array());
+        // MCP server added.
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
+    }
+
+    #[test]
+    fn merges_mcp_servers_without_clobbering_existing_servers() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        // Pre-existing settings with another MCP server.
+        let existing = r#"{"mcpServers": {"other-tool": {"command": "other", "args": ["run"]}}}"#;
+        std::fs::write(claude_dir.join("settings.json"), existing).unwrap();
+
+        install_hooks(dir.path()).unwrap();
+
+        let settings = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+
+        // Existing server preserved.
+        assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
+        // mati server added alongside.
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
+        assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
     }
 
     #[test]

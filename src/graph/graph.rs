@@ -198,8 +198,11 @@ impl Graph {
         self.traverse_incoming(node, kind, 1)
     }
 
-    /// Borrow the underlying store — used by CLI commands that need both
-    /// graph traversal and record reads in the same operation.
+    /// Borrow the underlying store for read-only operations.
+    ///
+    /// MCP tools need both Store reads and Graph traversal. This accessor
+    /// avoids splitting ownership — the Graph owns the Store, and callers
+    /// borrow it through this method.
     pub fn store(&self) -> &Store {
         &self.store
     }
