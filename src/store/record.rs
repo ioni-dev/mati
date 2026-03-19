@@ -306,7 +306,7 @@ impl StalenessScore {
 ///   StaticAnalysis  → 0.10
 ///
 /// confidence = base_score
-///   × log2(confirmation_count + 1)
+///   × log2(confirmation_count + 2)
 ///   × min(contributor_count, 3) / 3
 ///   × recency_weight(last_accessed)   90-day half-life
 ///   × ref_boost                       1.5× if ref_url set
