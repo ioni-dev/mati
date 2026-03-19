@@ -4,6 +4,7 @@ pub mod gaps;
 pub mod gotcha;
 pub mod hooks;
 pub mod init;
+pub mod reparse;
 pub mod show;
 pub mod stats;
 pub mod status;

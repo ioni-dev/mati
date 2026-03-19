@@ -84,6 +84,11 @@ enum Commands {
     SessionFlush,
     #[command(hide = true)]
     SessionHarvest,
+    #[command(hide = true)]
+    Reparse {
+        /// Repo-relative file path to re-parse
+        path: String,
+    },
 }
 
 #[tokio::main]
@@ -133,6 +138,7 @@ async fn main() -> Result<()> {
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+        Commands::Reparse { path } => cli::reparse::run(&path).await,
     }
 }
 
