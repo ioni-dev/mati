@@ -41,6 +41,26 @@ pub async fn run(args: InitArgs) -> Result<()> {
     };
     let root = std::fs::canonicalize(&root)?;
 
+    // Stop daemon if running — SurrealKV requires exclusive store access.
+    // The daemon must release its lock before init can open the store.
+    {
+        use crate::cli::daemon::mati_root_for;
+        if let Ok(mati_root) = mati_root_for(&root) {
+            if mati_root.join("mati.sock").exists() {
+                print!("  Stopping daemon for exclusive store access...");
+                let _ = crate::cli::daemon::run_daemon_stop().await;
+                // Wait up to 3s for the socket to disappear (daemon cleanup).
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while mati_root.join("mati.sock").exists()
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                println!(" done");
+            }
+        }
+    }
+
     let slug = derive_slug(&root);
     let project_name = root
         .file_name()

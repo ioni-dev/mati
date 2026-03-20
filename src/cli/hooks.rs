@@ -17,6 +17,7 @@ use mati_core::store::{
     Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
     RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, Store,
 };
+use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
 
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
 
@@ -30,6 +31,26 @@ struct GetOutput {
 
 pub async fn run_get(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "get", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(resp) => {
+            let json = match resp.get("data") {
+                Some(d) if d.is_null() => "null".to_string(),
+                Some(d) => d.to_string(),
+                None => "null".to_string(),
+            };
+            println!("{json}");
+            return Ok(());
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::Unresponsive => {
+            tracing::warn!("mati get: daemon unresponsive — degrading gracefully");
+            println!("null");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     let output = get_json(&store, key).await?;
     println!("{output}");
@@ -133,6 +154,17 @@ const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 
 pub async fn run_log_miss(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_miss", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::Unresponsive => {
+            tracing::warn!("log_miss: daemon unresponsive — skipping (non-fatal)");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     log_miss_impl(&store, key).await?;
     store.close().await?;
@@ -148,6 +180,17 @@ async fn log_miss_impl(store: &Store, key: &str) -> Result<()> {
 
 pub async fn run_log_hit(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_hit", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::Unresponsive => {
+            tracing::warn!("log_hit: daemon unresponsive — skipping (non-fatal)");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     log_hit_impl(&store, key).await?;
     store.close().await?;
@@ -183,20 +226,28 @@ async fn log_hit_impl(store: &Store, key: &str) -> Result<()> {
 /// Called by post-edit.sh hook to avoid two separate process spawns.
 pub async fn run_edit_hook(path: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "edit_hook", serde_json::json!({ "path": path })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::Unresponsive => {
+            // Daemon holds the store lock — cannot fall back to Store::open.
+            // Degrade gracefully: skip this hook invocation (P9).
+            tracing::warn!(path, "edit_hook: daemon unresponsive — skipping (non-fatal)");
+            return Ok(());
+        }
+    }
+
+    // Daemon not running — direct store path.
     let store = Store::open(&cwd).await?;
-
     let file_key = format!("file:{path}");
-
-    // log-hit: best-effort
     if let Err(e) = log_hit_impl(&store, &file_key).await {
         tracing::warn!(path, "edit-hook log-hit failed: {e}");
     }
-
-    // reparse: best-effort
     if let Err(e) = crate::cli::reparse::reparse_impl(&store, &cwd, path).await {
         tracing::warn!(path, "edit-hook reparse failed: {e}");
     }
-
     store.close().await?;
     Ok(())
 }
@@ -205,6 +256,17 @@ pub async fn run_edit_hook(path: &str) -> Result<()> {
 
 pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_compliance_miss", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::Unresponsive => {
+            tracing::warn!("log_compliance_miss: daemon unresponsive — skipping (non-fatal)");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     log_compliance_miss_impl(&store, key).await?;
     store.close().await?;
@@ -220,6 +282,25 @@ async fn log_compliance_miss_impl(store: &Store, key: &str) -> Result<()> {
 
 pub async fn run_session_check_consulted(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "session_check_consulted", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(resp) => {
+            let consulted = resp
+                .get("data")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false);
+            println!("{consulted}");
+            return Ok(());
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::Unresponsive => {
+            tracing::warn!("session_check_consulted: daemon unresponsive — returning false");
+            println!("false");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     let result = check_consulted_impl(&store, key).await?;
     println!("{result}");
