@@ -15,6 +15,6 @@ pub use durability::Durability;
 pub use record::{
     Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType, GotchaRecord,
     KnowledgeGap, OnboardingScore, Priority, QualityScore, QualitySignal, QualityTier, Record,
-    RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, StalenessTier,
-    TodoComment, TodoKind, TombstoneReason,
+    RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload,
+    StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind, TombstoneReason,
 };

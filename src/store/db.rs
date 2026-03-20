@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use surrealkv::{
-    Durability as SkvDurability, LSMIterator, Mode, Options, Transaction, Tree, TreeBuilder,
-    VLogChecksumLevel,
+    Durability as SkvDurability, HistoryOptions, LSMIterator, Mode, Options, Transaction, Tree,
+    TreeBuilder, VLogChecksumLevel,
 };
 
 use super::record::Record;
@@ -35,7 +35,7 @@ const SESSIONS_RETENTION_NS: u64 = 90 * 24 * 60 * 60 * 1_000_000_000u64;
 /// during normal `put`/`put_batch` calls. Must stay in sync with
 /// [`Durability::for_key`]'s Immediate set.
 const KNOWLEDGE_NAMESPACES: &[&str] = &[
-    "gotcha:", "decision:", "file:", "stage:", "dev_note:",
+    "gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:",
 ];
 
 /// Key namespaces stored in the `sessions` tree that contain [`Record`] structs.
@@ -387,6 +387,81 @@ impl Store {
     }
 
     // -------------------------------------------------------------------------
+    // History (M-14)
+    // -------------------------------------------------------------------------
+
+    /// Return version history for a single key, newest first.
+    ///
+    /// Includes tombstones (deletions). Uses the tight upper bound `key + \0`
+    /// so adjacent keys never spill into the result set.
+    ///
+    /// `limit` caps the number of entries returned; `0` means unlimited.
+    pub fn history(&self, key: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
+        anyhow::ensure!(!key.is_empty(), "history key must not be empty");
+        let tree = self.tree_for(key);
+        let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+
+        let mut opts = HistoryOptions::new().with_tombstones(true);
+        if limit > 0 {
+            opts = opts.with_limit(limit);
+        }
+
+        history_impl(&txn, key, &opts)
+    }
+
+    /// Return version history for a single key since `since_ts` (seconds),
+    /// newest first.
+    ///
+    /// Timestamps are converted to nanoseconds for the SurrealKV range filter.
+    pub fn history_since(
+        &self,
+        key: &str,
+        since_ts: u64,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
+        anyhow::ensure!(!key.is_empty(), "history key must not be empty");
+        let tree = self.tree_for(key);
+        let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+
+        let since_ns = since_ts.saturating_mul(1_000_000_000);
+        let mut opts = HistoryOptions::new()
+            .with_tombstones(true)
+            .with_ts_range(since_ns, u64::MAX);
+        if limit > 0 {
+            opts = opts.with_limit(limit);
+        }
+
+        history_impl(&txn, key, &opts)
+    }
+
+    /// Return all records updated since `since_ts` (seconds), newest first.
+    ///
+    /// Scans every knowledge namespace (including `dep:`) and returns records
+    /// whose `updated_at >= since_ts`. Results are sorted by `updated_at`
+    /// descending with secondary sort by key for deterministic ordering.
+    pub async fn records_since(&self, since_ts: u64, limit: usize) -> Result<Vec<Record>> {
+        let mut results = Vec::new();
+        for ns in KNOWLEDGE_NAMESPACES {
+            let records = self.scan_prefix(ns).await?;
+            for r in records {
+                if r.updated_at >= since_ts {
+                    results.push(r);
+                }
+            }
+        }
+        // Newest first, secondary sort by key for determinism
+        results.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        if limit > 0 && results.len() > limit {
+            results.truncate(limit);
+        }
+        Ok(results)
+    }
+
+    // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
 
@@ -539,6 +614,76 @@ fn prefix_end(prefix: &str) -> String {
     }
     // All bytes were 0xff — no upper bound needed; use a sentinel
     "\u{ffff}".to_owned()
+}
+
+/// A single versioned entry from the SurrealKV history iterator.
+///
+/// Timestamps come from SurrealKV's internal clock (nanoseconds since epoch).
+/// Both seconds and nanoseconds are exposed for callers that need either
+/// precision level.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    /// Timestamp in whole seconds (nanosecond timestamp / 1_000_000_000).
+    pub timestamp_secs: u64,
+    /// Raw nanosecond timestamp from SurrealKV.
+    pub timestamp_ns: u64,
+    /// Deserialized record, `None` for tombstones or corrupt values.
+    pub record: Option<Record>,
+    /// `true` when this version represents a deletion.
+    pub is_tombstone: bool,
+}
+
+/// Shared synchronous implementation for key history queries.
+///
+/// Iterates all versions of `key` using `history_with_options` with the tight
+/// upper bound `key + \0` (not `prefix_end`) to guarantee no adjacent key
+/// spills. Returns entries sorted newest first.
+fn history_impl(txn: &Transaction, key: &str, opts: &HistoryOptions) -> Result<Vec<HistoryEntry>> {
+    // Upper bound: key + NUL byte — tighter than prefix_end which increments
+    // the last byte. This ensures only exact-key versions are returned.
+    let mut upper = key.as_bytes().to_vec();
+    upper.push(0x00);
+
+    let mut cursor = txn.history_with_options(
+        key.as_bytes(),
+        upper.as_slice(),
+        opts,
+    )?;
+
+    let mut entries = Vec::new();
+    while cursor.next()? {
+        let key_ref = cursor.key();
+
+        // Guard: only process entries whose user_key matches exactly
+        if key_ref.user_key() != key.as_bytes() {
+            continue;
+        }
+
+        let is_tombstone = key_ref.is_tombstone();
+        let ts_ns = key_ref.timestamp();
+        let ts_secs = ts_ns / 1_000_000_000;
+
+        let record = if is_tombstone {
+            None
+        } else {
+            match cursor.value() {
+                Ok(bytes) => serde_json::from_slice::<Record>(&bytes).ok(),
+                Err(_) => None,
+            }
+        };
+
+        entries.push(HistoryEntry {
+            timestamp_secs: ts_secs,
+            timestamp_ns: ts_ns,
+            record,
+            is_tombstone,
+        });
+    }
+
+    // Newest first — SurrealKV history iterator order is not guaranteed to be
+    // reverse-chronological, so sort explicitly.
+    entries.sort_by(|a, b| b.timestamp_ns.cmp(&a.timestamp_ns));
+    Ok(entries)
 }
 
 /// Current time in microseconds since UNIX epoch.
@@ -1836,6 +1981,217 @@ mod tests {
     async fn open_healthy_index_does_not_set_rebuild_flag() {
         let (store, _dir) = temp_store();
         assert!(!store.index_needs_rebuild());
+    }
+
+    // ─── history (M-14) ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn history_empty_key_returns_error() {
+        let (store, _dir) = temp_store();
+        let result = store.history("", 0);
+        assert!(result.is_err(), "empty key must be rejected");
+    }
+
+    #[tokio::test]
+    async fn history_single_version() {
+        let (store, _dir) = temp_store();
+        store.put("gotcha:single", &make_record("gotcha:single")).await.unwrap();
+
+        let entries = store.history("gotcha:single", 0).unwrap();
+        assert!(!entries.is_empty(), "must return at least one version");
+        assert!(!entries[0].is_tombstone);
+        assert!(entries[0].record.is_some());
+        assert_eq!(entries[0].record.as_ref().unwrap().key, "gotcha:single");
+    }
+
+    #[tokio::test]
+    async fn history_multiple_versions_newest_first() {
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:multi");
+        r.value = "v1".to_string();
+        store.put("gotcha:multi", &r).await.unwrap();
+        r.value = "v2".to_string();
+        r.version.logical_clock = 2;
+        store.put("gotcha:multi", &r).await.unwrap();
+        r.value = "v3".to_string();
+        r.version.logical_clock = 3;
+        store.put("gotcha:multi", &r).await.unwrap();
+
+        let entries = store.history("gotcha:multi", 0).unwrap();
+        assert!(entries.len() >= 3, "expected >=3 versions, got {}", entries.len());
+
+        // Newest first: timestamps must be non-increasing
+        for pair in entries.windows(2) {
+            assert!(
+                pair[0].timestamp_ns >= pair[1].timestamp_ns,
+                "history must be newest-first: {} >= {}",
+                pair[0].timestamp_ns,
+                pair[1].timestamp_ns,
+            );
+        }
+
+        // Newest entry should have the latest value
+        let newest = entries[0].record.as_ref().unwrap();
+        assert_eq!(newest.value, "v3");
+    }
+
+    #[tokio::test]
+    async fn history_includes_tombstones() {
+        let (store, _dir) = temp_store();
+        store.put("gotcha:tomb", &make_record("gotcha:tomb")).await.unwrap();
+
+        // Use soft_delete (not hard delete) so SurrealKV retains the tombstone
+        // marker in the version history. Store::delete is a hard delete that
+        // erases all versions completely — the history API surfaces soft-delete
+        // tombstones from lifecycle transitions.
+        {
+            let mut txn = store.knowledge.begin_with_mode(Mode::WriteOnly).unwrap();
+            txn.set_durability(SkvDurability::Immediate);
+            txn.soft_delete(b"gotcha:tomb").unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        let entries = store.history("gotcha:tomb", 0).unwrap();
+        assert!(entries.len() >= 2, "must have create + soft-delete, got {}", entries.len());
+        // At least one tombstone must exist
+        assert!(
+            entries.iter().any(|e| e.is_tombstone),
+            "tombstone must be present in history",
+        );
+    }
+
+    #[tokio::test]
+    async fn history_no_key_spill() {
+        let (store, _dir) = temp_store();
+        store.put("gotcha:alpha", &make_record("gotcha:alpha")).await.unwrap();
+        store.put("gotcha:alpha-extended", &make_record("gotcha:alpha-extended")).await.unwrap();
+        store.put("gotcha:beta", &make_record("gotcha:beta")).await.unwrap();
+
+        let entries = store.history("gotcha:alpha", 0).unwrap();
+        for e in &entries {
+            if let Some(ref rec) = e.record {
+                assert_eq!(rec.key, "gotcha:alpha",
+                    "spilled into adjacent key: {}", rec.key);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn history_limit() {
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:limited");
+        for i in 0..5 {
+            r.value = format!("v{i}");
+            r.version.logical_clock = i as u64;
+            store.put("gotcha:limited", &r).await.unwrap();
+        }
+
+        let entries = store.history("gotcha:limited", 2).unwrap();
+        assert!(entries.len() <= 2, "limit=2 but got {} entries", entries.len());
+    }
+
+    #[tokio::test]
+    async fn history_since_filters_old_versions() {
+        let (store, _dir) = temp_store();
+        let mut r = make_record("gotcha:since");
+        r.value = "old".to_string();
+        store.put("gotcha:since", &r).await.unwrap();
+
+        // Capture a "since" timestamp between writes — use nanosecond
+        // granularity so we can convert to seconds.
+        let since_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        r.value = "new".to_string();
+        r.version.logical_clock = 2;
+        store.put("gotcha:since", &r).await.unwrap();
+
+        let entries = store.history_since("gotcha:since", since_secs, 0).unwrap();
+        // Should contain at least the "new" version
+        assert!(
+            !entries.is_empty(),
+            "since filter should include the recent write",
+        );
+        // Verify all returned timestamps are >= since_secs
+        for e in &entries {
+            assert!(
+                e.timestamp_secs >= since_secs.saturating_sub(1),
+                "entry ts {} is before since {}",
+                e.timestamp_secs,
+                since_secs,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn records_since_with_dep() {
+        let (store, _dir) = temp_store();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let old_ts = now.saturating_sub(3600);
+
+        let mut old_rec = make_record("gotcha:old");
+        old_rec.updated_at = old_ts;
+        store.put("gotcha:old", &old_rec).await.unwrap();
+
+        let mut new_gotcha = make_record("gotcha:new");
+        new_gotcha.updated_at = now;
+        store.put("gotcha:new", &new_gotcha).await.unwrap();
+
+        let mut dep_rec = make_record("dep:serde");
+        dep_rec.category = crate::store::record::Category::Dependency;
+        dep_rec.updated_at = now;
+        store.put("dep:serde", &dep_rec).await.unwrap();
+
+        let since = now.saturating_sub(60);
+        let results = store.records_since(since, 0).await.unwrap();
+        let keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
+
+        assert!(keys.contains(&"gotcha:new"), "new gotcha should appear");
+        assert!(keys.contains(&"dep:serde"), "dep record should appear");
+        assert!(!keys.contains(&"gotcha:old"), "old gotcha should be excluded");
+
+        // Verify newest-first ordering
+        for pair in results.windows(2) {
+            assert!(
+                pair[0].updated_at >= pair[1].updated_at,
+                "results must be newest-first",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn records_since_respects_limit() {
+        let (store, _dir) = temp_store();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for i in 0..10 {
+            let mut r = make_record(&format!("gotcha:lim-{i:02}"));
+            r.updated_at = now;
+            store.put(&r.key, &r).await.unwrap();
+        }
+
+        let results = store.records_since(now.saturating_sub(1), 3).await.unwrap();
+        assert_eq!(results.len(), 3, "limit=3 should cap at 3");
+    }
+
+    #[test]
+    fn history_entry_timestamp_conversion() {
+        let entry = HistoryEntry {
+            timestamp_secs: 1_710_520_800,
+            timestamp_ns: 1_710_520_800_000_000_000,
+            record: None,
+            is_tombstone: false,
+        };
+        assert_eq!(entry.timestamp_secs, entry.timestamp_ns / 1_000_000_000);
     }
 
 }

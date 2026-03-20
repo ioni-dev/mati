@@ -27,12 +27,16 @@ pub struct LsArgs {
 
 #[derive(Args)]
 pub struct HistoryArgs {
-    /// Record key
-    pub key: String,
+    /// Record key (omit to list all recently changed records with --since)
+    pub key: Option<String>,
 
-    /// Show records changed in time window (e.g., "2w", "30d")
+    /// Show records changed in time window (e.g., "2h", "7d", "2w", "3m", "1y")
     #[arg(long)]
     pub since: Option<String>,
+
+    /// Maximum entries to display
+    #[arg(long, default_value = "50")]
+    pub limit: usize,
 }
 
 #[derive(Args)]
@@ -558,8 +562,237 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
 
 // ── run_history (M-14-C stub) ────────────────────────────────────────────────
 
-pub async fn run_history(_args: HistoryArgs) -> Result<()> {
-    Err(anyhow::anyhow!("mati history not yet implemented (M-14-C)"))
+pub async fn run_history(args: HistoryArgs) -> Result<()> {
+    if args.limit == 0 {
+        anyhow::bail!("--limit must be at least 1");
+    }
+
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+
+    // Outer/inner pattern: errors from inner are captured, store.close()
+    // is always called regardless.
+    let result = run_history_inner(&store, &args).await;
+    store.close().await?;
+    result
+}
+
+async fn run_history_inner(store: &Store, args: &HistoryArgs) -> Result<()> {
+    let use_color = std::io::stdout().is_terminal();
+
+    match (&args.key, &args.since) {
+        // mati history <key> --since 7d
+        (Some(key), Some(since_str)) => {
+            let secs = parse_since_duration(since_str)?;
+            let since_ts = now_secs().saturating_sub(secs);
+            let entries = store.history_since(key, since_ts, args.limit)?;
+            if entries.is_empty() {
+                println!("No history for '{}' in the last {}.", key, duration_label(secs));
+                return Ok(());
+            }
+            render_timeline(key, &entries, use_color);
+        }
+        // mati history <key>
+        (Some(key), None) => {
+            let entries = store.history(key, args.limit)?;
+            if entries.is_empty() {
+                println!("No history for '{}'.", key);
+                return Ok(());
+            }
+            render_timeline(key, &entries, use_color);
+        }
+        // mati history --since 7d
+        (None, Some(since_str)) => {
+            let secs = parse_since_duration(since_str)?;
+            let since_ts = now_secs().saturating_sub(secs);
+            let records = store.records_since(since_ts, args.limit).await?;
+            if records.is_empty() {
+                println!("No records changed in the last {}.", duration_label(secs));
+                return Ok(());
+            }
+            show_records_since(&records, secs, use_color);
+        }
+        // mati history (no args at all)
+        (None, None) => {
+            anyhow::bail!(
+                "provide a key (e.g., mati history gotcha:foo) or --since (e.g., mati history --since 7d)"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_timeline(key: &str, entries: &[mati_core::store::db::HistoryEntry], use_color: bool) {
+    let (blue, gray, red, yellow, green, white, bold, reset) = if use_color {
+        (
+            colors::BLUE,
+            colors::GRAY,
+            colors::RED,
+            colors::YELLOW,
+            colors::GREEN,
+            colors::WHITE,
+            colors::BOLD,
+            colors::RESET,
+        )
+    } else {
+        ("", "", "", "", "", "", "", "")
+    };
+
+    println!(
+        "\n{bold}{blue}history{reset}  {bold}{white}{key}{reset}  {gray}({} version{}){reset}\n",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" },
+    );
+
+    for (i, entry) in entries.iter().enumerate() {
+        let ts_label = format_ts_short(entry.timestamp_secs);
+
+        if entry.is_tombstone {
+            println!("  {red}x{reset}  {gray}{ts_label}{reset}  {red}deleted{reset}");
+        } else if let Some(ref rec) = entry.record {
+            // Detect "created" by comparing created_at == updated_at on the record
+            let is_creation = rec.created_at == rec.updated_at;
+            let action = if is_creation { "created" } else { "updated" };
+            let action_color = if is_creation { green } else { yellow };
+
+            let src = source_short_label(&rec.source);
+            let val_preview = truncate(&rec.value, 60);
+
+            println!(
+                "  {action_color}*{reset}  {gray}{ts_label}{reset}  {action_color}{action}{reset}  {gray}{src}{reset}"
+            );
+            if i == 0 || !val_preview.is_empty() {
+                println!("     {white}{val_preview}{reset}");
+            }
+            println!(
+                "     {gray}conf={:.2}  qual={:.2}  clock={}{reset}",
+                rec.confidence.value,
+                rec.quality.value,
+                rec.version.logical_clock,
+            );
+        } else {
+            // Non-tombstone but record could not be deserialized
+            println!("  {yellow}?{reset}  {gray}{ts_label}{reset}  {yellow}unreadable version{reset}");
+        }
+
+        if i < entries.len() - 1 {
+            println!("  {gray}|{reset}");
+        }
+    }
+    println!();
+}
+
+fn show_records_since(records: &[Record], window_secs: u64, _use_color: bool) {
+    println!(
+        "\nRecords changed in the last {}  ({} total)\n",
+        duration_label(window_secs),
+        records.len(),
+    );
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Key"),
+            Cell::new("Updated (UTC)"),
+            Cell::new("Source"),
+            Cell::new("Conf"),
+            Cell::new("Value"),
+        ]);
+
+    for r in records {
+        table.add_row(vec![
+            Cell::new(&r.key),
+            Cell::new(format_ts_short(r.updated_at)),
+            Cell::new(source_short_label(&r.source)),
+            Cell::new(format!("{:.2}", r.confidence.value))
+                .fg(score_comfy_color(r.confidence.value)),
+            Cell::new(truncate(&r.value, 40)),
+        ]);
+    }
+
+    println!("{table}");
+}
+
+/// Parse a human-friendly duration suffix into seconds.
+///
+/// Supported suffixes: h (hours), d (days), w (weeks), m (months ~30d), y (years ~365d).
+fn parse_since_duration(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("--since value must not be empty");
+    }
+    let (digits, suffix) = s.split_at(s.len() - 1);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --since format '{s}': expected <number><h|d|w|m|y>"))?;
+    if n == 0 {
+        anyhow::bail!("--since value must be positive, got '{s}'");
+    }
+    let multiplier: u64 = match suffix {
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 7 * 86400,
+        "m" => 30 * 86400,
+        "y" => 365 * 86400,
+        _ => anyhow::bail!("unknown --since suffix '{suffix}': expected h, d, w, m, or y"),
+    };
+    Ok(n.saturating_mul(multiplier))
+}
+
+/// Format a Unix timestamp (seconds) as "YYYY-MM-DD HH:MM".
+fn format_ts_short(ts: u64) -> String {
+    if ts == 0 {
+        return "\u{2014}".to_string();
+    }
+    let days = ts / 86400;
+    let rem = ts % 86400;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}")
+}
+
+/// Short label for RecordSource (no parenthetical detail).
+fn source_short_label(src: &RecordSource) -> &'static str {
+    match src {
+        RecordSource::StaticAnalysis => "L0",
+        RecordSource::ClaudeEnrich => "L1",
+        RecordSource::SessionHook => "L2",
+        RecordSource::DeveloperManual => "manual",
+        RecordSource::Import => "import",
+    }
+}
+
+/// Human-friendly duration label from seconds.
+fn duration_label(secs: u64) -> String {
+    if secs >= 365 * 86400 {
+        let y = secs / (365 * 86400);
+        return format!("{y} year{}", if y == 1 { "" } else { "s" });
+    }
+    if secs >= 30 * 86400 {
+        let m = secs / (30 * 86400);
+        return format!("{m} month{}", if m == 1 { "" } else { "s" });
+    }
+    if secs >= 7 * 86400 {
+        let w = secs / (7 * 86400);
+        return format!("{w} week{}", if w == 1 { "" } else { "s" });
+    }
+    if secs >= 86400 {
+        let d = secs / 86400;
+        return format!("{d} day{}", if d == 1 { "" } else { "s" });
+    }
+    let h = secs / 3600;
+    format!("{h} hour{}", if h == 1 { "" } else { "s" })
+}
+
+/// Current wall-clock time in seconds since Unix epoch.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ── Display helpers (pub(crate) for reuse by status, quality-check, etc.) ────
@@ -716,13 +949,29 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
 
 // ── Table helper functions ───────────────────────────────────────────────────
 
-fn truncate(s: &str, max: usize) -> String {
+/// Truncate a string to `max` display characters, appending "..." if truncated.
+///
+/// UTF-8 safe: uses `char_indices` to find the correct byte boundary so
+/// multi-byte characters are never split.
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
-    if first_line.len() <= max {
-        first_line.to_string()
-    } else {
-        format!("{}...", &first_line[..max - 3])
+    if max < 4 {
+        // Too small for "..." — just return what fits
+        return first_line.chars().take(max).collect();
     }
+    // Check whether the first line fits within `max` characters
+    let char_count = first_line.chars().count();
+    if char_count <= max {
+        return first_line.to_string();
+    }
+    // Find the byte index where we need to cut (max - 3 characters for "...")
+    let target_chars = max - 3;
+    let byte_end = first_line
+        .char_indices()
+        .nth(target_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(first_line.len());
+    format!("{}...", &first_line[..byte_end])
 }
 
 fn priority_weight(p: &Priority) -> f32 {
@@ -860,5 +1109,158 @@ mod tests {
     #[test]
     fn format_date_known() {
         assert_eq!(format_date(19737 * 86400), "2024-01-15");
+    }
+
+    // ── parse_since_duration ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_since_hours() {
+        assert_eq!(parse_since_duration("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn parse_since_days() {
+        assert_eq!(parse_since_duration("7d").unwrap(), 604800);
+    }
+
+    #[test]
+    fn parse_since_weeks() {
+        assert_eq!(parse_since_duration("2w").unwrap(), 14 * 86400);
+    }
+
+    #[test]
+    fn parse_since_months() {
+        assert_eq!(parse_since_duration("3m").unwrap(), 90 * 86400);
+    }
+
+    #[test]
+    fn parse_since_years() {
+        assert_eq!(parse_since_duration("1y").unwrap(), 365 * 86400);
+    }
+
+    #[test]
+    fn parse_since_invalid_suffix() {
+        assert!(parse_since_duration("7x").is_err());
+    }
+
+    #[test]
+    fn parse_since_no_number() {
+        assert!(parse_since_duration("d").is_err());
+    }
+
+    #[test]
+    fn parse_since_zero_value() {
+        assert!(parse_since_duration("0d").is_err());
+    }
+
+    #[test]
+    fn parse_since_empty() {
+        assert!(parse_since_duration("").is_err());
+    }
+
+    // ── format_ts_short ──────────────────────────────────────────────────────
+
+    #[test]
+    fn format_ts_short_zero_is_em_dash() {
+        assert_eq!(format_ts_short(0), "\u{2014}");
+    }
+
+    #[test]
+    fn format_ts_short_known_date() {
+        // 2024-01-15 01:02
+        let ts = 19737 * 86400 + 3720;
+        assert_eq!(format_ts_short(ts), "2024-01-15 01:02");
+    }
+
+    // ── source_short_label ───────────────────────────────────────────────────
+
+    #[test]
+    fn source_short_label_values() {
+        assert_eq!(source_short_label(&RecordSource::StaticAnalysis), "L0");
+        assert_eq!(source_short_label(&RecordSource::ClaudeEnrich), "L1");
+        assert_eq!(source_short_label(&RecordSource::SessionHook), "L2");
+        assert_eq!(source_short_label(&RecordSource::DeveloperManual), "manual");
+        assert_eq!(source_short_label(&RecordSource::Import), "import");
+    }
+
+    // ── duration_label ───────────────────────────────────────────────────────
+
+    #[test]
+    fn duration_label_hours() {
+        assert_eq!(duration_label(3600), "1 hour");
+        assert_eq!(duration_label(7200), "2 hours");
+    }
+
+    #[test]
+    fn duration_label_days() {
+        assert_eq!(duration_label(86400), "1 day");
+        assert_eq!(duration_label(3 * 86400), "3 days");
+    }
+
+    #[test]
+    fn duration_label_weeks() {
+        assert_eq!(duration_label(7 * 86400), "1 week");
+        assert_eq!(duration_label(14 * 86400), "2 weeks");
+    }
+
+    #[test]
+    fn duration_label_months() {
+        assert_eq!(duration_label(30 * 86400), "1 month");
+        assert_eq!(duration_label(60 * 86400), "2 months");
+    }
+
+    #[test]
+    fn duration_label_years() {
+        assert_eq!(duration_label(365 * 86400), "1 year");
+        assert_eq!(duration_label(730 * 86400), "2 years");
+    }
+
+    // ── truncate multibyte + edge cases ──────────────────────────────────────
+
+    #[test]
+    fn truncate_multibyte_chars() {
+        // Each emoji is 4 bytes. "abcde" is 9 chars total.
+        let s = "ab\u{1F600}cd\u{1F600}ef";
+        // max=6 means we need 3 chars + "..."
+        let result = truncate(s, 6);
+        assert!(result.ends_with("..."));
+        assert_eq!(result.chars().count(), 6); // 3 chars + 3 dots
+    }
+
+    #[test]
+    fn truncate_exact_boundary() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_one_over() {
+        assert_eq!(truncate("hello!", 5), "he...");
+    }
+
+    #[test]
+    fn truncate_max_less_than_four() {
+        // max < 4: just take what fits, no "..."
+        assert_eq!(truncate("hello", 3), "hel");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate("", 10), "");
+    }
+
+    #[test]
+    fn truncate_all_multibyte() {
+        // 4 emoji = 4 chars, each 4 bytes
+        let s = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}";
+        let result = truncate(s, 4);
+        assert_eq!(result, s); // exactly fits
+    }
+
+    #[test]
+    fn truncate_all_multibyte_over() {
+        let s = "\u{1F600}\u{1F601}\u{1F602}\u{1F603}\u{1F604}";
+        let result = truncate(s, 4);
+        // 1 char + "..." = 4 chars
+        assert_eq!(result, "\u{1F600}...");
     }
 }
