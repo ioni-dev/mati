@@ -14,5 +14,5 @@ command -v jq &>/dev/null || exit 0
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
 [ -z "$FILE_PATH" ] && exit 0
 
-mati log-hit "file:$FILE_PATH" &>/dev/null &
+(mati log-hit "file:$FILE_PATH" && mati reparse "$FILE_PATH") &>/dev/null &
 "#;

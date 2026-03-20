@@ -7,3 +7,6 @@ pub mod pre_bash;
 pub mod pre_compact;
 pub mod pre_read;
 pub mod session_end;
+
+#[cfg(test)]
+mod compliance;

@@ -16,7 +16,8 @@ use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
 use crate::health::confidence;
 use crate::store::record::{
-    ContextPacket, FileRecord, GotchaRecord, Priority, QualityTier, Record,
+    ContextPacket, FileRecord, GotchaRecord, Priority, QualityTier, Record, RecordLifecycle,
+    StaleReviewPayload, StalenessTier,
 };
 
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams};
@@ -194,17 +195,25 @@ pub async fn assemble_context_packet(
     // 1. Stage
     let stage = store.get("stage:current").await?;
 
-    // 2. Scan all gotchas, filter confirmed + quality >= 0.4
+    // 2. Scan all gotchas, filter confirmed + quality >= 0.4, exclude tombstones
     let all_gotchas = store.scan_prefix("gotcha:").await?;
     let mut confirmed_gotchas: Vec<Record> = all_gotchas
         .into_iter()
         .filter(|r| {
+            // Exclude tombstoned records
+            if !matches!(r.lifecycle, RecordLifecycle::Active) {
+                return false;
+            }
+            // Exclude tombstone-tier staleness
+            if r.staleness.tier == StalenessTier::Tombstone {
+                return false;
+            }
             // Parse the gotcha detail to check confirmed flag
             if let Ok(gotcha) = serde_json::from_str::<GotchaRecord>(&r.value) {
                 gotcha.confirmed && r.quality.value >= 0.4
             } else {
-                // If value isn't a GotchaRecord JSON, check quality only
-                r.quality.value >= 0.4
+                // Unparseable gotcha value — exclude (not quality check)
+                false
             }
         })
         .collect();
@@ -213,6 +222,11 @@ pub async fn assemble_context_packet(
     let mut file_records = Vec::new();
     let mut context_gotcha_keys = HashSet::new();
     let mut decision_keys = HashSet::new();
+    // Collect nudge candidates during this pass to avoid N+1 re-lookups later.
+    let mut unconfirmed_candidates = Vec::new();
+    // M-13-B: collect stale warnings
+    let mut stale_warnings: Vec<String> = Vec::new();
+    let mut seen_stale_keys: HashSet<String> = HashSet::new();
 
     for file_path in context_files {
         let file_key = if file_path.starts_with("file:") {
@@ -221,10 +235,46 @@ pub async fn assemble_context_packet(
             format!("file:{file_path}")
         };
 
-        // Get file record
+        // Get file record first to check lifecycle/staleness before traversal
         if let Ok(Some(record)) = store.get(&file_key).await {
+            // M-13-B: exclude tombstone files from traversal entirely
+            if record.staleness.tier == StalenessTier::Tombstone
+                || !matches!(record.lifecycle, RecordLifecycle::Active)
+            {
+                continue;
+            }
+
+            // M-13-B: stale/liability file records generate warnings
+            match record.staleness.tier {
+                StalenessTier::Stale => {
+                    let path = file_key.strip_prefix("file:").unwrap_or(&file_key);
+                    if seen_stale_keys.insert(file_key.clone()) {
+                        stale_warnings.push(format!(
+                            "`{path}` record is stale (staleness {:.2}) — verify before trusting",
+                            record.staleness.value
+                        ));
+                    }
+                }
+                StalenessTier::Liability => {
+                    let path = file_key.strip_prefix("file:").unwrap_or(&file_key);
+                    if seen_stale_keys.insert(file_key.clone()) {
+                        stale_warnings.push(format!(
+                            "`{path}` record is a liability (staleness {:.2}) — do not trust, read the file",
+                            record.staleness.value
+                        ));
+                    }
+                }
+                _ => {}
+            }
+
             if let Ok(fr) = serde_json::from_str::<FileRecord>(&record.value) {
+                // Nudge detection: hot file (access_count >= 3) with no gotchas
+                let is_nudge_candidate =
+                    record.access_count >= 3 && fr.gotcha_keys.is_empty();
                 file_records.push(fr);
+                if is_nudge_candidate {
+                    unconfirmed_candidates.push(file_key.clone());
+                }
             }
         }
 
@@ -243,6 +293,28 @@ pub async fn assemble_context_packet(
         // Decisions via AffectedBy
         for key in graph.neighbors(&file_key, &EdgeKind::AffectedBy) {
             decision_keys.insert(key);
+        }
+    }
+
+    // M-13-B: surface stale reviews from last 2 days
+    {
+        let now = chrono::Utc::now();
+        for days_ago in 0..2 {
+            let date = (now - chrono::Duration::days(days_ago)).format("%Y-%m-%d");
+            let review_key = format!("analytics:stale_review_{date}");
+            if let Ok(Some(record)) = store.get(&review_key).await {
+                if let Ok(payload) = serde_json::from_str::<StaleReviewPayload>(&record.value) {
+                    for entry in &payload.entries {
+                        if seen_stale_keys.insert(entry.key.clone()) {
+                            let path = entry.key.strip_prefix("file:").unwrap_or(&entry.key);
+                            stale_warnings.push(format!(
+                                "`{path}` staleness {:.2} ({:?}) — review recommended",
+                                entry.staleness_value, entry.tier
+                            ));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -288,7 +360,9 @@ pub async fn assemble_context_packet(
     if !critical_gotchas.is_empty() {
         let mut gotcha_section = String::from("## Gotchas\n");
         for record in &critical_gotchas {
-            let caveat = if record.quality.tier == QualityTier::Poor {
+            let caveat = if record.staleness.tier == StalenessTier::Liability {
+                " [STALE — verify before trusting]"
+            } else if record.quality.tier == QualityTier::Poor {
                 " [LOW QUALITY — verify]"
             } else {
                 ""
@@ -324,6 +398,23 @@ pub async fn assemble_context_packet(
         }
     }
 
+    // M-13-B: Stale Warnings section — BEFORE Decisions
+    if !stale_warnings.is_empty() {
+        let mut stale_section = String::from("## Stale Warnings\n");
+        for warning in &stale_warnings {
+            let line = format!("- {warning}\n");
+            let tokens = estimate_tokens(&line);
+            if used_tokens + tokens > available_tokens {
+                break;
+            }
+            stale_section.push_str(&line);
+            used_tokens += tokens;
+        }
+        if stale_section.len() > "## Stale Warnings\n".len() {
+            sections.push(stale_section);
+        }
+    }
+
     // Decisions section
     if !related_decisions.is_empty() {
         let mut dec_section = String::from("## Decisions\n");
@@ -341,6 +432,31 @@ pub async fn assemble_context_packet(
         }
     }
 
+    // M-12-E: Passive nudge — detect hot files with no gotchas.
+    // NOTE: This is a deliberate exception to P2 ("inject nothing by default").
+    // Nudges are advisory suggestions, not knowledge injection, and are only
+    // emitted when token budget allows after all knowledge sections.
+    // unconfirmed_candidates were collected during the context-file traversal
+    // above (step 3), so no additional store lookups are needed here.
+    if !unconfirmed_candidates.is_empty() {
+        let mut nudge_section = String::from("## Suggested Actions\n");
+        for key in &unconfirmed_candidates {
+            let path = key.strip_prefix("file:").unwrap_or(key);
+            let line = format!(
+                "- `{path}` is read frequently but has no recorded gotchas. The developer may want to run `mati gotcha add {path}`.\n"
+            );
+            let tokens = estimate_tokens(&line);
+            if used_tokens + tokens > available_tokens {
+                break;
+            }
+            nudge_section.push_str(&line);
+            used_tokens += tokens;
+        }
+        if nudge_section.len() > "## Suggested Actions\n".len() {
+            sections.push(nudge_section);
+        }
+    }
+
     let mut injection_string = sections.join("\n");
     injection_string.push_str(VECTOR_B);
 
@@ -353,8 +469,8 @@ pub async fn assemble_context_packet(
         related_decisions,
         recent_session: None,
         token_estimate,
-        stale_warnings: vec![],
-        unconfirmed_candidates: vec![],
+        stale_warnings,
+        unconfirmed_candidates,
         knowledge_gaps: vec![],
         compliance_rate: None,
         injection_string,
@@ -657,5 +773,496 @@ mod tests {
                 || packet.critical_gotchas.iter().any(|g| g.key == "gotcha:important"),
             "graph-connected gotcha must appear in context packet"
         );
+    }
+
+    // ── M-12-E: nudge detection ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn nudge_shown_for_hot_file_with_no_gotchas() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/hot.rs".to_string(),
+            purpose: "Hot module".to_string(),
+            entry_points: vec!["run".to_string()],
+            imports: vec![],
+            gotcha_keys: vec![], // no gotchas
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 10,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 100,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/hot.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.access_count = 5; // >= 3 threshold
+        store.put("file:src/hot.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/hot.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.unconfirmed_candidates.contains(&"file:src/hot.rs".to_string()),
+            "hot file with no gotchas should be in unconfirmed_candidates"
+        );
+        assert!(
+            packet.injection_string.contains("Suggested Actions"),
+            "nudge section should appear in injection string"
+        );
+        assert!(
+            packet.injection_string.contains("mati gotcha add"),
+            "nudge should suggest gotcha add command"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_nudge_for_file_with_low_access_count() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/cold.rs".to_string(),
+            purpose: "Cold module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/cold.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.access_count = 1; // < 3 threshold
+        store.put("file:src/cold.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/cold.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.unconfirmed_candidates.is_empty(),
+            "low-access file should not trigger nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_nudge_for_file_with_gotchas() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/covered.rs".to_string(),
+            purpose: "Covered module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec!["gotcha:existing".to_string()],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 10,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 100,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/covered.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.access_count = 10;
+        store.put("file:src/covered.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/covered.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.unconfirmed_candidates.is_empty(),
+            "file with gotchas should not trigger nudge"
+        );
+    }
+
+    // ── M-13-B: stale warning tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tombstone_gotcha_excluded_from_bootstrap() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Create a tombstone-tier gotcha
+        let mut gotcha = make_gotcha_record("gotcha:tombstone", "tombstone rule", true, 0.80);
+        gotcha.staleness = StalenessScore {
+            value: 0.95,
+            tier: StalenessTier::Tombstone,
+            signals: vec![],
+            computed_at: now(),
+            last_record_sha: String::new(),
+        };
+        store.put("gotcha:tombstone", &gotcha).await.unwrap();
+
+        // Create a normal gotcha
+        let good = make_gotcha_record("gotcha:good", "good rule", true, 0.80);
+        store.put("gotcha:good", &good).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+
+        assert!(
+            !packet.injection_string.contains("gotcha:tombstone"),
+            "tombstone gotcha must not appear in injection"
+        );
+        assert!(
+            packet.injection_string.contains("gotcha:good"),
+            "normal gotcha should appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn liability_gotcha_gets_stale_caveat() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut gotcha = make_gotcha_record("gotcha:liability", "liability rule", true, 0.80);
+        gotcha.staleness = StalenessScore {
+            value: 0.75,
+            tier: StalenessTier::Liability,
+            signals: vec![],
+            computed_at: now(),
+            last_record_sha: String::new(),
+        };
+        store.put("gotcha:liability", &gotcha).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+
+        if packet.injection_string.contains("gotcha:liability") {
+            assert!(
+                packet.injection_string.contains("STALE"),
+                "liability gotcha must have STALE caveat"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_file_generates_warning() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/stale.rs".to_string(),
+            purpose: "Stale module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/stale.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.staleness = StalenessScore {
+            value: 0.55,
+            tier: StalenessTier::Stale,
+            signals: vec![],
+            computed_at: now(),
+            last_record_sha: String::new(),
+        };
+        store.put("file:src/stale.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/stale.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !packet.stale_warnings.is_empty(),
+            "stale file should generate a warning"
+        );
+        assert!(
+            packet.stale_warnings.iter().any(|w| w.contains("stale.rs")),
+            "warning should mention the stale file"
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_file_excluded_from_traversal() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/dead.rs".to_string(),
+            purpose: "Dead module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/dead.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.staleness = StalenessScore {
+            value: 0.95,
+            tier: StalenessTier::Tombstone,
+            signals: vec![],
+            computed_at: now(),
+            last_record_sha: String::new(),
+        };
+        store.put("file:src/dead.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/dead.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.file_records.is_empty(),
+            "tombstone file should not appear in file_records"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_warnings_deduplicated() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/dup.rs".to_string(),
+            purpose: "Dup module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/dup.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.staleness = StalenessScore {
+            value: 0.55,
+            tier: StalenessTier::Stale,
+            signals: vec![],
+            computed_at: now(),
+            last_record_sha: String::new(),
+        };
+        store.put("file:src/dup.rs", &file_record).await.unwrap();
+
+        // Also create a stale review entry for the same key
+        let review_payload = StaleReviewPayload {
+            session_timestamp: now(),
+            entries: vec![StaleReviewEntry {
+                key: "file:src/dup.rs".to_string(),
+                staleness_value: 0.55,
+                tier: StalenessTier::Stale,
+                last_updated: now(),
+                signals: vec!["stale".to_string()],
+            }],
+        };
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let review_key = format!("analytics:stale_review_{today}");
+        let review_record = make_record(
+            &review_key,
+            &serde_json::to_string(&review_payload).unwrap(),
+            Category::Analytics,
+            0.5,
+        );
+        store.put(&review_key, &review_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/dup.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Should have exactly 1 warning, not 2 (dedup by key)
+        let dup_count = packet
+            .stale_warnings
+            .iter()
+            .filter(|w| w.contains("dup.rs"))
+            .count();
+        assert_eq!(dup_count, 1, "same key should not produce duplicate warnings");
+    }
+
+    #[tokio::test]
+    async fn stale_warnings_section_before_decisions() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Create a stale file
+        let fr = FileRecord {
+            path: "src/stale.rs".to_string(),
+            purpose: "Stale".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: now(),
+        };
+        let mut file_record = make_record(
+            "file:src/stale.rs",
+            &serde_json::to_string(&fr).unwrap(),
+            Category::File,
+            0.5,
+        );
+        file_record.staleness = StalenessScore {
+            value: 0.55,
+            tier: StalenessTier::Stale,
+            signals: vec![],
+            computed_at: now(),
+            last_record_sha: String::new(),
+        };
+        store.put("file:src/stale.rs", &file_record).await.unwrap();
+
+        // Create a decision record reachable via graph edge
+        let decision = make_record(
+            "decision:arch",
+            "Use SurrealKV",
+            Category::Decision,
+            0.8,
+        );
+        store.put("decision:arch", &decision).await.unwrap();
+
+        let mut graph = Graph::load(store).await.unwrap();
+        graph
+            .add_edge("file:src/stale.rs", EdgeKind::AffectedBy, "decision:arch")
+            .await
+            .unwrap();
+
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/stale.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let stale_pos = packet.injection_string.find("## Stale Warnings");
+        let dec_pos = packet.injection_string.find("## Decisions");
+
+        if let (Some(s), Some(d)) = (stale_pos, dec_pos) {
+            assert!(
+                s < d,
+                "Stale Warnings section must appear before Decisions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_gotcha_never_injected() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Create an unconfirmed gotcha
+        let unconfirmed = make_gotcha_record("gotcha:unconfirmed", "unconfirmed rule", false, 0.80);
+        store.put("gotcha:unconfirmed", &unconfirmed).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+
+        assert!(
+            !packet.injection_string.contains("gotcha:unconfirmed"),
+            "unconfirmed gotcha must never be injected"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_store_returns_only_vector_b() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+
+        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+
+        assert!(packet.injection_string.contains("[mati] Before reading"));
+        assert!(packet.critical_gotchas.is_empty());
+        assert!(packet.file_records.is_empty());
+        assert!(packet.stale_warnings.is_empty());
+        assert!(packet.related_decisions.is_empty());
     }
 }

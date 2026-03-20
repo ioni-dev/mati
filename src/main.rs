@@ -9,7 +9,7 @@ use slugify::slugify;
 use mati_core::health::quality;
 use mati_core::store::{
     Category, ConfidenceScore, QualityScore, QualityTier, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore, StalenessTier, Store,
+    RecordVersion, StalenessScore, Store,
 };
 
 mod cli;
@@ -63,8 +63,8 @@ enum Commands {
     Export(cli::show::ExportArgs),
     /// Import from CLAUDE.md or JSON
     Import(cli::show::ImportArgs),
-    /// List stale records
-    Stale,
+    /// List stale records with signals, impact, and action hints
+    Stale(cli::stale::StaleArgs),
     /// Check mati daemon reachability and latency
     Ping,
     /// Run as MCP stdio server (for Claude Code plugin)
@@ -84,6 +84,11 @@ enum Commands {
     SessionFlush,
     #[command(hide = true)]
     SessionHarvest,
+    #[command(hide = true)]
+    Reparse {
+        /// Repo-relative file path to re-parse
+        path: String,
+    },
 }
 
 #[tokio::main]
@@ -112,7 +117,7 @@ async fn main() -> Result<()> {
         Commands::Note { text } => run_note(&text).await,
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
-        Commands::Stale => run_stale().await,
+        Commands::Stale(args) => cli::stale::run(args).await,
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
             let store = Store::open(&cwd).await?;
@@ -133,6 +138,7 @@ async fn main() -> Result<()> {
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+        Commands::Reparse { path } => cli::reparse::run(&path).await,
     }
 }
 
@@ -349,69 +355,6 @@ async fn run_improve(key: &str) -> Result<()> {
         "Updated {key}  (quality: {:.2} -> {:.2})",
         score.value, new_score.value
     );
-    Ok(())
-}
-
-// ── M-08-O: mati stale ──────────────────────────────────────────────────────
-
-async fn run_stale() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
-
-    let mut stale: Vec<Record> = Vec::new();
-    for prefix in &["gotcha:", "decision:", "file:", "dev_note:"] {
-        let records = store.scan_prefix(prefix).await?;
-        for r in records {
-            match r.staleness.tier {
-                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
-                    stale.push(r);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if stale.is_empty() {
-        println!("No stale records found.");
-        return Ok(());
-    }
-
-    // Sort by staleness descending
-    stale.sort_by(|a, b| {
-        b.staleness
-            .value
-            .partial_cmp(&a.staleness.value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL_CONDENSED)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("Key"),
-            Cell::new("Staleness"),
-            Cell::new("Tier"),
-            Cell::new("Updated"),
-        ]);
-
-    for r in &stale {
-        let tier_label = match r.staleness.tier {
-            StalenessTier::Stale => "Stale",
-            StalenessTier::Liability => "Liability",
-            StalenessTier::Tombstone => "Tombstone",
-            _ => "?",
-        };
-        table.add_row(vec![
-            Cell::new(&r.key),
-            Cell::new(format!("{:.2}", r.staleness.value)),
-            Cell::new(tier_label),
-            Cell::new(cli::show::format_date(r.updated_at)),
-        ]);
-    }
-
-    println!("{table}");
-    println!("  {} stale records", stale.len());
     Ok(())
 }
 
