@@ -80,6 +80,7 @@ pub(crate) async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel
         rel_path: rel_path.to_string(),
         language,
         size_bytes,
+        mtime_secs: 0, // reparse always re-reads — mtime not needed
     };
 
     // 3. Parse file — graceful degradation on failure

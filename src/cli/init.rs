@@ -4,13 +4,11 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;
-use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use mati_core::analysis::{
-    build_edges, build_file_records, import_claude_md, mine_git_history, parse_dependencies,
-    parse_files_parallel, Walker,
+    build_edges, build_file_records, hash_and_parse_parallel, import_claude_md, mine_git_history,
+    parse_dependencies, Walker,
 };
 use mati_core::graph::Graph;
 use mati_core::scaffold::{install_hooks, write_claude_md_stub};
@@ -92,82 +90,42 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // Build walked_paths before consuming `files` (needed for git history).
     let walked_paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
-    // ── 2. Hash check — open store + compute hashes in parallel ──────────────
-    let t = Instant::now();
-
-    // Open the store early — needed to load stored hashes for incremental skip.
+    // ── 2. Load stored mtimes (plain file, not KV) ───────────────────────────
+    // Open the store early — needed for downstream writes.
     let store = Store::open(&root).await?;
 
-    // Compute SHA-256 of all file contents in parallel (I/O + CPU bound, rayon).
-    // Borrows `files` — does not consume it (dep scanning needs all walked files).
-    let current_hashes: HashMap<String, String> = files
-        .par_iter()
-        .filter_map(|f| {
-            std::fs::read(&f.abs_path).ok().map(|bytes| {
-                let digest = Sha256::digest(&bytes);
-                let hash = hex::encode(digest);
-                (f.rel_path.clone(), hash)
-            })
-        })
-        .collect();
+    // mtime_index.json sits next to knowledge.db — plain file I/O is much
+    // faster than storing a ~4MB blob in SurrealKV.
+    let mtime_index_path = store.root.join("mtime_index.json");
+    let stored_mtimes: HashMap<String, u64> = std::fs::read(&mtime_index_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
 
-    // Load stored hashes from previous init (sessions tree, Eventual).
-    let stored_hashes: HashMap<String, String> = store
-        .scan_prefix("parse:hash:")
-        .await?
-        .into_iter()
-        .map(|r| {
-            let path = r.key.strip_prefix("parse:hash:").unwrap_or(&r.key).to_string();
-            (path, r.value)
-        })
-        .collect();
-
-    // Compute per-file parse decision without consuming `files`.
-    // `files` must remain available for dep scanning (manifests are in the full walk).
-    let needs_parse: Vec<bool> = files
-        .iter()
-        .map(|f| {
-            match (current_hashes.get(&f.rel_path), stored_hashes.get(&f.rel_path)) {
-                (Some(curr), Some(stored)) => curr != stored,
-                _ => true, // new file or unreadable → must parse
-            }
-        })
-        .collect();
-
-    let parse_count = needs_parse.iter().filter(|&&p| p).count();
-    let skipped_count = total_file_count - parse_count;
-
-    // Clone only the files that need parsing — avoids cloning the full list.
-    let files_to_parse: Vec<_> = files
-        .iter()
-        .zip(&needs_parse)
-        .filter(|(_, &p)| p)
-        .map(|(f, _)| f.clone())
-        .collect();
+    // ── 3. Mtime check + parse in one pass ───────────────────────────────────
+    // For each file: if mtime matches stored → skip (zero disk I/O).
+    // Otherwise → read bytes + run tree-sitter on the same content.
+    let t = Instant::now();
+    let hp = hash_and_parse_parallel(&files, &stored_mtimes);
+    let files_to_parse = hp.parsed_files;
+    let analyses = hp.analyses;
+    let parse_count = hp.parse_count;
+    let skipped_count = hp.skipped_count;
 
     if skipped_count > 0 {
         println!(
-            "  Hash check (incremental)...    {:>4} changed  {:>4} skipped  {:>3}ms",
+            "  Mtime+parse (incremental)...   {:>4} changed  {:>4} skipped  {:>3}ms",
             parse_count,
             skipped_count,
             t.elapsed().as_millis()
         );
     } else {
         println!(
-            "  Hash check (first run)...      {:>4} to parse          {:>3}ms",
+            "  Mtime+parse (first run)...     {:>4} files             {:>3}ms",
             parse_count,
             t.elapsed().as_millis()
         );
     }
-
-    // ── 3. Parse (changed/new files only) ────────────────────────────────────
-    let t = Instant::now();
-    let analyses = parse_files_parallel(&files_to_parse);
-    println!(
-        "  Parsing with tree-sitter...    {:>4} files             {:>3}ms",
-        parse_count,
-        t.elapsed().as_millis()
-    );
 
     // ── 4. Git history ───────────────────────────────────────────────────────
     let t = Instant::now();
@@ -305,18 +263,16 @@ pub async fn run(args: InitArgs) -> Result<()> {
         })
         .collect();
 
-    // Parse-hash records — written for all changed/new files so re-init can
-    // skip them when their content is unchanged. Stored in the sessions tree
-    // (Eventual durability) — recomputable, not user-visible knowledge.
-    let hash_record_structs: Vec<Record> = files_to_parse
-        .iter()
-        .filter_map(|f| {
-            current_hashes.get(&f.rel_path).map(|h| {
-                let key = format!("parse:hash:{}", f.rel_path);
-                make_hash_record(&key, h, device_id, now)
-            })
-        })
-        .collect();
+    // Write updated mtime index as a plain file (not a KV record).
+    // Plain file I/O avoids SurrealKV overhead for large blobs.
+    {
+        let mut merged = stored_mtimes;
+        merged.extend(hp.new_mtimes);
+        if let Ok(blob) = serde_json::to_string(&merged) {
+            let _ = std::fs::write(&mtime_index_path, blob);
+        }
+    }
+    let hash_record_structs: Vec<Record> = vec![];
 
     // Combine all records
     let all_records: Vec<Record> = claude_import
@@ -337,7 +293,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // Store was already opened above for hash loading. Reuse it.
     store.put_batch(&all_pairs).await?;
 
-    // ── 9a. Seed stats snapshot (first run only) ──────────────────────────────
+    // ── 9a. Seed stats snapshot (first run only) ─────────────────────────────
     // On incremental re-init, in-memory file_record_structs is incomplete
     // (only changed files). Skip seeding — mati stats will recompute from the
     // full store on next call.
@@ -450,10 +406,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-/// Build a minimal sessions-tree Record to persist a file content hash.
+/// Build a minimal sessions-tree Record for a parse-cache blob.
 ///
-/// Key format: `parse:hash:<rel_path>` (Eventual durability, sessions tree).
-/// Value: SHA-256 hex string (64 chars). Not user-visible knowledge.
+/// Used for `parse:mtime_index` (JSON blob) — Eventual durability, sessions tree.
 fn make_hash_record(key: &str, hash: &str, device_id: Uuid, now: u64) -> Record {
     Record {
         key: key.to_string(),
