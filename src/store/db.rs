@@ -30,6 +30,11 @@ use crate::search::Search;
 // 90 days expressed as nanoseconds — retention period for sessions.db
 const SESSIONS_RETENTION_NS: u64 = 90 * 24 * 60 * 60 * 1_000_000_000u64;
 
+/// Marker file written by `mati init` when tantivy indexing is deferred.
+/// Detected by [`Store::open_and_rebuild`] (MCP server startup) to trigger
+/// a full rebuild before serving search queries.
+const SEARCH_STALE_MARKER: &str = "search_stale";
+
 /// Key namespaces stored in the `knowledge` tree that contain [`Record`] structs.
 ///
 /// Used by [`Store::rebuild_search_index`] to scan everything that was indexed
@@ -131,8 +136,23 @@ impl Store {
     pub async fn open_and_rebuild(repo_root: &Path) -> Result<Self> {
         let mut store = Self::open(repo_root).await?;
 
-        // Eagerly initialize tantivy — detect and recover from corruption.
         let search_path = store.root.join("search_index");
+        let stale_marker = store.root.join(SEARCH_STALE_MARKER);
+
+        // Stale marker is written by `mati init` when tantivy indexing was
+        // deferred. Wipe the index before opening so the subsequent rebuild
+        // starts from an empty state (no duplicates).
+        let has_stale_marker = stale_marker.exists();
+        if has_stale_marker && search_path.exists() {
+            std::fs::remove_dir_all(&search_path).with_context(|| {
+                format!(
+                    "failed to remove stale search index at {}",
+                    search_path.display()
+                )
+            })?;
+        }
+
+        // Eagerly initialize tantivy — detect and recover from corruption.
         match Search::open(&search_path) {
             Ok(s) => {
                 let _ = store.search.set(s);
@@ -158,8 +178,17 @@ impl Store {
             }
         }
 
+        if has_stale_marker {
+            store.index_needs_rebuild = true;
+        }
+
         if store.index_needs_rebuild() {
             store.rebuild_search_index().await?;
+            // Remove stale marker only after a successful rebuild so a
+            // crashed rebuild retries on the next open_and_rebuild call.
+            if has_stale_marker {
+                let _ = std::fs::remove_file(&stale_marker);
+            }
         }
         Ok(store)
     }
@@ -272,6 +301,62 @@ impl Store {
             self.bump_write_seq();
         }
         Ok(())
+    }
+
+    /// Write multiple records to KV only, skipping the tantivy search index.
+    ///
+    /// Use this during bulk init passes where search indexing would block the
+    /// critical path. Follow with [`Self::index_records`] to update tantivy
+    /// from the same in-memory records without a KV round-trip.
+    ///
+    /// Same durability semantics as [`Self::put_batch`]: at most 2 fsyncs.
+    pub async fn put_batch_kv_only(&self, records: &[(&str, &Record)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut immediate: Vec<(&str, &Record)> = Vec::new();
+        let mut eventual: Vec<(&str, &Record)> = Vec::new();
+        for &(key, record) in records {
+            match Durability::for_key(key) {
+                Durability::Immediate => immediate.push((key, record)),
+                Durability::Eventual  => eventual.push((key, record)),
+            }
+        }
+        if !immediate.is_empty() {
+            let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
+            txn.set_durability(SkvDurability::Immediate);
+            for (key, record) in &immediate {
+                let bytes = serde_json::to_vec(record)
+                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                txn.set(key.as_bytes(), bytes)?;
+            }
+            txn.commit().await?;
+        }
+        if !eventual.is_empty() {
+            let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
+            txn.set_durability(SkvDurability::Eventual);
+            for (key, record) in &eventual {
+                let bytes = serde_json::to_vec(record)
+                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                txn.set(key.as_bytes(), bytes)?;
+            }
+            txn.commit().await?;
+        }
+        if records.iter().any(|(k, _)| is_knowledge_key(*k)) {
+            self.bump_write_seq();
+        }
+        Ok(())
+    }
+
+    /// Mark the search index as stale so the next [`Self::open_and_rebuild`]
+    /// call wipes and rebuilds it from KV.
+    ///
+    /// Written by `mati init` after a cold init pass to defer the tantivy
+    /// indexing cost (~400ms on 27k records) to the first MCP server startup.
+    /// Best-effort: a write failure is silently discarded — the worst outcome
+    /// is that the search index contains stale data until the next full rebuild.
+    pub fn mark_search_stale(&self) {
+        let _ = std::fs::write(self.root.join(SEARCH_STALE_MARKER), b"");
     }
 
     /// Write multiple records in a single transaction per durability class.
