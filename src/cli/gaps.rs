@@ -83,8 +83,14 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         }
     }
 
-    // ── Compute gaps ─────────────────────────────────────────────────────
-    let all_gaps = gaps::analyze(&store).await?;
+    // ── Compute gaps — scan once and pass pre-loaded records ─────────────
+    let (files, gotchas, decisions, deps) = tokio::try_join!(
+        store.scan_prefix("file:"),
+        store.scan_prefix("gotcha:"),
+        store.scan_prefix("decision:"),
+        store.scan_prefix("dep:"),
+    )?;
+    let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps);
 
     // ── Write cache (best-effort) ────────────────────────────────────────
     if let Ok(cache_value) = serde_json::to_string(&all_gaps) {

@@ -110,13 +110,15 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         ("", "", "", "", "", "", "")
     };
 
-    // ── Scan all namespaces ────────────────────────────────────────────────────
+    // ── Scan all namespaces (once — results are reused by gaps + onboarding) ──
 
-    let files = store.scan_prefix("file:").await?;
-    let gotchas = store.scan_prefix("gotcha:").await?;
-    let decisions = store.scan_prefix("decision:").await?;
-    let notes = store.scan_prefix("dev_note:").await?;
-    let deps = store.scan_prefix("dep:").await?;
+    let (files, gotchas, decisions, notes, deps) = tokio::try_join!(
+        store.scan_prefix("file:"),
+        store.scan_prefix("gotcha:"),
+        store.scan_prefix("decision:"),
+        store.scan_prefix("dev_note:"),
+        store.scan_prefix("dep:"),
+    )?;
 
     // ── Project name ───────────────────────────────────────────────────────────
 
@@ -185,8 +187,8 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         "    Avg confidence         {conf_color}{avg_confidence:.2}{reset}"
     );
 
-    // Knowledge gaps
-    let gap_list = gaps::analyze(&store).await?;
+    // Knowledge gaps — pass pre-loaded records, no redundant scans
+    let gap_list = gaps::analyze(&files, &gotchas, &decisions, &deps);
     let gap_count = gap_list.len() as u32;
     let gap_color = if gap_count == 0 { green } else { yellow };
     println!(
@@ -239,7 +241,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
     println!("  {bold}{blue}Onboarding readiness{reset}");
 
-    let onboarding_score = onboarding::compute(&store).await?;
+    let onboarding_score = onboarding::compute_from_records(&files, &decisions, &gotchas);
 
     let min_color = if onboarding_score.estimated_minutes <= 10.0 {
         green
