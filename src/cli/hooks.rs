@@ -177,6 +177,30 @@ async fn log_hit_impl(store: &Store, key: &str) -> Result<()> {
     Ok(())
 }
 
+// ── edit-hook (combined log-hit + reparse) ───────────────────────────────────
+
+/// Combined log-hit + reparse in a single store open/close cycle.
+/// Called by post-edit.sh hook to avoid two separate process spawns.
+pub async fn run_edit_hook(path: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+
+    let file_key = format!("file:{path}");
+
+    // log-hit: best-effort
+    if let Err(e) = log_hit_impl(&store, &file_key).await {
+        tracing::warn!(path, "edit-hook log-hit failed: {e}");
+    }
+
+    // reparse: best-effort
+    if let Err(e) = crate::cli::reparse::reparse_impl(&store, &cwd, path).await {
+        tracing::warn!(path, "edit-hook reparse failed: {e}");
+    }
+
+    store.close().await?;
+    Ok(())
+}
+
 // ── log-compliance-miss ──────────────────────────────────────────────────────
 
 pub async fn run_log_compliance_miss(key: &str) -> Result<()> {

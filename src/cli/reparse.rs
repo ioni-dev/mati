@@ -48,7 +48,7 @@ pub async fn run(path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str) -> Result<()> {
+pub(crate) async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str) -> Result<()> {
     let abs_path = repo_root.join(rel_path);
     let file_key = format!("file:{rel_path}");
     let now = now_secs();
