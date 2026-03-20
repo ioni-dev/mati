@@ -39,6 +39,20 @@ const KNOWLEDGE_NAMESPACES: &[&str] = &[
     "gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:",
 ];
 
+/// Returns `true` for keys whose writes should invalidate cached stats snapshots.
+///
+/// These are the namespaces that affect the knowledge coverage aggregates
+/// displayed by `mati stats` and `mati gaps`. Must stay in sync with
+/// [`KNOWLEDGE_NAMESPACES`].
+fn is_knowledge_key(key: &str) -> bool {
+    key.starts_with("file:")
+        || key.starts_with("gotcha:")
+        || key.starts_with("decision:")
+        || key.starts_with("dep:")
+        || key.starts_with("dev_note:")
+        || key.starts_with("stage:")
+}
+
 /// Key namespaces stored in the `sessions` tree that contain [`Record`] structs.
 ///
 /// `graph:edge:*` is intentionally excluded — those values are raw 8-byte
@@ -254,6 +268,9 @@ impl Store {
             Ok(search) => { search.add_record(record)?; }
             Err(e) => { tracing::warn!("search index unavailable during put: {e}"); }
         }
+        if is_knowledge_key(key) {
+            self.bump_write_seq();
+        }
         Ok(())
     }
 
@@ -310,6 +327,9 @@ impl Store {
                 let _ = search.add_records(&search_records)?;
             }
             Err(e) => { tracing::warn!("search index unavailable during put_batch: {e}"); }
+        }
+        if records.iter().any(|(k, _)| is_knowledge_key(*k)) {
+            self.bump_write_seq();
         }
         Ok(())
     }
@@ -566,6 +586,35 @@ impl Store {
         anyhow::ensure!(result.is_some(), "ping sentinel write was not visible on read-back");
 
         Ok(now_micros() - start)
+    }
+
+    // -------------------------------------------------------------------------
+    // Write-seq cache invalidation
+    // -------------------------------------------------------------------------
+
+    /// Path to the monotonic counter file: `~/.mati/<slug>/health_write_seq`.
+    fn write_seq_path(&self) -> PathBuf {
+        self.root.join("health_write_seq")
+    }
+
+    /// Read the current knowledge write-sequence counter.
+    ///
+    /// Returns `0` if the file does not exist or cannot be parsed — callers
+    /// treat `0` as "no valid cached snapshot" and recompute.
+    pub fn read_write_seq(&self) -> u64 {
+        std::fs::read_to_string(self.write_seq_path())
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Increment the write-seq counter. Called after every knowledge-key write.
+    ///
+    /// Best-effort: file write errors are silently discarded — a failed bump
+    /// causes the next stats call to recompute, which is correct behaviour.
+    fn bump_write_seq(&self) {
+        let next = self.read_write_seq().wrapping_add(1);
+        let _ = std::fs::write(self.write_seq_path(), next.to_string());
     }
 
     // -------------------------------------------------------------------------
