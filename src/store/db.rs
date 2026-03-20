@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use once_cell::sync::OnceCell;
 use sha2::{Digest, Sha256};
 use surrealkv::{
     Durability as SkvDurability, HistoryOptions, LSMIterator, Mode, Options, Transaction, Tree,
@@ -56,8 +57,13 @@ const SESSION_NAMESPACES: &[&str] = &[
 pub struct Store {
     knowledge: Tree,
     sessions: Tree,
-    /// Tantivy full-text index — kept open for the session lifetime.
-    search: Search,
+    /// Tantivy full-text index — lazily initialized on first use.
+    ///
+    /// Hook commands (`get`, `log-hit`, `log-miss`, `reparse`) never touch the
+    /// search index, so we skip the ~30-50ms tantivy init on `Store::open`.
+    /// The index is created on the first call to a method that needs it
+    /// (`put`, `put_batch`, `search`, `rebuild_search_index`).
+    search: OnceCell<Search>,
     /// Absolute path to `~/.mati/<slug>/`
     pub root: PathBuf,
     /// Set by [`Store::open`] when the search index was corrupt or schema-
@@ -86,18 +92,43 @@ impl Store {
         let knowledge = open_knowledge_tree(root.join("knowledge.db"))?;
         let sessions  = open_sessions_tree(root.join("sessions.db"))?;
 
-        let search_path = root.join("search_index");
-        let (search, index_needs_rebuild) = match Search::open(&search_path) {
-            Ok(s)  => (s, false),
+        // Tantivy is NOT initialized here — it is lazily created on first use
+        // via `ensure_search()`. This saves ~30-50ms for hook commands that
+        // only need KV reads/writes (get, log-hit, log-miss, reparse).
+
+        Ok(Self {
+            knowledge,
+            sessions,
+            search: OnceCell::new(),
+            root,
+            index_needs_rebuild: false,
+        })
+    }
+
+    /// Open the store and rebuild the search index from SurrealKV if needed.
+    ///
+    /// This is the recommended entry point for the CLI and MCP server. It
+    /// combines [`Store::open`] with an automatic [`Store::rebuild_search_index`]
+    /// call when the index was corrupt or missing (C4). Search queries are safe
+    /// to issue immediately on the returned store.
+    ///
+    /// Unlike [`Store::open`], this eagerly initializes tantivy so corruption
+    /// can be detected and recovered from before any queries are issued.
+    pub async fn open_and_rebuild(repo_root: &Path) -> Result<Self> {
+        let mut store = Self::open(repo_root).await?;
+
+        // Eagerly initialize tantivy — detect and recover from corruption.
+        let search_path = store.root.join("search_index");
+        match Search::open(&search_path) {
+            Ok(s) => {
+                let _ = store.search.set(s);
+            }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     path  = %search_path.display(),
                     "search index corrupt or schema-incompatible — wiping and scheduling rebuild"
                 );
-                // Remove the corrupt directory so Search::open starts clean.
-                // Propagate removal errors: if we cannot clear the directory
-                // we cannot guarantee a consistent index.
                 if search_path.exists() {
                     std::fs::remove_dir_all(&search_path).with_context(|| {
                         format!(
@@ -108,21 +139,11 @@ impl Store {
                 }
                 let s = Search::open(&search_path)
                     .context("failed to open fresh search index after clearing corrupt data")?;
-                (s, true)
+                let _ = store.search.set(s);
+                store.index_needs_rebuild = true;
             }
-        };
+        }
 
-        Ok(Self { knowledge, sessions, search, root, index_needs_rebuild })
-    }
-
-    /// Open the store and rebuild the search index from SurrealKV if needed.
-    ///
-    /// This is the recommended entry point for the CLI and MCP server. It
-    /// combines [`Store::open`] with an automatic [`Store::rebuild_search_index`]
-    /// call when the index was corrupt or missing (C4). Search queries are safe
-    /// to issue immediately on the returned store.
-    pub async fn open_and_rebuild(repo_root: &Path) -> Result<Self> {
-        let store = Self::open(repo_root).await?;
         if store.index_needs_rebuild() {
             store.rebuild_search_index().await?;
         }
@@ -140,6 +161,38 @@ impl Store {
         self.index_needs_rebuild
     }
 
+    /// Lazily initialize (or return) the tantivy search index.
+    ///
+    /// First call opens the index at `<root>/search_index/`, creating the
+    /// directory and schema if absent. Subsequent calls return the cached
+    /// reference in O(1). If the index is corrupt, the corrupt directory is
+    /// wiped and a fresh index is created.
+    fn ensure_search(&self) -> Result<&Search> {
+        self.search.get_or_try_init(|| {
+            let search_path = self.root.join("search_index");
+            match Search::open(&search_path) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path  = %search_path.display(),
+                        "search index corrupt on lazy init — wiping and creating fresh"
+                    );
+                    if search_path.exists() {
+                        std::fs::remove_dir_all(&search_path).with_context(|| {
+                            format!(
+                                "failed to remove corrupt search index at {}",
+                                search_path.display()
+                            )
+                        })?;
+                    }
+                    Search::open(&search_path)
+                        .context("failed to open fresh search index after clearing corrupt data")
+                }
+            }
+        })
+    }
+
     /// Rebuild the tantivy search index from scratch by scanning all
     /// [`Record`]-containing namespaces in SurrealKV (C4).
     ///
@@ -150,6 +203,8 @@ impl Store {
     ///
     /// Returns the total number of records committed to the index.
     pub async fn rebuild_search_index(&self) -> Result<usize> {
+        let search = self.ensure_search()?;
+
         // Scan and index one namespace at a time — avoids loading all records
         // into memory simultaneously. Peak RSS is bounded by the largest single
         // namespace (typically `file:`) rather than the entire corpus.
@@ -161,7 +216,7 @@ impl Store {
                 continue;
             }
             let refs: Vec<&Record> = records.iter().collect();
-            committed += self.search.add_records(&refs)?;
+            committed += search.add_records(&refs)?;
         }
 
         tracing::info!(committed, "search index rebuilt from SurrealKV");
@@ -192,9 +247,13 @@ impl Store {
             .with_context(|| format!("failed to serialize record for key '{key}'"))?;
         txn.set(key.as_bytes(), bytes)?;
         txn.commit().await?;
-        // Commits the tantivy index immediately — one fsync per call.
-        // For bulk writes use `put_batch` to collapse this to a single commit.
-        self.search.add_record(record)?;
+
+        // Update search index — KV write is primary, search is secondary.
+        // If tantivy fails to initialize, the KV write still succeeded.
+        match self.ensure_search() {
+            Ok(search) => { search.add_record(record)?; }
+            Err(e) => { tracing::warn!("search index unavailable during put: {e}"); }
+        }
         Ok(())
     }
 
@@ -243,12 +302,15 @@ impl Store {
             txn.commit().await?;
         }
 
-        // Chunked tantivy commits (COMMIT_CHUNK docs each) — caps the loss
-        // window on a mid-ingest crash without blocking the SurrealKV writes
-        // above. The usize return (committed count) is not needed at this call
-        // site; errors propagate via `?`.
-        let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
-        let _ = self.search.add_records(&search_records)?;
+        // Update search index — KV write is primary, search is secondary.
+        // If tantivy fails to initialize, the KV writes still succeeded.
+        match self.ensure_search() {
+            Ok(search) => {
+                let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
+                let _ = search.add_records(&search_records)?;
+            }
+            Err(e) => { tracing::warn!("search index unavailable during put_batch: {e}"); }
+        }
         Ok(())
     }
 
@@ -299,7 +361,8 @@ impl Store {
     /// Returns results ordered by descending BM25 relevance score. Returns an
     /// empty `Vec` when `text` is blank or `limit` is 0.
     pub async fn search(&self, text: &str, limit: usize) -> Result<Vec<Record>> {
-        let keys = self.search.query_keys(text, limit)?;
+        let search = self.ensure_search()?;
+        let keys = search.query_keys(text, limit)?;
         let mut records = Vec::with_capacity(keys.len());
         for key in &keys {
             if let Some(record) = self.get(key).await? {
@@ -473,7 +536,10 @@ impl Store {
     /// "already locked by another process".
     pub async fn close(self) -> Result<()> {
         tokio::try_join!(self.knowledge.close(), self.sessions.close())?;
-        self.search.close()?;
+        // Only close search if it was initialized during this session.
+        if let Some(search) = self.search.into_inner() {
+            search.close()?;
+        }
         Ok(())
     }
 
@@ -711,7 +777,8 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
         let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-        let search    = Search::open(&root.join("search_index")).unwrap();
+        let search    = OnceCell::new();
+        let _         = search.set(Search::open(&root.join("search_index")).unwrap());
         let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
         (store, dir)
     }
@@ -893,7 +960,8 @@ mod tests {
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
             let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = Search::open(&root.join("search_index")).unwrap();
+            let search    = OnceCell::new();
+            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
             let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
             for i in 0..100 {
                 let r = make_record(i);
@@ -906,7 +974,8 @@ mod tests {
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
             let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = Search::open(&root.join("search_index")).unwrap();
+            let search    = OnceCell::new();
+            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
             let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
             let results = store.scan_prefix("gotcha:").await.unwrap();
             assert_eq!(results.len(), 100, "expected 100 records after reopen, got {}", results.len());
@@ -1374,7 +1443,8 @@ mod tests {
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
             let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = Search::open(&root.join("search_index")).unwrap();
+            let search    = OnceCell::new();
+            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
             let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
             for i in 0..10 {
                 let key = format!("session:{i:04}");
@@ -1386,7 +1456,8 @@ mod tests {
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
             let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = Search::open(&root.join("search_index")).unwrap();
+            let search    = OnceCell::new();
+            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
             let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
             let results = store.scan_prefix("session:").await.unwrap();
             assert_eq!(results.len(), 10,
@@ -1869,7 +1940,8 @@ mod tests {
     fn reopen_store(root: &std::path::PathBuf) -> Store {
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
         let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-        let search    = Search::open(&root.join("search_index")).unwrap();
+        let search    = OnceCell::new();
+        let _         = search.set(Search::open(&root.join("search_index")).unwrap());
         Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false }
     }
 
@@ -1919,18 +1991,25 @@ mod tests {
         // Corrupt the index by overwriting meta.json with garbage
         std::fs::write(root.join("search_index").join("meta.json"), b"not valid json {{{{").unwrap();
 
-        // Replicate the Store::open recovery path: Search::open fails → wipe → reopen
+        // Replicate the Store::open_and_rebuild recovery path: Search::open fails → wipe → reopen
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
         let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
         let search_path = root.join("search_index");
-        let (search, needs_rebuild) = match Search::open(&search_path) {
-            Ok(s)  => (s, false),
-            Err(_) => {
-                std::fs::remove_dir_all(&search_path).unwrap();
-                (Search::open(&search_path).unwrap(), true)
+        let (search_cell, needs_rebuild) = {
+            let cell = OnceCell::new();
+            match Search::open(&search_path) {
+                Ok(s) => {
+                    let _ = cell.set(s);
+                    (cell, false)
+                }
+                Err(_) => {
+                    std::fs::remove_dir_all(&search_path).unwrap();
+                    let _ = cell.set(Search::open(&search_path).unwrap());
+                    (cell, true)
+                }
             }
         };
-        let store2 = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: needs_rebuild };
+        let store2 = Store { knowledge, sessions, search: search_cell, root: root.clone(), index_needs_rebuild: needs_rebuild };
 
         assert!(store2.index_needs_rebuild(), "corrupt meta.json must trigger rebuild flag");
 
