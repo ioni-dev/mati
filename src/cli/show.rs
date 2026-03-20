@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
+use serde::{Deserialize, Serialize};
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use mati_core::store::{
-    Category, ConfidenceScore, FileRecord, Priority, QualitySignal, QualityTier, Record,
-    RecordLifecycle, RecordSource, StalenessTier, Store,
+    Category, ConfidenceScore, FileRecord, Priority, QualityScore, QualitySignal, QualityTier,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessTier, StalenessScore, Store,
 };
 
 use super::colors;
@@ -23,6 +24,10 @@ pub struct ShowArgs {
 pub struct LsArgs {
     /// Category to list: files, gotchas, decisions (omit for all)
     pub category: Option<String>,
+
+    /// Maximum file records to show (hotspots first; 0 = unlimited)
+    #[arg(long, short = 'n', default_value = "200")]
+    pub limit: usize,
 }
 
 #[derive(Args)]
@@ -248,22 +253,78 @@ fn print_record(record: &Record, use_color: bool) {
     println!();
 }
 
+// ── ls cache types ────────────────────────────────────────────────────────────
+
+/// Pre-sorted display row for a single file record.
+#[derive(Serialize, Deserialize)]
+struct LsFileRow {
+    path: String,
+    purpose: String,
+    entry_count: usize,
+    confidence: f32,
+    quality: f32,
+    is_hotspot: bool,
+}
+
+/// Write-seq-invalidated cache for `mati ls files`.
+///
+/// Cache key: `analytics:ls_files_cache`.
+/// Valid when `write_seq == store.read_write_seq()` AND `limit == requested_limit`.
+#[derive(Serialize, Deserialize)]
+struct LsFilesCache {
+    write_seq: u64,
+    /// The `--limit` value used when this cache was built.
+    limit: usize,
+    /// Total file records in the store (shown in the footer even when truncated).
+    total: usize,
+    rows: Vec<LsFileRow>,
+}
+
+/// Build a minimal analytics Record for caching ls output.
+fn ls_cache_record(key: &str, value: String) -> Record {
+    let now = now_secs();
+    Record {
+        key: key.to_string(),
+        value,
+        category: Category::Analytics,
+        priority: Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::SessionHook,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
+        gap_analysis_score: 0.0,
+    }
+}
+
 // ── run_ls (M-08-C/D/E) ─────────────────────────────────────────────────────
 
 pub async fn run_ls(args: LsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = Store::open(&cwd).await?;
     let use_color = std::io::stdout().is_terminal();
+    let limit = args.limit;
 
     match args.category.as_deref() {
-        Some("files") => ls_files(&store, use_color).await?,
+        Some("files") => ls_files(&store, use_color, limit).await?,
         Some("gotchas") => ls_gotchas(&store, use_color).await?,
         Some("decisions") => ls_decisions(&store, use_color).await?,
         Some(other) => anyhow::bail!(
             "unknown category '{other}'. Valid: files, gotchas, decisions"
         ),
         None => {
-            ls_files(&store, use_color).await?;
+            ls_files(&store, use_color, limit).await?;
             println!();
             ls_gotchas(&store, use_color).await?;
             println!();
@@ -273,50 +334,85 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ls_files(store: &Store, _use_color: bool) -> Result<()> {
+const LS_FILES_CACHE_KEY: &str = "analytics:ls_files_cache";
+
+async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
+    // ── Cache check ───────────────────────────────────────────────────────
+    let current_seq = store.read_write_seq();
+    if let Ok(Some(cached)) = store.get(LS_FILES_CACHE_KEY).await {
+        if let Ok(entry) = serde_json::from_str::<LsFilesCache>(&cached.value) {
+            if entry.write_seq == current_seq && entry.limit == limit {
+                render_ls_files_table(&entry.rows, entry.total, limit);
+                return Ok(());
+            }
+        }
+    }
+
+    // ── Full scan ─────────────────────────────────────────────────────────
     let records = store.scan_prefix("file:").await?;
     if records.is_empty() {
         println!("No file records found.");
         return Ok(());
     }
 
-    // Parse FileRecord from each record's value for display purposes.
-    // Sort: hotspots first, then by path.
-    let mut rows: Vec<(String, String, usize, f32, f32, bool)> = Vec::new();
+    let mut rows: Vec<LsFileRow> = Vec::with_capacity(records.len());
     for r in &records {
         let path = r.key.strip_prefix("file:").unwrap_or(&r.key);
-        let (purpose, entry_count, is_hotspot) = match serde_json::from_str::<FileRecord>(&r.value)
-        {
-            Ok(fr) => {
-                let purpose = if fr.purpose.is_empty() {
-                    "(pending enrichment)".to_string()
-                } else {
-                    truncate(&fr.purpose, 40)
-                };
-                (purpose, fr.entry_points.len(), fr.is_hotspot)
-            }
-            Err(_) => {
-                let purpose = if r.value.is_empty() {
-                    "(pending enrichment)".to_string()
-                } else {
-                    truncate(&r.value, 40)
-                };
-                (purpose, 0, false)
-            }
-        };
-        rows.push((
-            path.to_string(),
+        let (purpose, entry_count, is_hotspot) =
+            match serde_json::from_str::<FileRecord>(&r.value) {
+                Ok(fr) => {
+                    let purpose = if fr.purpose.is_empty() {
+                        "(pending enrichment)".to_string()
+                    } else {
+                        truncate(&fr.purpose, 40)
+                    };
+                    (purpose, fr.entry_points.len(), fr.is_hotspot)
+                }
+                Err(_) => {
+                    let purpose = if r.value.is_empty() {
+                        "(pending enrichment)".to_string()
+                    } else {
+                        truncate(&r.value, 40)
+                    };
+                    (purpose, 0, false)
+                }
+            };
+        rows.push(LsFileRow {
+            path: path.to_string(),
             purpose,
             entry_count,
-            r.confidence.value,
-            r.quality.value,
+            confidence: r.confidence.value,
+            quality: r.quality.value,
             is_hotspot,
-        ));
+        });
     }
 
     // Sort: hotspots first, then alphabetical by path
-    rows.sort_by(|a, b| b.5.cmp(&a.5).then_with(|| a.0.cmp(&b.0)));
+    rows.sort_by(|a, b| b.is_hotspot.cmp(&a.is_hotspot).then_with(|| a.path.cmp(&b.path)));
 
+    let total = rows.len();
+
+    // Apply limit AFTER sorting so hotspots are always included first.
+    let display_rows: Vec<LsFileRow> = if limit == 0 {
+        rows
+    } else {
+        rows.into_iter().take(limit).collect()
+    };
+
+    render_ls_files_table(&display_rows, total, limit);
+
+    // ── Write cache (best-effort) ─────────────────────────────────────────
+    let cache = LsFilesCache { write_seq: current_seq, limit, total, rows: display_rows };
+    if let Ok(value) = serde_json::to_string(&cache) {
+        let record = ls_cache_record(LS_FILES_CACHE_KEY, value);
+        let _ = store.put(LS_FILES_CACHE_KEY, &record).await;
+    }
+
+    Ok(())
+}
+
+/// Render the file listing table from pre-sorted, already-limited rows.
+fn render_ls_files_table(rows: &[LsFileRow], total: usize, limit: usize) {
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL_CONDENSED)
@@ -330,20 +426,27 @@ async fn ls_files(store: &Store, _use_color: bool) -> Result<()> {
             Cell::new("Hot"),
         ]);
 
-    for (path, purpose, entries, conf, qual, hot) in &rows {
+    for row in rows {
         table.add_row(vec![
-            Cell::new(path),
-            Cell::new(purpose),
-            Cell::new(entries),
-            Cell::new(format!("{conf:.2}")).fg(score_comfy_color(*conf)),
-            Cell::new(format!("{qual:.2}")).fg(score_comfy_color(*qual)),
-            Cell::new(if *hot { "*" } else { "" }),
+            Cell::new(&row.path),
+            Cell::new(&row.purpose),
+            Cell::new(row.entry_count),
+            Cell::new(format!("{:.2}", row.confidence)).fg(score_comfy_color(row.confidence)),
+            Cell::new(format!("{:.2}", row.quality)).fg(score_comfy_color(row.quality)),
+            Cell::new(if row.is_hotspot { "*" } else { "" }),
         ]);
     }
 
     println!("{table}");
-    println!("  {} file records", records.len());
-    Ok(())
+    if limit > 0 && rows.len() < total {
+        println!(
+            "  showing {} of {} file records (hotspots first) — use -n 0 for all",
+            rows.len(),
+            total
+        );
+    } else {
+        println!("  {} file records", total);
+    }
 }
 
 async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
