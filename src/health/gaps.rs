@@ -9,9 +9,7 @@
 //!
 //! Coverage depends on gap type (see [`coverage_for_gap`]).
 
-use anyhow::Result;
-
-use crate::store::{FileRecord, GapType, KnowledgeGap, Record, RecordSource, Store};
+use crate::store::{FileRecord, GapType, KnowledgeGap, Record, RecordSource};
 
 // ── Coverage constants (ARCHITECTURE.md §13.2) ─────────────────────────────
 
@@ -30,25 +28,30 @@ const COVERAGE_STALE_HOTSPOT: f32 = 0.3;
 
 /// Scan the store for knowledge gaps across all 8 gap types.
 ///
+/// Accepts pre-loaded record slices to avoid redundant store scans when
+/// called from `mati stats` or `mati gaps` which already have the data.
+///
 /// Returns gaps sorted by `risk_score` descending (highest risk first).
-pub async fn analyze(store: &Store) -> Result<Vec<KnowledgeGap>> {
+pub fn analyze(
+    file_records: &[Record],
+    gotchas: &[Record],
+    decisions: &[Record],
+    deps: &[Record],
+) -> Vec<KnowledgeGap> {
     let mut gaps = Vec::new();
 
-    // Scan all file records once — reused by multiple detectors.
-    let file_records = store.scan_prefix("file:").await?;
-
-    detect_hot_file_no_record(&file_records, &mut gaps);
-    detect_hot_file_no_purpose(&file_records, &mut gaps);
-    detect_hot_file_no_gotchas(&file_records, &mut gaps);
-    detect_frequently_read_no_enrich(&file_records, &mut gaps);
-    detect_orphaned_decisions(store, &mut gaps).await?;
-    detect_dependency_unknown(store, &mut gaps).await?;
+    detect_hot_file_no_record(file_records, &mut gaps);
+    detect_hot_file_no_purpose(file_records, &mut gaps);
+    detect_hot_file_no_gotchas(file_records, &mut gaps);
+    detect_frequently_read_no_enrich(file_records, &mut gaps);
+    detect_orphaned_decisions(decisions, &mut gaps);
+    detect_dependency_unknown(file_records, gotchas, deps, &mut gaps);
     // CoChangePairUnmapped skipped for v0.1 — needs graph edge analysis.
-    detect_stale_hotspots(&file_records, &mut gaps);
+    detect_stale_hotspots(file_records, &mut gaps);
 
     // Highest risk first.
     gaps.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(gaps)
+    gaps
 }
 
 // ── Risk score computation ──────────────────────────────────────────────────
@@ -258,9 +261,8 @@ fn detect_frequently_read_no_enrich(file_records: &[Record], gaps: &mut Vec<Know
 
 /// OrphanedDecision: `decision:*` records whose value JSON has empty
 /// `affected_files` (or is not parseable as a structure with that field).
-async fn detect_orphaned_decisions(store: &Store, gaps: &mut Vec<KnowledgeGap>) -> Result<()> {
-    let decisions = store.scan_prefix("decision:").await?;
-    for record in &decisions {
+fn detect_orphaned_decisions(decisions: &[Record], gaps: &mut Vec<KnowledgeGap>) {
+    for record in decisions {
         let is_orphaned = match serde_json::from_str::<serde_json::Value>(&record.value) {
             Ok(v) => {
                 let affected = v.get("affected_files");
@@ -293,71 +295,70 @@ async fn detect_orphaned_decisions(store: &Store, gaps: &mut Vec<KnowledgeGap>) 
             action_hint: action_hint_for_gap(&GapType::OrphanedDecision, &record.key),
         });
     }
-    Ok(())
 }
 
 /// DependencyUnknown: `dep:*` records with no confirmed gotchas linked.
 /// We check whether any `gotcha:*` record references this dependency.
-async fn detect_dependency_unknown(store: &Store, gaps: &mut Vec<KnowledgeGap>) -> Result<()> {
-    let deps = store.scan_prefix("dep:").await?;
-    let gotchas = store.scan_prefix("gotcha:").await?;
+fn detect_dependency_unknown(
+    file_records: &[Record],
+    gotchas: &[Record],
+    deps: &[Record],
+    gaps: &mut Vec<KnowledgeGap>,
+) {
+    // Pre-compute dep names once to avoid repeated strip_prefix in hot loops.
+    let dep_names: Vec<(&str, &str)> = deps
+        .iter()
+        .map(|d| (d.key.as_str(), d.key.strip_prefix("dep:").unwrap_or(&d.key)))
+        .collect();
 
-    // Build a set of dep names that have at least one confirmed gotcha referencing them.
+    // Build a set of dep keys that have at least one confirmed gotcha referencing them.
     let mut deps_with_gotchas = std::collections::HashSet::new();
-    for gotcha in &gotchas {
+    for gotcha in gotchas {
         if let Ok(gr) = serde_json::from_str::<serde_json::Value>(&gotcha.value) {
-            // Check if this gotcha's affected_files mentions the dep, or if
-            // the gotcha key itself contains the dep name.
             if let Some(confirmed) = gr.get("confirmed") {
                 if confirmed.as_bool() != Some(true) {
                     continue;
                 }
             }
             // A gotcha that references a dep typically has the dep name in its key
-            // or affected_files. Use word-boundary matching to avoid false positives
+            // or value. Use word-boundary matching to avoid false positives
             // from substring matches (e.g. "go" matching "google").
-            for dep_rec in &deps {
-                let dep_name = dep_rec.key.strip_prefix("dep:").unwrap_or(&dep_rec.key);
-                if gotcha.key.contains(&format!("dep:{dep_name}"))
-                    || contains_word(&gotcha.value, dep_name)
-                {
-                    deps_with_gotchas.insert(dep_rec.key.clone());
+            for (dep_key, dep_name) in &dep_names {
+                if gotcha.key.contains(dep_key) || contains_word(&gotcha.value, dep_name) {
+                    deps_with_gotchas.insert(*dep_key);
                 }
             }
         }
     }
 
-    // Scan file records to count how many files use each dep.
-    let file_records = store.scan_prefix("file:").await?;
-    let mut dep_usage_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for file_rec in &file_records {
+    // Count how many files use each dep (by checking imports).
+    let mut dep_usage_count: std::collections::HashMap<&str, u32> =
+        std::collections::HashMap::new();
+    for file_rec in file_records {
         if let Some(fr) = parse_file_record(file_rec) {
             for import in &fr.imports {
-                for dep_rec in &deps {
-                    let dep_name = dep_rec.key.strip_prefix("dep:").unwrap_or(&dep_rec.key);
+                for (dep_key, dep_name) in &dep_names {
                     if import.contains(dep_name) {
-                        *dep_usage_count.entry(dep_rec.key.clone()).or_default() += 1;
+                        *dep_usage_count.entry(dep_key).or_default() += 1;
                     }
                 }
             }
         }
     }
 
-    for dep in &deps {
-        if deps_with_gotchas.contains(&dep.key) {
+    for (dep_key, _) in &dep_names {
+        if deps_with_gotchas.contains(dep_key) {
             continue;
         }
-        // change_frequency = number of files using the dep.
-        let freq = dep_usage_count.get(&dep.key).copied().unwrap_or(1) as f32;
+        let freq = dep_usage_count.get(dep_key).copied().unwrap_or(1) as f32;
         gaps.push(KnowledgeGap {
-            key: dep.key.clone(),
+            key: dep_key.to_string(),
             gap_type: GapType::DependencyUnknown,
             risk_score: risk_score(freq, COVERAGE_DEPENDENCY_UNKNOWN),
-            description: description_for_gap(&GapType::DependencyUnknown, &dep.key),
-            action_hint: action_hint_for_gap(&GapType::DependencyUnknown, &dep.key),
+            description: description_for_gap(&GapType::DependencyUnknown, dep_key),
+            action_hint: action_hint_for_gap(&GapType::DependencyUnknown, dep_key),
         });
     }
-    Ok(())
 }
 
 /// StaleHotspot: hotspot files with `staleness.value >= 0.5`.

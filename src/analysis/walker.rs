@@ -292,6 +292,14 @@ impl ParallelVisitor for FileVisitor {
 
         let path = entry.path();
 
+        // Skip .git/ internals. .hidden(false) is needed to include .github/,
+        // .claude/, etc., but the .git directory itself contains no project
+        // knowledge — only git object/ref data. Check via path components so
+        // we don't accidentally skip a legitimate ".git"-named user directory.
+        if path.components().any(|c| c.as_os_str() == ".git") {
+            return WalkState::Continue;
+        }
+
         // Extension-based binary filter: checked before metadata() to avoid
         // unnecessary syscalls on clearly unanalysable files.
         if is_binary_extension(path) {

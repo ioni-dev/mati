@@ -20,6 +20,10 @@ exclude     = [".claude/", "docs/", "*.md"]
 name = "mati"
 path = "src/main.rs"
 
+[[bin]]
+name    = "bench_real"
+path    = "src/bin/bench_real/main.rs"
+
 [lib]
 name = "mati_core"
 path = "src/lib.rs"
@@ -178,9 +182,9 @@ harness = false
 
 [profile.release]
 opt-level     = 3
-lto           = "thin"    # full LTO adds ~40s build; thin is sufficient
+lto           = "thin"    # fat LTO adds 3x build time for <5ms runtime gain — not worth it
 codegen-units = 1
-strip         = true      # strip symbols — reduces binary ~40%
+strip         = true      # strip debug symbols — smaller binary, faster load
 
 [profile.dev]
 opt-level = 1             # faster incremental builds, enough for tree-sitter

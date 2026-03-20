@@ -11,6 +11,7 @@
 //! - Disk read skipped for unsupported languages.
 //! - Count-only captures: no text allocated for counting signals.
 
+mod go;
 mod python;
 mod rust;
 mod typescript;
@@ -80,7 +81,7 @@ impl StaticFileAnalysis {
 pub fn parse_file(file: &WalkedFile) -> Result<StaticFileAnalysis> {
     // Guard: skip disk read for unsupported languages.
     match file.language {
-        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python => {}
+        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python | Language::Go => {}
         _ => return Ok(StaticFileAnalysis::empty(file)),
     }
 
@@ -95,6 +96,7 @@ pub fn parse_file(file: &WalkedFile) -> Result<StaticFileAnalysis> {
             typescript::parse_typescript(file, &source)
         }
         Language::Python => python::parse_python(file, &source),
+        Language::Go => go::parse_go(file, &source),
         _ => unreachable!(),
     }
 }
@@ -240,9 +242,9 @@ mod tests {
     #[test]
     fn unsupported_language_skipped_without_disk_read() {
         let f = WalkedFile {
-            abs_path: PathBuf::from("/nonexistent/file.go"),
-            rel_path: "main.go".to_owned(),
-            language: Language::Go,
+            abs_path: PathBuf::from("/nonexistent/file.java"),
+            rel_path: "Main.java".to_owned(),
+            language: Language::Java,
             size_bytes: 0,
         };
         let a = parse_file(&f).unwrap();
