@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Args;
 use uuid::Uuid;
 
@@ -76,7 +76,15 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .unwrap_or_default()
         .as_secs();
 
-    // ── 1. Walk ──────────────────────────────────────────────────────────────
+    // ── 1. Walk + Store::open (concurrent) ───────────────────────────────────
+    // Store::open has no internal await points — it is synchronous SurrealKV
+    // startup (~65ms). Spawning it before the walk lets it run on a separate
+    // tokio worker thread while the walk occupies the current one (~434ms).
+    let store_task = {
+        let root = root.clone();
+        tokio::spawn(async move { Store::open(&root).await })
+    };
+
     let t = Instant::now();
     let walker = Walker::new(&root);
     let files = walker.walk()?;
@@ -91,10 +99,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let walked_paths: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
 
     // ── 2. Load stored mtimes (plain file, not KV) ───────────────────────────
-    // Open the store early — needed for downstream writes.
-    let t = Instant::now();
-    let store = Store::open(&root).await?;
-    let store_open_ms = t.elapsed().as_millis();
+    // Await the store that was opened concurrently with the walk above.
+    let store = store_task.await.context("Store::open task panicked")??;
 
     // mtime_index.json sits next to knowledge.db — plain file I/O is much
     // faster than storing a ~4MB blob in SurrealKV.
@@ -311,10 +317,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let t = Instant::now();
     store.put_batch_kv_only(&all_pairs).await?;
     println!(
-        "  Writing store (KV)...          {:>4} recs    {:>4}ms  (store open: {}ms)",
+        "  Writing store (KV)...          {:>4} recs    {:>4}ms",
         all_records.len(),
         t.elapsed().as_millis(),
-        store_open_ms,
     );
 
     // ── 9a. Seed stats snapshot (first run only) ─────────────────────────────
