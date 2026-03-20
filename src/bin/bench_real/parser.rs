@@ -447,28 +447,43 @@ pub fn parse_ls_count(stdout: &str) -> usize {
 
 /// Extract "file:<path>" keys from `mati ls files` output.
 ///
-/// The table uses `┆` (U+2506) as the column separator and shows relative
-/// paths in the first column — we prepend "file:" to form the store key.
+/// Handles two output formats:
+/// - Hot path (cache hit): comfy_table with `┆` (U+2506) column separators.
+/// - Cold path (streaming): fixed-width columns; path occupies the first 42 chars.
 pub fn extract_file_keys(stdout: &str) -> Vec<String> {
     let clean = strip_ansi(stdout);
     let mut keys = Vec::new();
     for line in clean.lines() {
-        // Data rows contain ┆ as column separator.
-        if !line.contains('┆') { continue; }
-        // Skip header row (contains "Path" or "Purpose").
-        let t = line.trim();
-        if t.contains("Path") && t.contains("Purpose") { continue; }
-        // First cell (between leading │/┆ and first ┆) is the path.
-        let cell = line
-            .splitn(3, '┆')
-            .nth(0)
-            .unwrap_or("")
-            .trim_matches(|c: char| c == '│' || c == ' ' || c == '┆');
-        let path = cell.trim();
-        if !path.is_empty() && !path.starts_with('─') && !path.starts_with('═')
-            && !path.starts_with('╞') && !path.starts_with('┌')
-        {
-            keys.push(format!("file:{}", path));
+        if line.contains('┆') {
+            // Hot-path format (comfy_table): ┆-separated columns.
+            let t = line.trim();
+            if t.contains("Path") && t.contains("Purpose") { continue; }
+            let cell = line
+                .splitn(3, '┆')
+                .nth(0)
+                .unwrap_or("")
+                .trim_matches(|c: char| c == '│' || c == ' ' || c == '┆');
+            let path = cell.trim();
+            if !path.is_empty() && !path.starts_with('─') && !path.starts_with('═')
+                && !path.starts_with('╞') && !path.starts_with('┌')
+            {
+                keys.push(format!("file:{}", path));
+            }
+        } else {
+            // Cold-path format (streaming): fixed-width, path in first 42 chars.
+            let t = line.trim();
+            if t.is_empty() { continue; }
+            // Skip header, separator, and summary lines.
+            if t.starts_with("PATH") || t.starts_with("─") || t.starts_with("━")
+                || t.starts_with('╞') || t.starts_with('┌') || t.starts_with('═')
+                || t.ends_with("files total") || t.contains("files total")
+            { continue; }
+            // Path occupies the first COL_PATH (42) characters.
+            let col_end = line.char_indices().nth(42).map(|(i, _)| i).unwrap_or(line.len());
+            let path = line[..col_end].trim();
+            if !path.is_empty() && (path.contains('/') || path.contains('.')) {
+                keys.push(format!("file:{}", path));
+            }
         }
     }
     keys

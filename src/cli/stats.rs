@@ -429,8 +429,8 @@ pub async fn seed_snapshot(
     deps: &[Record],
     now: u64,
 ) -> Result<()> {
-    use mati_core::health::{gaps, onboarding};
-    use mati_core::store::{FileRecord, GapType};
+    use mati_core::health::onboarding;
+    use mati_core::store::FileRecord;
 
     let file_data: Vec<FileRecord> = files
         .iter()
@@ -455,8 +455,10 @@ pub async fn seed_snapshot(
         sum / all_knowledge.len() as f32
     };
 
-    let gap_list = gaps::analyze(files, gotchas, decisions, deps);
-    let gap_count = gap_list.len() as u32;
+    // Skip gaps analysis during init — it adds ~1200ms to cold init.
+    // The first `mati gaps` run computes and caches gaps independently.
+    // Stats display treats 0 as "not yet computed" (no line shown).
+    let gap_count = 0u32;
 
     let thirty_days_ago = now.saturating_sub(30 * 86400);
     let all_records: Vec<&Record> = files
@@ -480,10 +482,7 @@ pub async fn seed_snapshot(
         .iter()
         .filter(|fr| fr.is_hotspot && fr.purpose.is_empty())
         .count() as u32;
-    let orphaned_decisions = gap_list
-        .iter()
-        .filter(|g| g.gap_type == GapType::OrphanedDecision)
-        .count() as u32;
+    let orphaned_decisions = 0u32; // computed by mati gaps, not seeded here
     let low_confidence = all_records
         .iter()
         .filter(|r| r.confidence.value < 0.3)
