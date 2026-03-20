@@ -372,6 +372,37 @@ impl Store {
         Ok(records)
     }
 
+    /// Scan records whose key starts with `prefix`, invoking `callback` for each.
+    ///
+    /// Same tree routing and prefix semantics as [`scan_prefix`], but records
+    /// are deserialized and passed to `callback` one at a time rather than
+    /// collected into a `Vec`. Callers can begin processing (e.g. printing to
+    /// stdout) before the full scan completes, giving time-to-first-row
+    /// latency proportional to a single deserialization rather than the full
+    /// scan.
+    ///
+    /// Return order is lexicographic (underlying KV order). Callers that need
+    /// a different order must collect and sort after the fact.
+    pub async fn scan_prefix_each<F>(&self, prefix: &str, mut callback: F) -> Result<()>
+    where
+        F: FnMut(Record),
+    {
+        let tree = self.tree_for(prefix);
+        let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+        let end = prefix_end(prefix);
+        let mut cursor = txn.range(prefix.as_bytes(), end.as_bytes())?;
+        while cursor.next()? {
+            let bytes = cursor.value()?;
+            match serde_json::from_slice::<Record>(&bytes) {
+                Ok(record) => callback(record),
+                Err(e) => {
+                    tracing::warn!("skipping malformed record during scan: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Full-text BM25 search over all indexed records.
     ///
     /// Calls tantivy for the top `limit` matching keys, then fetches each full
