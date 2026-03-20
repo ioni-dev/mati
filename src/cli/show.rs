@@ -348,60 +348,79 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
         }
     }
 
-    // ── Full scan ─────────────────────────────────────────────────────────
-    let records = store.scan_prefix("file:").await?;
-    if records.is_empty() {
+    // ── Cold path: streaming scan ──────────────────────────────────────────
+    // Print the header immediately so the user sees output before the full
+    // scan completes. Rows are printed in store (lexicographic) order as they
+    // arrive; the cache written at the end stores them sorted (hotspots first)
+    // for the hot path rendered by render_ls_files_table.
+    let mut first = true;
+    let mut rows: Vec<LsFileRow> = Vec::new();
+    let mut printed_count: usize = 0;
+
+    store
+        .scan_prefix_each("file:", |r| {
+            let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
+            let (purpose, entry_count, is_hotspot) =
+                match serde_json::from_str::<FileRecord>(&r.value) {
+                    Ok(fr) => {
+                        let purpose = if fr.purpose.is_empty() {
+                            "(pending enrichment)".to_string()
+                        } else {
+                            truncate(&fr.purpose, 40)
+                        };
+                        (purpose, fr.entry_points.len(), fr.is_hotspot)
+                    }
+                    Err(_) => {
+                        let purpose = if r.value.is_empty() {
+                            "(pending enrichment)".to_string()
+                        } else {
+                            truncate(&r.value, 40)
+                        };
+                        (purpose, 0, false)
+                    }
+                };
+            let row = LsFileRow {
+                path,
+                purpose,
+                entry_count,
+                confidence: r.confidence.value,
+                quality: r.quality.value,
+                is_hotspot,
+            };
+            if limit == 0 || printed_count < limit {
+                if first {
+                    print_ls_files_stream_header();
+                    first = false;
+                }
+                print_ls_files_stream_row(&row);
+                printed_count += 1;
+            }
+            rows.push(row);
+        })
+        .await?;
+
+    if rows.is_empty() {
         println!("No file records found.");
         return Ok(());
     }
 
-    let mut rows: Vec<LsFileRow> = Vec::with_capacity(records.len());
-    for r in &records {
-        let path = r.key.strip_prefix("file:").unwrap_or(&r.key);
-        let (purpose, entry_count, is_hotspot) =
-            match serde_json::from_str::<FileRecord>(&r.value) {
-                Ok(fr) => {
-                    let purpose = if fr.purpose.is_empty() {
-                        "(pending enrichment)".to_string()
-                    } else {
-                        truncate(&fr.purpose, 40)
-                    };
-                    (purpose, fr.entry_points.len(), fr.is_hotspot)
-                }
-                Err(_) => {
-                    let purpose = if r.value.is_empty() {
-                        "(pending enrichment)".to_string()
-                    } else {
-                        truncate(&r.value, 40)
-                    };
-                    (purpose, 0, false)
-                }
-            };
-        rows.push(LsFileRow {
-            path: path.to_string(),
-            purpose,
-            entry_count,
-            confidence: r.confidence.value,
-            quality: r.quality.value,
-            is_hotspot,
-        });
+    let total = rows.len();
+    if limit > 0 && printed_count < total {
+        println!(
+            "  showing {} of {} file records (hotspots first on next call) — use -n 0 for all",
+            printed_count, total
+        );
+    } else {
+        println!("  {} file records", total);
     }
 
-    // Sort: hotspots first, then alphabetical by path
+    // ── Write cache (sorted, best-effort) ────────────────────────────────
     rows.sort_by(|a, b| b.is_hotspot.cmp(&a.is_hotspot).then_with(|| a.path.cmp(&b.path)));
-
-    let total = rows.len();
-
-    // Apply limit AFTER sorting so hotspots are always included first.
     let display_rows: Vec<LsFileRow> = if limit == 0 {
         rows
     } else {
         rows.into_iter().take(limit).collect()
     };
-
-    render_ls_files_table(&display_rows, total, limit);
-
-    // ── Write cache (best-effort) ─────────────────────────────────────────
     let cache = LsFilesCache { write_seq: current_seq, limit, total, rows: display_rows };
     if let Ok(value) = serde_json::to_string(&cache) {
         let record = ls_cache_record(LS_FILES_CACHE_KEY, value);
@@ -409,6 +428,35 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+// Column widths for the streaming (cold-path) fixed-width format.
+// PATH is left-truncated to preserve the filename when paths are long.
+const COL_PATH: usize = 42;
+const COL_PURPOSE: usize = 38;
+
+/// Print the fixed-width header for the streaming cold-path display.
+fn print_ls_files_stream_header() {
+    println!(
+        "{:<COL_PATH$}  {:<COL_PURPOSE$}  {:>3}  {:>4}  {:>4}  {:>3}",
+        "PATH", "PURPOSE", "ENT", "CONF", "QUAL", "HOT"
+    );
+    println!("{}", "─".repeat(COL_PATH + COL_PURPOSE + 22));
+}
+
+/// Print a single row in fixed-width format during the streaming cold-path scan.
+fn print_ls_files_stream_row(row: &LsFileRow) {
+    // Left-truncate paths so the filename is always visible.
+    let path = if row.path.len() > COL_PATH {
+        format!("…{}", &row.path[row.path.len() - (COL_PATH - 1)..])
+    } else {
+        row.path.clone()
+    };
+    let hot = if row.is_hotspot { "*" } else { "" };
+    println!(
+        "{:<COL_PATH$}  {:<COL_PURPOSE$}  {:>3}  {:>4.2}  {:>4.2}  {:>3}",
+        path, row.purpose, row.entry_count, row.confidence, row.quality, hot
+    );
 }
 
 /// Render the file listing table from pre-sorted, already-limited rows.
