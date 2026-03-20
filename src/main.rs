@@ -85,6 +85,11 @@ enum Commands {
     #[command(hide = true)]
     SessionHarvest,
     #[command(hide = true)]
+    EditHook {
+        /// Repo-relative file path
+        path: String,
+    },
+    #[command(hide = true)]
     Reparse {
         /// Repo-relative file path to re-parse
         path: String,
@@ -138,6 +143,7 @@ async fn main() -> Result<()> {
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+        Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
     }
 }
