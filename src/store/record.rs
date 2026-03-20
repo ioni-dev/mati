@@ -251,6 +251,32 @@ pub enum StalenessSignal {
     UnsafeCountChanged(i32),
     /// Net change in `.unwrap()` call count (positive = added, negative = removed).
     UnwrapCountChanged(i32),
+    /// Number of commits touching this file since last staleness confirmation.
+    GitCommitsSince(u32),
+}
+
+impl std::fmt::Display for StalenessSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAccessedDays(d) => write!(f, "not accessed for {d} days"),
+            Self::LinesChangedPct(pct) => write!(f, "{:.0}% of lines changed", pct * 100.0),
+            Self::EntryPointsChanged(n) => write!(f, "{n} entry points changed"),
+            Self::ImportsChanged(n) => write!(f, "{n} imports changed"),
+            Self::FileDeleted => write!(f, "source file deleted"),
+            Self::FileRenamed { new_path } => write!(f, "file renamed to {new_path}"),
+            Self::DependencyBumped {
+                dep,
+                old_ver,
+                new_ver,
+            } => write!(f, "{dep} bumped {old_ver} \u{2192} {new_ver}"),
+            Self::LinkedFileChanged { path } => write!(f, "linked file {path} changed"),
+            Self::CascadeFromDecision(key) => write!(f, "cascaded from {key}"),
+            Self::TodosChanged => write!(f, "TODOs changed"),
+            Self::UnsafeCountChanged(delta) => write!(f, "unsafe count changed by {delta}"),
+            Self::UnwrapCountChanged(delta) => write!(f, "unwrap count changed by {delta}"),
+            Self::GitCommitsSince(n) => write!(f, "{n} commits since last confirmation"),
+        }
+    }
 }
 
 /// Replaces the flat `stale: bool` with a scored, tiered system.
@@ -650,6 +676,30 @@ pub struct GotchaRecord {
     /// Whether a developer has explicitly confirmed this record is accurate.
     /// Layer 0 stubs are always `false` until confirmed via `mati gotcha add`.
     pub confirmed: bool,
+}
+
+// ─────────────────────────────────────────────
+// Stale review (M-13-C)
+// ─────────────────────────────────────────────
+
+/// A single entry in a stale-review session payload.
+///
+/// Surfaced to Claude via `mem_bootstrap` stale warnings section.
+/// Stored inside `StaleReviewPayload` in `session:<ts>` records.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StaleReviewEntry {
+    pub key: String,
+    pub staleness_value: f32,
+    pub tier: StalenessTier,
+    pub last_updated: u64,
+    pub signals: Vec<String>,
+}
+
+/// Payload written to `session:<ts>` after a stale-review pass.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StaleReviewPayload {
+    pub session_timestamp: u64,
+    pub entries: Vec<StaleReviewEntry>,
 }
 
 // ─────────────────────────────────────────────
@@ -1179,6 +1229,10 @@ mod tests {
             },
             StalenessSignal::LinkedFileChanged { path: "src/bar.rs".to_string() },
             StalenessSignal::CascadeFromDecision("decision:arch".to_string()),
+            StalenessSignal::TodosChanged,
+            StalenessSignal::UnsafeCountChanged(3),
+            StalenessSignal::UnwrapCountChanged(-2),
+            StalenessSignal::GitCommitsSince(7),
         ];
         for signal in &signals {
             let json = serde_json::to_string(signal).expect("serialize");
@@ -1455,6 +1509,110 @@ mod tests {
         assert_eq!(record.source, RecordSource::StaticAnalysis);
         assert_eq!(record.confidence.value, 0.10);
         assert_eq!(record.confidence.contributor_count, 1);
+    }
+
+    // ── StaleReviewEntry / StaleReviewPayload serde ──────────────────────────
+
+    #[test]
+    fn stale_review_entry_serde_roundtrip() {
+        let entry = StaleReviewEntry {
+            key: "file:src/store/db.rs".to_string(),
+            staleness_value: 0.72,
+            tier: StalenessTier::Stale,
+            last_updated: 1_710_520_800,
+            signals: vec![
+                "not accessed for 45 days".to_string(),
+                "3 entry points changed".to_string(),
+            ],
+        };
+        assert_serde_roundtrip(&entry);
+    }
+
+    #[test]
+    fn stale_review_payload_serde_roundtrip() {
+        let payload = StaleReviewPayload {
+            session_timestamp: 1_710_520_800,
+            entries: vec![
+                StaleReviewEntry {
+                    key: "file:src/store/db.rs".to_string(),
+                    staleness_value: 0.72,
+                    tier: StalenessTier::Stale,
+                    last_updated: 1_710_500_000,
+                    signals: vec!["not accessed for 45 days".to_string()],
+                },
+                StaleReviewEntry {
+                    key: "gotcha:inference-async".to_string(),
+                    staleness_value: 0.85,
+                    tier: StalenessTier::Liability,
+                    last_updated: 1_710_400_000,
+                    signals: vec![
+                        "90 commits since last confirmation".to_string(),
+                        "75% of lines changed".to_string(),
+                    ],
+                },
+            ],
+        };
+        assert_serde_roundtrip(&payload);
+        let json = serde_json::to_string(&payload).unwrap();
+        let restored: StaleReviewPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.entries.len(), 2);
+        assert_eq!(restored.session_timestamp, 1_710_520_800);
+    }
+
+    #[test]
+    fn stale_review_payload_empty_entries_serde() {
+        let payload = StaleReviewPayload {
+            session_timestamp: 1_710_520_800,
+            entries: vec![],
+        };
+        assert_serde_roundtrip(&payload);
+        let json = serde_json::to_string(&payload).unwrap();
+        let restored: StaleReviewPayload = serde_json::from_str(&json).unwrap();
+        assert!(restored.entries.is_empty());
+    }
+
+    // ── GitCommitsSince signal ───────────────────────────────────────────────
+
+    #[test]
+    fn staleness_signal_git_commits_since_serde() {
+        let signal = StalenessSignal::GitCommitsSince(42);
+        assert_serde_roundtrip(&signal);
+        let json = serde_json::to_string(&signal).unwrap();
+        assert!(json.contains("git_commits_since"), "wire format: {json}");
+    }
+
+    #[test]
+    fn staleness_signal_git_commits_since_display() {
+        let signal = StalenessSignal::GitCommitsSince(7);
+        assert_eq!(signal.to_string(), "7 commits since last confirmation");
+    }
+
+    #[test]
+    fn staleness_signal_display_all_variants() {
+        // Smoke test: every variant produces a non-empty string.
+        let signals: Vec<StalenessSignal> = vec![
+            StalenessSignal::NotAccessedDays(30),
+            StalenessSignal::LinesChangedPct(0.75),
+            StalenessSignal::EntryPointsChanged(2),
+            StalenessSignal::ImportsChanged(5),
+            StalenessSignal::FileDeleted,
+            StalenessSignal::FileRenamed { new_path: "src/foo.rs".to_string() },
+            StalenessSignal::DependencyBumped {
+                dep: "tokio".to_string(),
+                old_ver: "1.40".to_string(),
+                new_ver: "1.50".to_string(),
+            },
+            StalenessSignal::LinkedFileChanged { path: "src/bar.rs".to_string() },
+            StalenessSignal::CascadeFromDecision("decision:arch".to_string()),
+            StalenessSignal::TodosChanged,
+            StalenessSignal::UnsafeCountChanged(3),
+            StalenessSignal::UnwrapCountChanged(-2),
+            StalenessSignal::GitCommitsSince(7),
+        ];
+        for signal in &signals {
+            let display = signal.to_string();
+            assert!(!display.is_empty(), "Display for {signal:?} should not be empty");
+        }
     }
 
 }
