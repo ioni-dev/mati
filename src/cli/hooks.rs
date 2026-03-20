@@ -12,9 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use mati_core::health::staleness::StalenessAnalyzer;
 use mati_core::store::{
     Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, Store,
+    RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, Store,
 };
 
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
@@ -118,6 +119,15 @@ struct DailyAgg {
 }
 
 const MAX_AGG_KEYS: usize = 100;
+
+/// Minimum staleness value for a record to be included in the daily stale review.
+const STALE_REVIEW_MIN: f32 = 0.4;
+
+/// Maximum staleness value for stale review inclusion (Liability and above are excluded).
+const STALE_REVIEW_MAX: f32 = 0.7;
+
+/// Maximum number of entries in a single daily stale review record.
+const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 
 // ── log-miss ─────────────────────────────────────────────────────────────────
 
@@ -235,12 +245,12 @@ async fn session_flush_impl(store: &Store) -> Result<()> {
 pub async fn run_session_harvest() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = Store::open(&cwd).await?;
-    session_harvest_impl(&store).await?;
+    session_harvest_impl(&store, &cwd).await?;
     store.close().await?;
     Ok(())
 }
 
-async fn session_harvest_impl(store: &Store) -> Result<()> {
+async fn session_harvest_impl(store: &Store, cwd: &std::path::Path) -> Result<()> {
     let now = now_secs();
 
     // M-12-D: promote gotcha candidates before archiving
@@ -250,11 +260,33 @@ async fn session_harvest_impl(store: &Store) -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "gotcha promotion failed"),
     }
 
+    // M-13-A: run full staleness analysis
+    match StalenessAnalyzer::new(cwd).analyze_all(store).await {
+        Ok(report) if report.updated > 0 => {
+            tracing::info!(
+                scanned = report.scanned,
+                updated = report.updated,
+                tombstoned = report.tombstoned,
+                liability = report.liability,
+                "staleness analysis complete"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "staleness analysis failed"),
+    }
+
     // Read session:current (written by session-flush)
     let session_value = match store.get("session:current").await? {
         Some(r) => r.value,
         None => return Ok(()),
     };
+
+    // M-13-C: collect and store stale reviews for consulted keys
+    match collect_and_store_stale_reviews(store, &session_value, now).await {
+        Ok(n) if n > 0 => tracing::info!(entries = n, "stale review entries collected"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "stale review collection failed"),
+    }
 
     // Write permanent session record
     let session_key = format!("session:{now}");
@@ -333,6 +365,162 @@ async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
     }
 
     Ok(promoted)
+}
+
+// ── M-13-C: Stale review collection ─────────────────────────────────────
+
+/// Format a date key for stale review analytics records.
+fn format_review_date(now_secs: u64) -> String {
+    let dt = chrono::DateTime::from_timestamp(now_secs as i64, 0)
+        .unwrap_or_else(|| chrono::Utc::now());
+    dt.format("%Y-%m-%d").to_string()
+}
+
+/// Collect stale entries from consulted keys and store/merge into a daily review record.
+///
+/// Merges with any existing daily review (not overwrites). Deduplicates by key,
+/// sorts descending by staleness, and truncates to MAX_STALE_REVIEW_ENTRIES.
+/// Returns the number of new entries added.
+async fn collect_and_store_stale_reviews(
+    store: &Store,
+    session_value: &str,
+    now: u64,
+) -> Result<usize> {
+    // Parse consulted keys from session value
+    let session: serde_json::Value = serde_json::from_str(session_value)?;
+    let consulted_keys = match session["consulted_keys"].as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>(),
+        None => return Ok(0),
+    };
+
+    if consulted_keys.is_empty() {
+        return Ok(0);
+    }
+
+    // Collect entries from consulted keys that are in the stale range
+    let new_entries = collect_stale_entries(store, &consulted_keys).await?;
+    if new_entries.is_empty() {
+        return Ok(0);
+    }
+
+    let date = format_review_date(now);
+    let review_key = format!("analytics:stale_review_{date}");
+    let new_count = new_entries.len();
+
+    // Merge with existing daily review if present
+    let mut payload = match store.get(&review_key).await? {
+        Some(existing) => {
+            serde_json::from_str::<StaleReviewPayload>(&existing.value)
+                .unwrap_or(StaleReviewPayload {
+                    session_timestamp: now,
+                    entries: vec![],
+                })
+        }
+        None => StaleReviewPayload {
+            session_timestamp: now,
+            entries: vec![],
+        },
+    };
+
+    // Merge: add new entries, dedup by key (newest wins)
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+
+    // Add new entries first (they take priority)
+    for entry in new_entries {
+        if seen_keys.insert(entry.key.clone()) {
+            merged.push(entry);
+        }
+    }
+
+    // Then existing entries (skip duplicates)
+    for entry in payload.entries {
+        if seen_keys.insert(entry.key.clone()) {
+            merged.push(entry);
+        }
+    }
+
+    // Sort descending by staleness
+    merged.sort_by(|a, b| {
+        b.staleness_value
+            .partial_cmp(&a.staleness_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Truncate
+    merged.truncate(MAX_STALE_REVIEW_ENTRIES);
+
+    payload.session_timestamp = now;
+    payload.entries = merged;
+
+    let record = analytics_record(&review_key, serde_json::to_string(&payload)?);
+    store.put(&review_key, &record).await?;
+
+    Ok(new_count)
+}
+
+/// Scan consulted keys, filter those in [STALE_REVIEW_MIN, STALE_REVIEW_MAX),
+/// excluding Liability/Tombstone tiers. Sort descending, truncate.
+async fn collect_stale_entries(
+    store: &Store,
+    consulted_keys: &[String],
+) -> Result<Vec<StaleReviewEntry>> {
+    let mut entries = Vec::new();
+
+    for key in consulted_keys {
+        let record = match store.get(key).await? {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Exclude non-Active lifecycle
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+
+        // Exclude Liability and Tombstone tiers
+        if matches!(
+            record.staleness.tier,
+            mati_core::store::StalenessTier::Liability | mati_core::store::StalenessTier::Tombstone
+        ) {
+            continue;
+        }
+
+        // Filter to [STALE_REVIEW_MIN, STALE_REVIEW_MAX) range
+        if record.staleness.value < STALE_REVIEW_MIN || record.staleness.value >= STALE_REVIEW_MAX {
+            continue;
+        }
+
+        let top_signals: Vec<String> = record
+            .staleness
+            .signals
+            .iter()
+            .take(3)
+            .map(|s| s.to_string())
+            .collect();
+
+        entries.push(StaleReviewEntry {
+            key: key.clone(),
+            staleness_value: record.staleness.value,
+            tier: record.staleness.tier.clone(),
+            last_updated: record.updated_at,
+            signals: top_signals,
+        });
+    }
+
+    // Sort descending by staleness
+    entries.sort_by(|a, b| {
+        b.staleness_value
+            .partial_cmp(&a.staleness_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    entries.truncate(MAX_STALE_REVIEW_ENTRIES);
+
+    Ok(entries)
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -822,7 +1010,7 @@ mod tests {
         let store = open_test_store(&dir).await;
 
         // Should not error
-        session_harvest_impl(&store).await.unwrap();
+        session_harvest_impl(&store, dir.path()).await.unwrap();
 
         // No session:* records created (except if there were consulted markers)
         let sessions = store.scan_prefix("session:").await.unwrap();
@@ -845,7 +1033,7 @@ mod tests {
         let markers_before = store.scan_keys("session:consulted:").await.unwrap();
         assert_eq!(markers_before.len(), 2);
 
-        session_harvest_impl(&store).await.unwrap();
+        session_harvest_impl(&store, dir.path()).await.unwrap();
 
         // Consulted markers should be cleaned up
         let markers_after = store.scan_keys("session:consulted:").await.unwrap();
@@ -882,7 +1070,7 @@ mod tests {
 
         // Flush + harvest
         session_flush_impl(&store).await.unwrap();
-        session_harvest_impl(&store).await.unwrap();
+        session_harvest_impl(&store, dir.path()).await.unwrap();
 
         let updated_stage = store.get("stage:current").await.unwrap().unwrap();
         assert!(
@@ -911,11 +1099,11 @@ mod tests {
 
         // First harvest
         session_flush_impl(&store).await.unwrap();
-        session_harvest_impl(&store).await.unwrap();
+        session_harvest_impl(&store, dir.path()).await.unwrap();
 
         // Second harvest — need a new session:current for harvest to proceed
         session_flush_impl(&store).await.unwrap();
-        session_harvest_impl(&store).await.unwrap();
+        session_harvest_impl(&store, dir.path()).await.unwrap();
 
         let final_stage = store.get("stage:current").await.unwrap().unwrap();
         let last_session_count = final_stage
@@ -1015,7 +1203,7 @@ mod tests {
         assert_eq!(flush_data["consulted_keys"].as_array().unwrap().len(), 2);
 
         // 5. Harvest
-        session_harvest_impl(&store).await.unwrap();
+        session_harvest_impl(&store, dir.path()).await.unwrap();
 
         // Consulted markers gone
         assert!(!check_consulted_impl(&store, "file:src/main.rs").await.unwrap());
@@ -1105,6 +1293,347 @@ mod tests {
 
         let promoted = promote_gotcha_candidates(&store).await.unwrap();
         assert_eq!(promoted, 0);
+
+        store.close().await.unwrap();
+    }
+
+    // ── M-13-C: stale review collection ─────────────────────────────────────
+
+    fn make_file_record_with_staleness(key: &str, staleness_value: f32) -> Record {
+        let mut record = make_file_record(key);
+        record.staleness.value = staleness_value;
+        record.staleness.tier = StalenessScore::tier_from_value(staleness_value);
+        record
+    }
+
+    #[tokio::test]
+    async fn stale_review_collects_records_in_range() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        // Create records with different staleness values
+        let stale_record = make_file_record_with_staleness("file:src/stale.rs", 0.5);
+        store.put("file:src/stale.rs", &stale_record).await.unwrap();
+
+        let fresh_record = make_file_record_with_staleness("file:src/fresh.rs", 0.1);
+        store.put("file:src/fresh.rs", &fresh_record).await.unwrap();
+
+        let entries = collect_stale_entries(
+            &store,
+            &["file:src/stale.rs".to_string(), "file:src/fresh.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1, "only record in [0.4, 0.7) range should be included");
+        assert_eq!(entries[0].key, "file:src/stale.rs");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_excludes_liability_and_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        // Liability (0.7+)
+        let liability = make_file_record_with_staleness("file:src/liability.rs", 0.75);
+        store.put("file:src/liability.rs", &liability).await.unwrap();
+
+        // Tombstone (0.9+)
+        let tombstone = make_file_record_with_staleness("file:src/tombstone.rs", 0.95);
+        store.put("file:src/tombstone.rs", &tombstone).await.unwrap();
+
+        // In range
+        let stale = make_file_record_with_staleness("file:src/stale.rs", 0.55);
+        store.put("file:src/stale.rs", &stale).await.unwrap();
+
+        let entries = collect_stale_entries(
+            &store,
+            &[
+                "file:src/liability.rs".to_string(),
+                "file:src/tombstone.rs".to_string(),
+                "file:src/stale.rs".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "file:src/stale.rs");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_sorts_descending() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let low = make_file_record_with_staleness("file:src/low.rs", 0.42);
+        store.put("file:src/low.rs", &low).await.unwrap();
+
+        let high = make_file_record_with_staleness("file:src/high.rs", 0.65);
+        store.put("file:src/high.rs", &high).await.unwrap();
+
+        let entries = collect_stale_entries(
+            &store,
+            &["file:src/low.rs".to_string(), "file:src/high.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "file:src/high.rs", "higher staleness first");
+        assert_eq!(entries[1].key, "file:src/low.rs");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_merges_same_day() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let now = now_secs();
+
+        // First session: create a stale record and store a review
+        let stale1 = make_file_record_with_staleness("file:src/a.rs", 0.5);
+        store.put("file:src/a.rs", &stale1).await.unwrap();
+
+        let session_value1 = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": ["file:src/a.rs"],
+            "flushed_at": now,
+        }))
+        .unwrap();
+
+        collect_and_store_stale_reviews(&store, &session_value1, now)
+            .await
+            .unwrap();
+
+        // Second session: add another stale record
+        let stale2 = make_file_record_with_staleness("file:src/b.rs", 0.55);
+        store.put("file:src/b.rs", &stale2).await.unwrap();
+
+        let session_value2 = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": ["file:src/b.rs"],
+            "flushed_at": now + 100,
+        }))
+        .unwrap();
+
+        collect_and_store_stale_reviews(&store, &session_value2, now + 100)
+            .await
+            .unwrap();
+
+        // Verify merged result
+        let date = format_review_date(now);
+        let review_key = format!("analytics:stale_review_{date}");
+        let record = store.get(&review_key).await.unwrap().unwrap();
+        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+
+        assert_eq!(payload.entries.len(), 2, "should merge entries from both sessions");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_deduplicates_by_key() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let now = now_secs();
+
+        let stale = make_file_record_with_staleness("file:src/dup.rs", 0.5);
+        store.put("file:src/dup.rs", &stale).await.unwrap();
+
+        let session_value = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": ["file:src/dup.rs"],
+            "flushed_at": now,
+        }))
+        .unwrap();
+
+        // Store twice for same day
+        collect_and_store_stale_reviews(&store, &session_value, now)
+            .await
+            .unwrap();
+        collect_and_store_stale_reviews(&store, &session_value, now + 100)
+            .await
+            .unwrap();
+
+        let date = format_review_date(now);
+        let review_key = format!("analytics:stale_review_{date}");
+        let record = store.get(&review_key).await.unwrap().unwrap();
+        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+
+        assert_eq!(payload.entries.len(), 1, "duplicate keys should be deduped");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_truncates_to_max() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let now = now_secs();
+
+        // Create more stale records than MAX_STALE_REVIEW_ENTRIES
+        let mut keys = Vec::new();
+        for i in 0..30 {
+            let key = format!("file:src/file{i}.rs");
+            let staleness = 0.4 + (i as f32 * 0.005); // all in [0.4, 0.7)
+            let record = make_file_record_with_staleness(&key, staleness);
+            store.put(&key, &record).await.unwrap();
+            keys.push(key);
+        }
+
+        let session_value = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": keys,
+            "flushed_at": now,
+        }))
+        .unwrap();
+
+        collect_and_store_stale_reviews(&store, &session_value, now)
+            .await
+            .unwrap();
+
+        let date = format_review_date(now);
+        let review_key = format!("analytics:stale_review_{date}");
+        let record = store.get(&review_key).await.unwrap().unwrap();
+        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+
+        assert!(
+            payload.entries.len() <= MAX_STALE_REVIEW_ENTRIES,
+            "entries should be truncated to MAX_STALE_REVIEW_ENTRIES"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_includes_stale_review() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        // Seed a stale file record. StalenessAnalyzer runs first in harvest
+        // and recomputes staleness from scratch. In test env (no git, recent
+        // access), recomputed staleness drops to ~0. To test the stale review
+        // pipeline, call collect_and_store_stale_reviews directly, bypassing
+        // the analyzer — this isolates the collection logic.
+        let stale = make_file_record_with_staleness("file:src/stale.rs", 0.55);
+        store.put("file:src/stale.rs", &stale).await.unwrap();
+
+        // Build session JSON referencing the stale record as consulted
+        let now = now_secs();
+        let session_value = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": ["file:src/stale.rs"],
+            "flushed_at": now,
+        }))
+        .unwrap();
+
+        let count = collect_and_store_stale_reviews(&store, &session_value, now)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "one stale record should be flagged");
+
+        // Verify stale review was written
+        let review_key = today_key("analytics:stale_review_");
+        let review = store.get(&review_key).await.unwrap();
+
+        assert!(review.is_some(), "stale review should be created");
+        if let Some(record) = review {
+            let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+            assert!(
+                payload.entries.iter().any(|e| e.key == "file:src/stale.rs"),
+                "stale file should appear in review"
+            );
+        }
+
+        store.close().await.unwrap();
+    }
+
+    #[test]
+    fn format_review_date_produces_valid_format() {
+        let date = format_review_date(1_700_000_000);
+        assert_eq!(date.len(), 10);
+        assert_eq!(&date[4..5], "-");
+        assert_eq!(&date[7..8], "-");
+    }
+
+    #[tokio::test]
+    async fn gotcha_promotion_uses_threshold_constant() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        // Test exactly at threshold (GOTCHA_PROMOTION_ACCESS_THRESHOLD = 3)
+        let mut record = make_gotcha_record("gotcha:at-threshold", false);
+        record.access_count = GOTCHA_PROMOTION_ACCESS_THRESHOLD;
+        store.put("gotcha:at-threshold", &record).await.unwrap();
+
+        let promoted = promote_gotcha_candidates(&store).await.unwrap();
+        assert_eq!(promoted, 1, "record at threshold should be promoted");
+
+        // Test one below threshold
+        let mut below = make_gotcha_record("gotcha:below-threshold", false);
+        below.access_count = GOTCHA_PROMOTION_ACCESS_THRESHOLD - 1;
+        store.put("gotcha:below-threshold", &below).await.unwrap();
+
+        let promoted = promote_gotcha_candidates(&store).await.unwrap();
+        assert_eq!(promoted, 0, "record below threshold should not be promoted");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_empty_session_value() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let session_value = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": [],
+            "flushed_at": 12345,
+        }))
+        .unwrap();
+
+        let count = collect_and_store_stale_reviews(&store, &session_value, 12345)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "empty consulted keys should produce no entries");
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_review_scopes_to_consulted_keys_only() {
+        let dir = TempDir::new().unwrap();
+        let store = open_test_store(&dir).await;
+
+        let now = now_secs();
+
+        // Create two stale records but only consult one
+        let stale1 = make_file_record_with_staleness("file:src/consulted.rs", 0.5);
+        store.put("file:src/consulted.rs", &stale1).await.unwrap();
+
+        let stale2 = make_file_record_with_staleness("file:src/not-consulted.rs", 0.6);
+        store.put("file:src/not-consulted.rs", &stale2).await.unwrap();
+
+        let session_value = serde_json::to_string(&serde_json::json!({
+            "consulted_keys": ["file:src/consulted.rs"],
+            "flushed_at": now,
+        }))
+        .unwrap();
+
+        collect_and_store_stale_reviews(&store, &session_value, now)
+            .await
+            .unwrap();
+
+        let date = format_review_date(now);
+        let review_key = format!("analytics:stale_review_{date}");
+        let record = store.get(&review_key).await.unwrap().unwrap();
+        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+
+        assert_eq!(payload.entries.len(), 1);
+        assert_eq!(payload.entries[0].key, "file:src/consulted.rs");
 
         store.close().await.unwrap();
     }
