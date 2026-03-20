@@ -1,4 +1,5 @@
 pub mod colors;
+pub mod daemon;
 pub mod enrich;
 pub mod gaps;
 pub mod gotcha;

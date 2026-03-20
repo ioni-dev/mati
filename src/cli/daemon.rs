@@ -1,31 +1,48 @@
 //! Daemon mode — keeps Store open to eliminate CLI startup overhead (M-17-A).
 //!
 //! The daemon listens on a Unix socket (`~/.mati/<slug>/mati.sock`) and handles
-//! newline-delimited JSON requests. Hook commands (`mati get`, `mati log-hit`,
-//! `mati log-miss`) connect via [`daemon_request`] to skip the ~150ms
-//! SurrealKV + tantivy init that a cold `Store::open` incurs.
+//! newline-delimited JSON requests. Hook commands route through [`daemon_result`]
+//! to skip the ~150ms SurrealKV init cost on every hook invocation.
 //!
-//! **Protocol:** One JSON request per connection, one JSON response, then close.
+//! ## Protocol
 //!
-//! Request:
+//! One JSON request per connection, one JSON response, then close.
+//!
 //! ```json
-//! {"cmd":"get","args":{"key":"file:src/main.rs"}}
-//! {"cmd":"log_hit","args":{"key":"file:src/main.rs"}}
-//! {"cmd":"log_miss","args":{"key":"file:src/main.rs"}}
-//! {"cmd":"ping","args":{}}
+//! // Request
+//! {"v":1,"cmd":"get","args":{"key":"file:src/main.rs"}}
+//! {"v":1,"cmd":"log_hit","args":{"key":"file:src/main.rs"}}
+//! {"v":1,"cmd":"log_miss","args":{"key":"file:src/main.rs"}}
+//! {"v":1,"cmd":"log_compliance_miss","args":{"key":"file:src/main.rs"}}
+//! {"v":1,"cmd":"session_check_consulted","args":{"key":"file:src/main.rs"}}
+//! {"v":1,"cmd":"edit_hook","args":{"path":"src/main.rs"}}
+//! {"v":1,"cmd":"session_flush","args":{}}
+//! {"v":1,"cmd":"ping","args":{}}
+//!
+//! // Response
+//! {"ok":true,"v":1,"data":<value>}
+//! {"ok":false,"v":1,"error":"description"}
 //! ```
 //!
-//! Response:
-//! ```json
-//! {"ok":true,"data":"<json value>"}
-//! {"ok":false,"error":"description"}
-//! ```
+//! ## Lifecycle
 //!
-//! **Connection model:** Sequential (one connection at a time on the main task).
-//! Claude hooks fire serially within a session, so parallel handling is
-//! unnecessary. This sidesteps `Store` not being `Send`/`Sync`.
+//! Self-managing — no agent-specific session hooks required:
+//! - Start: `mati daemon start` (or any agent's session-start script)
+//! - Auto-shutdown: after [`IDLE_SHUTDOWN_SECS`] with no requests, using **wall clock**
+//!   so sleep/wake cycles correctly count toward idle time (tokio monotonic clock
+//!   freezes during system sleep and would never fire after a long hibernate).
+//! - Signal shutdown: SIGINT / SIGTERM → flush store, remove socket + PID file.
+//! - `mati init` and other commands needing direct store access must stop the daemon
+//!   first — SurrealKV holds a process-level exclusive lock.
+//!
+//! ## Connection model
+//!
+//! Sequential (one connection at a time). Hooks fire serially within a session, so
+//! parallel handling is unnecessary and avoids `Store` Send/Sync requirements.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -35,11 +52,28 @@ use tokio::net::{UnixListener, UnixStream};
 
 use mati_core::store::{derive_slug, Store};
 
-// ── Protocol types ──────────────────────────────────────────────────────────
+// ── Protocol constants ───────────────────────────────────────────────────────
+
+/// Bump when request/response format changes incompatibly. Clients that send a
+/// different version get an error and must fall back to direct `Store::open`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Idle shutdown threshold — wall-clock seconds with no requests.
+/// Uses wall time (not monotonic) so sleep/wake contributes correctly.
+const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
+
+/// How often to sample wall-clock idle time. Fine enough to catch post-wake
+/// idle windows; coarse enough not to burn cycles.
+const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // every 5 min
+
+// ── Protocol types ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct Request {
     cmd: String,
+    /// Protocol version from client. `None` for legacy clients (treated as compatible).
+    #[serde(default, rename = "v")]
+    version: Option<u32>,
     #[serde(default)]
     args: serde_json::Value,
 }
@@ -47,6 +81,9 @@ struct Request {
 #[derive(Debug, Serialize)]
 struct Response {
     ok: bool,
+    /// Always the daemon's version so clients can detect skew.
+    #[serde(rename = "v")]
+    version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,48 +92,105 @@ struct Response {
 
 impl Response {
     fn ok(data: serde_json::Value) -> Self {
-        Self { ok: true, data: Some(data), error: None }
+        Self { ok: true, version: PROTOCOL_VERSION, data: Some(data), error: None }
     }
-
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, data: None, error: Some(msg.into()) }
+        Self { ok: false, version: PROTOCOL_VERSION, data: None, error: Some(msg.into()) }
     }
 }
 
-// ── Read timeout ────────────────────────────────────────────────────────────
+/// Outcome of a [`daemon_result`] call. Each variant carries the information
+/// the caller needs to decide whether to fall back to `Store::open`.
+#[derive(Debug)]
+pub enum DaemonResult {
+    /// Daemon responded. The value is the full JSON response (`ok`, `v`, `data`/`error`).
+    Ok(serde_json::Value),
+    /// No socket file — daemon is not running. **Safe** to use `Store::open`.
+    NotRunning,
+    /// Socket was stale (ECONNREFUSED + PID dead). Files cleaned up.
+    /// **Safe** to use `Store::open`.
+    StaleSocket,
+    /// Daemon process is alive but not responding (or protocol version mismatch).
+    /// **Not safe** to use `Store::open` — daemon likely holds the SurrealKV lock.
+    /// Callers must degrade gracefully (P9) rather than attempt direct store access.
+    Unresponsive,
+}
 
-/// Maximum time to wait for a complete request line from a client connection.
-/// Prevents a stale or misbehaving connection from blocking the sequential
-/// serve loop indefinitely.
+// ── Connection timeout ───────────────────────────────────────────────────────
+
+/// Max wait for a complete request line per connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
-// ── Server ──────────────────────────────────────────────────────────────────
+// ── Server ───────────────────────────────────────────────────────────────────
 
 /// Start the daemon: open the Store, bind the Unix socket, and serve forever.
 ///
-/// Blocks until SIGINT/SIGTERM. Cleans up the socket and PID file on exit.
+/// Exits cleanly on SIGINT, SIGTERM, or after [`IDLE_SHUTDOWN_SECS`] of wall-clock
+/// idle time. Removes the socket and PID file on any exit path.
 pub async fn run_daemon_start() -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let repo_root = Arc::new(std::fs::canonicalize(&cwd)?);
     let store = Store::open(&cwd).await?;
 
     let sock_path = store.root.join("mati.sock");
     let pid_path = store.root.join("mati.pid");
 
-    // Remove stale socket from a previous unclean shutdown
+    // Remove stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(&sock_path);
 
-    // Write PID file so `mati daemon stop` can signal us
     std::fs::write(&pid_path, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
 
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind Unix socket at {}", sock_path.display()))?;
 
-    tracing::info!(path = %sock_path.display(), pid = std::process::id(), "mati daemon listening");
-    eprintln!("mati daemon listening on {}", sock_path.display());
+    tracing::info!(
+        path = %sock_path.display(),
+        pid = std::process::id(),
+        "mati daemon listening"
+    );
+    eprintln!(
+        "mati daemon listening on {} (idle shutdown: {}min)",
+        sock_path.display(),
+        IDLE_SHUTDOWN_SECS / 60
+    );
 
-    // Graceful shutdown on SIGINT (ctrl-c) or SIGTERM
-    let shutdown = async {
+    // Wall-clock timestamp of last accepted connection. Updated in serve_loop.
+    // Intentionally uses wall clock, not monotonic — monotonic freezes during sleep.
+    let last_wall = Arc::new(AtomicU64::new(wall_secs()));
+
+    // Idle-check background task. Fires every IDLE_CHECK_INTERVAL_SECS and compares
+    // wall-clock elapsed time against IDLE_SHUTDOWN_SECS.
+    let idle_notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let last_wall = last_wall.clone();
+        let notify = idle_notify.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let now = wall_secs();
+                let last = last_wall.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= IDLE_SHUTDOWN_SECS {
+                    tracing::info!(
+                        idle_secs = now.saturating_sub(last),
+                        "mati daemon: idle shutdown"
+                    );
+                    eprintln!(
+                        "mati daemon: idle {}min — shutting down",
+                        IDLE_SHUTDOWN_SECS / 60
+                    );
+                    notify.notify_one();
+                    break;
+                }
+            }
+        });
+    }
+
+    // Graceful shutdown on SIGINT or SIGTERM.
+    let signal_shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
@@ -115,48 +209,57 @@ pub async fn run_daemon_start() -> Result<()> {
     };
 
     tokio::select! {
-        _ = serve_loop(&store, &listener) => {}
-        _ = shutdown => {
-            tracing::info!("mati daemon shutting down");
+        _ = serve_loop(&store, &repo_root, &listener, &last_wall) => {}
+        _ = signal_shutdown => {
+            tracing::info!("mati daemon: signal shutdown");
             eprintln!("mati daemon shutting down");
+        }
+        _ = idle_notify.notified() => {
+            // Message already printed in idle-check task.
         }
     }
 
-    // Cleanup
+    // Cleanup — runs on every exit path.
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     store.close().await?;
-
     Ok(())
 }
 
 /// Accept and handle connections sequentially — one at a time.
-///
-/// Sequential handling is intentional: `Store` is not `Send`/`Sync`, and hooks
-/// fire serially within a single Claude session. This keeps the implementation
-/// simple and avoids any interior mutability overhead.
-async fn serve_loop(store: &Store, listener: &UnixListener) {
+async fn serve_loop(
+    store: &Store,
+    repo_root: &Path,
+    listener: &UnixListener,
+    last_wall: &AtomicU64,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                if let Err(e) = handle_connection(store, stream).await {
-                    tracing::warn!(error = %e, "daemon connection error");
+                // Stamp wall time on every accepted connection so idle-shutdown
+                // correctly measures time since the last request, not since startup.
+                last_wall.store(wall_secs(), Ordering::Relaxed);
+                if let Err(e) = handle_connection(store, repo_root, stream).await {
+                    tracing::warn!(error = %e, "daemon: connection error");
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "daemon accept error");
+                tracing::warn!(error = %e, "daemon: accept error");
             }
         }
     }
 }
 
-/// Read one JSON request line, dispatch it, write one JSON response line.
-async fn handle_connection(store: &Store, stream: UnixStream) -> Result<()> {
+/// Read one JSON request, dispatch, write one JSON response.
+async fn handle_connection(
+    store: &Store,
+    repo_root: &Path,
+    stream: UnixStream,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
 
-    // Read with timeout to avoid blocking the serve loop on a stale connection
     match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line)).await {
         Ok(Ok(0)) => return Ok(()), // client closed without sending
         Ok(Ok(_)) => {}
@@ -167,19 +270,16 @@ async fn handle_connection(store: &Store, stream: UnixStream) -> Result<()> {
     let request: Request = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(e) => {
-            let resp = Response::err(format!("invalid JSON: {e}"));
-            write_response(&mut writer, &resp).await?;
+            write_response(&mut writer, &Response::err(format!("invalid JSON: {e}"))).await?;
             return Ok(());
         }
     };
 
-    let response = dispatch(store, &request).await;
+    let response = dispatch(store, repo_root, &request).await;
     write_response(&mut writer, &response).await?;
-
     Ok(())
 }
 
-/// Write a JSON response followed by a newline, then flush.
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: &Response,
@@ -191,28 +291,39 @@ async fn write_response(
     Ok(())
 }
 
-/// Route a request to the appropriate store operation.
-async fn dispatch(store: &Store, req: &Request) -> Response {
+/// Route a request to the appropriate handler.
+async fn dispatch(store: &Store, repo_root: &Path, req: &Request) -> Response {
+    // Version check. Explicit mismatch → error so client falls back rather than
+    // misinterpreting a response from an incompatible daemon.
+    if let Some(v) = req.version {
+        if v != PROTOCOL_VERSION {
+            return Response::err(format!(
+                "protocol version mismatch: client={v} daemon={PROTOCOL_VERSION}; \
+                 run `mati daemon stop && mati daemon start` to upgrade"
+            ));
+        }
+    }
+
     match req.cmd.as_str() {
-        "get" => cmd_get(store, &req.args).await,
-        "log_hit" => cmd_log_hit(store, &req.args).await,
-        "log_miss" => cmd_log_miss(store, &req.args).await,
-        "log_compliance_miss" => cmd_log_compliance_miss(store, &req.args).await,
+        "get"                     => cmd_get(store, &req.args).await,
+        "log_hit"                 => cmd_log_hit(store, &req.args).await,
+        "log_miss"                => cmd_log_miss(store, &req.args).await,
+        "log_compliance_miss"     => cmd_log_compliance_miss(store, &req.args).await,
         "session_check_consulted" => cmd_session_check_consulted(store, &req.args).await,
-        "ping" => Response::ok(serde_json::Value::String("pong".into())),
+        "edit_hook"               => cmd_edit_hook(store, repo_root, &req.args).await,
+        "session_flush"           => cmd_session_flush(store).await,
+        "ping"                    => Response::ok(serde_json::Value::String("pong".into())),
         other => Response::err(format!("unknown command: {other}")),
     }
 }
 
-// ── Command handlers ────────────────────────────────────────────────────────
+// ── Command handlers ─────────────────────────────────────────────────────────
 
-/// Fetch a record by key — mirrors `hooks::run_get` logic.
 async fn cmd_get(store: &Store, args: &serde_json::Value) -> Response {
     let key = match args.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-
     match store.get(key).await {
         Ok(Some(record)) => match serde_json::to_value(&record) {
             Ok(val) => Response::ok(val),
@@ -223,83 +334,63 @@ async fn cmd_get(store: &Store, args: &serde_json::Value) -> Response {
     }
 }
 
-/// Bump access_count and mark consulted — mirrors `hooks::log_hit_impl` logic.
 async fn cmd_log_hit(store: &Store, args: &serde_json::Value) -> Response {
     let key = match args.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-
     let now = now_secs();
 
-    // 1. Daily hit aggregation
     let agg_key = today_key("analytics:hit_");
     if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
         tracing::warn!(error = %e, "daemon: hit aggregation failed");
     }
 
-    // 2. Mark as consulted for session tracking
     let consulted_key = format!("session:consulted:{key}");
-    let marker = session_record(&consulted_key, String::new());
-    if let Err(e) = store.put(&consulted_key, &marker).await {
+    if let Err(e) = store.put(&consulted_key, &session_record(&consulted_key, String::new())).await {
         tracing::warn!(error = %e, "daemon: consulted marker failed");
     }
 
-    // 3. Bump access_count and last_accessed on the target record
-    match store.get(key).await {
-        Ok(Some(mut record)) => {
-            record.access_count += 1;
-            record.last_accessed = now;
-            if let Err(e) = store.put(key, &record).await {
-                tracing::warn!(error = %e, "daemon: access_count bump failed");
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "daemon: get for access_count failed");
+    if let Ok(Some(mut record)) = store.get(key).await {
+        record.access_count += 1;
+        record.last_accessed = now;
+        if let Err(e) = store.put(key, &record).await {
+            tracing::warn!(error = %e, "daemon: access_count bump failed");
         }
     }
 
     Response::ok(serde_json::Value::String("hit logged".into()))
 }
 
-/// Record a miss — mirrors `hooks::log_miss_impl` logic.
 async fn cmd_log_miss(store: &Store, args: &serde_json::Value) -> Response {
     let key = match args.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-
     let agg_key = today_key("analytics:miss_");
     if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
         return Response::err(format!("miss aggregation failed: {e}"));
     }
-
     Response::ok(serde_json::Value::String("miss logged".into()))
 }
 
-/// Record a compliance miss — mirrors `hooks::log_compliance_miss_impl` logic.
 async fn cmd_log_compliance_miss(store: &Store, args: &serde_json::Value) -> Response {
     let key = match args.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-
     let agg_key = today_key("compliance:miss_");
     if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
         return Response::err(format!("compliance miss aggregation failed: {e}"));
     }
-
     Response::ok(serde_json::Value::String("compliance miss logged".into()))
 }
 
-/// Check if a key was consulted this session — mirrors `hooks::check_consulted_impl`.
 async fn cmd_session_check_consulted(store: &Store, args: &serde_json::Value) -> Response {
     let key = match args.get("key").and_then(|v| v.as_str()) {
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-
     let consulted_key = format!("session:consulted:{key}");
     match store.get(&consulted_key).await {
         Ok(Some(_)) => Response::ok(serde_json::Value::Bool(true)),
@@ -308,13 +399,209 @@ async fn cmd_session_check_consulted(store: &Store, args: &serde_json::Value) ->
     }
 }
 
-// ── Shared helpers (mirrors hooks.rs) ───────────────────────────────────────
+/// Combined log-hit + reparse. The daemon already has the store open so this
+/// avoids the ~200ms SurrealKV re-open cost that `run_edit_hook` incurs as a
+/// standalone process.
+async fn cmd_edit_hook(store: &Store, repo_root: &Path, args: &serde_json::Value) -> Response {
+    let path = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Response::err("missing args.path"),
+    };
+    let file_key = format!("file:{path}");
+    let now = now_secs();
+
+    // log-hit (best-effort — mirrors log_hit_impl in hooks.rs)
+    let agg_key = today_key("analytics:hit_");
+    let _ = upsert_daily_agg(store, &agg_key, &file_key).await;
+    let consulted_key = format!("session:consulted:{file_key}");
+    let _ = store.put(&consulted_key, &session_record(&consulted_key, String::new())).await;
+    if let Ok(Some(mut record)) = store.get(&file_key).await {
+        record.access_count += 1;
+        record.last_accessed = now;
+        let _ = store.put(&file_key, &record).await;
+    }
+
+    // reparse (best-effort — non-fatal per P9)
+    if let Err(e) = crate::cli::reparse::reparse_impl(store, repo_root, path).await {
+        tracing::warn!(path, error = %e, "daemon edit_hook: reparse failed (non-fatal)");
+    }
+
+    Response::ok(serde_json::Value::Null)
+}
+
+/// Flush consulted-key markers into `session:current`.
+/// Mirrors `session_flush_impl` in hooks.rs. Called at session end before harvest.
+async fn cmd_session_flush(store: &Store) -> Response {
+    let now = now_secs();
+    let consulted_keys = match store.scan_keys("session:consulted:").await {
+        Ok(keys) => keys,
+        Err(e) => return Response::err(format!("scan_keys error: {e}")),
+    };
+    let stripped: Vec<String> = consulted_keys
+        .iter()
+        .map(|k| k.strip_prefix("session:consulted:").unwrap_or(k).to_string())
+        .collect();
+    let value = match serde_json::to_string(&serde_json::json!({
+        "consulted_keys": stripped,
+        "flushed_at": now,
+    })) {
+        Ok(v) => v,
+        Err(e) => return Response::err(format!("serialize error: {e}")),
+    };
+    match store.put("session:current", &session_record("session:current", value)).await {
+        Ok(()) => Response::ok(serde_json::Value::String("flushed".into())),
+        Err(e) => Response::err(format!("store error: {e}")),
+    }
+}
+
+// ── Client ───────────────────────────────────────────────────────────────────
+
+/// Send a request to the daemon and return a [`DaemonResult`].
+///
+/// Handles three failure modes:
+/// - **No socket** → [`DaemonResult::NotRunning`] — safe to use `Store::open`
+/// - **ECONNREFUSED + PID dead** → clean up stale files, [`DaemonResult::StaleSocket`] — safe to use `Store::open`
+/// - **PID alive but not responding** → [`DaemonResult::Unresponsive`] — **unsafe** to use `Store::open`
+pub async fn daemon_result(
+    root: &Path,
+    cmd: &str,
+    args: serde_json::Value,
+) -> DaemonResult {
+    let sock_path = root.join("mati.sock");
+
+    if !sock_path.exists() {
+        return DaemonResult::NotRunning;
+    }
+
+    let stream = match UnixStream::connect(&sock_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+            if is_refused {
+                if is_pid_dead(root) {
+                    // Stale socket — clean up so next direct open works.
+                    let _ = std::fs::remove_file(&sock_path);
+                    let _ = std::fs::remove_file(&root.join("mati.pid"));
+                    tracing::debug!("daemon: removed stale socket");
+                    return DaemonResult::StaleSocket;
+                } else {
+                    tracing::warn!("daemon: socket refused but PID alive — unresponsive");
+                    return DaemonResult::Unresponsive;
+                }
+            }
+            // Any other error (ENOENT race, permission, etc.) — treat as not running.
+            tracing::debug!(error = %e, "daemon: connect failed, treating as not running");
+            return DaemonResult::NotRunning;
+        }
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({ "v": PROTOCOL_VERSION, "cmd": cmd, "args": args });
+    let mut bytes = match serde_json::to_vec(&request) {
+        Ok(b) => b,
+        Err(_) => return DaemonResult::Unresponsive,
+    };
+    bytes.push(b'\n');
+
+    if writer.write_all(&bytes).await.is_err() {
+        return DaemonResult::Unresponsive;
+    }
+    if writer.shutdown().await.is_err() {
+        return DaemonResult::Unresponsive;
+    }
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    match tokio::time::timeout(Duration::from_secs(2), buf_reader.read_line(&mut line)).await {
+        Ok(Ok(n)) if n > 0 => {}
+        _ => return DaemonResult::Unresponsive,
+    }
+
+    let resp: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return DaemonResult::Unresponsive,
+    };
+
+    // Protocol version mismatch — client must not interpret this response.
+    // Treat as Unresponsive: daemon is alive (holds the lock) but incompatible.
+    if let Some(v) = resp.get("v").and_then(|v| v.as_u64()) {
+        if v as u32 != PROTOCOL_VERSION {
+            tracing::warn!(
+                daemon_v = v,
+                client_v = PROTOCOL_VERSION,
+                "daemon: protocol version mismatch — restart daemon to upgrade"
+            );
+            return DaemonResult::Unresponsive;
+        }
+    }
+
+    DaemonResult::Ok(resp)
+}
+
+/// Convenience wrapper: extract the `data` field from a successful `get` response.
+///
+/// Returns the JSON string of the record (or `"null"`), or `None` if the daemon
+/// is unavailable or the result should not be used.
+pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
+    match daemon_result(root, "get", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(resp) => {
+            if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                return None;
+            }
+            match resp.get("data") {
+                Some(d) if d.is_null() => Some("null".to_string()),
+                Some(d) => Some(d.to_string()),
+                None => None,
+            }
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => None,
+        DaemonResult::Unresponsive => None,
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Derive `~/.mati/<slug>/` for the given working directory (repo root).
+///
+/// Public so `hooks.rs` and `init.rs` can compute the socket/PID path without
+/// duplicating the slug derivation logic.
+pub fn mati_root_for(cwd: &Path) -> Result<PathBuf> {
+    let slug = derive_slug(cwd);
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    Ok(home.join(".mati").join(slug))
+}
+
+/// Returns `true` if the PID recorded in the PID file is no longer alive.
+/// Uses `kill -0` (no signal sent, just checks process existence).
+/// Returns `true` (assume dead) if the PID file is absent or unreadable.
+fn is_pid_dead(root: &Path) -> bool {
+    let pid_path = root.join("mati.pid");
+    match std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(pid) => !std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+/// Derive the `~/.mati/<slug>/` path for the current working directory.
+fn project_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    mati_root_for(&cwd)
+}
+
+/// Unix seconds from wall clock (not monotonic — survives sleep/wake).
+fn wall_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    wall_secs()
 }
 
 fn today_key(prefix: &str) -> String {
@@ -364,7 +651,6 @@ fn analytics_record(key: &str, value: String) -> Record {
     r
 }
 
-/// Daily aggregation value.
 #[derive(Serialize, Deserialize)]
 struct DailyAgg {
     count: u64,
@@ -373,16 +659,12 @@ struct DailyAgg {
 
 const MAX_AGG_KEYS: usize = 100;
 
-/// Upsert a daily aggregation record (hit or miss counter).
 async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
     let now = now_secs();
-
     match store.get(agg_key).await? {
         Some(mut record) => {
-            let mut agg: DailyAgg = serde_json::from_str(&record.value).unwrap_or(DailyAgg {
-                count: 0,
-                keys: vec![],
-            });
+            let mut agg: DailyAgg =
+                serde_json::from_str(&record.value).unwrap_or(DailyAgg { count: 0, keys: vec![] });
             agg.count += 1;
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
@@ -394,10 +676,7 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
             store.put(agg_key, &record).await?;
         }
         None => {
-            let agg = DailyAgg {
-                count: 1,
-                keys: vec![target_key.to_string()],
-            };
+            let agg = DailyAgg { count: 1, keys: vec![target_key.to_string()] };
             let record = analytics_record(agg_key, serde_json::to_string(&agg)?);
             store.put(agg_key, &record).await?;
         }
@@ -405,7 +684,7 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
     Ok(())
 }
 
-// ── Stop ────────────────────────────────────────────────────────────────────
+// ── Stop ─────────────────────────────────────────────────────────────────────
 
 /// Stop a running daemon by sending SIGTERM to the PID in the PID file.
 pub async fn run_daemon_stop() -> Result<()> {
@@ -420,20 +699,16 @@ pub async fn run_daemon_stop() -> Result<()> {
 
     if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // Use kill(1) to send SIGTERM — no libc/nix dependency needed
             let status = std::process::Command::new("kill")
                 .arg("-TERM")
                 .arg(pid.to_string())
                 .status();
-
             match status {
                 Ok(s) if s.success() => {
-                    // Wait briefly for the daemon to clean up
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     println!("mati daemon stopped (pid {pid})");
                 }
                 Ok(_) => {
-                    // kill failed (process already dead) — clean up stale files
                     println!("mati daemon process {pid} already exited — cleaning up");
                 }
                 Err(e) => {
@@ -444,14 +719,12 @@ pub async fn run_daemon_stop() -> Result<()> {
         }
     }
 
-    // Always clean up stale socket and PID files
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
-
     Ok(())
 }
 
-// ── Status ──────────────────────────────────────────────────────────────────
+// ── Status ───────────────────────────────────────────────────────────────────
 
 /// Check if the daemon is running and responsive.
 pub async fn run_daemon_status() -> Result<()> {
@@ -468,19 +741,37 @@ pub async fn run_daemon_status() -> Result<()> {
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok());
 
-    // Try to ping the daemon
-    match daemon_request(&root, "ping", serde_json::json!({})).await {
-        Some(resp) if resp.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+    match daemon_result(&root, "ping", serde_json::json!({})).await {
+        DaemonResult::Ok(resp)
+            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) =>
+        {
             if let Some(pid) = pid_info {
                 println!("mati daemon is running (pid {pid})");
             } else {
                 println!("mati daemon is running");
             }
             println!("  socket: {}", sock_path.display());
+            println!(
+                "  protocol version: {}",
+                resp.get("v")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
         }
-        _ => {
+        DaemonResult::Unresponsive => {
             println!("mati daemon socket exists but is not responding");
             println!("  socket: {}", sock_path.display());
+            if let Some(pid) = pid_info {
+                println!("  pid: {pid} (alive)");
+            }
+            println!("  run `mati daemon stop` to clean up");
+        }
+        DaemonResult::StaleSocket => {
+            println!("mati daemon: stale socket cleaned up");
+        }
+        _ => {
+            println!("mati daemon is not running");
             if let Some(pid) = pid_info {
                 println!("  stale pid: {pid}");
             }
@@ -491,125 +782,60 @@ pub async fn run_daemon_status() -> Result<()> {
     Ok(())
 }
 
-// ── Client ──────────────────────────────────────────────────────────────────
-
-/// Send a request to the daemon and return the parsed response.
-///
-/// Returns `None` if the daemon is not running, the socket doesn't exist,
-/// or any I/O error occurs. Callers should fall back to direct `Store::open`.
-pub async fn daemon_request(
-    root: &Path,
-    cmd: &str,
-    args: serde_json::Value,
-) -> Option<serde_json::Value> {
-    let sock_path = root.join("mati.sock");
-    if !sock_path.exists() {
-        return None;
-    }
-
-    let stream = UnixStream::connect(&sock_path).await.ok()?;
-    let (reader, mut writer) = stream.into_split();
-
-    let request = serde_json::json!({ "cmd": cmd, "args": args });
-    let mut request_bytes = serde_json::to_vec(&request).ok()?;
-    request_bytes.push(b'\n');
-
-    writer.write_all(&request_bytes).await.ok()?;
-    writer.shutdown().await.ok()?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
-
-    // Read with a short timeout — daemon should respond in <10ms
-    match tokio::time::timeout(Duration::from_secs(2), buf_reader.read_line(&mut line)).await {
-        Ok(Ok(n)) if n > 0 => {}
-        _ => return None,
-    }
-
-    serde_json::from_str(line.trim()).ok()
-}
-
-/// Convenience wrapper: send a `get` command to the daemon.
-///
-/// Returns `Some(json_string)` with the record JSON (or `"null"` if not found),
-/// or `None` if the daemon is unavailable.
-pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
-    let resp = daemon_request(root, "get", serde_json::json!({ "key": key })).await?;
-
-    if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
-        return None;
-    }
-
-    let data = resp.get("data")?;
-    if data.is_null() {
-        Some("null".to_string())
-    } else {
-        Some(data.to_string())
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Derive the `~/.mati/<slug>/` path for the current working directory.
-fn project_root() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    let slug = derive_slug(&cwd);
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    Ok(home.join(".mati").join(slug))
-}
-
-// ── Tests ───────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_response_ok_serialization() {
+    fn response_ok_serialization() {
         let resp = Response::ok(serde_json::json!("pong"));
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""ok":true"#));
         assert!(json.contains(r#""data":"pong""#));
+        assert!(json.contains(r#""v":1"#));
         assert!(!json.contains("error"));
     }
 
     #[test]
-    fn test_response_err_serialization() {
+    fn response_err_serialization() {
         let resp = Response::err("bad request");
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains(r#""ok":false"#));
         assert!(json.contains(r#""error":"bad request""#));
+        assert!(json.contains(r#""v":1"#));
         assert!(!json.contains("data"));
     }
 
     #[test]
-    fn test_request_deserialization() {
-        let json = r#"{"cmd":"get","args":{"key":"file:src/main.rs"}}"#;
+    fn request_with_version() {
+        let json = r#"{"v":1,"cmd":"get","args":{"key":"file:src/main.rs"}}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         assert_eq!(req.cmd, "get");
+        assert_eq!(req.version, Some(1));
         assert_eq!(req.args["key"], "file:src/main.rs");
     }
 
     #[test]
-    fn test_request_deserialization_no_args() {
+    fn request_without_version_is_backward_compatible() {
         let json = r#"{"cmd":"ping"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         assert_eq!(req.cmd, "ping");
-        assert!(req.args.is_null());
+        assert_eq!(req.version, None); // legacy client — treated as compatible
     }
 
     #[tokio::test]
-    async fn test_daemon_get_returns_none_without_socket() {
+    async fn daemon_result_not_running_without_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = daemon_result(tmp.path(), "ping", serde_json::json!({})).await;
+        assert!(matches!(result, DaemonResult::NotRunning));
+    }
+
+    #[tokio::test]
+    async fn daemon_get_returns_none_without_socket() {
         let tmp = tempfile::tempdir().unwrap();
         let result = daemon_get(tmp.path(), "file:src/main.rs").await;
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_daemon_request_returns_none_without_socket() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result =
-            daemon_request(tmp.path(), "ping", serde_json::json!({})).await;
         assert!(result.is_none());
     }
 }
