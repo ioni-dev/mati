@@ -102,11 +102,28 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
 
-    // ── 3. Mtime check + parse in one pass ───────────────────────────────────
-    // For each file: if mtime matches stored → skip (zero disk I/O).
-    // Otherwise → read bytes + run tree-sitter on the same content.
-    let t = Instant::now();
-    let hp = hash_and_parse_parallel(&files, &stored_mtimes);
+    // ── 3–5. Parse + Git + Deps (parallel) ───────────────────────────────────
+    // Git and deps only need walk output — run all three concurrently.
+    // Wall time = max(parse, git, deps) instead of their sum (~252ms saved).
+    let (((hp, parse_ms), (git_result, git_ms)), (dep_result, dep_ms)) = rayon::join(
+        || {
+            rayon::join(
+                || {
+                    let t = Instant::now();
+                    (hash_and_parse_parallel(&files, &stored_mtimes), t.elapsed().as_millis())
+                },
+                || {
+                    let t = Instant::now();
+                    (mine_git_history(&root, &walked_paths), t.elapsed().as_millis())
+                },
+            )
+        },
+        || {
+            let t = Instant::now();
+            (parse_dependencies(&root, &files), t.elapsed().as_millis())
+        },
+    );
+
     let files_to_parse = hp.parsed_files;
     let analyses = hp.analyses;
     let parse_count = hp.parse_count;
@@ -117,23 +134,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
             "  Mtime+parse (incremental)...   {:>4} changed  {:>4} skipped  {:>3}ms",
             parse_count,
             skipped_count,
-            t.elapsed().as_millis()
+            parse_ms
         );
     } else {
         println!(
             "  Mtime+parse (first run)...     {:>4} files             {:>3}ms",
             parse_count,
-            t.elapsed().as_millis()
+            parse_ms
         );
     }
 
-    // ── 4. Git history ───────────────────────────────────────────────────────
-    let t = Instant::now();
-    let git_signals = match mine_git_history(&root, &walked_paths) {
+    let git_signals = match git_result {
         Ok(g) => {
             println!(
                 "  Mining git history...                              {:>4}ms",
-                t.elapsed().as_millis()
+                git_ms
             );
             Some(g)
         }
@@ -141,23 +156,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
             tracing::warn!("git history mining failed: {e}");
             println!(
                 "  Mining git history...               (skipped)      {:>4}ms",
-                t.elapsed().as_millis()
+                git_ms
             );
             None
         }
     };
 
-    // ── 5. Dependencies ──────────────────────────────────────────────────────
     // Always scan all walked files — manifest files (Cargo.toml, package.json,
     // go.mod) may be unchanged but are needed for correct dep records. On an
     // incremental run where no manifest changed, this is a fast no-op (<2ms).
-    let t = Instant::now();
-    let dep_signals = match parse_dependencies(&root, &files) {
+    let dep_signals = match dep_result {
         Ok(d) => {
             println!(
                 "  Parsing dependencies...              {:>4} deps    {:>4}ms",
                 d.deps.len(),
-                t.elapsed().as_millis()
+                dep_ms
             );
             d
         }
@@ -165,7 +178,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
             tracing::warn!("dependency parsing failed: {e}");
             println!(
                 "  Parsing dependencies...              (skipped)     {:>4}ms",
-                t.elapsed().as_millis()
+                dep_ms
             );
             mati_core::analysis::DepSignals::empty()
         }
