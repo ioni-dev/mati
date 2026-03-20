@@ -3,6 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Args;
+use serde::{Deserialize, Serialize};
 
 use mati_core::health::gaps;
 use mati_core::store::{
@@ -12,7 +13,13 @@ use mati_core::store::{
 
 use super::colors;
 
-const GAPS_CACHE_TTL_SECS: u64 = 60;
+/// Wrapper around the cached gap list that includes write-seq for invalidation.
+#[derive(Serialize, Deserialize)]
+struct GapsCacheEntry {
+    /// Knowledge write-sequence at cache time. `0` means no valid cache.
+    write_seq: u64,
+    gaps: Vec<KnowledgeGap>,
+}
 
 #[derive(Args)]
 pub struct GapsArgs {
@@ -64,14 +71,15 @@ pub async fn run(args: GapsArgs) -> Result<()> {
     let store = Store::open(&cwd).await?;
     let use_color = std::io::stdout().is_terminal();
 
-    // ── Cache check ──────────────────────────────────────────────────────
+    // ── Cache check: reuse when write-seq unchanged ───────────────────────
     let cache_key = "analytics:gaps_cache";
+    let current_seq = store.read_write_seq();
     if let Ok(Some(cached)) = store.get(cache_key).await {
-        let now = now_secs();
-        let age = now.saturating_sub(cached.updated_at);
-        if age < GAPS_CACHE_TTL_SECS {
-            if let Ok(gaps) = serde_json::from_str::<Vec<KnowledgeGap>>(&cached.value) {
-                let filtered: Vec<_> = gaps
+        if let Ok(entry) = serde_json::from_str::<GapsCacheEntry>(&cached.value) {
+            let now = now_secs();
+            let age = now.saturating_sub(cached.updated_at);
+            if entry.write_seq == current_seq {
+                let filtered: Vec<_> = entry.gaps
                     .into_iter()
                     .filter(|g| g.risk_score >= args.min_risk)
                     .take(args.limit)
@@ -93,7 +101,8 @@ pub async fn run(args: GapsArgs) -> Result<()> {
     let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps);
 
     // ── Write cache (best-effort) ────────────────────────────────────────
-    if let Ok(cache_value) = serde_json::to_string(&all_gaps) {
+    let cache_entry = GapsCacheEntry { write_seq: current_seq, gaps: all_gaps.clone() };
+    if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
         let record = cache_record(cache_key, cache_value);
         let _ = store.put(cache_key, &record).await;
     }

@@ -24,10 +24,14 @@ struct DailyAgg {
     keys: Vec<String>,
 }
 
-/// How many seconds a cached snapshot is considered fresh.
-const STATS_CACHE_TTL_SECS: u64 = 60;
+/// Stable cache key for the health snapshot (write-seq invalidated, no date suffix).
+const SNAPSHOT_KEY: &str = "analytics:knowledge_health";
 
-/// Snapshot payload written to `analytics:knowledge_health_<date>`.
+/// Maximum age of a cached snapshot even if write-seq matches (catches stale
+/// compliance data when no knowledge writes have happened for >24 h).
+const SNAPSHOT_MAX_AGE_SECS: u64 = 86_400;
+
+/// Snapshot payload written to `analytics:knowledge_health`.
 #[derive(Serialize, Deserialize)]
 struct HealthSnapshot {
     // Coverage
@@ -64,6 +68,11 @@ struct HealthSnapshot {
     bypasses_7d: u64,
 
     computed_at: u64,
+
+    /// Knowledge write-sequence at time of computation. Cache is valid when
+    /// this equals [`Store::read_write_seq()`]. `0` means no valid cache.
+    #[serde(default)]
+    write_seq: u64,
 }
 
 /// Current wall-clock time as Unix seconds.
@@ -78,20 +87,21 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = Store::open(&cwd).await?;
 
-    // ── Cache check: reuse today's snapshot if written within TTL ─────────
+    // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
-    let today = format_snapshot_date(now);
-    let snapshot_key = format!("analytics:knowledge_health_{today}");
-    if let Ok(Some(cached)) = store.get(&snapshot_key).await {
-        let age = now.saturating_sub(cached.updated_at);
-        if age < STATS_CACHE_TTL_SECS {
-            if let Ok(snapshot) = serde_json::from_str::<HealthSnapshot>(&cached.value) {
+    let current_seq = store.read_write_seq();
+    if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
+        if let Ok(snapshot) = serde_json::from_str::<HealthSnapshot>(&cached.value) {
+            let age = now.saturating_sub(snapshot.computed_at);
+            if snapshot.write_seq == current_seq
+                && age < SNAPSHOT_MAX_AGE_SECS
+            {
                 display_cached_stats(&snapshot, age, &cwd);
                 store.close().await?;
                 return Ok(());
             }
-            // Corrupt cache — fall through to recomputation
         }
+        // Stale or corrupt cache — fall through to recomputation
     }
 
     let use_color = io::stdout().is_terminal();
@@ -363,14 +373,27 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         bypasses_7d,
 
         computed_at: now,
+        write_seq: current_seq,
     };
 
-    let snapshot_value = serde_json::to_string(&snapshot)?;
+    write_snapshot_record(&store, &snapshot, now).await?;
 
-    let device_id = uuid::Uuid::new_v4();
-    let snapshot_record = Record {
-        key: snapshot_key.clone(),
-        value: snapshot_value,
+    println!(
+        "  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}\n"
+    );
+
+    store.close().await?;
+    Ok(())
+}
+
+// ── Snapshot persistence ──────────────────────────────────────────────────────
+
+/// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` in the store.
+async fn write_snapshot_record(store: &Store, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+    let value = serde_json::to_string(snapshot)?;
+    let record = Record {
+        key: SNAPSHOT_KEY.to_string(),
+        value,
         category: Category::Analytics,
         priority: Priority::Normal,
         tags: vec![],
@@ -380,7 +403,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id,
+            device_id: uuid::Uuid::new_v4(),
             logical_clock: 1,
             wall_clock: now,
         },
@@ -391,15 +414,112 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
         gap_analysis_score: 0.0,
     };
+    store.put(SNAPSHOT_KEY, &record).await
+}
 
-    store.put(&snapshot_key, &snapshot_record).await?;
+/// Compute and persist a `HealthSnapshot` from pre-loaded record slices.
+///
+/// Called by `mati init` after `put_batch` so that the very first `mati stats`
+/// after initialization is served from cache (O(1)) rather than rescanning.
+pub async fn seed_snapshot(
+    store: &Store,
+    files: &[Record],
+    gotchas: &[Record],
+    decisions: &[Record],
+    deps: &[Record],
+    now: u64,
+) -> Result<()> {
+    use mati_core::health::{gaps, onboarding};
+    use mati_core::store::{FileRecord, GapType};
 
-    println!(
-        "  {gray}Snapshot written: {snapshot_key}{reset}\n"
-    );
+    let file_data: Vec<FileRecord> = files
+        .iter()
+        .filter_map(|r| serde_json::from_str(&r.value).ok())
+        .collect();
 
-    store.close().await?;
-    Ok(())
+    let files_with_purpose = file_data.iter().filter(|fr| !fr.purpose.is_empty()).count() as u32;
+    let total_files = files.len() as u32;
+    let hotspot_count = file_data.iter().filter(|fr| fr.is_hotspot).count();
+    let gotchas_per_hotspot = if hotspot_count > 0 {
+        gotchas.len() as f32 / hotspot_count as f32
+    } else {
+        0.0
+    };
+    let decisions_count = decisions.len() as u32;
+
+    let all_knowledge: Vec<&Record> = gotchas.iter().chain(decisions.iter()).collect();
+    let avg_confidence = if all_knowledge.is_empty() {
+        0.0
+    } else {
+        let sum: f32 = all_knowledge.iter().map(|r| r.confidence.value).sum();
+        sum / all_knowledge.len() as f32
+    };
+
+    let gap_list = gaps::analyze(files, gotchas, decisions, deps);
+    let gap_count = gap_list.len() as u32;
+
+    let thirty_days_ago = now.saturating_sub(30 * 86400);
+    let all_records: Vec<&Record> = files
+        .iter()
+        .chain(gotchas.iter())
+        .chain(decisions.iter())
+        .chain(deps.iter())
+        .collect();
+    let new_records_30d = all_records
+        .iter()
+        .filter(|r| r.created_at >= thirty_days_ago)
+        .count() as u32;
+    let multi_contributor = all_records
+        .iter()
+        .filter(|r| r.confidence.contributor_count >= 2)
+        .count() as u32;
+
+    let onboarding_score = onboarding::compute_from_records(files, decisions, gotchas);
+
+    let critical_uncovered = file_data
+        .iter()
+        .filter(|fr| fr.is_hotspot && fr.purpose.is_empty())
+        .count() as u32;
+    let orphaned_decisions = gap_list
+        .iter()
+        .filter(|g| g.gap_type == GapType::OrphanedDecision)
+        .count() as u32;
+    let low_confidence = all_records
+        .iter()
+        .filter(|r| r.confidence.value < 0.3)
+        .count() as u32;
+
+    let write_seq = store.read_write_seq();
+    let snapshot = HealthSnapshot {
+        files_with_purpose,
+        total_files,
+        purpose_coverage: if total_files > 0 {
+            files_with_purpose as f32 / total_files as f32
+        } else {
+            0.0
+        },
+        gotchas_per_hotspot,
+        decisions_documented: decisions_count,
+        avg_confidence,
+        knowledge_gaps: gap_count,
+        new_records_30d,
+        multi_contributor_records: multi_contributor,
+        estimated_minutes: onboarding_score.estimated_minutes,
+        critical_files_covered: onboarding_score.critical_files_covered,
+        gotcha_coverage: onboarding_score.gotcha_coverage,
+        decision_coverage: onboarding_score.decision_coverage,
+        critical_uncovered,
+        orphaned_decisions,
+        low_confidence,
+        hits_7d: 0,
+        misses_7d: 0,
+        hit_rate_7d: 0.0,
+        bypasses_7d: 0,
+        computed_at: now,
+        write_seq,
+    };
+
+    write_snapshot_record(store, &snapshot, now).await
 }
 
 // ── Cached display ───────────────────────────────────────────────────────────
@@ -670,6 +790,7 @@ mod tests {
             hit_rate_7d: 0.84,
             bypasses_7d: 1,
             computed_at: 1_710_520_800,
+            write_seq: 42,
         }
     }
 

@@ -224,6 +224,34 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let store = Store::open(&root).await?;
     store.put_batch(&all_pairs).await?;
 
+    // ── 9a. Seed stats snapshot from in-memory records ────────────────────────
+    // Data is already in memory — free to compute. Ensures `mati stats` after
+    // init is O(1) (write-seq match) instead of triggering a full rescan.
+    let gotcha_recs: Vec<Record> = claude_import
+        .records
+        .iter()
+        .filter(|r| r.key.starts_with("gotcha:"))
+        .cloned()
+        .collect();
+    let decision_recs: Vec<Record> = claude_import
+        .records
+        .iter()
+        .filter(|r| r.key.starts_with("decision:"))
+        .cloned()
+        .collect();
+    if let Err(e) = super::stats::seed_snapshot(
+        &store,
+        &file_record_structs,
+        &gotcha_recs,
+        &decision_recs,
+        &dep_record_structs,
+        now,
+    )
+    .await
+    {
+        tracing::warn!("stats snapshot seed failed (non-fatal): {e}");
+    }
+
     // ── 10–11. Graph::load + add_edges_batch ─────────────────────────────────
     let mut graph = Graph::load(store).await?;
     graph.add_edges_batch(&layer0_edges.edges).await?;
