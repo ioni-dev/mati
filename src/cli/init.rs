@@ -92,7 +92,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // ── 2. Load stored mtimes (plain file, not KV) ───────────────────────────
     // Open the store early — needed for downstream writes.
+    let t = Instant::now();
     let store = Store::open(&root).await?;
+    let store_open_ms = t.elapsed().as_millis();
 
     // mtime_index.json sits next to knowledge.db — plain file I/O is much
     // faster than storing a ~4MB blob in SurrealKV.
@@ -302,9 +304,18 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(|r| (r.key.as_str(), r))
         .collect();
 
-    // ── 9. put_batch ─────────────────────────────────────────────────────────
-    // Store was already opened above for hash loading. Reuse it.
-    store.put_batch(&all_pairs).await?;
+    // ── 9. put_batch (KV only — tantivy indexed after graph ops) ─────────────
+    // Separating KV write from search indexing lets us profile each cost and
+    // keeps the fsync path clean. Search index is built from in-memory records
+    // (no KV re-scan) immediately after graph writes complete.
+    let t = Instant::now();
+    store.put_batch_kv_only(&all_pairs).await?;
+    println!(
+        "  Writing store (KV)...          {:>4} recs    {:>4}ms  (store open: {}ms)",
+        all_records.len(),
+        t.elapsed().as_millis(),
+        store_open_ms,
+    );
 
     // ── 9a. Seed stats snapshot (first run only) ─────────────────────────────
     // On incremental re-init, in-memory file_record_structs is incomplete
@@ -338,8 +349,24 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
 
     // ── 10–11. Graph::load + add_edges_batch ─────────────────────────────────
+    let t = Instant::now();
     let mut graph = Graph::load(store).await?;
     graph.add_edges_batch(&layer0_edges.edges).await?;
+    println!(
+        "  Graph load+edges...                              {:>4}ms",
+        t.elapsed().as_millis()
+    );
+
+    // ── 11a. Search index — deferred to first MCP server startup ─────────────
+    // Cold init: tantivy costs ~400ms to index 27k records. CLI commands scan
+    // KV directly and never need full-text search. Only the MCP server (via
+    // open_and_rebuild) needs tantivy — defer the rebuild there.
+    // Warm re-init: existing index is still valid; changed files are few and
+    // CLI commands tolerate slight search staleness.
+    if skipped_count == 0 {
+        graph.store().mark_search_stale();
+        println!("  Search index...                (deferred to first MCP server startup)");
+    }
 
     // ── 12. Scaffold: CLAUDE.md stub ─────────────────────────────────────────
     let t = Instant::now();
