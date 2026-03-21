@@ -70,7 +70,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     let now = now_secs();
     let current_seq = store.read_write_seq();
     if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
-        if let Ok(snap) = serde_json::from_str::<StatusSnapshot>(&cached.value) {
+        if let Some(snap) = cached.payload_as::<StatusSnapshot>() {
             let age = now.saturating_sub(snap.computed_at);
             if snap.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
                 display_cached_status(&snap, age, &cwd);
@@ -129,7 +129,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     let confirmed_count = gotchas
         .iter()
         .filter(|r| {
-            serde_json::from_str::<GotchaRecord>(&r.value)
+            r.payload_as::<GotchaRecord>()
                 .map(|gr| gr.confirmed)
                 .unwrap_or(false)
         })
@@ -206,7 +206,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     let hotspot_count = files
         .iter()
         .filter(|r| {
-            serde_json::from_str::<FileRecord>(&r.value)
+            r.payload_as::<FileRecord>()
                 .map(|fr| fr.is_hotspot)
                 .unwrap_or(false)
         })
@@ -253,10 +253,10 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
 
 /// Write a `StatusSnapshot` to `SNAPSHOT_KEY` in the store.
 async fn write_snapshot_record(store: &Store, snap: &StatusSnapshot, now: u64) -> Result<()> {
-    let value = serde_json::to_string(snap)?;
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
-        value,
+        value: String::new(),
+        payload: serde_json::to_value(snap).ok(),
         category: Category::Analytics,
         priority: Priority::Normal,
         tags: vec![],

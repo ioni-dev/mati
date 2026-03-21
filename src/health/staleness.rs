@@ -403,7 +403,7 @@ impl StalenessAnalyzer {
     ) -> Result<()> {
         // Parse FileRecord once if this is a file: record.
         let file_record: Option<FileRecord> = if record.key.starts_with("file:") {
-            serde_json::from_str(&record.value).ok()
+            record.payload_as::<FileRecord>()
         } else {
             None
         };
@@ -795,7 +795,7 @@ async fn cascade_factor(
         }
         Category::Gotcha => {
             // Parse the gotcha to find affected_files.
-            let gotcha: Option<GotchaRecord> = serde_json::from_str(&record.value).ok();
+            let gotcha: Option<GotchaRecord> = record.payload_as::<GotchaRecord>();
             let gotcha = match gotcha {
                 Some(g) => g,
                 None => return 0.0,
@@ -1042,6 +1042,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -1057,7 +1058,8 @@ mod tests {
         };
         Record {
             key: key.to_string(),
-            value: serde_json::to_string(&gotcha).unwrap(),
+            value: gotcha.rule.clone(),
+            payload: serde_json::to_value(&gotcha).ok(),
             category: Category::Gotcha,
             priority: Priority::High,
             tags: vec![],
@@ -1294,6 +1296,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -1343,6 +1346,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -1485,6 +1489,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         };
 
         let mut cache = HashMap::new();

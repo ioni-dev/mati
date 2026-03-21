@@ -63,6 +63,7 @@ fn cache_record(key: &str, value: String) -> Record {
         source: RecordSource::SessionHook,
         confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
         gap_analysis_score: 0.0,
+        payload: None,
     }
 }
 

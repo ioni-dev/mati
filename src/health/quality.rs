@@ -312,6 +312,7 @@ mod tests {
             source: RecordSource::DeveloperManual,
             confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 

@@ -107,7 +107,8 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
     let device_id = uuid::Uuid::new_v4();
     let mut record = Record {
         key: key.clone(),
-        value: serde_json::to_string(&gotcha)?,
+        value: value.clone(),
+        payload: serde_json::to_value(&gotcha).ok(),
         category: Category::Gotcha,
         priority: severity,
         tags: vec![],
@@ -131,14 +132,9 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
 
     // ── Quality analysis ─────────────────────────────────────────────────────
 
-    // Analyze quality on a clone with the human-readable text, not the JSON
-    // serialization. The stored record keeps the GotchaRecord JSON in `value`
-    // (expected by ls_gotchas and the MCP layer).
-    let score = {
-        let mut qa_record = record.clone();
-        qa_record.value = value;
-        quality::analyze(&qa_record)
-    };
+    // `record.value` is now the human-readable text (rule + reason), so quality
+    // analysis runs directly on the record — no clone needed.
+    let score = quality::analyze(&record);
     record.quality = score.clone();
 
     // Quality gate (< 0.2 → reject)

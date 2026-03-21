@@ -495,6 +495,7 @@ mod tests {
             rel_path: rel_path.to_string(),
             language: super::super::walker::Language::Unknown,
             size_bytes: 0,
+            mtime_secs: 0,
         }
     }
 

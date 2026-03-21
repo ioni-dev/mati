@@ -58,7 +58,7 @@ pub fn compute_from_records(
 ) -> OnboardingScore {
     let file_data: Vec<FileRecord> = file_records
         .iter()
-        .filter_map(|r| serde_json::from_str(&r.value).ok())
+        .filter_map(|r| r.payload_as::<FileRecord>())
         .collect();
     let hotspot_coverage  = compute_hotspot_coverage(&file_data);
     let gotcha_coverage   = compute_gotcha_coverage(&file_data);
@@ -229,6 +229,7 @@ mod tests {
                 challenge_count: 0,
             },
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 

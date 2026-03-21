@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rmp_serde as rmps;
 use once_cell::sync::OnceCell;
 use sha2::{Digest, Sha256};
 use surrealkv::{
@@ -286,7 +287,7 @@ impl Store {
         let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
         txn.set_durability(skv_durability(durability));
 
-        let bytes = serde_json::to_vec(record)
+        let bytes = rmps::to_vec_named(record)
             .with_context(|| format!("failed to serialize record for key '{key}'"))?;
         txn.set(key.as_bytes(), bytes)?;
         txn.commit().await?;
@@ -326,7 +327,7 @@ impl Store {
             let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
             txn.set_durability(SkvDurability::Immediate);
             for (key, record) in &immediate {
-                let bytes = serde_json::to_vec(record)
+                let bytes = rmps::to_vec_named(record)
                     .with_context(|| format!("failed to serialize record for key '{key}'"))?;
                 txn.set(key.as_bytes(), bytes)?;
             }
@@ -336,7 +337,7 @@ impl Store {
             let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
             txn.set_durability(SkvDurability::Eventual);
             for (key, record) in &eventual {
-                let bytes = serde_json::to_vec(record)
+                let bytes = rmps::to_vec_named(record)
                     .with_context(|| format!("failed to serialize record for key '{key}'"))?;
                 txn.set(key.as_bytes(), bytes)?;
             }
@@ -386,7 +387,7 @@ impl Store {
             let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
             txn.set_durability(SkvDurability::Immediate);
             for (key, record) in &immediate {
-                let bytes = serde_json::to_vec(record)
+                let bytes = rmps::to_vec_named(record)
                     .with_context(|| format!("failed to serialize record for key '{key}'"))?;
                 txn.set(key.as_bytes(), bytes)?;
             }
@@ -397,7 +398,7 @@ impl Store {
             let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
             txn.set_durability(SkvDurability::Eventual);
             for (key, record) in &eventual {
-                let bytes = serde_json::to_vec(record)
+                let bytes = rmps::to_vec_named(record)
                     .with_context(|| format!("failed to serialize record for key '{key}'"))?;
                 txn.set(key.as_bytes(), bytes)?;
             }
@@ -447,7 +448,7 @@ impl Store {
         let mut cursor = iter;
         while cursor.next()? {
             let bytes = cursor.value()?;
-            match serde_json::from_slice::<Record>(&bytes) {
+            match rmps::from_slice::<Record>(&bytes) {
                 Ok(record) => records.push(record),
                 Err(e) => {
                     tracing::warn!("skipping malformed record during scan: {e}");
@@ -478,7 +479,7 @@ impl Store {
         let mut cursor = txn.range(prefix.as_bytes(), end.as_bytes())?;
         while cursor.next()? {
             let bytes = cursor.value()?;
-            match serde_json::from_slice::<Record>(&bytes) {
+            match rmps::from_slice::<Record>(&bytes) {
                 Ok(record) => callback(record),
                 Err(e) => {
                     tracing::warn!("skipping malformed record during scan: {e}");
@@ -815,7 +816,7 @@ fn read_record(txn: &Transaction, key: &str) -> Result<Option<Record>> {
     match txn.get(key.as_bytes())? {
         None => Ok(None),
         Some(bytes) => {
-            let record = serde_json::from_slice::<Record>(&bytes)
+            let record = rmps::from_slice::<Record>(&bytes)
                 .with_context(|| format!("corrupt record at key '{key}'"))?;
             Ok(Some(record))
         }
@@ -898,7 +899,7 @@ fn history_impl(txn: &Transaction, key: &str, opts: &HistoryOptions) -> Result<V
             None
         } else {
             match cursor.value() {
-                Ok(bytes) => serde_json::from_slice::<Record>(&bytes).ok(),
+                Ok(bytes) => rmps::from_slice::<Record>(&bytes).ok(),
                 Err(_) => None,
             }
         };
@@ -988,6 +989,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         };
 
         store.put("gotcha:test-key", &record).await.unwrap();
@@ -1029,6 +1031,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         };
 
         store.put("file:src/main.rs", &record).await.unwrap();
@@ -1070,6 +1073,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         };
 
         store.put("gotcha:alpha", &make_record("gotcha:alpha")).await.unwrap();
@@ -1118,6 +1122,7 @@ mod tests {
                 source: RecordSource::StaticAnalysis,
                 confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
                 gap_analysis_score: 0.0,
+                payload: None,
             }
         };
 
@@ -1201,6 +1206,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -1562,6 +1568,7 @@ mod tests {
                 challenge_count: 1,
             },
             gap_analysis_score: 0.31,
+            payload: None,
         };
 
         store.put("gotcha:full-fields", &written).await.unwrap();
