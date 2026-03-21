@@ -562,6 +562,7 @@ fn make_walked_file(dir: &Path, rel: &str, content: &str) -> WalkedFile {
         rel_path: rel.to_owned(),
         language: detect_language(Path::new(rel)),
         size_bytes: content.len() as u64,
+        mtime_secs: 0,
     }
 }
 

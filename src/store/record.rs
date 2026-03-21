@@ -21,6 +21,7 @@
 //! computed scores. Use field-level epsilon comparison in tests and comparators.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────
@@ -509,6 +510,18 @@ pub struct Record {
     pub confidence: ConfidenceScore,
     /// Pre-computed gap risk score: `change_frequency × (1 - coverage_score)`.
     pub gap_analysis_score: f32,
+    /// Structured per-category payload — typed data in JSON form.
+    ///
+    /// - `file:*`     → `FileRecord`
+    /// - `gotcha:*`   → `GotchaRecord`
+    /// - `decision:*` → serialized decision body (TBD Layer 1)
+    /// - `analytics:*`, `session:*` → arbitrary JSON blob (DailyAgg, StaleReviewPayload, …)
+    ///
+    /// `value` is always the human-readable text: rule, purpose, body.
+    /// `payload` carries all structured fields so read sites never parse `value` as JSON.
+    /// Stored as-is in MessagePack (serde_json::Value → msgpack map).
+    #[serde(default)]
+    pub payload: Option<JsonValue>,
 }
 
 impl Record {
@@ -517,6 +530,14 @@ impl Record {
     /// Convenience accessor — delegates to `self.version.device_id`.
     pub fn device_id(&self) -> DeviceId {
         self.version.device_id
+    }
+
+    /// Deserialize the structured payload into a typed value.
+    ///
+    /// Returns `None` when `payload` is absent or the JSON shape does not match `T`.
+    /// Always prefer this over `serde_json::from_str(&self.value)`.
+    pub fn payload_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        self.payload.as_ref().and_then(|p| serde_json::from_value(p.clone()).ok())
     }
 
     /// Construct a layer-0 file stub for `file:<path>`.
@@ -553,6 +574,7 @@ impl Record {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 }
@@ -873,6 +895,7 @@ mod tests {
             source: RecordSource::DeveloperManual,
             confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 

@@ -275,6 +275,7 @@ mod tests {
             rel_path: rel.to_owned(),
             language: lang,
             size_bytes: content.len() as u64,
+            mtime_secs: 0,
         }
     }
 

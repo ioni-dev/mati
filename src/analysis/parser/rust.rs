@@ -184,6 +184,7 @@ mod tests {
             rel_path: rel.to_owned(),
             language: Language::Rust,
             size_bytes: content.len() as u64,
+            mtime_secs: 0,
         }
     }
 

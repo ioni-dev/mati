@@ -102,6 +102,7 @@ fn make_record(i: usize) -> Record {
         source: RecordSource::StaticAnalysis,
         confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
         gap_analysis_score: 0.0,
+        payload: None,
     }
 }
 

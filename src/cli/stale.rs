@@ -4,11 +4,91 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
+use serde::{Deserialize, Serialize};
 
-use mati_core::store::{Category, Record, StalenessSignal, StalenessTier, Store};
+use mati_core::store::{
+    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore, StalenessSignal, StalenessTier, Store,
+};
 
 use super::colors;
 use super::show::{format_date, staleness_color, truncate};
+
+// ── Cache ─────────────────────────────────────────────────────────────────────
+
+const STALE_CACHE_KEY: &str = "analytics:stale_cache";
+
+/// Write-seq–invalidated cache of the full stale record list.
+/// Records are pre-sorted by staleness value descending; apply `--limit` at display time.
+#[derive(Serialize, Deserialize)]
+struct StaleCache {
+    /// Knowledge write-seq at cache time. Cache is valid while this matches the store.
+    write_seq: u64,
+    records: Vec<Record>,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn cache_record(value: String) -> Record {
+    let now = now_secs();
+    Record {
+        key: STALE_CACHE_KEY.to_string(),
+        value,
+        category: Category::Analytics,
+        priority: Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::StaticAnalysis,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+        gap_analysis_score: 0.0,
+        payload: None,
+    }
+}
+
+/// Seed the stale cache from in-memory records immediately after `mati init`.
+///
+/// Called only on cold init (skipped_count == 0), where all records are freshly
+/// written and their staleness tiers are accurate. On cold init the stale list
+/// is always empty, so this writes a trivially small record that lets the very
+/// first post-init `mati stale` hit the cache (O(1)).
+pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
+    let write_seq = store.read_write_seq();
+    let mut stale: Vec<Record> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.staleness.tier,
+                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
+            )
+        })
+        .cloned()
+        .collect();
+    stale.sort_by(|a, b| {
+        b.staleness.value.partial_cmp(&a.staleness.value).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let entry = StaleCache { write_seq, records: stale };
+    let mut rec = cache_record(String::new());
+    rec.payload = serde_json::to_value(&entry).ok();
+    store.put(STALE_CACHE_KEY, &rec).await?;
+    Ok(())
+}
 
 // ── Args ─────────────────────────────────────────────────────────────────────
 
@@ -28,25 +108,40 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = Store::open(&cwd).await?;
 
-    let mut stale: Vec<Record> = Vec::new();
-    for prefix in &["gotcha:", "decision:", "file:", "dev_note:"] {
-        let records = store.scan_prefix(prefix).await?;
-        for r in records {
-            match r.staleness.tier {
-                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
-                    stale.push(r);
-                }
-                _ => {}
+    // ── Cache check: reuse when write-seq unchanged ───────────────────────────
+    let current_seq = store.read_write_seq();
+    if let Ok(Some(cached)) = store.get(STALE_CACHE_KEY).await {
+        if let Some(entry) = cached.payload_as::<StaleCache>() {
+            if entry.write_seq == current_seq {
+                let mut stale = entry.records;
+                stale.truncate(args.limit);
+                store.close().await?;
+                display_stale(&stale, args.verbose);
+                return Ok(());
             }
         }
     }
 
-    store.close().await?;
+    // ── Cache miss: scan all four prefixes concurrently ───────────────────────
+    let (gotchas, decisions, files, notes) = tokio::try_join!(
+        store.scan_prefix("gotcha:"),
+        store.scan_prefix("decision:"),
+        store.scan_prefix("file:"),
+        store.scan_prefix("dev_note:"),
+    )?;
 
-    if stale.is_empty() {
-        println!("No stale records.");
-        return Ok(());
-    }
+    let mut stale: Vec<Record> = gotchas
+        .into_iter()
+        .chain(decisions)
+        .chain(files)
+        .chain(notes)
+        .filter(|r| {
+            matches!(
+                r.staleness.tier,
+                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
+            )
+        })
+        .collect();
 
     // Sort by staleness descending
     stale.sort_by(|a, b| {
@@ -56,8 +151,25 @@ pub async fn run(args: StaleArgs) -> Result<()> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Write cache (full sorted list, before limit)
+    let cache_entry = StaleCache { write_seq: current_seq, records: stale.clone() };
+    let mut rec = cache_record(String::new());
+    rec.payload = serde_json::to_value(&cache_entry).ok();
+    let _ = store.put(STALE_CACHE_KEY, &rec).await;
+
     // Limit
     stale.truncate(args.limit);
+
+    store.close().await?;
+    display_stale(&stale, args.verbose);
+    Ok(())
+}
+
+fn display_stale(stale: &[Record], verbose: bool) {
+    if stale.is_empty() {
+        println!("No stale records.");
+        return;
+    }
 
     let use_color = std::io::stdout().is_terminal();
 
@@ -80,14 +192,11 @@ pub async fn run(args: StaleArgs) -> Result<()> {
         table.force_no_tty();
     }
 
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = now_secs();
 
-    for r in &stale {
+    for r in stale {
         let age_days = if r.updated_at > 0 {
-            (now_secs.saturating_sub(r.updated_at)) / 86400
+            (now.saturating_sub(r.updated_at)) / 86400
         } else {
             0
         };
@@ -109,88 +218,43 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     // ── Summary + action hints ───────────────────────────────────────────────
 
     let (red, yellow, gray, bold, reset) = if use_color {
-        (
-            colors::RED,
-            colors::YELLOW,
-            colors::GRAY,
-            colors::BOLD,
-            colors::RESET,
-        )
+        (colors::RED, colors::YELLOW, colors::GRAY, colors::BOLD, colors::RESET)
     } else {
         ("", "", "", "", "")
     };
 
-    let n_liability = stale
-        .iter()
-        .filter(|r| r.staleness.tier == StalenessTier::Liability)
-        .count();
-    let n_tombstone = stale
-        .iter()
-        .filter(|r| r.staleness.tier == StalenessTier::Tombstone)
-        .count();
-    let n_stale = stale
-        .iter()
-        .filter(|r| r.staleness.tier == StalenessTier::Stale)
-        .count();
+    let n_liability = stale.iter().filter(|r| r.staleness.tier == StalenessTier::Liability).count();
+    let n_tombstone = stale.iter().filter(|r| r.staleness.tier == StalenessTier::Tombstone).count();
+    let n_stale = stale.iter().filter(|r| r.staleness.tier == StalenessTier::Stale).count();
 
     let mut parts: Vec<String> = Vec::new();
-    if n_tombstone > 0 {
-        parts.push(format!("{red}{n_tombstone} tombstone{reset}"));
-    }
-    if n_liability > 0 {
-        parts.push(format!("{red}{n_liability} liability{reset}"));
-    }
-    if n_stale > 0 {
-        parts.push(format!("{yellow}{n_stale} stale{reset}"));
-    }
-    let breakdown = if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", parts.join(", "))
-    };
+    if n_tombstone > 0 { parts.push(format!("{red}{n_tombstone} tombstone{reset}")); }
+    if n_liability > 0 { parts.push(format!("{red}{n_liability} liability{reset}")); }
+    if n_stale > 0 { parts.push(format!("{yellow}{n_stale} stale{reset}")); }
+    let breakdown = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
 
-    println!(
-        "\n  {bold}{} stale records{reset}{breakdown}\n",
-        stale.len()
-    );
+    println!("\n  {bold}{} stale records{reset}{breakdown}\n", stale.len());
 
-    // Collect unique action hints for the footer
     let mut actions: Vec<String> = Vec::new();
-    for r in &stale {
+    for r in stale {
         let hint = action_hint(r);
-        if !actions.contains(&hint) {
-            actions.push(hint);
-        }
-        if actions.len() >= 5 {
-            break;
-        }
+        if !actions.contains(&hint) { actions.push(hint); }
+        if actions.len() >= 5 { break; }
     }
 
     if !actions.is_empty() {
         println!("  {gray}Suggested actions:{reset}");
-        for a in &actions {
-            println!("    {a}");
-        }
+        for a in &actions { println!("    {a}"); }
         println!();
     }
 
     // ── Verbose per-record blocks ────────────────────────────────────────────
 
-    if args.verbose {
+    if verbose {
         println!();
-        for r in &stale {
-            let age_days = if r.updated_at > 0 {
-                (now_secs.saturating_sub(r.updated_at)) / 86400
-            } else {
-                0
-            };
-
-            let stc = if use_color {
-                staleness_color(&r.staleness.tier)
-            } else {
-                ""
-            };
-
+        for r in stale {
+            let age_days = if r.updated_at > 0 { (now.saturating_sub(r.updated_at)) / 86400 } else { 0 };
+            let stc = if use_color { staleness_color(&r.staleness.tier) } else { "" };
             let tier_label = tier_short_label(&r.staleness.tier).to_uppercase();
 
             println!(
@@ -208,14 +272,9 @@ pub async fn run(args: StaleArgs) -> Result<()> {
                 println!("               {gray}Signals: {full_sigs}{reset}");
             }
 
-            println!(
-                "               \u{2192} Action: {}\n",
-                action_hint(r),
-            );
+            println!("               \u{2192} Action: {}\n", action_hint(r));
         }
     }
-
-    Ok(())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -343,6 +402,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 

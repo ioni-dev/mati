@@ -91,7 +91,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     let now = now_secs();
     let current_seq = store.read_write_seq();
     if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
-        if let Ok(snapshot) = serde_json::from_str::<HealthSnapshot>(&cached.value) {
+        if let Some(snapshot) = cached.payload_as::<HealthSnapshot>() {
             let age = now.saturating_sub(snapshot.computed_at);
             if snapshot.write_seq == current_seq
                 && age < SNAPSHOT_MAX_AGE_SECS
@@ -150,7 +150,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // Files with purpose
     let file_data: Vec<FileRecord> = files
         .iter()
-        .filter_map(|r| serde_json::from_str(&r.value).ok())
+        .filter_map(|r| r.payload_as::<FileRecord>())
         .collect();
 
     let files_with_purpose = file_data.iter().filter(|fr| !fr.purpose.is_empty()).count() as u32;
@@ -390,10 +390,10 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
 /// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` in the store.
 async fn write_snapshot_record(store: &Store, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
-    let value = serde_json::to_string(snapshot)?;
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
-        value,
+        value: String::new(),
+        payload: serde_json::to_value(snapshot).ok(),
         category: Category::Analytics,
         priority: Priority::Normal,
         tags: vec![],
@@ -434,7 +434,7 @@ pub async fn seed_snapshot(
 
     let file_data: Vec<FileRecord> = files
         .iter()
-        .filter_map(|r| serde_json::from_str(&r.value).ok())
+        .filter_map(|r| r.payload_as::<FileRecord>())
         .collect();
 
     let files_with_purpose = file_data.iter().filter(|fr| !fr.purpose.is_empty()).count() as u32;
@@ -699,19 +699,19 @@ async fn scan_compliance_7d(store: &Store, now: u64) -> (u64, u64, u64) {
         let bypass_key = format!("compliance:miss_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
-            if let Ok(agg) = serde_json::from_str::<DailyAgg>(&record.value) {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
                 hits += agg.count;
             }
         }
 
         if let Ok(Some(record)) = store.get(&miss_key).await {
-            if let Ok(agg) = serde_json::from_str::<DailyAgg>(&record.value) {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
                 misses += agg.count;
             }
         }
 
         if let Ok(Some(record)) = store.get(&bypass_key).await {
-            if let Ok(agg) = serde_json::from_str::<DailyAgg>(&record.value) {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
                 bypasses += agg.count;
             }
         }

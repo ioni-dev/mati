@@ -123,6 +123,7 @@ mod tests {
             rel_path: "src/lib.rs".to_string(),
             language: Language::Rust,
             size_bytes: 400,
+            mtime_secs: 0,
         };
 
         let hotspots = git.hotspot_files.iter().cloned().collect::<HashSet<_>>();
@@ -150,6 +151,7 @@ mod tests {
             rel_path: "src/main.rs".to_string(),
             language: Language::Rust,
             size_bytes: 8,
+            mtime_secs: 0,
         }];
         let analyses = vec![StaticFileAnalysis {
             path: "src/main.rs".to_string(),

@@ -182,6 +182,7 @@ async fn run_note(text: &str) -> Result<()> {
         source: RecordSource::DeveloperManual,
         confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
         gap_analysis_score: 0.0,
+        payload: None,
     };
 
     // Run quality analyzer (display score, but no gate for notes)
@@ -203,7 +204,7 @@ async fn run_quality_check() -> Result<()> {
     let store = Store::open(&cwd).await?;
 
     let mut all: Vec<Record> = Vec::new();
-    for prefix in &["gotcha:", "decision:", "dev_note:"] {
+    for prefix in &["file:", "gotcha:", "decision:", "dev_note:"] {
         all.extend(store.scan_prefix(prefix).await?);
     }
 

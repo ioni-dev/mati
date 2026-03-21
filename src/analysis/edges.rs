@@ -309,6 +309,7 @@ mod tests {
             rel_path: rel_path.to_string(),
             language: lang,
             size_bytes: 100,
+            mtime_secs: 0,
         }
     }
 

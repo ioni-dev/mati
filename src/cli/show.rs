@@ -305,6 +305,7 @@ fn ls_cache_record(key: &str, value: String) -> Record {
         source: RecordSource::SessionHook,
         confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
         gap_analysis_score: 0.0,
+        payload: None,
     }
 }
 
@@ -340,7 +341,7 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
     // ── Cache check ───────────────────────────────────────────────────────
     let current_seq = store.read_write_seq();
     if let Ok(Some(cached)) = store.get(LS_FILES_CACHE_KEY).await {
-        if let Ok(entry) = serde_json::from_str::<LsFilesCache>(&cached.value) {
+        if let Some(entry) = cached.payload_as::<LsFilesCache>() {
             if entry.write_seq == current_seq && entry.limit == limit {
                 render_ls_files_table(&entry.rows, entry.total, limit);
                 return Ok(());
@@ -361,8 +362,8 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
         .scan_prefix_each("file:", |r| {
             let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
             let (purpose, entry_count, is_hotspot) =
-                match serde_json::from_str::<FileRecord>(&r.value) {
-                    Ok(fr) => {
+                match r.payload_as::<FileRecord>() {
+                    Some(fr) => {
                         let purpose = if fr.purpose.is_empty() {
                             "(pending enrichment)".to_string()
                         } else {
@@ -370,7 +371,7 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
                         };
                         (purpose, fr.entry_points.len(), fr.is_hotspot)
                     }
-                    Err(_) => {
+                    None => {
                         let purpose = if r.value.is_empty() {
                             "(pending enrichment)".to_string()
                         } else {
@@ -422,10 +423,9 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
         rows.into_iter().take(limit).collect()
     };
     let cache = LsFilesCache { write_seq: current_seq, limit, total, rows: display_rows };
-    if let Ok(value) = serde_json::to_string(&cache) {
-        let record = ls_cache_record(LS_FILES_CACHE_KEY, value);
-        let _ = store.put(LS_FILES_CACHE_KEY, &record).await;
-    }
+    let mut record = ls_cache_record(LS_FILES_CACHE_KEY, String::new());
+    record.payload = serde_json::to_value(&cache).ok();
+    let _ = store.put(LS_FILES_CACHE_KEY, &record).await;
 
     Ok(())
 }
@@ -528,9 +528,9 @@ async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
 
     for r in &records {
         let key_short = r.key.strip_prefix("gotcha:").unwrap_or(&r.key);
-        let (rule, confirmed) = match serde_json::from_str::<mati_core::store::GotchaRecord>(&r.value) {
-            Ok(gr) => (truncate(&gr.rule, 40), gr.confirmed),
-            Err(_) => (truncate(&r.value, 40), false),
+        let (rule, confirmed) = match r.payload_as::<mati_core::store::GotchaRecord>() {
+            Some(gr) => (truncate(&gr.rule, 40), gr.confirmed),
+            None => (truncate(&r.value, 40), false),
         };
         let sev = priority_short(&r.priority);
         table.add_row(vec![
@@ -596,7 +596,7 @@ pub async fn run_export(args: ExportArgs) -> Result<()> {
 
     let output = match args.format.as_str() {
         "json" => export_json(&store).await?,
-        "md" => export_md(&store).await?,
+        "md" | "markdown" => export_md(&store).await?,
         other => anyhow::bail!("unknown format '{other}'. Valid: md, json"),
     };
 

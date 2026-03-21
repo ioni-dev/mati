@@ -332,6 +332,7 @@ mod tests {
             rel_path: "Main.java".to_owned(),
             language: Language::Java,
             size_bytes: 0,
+            mtime_secs: 0,
         };
         let a = parse_file(&f).unwrap();
         assert!(a.entry_points.is_empty());
@@ -351,6 +352,7 @@ mod tests {
                     rel_path: rel,
                     language: Language::Rust,
                     size_bytes: 20,
+                    mtime_secs: 0,
                 }
             })
             .collect();

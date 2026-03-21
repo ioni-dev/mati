@@ -151,10 +151,9 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 
 // ── Gap type detectors ──────────────────────────────────────────────────────
 
-/// Parse a `FileRecord` from a `Record`'s value field. Returns `None` if the
-/// value is not valid JSON or does not deserialize to a `FileRecord`.
+/// Parse a `FileRecord` from a `Record`'s payload. Returns `None` if absent.
 fn parse_file_record(record: &Record) -> Option<FileRecord> {
-    serde_json::from_str(&record.value).ok()
+    record.payload_as::<FileRecord>()
 }
 
 /// HotFileNoRecord: hotspot files where `is_hotspot=true` but the record's
@@ -263,16 +262,16 @@ fn detect_frequently_read_no_enrich(file_records: &[Record], gaps: &mut Vec<Know
 /// `affected_files` (or is not parseable as a structure with that field).
 fn detect_orphaned_decisions(decisions: &[Record], gaps: &mut Vec<KnowledgeGap>) {
     for record in decisions {
-        let is_orphaned = match serde_json::from_str::<serde_json::Value>(&record.value) {
-            Ok(v) => {
+        let is_orphaned = match &record.payload {
+            Some(v) => {
                 let affected = v.get("affected_files");
                 match affected {
                     None => true,
                     Some(arr) => arr.as_array().map_or(true, |a| a.is_empty()),
                 }
             }
-            // Non-JSON value — plain text decision, no affected files at all.
-            Err(_) => true,
+            // No payload — decision has no structured data, treat as orphaned.
+            None => true,
         };
 
         if !is_orphaned {
@@ -314,7 +313,7 @@ fn detect_dependency_unknown(
     // Build a set of dep keys that have at least one confirmed gotcha referencing them.
     let mut deps_with_gotchas = std::collections::HashSet::new();
     for gotcha in gotchas {
-        if let Ok(gr) = serde_json::from_str::<serde_json::Value>(&gotcha.value) {
+        if let Some(gr) = &gotcha.payload {
             if let Some(confirmed) = gr.get("confirmed") {
                 if confirmed.as_bool() != Some(true) {
                     continue;

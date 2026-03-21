@@ -242,7 +242,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .map(|(i, fr)| {
             let key = format!("file:{}", fr.path);
             let mut rec = Record::layer0_file_stub(&key, device_id, logical_clock + i as u64, now);
-            rec.value = serde_json::to_string(fr).unwrap_or_default();
+            // value = purpose (empty at layer 0 — enrichment fills it later)
+            // payload = full FileRecord struct for fast-path reads
+            rec.payload = serde_json::to_value(fr).ok();
             rec
         })
         .collect();
@@ -322,10 +324,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
         t.elapsed().as_millis(),
     );
 
-    // ── 9a. Seed stats snapshot (first run only) ─────────────────────────────
-    // On incremental re-init, in-memory file_record_structs is incomplete
-    // (only changed files). Skip seeding — mati stats will recompute from the
-    // full store on next call.
+    // ── 9a. Seed stats + stale cache (first run only) ────────────────────────
+    // On incremental re-init, in-memory record slices are incomplete
+    // (only changed files). Skip seeding — mati stats/stale will recompute
+    // from the full store on their next call.
     if skipped_count == 0 {
         let gotcha_recs: Vec<Record> = claude_import
             .records
@@ -351,12 +353,24 @@ pub async fn run(args: InitArgs) -> Result<()> {
         {
             tracing::warn!("stats snapshot seed failed (non-fatal): {e}");
         }
+        if let Err(e) = super::stale::seed_stale_cache(&store, &all_records).await {
+            tracing::warn!("stale cache seed failed (non-fatal): {e}");
+        }
     }
 
     // ── 10–11. Graph::load + add_edges_batch ─────────────────────────────────
+    // Warm re-init with no new edges: skip the 14k-key prefix scan entirely.
+    // Graph::empty wraps the Store without touching SurrealKV — close() and
+    // store() still work. Cold init (skipped_count == 0) always loads because
+    // mark_search_stale is only called on cold paths and is a no-op concern.
     let t = Instant::now();
-    let mut graph = Graph::load(store).await?;
-    graph.add_edges_batch(&layer0_edges.edges).await?;
+    let mut graph = if layer0_edges.edges.is_empty() && skipped_count > 0 {
+        Graph::empty(store)
+    } else {
+        let mut g = Graph::load(store).await?;
+        g.add_edges_batch(&layer0_edges.edges).await?;
+        g
+    };
     println!(
         "  Graph load+edges...                              {:>4}ms",
         t.elapsed().as_millis()
@@ -477,5 +491,6 @@ fn make_hash_record(key: &str, hash: &str, device_id: Uuid, now: u64) -> Record 
         source: RecordSource::StaticAnalysis,
         confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
         gap_analysis_score: 0.0,
+        payload: None,
     }
 }

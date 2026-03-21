@@ -208,6 +208,7 @@ mod tests {
                 challenge_count: 0,
             },
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 

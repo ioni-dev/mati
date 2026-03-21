@@ -13,7 +13,8 @@ const EDGE_PREFIX: &str = "graph:edge:";
 
 /// In-memory directed knowledge graph backed by SurrealKV.
 ///
-/// Loaded at session start by scanning all `graph:edge:*` keys.
+/// Use `Graph::load` to restore the full graph from disk, or `Graph::empty`
+/// when the caller only needs store access (e.g. warm re-init with no new edges).
 /// Every mutation writes through to SurrealKV immediately — no edges are lost
 /// on restart. Traversal is fully in-memory (<1 ms).
 pub struct Graph {
@@ -30,6 +31,18 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Wrap a Store without scanning any keys. All collections are empty.
+    /// Use when the caller needs store access but has no edges to add or read
+    /// (e.g. warm re-init with zero new edges — skips the 14k-key prefix scan).
+    pub fn empty(store: Store) -> Self {
+        Graph {
+            inner: DiGraph::new(),
+            node_index: HashMap::new(),
+            edge_set: HashSet::new(),
+            store,
+        }
+    }
+
     /// Load the full graph from SurrealKV by scanning `graph:edge:*`.
     pub async fn load(store: Store) -> Result<Self> {
         let keys = store.scan_keys(EDGE_PREFIX).await?;
@@ -285,6 +298,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore { value: 1.0, confirmation_count: 0, contributor_count: 0, last_challenged: None, challenge_count: 0 },
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
