@@ -466,11 +466,17 @@ impl<'a> Report<'a> {
                 summary.files, summary.entry_points, summary.imports
             );
         }
-        if summary.todos > 0 || summary.doc_comments > 0 || summary.hotspots > 0 {
+        if summary.gotcha_cands > 0 || summary.todos > 0 || summary.doc_comments > 0 || summary.hotspots > 0 {
             println!(
-                "  TODOs:        {}       Doc comments: {}      Hotspots: {}",
-                summary.todos, summary.doc_comments, summary.hotspots
+                "  Gotcha cands: {}   (unwrap+unsafe+panic+TODO)   Hotspots: {}",
+                summary.gotcha_cands, summary.hotspots
             );
+            if summary.todos > 0 || summary.doc_comments > 0 {
+                println!(
+                    "  TODOs:        {}       Doc comments: {}",
+                    summary.todos, summary.doc_comments
+                );
+            }
         }
 
         println!();
@@ -586,6 +592,7 @@ struct Summary {
     files: u64,
     entry_points: u64,
     imports: u64,
+    gotcha_cands: u64,
     todos: u64,
     doc_comments: u64,
     hotspots: u64,
@@ -735,8 +742,7 @@ fn extract_init_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
     let entry_points = extract_number(output, "entry points:")
         .max(extract_number(output, "entry_points:"));
     let imports = extract_number(output, "imports:");
-    let todos = extract_number(output, "todos:")
-        .max(candidates); // gotcha_candidates includes TODOs
+    let todos = extract_number(output, "todos:");
     let doc_comments = extract_number(output, "doc comments:");
     let co_change_pairs = extract_number(output, "co-change pairs:");
     let revert_stubs = extract_number(output, "revert stubs:");
@@ -750,6 +756,9 @@ fn extract_init_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
     }
     if imports > 0 {
         sr.add_metric("imports", &imports.to_string());
+    }
+    if candidates > 0 {
+        sr.add_metric("gotcha_cands", &candidates.to_string());
     }
     if todos > 0 {
         sr.add_metric("todos", &todos.to_string());
@@ -780,6 +789,7 @@ fn extract_init_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
     summary.files = files.max(summary.files);
     summary.entry_points = entry_points.max(summary.entry_points);
     summary.imports = imports.max(summary.imports);
+    summary.gotcha_cands = candidates.max(summary.gotcha_cands);
     summary.todos = todos.max(summary.todos);
     summary.doc_comments = doc_comments.max(summary.doc_comments);
     summary.hotspots = hotspots.max(summary.hotspots);
@@ -860,10 +870,11 @@ fn extract_ping_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summar
 // ── mati status ───────────────────────────────────────────────────────────────
 
 fn extract_status_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary) {
-    // "  Records    214 files  41 gotchas  0 decisions  ..."
-    let files = extract_number(output, "files");
-    let gotchas = extract_number(output, "gotchas");
-    let decisions = extract_number(output, "decisions");
+    // "  Records    214 files  41 gotchas  0 decisions  0 notes  34 deps"
+    // Numbers come BEFORE the keyword
+    let files = extract_int_before_word(output, " files");
+    let gotchas = extract_int_before_word(output, " gotchas");
+    let decisions = extract_int_before_word(output, " decisions");
     let hotspots = extract_number(output, "hotspot");
 
     // "  Confidence   avg 0.10  median ..."
@@ -883,10 +894,13 @@ fn extract_status_metrics(output: &str, sr: &mut StepResult, summary: &mut Summa
 
     let total = files + gotchas + decisions;
     sr.add_metric("coverage", &format!("{coverage}%"));
-    sr.add_metric("records", &total.to_string());
+    sr.add_metric("files", &files.to_string());
+    sr.add_metric("gotchas", &gotchas.to_string());
     sr.add_metric("hotspots", &hotspots.to_string());
 
     if let Some(avg) = conf_avg {
+        // NOTE: status conf_avg includes ALL records (files+gotchas+decisions+notes)
+        // stats confidence_avg includes only gotchas+decisions — intentionally different
         sr.add_metric("conf_avg", &format!("{avg:.2}"));
     }
 
