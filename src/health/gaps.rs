@@ -187,44 +187,43 @@ fn parse_file_record(record: &Record) -> Option<FileRecord> {
     record.payload_as::<FileRecord>()
 }
 
-/// HotFileNoRecord: hotspot files where `is_hotspot=true` but the record's
-/// value is empty (no FileRecord data at all). In practice, a file: record
-/// with an empty value means Layer 0 created the key but wrote no content.
+/// HotFileNoRecord: hotspot files where `is_hotspot=true` but the record has
+/// no FileRecord payload at all (i.e. Layer 0 never populated the file: key).
+///
+/// NOTE: `record.value` is the human-authored text field and is intentionally
+/// empty for all Layer 0 stubs — it cannot be used to detect missing payload.
+/// After the MessagePack migration, FileRecord lives in `record.payload`.
 fn detect_hot_file_no_record(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) {
     for record in file_records {
-        if record.value.is_empty() {
-            // No FileRecord data — try to get change_frequency from parsed
-            // FileRecord. Since the value is empty here, fall back to 1.0.
-            let freq = parse_file_record(record)
-                .map(|fr| fr.change_frequency as f32)
-                .unwrap_or(1.0);
-            let gap = KnowledgeGap {
-                key: record.key.clone(),
-                gap_type: GapType::HotFileNoRecord,
-                risk_score: risk_score(freq, COVERAGE_HOT_FILE_NO_RECORD),
-                description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
-                action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
-            };
-            gaps.push(gap);
-            continue;
-        }
-
-        if let Some(fr) = parse_file_record(record) {
-            // File has a parsed record — handled by other detectors. But if
-            // is_hotspot is true and everything else is empty, it's still a gap.
-            if fr.is_hotspot
-                && fr.purpose.is_empty()
-                && fr.gotcha_keys.is_empty()
-                && fr.entry_points.is_empty()
-            {
+        match parse_file_record(record) {
+            None => {
+                // No FileRecord payload at all — genuine empty stub.
                 let gap = KnowledgeGap {
                     key: record.key.clone(),
                     gap_type: GapType::HotFileNoRecord,
-                    risk_score: risk_score(fr.change_frequency as f32, COVERAGE_HOT_FILE_NO_RECORD),
+                    risk_score: risk_score(1.0, COVERAGE_HOT_FILE_NO_RECORD),
                     description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
                     action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
                 };
                 gaps.push(gap);
+            }
+            Some(fr) => {
+                // File has a FileRecord — handled by other detectors. But if
+                // is_hotspot is true and everything else is empty, it's a gap.
+                if fr.is_hotspot
+                    && fr.purpose.is_empty()
+                    && fr.gotcha_keys.is_empty()
+                    && fr.entry_points.is_empty()
+                {
+                    let gap = KnowledgeGap {
+                        key: record.key.clone(),
+                        gap_type: GapType::HotFileNoRecord,
+                        risk_score: risk_score(fr.change_frequency as f32, COVERAGE_HOT_FILE_NO_RECORD),
+                        description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
+                        action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
+                    };
+                    gaps.push(gap);
+                }
             }
         }
     }
