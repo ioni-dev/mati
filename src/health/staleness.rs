@@ -1187,6 +1187,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
 
         let cascaded = cascade_staleness_to_gotchas(&store, &file_record)
@@ -1224,6 +1226,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
 
         let cascaded = cascade_staleness_to_gotchas(&store, &file_record)
@@ -1254,6 +1258,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
 
         let cascaded = cascade_staleness_to_gotchas(&store, &file_record)
@@ -1323,6 +1329,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session,
+            content_hash: None,
+            line_count: 0,
         };
         Record {
             key: key.to_string(),
@@ -1431,6 +1439,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         };
         let cache = HashMap::new();
         let factor = dep_factor(Some(&fr), &cache);
@@ -1454,6 +1464,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         };
 
         // Create a dep record for tokio that was updated after the file.
@@ -1534,6 +1546,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
 
         let record = make_file_record_full(
@@ -1576,6 +1590,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
 
         let record = make_file_record_full(

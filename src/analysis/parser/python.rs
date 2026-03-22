@@ -34,6 +34,8 @@ const PY_QUERY_SRC: &str = r#"
   (try_statement) @branch
 
   (comment) @comment
+
+  (module . (expression_statement (string) @module_doc))
 "#;
 
 static PY_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
@@ -55,11 +57,12 @@ thread_local! {
 // ── Capture indices ───────────────────────────────────────────────────────────
 
 struct PyCaptures {
-    fn_name: u32,
+    fn_name:    u32,
     class_name: u32,
-    import: u32,
-    branch: u32,
-    comment: u32,
+    import:     u32,
+    branch:     u32,
+    comment:    u32,
+    module_doc: u32,
 }
 
 impl PyCaptures {
@@ -69,11 +72,12 @@ impl PyCaptures {
                 .unwrap_or_else(|| panic!("parser/python: query missing @{name}"))
         };
         Self {
-            fn_name: idx("fn_name"),
+            fn_name:    idx("fn_name"),
             class_name: idx("class_name"),
-            import: idx("import"),
-            branch: idx("branch"),
-            comment: idx("comment"),
+            import:     idx("import"),
+            branch:     idx("branch"),
+            comment:    idx("comment"),
+            module_doc: idx("module_doc"),
         }
     }
 }
@@ -108,6 +112,9 @@ pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFile
         unwrap_count: 0,
         panic_count: 0,
         branch_count: 0,
+        module_doc: None,
+        content_hash: None,
+        line_count: 0,
     };
 
     let mut cursor = tree_sitter::QueryCursor::new();
@@ -150,6 +157,13 @@ pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFile
                         out.todos.push(todo);
                     }
                 }
+            } else if idx == ci.module_doc && out.module_doc.is_none() {
+                // First string at module level = module docstring.
+                if let Ok(raw) = node.utf8_text(src) {
+                    if let Some(cleaned) = strip_python_docstring(raw) {
+                        out.module_doc = Some(super::normalize_doc(&cleaned));
+                    }
+                }
             }
         }
     }
@@ -175,6 +189,28 @@ fn is_top_level(node: tree_sitter::Node) -> bool {
         }
         _ => false,
     }
+}
+
+/// Strip Python string delimiters from a raw `string` node text.
+///
+/// Returns `None` if the content is empty after stripping.
+/// Handles triple-double, triple-single, double, and single-quoted strings.
+fn strip_python_docstring(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    // Try longest delimiters first.
+    let inner = if s.starts_with("\"\"\"") && s.ends_with("\"\"\"") && s.len() >= 6 {
+        &s[3..s.len() - 3]
+    } else if s.starts_with("'''") && s.ends_with("'''") && s.len() >= 6 {
+        &s[3..s.len() - 3]
+    } else if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        &s[1..s.len() - 1]
+    } else if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+    let trimmed = inner.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -391,5 +427,43 @@ mod tests {
         let f = make_file(&dir, "src/app.py", "def main():\n    pass\n");
         let a = parse_python(&f, "def main():\n    pass\n").unwrap();
         assert_eq!(a.path, "src/app.py");
+    }
+
+    // ── Module doc (docstring) ────────────────────────────────────────────────
+
+    #[test]
+    fn triple_double_quote_docstring() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "\"\"\"Handles payment processing.\"\"\"\ndef pay(): pass\n");
+        assert_eq!(a.module_doc.as_deref(), Some("Handles payment processing."));
+    }
+
+    #[test]
+    fn triple_single_quote_docstring() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "'''Auth utilities.'''\ndef auth(): pass\n");
+        assert_eq!(a.module_doc.as_deref(), Some("Auth utilities."));
+    }
+
+    #[test]
+    fn single_double_quote_docstring() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "\"Short description.\"\ndef f(): pass\n");
+        assert_eq!(a.module_doc.as_deref(), Some("Short description."));
+    }
+
+    #[test]
+    fn no_docstring_yields_none() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "# comment\ndef f(): pass\n");
+        assert!(a.module_doc.is_none());
+    }
+
+    #[test]
+    fn docstring_after_function_not_captured() {
+        let dir = TempDir::new().unwrap();
+        // String is NOT the first statement → not a module docstring.
+        let a = parse(&dir, "x = 1\n\"\"\"Not a module docstring.\"\"\"\n");
+        assert!(a.module_doc.is_none());
     }
 }

@@ -63,6 +63,12 @@ enum Commands {
     Export(cli::show::ExportArgs),
     /// Import from CLAUDE.md or JSON
     Import(cli::show::ImportArgs),
+    /// Review auto-detected candidates (confirmed=false) — confirm, edit, skip, or delete
+    Review(cli::review::ReviewArgs),
+    /// Show everything mati knows about a file — purpose, gotchas, decisions, co-changes
+    Explain(cli::explain::ExplainArgs),
+    /// Cross-reference a git diff against the knowledge store, surface gotchas before merge
+    Diff(cli::diff::DiffArgs),
     /// List stale records with signals, impact, and action hints
     Stale(cli::stale::StaleArgs),
     /// Check mati daemon reachability and latency
@@ -70,6 +76,11 @@ enum Commands {
     /// Run as MCP stdio server (for Claude Code plugin)
     Serve,
     // ── Internal hook commands (hidden from --help) ─────────────────────
+    #[command(hide = true)]
+    DocCapture {
+        /// Repo-relative file path
+        path: String,
+    },
     #[command(hide = true)]
     Get { key: String },
     #[command(hide = true)]
@@ -122,6 +133,9 @@ async fn main() -> Result<()> {
         Commands::Note { text } => run_note(&text).await,
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
+        Commands::Review(args) => cli::review::run(args).await,
+        Commands::Explain(args) => cli::explain::run(args).await,
+        Commands::Diff(args) => cli::diff::run(args).await,
         Commands::Stale(args) => cli::stale::run(args).await,
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
@@ -143,6 +157,7 @@ async fn main() -> Result<()> {
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+        Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
     }

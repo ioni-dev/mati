@@ -1,10 +1,13 @@
 use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
+use mati_core::graph::{EdgeKind, Graph};
 use mati_core::health::gaps;
 use mati_core::store::{
     Category, ConfidenceScore, KnowledgeGap, Priority, QualityScore, Record, RecordLifecycle,
@@ -92,21 +95,41 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         }
     }
 
-    // ── Compute gaps — scan once and pass pre-loaded records ─────────────
+    // ── Compute gaps — scan records and load graph for fan-in ─────────────
     let (files, gotchas, decisions, deps) = tokio::try_join!(
         store.scan_prefix("file:"),
         store.scan_prefix("gotcha:"),
         store.scan_prefix("decision:"),
         store.scan_prefix("dep:"),
     )?;
-    let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps);
+
+    // Load graph to compute import fan-in (how many files import each file).
+    // Fan-in drives HighFanInNoContract detection. Gracefully degrade if the
+    // graph fails to load — all other gap types still work.
+    let fan_in = match Graph::load(store).await {
+        Ok(graph) => {
+            let fi = compute_fan_in(&graph, &files);
+            graph.close().await?;
+            fi
+        }
+        Err(e) => {
+            tracing::warn!("gaps: graph load failed, HighFanInNoContract skipped: {e}");
+            HashMap::new()
+        }
+    };
+
+    let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps, &fan_in);
 
     // ── Write cache (best-effort) ────────────────────────────────────────
+    // Re-open store for cache write (graph took ownership above).
+    let cwd2 = std::env::current_dir()?;
+    let store2 = Store::open(&cwd2).await?;
     let cache_entry = GapsCacheEntry { write_seq: current_seq, gaps: all_gaps.clone() };
     if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
         let record = cache_record(cache_key, cache_value);
-        let _ = store.put(cache_key, &record).await;
+        let _ = store2.put(cache_key, &record).await;
     }
+    store2.close().await?;
 
     let filtered: Vec<_> = all_gaps
         .into_iter()
@@ -115,8 +138,20 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         .collect();
 
     display_gaps(&filtered, None, use_color);
-    store.close().await?;
     Ok(())
+}
+
+/// Count reverse Imports edges per file key — how many files import each file.
+///
+/// Used to detect high fan-in files whose blast radius is undocumented.
+fn compute_fan_in(graph: &Graph, file_records: &[Record]) -> HashMap<String, usize> {
+    let mut fan_in: HashMap<String, usize> = HashMap::new();
+    for record in file_records {
+        for imported_key in graph.neighbors(&record.key, &EdgeKind::Imports) {
+            *fan_in.entry(imported_key).or_default() += 1;
+        }
+    }
+    fan_in
 }
 
 fn display_gaps(gaps: &[KnowledgeGap], cache_age: Option<u64>, use_color: bool) {

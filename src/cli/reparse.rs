@@ -166,6 +166,8 @@ pub(crate) async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel
         is_hotspot: old_fr.is_hotspot,
         token_cost_estimate: (walked.size_bytes / 4).min(u32::MAX as u64) as u32,
         last_modified_session: now,
+        content_hash: analysis.content_hash.clone(),
+        line_count: analysis.line_count,
     };
 
     record.value = merged.purpose.clone();
@@ -214,6 +216,8 @@ fn build_file_record_from_analysis(
         is_hotspot: false,
         token_cost_estimate: (walked.size_bytes / 4).min(u32::MAX as u64) as u32,
         last_modified_session: now,
+        content_hash: analysis.content_hash.clone(),
+        line_count: analysis.line_count,
     }
 }
 
@@ -292,6 +296,8 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 100,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         }
     }
 
@@ -307,6 +313,9 @@ mod tests {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         }
     }
 
@@ -355,6 +364,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
         let new = StaticFileAnalysis {
             path: "src/main.rs".into(),
@@ -367,6 +378,9 @@ mod tests {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         };
         let diff = compute_diff(&old, &new);
         assert!(diff.is_empty());
@@ -416,6 +430,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
         let record = Record {
             key: "file:gone.rs".into(),
@@ -477,6 +493,8 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 50,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         };
         let record = Record {
             key: "file:lib.rs".into(),
@@ -552,10 +570,13 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         };
         let record = Record {
             key: "file:stable.rs".into(),
-            value: serde_json::to_string(&fr).unwrap(),
+            value: fr.purpose.clone(),
+            payload: serde_json::to_value(&fr).ok(),
             category: Category::File,
             priority: mati_core::store::record::Priority::Normal,
             tags: vec![],
@@ -575,7 +596,6 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
-            payload: None,
         };
         store.put("file:stable.rs", &record).await.unwrap();
 

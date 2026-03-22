@@ -253,6 +253,150 @@ pub async fn run_edit_hook(path: &str) -> Result<()> {
     Ok(())
 }
 
+// ── doc-capture (2.3) ────────────────────────────────────────────────────────
+
+/// Read first lines of new file content from stdin, detect a canonical doc
+/// comment, and update the `file:*` record's purpose + confidence.
+///
+/// Called by `post_edit.sh` in the background — must be fast and non-blocking.
+/// Gracefully no-ops when no record exists yet or content has no doc comment.
+pub async fn run_doc_capture(path: &str) -> Result<()> {
+    use std::io::Read as _;
+    let mut content = String::new();
+    std::io::stdin().read_to_string(&mut content)?;
+
+    let purpose = extract_doc_comment(path, &content);
+    if purpose.is_empty() {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+    let file_key = format!("file:{path}");
+
+    let mut record = match store.get(&file_key).await? {
+        Some(r) => r,
+        None => {
+            store.close().await?;
+            return Ok(());
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Only update purpose when the record's current source is static analysis
+    // (Layer 0 stub) — don't overwrite developer-manual or higher-quality records.
+    if record.source != RecordSource::StaticAnalysis {
+        store.close().await?;
+        return Ok(());
+    }
+
+    if let Some(mut fr) = record.payload_as::<mati_core::store::FileRecord>() {
+        fr.purpose = purpose.clone();
+        record.payload = serde_json::to_value(&fr).ok();
+    } else {
+        store.close().await?;
+        return Ok(());
+    }
+
+    record.value = purpose;
+    record.source = RecordSource::SessionHook;
+    record.confidence.value = 0.65;
+    record.quality = QualityScore::doc_comment_default();
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    if let Err(e) = store.put(&file_key, &record).await {
+        tracing::warn!(path, "doc-capture put failed: {e}");
+    }
+    store.close().await?;
+    Ok(())
+}
+
+/// Detect a canonical module-level doc comment from the first few lines of content.
+/// Returns the cleaned comment text, or an empty string if none found.
+fn extract_doc_comment(path: &str, content: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    match ext {
+        "rs" => extract_rust_module_doc(content),
+        "py" => extract_python_docstring(content),
+        "go" => extract_go_package_doc_comment(content),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => extract_jsdoc(content),
+        _ => String::new(),
+    }
+}
+
+/// Collect consecutive `//!` lines at the top of a Rust file.
+fn extract_rust_module_doc(content: &str) -> String {
+    let lines: Vec<&str> = content
+        .lines()
+        .take_while(|l| l.trim_start().starts_with("//!"))
+        .map(|l| l.trim_start().trim_start_matches("//!").trim())
+        .collect();
+    lines.join(" ").trim().to_string()
+}
+
+/// Extract the first line of a Python module docstring (`"""` or `'''`).
+fn extract_python_docstring(content: &str) -> String {
+    let trimmed = content.trim_start();
+    for delim in &[r#"""""#, "'''"] {
+        if trimmed.starts_with(delim) {
+            let rest = &trimmed[delim.len()..];
+            if let Some(end) = rest.find(delim) {
+                return rest[..end]
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Collect the `//` comment block that appears immediately before `package X`.
+fn extract_go_package_doc_comment(content: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            lines.push(t.trim_start_matches("//").trim().to_string());
+        } else if t.starts_with("package ") {
+            break;
+        } else if !t.is_empty() {
+            lines.clear(); // non-comment, non-empty line resets the block
+        }
+    }
+    lines.join(" ").trim().to_string()
+}
+
+/// Extract a JSDoc `/** ... */` block at the top of a JS/TS file.
+fn extract_jsdoc(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("/**") {
+        let rest = &trimmed[3..];
+        if let Some(end) = rest.find("*/") {
+            let text: Vec<&str> = rest[..end]
+                .lines()
+                .map(|l| l.trim().trim_start_matches('*').trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            return text.join(" ").trim().to_string();
+        }
+    }
+    String::new()
+}
+
 // ── log-compliance-miss ──────────────────────────────────────────────────────
 
 pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
@@ -382,9 +526,15 @@ async fn session_harvest_impl(store: &Store, cwd: &std::path::Path) -> Result<()
     }
 
     // Read session:current (written by session-flush)
-    let session_value = match store.get("session:current").await? {
-        Some(r) => r.value,
+    let session_rec = match store.get("session:current").await? {
+        Some(r) => r,
         None => return Ok(()),
+    };
+
+    // Reconstruct the session value string for callers that still use &str
+    let session_value = match session_rec.payload.as_ref() {
+        Some(p) => serde_json::to_string(p).unwrap_or_default(),
+        None => session_rec.value.clone(),
     };
 
     // M-13-C: collect and store stale reviews for consulted keys
@@ -394,11 +544,11 @@ async fn session_harvest_impl(store: &Store, cwd: &std::path::Path) -> Result<()
         Err(e) => tracing::warn!(error = %e, "stale review collection failed"),
     }
 
-    // Write permanent session record
+    // Write permanent session record — propagate payload so consumers can read structured data
     let session_key = format!("session:{now}");
-    store
-        .put(&session_key, &session_record(&session_key, session_value))
-        .await?;
+    let mut perm = session_record(&session_key, session_value);
+    perm.payload = session_rec.payload;
+    store.put(&session_key, &perm).await?;
 
     // Clean up session:consulted:* markers
     let consulted_keys = store.scan_keys("session:consulted:").await?;
@@ -792,7 +942,7 @@ mod tests {
     #[test]
     fn extract_confirmed_false_for_corrupt_gotcha_value() {
         let mut record = make_gotcha_record("gotcha:test", true);
-        record.value = "not valid json at all".into();
+        record.payload = None; // corrupt the payload — extract_confirmed reads payload, not value
         assert!(!extract_confirmed(&record));
     }
 
@@ -1748,3 +1898,4 @@ mod tests {
         store.close().await.unwrap();
     }
 }
+

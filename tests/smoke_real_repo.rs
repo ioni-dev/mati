@@ -109,7 +109,8 @@ mod tests {
         };
         Record {
             key: key.to_string(),
-            value: serde_json::to_string(&gotcha).expect("failed to serialize gotcha"),
+            value: gotcha.rule.clone(),
+            payload: serde_json::to_value(&gotcha).ok(),
             category: Category::Gotcha,
             priority: Priority::High,
             tags: vec!["test".to_string()],
@@ -134,7 +135,6 @@ mod tests {
             source: RecordSource::DeveloperManual,
             confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
             gap_analysis_score: 0.0,
-            payload: None,
         }
     }
 

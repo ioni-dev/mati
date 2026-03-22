@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::analysis::walker::{Language, WalkedFile};
 use crate::store::record::{TodoComment, TodoKind};
@@ -53,6 +54,12 @@ pub struct StaticFileAnalysis {
     pub panic_count: u32,
     /// Control-flow branches: if, match/switch, loop, while, for, ternary, try.
     pub branch_count: u32,
+    /// Canonical module-level doc comment (language-specific — see ENRICHMENT.md §1.1).
+    pub module_doc: Option<String>,
+    /// SHA-256 hex digest of file bytes at parse time. Used for content-change detection (P3).
+    pub content_hash: Option<String>,
+    /// Number of newlines in the file — used for line-count delta in staleness signals.
+    pub line_count: u32,
 }
 
 impl StaticFileAnalysis {
@@ -68,6 +75,9 @@ impl StaticFileAnalysis {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         }
     }
 }
@@ -163,11 +173,15 @@ pub fn hash_and_parse_parallel(
                 Ok(b) => b,
                 Err(_) => return None, // unreadable — skip silently
             };
+            let content_hash = format!("{:x}", Sha256::digest(&bytes));
+            let line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
             let source = String::from_utf8_lossy(&bytes);
-            let analysis = parse_file_from_source(f, &source).unwrap_or_else(|e| {
+            let mut analysis = parse_file_from_source(f, &source).unwrap_or_else(|e| {
                 tracing::warn!("parser: error on {}: {e}", f.rel_path);
                 StaticFileAnalysis::empty(f)
             });
+            analysis.content_hash = Some(content_hash);
+            analysis.line_count = line_count;
             Some(Slot::Changed(f.clone(), analysis))
         })
         .collect();
@@ -256,6 +270,31 @@ pub(crate) fn extract_todo(comment: &str, line: u32) -> Option<TodoComment> {
         line,
         kind,
     })
+}
+
+/// Normalize a doc comment string: collapse internal whitespace runs to a
+/// single space and trim leading/trailing whitespace.
+///
+/// Used by language parsers to clean up multi-line doc comments before storing
+/// them as `module_doc`.
+pub(crate) fn normalize_doc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = true; // trim leading
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

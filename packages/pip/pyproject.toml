@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mati-ai"
+version = "0.1.0"
+description = "Engineering knowledge that survives turnover"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+[project.urls]
+Repository = "https://github.com/ioni-dev/mati"
+
+[project.scripts]
+mati = "mati_ai:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mati_ai*"]
+
+[tool.setuptools.package-data]
+mati_ai = ["bin/.gitkeep"]

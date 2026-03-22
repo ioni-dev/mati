@@ -799,6 +799,8 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 100,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/hot.rs",
@@ -853,6 +855,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/cold.rs",
@@ -899,6 +903,8 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 100,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/covered.rs",
@@ -1005,6 +1011,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",
@@ -1060,6 +1068,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/dead.rs",
@@ -1111,6 +1121,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/dup.rs",
@@ -1187,6 +1199,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",

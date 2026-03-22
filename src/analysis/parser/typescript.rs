@@ -210,6 +210,9 @@ fn parse_ecma(
         unwrap_count: 0,
         panic_count: 0,
         branch_count: 0,
+        module_doc: None, // TypeScript @fileoverview not implemented yet
+        content_hash: None,
+        line_count: 0,
     };
 
     let mut cursor = tree_sitter::QueryCursor::new();
