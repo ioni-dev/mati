@@ -191,6 +191,8 @@ mod tests {
             is_hotspot,
             token_cost_estimate: 200,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         }
     }
 

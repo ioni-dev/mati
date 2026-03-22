@@ -1,0 +1,10 @@
+{
+  "name": "@mati-dev/mati",
+  "version": "0.1.0",
+  "description": "Engineering knowledge that survives turnover",
+  "bin": { "mati": "bin/mati" },
+  "scripts": { "postinstall": "node install.js" },
+  "repository": { "type": "git", "url": "https://github.com/ioni-dev/mati" },
+  "license": "MIT",
+  "engines": { "node": ">=16" }
+}

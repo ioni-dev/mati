@@ -199,3 +199,14 @@ opt-level = 1
 # build.rs compiles all tree-sitter C parsers via the `cc` crate.
 # Add `cc = "1"` to [build-dependencies] when adding a new grammar.
 # See: https://tree-sitter.github.io/tree-sitter/creating-parsers
+
+# ─────────────────────────────────────────────
+# cargo-binstall metadata
+# ─────────────────────────────────────────────
+# Enables: cargo binstall mati
+# Resolves the correct pre-built binary for the host platform.
+
+[package.metadata.binstall]
+pkg-url  = "https://github.com/ioni-dev/mati/releases/download/v{ version }/mati-{ target }.tar.gz"
+bin-dir  = "mati"
+pkg-fmt  = "tgz"

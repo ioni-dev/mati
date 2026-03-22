@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "mati": {
+      "command": "mati",
+      "args": ["serve"],
+      "description": "Engineering knowledge that survives turnover. Persistent, queryable knowledge store for codebases — accumulates per-file gotchas, architectural decisions, and project state, then surfaces them to Claude on demand.",
+      "homepage": "https://mati.dev",
+      "repository": "https://github.com/mati-dev/mati",
+      "version": "0.1.0"
+    }
+  }
+}

@@ -197,8 +197,10 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         "    Avg confidence         {conf_color}{avg_confidence:.2}{reset}"
     );
 
-    // Knowledge gaps — pass pre-loaded records, no redundant scans
-    let gap_list = gaps::analyze(&files, &gotchas, &decisions, &deps);
+    // Knowledge gaps — pass pre-loaded records, no redundant scans.
+    // Empty fan_in: stats skips graph load for speed; HighFanInNoContract
+    // gaps appear in `mati gaps` which loads the full graph.
+    let gap_list = gaps::analyze(&files, &gotchas, &decisions, &deps, &std::collections::HashMap::new());
     let gap_count = gap_list.len() as u32;
     let gap_color = if gap_count == 0 { green } else { yellow };
     println!(

@@ -123,7 +123,14 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
         unwrap_count: 0,
         panic_count: 0,
         branch_count: 0,
+        module_doc: None,
+        content_hash: None,
+        line_count: 0,
     };
+
+    // Collect `//!` inner doc lines in file-top position (rows 0-4).
+    // Joined after the loop so we handle multi-line module docs correctly.
+    let mut inner_doc_lines: Vec<(usize, String)> = Vec::new();
 
     let mut cursor = tree_sitter::QueryCursor::new();
     for m in cursor.matches(query, tree.root_node(), src) {
@@ -153,12 +160,58 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
-                    let line = node.start_position().row as u32 + 1;
+                    let row = node.start_position().row;
+                    let line = row as u32 + 1;
                     if let Some(todo) = extract_todo(text, line) {
                         out.todos.push(todo);
                     }
+                    // Capture inner doc comments at the file top only.
+                    // Handles both `//!` line style and `/*! ... */` block style.
+                    if row < 5 {
+                        if text.starts_with("//!") {
+                            let stripped = text
+                                .trim_start_matches("//!")
+                                .trim_start_matches('/')
+                                .trim()
+                                .to_string();
+                            if !stripped.is_empty() {
+                                inner_doc_lines.push((row, stripped));
+                            }
+                        } else if text.starts_with("/*!") {
+                            let inner = text
+                                .trim_start_matches("/*!")
+                                .trim_end_matches("*/")
+                                .trim();
+                            // Collapse all lines into one summary.
+                            let collapsed: String = inner
+                                .lines()
+                                .map(|l| l.trim().trim_start_matches('*').trim())
+                                .filter(|l| !l.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !collapsed.is_empty() {
+                                inner_doc_lines.push((row, collapsed));
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    // Build module_doc from contiguous inner doc lines at file top.
+    if !inner_doc_lines.is_empty() {
+        inner_doc_lines.sort_by_key(|(r, _)| *r);
+        // Only keep a contiguous block starting at the lowest captured row.
+        let start_row = inner_doc_lines[0].0;
+        let contiguous: Vec<&str> = inner_doc_lines
+            .iter()
+            .enumerate()
+            .take_while(|(i, (r, _))| *r == start_row + i)
+            .map(|(_, (_, text))| text.as_str())
+            .collect();
+        if !contiguous.is_empty() {
+            out.module_doc = Some(super::normalize_doc(&contiguous.join(" ")));
         }
     }
 
@@ -365,6 +418,46 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "// just a comment\nfn f() {}");
         assert!(a.todos.is_empty());
+    }
+
+    // ── Module doc (//!) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn inner_doc_at_top_sets_module_doc() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "//! Handles request routing.\nfn f() {}");
+        assert_eq!(a.module_doc.as_deref(), Some("Handles request routing."));
+    }
+
+    #[test]
+    fn multi_line_inner_doc_joined() {
+        let dir = TempDir::new().unwrap();
+        let src = "//! First line.\n//! Second line.\nfn f() {}";
+        let a = parse(&dir, src);
+        assert_eq!(a.module_doc.as_deref(), Some("First line. Second line."));
+    }
+
+    #[test]
+    fn inner_doc_mid_file_ignored() {
+        let dir = TempDir::new().unwrap();
+        // row 5+ (0-indexed) — beyond the early-rows window
+        let src = "fn f() {}\nfn g() {}\nfn h() {}\nfn i() {}\nfn j() {}\n//! late doc\nfn k() {}";
+        let a = parse(&dir, src);
+        assert!(a.module_doc.is_none());
+    }
+
+    #[test]
+    fn block_inner_doc_sets_module_doc() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "/*!\nThe main entry point.\n*/\nfn f() {}");
+        assert_eq!(a.module_doc.as_deref(), Some("The main entry point."));
+    }
+
+    #[test]
+    fn no_inner_doc_yields_none() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "/// outer doc\nfn f() {}");
+        assert!(a.module_doc.is_none());
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────────
