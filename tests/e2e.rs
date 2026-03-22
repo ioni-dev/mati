@@ -1174,10 +1174,13 @@ fn extract_show_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summar
             }
             None
         });
+    // "    source      StaticAnalysis (Layer 0)"
+    // Must match the metadata "source" line, not "base (source)  0.10" in the confidence section.
+    // The metadata line has "source" as the first non-whitespace token.
     let source = output.lines()
-        .find(|l| l.contains("source"))
-        .and_then(|l| l.split("source").nth(1))
-        .map(|s| s.trim().trim_start_matches(':').trim().to_string());
+        .find(|l| l.trim_start().starts_with("source") && !l.contains("base (source)"))
+        .and_then(|l| l.trim_start().strip_prefix("source"))
+        .map(|s| s.trim().to_string());
 
     if let Some(c) = conf {
         sr.add_metric("confidence", &format!("{c:.2}"));
