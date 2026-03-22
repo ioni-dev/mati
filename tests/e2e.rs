@@ -1400,7 +1400,10 @@ fn extract_review_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _summ
         sr.add_metric("candidates", &(candidates.max(shown)).to_string());
         if skipped > 0 { sr.add_metric("skipped", &skipped.to_string()); }
     } else {
-        sr.add_metric("candidates", "0");
+        // 0 is expected on shallow clones: review only shows gotcha:* records
+        // with confirmed=false AND quality>=0.4. Auto-stubs (co-change, revert,
+        // ownership) require git history depth > 5 to be generated.
+        sr.add_metric("candidates", "0 (expected: no auto-stubs on shallow clone)");
     }
 }
 
