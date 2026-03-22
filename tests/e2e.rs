@@ -70,7 +70,7 @@ fn e2e_full_lifecycle() {
     extract_gaps_metrics(&r.stdout, &mut sr, &mut summary);
     report.add(sr);
 
-    let r = h_run(&mati, &repo, home, &["ls", "files"]);
+    let r = h_run(&mati, &repo, home, &["ls", "files", "-n", "0"]);
     let mut sr = StepResult::new("ls files", &r);
     extract_ls_files_metrics(&r.stdout, &mut sr, &mut summary);
     report.add(sr);
