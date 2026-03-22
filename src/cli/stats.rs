@@ -193,9 +193,14 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         sum / knowledge_records.len() as f32
     };
     let conf_color = if avg_confidence >= 0.6 { green } else { yellow };
-    println!(
-        "    Avg confidence         {conf_color}{avg_confidence:.2}{reset}"
-    );
+    if knowledge_records.is_empty() {
+        println!("    Avg confidence         {gray}—  (no gotchas or decisions yet){reset}");
+    } else {
+        println!(
+            "    Avg confidence         {conf_color}{avg_confidence:.2}{reset}  {gray}(gotchas + decisions, n={}){reset}",
+            knowledge_records.len()
+        );
+    }
 
     // Knowledge gaps — pass pre-loaded records, no redundant scans.
     // Empty fan_in: stats skips graph load for speed; HighFanInNoContract
@@ -583,10 +588,14 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
     );
 
     let conf_color = if s.avg_confidence >= 0.6 { green } else { yellow };
-    println!(
-        "    Avg confidence         {conf_color}{:.2}{reset}",
-        s.avg_confidence
-    );
+    if s.avg_confidence == 0.0 && s.decisions_documented == 0 {
+        println!("    Avg confidence         {gray}—  (no gotchas or decisions yet){reset}");
+    } else {
+        println!(
+            "    Avg confidence         {conf_color}{:.2}{reset}  {gray}(gotchas + decisions){reset}",
+            s.avg_confidence
+        );
+    }
 
     let gap_color = if s.knowledge_gaps == 0 { green } else { yellow };
     println!(
