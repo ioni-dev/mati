@@ -71,6 +71,8 @@ enum Commands {
     Diff(cli::diff::DiffArgs),
     /// List stale records with signals, impact, and action hints
     Stale(cli::stale::StaleArgs),
+    /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
+    Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
     Ping,
     /// Run as MCP stdio server (for Claude Code plugin)
@@ -137,6 +139,11 @@ async fn main() -> Result<()> {
         Commands::Explain(args) => cli::explain::run(args).await,
         Commands::Diff(args) => cli::diff::run(args).await,
         Commands::Stale(args) => cli::stale::run(args).await,
+        Commands::Daemon(args) => match args.command {
+            cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
+            cli::daemon::DaemonCommand::Stop => cli::daemon::run_daemon_stop().await,
+            cli::daemon::DaemonCommand::Status => cli::daemon::run_daemon_status().await,
+        },
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
             let store = Store::open(&cwd).await?;

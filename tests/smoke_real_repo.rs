@@ -286,21 +286,45 @@ mod tests {
 
     /// Proves the staleness analyzer establishes baselines efficiently on a real
     /// git repo, completing within the 3-second budget.
+    ///
+    /// Seeds records using real source file paths from the project so the
+    /// revwalk and git_factor computation hit actual commits in the git history.
     #[tokio::test]
     #[ignore] // touches disk and git extensively
     async fn smoke_staleness_analyzer_completes_within_budget() {
         let (store, _dir) = temp_store().await;
         let root = project_root();
 
-        // Seed 100 file records with empty last_record_sha
-        for i in 0..100 {
-            let key = format!("file:src/mod_{i}.rs");
-            let record = make_file_record(&key);
-            store
-                .put(&key, &record)
-                .await
-                .expect(&format!("failed to seed record {i}"));
+        // Collect real .rs paths from src/ relative to project root.
+        fn collect_rs(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    collect_rs(&p, root, out);
+                } else if p.extension().map_or(false, |x| x == "rs") {
+                    if let Ok(rel) = p.strip_prefix(root) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                }
+            }
         }
+        let src_dir = root.join("src");
+        let mut real_paths: Vec<String> = Vec::new();
+        collect_rs(&src_dir, &root, &mut real_paths);
+
+        assert!(
+            !real_paths.is_empty(),
+            "no .rs files found under src/ — project_root may be wrong"
+        );
+
+        for path in &real_paths {
+            let key = format!("file:{path}");
+            let record = make_file_record(&key);
+            store.put(&key, &record).await.expect("failed to seed record");
+        }
+
+        let seeded = real_paths.len();
 
         let analyzer = StalenessAnalyzer::new(&root);
         let start = Instant::now();
@@ -311,8 +335,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            report.scanned >= 100,
-            "expected at least 100 scanned, got {}",
+            report.scanned >= seeded as u32,
+            "expected at least {seeded} scanned, got {}",
             report.scanned
         );
 
@@ -322,12 +346,21 @@ mod tests {
             elapsed.as_secs_f64()
         );
 
-        // Verify baselines were set: at least some records should now have
-        // a non-empty last_record_sha (the analyzer establishes HEAD as baseline
-        // for records that reference real files in the git repo).
-        // Note: Our seeded file paths (src/mod_N.rs) don't exist in the repo,
-        // so the analyzer may not set SHA baselines for them. But it should
-        // still complete without error and scan all records.
+        // With real paths the git_factor computation runs revwalk for each
+        // file — verify at least some records received a non-empty baseline SHA.
+        let mut sha_count = 0u32;
+        for path in &real_paths {
+            let key = format!("file:{path}");
+            if let Ok(Some(r)) = store.get(&key).await {
+                if !r.staleness.last_record_sha.is_empty() {
+                    sha_count += 1;
+                }
+            }
+        }
+        assert!(
+            sha_count > 0,
+            "expected at least one record to have a baseline SHA set, got 0"
+        );
 
         store.close().await.expect("store close failed");
     }

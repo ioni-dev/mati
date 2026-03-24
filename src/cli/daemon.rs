@@ -46,11 +46,31 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use mati_core::store::{derive_slug, Store};
+
+// ── CLI subcommand types ──────────────────────────────────────────────────────
+
+/// `mati daemon <start|stop|status>` — manage the background daemon process.
+#[derive(Args, Debug)]
+pub struct DaemonArgs {
+    #[command(subcommand)]
+    pub command: DaemonCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Start the daemon in the foreground (blocks until shutdown)
+    Start,
+    /// Stop a running daemon (sends SIGTERM, removes socket + PID file)
+    Stop,
+    /// Show whether the daemon is running and its socket path
+    Status,
+}
 
 // ── Protocol constants ───────────────────────────────────────────────────────
 
@@ -61,6 +81,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Idle shutdown threshold — wall-clock seconds with no requests.
 /// Uses wall time (not monotonic) so sleep/wake contributes correctly.
 const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
+
+/// Unix domain socket path length limit.
+/// macOS allows 104 bytes; Linux allows 108. Use the stricter macOS limit as
+/// a universal guard so paths valid on Linux are also valid on macOS.
+const UNIX_SOCK_PATH_MAX: usize = 104;
 
 /// How often to sample wall-clock idle time. Fine enough to catch post-wake
 /// idle windows; coarse enough not to burn cycles.
@@ -129,17 +154,37 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 /// idle time. Removes the socket and PID file on any exit path.
 pub async fn run_daemon_start() -> Result<()> {
     let cwd = std::env::current_dir()?;
+    // Compute mati_root separately so we can write the starting sentinel before
+    // Store::open (which may fail). This prevents try_auto_start from spawning
+    // a second daemon while this one is initializing.
+    let mati_root = mati_root_for(&cwd)?;
+    let starting_path = mati_root.join("mati.starting");
+    let _ = std::fs::write(&starting_path, wall_secs().to_string());
+
     let repo_root = Arc::new(std::fs::canonicalize(&cwd)?);
     let store = Store::open(&cwd).await?;
 
     let sock_path = store.root.join("mati.sock");
     let pid_path = store.root.join("mati.pid");
 
+    // Unix domain socket paths are limited to 104 bytes on macOS / 108 on Linux.
+    // Use the stricter macOS limit as a universal guard.
+    let sock_path_bytes = sock_path.as_os_str().len();
+    if sock_path_bytes > UNIX_SOCK_PATH_MAX {
+        anyhow::bail!(
+            "socket path too long ({sock_path_bytes} > {UNIX_SOCK_PATH_MAX} bytes): {}\n\
+             Shorten your home directory path or symlink ~/.mati to a shorter location.",
+            sock_path.display()
+        );
+    }
+
     // Remove stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(&sock_path);
 
     std::fs::write(&pid_path, std::process::id().to_string())
         .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    // PID is written — remove the starting sentinel so try_auto_start won't block.
+    let _ = std::fs::remove_file(&starting_path);
 
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind Unix socket at {}", sock_path.display()))?;
@@ -155,12 +200,10 @@ pub async fn run_daemon_start() -> Result<()> {
         IDLE_SHUTDOWN_SECS / 60
     );
 
-    // Wall-clock timestamp of last accepted connection. Updated in serve_loop.
-    // Intentionally uses wall clock, not monotonic — monotonic freezes during sleep.
+    // Wall-clock timestamp of last accepted connection.
     let last_wall = Arc::new(AtomicU64::new(wall_secs()));
 
-    // Idle-check background task. Fires every IDLE_CHECK_INTERVAL_SECS and compares
-    // wall-clock elapsed time against IDLE_SHUTDOWN_SECS.
+    // Idle-check background task (unchanged — same logic as before).
     let idle_notify = Arc::new(tokio::sync::Notify::new());
     {
         let last_wall = last_wall.clone();
@@ -189,63 +232,92 @@ pub async fn run_daemon_start() -> Result<()> {
         });
     }
 
-    // Graceful shutdown on SIGINT or SIGTERM.
-    let signal_shutdown = async {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => {}
-                _ = sigterm.recv() => {}
+    // Graceful shutdown signal — used to stop serve_loop_graceful after the
+    // current in-flight connection completes (never mid-write).
+    let shutdown = tokio::sync::Notify::new();
+
+    // Run serve_loop and the shutdown-watcher concurrently with join! so that
+    // serve_loop is NEVER cancelled by tokio. It exits only after handle_connection
+    // returns, ensuring all writes are committed before store.close() is called.
+    tokio::join!(
+        serve_loop_graceful(&store, &repo_root, &listener, &last_wall, &shutdown),
+        async {
+            // Wait for either a signal or the idle-check notification.
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {
+                        tracing::info!("mati daemon: signal shutdown (SIGINT)");
+                        eprintln!("mati daemon shutting down");
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::info!("mati daemon: signal shutdown (SIGTERM)");
+                        eprintln!("mati daemon shutting down");
+                    }
+                    _ = idle_notify.notified() => {
+                        // Idle shutdown message already printed in idle-check task.
+                    }
+                }
             }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    _ = ctrl_c => {
+                        tracing::info!("mati daemon: signal shutdown");
+                        eprintln!("mati daemon shutting down");
+                    }
+                    _ = idle_notify.notified() => {}
+                }
+            }
+            // Signal serve_loop_graceful to stop accepting after current connection.
+            shutdown.notify_one();
         }
-        #[cfg(not(unix))]
-        {
-            ctrl_c.await.ok();
-        }
-    };
+    );
 
-    tokio::select! {
-        _ = serve_loop(&store, &repo_root, &listener, &last_wall) => {}
-        _ = signal_shutdown => {
-            tracing::info!("mati daemon: signal shutdown");
-            eprintln!("mati daemon shutting down");
-        }
-        _ = idle_notify.notified() => {
-            // Message already printed in idle-check task.
-        }
-    }
-
-    // Cleanup — runs on every exit path.
+    // Cleanup — runs only AFTER serve_loop_graceful has finished the in-flight
+    // connection. Store is closed cleanly with no concurrent writers.
+    let _ = std::fs::remove_file(&starting_path);  // belt-and-suspenders
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     store.close().await?;
     Ok(())
 }
 
-/// Accept and handle connections sequentially — one at a time.
-async fn serve_loop(
+/// Accept and handle connections sequentially. Exits cleanly after the current
+/// connection completes when `shutdown` is notified — never cancels a connection
+/// mid-execution.
+async fn serve_loop_graceful(
     store: &Store,
     repo_root: &Path,
     listener: &UnixListener,
     last_wall: &AtomicU64,
+    shutdown: &tokio::sync::Notify,
 ) {
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                // Stamp wall time on every accepted connection so idle-shutdown
-                // correctly measures time since the last request, not since startup.
-                last_wall.store(wall_secs(), Ordering::Relaxed);
-                if let Err(e) = handle_connection(store, repo_root, stream).await {
-                    tracing::warn!(error = %e, "daemon: connection error");
+        // Race between a new connection and the shutdown signal.
+        // `biased` ensures shutdown is checked first on every iteration so a
+        // notify_one() that arrived during handle_connection is never missed.
+        let stream = tokio::select! {
+            biased;
+            _ = shutdown.notified() => break,
+            result = listener.accept() => {
+                match result {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "daemon: accept error");
+                        continue;
+                    }
                 }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "daemon: accept error");
-            }
+        };
+        last_wall.store(wall_secs(), Ordering::Relaxed);
+        // Runs to completion — NOT cancellable by shutdown.
+        if let Err(e) = handle_connection(store, repo_root, stream).await {
+            tracing::warn!(error = %e, "daemon: connection error");
         }
     }
 }
@@ -469,6 +541,14 @@ pub async fn daemon_result(
 ) -> DaemonResult {
     let sock_path = root.join("mati.sock");
 
+    if sock_path.as_os_str().len() > UNIX_SOCK_PATH_MAX {
+        tracing::warn!(
+            path = %sock_path.display(),
+            "daemon_result: socket path exceeds Unix limit — daemon unavailable"
+        );
+        return DaemonResult::NotRunning;
+    }
+
     if !sock_path.exists() {
         return DaemonResult::NotRunning;
     }
@@ -559,6 +639,74 @@ pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
     }
 }
 
+// ── Auto-start ───────────────────────────────────────────────────────────────
+
+/// Spawn `mati daemon start` in the background if no daemon is currently running.
+///
+/// Fire-and-forget: does **not** wait for the daemon to be ready. The calling
+/// hook falls through to direct `Store::open` for this invocation; the daemon
+/// will be ready for all subsequent hook calls in the same session.
+///
+/// Guards against double-spawn: if a PID file or socket already exists the
+/// function returns immediately — the daemon is either running or already
+/// starting.
+pub fn try_auto_start(project_cwd: &Path) {
+    let root = match mati_root_for(project_cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "auto-start: could not derive mati root");
+            return;
+        }
+    };
+
+    // Already running or a prior auto-start is in progress.
+    if root.join("mati.pid").exists() || root.join("mati.sock").exists() {
+        return;
+    }
+
+    // Cooldown: a recent auto-start attempt wrote mati.starting before calling
+    // Store::open. If the daemon process failed (store error), mati.starting
+    // persists. Retry only after 10 seconds to avoid a spawn loop.
+    let starting_path = root.join("mati.starting");
+    if let Ok(content) = std::fs::read_to_string(&starting_path) {
+        if let Ok(ts) = content.trim().parse::<u64>() {
+            if wall_secs().saturating_sub(ts) < 10 {
+                tracing::debug!("auto-start: recent attempt in progress or failed (10s cooldown)");
+                return;
+            }
+        }
+        // Sentinel older than 10s — stale, remove and retry.
+        let _ = std::fs::remove_file(&starting_path);
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "auto-start: could not find current exe");
+            return;
+        }
+    };
+
+    match std::process::Command::new(&exe)
+        .args(["daemon", "start"])
+        .current_dir(project_cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            tracing::debug!(pid = child.id(), "auto-started mati daemon");
+            // Detach — do not wait. The child runs independently.
+            std::mem::forget(child);
+        }
+        Err(e) => {
+            // Non-fatal: hooks fall back to direct Store::open automatically.
+            tracing::debug!(error = %e, "auto-start: failed to spawn daemon");
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Derive `~/.mati/<slug>/` for the given working directory (repo root).
@@ -574,7 +722,7 @@ pub fn mati_root_for(cwd: &Path) -> Result<PathBuf> {
 /// Returns `true` if the PID recorded in the PID file is no longer alive.
 /// Uses `kill -0` (no signal sent, just checks process existence).
 /// Returns `true` (assume dead) if the PID file is absent or unreadable.
-fn is_pid_dead(root: &Path) -> bool {
+pub fn is_pid_dead(root: &Path) -> bool {
     let pid_path = root.join("mati.pid");
     match std::fs::read_to_string(&pid_path)
         .ok()
@@ -749,7 +897,8 @@ pub async fn run_daemon_status() -> Result<()> {
             if let Some(pid) = pid_info {
                 println!("mati daemon is running (pid {pid})");
             } else {
-                println!("mati daemon is running");
+                println!("mati daemon is running (pid unknown — PID file missing)");
+                println!("  run `mati daemon stop` to restore clean state");
             }
             println!("  socket: {}", sock_path.display());
             println!(
