@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn avg_confidence_no_qualifying() {
-        let records = vec![
+        let records = [
             make_record("gotcha:low", "some text", 0.3),
             make_record("gotcha:also-low", "other text", 0.5),
         ];
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn avg_confidence_all_qualifying() {
-        let records = vec![
+        let records = [
             make_record("gotcha:high", "some text", 0.8),
             make_record("decision:important", "other text", 0.6),
         ];
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn avg_confidence_mixed() {
-        let records = vec![
+        let records = [
             make_record("gotcha:high", "some text", 0.9),
             make_record("gotcha:low", "other text", 0.3), // below threshold
             make_record("decision:mid", "text", 0.7),

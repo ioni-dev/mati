@@ -692,6 +692,7 @@ impl FileRecord {
     /// `purpose`, `gotcha_keys`, and `decision_keys` intentionally start empty.
     /// The Layer 0 pipeline only records structural facts; enrichment fills in
     /// the human-readable purpose later.
+    #[allow(clippy::too_many_arguments)]
     pub fn layer0_stub(
         path: impl Into<String>,
         entry_points: Vec<String>,

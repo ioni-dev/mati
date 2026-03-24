@@ -225,7 +225,7 @@ fn detect_imperative_verb(text: &str) -> bool {
         .to_lowercase();
     // Strip trailing punctuation from the first word
     let first_word = first_word.trim_end_matches(|c: char| !c.is_alphanumeric());
-    IMPERATIVE_VERBS.contains(&first_word.as_ref())
+    IMPERATIVE_VERBS.contains(&first_word)
 }
 
 /// Check if text contains any causality marker.

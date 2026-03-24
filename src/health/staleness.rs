@@ -269,7 +269,7 @@ impl StalenessAnalyzer {
             .as_secs();
 
         let repo = git2::Repository::open(repo_path).ok();
-        let head_commit = repo.as_ref().and_then(|r| head_commit_sha(r));
+        let head_commit = repo.as_ref().and_then(head_commit_sha);
 
         Self {
             repo,
@@ -282,7 +282,7 @@ impl StalenessAnalyzer {
     #[cfg(test)]
     fn new_with_now(repo_path: &Path, now: u64) -> Self {
         let repo = git2::Repository::open(repo_path).ok();
-        let head_commit = repo.as_ref().and_then(|r| head_commit_sha(r));
+        let head_commit = repo.as_ref().and_then(head_commit_sha);
 
         Self {
             repo,

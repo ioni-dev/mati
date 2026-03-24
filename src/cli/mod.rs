@@ -1,3 +1,4 @@
+pub mod check;
 pub mod colors;
 pub mod daemon;
 pub mod diff;

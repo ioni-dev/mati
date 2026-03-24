@@ -169,7 +169,7 @@ impl MatiServer {
         let store = graph.store();
 
         let context_files = params.context_files.unwrap_or_default();
-        match assemble_context_packet(store, &*graph, &context_files).await {
+        match assemble_context_packet(store, &graph, &context_files).await {
             Ok(packet) => packet.injection_string,
             Err(e) => format!("[mati] bootstrap error: {e}{VECTOR_B}"),
         }

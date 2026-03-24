@@ -15,10 +15,6 @@ if ! command -v jq &>/dev/null; then
   exit 0
 fi
 
-if ! command -v bc &>/dev/null; then
-  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
-  exit 0
-fi
 
 # ── Extract command ───────────────────────────────────────────────────────
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
@@ -79,13 +75,13 @@ LIABILITY_EOF
 fi
 
 if [ "$CONFIRMED" = "true" ] && \
-   [ "$(echo "$CONFIDENCE >= 0.6" | bc -l)" = "1" ] && \
-   [ "$(echo "$QUALITY >= 0.4" | bc -l)" = "1" ]; then
+   awk "BEGIN { exit !($CONFIDENCE >= 0.6) }" && \
+   awk "BEGIN { exit !($QUALITY >= 0.4) }"; then
   mati log-hit "file:$FILE_PATH" &>/dev/null &
 
   # M-13-D: medium-confidence stale note
   STALE_NOTE=""
-  if [ "$(echo "$STALENESS >= 0.4" | bc -l)" = "1" ]; then
+  if awk "BEGIN { exit !($STALENESS >= 0.4) }"; then
     STALE_NOTE=" (staleness $(printf '%.2f' "$STALENESS") — verify critical details)"
   fi
 
@@ -95,13 +91,13 @@ DENY_EOF
   exit 0
 fi
 
-if [ "$(echo "$CONFIDENCE >= 0.3" | bc -l)" = "1" ] && \
-   [ "$(echo "$QUALITY >= 0.4" | bc -l)" = "1" ]; then
+if awk "BEGIN { exit !($CONFIDENCE >= 0.3) }" && \
+   awk "BEGIN { exit !($QUALITY >= 0.4) }"; then
   mati log-hit "file:$FILE_PATH" &>/dev/null &
 
   # M-13-D: medium-confidence stale note
   STALE_NOTE=""
-  if [ "$(echo "$STALENESS >= 0.4" | bc -l)" = "1" ]; then
+  if awk "BEGIN { exit !($STALENESS >= 0.4) }"; then
     STALE_NOTE=" Warning: staleness $(printf '%.2f' "$STALENESS") — cached knowledge may be outdated."
   fi
 

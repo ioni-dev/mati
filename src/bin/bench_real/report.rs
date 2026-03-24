@@ -93,7 +93,7 @@ fn section_latency(reports: &[RepoReport]) -> String {
         .collect();
     s += &format!("| Command | {} |\n", repo_headers.join(" | "));
 
-    let sep: Vec<&str> = std::iter::repeat("--- | ---").take(reports.len()).collect();
+    let sep: Vec<&str> = std::iter::repeat_n("--- | ---", reports.len()).collect();
     s += &format!("| --- | {} |\n", sep.join(" | "));
 
     let rows: &[(&str, &str)] = &[

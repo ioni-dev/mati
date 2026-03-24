@@ -71,6 +71,8 @@ enum Commands {
     Diff(cli::diff::DiffArgs),
     /// List stale records with signals, impact, and action hints
     Stale(cli::stale::StaleArgs),
+    /// Verify hook enforcement pipeline is operational
+    Check,
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
@@ -139,6 +141,7 @@ async fn main() -> Result<()> {
         Commands::Explain(args) => cli::explain::run(args).await,
         Commands::Diff(args) => cli::diff::run(args).await,
         Commands::Stale(args) => cli::stale::run(args).await,
+        Commands::Check => cli::check::run().await,
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
             cli::daemon::DaemonCommand::Stop => cli::daemon::run_daemon_stop().await,
