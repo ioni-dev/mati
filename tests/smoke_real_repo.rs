@@ -768,6 +768,150 @@ type Handler struct{}
         );
     }
 
+    // ── Test 11: Go parser — real corpus (go-chi/chi v5.2.5) ────────────────
+
+    /// Proves the Go parser holds up against a real-world Go codebase:
+    /// no panics/errors across the full corpus, structural signals populated
+    /// on non-test files, `init()` excluded from entry_points, known exported
+    /// symbols present in the corpus.
+    ///
+    /// Clone strategy: mirrors `src/bin/bench_real/repos.rs::ensure_cloned`.
+    /// Clones go-chi/chi v5.2.5 (depth=1) into /tmp/mati-test-go-chi on the
+    /// first run and reuses the cached clone on subsequent runs.
+    ///
+    /// Run with:
+    ///   cargo test --test smoke_real_repo smoke_go_real_corpus -- --ignored
+    #[tokio::test]
+    #[ignore] // network + disk; opt-in only
+    async fn smoke_go_real_corpus_chi() {
+        use std::process::Command;
+
+        const CHI_URL: &str = "https://github.com/go-chi/chi";
+        const CHI_TAG: &str = "v5.2.5";
+        const CACHE_PATH: &str = "/tmp/mati-test-go-chi";
+
+        let dest = std::path::PathBuf::from(CACHE_PATH);
+
+        // ── Clone if not already cached (mirrors ensure_cloned in bench_real) ─
+        if !dest.join(".git").exists() {
+            eprintln!("[smoke_go_real_corpus] cloning {CHI_URL} @ {CHI_TAG}...");
+            let status = Command::new("git")
+                .args([
+                    "clone",
+                    "--depth", "1",
+                    "--branch", CHI_TAG,
+                    CHI_URL,
+                    CACHE_PATH,
+                ])
+                .status()
+                .expect("git not found on PATH — install git to run this test");
+            assert!(status.success(), "git clone failed for go-chi/chi {CHI_TAG}");
+            eprintln!("[smoke_go_real_corpus] clone complete");
+        } else {
+            eprintln!("[smoke_go_real_corpus] reusing cached clone at {CACHE_PATH}");
+        }
+
+        // ── Walk ──────────────────────────────────────────────────────────────
+        let walker = Walker::new(&dest);
+        let files = walker.walk().expect("walker failed on go-chi/chi");
+
+        let go_files: Vec<_> = files
+            .iter()
+            .filter(|f| f.language == Language::Go)
+            .collect();
+
+        assert!(
+            go_files.len() >= 30,
+            "expected at least 30 .go files in go-chi/chi, found {}",
+            go_files.len()
+        );
+
+        eprintln!("[smoke_go_real_corpus] found {} .go files", go_files.len());
+
+        // ── Parse all — zero errors allowed ───────────────────────────────────
+        let mut parse_errors: Vec<String> = Vec::new();
+        let mut analyses: Vec<(String, mati_core::analysis::parser::StaticFileAnalysis)> = Vec::new();
+
+        for file in &go_files {
+            match parse_file(file) {
+                Ok(a)  => analyses.push((file.rel_path.clone(), a)),
+                Err(e) => parse_errors.push(format!("{}: {e}", file.rel_path)),
+            }
+        }
+
+        assert!(
+            parse_errors.is_empty(),
+            "parse_file returned errors on {} Go file(s):\n{}",
+            parse_errors.len(),
+            parse_errors.join("\n")
+        );
+
+        // ── Non-test files: >80% must have entry_points or imports ────────────
+        let non_test: Vec<_> = analyses
+            .iter()
+            .filter(|(path, _)| !path.ends_with("_test.go"))
+            .collect();
+
+        assert!(
+            !non_test.is_empty(),
+            "expected non-test .go files in the corpus"
+        );
+
+        let with_signals = non_test
+            .iter()
+            .filter(|(_, a)| !a.entry_points.is_empty() || !a.imports.is_empty())
+            .count();
+
+        let ratio = with_signals as f64 / non_test.len() as f64;
+        assert!(
+            ratio >= 0.80,
+            "expected >80% of non-test .go files to have entry_points or imports, \
+             got {with_signals}/{} ({:.0}%)",
+            non_test.len(),
+            ratio * 100.0
+        );
+
+        eprintln!(
+            "[smoke_go_real_corpus] {with_signals}/{} non-test files have signals ({:.0}%)",
+            non_test.len(),
+            ratio * 100.0
+        );
+
+        // ── init() must never appear in entry_points ───────────────────────────
+        for (path, analysis) in &analyses {
+            assert!(
+                !analysis.entry_points.contains(&"init".to_string()),
+                "init() must not appear in entry_points (it is unexported) — found in {path}"
+            );
+        }
+
+        // ── Known exported symbols must appear across the corpus ───────────────
+        let all_entry_points: Vec<&str> = analyses
+            .iter()
+            .flat_map(|(_, a)| a.entry_points.iter().map(String::as_str))
+            .collect();
+
+        for symbol in &["NewRouter", "URLParam", "RouteContext"] {
+            assert!(
+                all_entry_points.contains(symbol),
+                "expected symbol {symbol:?} in corpus entry_points — \
+                 chi API may have changed or parser is silently dropping symbols"
+            );
+        }
+
+        // ── net/http must appear in at least one file's imports ────────────────
+        let any_net_http = analyses
+            .iter()
+            .any(|(_, a)| a.imports.contains(&"net/http".to_string()));
+
+        assert!(
+            any_net_http,
+            "expected at least one .go file to import net/http — chi is an HTTP router"
+        );
+
+        eprintln!("[smoke_go_real_corpus] all assertions passed");
+    }
+
     // ── Test 8: git2 integration ────────────────────────────────────────────
 
     /// Proves git2 integration works with the real mati repo: HEAD exists,
