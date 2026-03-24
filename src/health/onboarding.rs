@@ -48,55 +48,46 @@ const CONFIDENCE_THRESHOLD: f32 = 0.6;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-/// Compute the [`OnboardingScore`] by scanning the store for file, decision,
-/// and gotcha records.
-pub async fn compute(store: &Store) -> Result<OnboardingScore> {
-    // Scan all three prefixes concurrently.
-    let file_records = store.scan_prefix("file:").await?;
-    let decision_records = store.scan_prefix("decision:").await?;
-    let gotcha_records = store.scan_prefix("gotcha:").await?;
-
-    // Parse FileRecords to extract hotspot information.
+/// Compute the [`OnboardingScore`] from pre-loaded record slices.
+///
+/// Use this when the caller already has the store data to avoid redundant scans.
+pub fn compute_from_records(
+    file_records: &[crate::store::Record],
+    decisions: &[crate::store::Record],
+    gotchas: &[crate::store::Record],
+) -> OnboardingScore {
     let file_data: Vec<FileRecord> = file_records
         .iter()
-        .filter_map(|r| {
-            match serde_json::from_str(&r.value) {
-                Ok(fr) => Some(fr),
-                Err(e) => {
-                    tracing::warn!(key = %r.key, error = %e, "failed to parse FileRecord");
-                    None
-                }
-            }
-        })
+        .filter_map(|r| r.payload_as::<FileRecord>())
         .collect();
-
-    let hotspot_coverage = compute_hotspot_coverage(&file_data);
-    let gotcha_coverage = compute_gotcha_coverage(&file_data);
-    let decision_coverage = compute_decision_coverage(&decision_records);
-
-    // Combine gotcha and decision records for avg_confidence.
-    let all_knowledge_records: Vec<_> = gotcha_records
-        .iter()
-        .chain(decision_records.iter())
-        .collect();
-    let avg_confidence = compute_avg_confidence(&all_knowledge_records);
-
+    let hotspot_coverage  = compute_hotspot_coverage(&file_data);
+    let gotcha_coverage   = compute_gotcha_coverage(&file_data);
+    let decision_coverage = compute_decision_coverage(decisions);
+    let all_knowledge: Vec<_> = gotchas.iter().chain(decisions.iter()).collect();
+    let avg_confidence    = compute_avg_confidence(&all_knowledge);
     let estimated_minutes =
         compute_estimated_minutes(hotspot_coverage, gotcha_coverage, decision_coverage, avg_confidence);
-
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-
-    Ok(OnboardingScore {
+    OnboardingScore {
         estimated_minutes,
         critical_files_covered: hotspot_coverage,
         gotcha_coverage,
         decision_coverage,
         avg_confidence,
         computed_at: now,
-    })
+    }
+}
+
+/// Compute the [`OnboardingScore`] by scanning the store for file, decision,
+/// and gotcha records.
+pub async fn compute(store: &Store) -> Result<OnboardingScore> {
+    let file_records    = store.scan_prefix("file:").await?;
+    let decision_records = store.scan_prefix("decision:").await?;
+    let gotcha_records  = store.scan_prefix("gotcha:").await?;
+    Ok(compute_from_records(&file_records, &decision_records, &gotcha_records))
 }
 
 // ── Pure helpers (testable without Store) ────────────────────────────────────
@@ -200,6 +191,8 @@ mod tests {
             is_hotspot,
             token_cost_estimate: 200,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         }
     }
 
@@ -238,6 +231,7 @@ mod tests {
                 challenge_count: 0,
             },
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 

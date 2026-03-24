@@ -24,8 +24,15 @@ struct DailyAgg {
     keys: Vec<String>,
 }
 
-/// Snapshot payload written to `analytics:knowledge_health_<date>`.
-#[derive(Serialize)]
+/// Stable cache key for the health snapshot (write-seq invalidated, no date suffix).
+const SNAPSHOT_KEY: &str = "analytics:knowledge_health";
+
+/// Maximum age of a cached snapshot even if write-seq matches (catches stale
+/// compliance data when no knowledge writes have happened for >24 h).
+const SNAPSHOT_MAX_AGE_SECS: u64 = 86_400;
+
+/// Snapshot payload written to `analytics:knowledge_health`.
+#[derive(Serialize, Deserialize)]
 struct HealthSnapshot {
     // Coverage
     files_with_purpose: u32,
@@ -46,6 +53,14 @@ struct HealthSnapshot {
     gotcha_coverage: f32,
     decision_coverage: f32,
 
+    // Onboarding detail (added for cache display — backward compat via default)
+    #[serde(default)]
+    critical_uncovered: u32,
+    #[serde(default)]
+    orphaned_decisions: u32,
+    #[serde(default)]
+    low_confidence: u32,
+
     // Compliance (7d)
     hits_7d: u64,
     misses_7d: u64,
@@ -53,11 +68,42 @@ struct HealthSnapshot {
     bypasses_7d: u64,
 
     computed_at: u64,
+
+    /// Knowledge write-sequence at time of computation. Cache is valid when
+    /// this equals [`Store::read_write_seq()`]. `0` means no valid cache.
+    #[serde(default)]
+    write_seq: u64,
+}
+
+/// Current wall-clock time as Unix seconds.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub async fn run(_args: StatsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = Store::open(&cwd).await?;
+
+    // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
+    let now = now_secs();
+    let current_seq = store.read_write_seq();
+    if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
+        if let Some(snapshot) = cached.payload_as::<HealthSnapshot>() {
+            let age = now.saturating_sub(snapshot.computed_at);
+            if snapshot.write_seq == current_seq
+                && age < SNAPSHOT_MAX_AGE_SECS
+            {
+                display_cached_stats(&snapshot, age, &cwd);
+                store.close().await?;
+                return Ok(());
+            }
+        }
+        // Stale or corrupt cache — fall through to recomputation
+    }
+
     let use_color = io::stdout().is_terminal();
 
     let (blue, green, yellow, gray, white, bold, reset) = if use_color {
@@ -74,18 +120,15 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         ("", "", "", "", "", "", "")
     };
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // ── Scan all namespaces (once — results are reused by gaps + onboarding) ──
 
-    // ── Scan all namespaces ────────────────────────────────────────────────────
-
-    let files = store.scan_prefix("file:").await?;
-    let gotchas = store.scan_prefix("gotcha:").await?;
-    let decisions = store.scan_prefix("decision:").await?;
-    let notes = store.scan_prefix("dev_note:").await?;
-    let deps = store.scan_prefix("dep:").await?;
+    let (files, gotchas, decisions, notes, deps) = tokio::try_join!(
+        store.scan_prefix("file:"),
+        store.scan_prefix("gotcha:"),
+        store.scan_prefix("decision:"),
+        store.scan_prefix("dev_note:"),
+        store.scan_prefix("dep:"),
+    )?;
 
     // ── Project name ───────────────────────────────────────────────────────────
 
@@ -107,7 +150,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // Files with purpose
     let file_data: Vec<FileRecord> = files
         .iter()
-        .filter_map(|r| serde_json::from_str(&r.value).ok())
+        .filter_map(|r| r.payload_as::<FileRecord>())
         .collect();
 
     let files_with_purpose = file_data.iter().filter(|fr| !fr.purpose.is_empty()).count() as u32;
@@ -150,12 +193,19 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         sum / knowledge_records.len() as f32
     };
     let conf_color = if avg_confidence >= 0.6 { green } else { yellow };
-    println!(
-        "    Avg confidence         {conf_color}{avg_confidence:.2}{reset}"
-    );
+    if knowledge_records.is_empty() {
+        println!("    Avg confidence         {gray}—  (no gotchas or decisions yet){reset}");
+    } else {
+        println!(
+            "    Avg confidence         {conf_color}{avg_confidence:.2}{reset}  {gray}(gotchas + decisions, n={}){reset}",
+            knowledge_records.len()
+        );
+    }
 
-    // Knowledge gaps
-    let gap_list = gaps::analyze(&store).await?;
+    // Knowledge gaps — pass pre-loaded records, no redundant scans.
+    // Empty fan_in: stats skips graph load for speed; HighFanInNoContract
+    // gaps appear in `mati gaps` which loads the full graph.
+    let gap_list = gaps::analyze(&files, &gotchas, &decisions, &deps, &std::collections::HashMap::new());
     let gap_count = gap_list.len() as u32;
     let gap_color = if gap_count == 0 { green } else { yellow };
     println!(
@@ -208,7 +258,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
     println!("  {bold}{blue}Onboarding readiness{reset}");
 
-    let onboarding_score = onboarding::compute(&store).await?;
+    let onboarding_score = onboarding::compute_from_records(&files, &decisions, &gotchas);
 
     let min_color = if onboarding_score.estimated_minutes <= 10.0 {
         green
@@ -316,6 +366,10 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         gotcha_coverage: onboarding_score.gotcha_coverage,
         decision_coverage: onboarding_score.decision_coverage,
 
+        critical_uncovered: critical_uncovered as u32,
+        orphaned_decisions: orphaned_decisions as u32,
+        low_confidence: low_confidence as u32,
+
         hits_7d,
         misses_7d,
         hit_rate_7d: if total_lookups > 0 {
@@ -326,16 +380,27 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         bypasses_7d,
 
         computed_at: now,
+        write_seq: current_seq,
     };
 
-    let today = format_snapshot_date(now);
-    let snapshot_key = format!("analytics:knowledge_health_{today}");
-    let snapshot_value = serde_json::to_string(&snapshot)?;
+    write_snapshot_record(&store, &snapshot, now).await?;
 
-    let device_id = uuid::Uuid::new_v4();
-    let snapshot_record = Record {
-        key: snapshot_key.clone(),
-        value: snapshot_value,
+    println!(
+        "  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}\n"
+    );
+
+    store.close().await?;
+    Ok(())
+}
+
+// ── Snapshot persistence ──────────────────────────────────────────────────────
+
+/// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` in the store.
+async fn write_snapshot_record(store: &Store, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+    let record = Record {
+        key: SNAPSHOT_KEY.to_string(),
+        value: String::new(),
+        payload: serde_json::to_value(snapshot).ok(),
         category: Category::Analytics,
         priority: Priority::Normal,
         tags: vec![],
@@ -345,7 +410,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id,
+            device_id: uuid::Uuid::new_v4(),
             logical_clock: 1,
             wall_clock: now,
         },
@@ -356,15 +421,274 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
         gap_analysis_score: 0.0,
     };
+    store.put(SNAPSHOT_KEY, &record).await
+}
 
-    store.put(&snapshot_key, &snapshot_record).await?;
+/// Compute and persist a `HealthSnapshot` from pre-loaded record slices.
+///
+/// Called by `mati init` after `put_batch` so that the very first `mati stats`
+/// after initialization is served from cache (O(1)) rather than rescanning.
+pub async fn seed_snapshot(
+    store: &Store,
+    files: &[Record],
+    gotchas: &[Record],
+    decisions: &[Record],
+    deps: &[Record],
+    now: u64,
+) -> Result<()> {
+    use mati_core::health::onboarding;
+    use mati_core::store::FileRecord;
+
+    let file_data: Vec<FileRecord> = files
+        .iter()
+        .filter_map(|r| r.payload_as::<FileRecord>())
+        .collect();
+
+    let files_with_purpose = file_data.iter().filter(|fr| !fr.purpose.is_empty()).count() as u32;
+    let total_files = files.len() as u32;
+    let hotspot_count = file_data.iter().filter(|fr| fr.is_hotspot).count();
+    let gotchas_per_hotspot = if hotspot_count > 0 {
+        gotchas.len() as f32 / hotspot_count as f32
+    } else {
+        0.0
+    };
+    let decisions_count = decisions.len() as u32;
+
+    let all_knowledge: Vec<&Record> = gotchas.iter().chain(decisions.iter()).collect();
+    let avg_confidence = if all_knowledge.is_empty() {
+        0.0
+    } else {
+        let sum: f32 = all_knowledge.iter().map(|r| r.confidence.value).sum();
+        sum / all_knowledge.len() as f32
+    };
+
+    // Skip gaps analysis during init — it adds ~1200ms to cold init.
+    // The first `mati gaps` run computes and caches gaps independently.
+    // Stats display treats 0 as "not yet computed" (no line shown).
+    let gap_count = 0u32;
+
+    let thirty_days_ago = now.saturating_sub(30 * 86400);
+    let all_records: Vec<&Record> = files
+        .iter()
+        .chain(gotchas.iter())
+        .chain(decisions.iter())
+        .chain(deps.iter())
+        .collect();
+    let new_records_30d = all_records
+        .iter()
+        .filter(|r| r.created_at >= thirty_days_ago)
+        .count() as u32;
+    let multi_contributor = all_records
+        .iter()
+        .filter(|r| r.confidence.contributor_count >= 2)
+        .count() as u32;
+
+    let onboarding_score = onboarding::compute_from_records(files, decisions, gotchas);
+
+    let critical_uncovered = file_data
+        .iter()
+        .filter(|fr| fr.is_hotspot && fr.purpose.is_empty())
+        .count() as u32;
+    let orphaned_decisions = 0u32; // computed by mati gaps, not seeded here
+    let low_confidence = all_records
+        .iter()
+        .filter(|r| r.confidence.value < 0.3)
+        .count() as u32;
+
+    let write_seq = store.read_write_seq();
+    let snapshot = HealthSnapshot {
+        files_with_purpose,
+        total_files,
+        purpose_coverage: if total_files > 0 {
+            files_with_purpose as f32 / total_files as f32
+        } else {
+            0.0
+        },
+        gotchas_per_hotspot,
+        decisions_documented: decisions_count,
+        avg_confidence,
+        knowledge_gaps: gap_count,
+        new_records_30d,
+        multi_contributor_records: multi_contributor,
+        estimated_minutes: onboarding_score.estimated_minutes,
+        critical_files_covered: onboarding_score.critical_files_covered,
+        gotcha_coverage: onboarding_score.gotcha_coverage,
+        decision_coverage: onboarding_score.decision_coverage,
+        critical_uncovered,
+        orphaned_decisions,
+        low_confidence,
+        hits_7d: 0,
+        misses_7d: 0,
+        hit_rate_7d: 0.0,
+        bypasses_7d: 0,
+        computed_at: now,
+        write_seq,
+    };
+
+    write_snapshot_record(store, &snapshot, now).await
+}
+
+// ── Cached display ───────────────────────────────────────────────────────────
+
+/// Render the stats dashboard from a cached `HealthSnapshot`.
+///
+/// Output is identical to the live computation path except for a small
+/// "(cached Ns ago)" annotation after the header.
+fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
+    let use_color = io::stdout().is_terminal();
+
+    let (blue, green, yellow, gray, white, bold, reset) = if use_color {
+        (
+            colors::BLUE,
+            colors::GREEN,
+            colors::YELLOW,
+            colors::GRAY,
+            colors::WHITE,
+            colors::BOLD,
+            colors::RESET,
+        )
+    } else {
+        ("", "", "", "", "", "", "")
+    };
+
+    let project = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
 
     println!(
-        "  {gray}Snapshot written: {snapshot_key}{reset}\n"
+        "\n{bold}{blue}◈ mati stats{reset} — project: {bold}{white}{project}{reset}  {gray}(cached {age}s ago){reset}\n"
     );
 
-    store.close().await?;
-    Ok(())
+    // ── Coverage ─────────────────────────────────────────────────────────
+
+    println!("  {bold}{blue}Coverage{reset}");
+
+    let purpose_pct = if s.total_files > 0 {
+        s.files_with_purpose as f32 / s.total_files as f32 * 100.0
+    } else {
+        0.0
+    };
+    let purpose_color = if purpose_pct >= 60.0 { green } else { yellow };
+    println!(
+        "    Files with purpose     {purpose_color}{}{reset} / {white}{}{reset}  ({purpose_pct:.0}%)",
+        s.files_with_purpose, s.total_files
+    );
+
+    let gph_color = if s.gotchas_per_hotspot >= 2.0 { green } else { yellow };
+    println!(
+        "    Gotchas per hotspot    {gph_color}{:.1}{reset}  (target >= 2.0)",
+        s.gotchas_per_hotspot
+    );
+
+    let dec_color = if s.decisions_documented > 0 { green } else { yellow };
+    println!(
+        "    Decisions documented   {dec_color}{}{reset}",
+        s.decisions_documented
+    );
+
+    let conf_color = if s.avg_confidence >= 0.6 { green } else { yellow };
+    if s.avg_confidence == 0.0 && s.decisions_documented == 0 {
+        println!("    Avg confidence         {gray}—  (no gotchas or decisions yet){reset}");
+    } else {
+        println!(
+            "    Avg confidence         {conf_color}{:.2}{reset}  {gray}(gotchas + decisions){reset}",
+            s.avg_confidence
+        );
+    }
+
+    let gap_color = if s.knowledge_gaps == 0 { green } else { yellow };
+    println!(
+        "    Knowledge gaps         {gap_color}{}{reset}",
+        s.knowledge_gaps
+    );
+
+    println!();
+
+    // ── Knowledge velocity ───────────────────────────────────────────────
+
+    println!("  {bold}{blue}Knowledge velocity (30d){reset}");
+
+    let vel_color = if s.new_records_30d > 0 { green } else { yellow };
+    println!(
+        "    New records added      {vel_color}{}{reset}",
+        s.new_records_30d
+    );
+
+    let mc_color = if s.multi_contributor_records > 0 { green } else { yellow };
+    println!(
+        "    Confirmed by 2+ devs  {mc_color}{}{reset}",
+        s.multi_contributor_records
+    );
+
+    println!();
+
+    // ── Onboarding readiness ─────────────────────────────────────────────
+
+    println!("  {bold}{blue}Onboarding readiness{reset}");
+
+    let min_color = if s.estimated_minutes <= 10.0 { green } else { yellow };
+    println!(
+        "    Estimated onboarding   {min_color}{:.0} min{reset}",
+        s.estimated_minutes
+    );
+
+    let cu_color = if s.critical_uncovered == 0 { green } else { yellow };
+    println!(
+        "    Critical files uncov.  {cu_color}{}{reset}",
+        s.critical_uncovered
+    );
+
+    let od_color = if s.orphaned_decisions == 0 { green } else { yellow };
+    println!(
+        "    Orphaned decisions     {od_color}{}{reset}",
+        s.orphaned_decisions
+    );
+
+    let lc_color = if s.low_confidence == 0 { green } else { yellow };
+    println!(
+        "    Low-confidence (<0.3)  {lc_color}{}{reset}",
+        s.low_confidence
+    );
+
+    println!();
+
+    // ── Compliance ───────────────────────────────────────────────────────
+
+    println!("  {bold}{blue}Compliance (7d){reset}");
+
+    let total_lookups = s.hits_7d + s.misses_7d;
+    let hit_rate = if total_lookups > 0 {
+        s.hits_7d as f32 / total_lookups as f32 * 100.0
+    } else {
+        0.0
+    };
+
+    if total_lookups > 0 {
+        let hr_color = if hit_rate >= 80.0 { green } else { yellow };
+        println!(
+            "    Hit rate               {hr_color}{hit_rate:.0}%{reset}  ({white}{}{reset} hits / {white}{total_lookups}{reset} lookups)",
+            s.hits_7d
+        );
+    } else {
+        println!(
+            "    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)"
+        );
+    }
+
+    let bp_color = if s.bypasses_7d == 0 { green } else { yellow };
+    if s.bypasses_7d > 0 || total_lookups > 0 {
+        println!(
+            "    Bypasses               {bp_color}{}{reset}",
+            s.bypasses_7d
+        );
+    } else {
+        println!(
+            "    Bypasses               {gray}\u{2014}{reset}"
+        );
+    }
+
+    println!();
 }
 
 // ── Compliance scanning helpers ──────────────────────────────────────────────
@@ -386,19 +710,19 @@ async fn scan_compliance_7d(store: &Store, now: u64) -> (u64, u64, u64) {
         let bypass_key = format!("compliance:miss_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
-            if let Ok(agg) = serde_json::from_str::<DailyAgg>(&record.value) {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
                 hits += agg.count;
             }
         }
 
         if let Ok(Some(record)) = store.get(&miss_key).await {
-            if let Ok(agg) = serde_json::from_str::<DailyAgg>(&record.value) {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
                 misses += agg.count;
             }
         }
 
         if let Ok(Some(record)) = store.get(&bypass_key).await {
-            if let Ok(agg) = serde_json::from_str::<DailyAgg>(&record.value) {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
                 bypasses += agg.count;
             }
         }
@@ -452,9 +776,9 @@ mod tests {
         assert_eq!(agg.keys.len(), 2);
     }
 
-    #[test]
-    fn health_snapshot_serializes() {
-        let snapshot = HealthSnapshot {
+    /// Helper to build a fully-populated snapshot for tests.
+    fn sample_snapshot() -> HealthSnapshot {
+        HealthSnapshot {
             files_with_purpose: 10,
             total_files: 20,
             purpose_coverage: 0.5,
@@ -468,12 +792,21 @@ mod tests {
             critical_files_covered: 0.6,
             gotcha_coverage: 0.3,
             decision_coverage: 1.0,
+            critical_uncovered: 4,
+            orphaned_decisions: 1,
+            low_confidence: 3,
             hits_7d: 42,
             misses_7d: 8,
             hit_rate_7d: 0.84,
             bypasses_7d: 1,
             computed_at: 1_710_520_800,
-        };
+            write_seq: 42,
+        }
+    }
+
+    #[test]
+    fn health_snapshot_serializes() {
+        let snapshot = sample_snapshot();
         let json = serde_json::to_string(&snapshot).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["files_with_purpose"], 10);
@@ -482,5 +815,66 @@ mod tests {
         assert_eq!(parsed["knowledge_gaps"], 7);
         assert_eq!(parsed["hits_7d"], 42);
         assert_eq!(parsed["bypasses_7d"], 1);
+        assert_eq!(parsed["critical_uncovered"], 4);
+        assert_eq!(parsed["orphaned_decisions"], 1);
+        assert_eq!(parsed["low_confidence"], 3);
+    }
+
+    #[test]
+    fn health_snapshot_roundtrips() {
+        let snapshot = sample_snapshot();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let deserialized: HealthSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.files_with_purpose, snapshot.files_with_purpose);
+        assert_eq!(deserialized.total_files, snapshot.total_files);
+        assert_eq!(deserialized.decisions_documented, snapshot.decisions_documented);
+        assert_eq!(deserialized.knowledge_gaps, snapshot.knowledge_gaps);
+        assert_eq!(deserialized.new_records_30d, snapshot.new_records_30d);
+        assert_eq!(deserialized.multi_contributor_records, snapshot.multi_contributor_records);
+        assert_eq!(deserialized.critical_uncovered, snapshot.critical_uncovered);
+        assert_eq!(deserialized.orphaned_decisions, snapshot.orphaned_decisions);
+        assert_eq!(deserialized.low_confidence, snapshot.low_confidence);
+        assert_eq!(deserialized.hits_7d, snapshot.hits_7d);
+        assert_eq!(deserialized.misses_7d, snapshot.misses_7d);
+        assert_eq!(deserialized.bypasses_7d, snapshot.bypasses_7d);
+        assert_eq!(deserialized.computed_at, snapshot.computed_at);
+        assert!((deserialized.avg_confidence - snapshot.avg_confidence).abs() < 0.001);
+        assert!((deserialized.estimated_minutes - snapshot.estimated_minutes).abs() < 0.01);
+    }
+
+    #[test]
+    fn health_snapshot_backward_compat_missing_new_fields() {
+        // Simulates an old snapshot that was written before
+        // critical_uncovered / orphaned_decisions / low_confidence existed.
+        let old_json = r#"{
+            "files_with_purpose": 5,
+            "total_files": 10,
+            "purpose_coverage": 0.5,
+            "gotchas_per_hotspot": 2.0,
+            "decisions_documented": 1,
+            "avg_confidence": 0.7,
+            "knowledge_gaps": 2,
+            "new_records_30d": 8,
+            "multi_contributor_records": 0,
+            "estimated_minutes": 12.0,
+            "critical_files_covered": 0.8,
+            "gotcha_coverage": 0.5,
+            "decision_coverage": 1.0,
+            "hits_7d": 20,
+            "misses_7d": 5,
+            "hit_rate_7d": 0.8,
+            "bypasses_7d": 0,
+            "computed_at": 1710000000
+        }"#;
+        let snapshot: HealthSnapshot = serde_json::from_str(old_json).unwrap();
+        // New fields default to 0
+        assert_eq!(snapshot.critical_uncovered, 0);
+        assert_eq!(snapshot.orphaned_decisions, 0);
+        assert_eq!(snapshot.low_confidence, 0);
+        // Existing fields parse correctly
+        assert_eq!(snapshot.files_with_purpose, 5);
+        assert_eq!(snapshot.total_files, 10);
+        assert_eq!(snapshot.hits_7d, 20);
     }
 }

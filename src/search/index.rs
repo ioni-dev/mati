@@ -162,16 +162,20 @@ impl Search {
     ///
     /// Use this from `Store::put_batch`. Single-record writes use [`Self::add_record`].
     pub fn add_records(&self, records: &[&Record]) -> Result<usize> {
-        if records.is_empty() {
+        // Skip Unknown-language file records — they have empty entry_points,
+        // imports, and value at Layer 0 and carry no BM25 signal worth indexing.
+        // Non-file records (gotcha:*, decision:*, dep:*, etc.) are always indexed.
+        let indexable: Vec<&&Record> = records.iter().filter(|r| is_searchable(r)).collect();
+        if indexable.is_empty() {
             return Ok(0);
         }
 
-        let total = records.len();
+        let total = indexable.len();
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
 
         // Stage all documents. Tantivy worker threads handle auto-flushing
         // when their heap share fills up — no explicit chunking needed.
-        for (i, record) in records.iter().enumerate() {
+        for (i, record) in indexable.iter().enumerate() {
             if let Err(e) = writer.add_document(record_to_doc(record, &self.fields)) {
                 if let Err(rb) = writer.rollback() {
                     tracing::warn!(
@@ -279,6 +283,21 @@ impl Search {
 }
 
 // ── Document construction ─────────────────────────────────────────────────────
+
+/// Returns `false` for `file:*` records whose extension has no tree-sitter
+/// grammar — config files, markdown, shell scripts, etc. These records carry
+/// empty `entry_points` and `imports` at Layer 0 and add no BM25 signal.
+/// All non-file records (gotcha:*, decision:*, dep:*, etc.) return `true`.
+fn is_searchable(record: &Record) -> bool {
+    let Some(path) = record.key.strip_prefix("file:") else {
+        return true;
+    };
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "pyi" | "go" | "java")
+}
 
 /// Convert a `Record` into a tantivy document ready for indexing.
 fn record_to_doc(record: &Record, fields: &Fields) -> TantivyDocument {
@@ -505,6 +524,7 @@ mod tests {
             source:            RecordSource::StaticAnalysis,
             confidence:        ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -650,6 +670,7 @@ mod tests {
                 source:            RecordSource::StaticAnalysis,
                 confidence:        ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
                 gap_analysis_score: 0.0,
+                payload: None,
             }
         };
 

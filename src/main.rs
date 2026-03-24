@@ -63,13 +63,26 @@ enum Commands {
     Export(cli::show::ExportArgs),
     /// Import from CLAUDE.md or JSON
     Import(cli::show::ImportArgs),
+    /// Review auto-detected candidates (confirmed=false) — confirm, edit, skip, or delete
+    Review(cli::review::ReviewArgs),
+    /// Show everything mati knows about a file — purpose, gotchas, decisions, co-changes
+    Explain(cli::explain::ExplainArgs),
+    /// Cross-reference a git diff against the knowledge store, surface gotchas before merge
+    Diff(cli::diff::DiffArgs),
     /// List stale records with signals, impact, and action hints
     Stale(cli::stale::StaleArgs),
+    /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
+    Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
     Ping,
     /// Run as MCP stdio server (for Claude Code plugin)
     Serve,
     // ── Internal hook commands (hidden from --help) ─────────────────────
+    #[command(hide = true)]
+    DocCapture {
+        /// Repo-relative file path
+        path: String,
+    },
     #[command(hide = true)]
     Get { key: String },
     #[command(hide = true)]
@@ -84,6 +97,11 @@ enum Commands {
     SessionFlush,
     #[command(hide = true)]
     SessionHarvest,
+    #[command(hide = true)]
+    EditHook {
+        /// Repo-relative file path
+        path: String,
+    },
     #[command(hide = true)]
     Reparse {
         /// Repo-relative file path to re-parse
@@ -117,7 +135,15 @@ async fn main() -> Result<()> {
         Commands::Note { text } => run_note(&text).await,
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
+        Commands::Review(args) => cli::review::run(args).await,
+        Commands::Explain(args) => cli::explain::run(args).await,
+        Commands::Diff(args) => cli::diff::run(args).await,
         Commands::Stale(args) => cli::stale::run(args).await,
+        Commands::Daemon(args) => match args.command {
+            cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
+            cli::daemon::DaemonCommand::Stop => cli::daemon::run_daemon_stop().await,
+            cli::daemon::DaemonCommand::Status => cli::daemon::run_daemon_status().await,
+        },
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
             let store = Store::open(&cwd).await?;
@@ -138,6 +164,8 @@ async fn main() -> Result<()> {
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+        Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
+        Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
     }
 }
@@ -176,6 +204,7 @@ async fn run_note(text: &str) -> Result<()> {
         source: RecordSource::DeveloperManual,
         confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
         gap_analysis_score: 0.0,
+        payload: None,
     };
 
     // Run quality analyzer (display score, but no gate for notes)
@@ -197,7 +226,7 @@ async fn run_quality_check() -> Result<()> {
     let store = Store::open(&cwd).await?;
 
     let mut all: Vec<Record> = Vec::new();
-    for prefix in &["gotcha:", "decision:", "dev_note:"] {
+    for prefix in &["file:", "gotcha:", "decision:", "dev_note:"] {
         all.extend(store.scan_prefix(prefix).await?);
     }
 

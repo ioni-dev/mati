@@ -1,12 +1,13 @@
 use anyhow::Result;
 use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
+use serde::{Deserialize, Serialize};
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use mati_core::store::{
-    Category, ConfidenceScore, FileRecord, Priority, QualitySignal, QualityTier, Record,
-    RecordLifecycle, RecordSource, StalenessTier, Store,
+    Category, ConfidenceScore, FileRecord, Priority, QualityScore, QualitySignal, QualityTier,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessTier, StalenessScore, Store,
 };
 
 use super::colors;
@@ -23,6 +24,10 @@ pub struct ShowArgs {
 pub struct LsArgs {
     /// Category to list: files, gotchas, decisions (omit for all)
     pub category: Option<String>,
+
+    /// Maximum file records to show (hotspots first; 0 = unlimited)
+    #[arg(long, short = 'n', default_value = "200")]
+    pub limit: usize,
 }
 
 #[derive(Args)]
@@ -248,22 +253,79 @@ fn print_record(record: &Record, use_color: bool) {
     println!();
 }
 
+// ── ls cache types ────────────────────────────────────────────────────────────
+
+/// Pre-sorted display row for a single file record.
+#[derive(Serialize, Deserialize)]
+struct LsFileRow {
+    path: String,
+    purpose: String,
+    entry_count: usize,
+    confidence: f32,
+    quality: f32,
+    is_hotspot: bool,
+}
+
+/// Write-seq-invalidated cache for `mati ls files`.
+///
+/// Cache key: `analytics:ls_files_cache`.
+/// Valid when `write_seq == store.read_write_seq()` AND `limit == requested_limit`.
+#[derive(Serialize, Deserialize)]
+struct LsFilesCache {
+    write_seq: u64,
+    /// The `--limit` value used when this cache was built.
+    limit: usize,
+    /// Total file records in the store (shown in the footer even when truncated).
+    total: usize,
+    rows: Vec<LsFileRow>,
+}
+
+/// Build a minimal analytics Record for caching ls output.
+fn ls_cache_record(key: &str, value: String) -> Record {
+    let now = now_secs();
+    Record {
+        key: key.to_string(),
+        value,
+        category: Category::Analytics,
+        priority: Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::SessionHook,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
+        gap_analysis_score: 0.0,
+        payload: None,
+    }
+}
+
 // ── run_ls (M-08-C/D/E) ─────────────────────────────────────────────────────
 
 pub async fn run_ls(args: LsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = Store::open(&cwd).await?;
     let use_color = std::io::stdout().is_terminal();
+    let limit = args.limit;
 
     match args.category.as_deref() {
-        Some("files") => ls_files(&store, use_color).await?,
+        Some("files") => ls_files(&store, use_color, limit).await?,
         Some("gotchas") => ls_gotchas(&store, use_color).await?,
         Some("decisions") => ls_decisions(&store, use_color).await?,
         Some(other) => anyhow::bail!(
             "unknown category '{other}'. Valid: files, gotchas, decisions"
         ),
         None => {
-            ls_files(&store, use_color).await?;
+            ls_files(&store, use_color, limit).await?;
             println!();
             ls_gotchas(&store, use_color).await?;
             println!();
@@ -273,50 +335,132 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ls_files(store: &Store, _use_color: bool) -> Result<()> {
-    let records = store.scan_prefix("file:").await?;
-    if records.is_empty() {
+const LS_FILES_CACHE_KEY: &str = "analytics:ls_files_cache";
+
+async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
+    // ── Cache check ───────────────────────────────────────────────────────
+    let current_seq = store.read_write_seq();
+    if let Ok(Some(cached)) = store.get(LS_FILES_CACHE_KEY).await {
+        if let Some(entry) = cached.payload_as::<LsFilesCache>() {
+            if entry.write_seq == current_seq && entry.limit == limit {
+                render_ls_files_table(&entry.rows, entry.total, limit);
+                return Ok(());
+            }
+        }
+    }
+
+    // ── Cold path: streaming scan ──────────────────────────────────────────
+    // Print the header immediately so the user sees output before the full
+    // scan completes. Rows are printed in store (lexicographic) order as they
+    // arrive; the cache written at the end stores them sorted (hotspots first)
+    // for the hot path rendered by render_ls_files_table.
+    let mut first = true;
+    let mut rows: Vec<LsFileRow> = Vec::new();
+    let mut printed_count: usize = 0;
+
+    store
+        .scan_prefix_each("file:", |r| {
+            let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
+            let (purpose, entry_count, is_hotspot) =
+                match r.payload_as::<FileRecord>() {
+                    Some(fr) => {
+                        let purpose = if fr.purpose.is_empty() {
+                            "(pending enrichment)".to_string()
+                        } else {
+                            truncate(&fr.purpose, 40)
+                        };
+                        (purpose, fr.entry_points.len(), fr.is_hotspot)
+                    }
+                    None => {
+                        let purpose = if r.value.is_empty() {
+                            "(pending enrichment)".to_string()
+                        } else {
+                            truncate(&r.value, 40)
+                        };
+                        (purpose, 0, false)
+                    }
+                };
+            let row = LsFileRow {
+                path,
+                purpose,
+                entry_count,
+                confidence: r.confidence.value,
+                quality: r.quality.value,
+                is_hotspot,
+            };
+            if limit == 0 || printed_count < limit {
+                if first {
+                    print_ls_files_stream_header();
+                    first = false;
+                }
+                print_ls_files_stream_row(&row);
+                printed_count += 1;
+            }
+            rows.push(row);
+        })
+        .await?;
+
+    if rows.is_empty() {
         println!("No file records found.");
         return Ok(());
     }
 
-    // Parse FileRecord from each record's value for display purposes.
-    // Sort: hotspots first, then by path.
-    let mut rows: Vec<(String, String, usize, f32, f32, bool)> = Vec::new();
-    for r in &records {
-        let path = r.key.strip_prefix("file:").unwrap_or(&r.key);
-        let (purpose, entry_count, is_hotspot) = match serde_json::from_str::<FileRecord>(&r.value)
-        {
-            Ok(fr) => {
-                let purpose = if fr.purpose.is_empty() {
-                    "(pending enrichment)".to_string()
-                } else {
-                    truncate(&fr.purpose, 40)
-                };
-                (purpose, fr.entry_points.len(), fr.is_hotspot)
-            }
-            Err(_) => {
-                let purpose = if r.value.is_empty() {
-                    "(pending enrichment)".to_string()
-                } else {
-                    truncate(&r.value, 40)
-                };
-                (purpose, 0, false)
-            }
-        };
-        rows.push((
-            path.to_string(),
-            purpose,
-            entry_count,
-            r.confidence.value,
-            r.quality.value,
-            is_hotspot,
-        ));
+    let total = rows.len();
+    if limit > 0 && printed_count < total {
+        println!(
+            "  showing {} of {} file records (hotspots first on next call) — use -n 0 for all",
+            printed_count, total
+        );
+    } else {
+        println!("  {} file records", total);
     }
 
-    // Sort: hotspots first, then alphabetical by path
-    rows.sort_by(|a, b| b.5.cmp(&a.5).then_with(|| a.0.cmp(&b.0)));
+    // ── Write cache (sorted, best-effort) ────────────────────────────────
+    rows.sort_by(|a, b| b.is_hotspot.cmp(&a.is_hotspot).then_with(|| a.path.cmp(&b.path)));
+    let display_rows: Vec<LsFileRow> = if limit == 0 {
+        rows
+    } else {
+        rows.into_iter().take(limit).collect()
+    };
+    let cache = LsFilesCache { write_seq: current_seq, limit, total, rows: display_rows };
+    let mut record = ls_cache_record(LS_FILES_CACHE_KEY, String::new());
+    record.payload = serde_json::to_value(&cache).ok();
+    let _ = store.put(LS_FILES_CACHE_KEY, &record).await;
 
+    Ok(())
+}
+
+// Column widths for the streaming (cold-path) fixed-width format.
+// PATH is left-truncated to preserve the filename when paths are long.
+const COL_PATH: usize = 42;
+const COL_PURPOSE: usize = 38;
+
+/// Print the fixed-width header for the streaming cold-path display.
+fn print_ls_files_stream_header() {
+    println!(
+        "{:<COL_PATH$}  {:<COL_PURPOSE$}  {:>3}  {:>4}  {:>4}  {:>3}",
+        "PATH", "PURPOSE", "ENT", "CONF", "QUAL", "HOT"
+    );
+    println!("{}", "─".repeat(COL_PATH + COL_PURPOSE + 22));
+}
+
+/// Print a single row in fixed-width format during the streaming cold-path scan.
+fn print_ls_files_stream_row(row: &LsFileRow) {
+    // Left-truncate paths so the filename is always visible.
+    let path = if row.path.len() > COL_PATH {
+        format!("…{}", &row.path[row.path.len() - (COL_PATH - 1)..])
+    } else {
+        row.path.clone()
+    };
+    let hot = if row.is_hotspot { "*" } else { "" };
+    println!(
+        "{:<COL_PATH$}  {:<COL_PURPOSE$}  {:>3}  {:>4.2}  {:>4.2}  {:>3}",
+        path, row.purpose, row.entry_count, row.confidence, row.quality, hot
+    );
+}
+
+/// Render the file listing table from pre-sorted, already-limited rows.
+fn render_ls_files_table(rows: &[LsFileRow], total: usize, limit: usize) {
     let mut table = Table::new();
     table
         .load_preset(UTF8_FULL_CONDENSED)
@@ -330,20 +474,27 @@ async fn ls_files(store: &Store, _use_color: bool) -> Result<()> {
             Cell::new("Hot"),
         ]);
 
-    for (path, purpose, entries, conf, qual, hot) in &rows {
+    for row in rows {
         table.add_row(vec![
-            Cell::new(path),
-            Cell::new(purpose),
-            Cell::new(entries),
-            Cell::new(format!("{conf:.2}")).fg(score_comfy_color(*conf)),
-            Cell::new(format!("{qual:.2}")).fg(score_comfy_color(*qual)),
-            Cell::new(if *hot { "*" } else { "" }),
+            Cell::new(&row.path),
+            Cell::new(&row.purpose),
+            Cell::new(row.entry_count),
+            Cell::new(format!("{:.2}", row.confidence)).fg(score_comfy_color(row.confidence)),
+            Cell::new(format!("{:.2}", row.quality)).fg(score_comfy_color(row.quality)),
+            Cell::new(if row.is_hotspot { "*" } else { "" }),
         ]);
     }
 
     println!("{table}");
-    println!("  {} file records", records.len());
-    Ok(())
+    if limit > 0 && rows.len() < total {
+        println!(
+            "  showing {} of {} file records (hotspots first) — use -n 0 for all",
+            rows.len(),
+            total
+        );
+    } else {
+        println!("  {} file records", total);
+    }
 }
 
 async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
@@ -377,9 +528,9 @@ async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
 
     for r in &records {
         let key_short = r.key.strip_prefix("gotcha:").unwrap_or(&r.key);
-        let (rule, confirmed) = match serde_json::from_str::<mati_core::store::GotchaRecord>(&r.value) {
-            Ok(gr) => (truncate(&gr.rule, 40), gr.confirmed),
-            Err(_) => (truncate(&r.value, 40), false),
+        let (rule, confirmed) = match r.payload_as::<mati_core::store::GotchaRecord>() {
+            Some(gr) => (truncate(&gr.rule, 40), gr.confirmed),
+            None => (truncate(&r.value, 40), false),
         };
         let sev = priority_short(&r.priority);
         table.add_row(vec![
@@ -445,7 +596,7 @@ pub async fn run_export(args: ExportArgs) -> Result<()> {
 
     let output = match args.format.as_str() {
         "json" => export_json(&store).await?,
-        "md" => export_md(&store).await?,
+        "md" | "markdown" => export_md(&store).await?,
         other => anyhow::bail!("unknown format '{other}'. Valid: md, json"),
     };
 

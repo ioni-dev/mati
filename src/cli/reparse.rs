@@ -48,7 +48,7 @@ pub async fn run(path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str) -> Result<()> {
+pub(crate) async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str) -> Result<()> {
     let abs_path = repo_root.join(rel_path);
     let file_key = format!("file:{rel_path}");
     let now = now_secs();
@@ -80,6 +80,7 @@ async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str
         rel_path: rel_path.to_string(),
         language,
         size_bytes,
+        mtime_secs: 0, // reparse always re-reads — mtime not needed
     };
 
     // 3. Parse file — graceful degradation on failure
@@ -99,10 +100,10 @@ async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str
     // 6. No record → create Layer 0 stub
     let Some(mut record) = existing else {
         let file_record = build_file_record_from_analysis(rel_path, &analysis, &walked, now);
-        let value = serde_json::to_string(&file_record)?;
         let new_record = Record {
             key: file_key.clone(),
-            value,
+            value: file_record.purpose.clone(),
+            payload: serde_json::to_value(&file_record).ok(),
             category: Category::File,
             priority: mati_core::store::record::Priority::Normal,
             tags: vec![],
@@ -127,13 +128,14 @@ async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str
         return Ok(());
     };
 
-    // 7. Deserialize existing FileRecord, compare
-    let old_fr: FileRecord = match serde_json::from_str(&record.value) {
-        Ok(fr) => fr,
-        Err(_) => {
-            // Corrupt value — rebuild from scratch, preserve key metadata
+    // 7. Deserialize existing FileRecord from payload, compare
+    let old_fr: FileRecord = match record.payload_as::<FileRecord>() {
+        Some(fr) => fr,
+        None => {
+            // Missing or corrupt payload — rebuild from scratch, preserve key metadata
             let file_record = build_file_record_from_analysis(rel_path, &analysis, &walked, now);
-            record.value = serde_json::to_string(&file_record)?;
+            record.value = file_record.purpose.clone();
+            record.payload = serde_json::to_value(&file_record).ok();
             record.updated_at = now;
             record.version.logical_clock += 1;
             record.version.wall_clock = now;
@@ -164,9 +166,12 @@ async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str
         is_hotspot: old_fr.is_hotspot,
         token_cost_estimate: (walked.size_bytes / 4).min(u32::MAX as u64) as u32,
         last_modified_session: now,
+        content_hash: analysis.content_hash.clone(),
+        line_count: analysis.line_count,
     };
 
-    record.value = serde_json::to_string(&merged)?;
+    record.value = merged.purpose.clone();
+    record.payload = serde_json::to_value(&merged).ok();
 
     // 10. Apply staleness
     let signals = apply_reparse_staleness(&mut record, &diff);
@@ -211,6 +216,8 @@ fn build_file_record_from_analysis(
         is_hotspot: false,
         token_cost_estimate: (walked.size_bytes / 4).min(u32::MAX as u64) as u32,
         last_modified_session: now,
+        content_hash: analysis.content_hash.clone(),
+        line_count: analysis.line_count,
     }
 }
 
@@ -289,6 +296,8 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 100,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         }
     }
 
@@ -304,6 +313,9 @@ mod tests {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         }
     }
 
@@ -352,6 +364,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
         let new = StaticFileAnalysis {
             path: "src/main.rs".into(),
@@ -364,6 +378,9 @@ mod tests {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         };
         let diff = compute_diff(&old, &new);
         assert!(diff.is_empty());
@@ -383,7 +400,7 @@ mod tests {
         let r = record.unwrap();
         assert_eq!(r.category, Category::File);
 
-        let fr: FileRecord = serde_json::from_str(&r.value).unwrap();
+        let fr: FileRecord = r.payload_as::<FileRecord>().unwrap();
         assert!(fr.purpose.is_empty());
         assert!(fr.entry_points.contains(&"hello".to_string()));
 
@@ -413,6 +430,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 0,
             last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
         };
         let record = Record {
             key: "file:gone.rs".into(),
@@ -436,6 +455,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         };
         store.put("file:gone.rs", &record).await.unwrap();
 
@@ -473,10 +493,13 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 50,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         };
         let record = Record {
             key: "file:lib.rs".into(),
-            value: serde_json::to_string(&fr).unwrap(),
+            value: fr.purpose.clone(),
+            payload: serde_json::to_value(&fr).ok(),
             category: Category::File,
             priority: mati_core::store::record::Priority::Normal,
             tags: vec![],
@@ -502,7 +525,7 @@ mod tests {
         reparse_impl(&store, repo, "lib.rs").await.unwrap();
 
         let updated = store.get("file:lib.rs").await.unwrap().unwrap();
-        let updated_fr: FileRecord = serde_json::from_str(&updated.value).unwrap();
+        let updated_fr: FileRecord = updated.payload_as::<FileRecord>().unwrap();
 
         // Preserved
         assert_eq!(updated_fr.purpose, "Core library");
@@ -547,10 +570,13 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
         };
         let record = Record {
             key: "file:stable.rs".into(),
-            value: serde_json::to_string(&fr).unwrap(),
+            value: fr.purpose.clone(),
+            payload: serde_json::to_value(&fr).ok(),
             category: Category::File,
             priority: mati_core::store::record::Priority::Normal,
             tags: vec![],

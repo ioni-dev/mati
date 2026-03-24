@@ -309,6 +309,7 @@ mod tests {
             rel_path: rel_path.to_string(),
             language: lang,
             size_bytes: 100,
+            mtime_secs: 0,
         }
     }
 
@@ -324,6 +325,9 @@ mod tests {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         }
     }
 
@@ -471,6 +475,34 @@ mod tests {
         let result = build_edges(&files, &analyses, &[]);
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].2, "file:pkg/__init__.py");
+    }
+
+    #[test]
+    fn rust_unknown_import_returns_none() {
+        let files = vec![walked("src/lib.rs", Language::Rust)];
+        let analyses = vec![analysis(
+            "src/lib.rs",
+            Language::Rust,
+            &["crate::nonexistent"],
+        )];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 0);
+        assert_eq!(result.unresolved_imports, 1);
+    }
+
+    #[test]
+    fn python_unknown_import_returns_none() {
+        let files = vec![walked("app/main.py", Language::Python)];
+        let analyses = vec![analysis(
+            "app/main.py",
+            Language::Python,
+            &["app.nonexistent"],
+        )];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 0);
+        assert_eq!(result.unresolved_imports, 1);
     }
 
     // ── TypeScript/JavaScript import resolution ─────────────────────────────

@@ -18,17 +18,14 @@ pub use claude_md::{import_claude_md, ClaudeMdImport};
 pub use deps::{parse_dependencies, DepEntry, DepSignals, DepVersion, ManifestKind};
 pub use edges::{build_edges, Layer0Edges};
 pub use git::{mine_git_history, GitSignals};
-pub use parser::{parse_file, parse_files_parallel, StaticFileAnalysis};
+pub use parser::{hash_and_parse_parallel, parse_file, parse_files_parallel, StaticFileAnalysis};
 pub use walker::{Language, WalkedFile, Walker};
 
 /// Build one `FileRecord` from the parsed Layer 0 signals for a file.
 ///
-/// The caller supplies the walked file for token-cost estimation, the repo-wide
-/// git signals, and the current session timestamp. The returned record is a
-/// layer-0 stub: empty purpose, no gotcha links yet, and a rough token-cost
-/// estimate derived from file size. The persisted `Record` companion should
-/// use [`crate::store::record::Record::layer0_file_stub`] so quality is pinned
-/// to the suppressed layer-0 default (`0.10`).
+/// If the parser extracted a module-level doc comment (`analysis.module_doc`),
+/// it is used as the initial `purpose`. Records with a purpose are auto-promoted
+/// to `additionalContext` quality in the caller (`init.rs`).
 pub fn build_file_record(
     file: &WalkedFile,
     analysis: &StaticFileAnalysis,
@@ -50,7 +47,7 @@ pub fn build_file_record(
 
     let token_cost_estimate = (file.size_bytes / 4).min(u32::MAX as u64) as u32;
 
-    FileRecord::layer0_stub(
+    let mut fr = FileRecord::layer0_stub(
         path,
         analysis.entry_points.clone(),
         analysis.imports.clone(),
@@ -62,7 +59,18 @@ pub fn build_file_record(
         is_hotspot,
         token_cost_estimate,
         last_modified_session,
-    )
+    );
+
+    // Propagate author-written doc comment to purpose — gives immediate
+    // additionalContext value after `mati init` with no LLM calls.
+    if let Some(doc) = &analysis.module_doc {
+        fr.purpose = doc.clone();
+    }
+
+    fr.content_hash = analysis.content_hash.clone();
+    fr.line_count = analysis.line_count;
+
+    fr
 }
 
 /// Build layer-0 file records for a batch of parsed files.
@@ -110,6 +118,9 @@ mod tests {
             unwrap_count: 2,
             panic_count: 0,
             branch_count: 3,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         };
 
         let mut git = GitSignals::empty();
@@ -123,6 +134,7 @@ mod tests {
             rel_path: "src/lib.rs".to_string(),
             language: Language::Rust,
             size_bytes: 400,
+            mtime_secs: 0,
         };
 
         let hotspots = git.hotspot_files.iter().cloned().collect::<HashSet<_>>();
@@ -144,12 +156,41 @@ mod tests {
     }
 
     #[test]
+    fn module_doc_propagates_to_purpose() {
+        let analysis = StaticFileAnalysis {
+            path: "src/auth.rs".to_string(),
+            language: Language::Rust,
+            entry_points: vec![],
+            exported_types: vec![],
+            imports: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            panic_count: 0,
+            branch_count: 0,
+            module_doc: Some("Handles JWT authentication.".to_string()),
+            content_hash: None,
+            line_count: 0,
+        };
+        let file = WalkedFile {
+            abs_path: std::path::PathBuf::from("/repo/src/auth.rs"),
+            rel_path: "src/auth.rs".to_string(),
+            language: Language::Rust,
+            size_bytes: 100,
+            mtime_secs: 0,
+        };
+        let record = build_file_record(&file, &analysis, None, None, 0);
+        assert_eq!(record.purpose, "Handles JWT authentication.");
+    }
+
+    #[test]
     fn build_file_records_is_stable_for_missing_git_signals() {
         let files = vec![WalkedFile {
             abs_path: std::path::PathBuf::from("/repo/src/main.rs"),
             rel_path: "src/main.rs".to_string(),
             language: Language::Rust,
             size_bytes: 8,
+            mtime_secs: 0,
         }];
         let analyses = vec![StaticFileAnalysis {
             path: "src/main.rs".to_string(),
@@ -162,6 +203,9 @@ mod tests {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         }];
 
         let records = build_file_records(&files, &analyses, None, 55);

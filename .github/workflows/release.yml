@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: mati
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Linux targets — cross-compiled via `cross`
+  # ─────────────────────────────────────────────────────────────
+  build-linux:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          TARGET=${{ matrix.target }}
+          if [[ "$TARGET" == aarch64* ]]; then
+            STRIP_BIN="aarch64-linux-gnu-strip"
+            sudo apt-get install -y binutils-aarch64-linux-gnu
+          else
+            STRIP_BIN="strip"
+          fi
+          $STRIP_BIN "target/$TARGET/release/$BINARY_NAME"
+
+      - name: Package artifact
+        run: |
+          TARGET=${{ matrix.target }}
+          ARTIFACT="mati-${TARGET}.tar.gz"
+          tar -czf "$ARTIFACT" -C "target/$TARGET/release" "$BINARY_NAME"
+          echo "ARTIFACT=$ARTIFACT" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mati-${{ matrix.target }}
+          path: mati-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────
+  # macOS targets — native runners (cross does not support macOS)
+  # ─────────────────────────────────────────────────────────────
+  build-macos:
+    name: Build ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: strip "target/${{ matrix.target }}/release/$BINARY_NAME"
+
+      - name: Package artifact
+        run: |
+          TARGET=${{ matrix.target }}
+          ARTIFACT="mati-${TARGET}.tar.gz"
+          tar -czf "$ARTIFACT" -C "target/$TARGET/release" "$BINARY_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mati-${{ matrix.target }}
+          path: mati-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+  # ─────────────────────────────────────────────────────────────
+  # Publish GitHub Release with all artifacts + checksums
+  # ─────────────────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum mati-*.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/mati-x86_64-unknown-linux-musl.tar.gz
+            artifacts/mati-aarch64-unknown-linux-musl.tar.gz
+            artifacts/mati-x86_64-apple-darwin.tar.gz
+            artifacts/mati-aarch64-apple-darwin.tar.gz
+            artifacts/checksums.txt
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

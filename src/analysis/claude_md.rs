@@ -210,6 +210,7 @@ fn section_to_record(
         source: RecordSource::Import,
         confidence: ConfidenceScore::for_new_record(&RecordSource::Import),
         gap_analysis_score: 0.0,
+        payload: None,
     }
 }
 
