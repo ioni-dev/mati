@@ -596,6 +596,178 @@ mod tests {
         store.close().await.expect("store close failed");
     }
 
+    // ── Test 9: Go parser produces structural signals ────────────────────────
+
+    /// Proves the Go parser (M-18a) correctly extracts entry points, imports,
+    /// and exported types from synthetic Go source via the full
+    /// Walker → parse_file path.
+    ///
+    /// Verifies:
+    /// - Exported functions appear in `entry_points` (uppercase-first)
+    /// - Unexported functions are excluded
+    /// - Grouped imports are extracted with quotes stripped
+    /// - Exported types appear in `exported_types`
+    /// - Unexported types are excluded
+    /// - `language` tag is `Language::Go`
+    #[tokio::test]
+    async fn smoke_go_parser_produces_signals() {
+        const GO_SOURCE: &str = r#"// Package service implements the HTTP request handler.
+package service
+
+import (
+	"context"
+	"fmt"
+	"github.com/example/dep"
+)
+
+// HandleRequest processes an incoming request. Exported.
+func HandleRequest(ctx context.Context, req *Request) (*Response, error) {
+	fmt.Println("handling")
+	return nil, nil
+}
+
+// validate is unexported — must NOT appear in entry_points.
+func validate(r *Request) bool {
+	return r != nil
+}
+
+// Request is the exported input type.
+type Request struct {
+	ID   string
+	Body []byte
+}
+
+// internalState is unexported — must NOT appear in exported_types.
+type internalState struct {
+	count int
+}
+"#;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::write(dir.path().join("service.go"), GO_SOURCE)
+            .expect("failed to write synthetic Go file");
+
+        let walker = Walker::new(dir.path());
+        let files = walker.walk().expect("walker failed on temp Go dir");
+
+        let go_file = files
+            .iter()
+            .find(|f| f.language == Language::Go)
+            .expect("walker must detect service.go as Language::Go");
+
+        let analysis = parse_file(go_file)
+            .expect("parse_file must not error on valid Go source");
+
+        // Language tag
+        assert_eq!(analysis.language, Language::Go, "analysis.language must be Go");
+
+        // Exported function captured
+        assert!(
+            analysis.entry_points.contains(&"HandleRequest".to_string()),
+            "HandleRequest must be in entry_points; got: {:?}",
+            analysis.entry_points
+        );
+
+        // Unexported function excluded
+        assert!(
+            !analysis.entry_points.contains(&"validate".to_string()),
+            "unexported 'validate' must not appear in entry_points"
+        );
+
+        // All grouped imports extracted with quotes stripped
+        for import in &["context", "fmt", "github.com/example/dep"] {
+            assert!(
+                analysis.imports.contains(&import.to_string()),
+                "expected import {import:?} in {:?}",
+                analysis.imports
+            );
+        }
+
+        // Exported type captured
+        assert!(
+            analysis.exported_types.contains(&"Request".to_string()),
+            "Request must be in exported_types; got: {:?}",
+            analysis.exported_types
+        );
+
+        // Unexported type excluded
+        assert!(
+            !analysis.exported_types.contains(&"internalState".to_string()),
+            "unexported 'internalState' must not appear in exported_types"
+        );
+    }
+
+    // ── Test 10: Go FileRecord assembly ──────────────────────────────────────
+
+    /// Proves that Go parser signals flow correctly through `build_file_record`
+    /// and that the resulting `FileRecord` has populated `entry_points` and
+    /// `imports` — the fields used by `KnowledgeGapAnalyzer` and `mem_bootstrap`.
+    #[tokio::test]
+    async fn smoke_go_file_record_assembly() {
+        use mati_core::analysis::build_file_record;
+
+        const GO_SOURCE: &str = r#"package api
+
+import (
+	"net/http"
+	"encoding/json"
+)
+
+// ServeHTTP handles HTTP requests. Exported.
+func ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode("ok")
+}
+
+// Handler is the exported handler type.
+type Handler struct{}
+"#;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::write(dir.path().join("api.go"), GO_SOURCE)
+            .expect("failed to write synthetic Go file");
+
+        let walker = Walker::new(dir.path());
+        let files = walker.walk().expect("walker failed");
+        let go_file = files
+            .iter()
+            .find(|f| f.language == Language::Go)
+            .expect("api.go must be detected as Language::Go");
+
+        let analysis = parse_file(go_file).expect("parse_file failed");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // No git signals on first run — mirrors init.rs behavior before mine_git_history
+        let file_record = build_file_record(go_file, &analysis, None, None, now);
+
+        // FileRecord fields must carry Go parser output
+        assert!(
+            file_record.entry_points.contains(&"ServeHTTP".to_string()),
+            "FileRecord.entry_points must contain ServeHTTP; got: {:?}",
+            file_record.entry_points
+        );
+        assert!(
+            file_record.imports.contains(&"net/http".to_string()),
+            "FileRecord.imports must contain net/http; got: {:?}",
+            file_record.imports
+        );
+        assert!(
+            file_record.imports.contains(&"encoding/json".to_string()),
+            "FileRecord.imports must contain encoding/json; got: {:?}",
+            file_record.imports
+        );
+
+        // gap_analysis_score input fields are populated — non-zero entry_points
+        // means KnowledgeGapAnalyzer can compute HotFileNoContract gaps
+        assert!(
+            !file_record.entry_points.is_empty(),
+            "entry_points must be non-empty for gap detection to work on Go files"
+        );
+    }
+
     // ── Test 8: git2 integration ────────────────────────────────────────────
 
     /// Proves git2 integration works with the real mati repo: HEAD exists,
