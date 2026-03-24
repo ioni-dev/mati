@@ -114,6 +114,7 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         }
         Err(e) => {
             tracing::warn!("gaps: graph load failed, HighFanInNoContract skipped: {e}");
+            eprintln!("  note: HighFanInNoContract analysis skipped — {e:#}");
             HashMap::new()
         }
     };

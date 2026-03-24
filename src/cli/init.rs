@@ -643,8 +643,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         Err(e) => {
             tracing::warn!("CLAUDE.md stub write failed: {e}");
             println!(
-                "  Writing .claude/CLAUDE.md stub...    (skipped)      {:>3}ms",
-                t.elapsed().as_millis()
+                "  Writing .claude/CLAUDE.md stub...    skipped — {:#}",
+                e
             );
         }
     }
@@ -659,10 +659,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
             ),
             Err(e) => {
                 tracing::warn!("hook installation failed: {e}");
-                println!(
-                    "  Installing hooks into .claude/...    (skipped)      {:>3}ms",
-                    t.elapsed().as_millis()
-                );
+                println!("  Installing hooks into .claude/...    FAILED");
+                eprintln!();
+                eprintln!("  WARNING: hook installation failed — {e:#}");
+                eprintln!("  Read interception will not work until hooks are installed.");
+                eprintln!("  Fix the issue above, then re-run: mati init");
+                eprintln!();
             }
         }
     }
