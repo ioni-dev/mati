@@ -110,17 +110,17 @@ static JS_CAPTURES: LazyLock<EcmaCaptures> =
 thread_local! {
     static TS_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&*TS_LANGUAGE).expect("parser/typescript: TS grammar load failed");
+        p.set_language(&TS_LANGUAGE).expect("parser/typescript: TS grammar load failed");
         p
     });
     static TSX_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&*TSX_LANGUAGE).expect("parser/typescript: TSX grammar load failed");
+        p.set_language(&TSX_LANGUAGE).expect("parser/typescript: TSX grammar load failed");
         p
     });
     static JS_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&*JS_LANGUAGE).expect("parser/typescript: JS grammar load failed");
+        p.set_language(&JS_LANGUAGE).expect("parser/typescript: JS grammar load failed");
         p
     });
 }

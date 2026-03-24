@@ -454,7 +454,7 @@ fn e2e_full_lifecycle() {
                 .stdout
                 .lines()
                 .find(|l| l.contains("Imported") && l.contains("records"))
-                .and_then(|l| first_number(l))
+                .and_then(first_number)
                 .unwrap_or(0);
             summary.import_count_after = imported_count;
 
@@ -1454,22 +1454,20 @@ fn extract_gaps_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
         .find(|l| l.contains('●') || l.starts_with("  ●"))
         .and_then(|l| {
             // After the tier label, extract the path
-            l.splitn(2, "● ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().last())
+            l.split_once("● ")
+                .and_then(|(_, rest)| rest.split_whitespace().last())
         })
-        .map(|s| strip_ansi(s))
+        .map(strip_ansi)
         .unwrap_or_else(|| "?".to_string());
 
     // Try to get risk from a line containing a decimal after the path
     let top_risk = output.lines()
-        .skip_while(|l| !l.contains('●') && !l.contains("CRITICAL") && !l.contains("HIGH"))
-        .next()
+        .find(|l| l.contains('●') || l.contains("CRITICAL") || l.contains("HIGH"))
         .and_then(|_l| {
             // Find risk score — look for risk in description lines
             output.lines()
                 .find(|l| l.contains("risk") || l.contains("score"))
-                .and_then(|l| first_float(l))
+                .and_then(first_float)
         });
 
     sr.add_metric("gaps", &count.to_string());
@@ -1509,7 +1507,7 @@ fn extract_ls_files_metrics(output: &str, sr: &mut StepResult, summary: &mut Sum
             // comfy_table row: │ path.ext ┆ ...
             if t.starts_with('│') {
                 let after = t.trim_start_matches('│');
-                let cell = after.splitn(2, '\u{2506}').next().unwrap_or("").trim();
+                let cell = after.split('\u{2506}').next().unwrap_or("").trim();
                 return cell.ends_with(ext) || cell.contains(&format!("{ext}/")) || cell.contains(&format!("{}/", ext.trim_start_matches('.')));
             }
             // space-separated row: first token is path
@@ -1782,13 +1780,13 @@ fn extract_improve_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, summ
     // or "Current quality: 0.42 ..." and later "Updated ... (quality: ... -> 0.71)"
     let before = output.lines()
         .find(|l| l.contains("Current quality") || l.starts_with("Updated"))
-        .and_then(|l| first_float(l));
+        .and_then(first_float);
 
     let after = output.lines()
         .find(|l| l.contains("->") && l.contains("quality"))
         .and_then(|l| {
             // Find the number after "->"
-            l.split("->").nth(1).and_then(|s| first_float(s))
+            l.split("->").nth(1).and_then(first_float)
         });
 
     if let Some(b) = before { summary.quality_before = b; }
@@ -1819,7 +1817,7 @@ fn extract_export_json_metrics(output: &str, sr: &mut StepResult, summary: &mut 
     let cat = |r: &&serde_json::Value, s: &str| {
         r.get("category")
             .and_then(|c| c.as_str())
-            .map_or(false, |c| c.eq_ignore_ascii_case(s))
+            .is_some_and(|c| c.eq_ignore_ascii_case(s))
     };
 
     let total = arr.len() as u64;
@@ -2121,7 +2119,7 @@ fn pick_first_file_path(output: &str) -> Option<String> {
             // │ is 3 bytes (U+2502), so skip with char-aware split
             let after_bar = trimmed.trim_start_matches('│');
             let first_cell = after_bar
-                .splitn(2, '\u{2506}') // split on ┆
+                .split('\u{2506}') // split on ┆
                 .next()
                 .unwrap_or("")
                 .trim();

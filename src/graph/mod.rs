@@ -2,6 +2,7 @@
 // Edges stored as graph:edge:<from>:<kind>:<to> keys
 
 pub mod edges;
+#[allow(clippy::module_inception)]
 pub mod graph;
 pub use edges::{Edge, EdgeKind};
 pub use graph::Graph;

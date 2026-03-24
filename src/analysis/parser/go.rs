@@ -47,7 +47,7 @@ static GO_CAPTURES: LazyLock<GoCaptures> =
 thread_local! {
     static GO_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&*GO_LANGUAGE).expect("parser/go: grammar load failed");
+        p.set_language(&GO_LANGUAGE).expect("parser/go: grammar load failed");
         p
     });
 }
@@ -123,13 +123,7 @@ pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnal
 
             if idx == ci.branch {
                 out.branch_count += 1;
-            } else if idx == ci.fn_name {
-                if let Ok(name) = node.utf8_text(src) {
-                    if is_exported(name) {
-                        out.entry_points.push(name.to_owned());
-                    }
-                }
-            } else if idx == ci.method_name {
+            } else if idx == ci.fn_name || idx == ci.method_name {
                 if let Ok(name) = node.utf8_text(src) {
                     if is_exported(name) {
                         out.entry_points.push(name.to_owned());

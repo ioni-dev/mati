@@ -64,11 +64,11 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
             RESET = colors::RESET
         );
         println!(
-            "  {GRAY}confidence {conf:.2}  quality {quality}{hotspot}{RESET}",
+            "  {GRAY}confidence {conf:.2}  quality {quality:?}{hotspot}{RESET}",
             GRAY = colors::GRAY,
             RESET = colors::RESET,
             conf = file_rec.confidence.value,
-            quality = format!("{:?}", file_rec.quality.tier),
+            quality = file_rec.quality.tier,
             hotspot = hotspot_tag,
         );
     } else {

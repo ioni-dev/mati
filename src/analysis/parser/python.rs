@@ -49,7 +49,7 @@ static PY_CAPTURES: LazyLock<PyCaptures> =
 thread_local! {
     static PY_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&*PY_LANGUAGE).expect("parser/python: grammar load failed");
+        p.set_language(&PY_LANGUAGE).expect("parser/python: grammar load failed");
         p
     });
 }
@@ -198,13 +198,15 @@ fn is_top_level(node: tree_sitter::Node) -> bool {
 fn strip_python_docstring(raw: &str) -> Option<String> {
     let s = raw.trim();
     // Try longest delimiters first.
-    let inner = if s.starts_with("\"\"\"") && s.ends_with("\"\"\"") && s.len() >= 6 {
+    let inner = if (s.starts_with("\"\"\"") && s.ends_with("\"\"\"")
+        || s.starts_with("'''") && s.ends_with("'''"))
+        && s.len() >= 6
+    {
         &s[3..s.len() - 3]
-    } else if s.starts_with("'''") && s.ends_with("'''") && s.len() >= 6 {
-        &s[3..s.len() - 3]
-    } else if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        &s[1..s.len() - 1]
-    } else if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+    } else if (s.starts_with('"') && s.ends_with('"')
+        || s.starts_with('\'') && s.ends_with('\''))
+        && s.len() >= 2
+    {
         &s[1..s.len() - 1]
     } else {
         s
