@@ -589,7 +589,7 @@ mod tests {
         // Note: b.rs shows 1 from the branch commit (non-merge, counted)
         assert_eq!(signals.change_frequency.get("a.rs"), Some(&1));
         assert!(
-            signals.change_frequency.get("c.rs").is_none()
+            !signals.change_frequency.contains_key("c.rs")
                 || signals.change_frequency.get("c.rs") == Some(&0),
             "merge commit files should not be counted"
         );

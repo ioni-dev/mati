@@ -305,7 +305,7 @@ fn record_to_doc(record: &Record, fields: &Fields) -> TantivyDocument {
     doc.add_text(fields.key,        &record.key);
     doc.add_text(fields.value,      &record.value);
     doc.add_text(fields.category,   category_str(&record.category));
-    doc.add_text(fields.tags,       &record.tags.join(" "));
+    doc.add_text(fields.tags,       record.tags.join(" "));
     doc.add_u64(fields.priority,    priority_u64(&record.priority));
     doc.add_u64(fields.updated_at,  record.updated_at);
     doc

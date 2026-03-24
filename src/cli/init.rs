@@ -169,10 +169,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
         Err(e) => {
             tracing::warn!("git history mining failed: {e}");
-            println!(
-                "  Mining git history...               skipped — {}",
-                format!("{e:#}")
-            );
+            println!("  Mining git history...               skipped — {e:#}");
             None
         }
     };
@@ -191,10 +188,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
         Err(e) => {
             tracing::warn!("dependency parsing failed: {e}");
-            println!(
-                "  Parsing dependencies...              skipped — {}",
-                format!("{e:#}")
-            );
+            println!("  Parsing dependencies...              skipped — {e:#}");
             mati_core::analysis::DepSignals::empty()
         }
     };
@@ -214,10 +208,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
         Err(e) => {
             tracing::warn!("CLAUDE.md import failed: {e}");
-            println!(
-                "  Importing CLAUDE.md...               skipped — {}",
-                format!("{e:#}")
-            );
+            println!("  Importing CLAUDE.md...               skipped — {e:#}");
             mati_core::analysis::ClaudeMdImport { records: vec![] }
         }
     };
@@ -610,7 +601,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // store() still work. Cold init (skipped_count == 0) always loads because
     // mark_search_stale is only called on cold paths and is a no-op concern.
     let t = Instant::now();
-    let mut graph = if layer0_edges.edges.is_empty() && skipped_count > 0 {
+    let graph = if layer0_edges.edges.is_empty() && skipped_count > 0 {
         Graph::empty(store)
     } else {
         let mut g = Graph::load(store).await?;
@@ -909,10 +900,10 @@ fn build_revert_gotchas(
             .then_with(|| a.0.cmp(b.0))
     });
 
-    let mut clock_offset: u64 = 0;
     let mut result: Vec<RevertGotcha> = Vec::new();
 
-    for (path, count, rate) in candidates {
+    for (clock_offset, (path, count, rate)) in candidates.into_iter().enumerate() {
+        let clock_offset = clock_offset as u64;
         let pct = (rate * 100.0).round() as u32;
         let rule = format!(
             "High revert rate ({pct}% of commits, {count} reverts) — this interface has been broken and undone repeatedly. Test carefully before touching.",
@@ -945,7 +936,6 @@ fn build_revert_gotchas(
         rec.confidence.value = 0.35;
         rec.tags = vec!["revert".to_string(), "auto-generated".to_string()];
         rec.payload = serde_json::to_value(&gotcha).ok();
-        clock_offset += 1;
 
         result.push(RevertGotcha {
             key,
@@ -1018,10 +1008,10 @@ fn build_ownership_gotchas(
             .then_with(|| a.0.cmp(b.0))
     });
 
-    let mut clock_offset: u64 = 0;
     let mut result: Vec<OwnershipGotcha> = Vec::new();
 
-    for (path, top_author, top_count, ratio) in candidates {
+    for (clock_offset, (path, top_author, top_count, ratio)) in candidates.into_iter().enumerate() {
+        let clock_offset = clock_offset as u64;
         let total = signals
             .change_frequency
             .get(path)
@@ -1059,7 +1049,6 @@ fn build_ownership_gotchas(
         rec.confidence.value = 0.40;
         rec.tags = vec!["ownership".to_string(), "auto-generated".to_string()];
         rec.payload = serde_json::to_value(&gotcha).ok();
-        clock_offset += 1;
 
         result.push(OwnershipGotcha {
             key,
@@ -1074,6 +1063,7 @@ fn build_ownership_gotchas(
 /// Build a minimal sessions-tree Record for a parse-cache blob.
 ///
 /// Used for `parse:mtime_index` (JSON blob) — Eventual durability, sessions tree.
+#[allow(dead_code)]
 fn make_hash_record(key: &str, hash: &str, device_id: Uuid, now: u64) -> Record {
     Record {
         key: key.to_string(),

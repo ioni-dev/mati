@@ -152,7 +152,7 @@ mod tests {
             store
                 .put(&key, &record)
                 .await
-                .expect(&format!("failed to put record {key}"));
+                .unwrap_or_else(|e| panic!("failed to put record {key}: {e}"));
         }
 
         // scan_prefix returns them
@@ -256,7 +256,7 @@ mod tests {
 
         for file in &rust_files {
             let analysis = parse_file(file)
-                .expect(&format!("parse_file panicked/errored on {}", file.rel_path));
+                .unwrap_or_else(|e| panic!("parse_file panicked/errored on {}: {e}", file.rel_path));
 
             // Basic structural invariants
             assert_eq!(
@@ -302,7 +302,7 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     collect_rs(&p, root, out);
-                } else if p.extension().map_or(false, |x| x == "rs") {
+                } else if p.extension().is_some_and(|x| x == "rs") {
                     if let Ok(rel) = p.strip_prefix(root) {
                         out.push(rel.to_string_lossy().into_owned());
                     }
@@ -566,7 +566,7 @@ mod tests {
             store
                 .put(key, &record)
                 .await
-                .expect(&format!("failed to put version {i}"));
+                .unwrap_or_else(|e| panic!("failed to put version {i}: {e}"));
         }
 
         // Retrieve history

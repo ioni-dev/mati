@@ -148,7 +148,7 @@ pub fn hash_and_parse_parallel(
     stored_mtimes: &HashMap<String, u64>,
 ) -> HashParseOutput {
     enum Slot {
-        Changed(WalkedFile, StaticFileAnalysis),
+        Changed(Box<(WalkedFile, StaticFileAnalysis)>),
         Unchanged,
     }
 
@@ -166,7 +166,7 @@ pub fn hash_and_parse_parallel(
             }
             // Non-parseable languages: record mtime from walker metadata — no disk read.
             if !parseable(f.language) {
-                return Some(Slot::Changed(f.clone(), StaticFileAnalysis::empty(f)));
+                return Some(Slot::Changed(Box::new((f.clone(), StaticFileAnalysis::empty(f)))));
             }
             // Parseable, changed/new: read file bytes and run tree-sitter.
             let bytes = match std::fs::read(&f.abs_path) {
@@ -182,7 +182,7 @@ pub fn hash_and_parse_parallel(
             });
             analysis.content_hash = Some(content_hash);
             analysis.line_count = line_count;
-            Some(Slot::Changed(f.clone(), analysis))
+            Some(Slot::Changed(Box::new((f.clone(), analysis))))
         })
         .collect();
 
@@ -193,7 +193,8 @@ pub fn hash_and_parse_parallel(
 
     for slot in slots.into_iter().flatten() {
         match slot {
-            Slot::Changed(file, analysis) => {
+            Slot::Changed(boxed) => {
+                let (file, analysis) = *boxed;
                 new_mtimes.insert(file.rel_path.clone(), file.mtime_secs);
                 parsed_files.push(file);
                 analyses.push(analysis);

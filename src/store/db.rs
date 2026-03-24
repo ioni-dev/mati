@@ -364,7 +364,7 @@ impl Store {
             }
             txn.commit().await?;
         }
-        if records.iter().any(|(k, _)| is_knowledge_key(*k)) {
+        if records.iter().any(|(k, _)| is_knowledge_key(k)) {
             self.bump_write_seq();
         }
         Ok(())
@@ -426,7 +426,7 @@ impl Store {
             txn.commit().await?;
         }
 
-        let has_knowledge = records.iter().any(|(k, _)| is_knowledge_key(*k));
+        let has_knowledge = records.iter().any(|(k, _)| is_knowledge_key(k));
 
         // Crash-fence — same pattern as put().
         if has_knowledge {
@@ -833,7 +833,7 @@ fn read_remote_url(repo_root: &Path) -> Option<String> {
     config
         .lines()
         .find(|l| l.trim_start().starts_with("url ="))
-        .map(|l| l.splitn(2, '=').nth(1).unwrap_or("").trim().to_owned())
+        .map(|l| l.split_once('=').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -2138,12 +2138,12 @@ mod tests {
 
     // Helper: open a fresh store over an existing data directory (bypasses slug
     // derivation so tests can point at a tempdir directly).
-    fn reopen_store(root: &std::path::PathBuf) -> Store {
+    fn reopen_store(root: &std::path::Path) -> Store {
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
         let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
         let search    = OnceCell::new();
         let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-        Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false }
+        Store { knowledge, sessions, search, root: root.to_path_buf(), index_needs_rebuild: false }
     }
 
     /// Write records, close, delete search_index/, reopen with a fresh empty

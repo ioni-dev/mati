@@ -283,7 +283,9 @@ pub async fn run_daemon_start() -> Result<()> {
     let _ = std::fs::remove_file(&starting_path);  // belt-and-suspenders
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
-    store.close().await?;
+    if let Err(e) = store.close().await {
+        tracing::warn!("daemon: store close warning on shutdown: {e}");
+    }
     Ok(())
 }
 
@@ -561,7 +563,7 @@ pub async fn daemon_result(
                 if is_pid_dead(root) {
                     // Stale socket — clean up so next direct open works.
                     let _ = std::fs::remove_file(&sock_path);
-                    let _ = std::fs::remove_file(&root.join("mati.pid"));
+                    let _ = std::fs::remove_file(root.join("mati.pid"));
                     tracing::debug!("daemon: removed stale socket");
                     return DaemonResult::StaleSocket;
                 } else {
@@ -622,6 +624,7 @@ pub async fn daemon_result(
 ///
 /// Returns the JSON string of the record (or `"null"`), or `None` if the daemon
 /// is unavailable or the result should not be used.
+#[allow(dead_code)]
 pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
     match daemon_result(root, "get", serde_json::json!({ "key": key })).await {
         DaemonResult::Ok(resp) => {

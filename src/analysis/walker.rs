@@ -346,10 +346,8 @@ impl ParallelVisitor for FileVisitor {
             mtime_secs,
         });
 
-        if self.local.len() >= FLUSH_THRESHOLD {
-            if !self.flush() {
-                return WalkState::Quit;
-            }
+        if self.local.len() >= FLUSH_THRESHOLD && !self.flush() {
+            return WalkState::Quit;
         }
 
         WalkState::Continue

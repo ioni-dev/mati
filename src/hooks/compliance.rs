@@ -881,10 +881,6 @@ fn preread_stdin_invalid_json_exits_cleanly() {
     // jq should fail on invalid JSON -> the script may exit due to set -e,
     // or the jq fallback defaults kick in. Either way, no hang.
     // We accept exit code 0 (if guards catch it) or non-zero (if set -e fires).
-    assert!(
-        output.exit_code == 0 || output.exit_code != 0,
-        "should not hang"
-    );
     // If it does produce output, it should be valid JSON
     if !output.stdout.trim().is_empty() {
         assert!(

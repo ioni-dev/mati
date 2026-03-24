@@ -54,7 +54,7 @@ static RUST_CAPTURES: LazyLock<RustCaptures> =
 thread_local! {
     static RUST_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&*RUST_LANGUAGE).expect("parser/rust: grammar load failed");
+        p.set_language(&RUST_LANGUAGE).expect("parser/rust: grammar load failed");
         p
     });
 }
