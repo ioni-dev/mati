@@ -35,6 +35,9 @@ const SESSIONS_RETENTION_NS: u64 = 90 * 24 * 60 * 60 * 1_000_000_000u64;
 /// Detected by [`Store::open_and_rebuild`] (MCP server startup) to trigger
 /// a full rebuild before serving search queries.
 const SEARCH_STALE_MARKER: &str = "search_stale";
+/// Written before every tantivy commit on knowledge keys; removed on success.
+/// Presence on startup means a crash interrupted the KV→tantivy sync window.
+const SEARCH_SYNC_PENDING: &str = "search_sync_pending";
 
 /// Key namespaces stored in the `knowledge` tree that contain [`Record`] structs.
 ///
@@ -183,8 +186,18 @@ impl Store {
             store.index_needs_rebuild = true;
         }
 
+        // Detect crash-window desync: KV write committed but the tantivy
+        // commit was interrupted before the fence could be cleared.
+        if store.root.join(SEARCH_SYNC_PENDING).exists() {
+            tracing::warn!("tantivy crash-window desync detected — scheduling rebuild");
+            store.index_needs_rebuild = true;
+        }
+
         if store.index_needs_rebuild() {
             store.rebuild_search_index().await?;
+            // Clear the crash-fence if present — a full rebuild is a complete
+            // re-sync from KV, so the index is authoritative again.
+            let _ = std::fs::remove_file(store.root.join(SEARCH_SYNC_PENDING));
             // Remove stale marker only after a successful rebuild so a
             // crashed rebuild retries on the next open_and_rebuild call.
             if has_stale_marker {
@@ -292,6 +305,13 @@ impl Store {
         txn.set(key.as_bytes(), bytes)?;
         txn.commit().await?;
 
+        // Crash-fence: written after KV commit, removed after tantivy commit.
+        // If the process dies between these two points, open_and_rebuild sees
+        // the marker on the next start and triggers a full index rebuild.
+        if is_knowledge_key(key) {
+            let _ = std::fs::write(self.root.join(SEARCH_SYNC_PENDING), b"");
+        }
+
         // Update search index — KV write is primary, search is secondary.
         // If tantivy fails to initialize, the KV write still succeeded.
         match self.ensure_search() {
@@ -300,6 +320,7 @@ impl Store {
         }
         if is_knowledge_key(key) {
             self.bump_write_seq();
+            let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
         }
         Ok(())
     }
@@ -405,6 +426,13 @@ impl Store {
             txn.commit().await?;
         }
 
+        let has_knowledge = records.iter().any(|(k, _)| is_knowledge_key(*k));
+
+        // Crash-fence — same pattern as put().
+        if has_knowledge {
+            let _ = std::fs::write(self.root.join(SEARCH_SYNC_PENDING), b"");
+        }
+
         // Update search index — KV write is primary, search is secondary.
         // If tantivy fails to initialize, the KV writes still succeeded.
         match self.ensure_search() {
@@ -414,8 +442,9 @@ impl Store {
             }
             Err(e) => { tracing::warn!("search index unavailable during put_batch: {e}"); }
         }
-        if records.iter().any(|(k, _)| is_knowledge_key(*k)) {
+        if has_knowledge {
             self.bump_write_seq();
+            let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
         }
         Ok(())
     }
