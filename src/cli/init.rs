@@ -171,7 +171,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
             tracing::warn!("git history mining failed: {e}");
             println!(
                 "  Mining git history...               skipped — {}",
-                e.to_string().lines().next().unwrap_or("unknown error")
+                format!("{e:#}")
             );
             None
         }
@@ -193,7 +193,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
             tracing::warn!("dependency parsing failed: {e}");
             println!(
                 "  Parsing dependencies...              skipped — {}",
-                e.to_string().lines().next().unwrap_or("unknown error")
+                format!("{e:#}")
             );
             mati_core::analysis::DepSignals::empty()
         }
@@ -216,7 +216,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
             tracing::warn!("CLAUDE.md import failed: {e}");
             println!(
                 "  Importing CLAUDE.md...               skipped — {}",
-                e.to_string().lines().next().unwrap_or("unknown error")
+                format!("{e:#}")
             );
             mati_core::analysis::ClaudeMdImport { records: vec![] }
         }
