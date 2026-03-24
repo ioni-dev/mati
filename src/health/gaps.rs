@@ -134,7 +134,7 @@ fn description_for_gap(gap_type: &GapType, key: &str) -> String {
 
 fn action_hint_for_gap(gap_type: &GapType, key: &str) -> String {
     // Strip the namespace prefix to get the bare path/slug for CLI commands.
-    let bare = key.splitn(2, ':').nth(1).unwrap_or(key);
+    let bare = key.split_once(':').map_or(key, |(_, rest)| rest);
 
     match gap_type {
         GapType::HotFileNoRecord => {
@@ -297,7 +297,7 @@ fn detect_orphaned_decisions(decisions: &[Record], gaps: &mut Vec<KnowledgeGap>)
                 let affected = v.get("affected_files");
                 match affected {
                     None => true,
-                    Some(arr) => arr.as_array().map_or(true, |a| a.is_empty()),
+                    Some(arr) => arr.as_array().is_none_or(Vec::is_empty),
                 }
             }
             // No payload — decision has no structured data, treat as orphaned.
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn gaps_sort_by_risk_descending() {
-        let mut gaps = vec![
+        let mut gaps = [
             KnowledgeGap {
                 key: "file:low.rs".into(),
                 gap_type: GapType::HotFileNoGotchas,

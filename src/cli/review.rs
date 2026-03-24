@@ -507,7 +507,7 @@ mod tests {
         let mut high = make_record("gotcha:high-access", &make_gotcha_record(false), 0.50);
         high.access_count = 10;
 
-        let mut candidates = vec![low, high];
+        let mut candidates = [low, high];
         candidates.sort_by(|a, b| b.access_count.cmp(&a.access_count));
 
         assert_eq!(candidates[0].key, "gotcha:high-access");

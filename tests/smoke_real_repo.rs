@@ -152,7 +152,7 @@ mod tests {
             store
                 .put(&key, &record)
                 .await
-                .expect(&format!("failed to put record {key}"));
+                .unwrap_or_else(|e| panic!("failed to put record {key}: {e}"));
         }
 
         // scan_prefix returns them
@@ -256,7 +256,7 @@ mod tests {
 
         for file in &rust_files {
             let analysis = parse_file(file)
-                .expect(&format!("parse_file panicked/errored on {}", file.rel_path));
+                .unwrap_or_else(|e| panic!("parse_file panicked/errored on {}: {e}", file.rel_path));
 
             // Basic structural invariants
             assert_eq!(
@@ -302,7 +302,7 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     collect_rs(&p, root, out);
-                } else if p.extension().map_or(false, |x| x == "rs") {
+                } else if p.extension().is_some_and(|x| x == "rs") {
                     if let Ok(rel) = p.strip_prefix(root) {
                         out.push(rel.to_string_lossy().into_owned());
                     }
@@ -566,7 +566,7 @@ mod tests {
             store
                 .put(key, &record)
                 .await
-                .expect(&format!("failed to put version {i}"));
+                .unwrap_or_else(|e| panic!("failed to put version {i}: {e}"));
         }
 
         // Retrieve history
@@ -594,6 +594,322 @@ mod tests {
         }
 
         store.close().await.expect("store close failed");
+    }
+
+    // ── Test 9: Go parser produces structural signals ────────────────────────
+
+    /// Proves the Go parser (M-18a) correctly extracts entry points, imports,
+    /// and exported types from synthetic Go source via the full
+    /// Walker → parse_file path.
+    ///
+    /// Verifies:
+    /// - Exported functions appear in `entry_points` (uppercase-first)
+    /// - Unexported functions are excluded
+    /// - Grouped imports are extracted with quotes stripped
+    /// - Exported types appear in `exported_types`
+    /// - Unexported types are excluded
+    /// - `language` tag is `Language::Go`
+    #[tokio::test]
+    async fn smoke_go_parser_produces_signals() {
+        const GO_SOURCE: &str = r#"// Package service implements the HTTP request handler.
+package service
+
+import (
+	"context"
+	"fmt"
+	"github.com/example/dep"
+)
+
+// HandleRequest processes an incoming request. Exported.
+func HandleRequest(ctx context.Context, req *Request) (*Response, error) {
+	fmt.Println("handling")
+	return nil, nil
+}
+
+// validate is unexported — must NOT appear in entry_points.
+func validate(r *Request) bool {
+	return r != nil
+}
+
+// Request is the exported input type.
+type Request struct {
+	ID   string
+	Body []byte
+}
+
+// internalState is unexported — must NOT appear in exported_types.
+type internalState struct {
+	count int
+}
+"#;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::write(dir.path().join("service.go"), GO_SOURCE)
+            .expect("failed to write synthetic Go file");
+
+        let walker = Walker::new(dir.path());
+        let files = walker.walk().expect("walker failed on temp Go dir");
+
+        let go_file = files
+            .iter()
+            .find(|f| f.language == Language::Go)
+            .expect("walker must detect service.go as Language::Go");
+
+        let analysis = parse_file(go_file)
+            .expect("parse_file must not error on valid Go source");
+
+        // Language tag
+        assert_eq!(analysis.language, Language::Go, "analysis.language must be Go");
+
+        // Exported function captured
+        assert!(
+            analysis.entry_points.contains(&"HandleRequest".to_string()),
+            "HandleRequest must be in entry_points; got: {:?}",
+            analysis.entry_points
+        );
+
+        // Unexported function excluded
+        assert!(
+            !analysis.entry_points.contains(&"validate".to_string()),
+            "unexported 'validate' must not appear in entry_points"
+        );
+
+        // All grouped imports extracted with quotes stripped
+        for import in &["context", "fmt", "github.com/example/dep"] {
+            assert!(
+                analysis.imports.contains(&import.to_string()),
+                "expected import {import:?} in {:?}",
+                analysis.imports
+            );
+        }
+
+        // Exported type captured
+        assert!(
+            analysis.exported_types.contains(&"Request".to_string()),
+            "Request must be in exported_types; got: {:?}",
+            analysis.exported_types
+        );
+
+        // Unexported type excluded
+        assert!(
+            !analysis.exported_types.contains(&"internalState".to_string()),
+            "unexported 'internalState' must not appear in exported_types"
+        );
+    }
+
+    // ── Test 10: Go FileRecord assembly ──────────────────────────────────────
+
+    /// Proves that Go parser signals flow correctly through `build_file_record`
+    /// and that the resulting `FileRecord` has populated `entry_points` and
+    /// `imports` — the fields used by `KnowledgeGapAnalyzer` and `mem_bootstrap`.
+    #[tokio::test]
+    async fn smoke_go_file_record_assembly() {
+        use mati_core::analysis::build_file_record;
+
+        const GO_SOURCE: &str = r#"package api
+
+import (
+	"net/http"
+	"encoding/json"
+)
+
+// ServeHTTP handles HTTP requests. Exported.
+func ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode("ok")
+}
+
+// Handler is the exported handler type.
+type Handler struct{}
+"#;
+
+        let dir = TempDir::new().expect("failed to create temp dir");
+        std::fs::write(dir.path().join("api.go"), GO_SOURCE)
+            .expect("failed to write synthetic Go file");
+
+        let walker = Walker::new(dir.path());
+        let files = walker.walk().expect("walker failed");
+        let go_file = files
+            .iter()
+            .find(|f| f.language == Language::Go)
+            .expect("api.go must be detected as Language::Go");
+
+        let analysis = parse_file(go_file).expect("parse_file failed");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // No git signals on first run — mirrors init.rs behavior before mine_git_history
+        let file_record = build_file_record(go_file, &analysis, None, None, now);
+
+        // FileRecord fields must carry Go parser output
+        assert!(
+            file_record.entry_points.contains(&"ServeHTTP".to_string()),
+            "FileRecord.entry_points must contain ServeHTTP; got: {:?}",
+            file_record.entry_points
+        );
+        assert!(
+            file_record.imports.contains(&"net/http".to_string()),
+            "FileRecord.imports must contain net/http; got: {:?}",
+            file_record.imports
+        );
+        assert!(
+            file_record.imports.contains(&"encoding/json".to_string()),
+            "FileRecord.imports must contain encoding/json; got: {:?}",
+            file_record.imports
+        );
+
+        // gap_analysis_score input fields are populated — non-zero entry_points
+        // means KnowledgeGapAnalyzer can compute HotFileNoContract gaps
+        assert!(
+            !file_record.entry_points.is_empty(),
+            "entry_points must be non-empty for gap detection to work on Go files"
+        );
+    }
+
+    // ── Test 11: Go parser — real corpus (go-chi/chi v5.2.5) ────────────────
+
+    /// Proves the Go parser holds up against a real-world Go codebase:
+    /// no panics/errors across the full corpus, structural signals populated
+    /// on non-test files, `init()` excluded from entry_points, known exported
+    /// symbols present in the corpus.
+    ///
+    /// Clone strategy: mirrors `src/bin/bench_real/repos.rs::ensure_cloned`.
+    /// Clones go-chi/chi v5.2.5 (depth=1) into /tmp/mati-test-go-chi on the
+    /// first run and reuses the cached clone on subsequent runs.
+    ///
+    /// Run with:
+    ///   cargo test --test smoke_real_repo smoke_go_real_corpus -- --ignored
+    #[tokio::test]
+    #[ignore] // network + disk; opt-in only
+    async fn smoke_go_real_corpus_chi() {
+        use std::process::Command;
+
+        const CHI_URL: &str = "https://github.com/go-chi/chi";
+        const CHI_TAG: &str = "v5.2.5";
+        const CACHE_PATH: &str = "/tmp/mati-test-go-chi";
+
+        let dest = std::path::PathBuf::from(CACHE_PATH);
+
+        // ── Clone if not already cached (mirrors ensure_cloned in bench_real) ─
+        if !dest.join(".git").exists() {
+            eprintln!("[smoke_go_real_corpus] cloning {CHI_URL} @ {CHI_TAG}...");
+            let status = Command::new("git")
+                .args([
+                    "clone",
+                    "--depth", "1",
+                    "--branch", CHI_TAG,
+                    CHI_URL,
+                    CACHE_PATH,
+                ])
+                .status()
+                .expect("git not found on PATH — install git to run this test");
+            assert!(status.success(), "git clone failed for go-chi/chi {CHI_TAG}");
+            eprintln!("[smoke_go_real_corpus] clone complete");
+        } else {
+            eprintln!("[smoke_go_real_corpus] reusing cached clone at {CACHE_PATH}");
+        }
+
+        // ── Walk ──────────────────────────────────────────────────────────────
+        let walker = Walker::new(&dest);
+        let files = walker.walk().expect("walker failed on go-chi/chi");
+
+        let go_files: Vec<_> = files
+            .iter()
+            .filter(|f| f.language == Language::Go)
+            .collect();
+
+        assert!(
+            go_files.len() >= 30,
+            "expected at least 30 .go files in go-chi/chi, found {}",
+            go_files.len()
+        );
+
+        eprintln!("[smoke_go_real_corpus] found {} .go files", go_files.len());
+
+        // ── Parse all — zero errors allowed ───────────────────────────────────
+        let mut parse_errors: Vec<String> = Vec::new();
+        let mut analyses: Vec<(String, mati_core::analysis::parser::StaticFileAnalysis)> = Vec::new();
+
+        for file in &go_files {
+            match parse_file(file) {
+                Ok(a)  => analyses.push((file.rel_path.clone(), a)),
+                Err(e) => parse_errors.push(format!("{}: {e}", file.rel_path)),
+            }
+        }
+
+        assert!(
+            parse_errors.is_empty(),
+            "parse_file returned errors on {} Go file(s):\n{}",
+            parse_errors.len(),
+            parse_errors.join("\n")
+        );
+
+        // ── Non-test files: >80% must have entry_points or imports ────────────
+        let non_test: Vec<_> = analyses
+            .iter()
+            .filter(|(path, _)| !path.ends_with("_test.go"))
+            .collect();
+
+        assert!(
+            !non_test.is_empty(),
+            "expected non-test .go files in the corpus"
+        );
+
+        let with_signals = non_test
+            .iter()
+            .filter(|(_, a)| !a.entry_points.is_empty() || !a.imports.is_empty())
+            .count();
+
+        let ratio = with_signals as f64 / non_test.len() as f64;
+        assert!(
+            ratio >= 0.80,
+            "expected >80% of non-test .go files to have entry_points or imports, \
+             got {with_signals}/{} ({:.0}%)",
+            non_test.len(),
+            ratio * 100.0
+        );
+
+        eprintln!(
+            "[smoke_go_real_corpus] {with_signals}/{} non-test files have signals ({:.0}%)",
+            non_test.len(),
+            ratio * 100.0
+        );
+
+        // ── init() must never appear in entry_points ───────────────────────────
+        for (path, analysis) in &analyses {
+            assert!(
+                !analysis.entry_points.contains(&"init".to_string()),
+                "init() must not appear in entry_points (it is unexported) — found in {path}"
+            );
+        }
+
+        // ── Known exported symbols must appear across the corpus ───────────────
+        let all_entry_points: Vec<&str> = analyses
+            .iter()
+            .flat_map(|(_, a)| a.entry_points.iter().map(String::as_str))
+            .collect();
+
+        for symbol in &["NewRouter", "URLParam", "RouteContext"] {
+            assert!(
+                all_entry_points.contains(symbol),
+                "expected symbol {symbol:?} in corpus entry_points — \
+                 chi API may have changed or parser is silently dropping symbols"
+            );
+        }
+
+        // ── net/http must appear in at least one file's imports ────────────────
+        let any_net_http = analyses
+            .iter()
+            .any(|(_, a)| a.imports.contains(&"net/http".to_string()));
+
+        assert!(
+            any_net_http,
+            "expected at least one .go file to import net/http — chi is an HTTP router"
+        );
+
+        eprintln!("[smoke_go_real_corpus] all assertions passed");
     }
 
     // ── Test 8: git2 integration ────────────────────────────────────────────

@@ -95,7 +95,7 @@ const SETTINGS_JSON: &str = r#"{
 ///
 /// Each script is a Rust string constant defined in `crate::hooks::*`.
 /// Replaces the pass-through stubs from M-06-J with real hook logic (M-09).
-const HOOK_SCRIPTS: &[(&str, &str)] = &[
+pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("pre-read.sh",             crate::hooks::pre_read::SCRIPT),
     ("pre-bash.sh",             crate::hooks::pre_bash::SCRIPT),
     ("post-read-compliance.sh", crate::hooks::post_compliance::SCRIPT),

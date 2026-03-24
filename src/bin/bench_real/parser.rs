@@ -1,8 +1,8 @@
-/// Output parsers for every mati command.
-///
-/// All parsers accept raw stdout (may contain ANSI codes) and strip them
-/// before extracting values. Parsing is best-effort — missing fields are
-/// left at their zero/default values and surfaced in the accuracy report.
+//! Output parsers for every mati command.
+//!
+//! All parsers accept raw stdout (may contain ANSI codes) and strip them
+//! before extracting values. Parsing is best-effort — missing fields are
+//! left at their zero/default values and surfaced in the accuracy report.
 
 // ── ANSI stripper ─────────────────────────────────────────────────────────────
 
@@ -204,7 +204,7 @@ pub fn parse_status(stdout: &str) -> StatusMetrics {
         // "  Confidence   avg 0.72  median 0.68"
         if t.contains("Confidence") || t.contains("confidence") {
             let floats: Vec<f64> = floats_in(t);
-            if floats.len() >= 1 {
+            if !floats.is_empty() {
                 m.confidence_avg = floats[0];
             }
             if floats.len() >= 2 {
@@ -215,7 +215,7 @@ pub fn parse_status(stdout: &str) -> StatusMetrics {
         // "  Hotspots     4 / 387 (1%)"
         if t.contains("Hotspot") || t.contains("hotspot") {
             let nums: Vec<usize> = numbers_in(t);
-            if nums.len() >= 1 {
+            if !nums.is_empty() {
                 m.hotspot_count = nums[0];
             }
             if nums.len() >= 2 {
@@ -459,8 +459,8 @@ pub fn extract_file_keys(stdout: &str) -> Vec<String> {
             let t = line.trim();
             if t.contains("Path") && t.contains("Purpose") { continue; }
             let cell = line
-                .splitn(3, '┆')
-                .nth(0)
+                .split('┆')
+                .next()
                 .unwrap_or("")
                 .trim_matches(|c: char| c == '│' || c == ' ' || c == '┆');
             let path = cell.trim();

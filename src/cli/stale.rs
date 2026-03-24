@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn stale_command_filters_only_stale_tiers() {
         // Simulate the filter logic from run(): only Stale|Liability|Tombstone pass.
-        let records = vec![
+        let records = [
             make_record("file:fresh.rs", Category::File, StalenessTier::Fresh),
             make_record("file:aging.rs", Category::File, StalenessTier::Aging),
             make_record("file:stale.rs", Category::File, StalenessTier::Stale),
@@ -513,7 +513,7 @@ mod tests {
         let mut r3 = make_record("file:c.rs", Category::File, StalenessTier::Tombstone);
         r3.staleness.value = 0.95;
 
-        let mut stale = vec![r1, r2, r3];
+        let mut stale = [r1, r2, r3];
         stale.sort_by(|a, b| {
             b.staleness
                 .value

@@ -114,6 +114,7 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         }
         Err(e) => {
             tracing::warn!("gaps: graph load failed, HighFanInNoContract skipped: {e}");
+            eprintln!("  note: HighFanInNoContract analysis skipped — {e:#}");
             HashMap::new()
         }
     };
@@ -195,7 +196,7 @@ fn display_gaps(gaps: &[KnowledgeGap], cache_age: Option<u64>, use_color: bool) 
         };
 
         // Strip namespace prefix from the key for display (e.g. "file:src/main.rs" -> "src/main.rs")
-        let display_key = gap.key.splitn(2, ':').nth(1).unwrap_or(&gap.key);
+        let display_key = gap.key.split_once(':').map_or(gap.key.as_str(), |(_, rest)| rest);
 
         println!(
             "{tier_color}{bold}\u{25cf} {tier_label:<9}{reset} {bold}{display_key}{reset}"

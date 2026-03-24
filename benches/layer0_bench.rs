@@ -334,7 +334,7 @@ impl Layer0Fixture {
         commit_snapshot(&repo, "initial snapshot");
 
         if !source_paths.is_empty() {
-            let hot_span = source_paths.len().min(128).max(1);
+            let hot_span = source_paths.len().clamp(1, 128);
             for commit_idx in 0..commit_count {
                 for offset in 0..8 {
                     let idx = (commit_idx * 8 + offset) % hot_span;
@@ -371,8 +371,7 @@ impl Layer0Fixture {
 }
 
 fn commit_count_for(file_count: usize) -> usize {
-    let scaled = (file_count / 100).clamp(24, 200);
-    scaled
+    (file_count / 100).clamp(24, 200)
 }
 
 fn layer0_sizes() -> Vec<(&'static str, usize)> {
@@ -740,7 +739,7 @@ fn bench_record_to_doc(record: &Record, f: &BenchFields) -> TantivyDocument {
         Category::Session    => "session",
         Category::Analytics  => "analytics",
     });
-    doc.add_text(f.tags,       &record.tags.join(" "));
+    doc.add_text(f.tags,       record.tags.join(" "));
     doc.add_u64(f.priority,    match &record.priority {
         Priority::Low      => 0,
         Priority::Normal   => 1,

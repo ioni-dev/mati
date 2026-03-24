@@ -384,8 +384,7 @@ fn extract_rust_module_doc(content: &str) -> String {
 fn extract_python_docstring(content: &str) -> String {
     let trimmed = content.trim_start();
     for delim in &[r#"""""#, "'''"] {
-        if trimmed.starts_with(delim) {
-            let rest = &trimmed[delim.len()..];
+        if let Some(rest) = trimmed.strip_prefix(delim) {
             if let Some(end) = rest.find(delim) {
                 return rest[..end]
                     .trim()
@@ -419,8 +418,7 @@ fn extract_go_package_doc_comment(content: &str) -> String {
 /// Extract a JSDoc `/** ... */` block at the top of a JS/TS file.
 fn extract_jsdoc(content: &str) -> String {
     let trimmed = content.trim_start();
-    if trimmed.starts_with("/**") {
-        let rest = &trimmed[3..];
+    if let Some(rest) = trimmed.strip_prefix("/**") {
         if let Some(end) = rest.find("*/") {
             let text: Vec<&str> = rest[..end]
                 .lines()
@@ -678,7 +676,7 @@ async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
 /// Format a date key for stale review analytics records.
 fn format_review_date(now_secs: u64) -> String {
     let dt = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-        .unwrap_or_else(|| chrono::Utc::now());
+        .unwrap_or_else(chrono::Utc::now);
     dt.format("%Y-%m-%d").to_string()
 }
 
