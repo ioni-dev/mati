@@ -35,6 +35,8 @@ impl Durability {
             || key.starts_with("hook_event:")
             || key.starts_with("compliance:")
             || key.starts_with("graph:edge:")
+            || key.starts_with("health:") // derived/computed data, fully recomputable
+            || key.starts_with("parse:") // file content hashes — recomputable on re-init
         {
             Self::Eventual
         } else {

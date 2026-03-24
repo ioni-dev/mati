@@ -17,6 +17,7 @@ use mati_core::store::{
     Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
     RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, Store,
 };
+use crate::cli::daemon::{daemon_result, mati_root_for, try_auto_start, DaemonResult};
 
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
 
@@ -30,6 +31,28 @@ struct GetOutput {
 
 pub async fn run_get(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "get", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(resp) => {
+            let json = match resp.get("data") {
+                Some(d) if d.is_null() => "null".to_string(),
+                Some(d) => d.to_string(),
+                None => "null".to_string(),
+            };
+            println!("{json}");
+            return Ok(());
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            tracing::warn!("mati get: daemon unresponsive — degrading gracefully");
+            println!("null");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     let output = get_json(&store, key).await?;
     println!("{output}");
@@ -55,7 +78,7 @@ fn extract_confirmed(record: &Record) -> bool {
     if record.category != Category::Gotcha {
         return false;
     }
-    serde_json::from_str::<GotchaRecord>(&record.value)
+    record.payload_as::<GotchaRecord>()
         .map(|g| g.confirmed)
         .unwrap_or(false)
 }
@@ -102,6 +125,7 @@ fn session_record(key: &str, value: String) -> Record {
         source: RecordSource::SessionHook,
         confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
         gap_analysis_score: 0.0,
+        payload: None,
     }
 }
 
@@ -133,6 +157,29 @@ const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 
 pub async fn run_log_miss(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_miss", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati log-miss: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati log-miss: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     log_miss_impl(&store, key).await?;
     store.close().await?;
@@ -148,6 +195,29 @@ async fn log_miss_impl(store: &Store, key: &str) -> Result<()> {
 
 pub async fn run_log_hit(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_hit", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati log-hit: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati log-hit: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     log_hit_impl(&store, key).await?;
     store.close().await?;
@@ -177,10 +247,219 @@ async fn log_hit_impl(store: &Store, key: &str) -> Result<()> {
     Ok(())
 }
 
+// ── edit-hook (combined log-hit + reparse) ───────────────────────────────────
+
+/// Combined log-hit + reparse in a single store open/close cycle.
+/// Called by post-edit.sh hook to avoid two separate process spawns.
+pub async fn run_edit_hook(path: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "edit_hook", serde_json::json!({ "path": path })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati edit-hook: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati edit-hook: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
+        }
+    }
+
+    // Daemon not running — direct store path.
+    let store = Store::open(&cwd).await?;
+    let file_key = format!("file:{path}");
+    if let Err(e) = log_hit_impl(&store, &file_key).await {
+        tracing::warn!(path, "edit-hook log-hit failed: {e}");
+    }
+    if let Err(e) = crate::cli::reparse::reparse_impl(&store, &cwd, path).await {
+        tracing::warn!(path, "edit-hook reparse failed: {e}");
+    }
+    store.close().await?;
+    Ok(())
+}
+
+// ── doc-capture (2.3) ────────────────────────────────────────────────────────
+
+/// Read first lines of new file content from stdin, detect a canonical doc
+/// comment, and update the `file:*` record's purpose + confidence.
+///
+/// Called by `post_edit.sh` in the background — must be fast and non-blocking.
+/// Gracefully no-ops when no record exists yet or content has no doc comment.
+pub async fn run_doc_capture(path: &str) -> Result<()> {
+    use std::io::Read as _;
+    let mut content = String::new();
+    std::io::stdin().read_to_string(&mut content)?;
+
+    let purpose = extract_doc_comment(path, &content);
+    if purpose.is_empty() {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let store = Store::open(&cwd).await?;
+    let file_key = format!("file:{path}");
+
+    let mut record = match store.get(&file_key).await? {
+        Some(r) => r,
+        None => {
+            store.close().await?;
+            return Ok(());
+        }
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Only update purpose when the record's current source is static analysis
+    // (Layer 0 stub) — don't overwrite developer-manual or higher-quality records.
+    if record.source != RecordSource::StaticAnalysis {
+        store.close().await?;
+        return Ok(());
+    }
+
+    if let Some(mut fr) = record.payload_as::<mati_core::store::FileRecord>() {
+        fr.purpose = purpose.clone();
+        record.payload = serde_json::to_value(&fr).ok();
+    } else {
+        store.close().await?;
+        return Ok(());
+    }
+
+    record.value = purpose;
+    record.source = RecordSource::SessionHook;
+    record.confidence.value = 0.65;
+    record.quality = QualityScore::doc_comment_default();
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    if let Err(e) = store.put(&file_key, &record).await {
+        tracing::warn!(path, "doc-capture put failed: {e}");
+    }
+    store.close().await?;
+    Ok(())
+}
+
+/// Detect a canonical module-level doc comment from the first few lines of content.
+/// Returns the cleaned comment text, or an empty string if none found.
+fn extract_doc_comment(path: &str, content: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    match ext {
+        "rs" => extract_rust_module_doc(content),
+        "py" => extract_python_docstring(content),
+        "go" => extract_go_package_doc_comment(content),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => extract_jsdoc(content),
+        _ => String::new(),
+    }
+}
+
+/// Collect consecutive `//!` lines at the top of a Rust file.
+fn extract_rust_module_doc(content: &str) -> String {
+    let lines: Vec<&str> = content
+        .lines()
+        .take_while(|l| l.trim_start().starts_with("//!"))
+        .map(|l| l.trim_start().trim_start_matches("//!").trim())
+        .collect();
+    lines.join(" ").trim().to_string()
+}
+
+/// Extract the first line of a Python module docstring (`"""` or `'''`).
+fn extract_python_docstring(content: &str) -> String {
+    let trimmed = content.trim_start();
+    for delim in &[r#"""""#, "'''"] {
+        if trimmed.starts_with(delim) {
+            let rest = &trimmed[delim.len()..];
+            if let Some(end) = rest.find(delim) {
+                return rest[..end]
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// Collect the `//` comment block that appears immediately before `package X`.
+fn extract_go_package_doc_comment(content: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            lines.push(t.trim_start_matches("//").trim().to_string());
+        } else if t.starts_with("package ") {
+            break;
+        } else if !t.is_empty() {
+            lines.clear(); // non-comment, non-empty line resets the block
+        }
+    }
+    lines.join(" ").trim().to_string()
+}
+
+/// Extract a JSDoc `/** ... */` block at the top of a JS/TS file.
+fn extract_jsdoc(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("/**") {
+        let rest = &trimmed[3..];
+        if let Some(end) = rest.find("*/") {
+            let text: Vec<&str> = rest[..end]
+                .lines()
+                .map(|l| l.trim().trim_start_matches('*').trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            return text.join(" ").trim().to_string();
+        }
+    }
+    String::new()
+}
+
 // ── log-compliance-miss ──────────────────────────────────────────────────────
 
 pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_compliance_miss", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati log-compliance-miss: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati log-compliance-miss: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     log_compliance_miss_impl(&store, key).await?;
     store.close().await?;
@@ -196,6 +475,27 @@ async fn log_compliance_miss_impl(store: &Store, key: &str) -> Result<()> {
 
 pub async fn run_session_check_consulted(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "session_check_consulted", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(resp) => {
+            let consulted = resp
+                .get("data")
+                .and_then(|d| d.as_bool())
+                .unwrap_or(false);
+            println!("{consulted}");
+            return Ok(());
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            tracing::warn!("session_check_consulted: daemon unresponsive — returning false");
+            println!("false");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     let result = check_consulted_impl(&store, key).await?;
     println!("{result}");
@@ -229,14 +529,14 @@ async fn session_flush_impl(store: &Store) -> Result<()> {
         .collect();
 
     // Write session:current
-    let value = serde_json::to_string(&serde_json::json!({
+    let session_data = serde_json::json!({
         "consulted_keys": stripped,
         "flushed_at": now,
-    }))?;
+    });
+    let mut rec = session_record("session:current", String::new());
+    rec.payload = Some(session_data);
 
-    store
-        .put("session:current", &session_record("session:current", value))
-        .await?;
+    store.put("session:current", &rec).await?;
     Ok(())
 }
 
@@ -276,9 +576,15 @@ async fn session_harvest_impl(store: &Store, cwd: &std::path::Path) -> Result<()
     }
 
     // Read session:current (written by session-flush)
-    let session_value = match store.get("session:current").await? {
-        Some(r) => r.value,
+    let session_rec = match store.get("session:current").await? {
+        Some(r) => r,
         None => return Ok(()),
+    };
+
+    // Reconstruct the session value string for callers that still use &str
+    let session_value = match session_rec.payload.as_ref() {
+        Some(p) => serde_json::to_string(p).unwrap_or_default(),
+        None => session_rec.value.clone(),
     };
 
     // M-13-C: collect and store stale reviews for consulted keys
@@ -288,11 +594,11 @@ async fn session_harvest_impl(store: &Store, cwd: &std::path::Path) -> Result<()
         Err(e) => tracing::warn!(error = %e, "stale review collection failed"),
     }
 
-    // Write permanent session record
+    // Write permanent session record — propagate payload so consumers can read structured data
     let session_key = format!("session:{now}");
-    store
-        .put(&session_key, &session_record(&session_key, session_value))
-        .await?;
+    let mut perm = session_record(&session_key, session_value);
+    perm.payload = session_rec.payload;
+    store.put(&session_key, &perm).await?;
 
     // Clean up session:consulted:* markers
     let consulted_keys = store.scan_keys("session:consulted:").await?;
@@ -342,9 +648,9 @@ async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
             continue;
         }
 
-        let mut gotcha: GotchaRecord = match serde_json::from_str(&record.value) {
-            Ok(g) => g,
-            Err(_) => continue,
+        let mut gotcha: GotchaRecord = match record.payload_as::<GotchaRecord>() {
+            Some(g) => g,
+            None => continue,
         };
 
         if gotcha.confirmed {
@@ -352,7 +658,7 @@ async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
         }
 
         gotcha.confirmed = true;
-        record.value = serde_json::to_string(&gotcha)?;
+        record.payload = serde_json::to_value(&gotcha).ok();
         // NOTE: confirmation_count includes auto-promotions. Downstream consumers
         // should not assume this counter reflects only human confirmations.
         record.confidence.confirmation_count += 1;
@@ -413,7 +719,7 @@ async fn collect_and_store_stale_reviews(
     // Merge with existing daily review if present
     let mut payload = match store.get(&review_key).await? {
         Some(existing) => {
-            serde_json::from_str::<StaleReviewPayload>(&existing.value)
+            existing.payload_as::<StaleReviewPayload>()
                 .unwrap_or(StaleReviewPayload {
                     session_timestamp: now,
                     entries: vec![],
@@ -456,7 +762,8 @@ async fn collect_and_store_stale_reviews(
     payload.session_timestamp = now;
     payload.entries = merged;
 
-    let record = analytics_record(&review_key, serde_json::to_string(&payload)?);
+    let mut record = analytics_record(&review_key, String::new());
+    record.payload = serde_json::to_value(&payload).ok();
     store.put(&review_key, &record).await?;
 
     Ok(new_count)
@@ -531,7 +838,7 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
 
     match store.get(agg_key).await? {
         Some(mut record) => {
-            let mut agg: DailyAgg = serde_json::from_str(&record.value).unwrap_or(DailyAgg {
+            let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
                 count: 0,
                 keys: vec![],
             });
@@ -539,7 +846,7 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
             }
-            record.value = serde_json::to_string(&agg)?;
+            record.payload = serde_json::to_value(&agg).ok();
             record.updated_at = now;
             record.version.logical_clock += 1;
             record.version.wall_clock = now;
@@ -550,7 +857,8 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
                 count: 1,
                 keys: vec![target_key.to_string()],
             };
-            let record = analytics_record(agg_key, serde_json::to_string(&agg)?);
+            let mut record = analytics_record(agg_key, String::new());
+            record.payload = serde_json::to_value(&agg).ok();
             store.put(agg_key, &record).await?;
         }
     }
@@ -594,6 +902,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -609,7 +918,8 @@ mod tests {
         };
         Record {
             key: key.to_string(),
-            value: serde_json::to_string(&gotcha).unwrap(),
+            value: gotcha.rule.clone(),
+            payload: serde_json::to_value(&gotcha).ok(),
             category: Category::Gotcha,
             priority: Priority::Critical,
             tags: vec![],
@@ -655,6 +965,7 @@ mod tests {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -681,7 +992,7 @@ mod tests {
     #[test]
     fn extract_confirmed_false_for_corrupt_gotcha_value() {
         let mut record = make_gotcha_record("gotcha:test", true);
-        record.value = "not valid json at all".into();
+        record.payload = None; // corrupt the payload — extract_confirmed reads payload, not value
         assert!(!extract_confirmed(&record));
     }
 
@@ -767,7 +1078,7 @@ mod tests {
             .unwrap();
 
         let record = store.get("analytics:miss_2026-03-18").await.unwrap().unwrap();
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 1);
         assert_eq!(agg.keys, vec!["file:src/main.rs"]);
 
@@ -785,7 +1096,7 @@ mod tests {
         upsert_daily_agg(&store, agg_key, "file:c.rs").await.unwrap();
 
         let record = store.get(agg_key).await.unwrap().unwrap();
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 3);
         assert_eq!(agg.keys.len(), 3);
 
@@ -803,7 +1114,7 @@ mod tests {
         upsert_daily_agg(&store, agg_key, "file:same.rs").await.unwrap();
 
         let record = store.get(agg_key).await.unwrap().unwrap();
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 3, "count should still increment");
         assert_eq!(agg.keys.len(), 1, "keys should deduplicate");
         assert_eq!(agg.keys[0], "file:same.rs");
@@ -824,7 +1135,7 @@ mod tests {
         }
 
         let record = store.get(agg_key).await.unwrap().unwrap();
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 120, "count tracks every call");
         assert_eq!(agg.keys.len(), 100, "keys capped at MAX_AGG_KEYS");
 
@@ -915,7 +1226,7 @@ mod tests {
 
         let agg_key = today_key("analytics:hit_");
         let record = store.get(&agg_key).await.unwrap().unwrap();
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 1);
         assert_eq!(agg.keys, vec!["file:src/main.rs"]);
 
@@ -975,7 +1286,7 @@ mod tests {
         session_flush_impl(&store).await.unwrap();
 
         let current = store.get("session:current").await.unwrap().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&current.value).unwrap();
+        let parsed = current.payload.as_ref().unwrap();
 
         let keys = parsed["consulted_keys"].as_array().unwrap();
         assert_eq!(keys.len(), 2);
@@ -996,7 +1307,7 @@ mod tests {
         session_flush_impl(&store).await.unwrap();
 
         let current = store.get("session:current").await.unwrap().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&current.value).unwrap();
+        let parsed = current.payload.as_ref().unwrap();
         assert_eq!(parsed["consulted_keys"].as_array().unwrap().len(), 0);
 
         store.close().await.unwrap();
@@ -1051,8 +1362,7 @@ mod tests {
         assert_eq!(permanent.len(), 1, "should have exactly one permanent session record");
 
         // Permanent record should contain the flushed data
-        let parsed: serde_json::Value =
-            serde_json::from_str(&permanent[0].value).unwrap();
+        let parsed = permanent[0].payload.as_ref().unwrap();
         let keys = parsed["consulted_keys"].as_array().unwrap();
         assert_eq!(keys.len(), 2);
 
@@ -1131,7 +1441,7 @@ mod tests {
         let agg_key = today_key("analytics:miss_");
         let record = store.get(&agg_key).await.unwrap().unwrap();
         assert_eq!(record.category, Category::Analytics);
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 1);
         assert_eq!(agg.keys, vec!["file:src/missing.rs"]);
 
@@ -1149,7 +1459,7 @@ mod tests {
 
         let agg_key = today_key("compliance:miss_");
         let record = store.get(&agg_key).await.unwrap().unwrap();
-        let agg: DailyAgg = serde_json::from_str(&record.value).unwrap();
+        let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 1);
         assert_eq!(agg.keys, vec!["file:src/unchecked.rs"]);
 
@@ -1199,7 +1509,7 @@ mod tests {
         // 4. Flush
         session_flush_impl(&store).await.unwrap();
         let current = store.get("session:current").await.unwrap().unwrap();
-        let flush_data: serde_json::Value = serde_json::from_str(&current.value).unwrap();
+        let flush_data = current.payload.as_ref().unwrap();
         assert_eq!(flush_data["consulted_keys"].as_array().unwrap().len(), 2);
 
         // 5. Harvest
@@ -1217,12 +1527,12 @@ mod tests {
         // Analytics survived
         let miss_key = today_key("analytics:miss_");
         let miss = store.get(&miss_key).await.unwrap().unwrap();
-        let miss_agg: DailyAgg = serde_json::from_str(&miss.value).unwrap();
+        let miss_agg: DailyAgg = miss.payload_as::<DailyAgg>().unwrap();
         assert_eq!(miss_agg.count, 1);
 
         let compliance_key = today_key("compliance:miss_");
         let comp = store.get(&compliance_key).await.unwrap().unwrap();
-        let comp_agg: DailyAgg = serde_json::from_str(&comp.value).unwrap();
+        let comp_agg: DailyAgg = comp.payload_as::<DailyAgg>().unwrap();
         assert_eq!(comp_agg.count, 1);
 
         store.close().await.unwrap();
@@ -1244,7 +1554,7 @@ mod tests {
         assert_eq!(promoted, 1);
 
         let updated = store.get("gotcha:candidate").await.unwrap().unwrap();
-        let gotcha: GotchaRecord = serde_json::from_str(&updated.value).unwrap();
+        let gotcha: GotchaRecord = updated.payload_as::<GotchaRecord>().unwrap();
         assert!(gotcha.confirmed);
         assert_eq!(updated.confidence.confirmation_count, 1);
 
@@ -1280,7 +1590,7 @@ mod tests {
 
         // Should still be unconfirmed
         let unchanged = store.get("gotcha:low-access").await.unwrap().unwrap();
-        let gotcha: GotchaRecord = serde_json::from_str(&unchanged.value).unwrap();
+        let gotcha: GotchaRecord = unchanged.payload_as::<GotchaRecord>().unwrap();
         assert!(!gotcha.confirmed);
 
         store.close().await.unwrap();
@@ -1429,7 +1739,7 @@ mod tests {
         let date = format_review_date(now);
         let review_key = format!("analytics:stale_review_{date}");
         let record = store.get(&review_key).await.unwrap().unwrap();
-        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+        let payload: StaleReviewPayload = record.payload_as::<StaleReviewPayload>().unwrap();
 
         assert_eq!(payload.entries.len(), 2, "should merge entries from both sessions");
 
@@ -1463,7 +1773,7 @@ mod tests {
         let date = format_review_date(now);
         let review_key = format!("analytics:stale_review_{date}");
         let record = store.get(&review_key).await.unwrap().unwrap();
-        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+        let payload: StaleReviewPayload = record.payload_as::<StaleReviewPayload>().unwrap();
 
         assert_eq!(payload.entries.len(), 1, "duplicate keys should be deduped");
 
@@ -1500,7 +1810,7 @@ mod tests {
         let date = format_review_date(now);
         let review_key = format!("analytics:stale_review_{date}");
         let record = store.get(&review_key).await.unwrap().unwrap();
-        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+        let payload: StaleReviewPayload = record.payload_as::<StaleReviewPayload>().unwrap();
 
         assert!(
             payload.entries.len() <= MAX_STALE_REVIEW_ENTRIES,
@@ -1542,7 +1852,7 @@ mod tests {
 
         assert!(review.is_some(), "stale review should be created");
         if let Some(record) = review {
-            let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+            let payload: StaleReviewPayload = record.payload_as::<StaleReviewPayload>().unwrap();
             assert!(
                 payload.entries.iter().any(|e| e.key == "file:src/stale.rs"),
                 "stale file should appear in review"
@@ -1630,7 +1940,7 @@ mod tests {
         let date = format_review_date(now);
         let review_key = format!("analytics:stale_review_{date}");
         let record = store.get(&review_key).await.unwrap().unwrap();
-        let payload: StaleReviewPayload = serde_json::from_str(&record.value).unwrap();
+        let payload: StaleReviewPayload = record.payload_as::<StaleReviewPayload>().unwrap();
 
         assert_eq!(payload.entries.len(), 1);
         assert_eq!(payload.entries[0].key, "file:src/consulted.rs");
@@ -1638,3 +1948,4 @@ mod tests {
         store.close().await.unwrap();
     }
 }
+

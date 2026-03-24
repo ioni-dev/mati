@@ -77,6 +77,10 @@ pub struct WalkedFile {
     pub rel_path: String,
     pub language: Language,
     pub size_bytes: u64,
+    /// File modification time as seconds since Unix epoch (0 if unavailable).
+    /// Used as a cheap pre-filter in incremental init: if mtime matches the
+    /// stored value, skip disk read + parse entirely.
+    pub mtime_secs: u64,
 }
 
 // ── Walker ────────────────────────────────────────────────────────────────────
@@ -292,6 +296,14 @@ impl ParallelVisitor for FileVisitor {
 
         let path = entry.path();
 
+        // Skip .git/ internals. .hidden(false) is needed to include .github/,
+        // .claude/, etc., but the .git directory itself contains no project
+        // knowledge — only git object/ref data. Check via path components so
+        // we don't accidentally skip a legitimate ".git"-named user directory.
+        if path.components().any(|c| c.as_os_str() == ".git") {
+            return WalkState::Continue;
+        }
+
         // Extension-based binary filter: checked before metadata() to avoid
         // unnecessary syscalls on clearly unanalysable files.
         if is_binary_extension(path) {
@@ -300,8 +312,8 @@ impl ParallelVisitor for FileVisitor {
 
         // DirEntry::metadata() reuses cached data where available (inode
         // info from readdir on Linux). Unavoidable for size filtering.
-        let size_bytes = match entry.metadata() {
-            Ok(m) => m.len(),
+        let meta = match entry.metadata() {
+            Ok(m) => m,
             Err(e) => {
                 tracing::warn!(
                     "walker: cannot read metadata for {}: {e}",
@@ -310,6 +322,13 @@ impl ParallelVisitor for FileVisitor {
                 return WalkState::Continue;
             }
         };
+        let size_bytes = meta.len();
+        let mtime_secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         if size_bytes > self.max_file_size {
             tracing::debug!(
@@ -324,6 +343,7 @@ impl ParallelVisitor for FileVisitor {
             rel_path: make_rel_path(&self.root, path),
             language: detect_language(path),
             size_bytes,
+            mtime_secs,
         });
 
         if self.local.len() >= FLUSH_THRESHOLD {

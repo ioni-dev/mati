@@ -11,12 +11,16 @@
 //! - Disk read skipped for unsupported languages.
 //! - Count-only captures: no text allocated for counting signals.
 
+mod go;
 mod python;
 mod rust;
 mod typescript;
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 
 use crate::analysis::walker::{Language, WalkedFile};
 use crate::store::record::{TodoComment, TodoKind};
@@ -50,6 +54,12 @@ pub struct StaticFileAnalysis {
     pub panic_count: u32,
     /// Control-flow branches: if, match/switch, loop, while, for, ternary, try.
     pub branch_count: u32,
+    /// Canonical module-level doc comment (language-specific — see ENRICHMENT.md §1.1).
+    pub module_doc: Option<String>,
+    /// SHA-256 hex digest of file bytes at parse time. Used for content-change detection (P3).
+    pub content_hash: Option<String>,
+    /// Number of newlines in the file — used for line-count delta in staleness signals.
+    pub line_count: u32,
 }
 
 impl StaticFileAnalysis {
@@ -65,6 +75,9 @@ impl StaticFileAnalysis {
             unwrap_count: 0,
             panic_count: 0,
             branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
         }
     }
 }
@@ -80,23 +93,14 @@ impl StaticFileAnalysis {
 pub fn parse_file(file: &WalkedFile) -> Result<StaticFileAnalysis> {
     // Guard: skip disk read for unsupported languages.
     match file.language {
-        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python => {}
+        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python | Language::Go => {}
         _ => return Ok(StaticFileAnalysis::empty(file)),
     }
-
     let source = match read_source(file) {
         Some(s) => s,
         None => return Ok(StaticFileAnalysis::empty(file)),
     };
-
-    match file.language {
-        Language::Rust => rust::parse_rust(file, &source),
-        Language::TypeScript | Language::JavaScript => {
-            typescript::parse_typescript(file, &source)
-        }
-        Language::Python => python::parse_python(file, &source),
-        _ => unreachable!(),
-    }
+    parse_file_from_source(file, &source)
 }
 
 /// Parse a slice of files in parallel using rayon.
@@ -115,7 +119,105 @@ pub fn parse_files_parallel(files: &[WalkedFile]) -> Vec<StaticFileAnalysis> {
         .collect()
 }
 
+/// Output of the combined mtime-check + parse pass.
+pub struct HashParseOutput {
+    /// Files whose mtime changed (new or modified), in rayon-completion order.
+    pub parsed_files: Vec<WalkedFile>,
+    /// Analyses for each file in `parsed_files` (same order).
+    pub analyses: Vec<StaticFileAnalysis>,
+    /// Updated mtimes for changed/new files only (rel_path → mtime_secs).
+    /// Merge these into the stored mtime index and write one blob record.
+    pub new_mtimes: HashMap<String, u64>,
+    /// Count of files that were (re)parsed.
+    pub parse_count: usize,
+    /// Count of files whose mtime matched the stored value — skipped (no read).
+    pub skipped_count: usize,
+}
+
+/// Combined mtime-check + parse pass.
+///
+/// For each file:
+/// - If `mtime_secs` matches the stored value → skip entirely (zero disk I/O).
+/// - Otherwise → read file bytes, run tree-sitter, record updated mtime.
+///
+/// This eliminates the full I/O sweep on re-init when files are unchanged:
+/// a re-init with no edits costs only the walk + mtime comparison (≈130ms),
+/// not a full disk read of all source files (≈2100ms on 58k-file repos).
+pub fn hash_and_parse_parallel(
+    files: &[WalkedFile],
+    stored_mtimes: &HashMap<String, u64>,
+) -> HashParseOutput {
+    enum Slot {
+        Changed(WalkedFile, StaticFileAnalysis),
+        Unchanged,
+    }
+
+    let parseable = |lang: Language| matches!(
+        lang,
+        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python | Language::Go
+    );
+
+    let slots: Vec<Option<Slot>> = files
+        .par_iter()
+        .map(|f| {
+            // Fast path: mtime unchanged → file is the same, skip entirely.
+            if f.mtime_secs != 0 && stored_mtimes.get(&f.rel_path) == Some(&f.mtime_secs) {
+                return Some(Slot::Unchanged);
+            }
+            // Non-parseable languages: record mtime from walker metadata — no disk read.
+            if !parseable(f.language) {
+                return Some(Slot::Changed(f.clone(), StaticFileAnalysis::empty(f)));
+            }
+            // Parseable, changed/new: read file bytes and run tree-sitter.
+            let bytes = match std::fs::read(&f.abs_path) {
+                Ok(b) => b,
+                Err(_) => return None, // unreadable — skip silently
+            };
+            let content_hash = format!("{:x}", Sha256::digest(&bytes));
+            let line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
+            let source = String::from_utf8_lossy(&bytes);
+            let mut analysis = parse_file_from_source(f, &source).unwrap_or_else(|e| {
+                tracing::warn!("parser: error on {}: {e}", f.rel_path);
+                StaticFileAnalysis::empty(f)
+            });
+            analysis.content_hash = Some(content_hash);
+            analysis.line_count = line_count;
+            Some(Slot::Changed(f.clone(), analysis))
+        })
+        .collect();
+
+    let mut parsed_files = Vec::new();
+    let mut analyses = Vec::new();
+    let mut new_mtimes = HashMap::new();
+    let mut skipped_count = 0usize;
+
+    for slot in slots.into_iter().flatten() {
+        match slot {
+            Slot::Changed(file, analysis) => {
+                new_mtimes.insert(file.rel_path.clone(), file.mtime_secs);
+                parsed_files.push(file);
+                analyses.push(analysis);
+            }
+            Slot::Unchanged => skipped_count += 1,
+        }
+    }
+
+    let parse_count = parsed_files.len();
+    HashParseOutput { parsed_files, analyses, new_mtimes, parse_count, skipped_count }
+}
+
 // ── Shared utilities ──────────────────────────────────────────────────────────
+
+/// Dispatch parse to the language-specific parser using pre-read source text.
+fn parse_file_from_source(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
+    match file.language {
+        Language::Rust => rust::parse_rust(file, source),
+        Language::TypeScript | Language::JavaScript => typescript::parse_typescript(file, source),
+        Language::Python => python::parse_python(file, source),
+        Language::Go => go::parse_go(file, source),
+        _ => Ok(StaticFileAnalysis::empty(file)),
+    }
+}
 
 fn read_source(file: &WalkedFile) -> Option<String> {
     match std::fs::read_to_string(&file.abs_path) {
@@ -168,6 +270,31 @@ pub(crate) fn extract_todo(comment: &str, line: u32) -> Option<TodoComment> {
         line,
         kind,
     })
+}
+
+/// Normalize a doc comment string: collapse internal whitespace runs to a
+/// single space and trim leading/trailing whitespace.
+///
+/// Used by language parsers to clean up multi-line doc comments before storing
+/// them as `module_doc`.
+pub(crate) fn normalize_doc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = true; // trim leading
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -240,10 +367,11 @@ mod tests {
     #[test]
     fn unsupported_language_skipped_without_disk_read() {
         let f = WalkedFile {
-            abs_path: PathBuf::from("/nonexistent/file.go"),
-            rel_path: "main.go".to_owned(),
-            language: Language::Go,
+            abs_path: PathBuf::from("/nonexistent/file.java"),
+            rel_path: "Main.java".to_owned(),
+            language: Language::Java,
             size_bytes: 0,
+            mtime_secs: 0,
         };
         let a = parse_file(&f).unwrap();
         assert!(a.entry_points.is_empty());
@@ -263,6 +391,7 @@ mod tests {
                     rel_path: rel,
                     language: Language::Rust,
                     size_bytes: 20,
+                    mtime_secs: 0,
                 }
             })
             .collect();

@@ -80,12 +80,12 @@ impl MatiServer {
         let store = graph.store();
         match store.get(&params.key).await {
             Ok(Some(mut record)) => {
+                // M-12-B: bump access_count on every MCP hit (mirrors mati log-hit hook path).
+                record.access_count += 1;
                 let new_confidence = confidence::recompute(&record);
-                if (new_confidence.value - record.confidence.value).abs() > 1e-4 {
-                    record.confidence = new_confidence;
-                    // Best-effort write-back; don't fail the read on write error.
-                    let _ = store.put(&params.key, &record).await;
-                }
+                record.confidence = new_confidence;
+                // Best-effort write-back; don't fail the read on write error.
+                let _ = store.put(&params.key, &record).await;
                 serde_json::to_string_pretty(&record).unwrap_or_else(|e| {
                     format!("{{\"error\": \"serialization failed: {e}\"}}")
                 })
@@ -208,11 +208,11 @@ pub async fn assemble_context_packet(
             if r.staleness.tier == StalenessTier::Tombstone {
                 return false;
             }
-            // Parse the gotcha detail to check confirmed flag
-            if let Ok(gotcha) = serde_json::from_str::<GotchaRecord>(&r.value) {
+            // Check confirmed flag from structured payload
+            if let Some(gotcha) = r.payload_as::<GotchaRecord>() {
                 gotcha.confirmed && r.quality.value >= 0.4
             } else {
-                // Unparseable gotcha value — exclude (not quality check)
+                // No payload or unparseable — exclude
                 false
             }
         })
@@ -267,7 +267,7 @@ pub async fn assemble_context_packet(
                 _ => {}
             }
 
-            if let Ok(fr) = serde_json::from_str::<FileRecord>(&record.value) {
+            if let Some(fr) = record.payload_as::<FileRecord>() {
                 // Nudge detection: hot file (access_count >= 3) with no gotchas
                 let is_nudge_candidate =
                     record.access_count >= 3 && fr.gotcha_keys.is_empty();
@@ -303,7 +303,7 @@ pub async fn assemble_context_packet(
             let date = (now - chrono::Duration::days(days_ago)).format("%Y-%m-%d");
             let review_key = format!("analytics:stale_review_{date}");
             if let Ok(Some(record)) = store.get(&review_key).await {
-                if let Ok(payload) = serde_json::from_str::<StaleReviewPayload>(&record.value) {
+                if let Some(payload) = record.payload_as::<StaleReviewPayload>() {
                     for entry in &payload.entries {
                         if seen_stale_keys.insert(entry.key.clone()) {
                             let path = entry.key.strip_prefix("file:").unwrap_or(&entry.key);
@@ -528,6 +528,7 @@ mod tests {
                 challenge_count: 0,
             },
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -541,8 +542,9 @@ mod tests {
             discovered_session: now(),
             confirmed,
         };
-        let value = serde_json::to_string(&gotcha).unwrap();
-        make_record(key, &value, Category::Gotcha, quality_value)
+        let mut record = make_record(key, rule, Category::Gotcha, quality_value);
+        record.payload = serde_json::to_value(&gotcha).ok();
+        record
     }
 
     // ── mem_get tests ────────────────────────────────────────────────────────
@@ -797,13 +799,16 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 100,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/hot.rs",
-            &serde_json::to_string(&fr).unwrap(),
+            &fr.purpose,
             Category::File,
             0.5,
         );
+        file_record.payload = serde_json::to_value(&fr).ok();
         file_record.access_count = 5; // >= 3 threshold
         store.put("file:src/hot.rs", &file_record).await.unwrap();
 
@@ -850,13 +855,16 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/cold.rs",
-            &serde_json::to_string(&fr).unwrap(),
+            &fr.purpose,
             Category::File,
             0.5,
         );
+        file_record.payload = serde_json::to_value(&fr).ok();
         file_record.access_count = 1; // < 3 threshold
         store.put("file:src/cold.rs", &file_record).await.unwrap();
 
@@ -895,6 +903,8 @@ mod tests {
             is_hotspot: true,
             token_cost_estimate: 100,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/covered.rs",
@@ -1001,6 +1011,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",
@@ -1056,6 +1068,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/dead.rs",
@@ -1107,6 +1121,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/dup.rs",
@@ -1183,6 +1199,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 50,
             last_modified_session: now(),
+            content_hash: None,
+            line_count: 0,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",

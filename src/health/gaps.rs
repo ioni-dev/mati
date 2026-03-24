@@ -9,9 +9,10 @@
 //!
 //! Coverage depends on gap type (see [`coverage_for_gap`]).
 
-use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-use crate::store::{FileRecord, GapType, KnowledgeGap, Record, RecordSource, Store};
+use crate::store::{FileRecord, GapType, KnowledgeGap, Record, RecordSource};
 
 // ── Coverage constants (ARCHITECTURE.md §13.2) ─────────────────────────────
 
@@ -25,30 +26,49 @@ const COVERAGE_DEPENDENCY_UNKNOWN: f32 = 0.0;
 #[cfg(test)]
 const COVERAGE_CO_CHANGE_PAIR_UNMAPPED: f32 = 0.0;
 const COVERAGE_STALE_HOTSPOT: f32 = 0.3;
+const COVERAGE_HOT_FILE_NO_TESTS: f32 = 0.0;
+const COVERAGE_HIGH_FAN_IN_NO_CONTRACT: f32 = 0.0;
+
+/// Minimum number of importers for a file to be flagged as high fan-in.
+const FAN_IN_THRESHOLD: usize = 5;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Scan the store for knowledge gaps across all 8 gap types.
+/// Scan the store for knowledge gaps across all gap types.
+///
+/// Accepts pre-loaded record slices to avoid redundant store scans when
+/// called from `mati stats` or `mati gaps` which already have the data.
+///
+/// `fan_in` maps `file:<path>` keys to their import fan-in count (number of
+/// files that import them). Pass an empty map if graph data is unavailable —
+/// `HighFanInNoContract` detection is skipped in that case.
 ///
 /// Returns gaps sorted by `risk_score` descending (highest risk first).
-pub async fn analyze(store: &Store) -> Result<Vec<KnowledgeGap>> {
+pub fn analyze(
+    file_records: &[Record],
+    gotchas: &[Record],
+    decisions: &[Record],
+    deps: &[Record],
+    fan_in: &HashMap<String, usize>,
+) -> Vec<KnowledgeGap> {
     let mut gaps = Vec::new();
 
-    // Scan all file records once — reused by multiple detectors.
-    let file_records = store.scan_prefix("file:").await?;
-
-    detect_hot_file_no_record(&file_records, &mut gaps);
-    detect_hot_file_no_purpose(&file_records, &mut gaps);
-    detect_hot_file_no_gotchas(&file_records, &mut gaps);
-    detect_frequently_read_no_enrich(&file_records, &mut gaps);
-    detect_orphaned_decisions(store, &mut gaps).await?;
-    detect_dependency_unknown(store, &mut gaps).await?;
+    detect_hot_file_no_record(file_records, &mut gaps);
+    detect_hot_file_no_purpose(file_records, &mut gaps);
+    detect_hot_file_no_gotchas(file_records, &mut gaps);
+    detect_frequently_read_no_enrich(file_records, &mut gaps);
+    detect_orphaned_decisions(decisions, &mut gaps);
+    detect_dependency_unknown(file_records, gotchas, deps, &mut gaps);
     // CoChangePairUnmapped skipped for v0.1 — needs graph edge analysis.
-    detect_stale_hotspots(&file_records, &mut gaps);
+    detect_stale_hotspots(file_records, &mut gaps);
+    detect_hot_file_no_tests(file_records, &mut gaps);
+    if !fan_in.is_empty() {
+        detect_high_fan_in_no_contract(file_records, fan_in, &mut gaps);
+    }
 
     // Highest risk first.
     gaps.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(gaps)
+    gaps
 }
 
 // ── Risk score computation ──────────────────────────────────────────────────
@@ -70,6 +90,8 @@ fn coverage_for_gap(gap_type: &GapType) -> f32 {
         GapType::DependencyUnknown => COVERAGE_DEPENDENCY_UNKNOWN,
         GapType::CoChangePairUnmapped => COVERAGE_CO_CHANGE_PAIR_UNMAPPED,
         GapType::StaleHotspot => COVERAGE_STALE_HOTSPOT,
+        GapType::HotFileNoTests => COVERAGE_HOT_FILE_NO_TESTS,
+        GapType::HighFanInNoContract => COVERAGE_HIGH_FAN_IN_NO_CONTRACT,
     }
 }
 
@@ -100,6 +122,12 @@ fn description_for_gap(gap_type: &GapType, key: &str) -> String {
         }
         GapType::StaleHotspot => {
             format!("Hot file {key} has stale knowledge — record may be outdated after recent changes")
+        }
+        GapType::HotFileNoTests => {
+            format!("Hot file {key} has no test file — high-churn code with no visible test coverage")
+        }
+        GapType::HighFanInNoContract => {
+            format!("{key} is imported by many files but has no gotchas or decisions — interface contracts are undocumented")
         }
     }
 }
@@ -133,6 +161,12 @@ fn action_hint_for_gap(gap_type: &GapType, key: &str) -> String {
         GapType::StaleHotspot => {
             format!("mati enrich --refresh {bare}")
         }
+        GapType::HotFileNoTests => {
+            format!("add tests for {bare} before the next change")
+        }
+        GapType::HighFanInNoContract => {
+            format!("mati gotcha add {bare}  # document interface contracts and invariants")
+        }
     }
 }
 
@@ -148,50 +182,48 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 
 // ── Gap type detectors ──────────────────────────────────────────────────────
 
-/// Parse a `FileRecord` from a `Record`'s value field. Returns `None` if the
-/// value is not valid JSON or does not deserialize to a `FileRecord`.
+/// Parse a `FileRecord` from a `Record`'s payload. Returns `None` if absent.
 fn parse_file_record(record: &Record) -> Option<FileRecord> {
-    serde_json::from_str(&record.value).ok()
+    record.payload_as::<FileRecord>()
 }
 
-/// HotFileNoRecord: hotspot files where `is_hotspot=true` but the record's
-/// value is empty (no FileRecord data at all). In practice, a file: record
-/// with an empty value means Layer 0 created the key but wrote no content.
+/// HotFileNoRecord: hotspot files where `is_hotspot=true` but the record has
+/// no FileRecord payload at all (i.e. Layer 0 never populated the file: key).
+///
+/// NOTE: `record.value` is the human-authored text field and is intentionally
+/// empty for all Layer 0 stubs — it cannot be used to detect missing payload.
+/// After the MessagePack migration, FileRecord lives in `record.payload`.
 fn detect_hot_file_no_record(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) {
     for record in file_records {
-        if record.value.is_empty() {
-            // No FileRecord data — try to get change_frequency from parsed
-            // FileRecord. Since the value is empty here, fall back to 1.0.
-            let freq = parse_file_record(record)
-                .map(|fr| fr.change_frequency as f32)
-                .unwrap_or(1.0);
-            let gap = KnowledgeGap {
-                key: record.key.clone(),
-                gap_type: GapType::HotFileNoRecord,
-                risk_score: risk_score(freq, COVERAGE_HOT_FILE_NO_RECORD),
-                description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
-                action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
-            };
-            gaps.push(gap);
-            continue;
-        }
-
-        if let Some(fr) = parse_file_record(record) {
-            // File has a parsed record — handled by other detectors. But if
-            // is_hotspot is true and everything else is empty, it's still a gap.
-            if fr.is_hotspot
-                && fr.purpose.is_empty()
-                && fr.gotcha_keys.is_empty()
-                && fr.entry_points.is_empty()
-            {
+        match parse_file_record(record) {
+            None => {
+                // No FileRecord payload at all — genuine empty stub.
                 let gap = KnowledgeGap {
                     key: record.key.clone(),
                     gap_type: GapType::HotFileNoRecord,
-                    risk_score: risk_score(fr.change_frequency as f32, COVERAGE_HOT_FILE_NO_RECORD),
+                    risk_score: risk_score(1.0, COVERAGE_HOT_FILE_NO_RECORD),
                     description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
                     action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
                 };
                 gaps.push(gap);
+            }
+            Some(fr) => {
+                // File has a FileRecord — handled by other detectors. But if
+                // is_hotspot is true and everything else is empty, it's a gap.
+                if fr.is_hotspot
+                    && fr.purpose.is_empty()
+                    && fr.gotcha_keys.is_empty()
+                    && fr.entry_points.is_empty()
+                {
+                    let gap = KnowledgeGap {
+                        key: record.key.clone(),
+                        gap_type: GapType::HotFileNoRecord,
+                        risk_score: risk_score(fr.change_frequency as f32, COVERAGE_HOT_FILE_NO_RECORD),
+                        description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
+                        action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
+                    };
+                    gaps.push(gap);
+                }
             }
         }
     }
@@ -258,19 +290,18 @@ fn detect_frequently_read_no_enrich(file_records: &[Record], gaps: &mut Vec<Know
 
 /// OrphanedDecision: `decision:*` records whose value JSON has empty
 /// `affected_files` (or is not parseable as a structure with that field).
-async fn detect_orphaned_decisions(store: &Store, gaps: &mut Vec<KnowledgeGap>) -> Result<()> {
-    let decisions = store.scan_prefix("decision:").await?;
-    for record in &decisions {
-        let is_orphaned = match serde_json::from_str::<serde_json::Value>(&record.value) {
-            Ok(v) => {
+fn detect_orphaned_decisions(decisions: &[Record], gaps: &mut Vec<KnowledgeGap>) {
+    for record in decisions {
+        let is_orphaned = match &record.payload {
+            Some(v) => {
                 let affected = v.get("affected_files");
                 match affected {
                     None => true,
                     Some(arr) => arr.as_array().map_or(true, |a| a.is_empty()),
                 }
             }
-            // Non-JSON value — plain text decision, no affected files at all.
-            Err(_) => true,
+            // No payload — decision has no structured data, treat as orphaned.
+            None => true,
         };
 
         if !is_orphaned {
@@ -293,71 +324,176 @@ async fn detect_orphaned_decisions(store: &Store, gaps: &mut Vec<KnowledgeGap>) 
             action_hint: action_hint_for_gap(&GapType::OrphanedDecision, &record.key),
         });
     }
-    Ok(())
 }
 
 /// DependencyUnknown: `dep:*` records with no confirmed gotchas linked.
 /// We check whether any `gotcha:*` record references this dependency.
-async fn detect_dependency_unknown(store: &Store, gaps: &mut Vec<KnowledgeGap>) -> Result<()> {
-    let deps = store.scan_prefix("dep:").await?;
-    let gotchas = store.scan_prefix("gotcha:").await?;
+fn detect_dependency_unknown(
+    file_records: &[Record],
+    gotchas: &[Record],
+    deps: &[Record],
+    gaps: &mut Vec<KnowledgeGap>,
+) {
+    // Pre-compute dep names once to avoid repeated strip_prefix in hot loops.
+    let dep_names: Vec<(&str, &str)> = deps
+        .iter()
+        .map(|d| (d.key.as_str(), d.key.strip_prefix("dep:").unwrap_or(&d.key)))
+        .collect();
 
-    // Build a set of dep names that have at least one confirmed gotcha referencing them.
+    // Build a set of dep keys that have at least one confirmed gotcha referencing them.
     let mut deps_with_gotchas = std::collections::HashSet::new();
-    for gotcha in &gotchas {
-        if let Ok(gr) = serde_json::from_str::<serde_json::Value>(&gotcha.value) {
-            // Check if this gotcha's affected_files mentions the dep, or if
-            // the gotcha key itself contains the dep name.
+    for gotcha in gotchas {
+        if let Some(gr) = &gotcha.payload {
             if let Some(confirmed) = gr.get("confirmed") {
                 if confirmed.as_bool() != Some(true) {
                     continue;
                 }
             }
             // A gotcha that references a dep typically has the dep name in its key
-            // or affected_files. Use word-boundary matching to avoid false positives
+            // or value. Use word-boundary matching to avoid false positives
             // from substring matches (e.g. "go" matching "google").
-            for dep_rec in &deps {
-                let dep_name = dep_rec.key.strip_prefix("dep:").unwrap_or(&dep_rec.key);
-                if gotcha.key.contains(&format!("dep:{dep_name}"))
-                    || contains_word(&gotcha.value, dep_name)
-                {
-                    deps_with_gotchas.insert(dep_rec.key.clone());
+            for (dep_key, dep_name) in &dep_names {
+                if gotcha.key.contains(dep_key) || contains_word(&gotcha.value, dep_name) {
+                    deps_with_gotchas.insert(*dep_key);
                 }
             }
         }
     }
 
-    // Scan file records to count how many files use each dep.
-    let file_records = store.scan_prefix("file:").await?;
-    let mut dep_usage_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for file_rec in &file_records {
+    // Count how many files use each dep (by checking imports).
+    let mut dep_usage_count: std::collections::HashMap<&str, u32> =
+        std::collections::HashMap::new();
+    for file_rec in file_records {
         if let Some(fr) = parse_file_record(file_rec) {
             for import in &fr.imports {
-                for dep_rec in &deps {
-                    let dep_name = dep_rec.key.strip_prefix("dep:").unwrap_or(&dep_rec.key);
+                for (dep_key, dep_name) in &dep_names {
                     if import.contains(dep_name) {
-                        *dep_usage_count.entry(dep_rec.key.clone()).or_default() += 1;
+                        *dep_usage_count.entry(dep_key).or_default() += 1;
                     }
                 }
             }
         }
     }
 
-    for dep in &deps {
-        if deps_with_gotchas.contains(&dep.key) {
+    for (dep_key, _) in &dep_names {
+        if deps_with_gotchas.contains(dep_key) {
             continue;
         }
-        // change_frequency = number of files using the dep.
-        let freq = dep_usage_count.get(&dep.key).copied().unwrap_or(1) as f32;
+        let freq = dep_usage_count.get(dep_key).copied().unwrap_or(1) as f32;
         gaps.push(KnowledgeGap {
-            key: dep.key.clone(),
+            key: dep_key.to_string(),
             gap_type: GapType::DependencyUnknown,
             risk_score: risk_score(freq, COVERAGE_DEPENDENCY_UNKNOWN),
-            description: description_for_gap(&GapType::DependencyUnknown, &dep.key),
-            action_hint: action_hint_for_gap(&GapType::DependencyUnknown, &dep.key),
+            description: description_for_gap(&GapType::DependencyUnknown, dep_key),
+            action_hint: action_hint_for_gap(&GapType::DependencyUnknown, dep_key),
         });
     }
-    Ok(())
+}
+
+/// HotFileNoTests: hotspot files with no corresponding test file in the repo.
+///
+/// Checks language-appropriate test file naming conventions against the set
+/// of all known file paths. Only flags hotspots — low-churn files are excluded
+/// to keep signal-to-noise high.
+fn detect_hot_file_no_tests(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) {
+    // Build lookup set of all known paths (strip "file:" prefix).
+    let all_paths: HashSet<&str> = file_records
+        .iter()
+        .filter_map(|r| r.key.strip_prefix("file:"))
+        .collect();
+
+    for record in file_records {
+        let Some(fr) = parse_file_record(record) else { continue };
+        if !fr.is_hotspot {
+            continue;
+        }
+        let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
+        if has_test_file(path, &all_paths) {
+            continue;
+        }
+        gaps.push(KnowledgeGap {
+            key: record.key.clone(),
+            gap_type: GapType::HotFileNoTests,
+            risk_score: risk_score(fr.change_frequency as f32, COVERAGE_HOT_FILE_NO_TESTS),
+            description: description_for_gap(&GapType::HotFileNoTests, &record.key),
+            action_hint: action_hint_for_gap(&GapType::HotFileNoTests, path),
+        });
+    }
+}
+
+/// Return `true` if a test file for `path` exists in `all_paths`.
+///
+/// Checks language-appropriate conventions:
+/// - Rust:       `{stem}_test.rs`, `tests/{path}`
+/// - Go:         `{stem}_test.go`  (same directory, Go convention)
+/// - TypeScript/JS: `{stem}.test.{ext}`, `{stem}.spec.{ext}`, `__tests__/{stem}.{ext}`
+/// - Python:     `test_{stem}.py`, `{stem}_test.py`, `tests/{path}`
+fn has_test_file(path: &str, all_paths: &HashSet<&str>) -> bool {
+    let p = Path::new(path);
+    let stem = match p.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return false,
+    };
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let parent = p.parent().and_then(|p| p.to_str()).unwrap_or("");
+
+    let join = |dir: &str, name: &str| -> String {
+        if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+    };
+
+    let candidates: &[String] = &[
+        // Rust
+        join(parent, &format!("{stem}_test.rs")),
+        join(parent, &format!("{stem}_tests.rs")),
+        format!("tests/{path}"),
+        // Go
+        join(parent, &format!("{stem}_test.go")),
+        // TypeScript / JavaScript
+        join(parent, &format!("{stem}.test.{ext}")),
+        join(parent, &format!("{stem}.spec.{ext}")),
+        join(parent, &format!("__tests__/{stem}.{ext}")),
+        format!("tests/{path}"),
+        format!("test/{path}"),
+        // Python
+        join(parent, &format!("test_{stem}.{ext}")),
+        join(parent, &format!("{stem}_test.{ext}")),
+        format!("tests/{path}"),
+    ];
+
+    candidates.iter().any(|c| all_paths.contains(c.as_str()))
+}
+
+/// HighFanInNoContract: files imported by >= FAN_IN_THRESHOLD others with no
+/// gotchas or decisions linked. High fan-in = high blast radius; undocumented
+/// contracts are invisible to both developers and Claude.
+fn detect_high_fan_in_no_contract(
+    file_records: &[Record],
+    fan_in: &HashMap<String, usize>,
+    gaps: &mut Vec<KnowledgeGap>,
+) {
+    for record in file_records {
+        let count = match fan_in.get(&record.key) {
+            Some(&n) if n >= FAN_IN_THRESHOLD => n,
+            _ => continue,
+        };
+        let Some(fr) = parse_file_record(record) else { continue };
+        // Skip files that already have documented contracts.
+        if !fr.gotcha_keys.is_empty() || !fr.decision_keys.is_empty() {
+            continue;
+        }
+        let bare = record.key.strip_prefix("file:").unwrap_or(&record.key);
+        gaps.push(KnowledgeGap {
+            key: record.key.clone(),
+            gap_type: GapType::HighFanInNoContract,
+            // Use fan-in count as the "frequency" — more importers = higher blast radius.
+            risk_score: risk_score(count as f32, COVERAGE_HIGH_FAN_IN_NO_CONTRACT),
+            description: format!(
+                "{} is imported by {count} files — no interface contract documented",
+                record.key
+            ),
+            action_hint: action_hint_for_gap(&GapType::HighFanInNoContract, bare),
+        });
+    }
 }
 
 /// StaleHotspot: hotspot files with `staleness.value >= 0.5`.
@@ -389,6 +525,61 @@ fn detect_stale_hotspots(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::store::{
+        Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
+        RecordVersion, StalenessScore,
+    };
+
+    // ── Test helpers ────────────────────────────────────────────────────
+
+    fn make_file_record_with(key: &str, fr: FileRecord) -> Record {
+        Record {
+            key: key.to_string(),
+            value: fr.purpose.clone(),
+            payload: serde_json::to_value(&fr).ok(),
+            category: Category::File,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 1_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        }
+    }
+
+    fn hotspot_fr(path: &str, change_frequency: u32) -> FileRecord {
+        FileRecord {
+            path: path.to_string(),
+            purpose: "Does important things".to_string(),
+            entry_points: vec!["run".to_string()],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 100,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+        }
+    }
 
     // ── Risk score computation ──────────────────────────────────────────
 
@@ -557,6 +748,209 @@ mod tests {
         assert!((gap.risk_score - 100.0).abs() < f32::EPSILON);
         assert!(!gap.description.is_empty());
         assert!(gap.action_hint.starts_with("mati "));
+    }
+
+    // ── HotFileNoTests ──────────────────────────────────────────────────
+
+    #[test]
+    fn hot_file_no_tests_flags_hotspot_without_test_file() {
+        let fr = hotspot_fr("src/auth.rs", 20);
+        let records = vec![make_file_record_with("file:src/auth.rs", fr)];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].gap_type, GapType::HotFileNoTests);
+        assert_eq!(gaps[0].key, "file:src/auth.rs");
+    }
+
+    #[test]
+    fn hot_file_no_tests_skips_non_hotspot() {
+        let mut fr = hotspot_fr("src/util.rs", 20);
+        fr.is_hotspot = false;
+        let records = vec![make_file_record_with("file:src/util.rs", fr)];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn hot_file_no_tests_suppressed_when_rust_test_file_exists() {
+        let hotspot = make_file_record_with("file:src/auth.rs", hotspot_fr("src/auth.rs", 20));
+        let test_fr = FileRecord {
+            path: "src/auth_test.rs".to_string(),
+            is_hotspot: false,
+            ..hotspot_fr("src/auth_test.rs", 0)
+        };
+        let test_rec = make_file_record_with("file:src/auth_test.rs", test_fr);
+        let records = vec![hotspot, test_rec];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert!(gaps.is_empty(), "should not flag when auth_test.rs exists");
+    }
+
+    #[test]
+    fn hot_file_no_tests_suppressed_when_tests_dir_mirror_exists() {
+        let hotspot = make_file_record_with("file:src/auth.rs", hotspot_fr("src/auth.rs", 20));
+        let mirror_fr = FileRecord {
+            path: "tests/src/auth.rs".to_string(),
+            is_hotspot: false,
+            ..hotspot_fr("tests/src/auth.rs", 0)
+        };
+        let mirror_rec = make_file_record_with("file:tests/src/auth.rs", mirror_fr);
+        let records = vec![hotspot, mirror_rec];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert!(gaps.is_empty(), "should not flag when tests/src/auth.rs exists");
+    }
+
+    #[test]
+    fn hot_file_no_tests_suppressed_when_ts_spec_file_exists() {
+        let hotspot_fr_ts = FileRecord {
+            path: "src/parser.ts".to_string(),
+            is_hotspot: true,
+            ..hotspot_fr("src/parser.ts", 15)
+        };
+        let hotspot = make_file_record_with("file:src/parser.ts", hotspot_fr_ts);
+        let spec_fr = FileRecord {
+            path: "src/parser.spec.ts".to_string(),
+            is_hotspot: false,
+            ..hotspot_fr("src/parser.spec.ts", 0)
+        };
+        let spec_rec = make_file_record_with("file:src/parser.spec.ts", spec_fr);
+        let records = vec![hotspot, spec_rec];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert!(gaps.is_empty(), "should not flag when parser.spec.ts exists");
+    }
+
+    #[test]
+    fn hot_file_no_tests_risk_score_uses_change_frequency() {
+        let fr = hotspot_fr("src/hot.rs", 50);
+        let records = vec![make_file_record_with("file:src/hot.rs", fr)];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        // coverage = 0.0, risk = 50 * 1.0 = 50.0
+        assert!((gaps[0].risk_score - 50.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn hot_file_no_tests_suppressed_when_jest_tests_dir_exists() {
+        let hotspot_fr_js = FileRecord {
+            path: "src/auth.ts".to_string(),
+            is_hotspot: true,
+            ..hotspot_fr("src/auth.ts", 15)
+        };
+        let hotspot = make_file_record_with("file:src/auth.ts", hotspot_fr_js);
+        let jest_fr = FileRecord {
+            path: "src/__tests__/auth.ts".to_string(),
+            is_hotspot: false,
+            ..hotspot_fr("src/__tests__/auth.ts", 0)
+        };
+        let jest_rec = make_file_record_with("file:src/__tests__/auth.ts", jest_fr);
+        let records = vec![hotspot, jest_rec];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert!(gaps.is_empty(), "should not flag when src/__tests__/auth.ts exists");
+    }
+
+    #[test]
+    fn hot_file_no_tests_suppressed_when_go_test_file_exists() {
+        let hotspot_fr_go = FileRecord {
+            path: "pkg/store/db.go".to_string(),
+            is_hotspot: true,
+            ..hotspot_fr("pkg/store/db.go", 10)
+        };
+        let hotspot = make_file_record_with("file:pkg/store/db.go", hotspot_fr_go);
+        let test_fr = FileRecord {
+            path: "pkg/store/db_test.go".to_string(),
+            is_hotspot: false,
+            ..hotspot_fr("pkg/store/db_test.go", 0)
+        };
+        let test_rec = make_file_record_with("file:pkg/store/db_test.go", test_fr);
+        let records = vec![hotspot, test_rec];
+        let mut gaps = vec![];
+        detect_hot_file_no_tests(&records, &mut gaps);
+        assert!(gaps.is_empty(), "should not flag when db_test.go exists");
+    }
+
+    // ── HighFanInNoContract ─────────────────────────────────────────────
+
+    #[test]
+    fn high_fan_in_flags_file_above_threshold_with_no_contracts() {
+        let fr = hotspot_fr("src/core.rs", 10);
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        let fan_in = HashMap::from([("file:src/core.rs".to_string(), 8)]);
+        let mut gaps = vec![];
+        detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].gap_type, GapType::HighFanInNoContract);
+        assert_eq!(gaps[0].key, "file:src/core.rs");
+    }
+
+    #[test]
+    fn high_fan_in_skips_file_below_threshold() {
+        let fr = hotspot_fr("src/core.rs", 10);
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        // 4 importers — below FAN_IN_THRESHOLD (5)
+        let fan_in = HashMap::from([("file:src/core.rs".to_string(), 4)]);
+        let mut gaps = vec![];
+        detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn high_fan_in_skips_file_with_gotcha_keys() {
+        let mut fr = hotspot_fr("src/core.rs", 10);
+        fr.gotcha_keys = vec!["gotcha:core-invariant".to_string()];
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        let fan_in = HashMap::from([("file:src/core.rs".to_string(), 10)]);
+        let mut gaps = vec![];
+        detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
+        assert!(gaps.is_empty(), "gotcha_keys present — should not flag");
+    }
+
+    #[test]
+    fn high_fan_in_skips_file_with_decision_keys() {
+        let mut fr = hotspot_fr("src/core.rs", 10);
+        fr.decision_keys = vec!["decision:use-surrealkv".to_string()];
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        let fan_in = HashMap::from([("file:src/core.rs".to_string(), 10)]);
+        let mut gaps = vec![];
+        detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
+        assert!(gaps.is_empty(), "decision_keys present — should not flag");
+    }
+
+    #[test]
+    fn high_fan_in_risk_score_uses_fan_in_count() {
+        let fr = hotspot_fr("src/core.rs", 10);
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        let fan_in = HashMap::from([("file:src/core.rs".to_string(), 7)]);
+        let mut gaps = vec![];
+        detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        // coverage = 0.0, risk = 7 * 1.0 = 7.0
+        assert!((gaps[0].risk_score - 7.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn high_fan_in_skipped_when_fan_in_map_is_empty() {
+        let fr = hotspot_fr("src/core.rs", 10);
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        // analyze() skips detect_high_fan_in_no_contract when map is empty
+        let gaps = analyze(&records, &[], &[], &[], &HashMap::new());
+        assert!(!gaps.iter().any(|g| g.gap_type == GapType::HighFanInNoContract));
+    }
+
+    #[test]
+    fn high_fan_in_description_mentions_importer_count() {
+        let fr = hotspot_fr("src/core.rs", 10);
+        let records = vec![make_file_record_with("file:src/core.rs", fr)];
+        let fan_in = HashMap::from([("file:src/core.rs".to_string(), 6)]);
+        let mut gaps = vec![];
+        detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].description.contains("6"), "description should mention importer count");
     }
 
     // ── Sorting ─────────────────────────────────────────────────────────

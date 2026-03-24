@@ -1,0 +1,43 @@
+{
+  "name": "mati",
+  "version": "0.1.0",
+  "description": "Engineering knowledge that survives turnover. Persistent, queryable knowledge store for codebases — accumulates per-file gotchas, architectural decisions, and project state, then surfaces them to Claude on demand via MCP stdio.",
+  "author": "mati-dev",
+  "homepage": "https://mati.dev",
+  "repository": "https://github.com/mati-dev/mati",
+  "documentation": "https://docs.mati.dev",
+  "license": "MIT",
+  "keywords": ["ai", "mcp", "claude", "knowledge", "developer-tools"],
+  "server": {
+    "type": "stdio",
+    "command": "mati",
+    "args": ["serve"]
+  },
+  "tools": [
+    {
+      "name": "mem_get",
+      "description": "Look up a single mati knowledge record by key. Always call this before using Read on any file — pass the key as \"file:<path>\". If this returns a confirmed record with confidence >= 0.6, do not read the file — use this record instead."
+    },
+    {
+      "name": "mem_query",
+      "description": "Search the mati knowledge store. Modes: \"text\" (default, BM25 full-text search) or \"graph\" (1-hop traversal from query as seed key). Returns matching records as JSON array."
+    },
+    {
+      "name": "mem_bootstrap",
+      "description": "Assemble a context packet for the current coding session. Gathers confirmed gotchas, file records, and architectural decisions relevant to the provided context_files, within a 2,000-token budget. Call this at session start."
+    }
+  ],
+  "install": {
+    "instructions": "Run `mati init` in your project root after installing the binary.",
+    "methods": [
+      {
+        "type": "shell",
+        "command": "curl -fsSL https://install.mati.dev | sh"
+      },
+      {
+        "type": "cargo",
+        "command": "cargo install mati"
+      }
+    ]
+  }
+}

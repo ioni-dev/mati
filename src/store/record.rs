@@ -21,6 +21,7 @@
 //! computed scores. Use field-level epsilon comparison in tests and comparators.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 // ─────────────────────────────────────────────
@@ -166,6 +167,51 @@ impl QualityScore {
         Self {
             value: 0.10,
             tier: QualityTier::Suppressed,
+            signals: vec![],
+            computed_at: 0,
+        }
+    }
+
+    /// Quality for a file record whose purpose was extracted from a language-
+    /// canonical doc comment (Rust `//!`, Go `// Package`, Python docstring).
+    ///
+    /// `Acceptable` tier (0.40) passes the `quality >= 0.4` injection gate.
+    /// Paired with `confidence = 0.45` in `init.rs`, these records surface as
+    /// `additionalContext` (allow + attach) rather than deny + inject.
+    pub fn doc_comment_default() -> Self {
+        Self {
+            value: 0.40,
+            tier: QualityTier::Acceptable,
+            signals: vec![],
+            computed_at: 0,
+        }
+    }
+
+    /// Quality for an auto-generated co-change gotcha (normal signal).
+    ///
+    /// `Acceptable` tier (0.40): passes quality gate.
+    /// Paired with `confidence = 0.45` (0.3–0.6 band) → additionalContext injection.
+    /// `confirmed: true` is set on the gotcha because co-change is objective git data,
+    /// but the confidence band keeps it out of the deny+inject path.
+    pub fn cochange_default() -> Self {
+        Self {
+            value: 0.40,
+            tier: QualityTier::Acceptable,
+            signals: vec![],
+            computed_at: 0,
+        }
+    }
+
+    /// Quality for a strong co-change gotcha (ratio >= 0.90 AND count >= 20).
+    ///
+    /// `Acceptable` tier (0.60): passes quality gate.
+    /// Paired with `confidence = 0.65` → deny+inject path.
+    /// A near-perfect co-change ratio over 20+ commits is strong enough evidence
+    /// that Claude should be forced to see the coupling before editing either file.
+    pub fn cochange_strong() -> Self {
+        Self {
+            value: 0.60,
+            tier: QualityTier::Acceptable,
             signals: vec![],
             computed_at: 0,
         }
@@ -509,6 +555,18 @@ pub struct Record {
     pub confidence: ConfidenceScore,
     /// Pre-computed gap risk score: `change_frequency × (1 - coverage_score)`.
     pub gap_analysis_score: f32,
+    /// Structured per-category payload — typed data in JSON form.
+    ///
+    /// - `file:*`     → `FileRecord`
+    /// - `gotcha:*`   → `GotchaRecord`
+    /// - `decision:*` → serialized decision body (TBD Layer 1)
+    /// - `analytics:*`, `session:*` → arbitrary JSON blob (DailyAgg, StaleReviewPayload, …)
+    ///
+    /// `value` is always the human-readable text: rule, purpose, body.
+    /// `payload` carries all structured fields so read sites never parse `value` as JSON.
+    /// Stored as-is in MessagePack (serde_json::Value → msgpack map).
+    #[serde(default)]
+    pub payload: Option<JsonValue>,
 }
 
 impl Record {
@@ -517,6 +575,14 @@ impl Record {
     /// Convenience accessor — delegates to `self.version.device_id`.
     pub fn device_id(&self) -> DeviceId {
         self.version.device_id
+    }
+
+    /// Deserialize the structured payload into a typed value.
+    ///
+    /// Returns `None` when `payload` is absent or the JSON shape does not match `T`.
+    /// Always prefer this over `serde_json::from_str(&self.value)`.
+    pub fn payload_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        self.payload.as_ref().and_then(|p| serde_json::from_value(p.clone()).ok())
     }
 
     /// Construct a layer-0 file stub for `file:<path>`.
@@ -553,6 +619,7 @@ impl Record {
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 }
@@ -610,6 +677,13 @@ pub struct FileRecord {
     pub token_cost_estimate: u32,
     /// Session timestamp of the last time this record was updated.
     pub last_modified_session: u64,
+    /// SHA-256 hex digest of file content at the time of last Layer 0 scan.
+    /// `None` for non-parseable files or the first scan (no stored baseline).
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// Newline count at last scan (≈ line count). 0 for non-parseable files.
+    #[serde(default)]
+    pub line_count: u32,
 }
 
 impl FileRecord {
@@ -646,6 +720,8 @@ impl FileRecord {
             is_hotspot,
             token_cost_estimate,
             last_modified_session,
+            content_hash: None,
+            line_count: 0,
         }
     }
 }
@@ -729,6 +805,10 @@ pub enum GapType {
     CoChangePairUnmapped,
     /// Hot file's record hasn't been updated since a significant refactor.
     StaleHotspot,
+    /// Hotspot file with no corresponding test file detected in the repo.
+    HotFileNoTests,
+    /// File imported by many others but has no gotchas or decisions documented.
+    HighFanInNoContract,
 }
 
 /// A detected knowledge gap with risk score and suggested resolution action.
@@ -873,6 +953,7 @@ mod tests {
             source: RecordSource::DeveloperManual,
             confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
             gap_analysis_score: 0.0,
+            payload: None,
         }
     }
 
@@ -896,6 +977,8 @@ mod tests {
             is_hotspot: false,
             token_cost_estimate: 180,
             last_modified_session: 1_710_520_800,
+            content_hash: None,
+            line_count: 0,
         }
     }
 

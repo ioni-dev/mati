@@ -58,6 +58,10 @@ pub struct GitSignals {
     pub recent_renames: Vec<(String, String)>,
     /// Co-change pairs where ratio >= CO_CHANGE_THRESHOLD: (a, b, count) with a < b.
     pub co_change_pairs: Vec<(String, String, u32)>,
+    /// path → number of revert commits that touched the file (conventional "Revert " prefix).
+    pub revert_counts: HashMap<String, u32>,
+    /// path → (author_name → commit_count). Used to detect ownership concentration.
+    pub author_commit_counts: HashMap<String, HashMap<String, u32>>,
 }
 
 impl GitSignals {
@@ -69,6 +73,8 @@ impl GitSignals {
             hotspot_files: Vec::new(),
             recent_renames: Vec::new(),
             co_change_pairs: Vec::new(),
+            revert_counts: HashMap::new(),
+            author_commit_counts: HashMap::new(),
         }
     }
 }
@@ -120,6 +126,8 @@ pub fn mine_git_history(
     let mut change_frequency: HashMap<u32, u32> = HashMap::new();
     let mut last_authors: HashMap<u32, String> = HashMap::new();
     let mut pair_counts: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut revert_counts_intern: HashMap<u32, u32> = HashMap::new();
+    let mut author_counts_intern: HashMap<u32, HashMap<String, u32>> = HashMap::new();
     let mut recent_renames: Vec<(String, String)> = Vec::new();
     let mut commit_files: Vec<u32> = Vec::with_capacity(64);
     let mut commits_processed: usize = 0;
@@ -257,6 +265,11 @@ pub fn mine_git_history(
             last_authors
                 .entry(idx)
                 .or_insert_with(|| committer_name.clone());
+            *author_counts_intern
+                .entry(idx)
+                .or_default()
+                .entry(committer_name.clone())
+                .or_insert(0) += 1;
         }
 
         // Generate co-change pairs — skip bulk commits
@@ -267,6 +280,13 @@ pub fn mine_git_history(
                     let key = (commit_files[i], commit_files[j]);
                     *pair_counts.entry(key).or_insert(0) += 1;
                 }
+            }
+        }
+
+        // Detect revert commits by conventional "Revert " subject prefix.
+        if commit.message().map(|m| m.starts_with("Revert ")).unwrap_or(false) {
+            for &idx in &commit_files {
+                *revert_counts_intern.entry(idx).or_insert(0) += 1;
             }
         }
 
@@ -316,12 +336,24 @@ pub fn mine_git_history(
             .then_with(|| a.1.cmp(&b.1))
     });
 
+    let revert_counts: HashMap<String, u32> = revert_counts_intern
+        .into_iter()
+        .map(|(idx, count)| (intern_vec[idx as usize].clone(), count))
+        .collect();
+
+    let author_commit_counts: HashMap<String, HashMap<String, u32>> = author_counts_intern
+        .into_iter()
+        .map(|(idx, counts)| (intern_vec[idx as usize].clone(), counts))
+        .collect();
+
     Ok(GitSignals {
         change_frequency: str_frequency,
         last_authors: str_authors,
         hotspot_files,
         recent_renames,
         co_change_pairs,
+        revert_counts,
+        author_commit_counts,
     })
 }
 
