@@ -100,6 +100,31 @@ fn e2e_full_lifecycle() {
     extract_show_metrics(&r.stdout, &mut sr, &mut summary);
     report.add(sr);
 
+    // mati get — hook fast-path hit (file record exists after init)
+    let r = h_run(&mati, &repo, home, &["get", &file_key]);
+    let mut sr = StepResult::new("get (hit)", &r);
+    extract_get_metrics(&r.stdout, &mut sr, &mut summary);
+    report.add(sr);
+
+    // mati get — hook fast-path miss (nonexistent key returns null, exit 0)
+    let r = h_run(&mati, &repo, home, &["get", "gotcha:nonexistent-ghost"]);
+    let mut sr = StepResult::new("get (miss)", &r);
+    extract_get_metrics(&r.stdout, &mut sr, &mut summary);
+    report.add(sr);
+
+    // mati log-miss / log-hit — hook tracking
+    {
+        let r = h_run(&mati, &repo, home, &["log-miss", &file_key]);
+        let mut sr = StepResult::new("log-miss", &r);
+        sr.add_metric("key", &file_key);
+        report.add(sr);
+
+        let r = h_run(&mati, &repo, home, &["log-hit", &file_key]);
+        let mut sr = StepResult::new("log-hit", &r);
+        sr.add_metric("key", &file_key);
+        report.add(sr);
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Iteration 2 — gotcha add / improve / note
     // ═══════════════════════════════════════════════════════════════════════════
@@ -130,6 +155,37 @@ fn e2e_full_lifecycle() {
     let mut sr = StepResult::new("note", &r);
     extract_note_metrics(&r.stdout, &r.stderr, &mut sr, &mut summary);
     report.add(sr);
+
+    // Extract note key and show the record to verify persistence
+    let note_key = {
+        let combined = format!("{}\n{}", r.stdout, r.stderr);
+        combined
+            .lines()
+            .find(|l| l.contains("dev_note:"))
+            .and_then(|l| l.split_whitespace().find(|t| t.starts_with("dev_note:")))
+            .map(|k| k.trim_end_matches(')').trim_end_matches(',').to_string())
+            .unwrap_or_default()
+    };
+    if !note_key.is_empty() {
+        let r = h_run(&mati, &repo, home, &["show", &note_key]);
+        let mut sr = StepResult::new("show note", &r);
+        extract_show_metrics(&r.stdout, &mut sr, &mut summary);
+        report.add(sr);
+    }
+
+    // Quality gate rejection — short/bad rule must be rejected (exit non-zero)
+    {
+        let bad_input = "bad\nno\nhigh\n\n\n".to_string();
+        let r = h_run_stdin(&mati, &repo, home, &["gotcha", "add", &explain_path], &bad_input);
+        let mut sr = StepResult::new("gotcha reject", &r);
+        // Correct behaviour: exit non-zero (quality gate blocked it)
+        sr.failed = r.exit_ok; // fails if the gate MISSED and let it through
+        sr.add_metric(
+            "quality gate",
+            if !r.exit_ok { "✓ rejected" } else { "MISSED" },
+        );
+        report.add(sr);
+    }
 
     // mati improve — feed improved text
     if !gotcha_key.is_empty() {
@@ -176,6 +232,42 @@ fn e2e_full_lifecycle() {
         let r = h_run(&mati, &repo, home, &["history", &gotcha_key]);
         let mut sr = StepResult::new("history", &r);
         extract_history_metrics(&r.stdout, &mut sr, &mut summary);
+        report.add(sr);
+    }
+
+    // mati reparse — single-file incremental reparse (silent, just exit 0)
+    {
+        let r = h_run(&mati, &repo, home, &["reparse", &explain_path]);
+        let mut sr = StepResult::new("reparse", &r);
+        extract_reparse_metrics(r.exit_ok, &mut sr, &mut summary);
+        report.add(sr);
+    }
+
+    // mati history --since 7d — all records changed in the last week
+    {
+        let r = h_run(&mati, &repo, home, &["history", "--since", "7d"]);
+        let mut sr = StepResult::new("history --since", &r);
+        extract_history_since_metrics(&r.stdout, &mut sr, &mut summary);
+        report.add(sr);
+    }
+
+    // Validate export JSON contains the gotcha we created
+    if !gotcha_key.is_empty() {
+        let contains = json_export.stdout.contains(&gotcha_key);
+        let mut sr = StepResult {
+            label: "export contains",
+            elapsed: std::time::Duration::ZERO,
+            failed: !contains,
+            skipped: false,
+            skip_reason: None,
+            metrics: vec![],
+            metrics2: vec![],
+            raw_stderr: None,
+        };
+        sr.add_metric(
+            "gotcha in export",
+            if contains { "✓" } else { "MISSING" },
+        );
         report.add(sr);
     }
 
@@ -242,11 +334,46 @@ fn e2e_full_lifecycle() {
     extract_changed_init_metrics(&restored_init.stdout, &mut sr, &mut summary);
     report.add(sr);
 
-    // mati review — feed 'q' to quit immediately (just verify it launches)
+    // mati review — confirm all candidates (up to 20) so gotcha becomes injectable
     {
-        let r = h_run_stdin(&mati, &repo, home, &["review"], "q\n");
+        let review_input = "c\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\nc\n";
+        let r = h_run_stdin(&mati, &repo, home, &["review"], review_input);
         let mut sr = StepResult::new("review", &r);
         extract_review_metrics(&r.stdout, &r.stderr, &mut sr, &mut summary);
+        report.add(sr);
+    }
+
+    // After review: show gotcha record to verify it's still accessible
+    if !gotcha_key.is_empty() {
+        let r = h_run(&mati, &repo, home, &["show", &gotcha_key]);
+        let mut sr = StepResult::new("show confirmed", &r);
+        // mati show does NOT print a confirmed field — check confidence from the output
+        let conf_val = extract_float_from_line(&r.stdout, "value");
+        if let Some(c) = conf_val {
+            sr.add_metric("confidence", &format!("{c:.2}"));
+        }
+        // confirmed is shown as "Y"/"-" only in ls gotchas, not in show output.
+        // We check it via `mati get` JSON below.
+        report.add(sr);
+
+        // mati get — JSON must have "confirmed":true (gotcha add creates confirmed=true)
+        let r = h_run(&mati, &repo, home, &["get", &gotcha_key]);
+        let mut sr = StepResult::new("get confirmed", &r);
+        let json_confirmed = r.stdout.contains("\"confirmed\":true");
+        // GetOutput flattens Record, so fields are at top level: {"confidence":{"value":0.80,...},"confirmed":true,...}
+        let json_conf_val = serde_json::from_str::<serde_json::Value>(r.stdout.trim())
+            .ok()
+            .and_then(|v| v.get("confidence").and_then(|c| c.get("value")).and_then(|v| v.as_f64()))
+            .map(|v| v as f32);
+        sr.add_metric("confirmed_in_json", if json_confirmed { "✓" } else { "missing" });
+        if let Some(c) = json_conf_val {
+            let inject_ready = c >= 0.6 && json_confirmed;
+            sr.add_metric("confidence", &format!("{c:.2}"));
+            sr.add_metric("injectable", if inject_ready { "✓ (≥0.6 + confirmed)" } else { "not yet" });
+            summary.hook_inject_ready = inject_ready;
+        }
+        summary.gotcha_confirmed = json_confirmed;
+        sr.failed = !json_confirmed;
         report.add(sr);
     }
 
@@ -255,6 +382,49 @@ fn e2e_full_lifecycle() {
     let mut sr = StepResult::new("quality-check", &r);
     extract_quality_check_metrics(&r.stdout, &mut sr, &mut summary);
     report.add(sr);
+
+    // mati session-check-consulted — file we log-hit earlier should be consulted
+    {
+        let r = h_run(&mati, &repo, home, &["session-check-consulted", &file_key]);
+        let mut sr = StepResult::new("session-consulted", &r);
+        let consulted = r.stdout.trim() == "true";
+        sr.add_metric("consulted", if consulted { "✓ true" } else { "false" });
+        report.add(sr);
+    }
+
+    // mati session-flush — write session:current record
+    {
+        let r = h_run(&mati, &repo, home, &["session-flush"]);
+        let mut sr = StepResult::new("session-flush", &r);
+        sr.add_metric("result", if r.exit_ok { "✓ (exit 0)" } else { "FAILED" });
+        summary.session_ok = r.exit_ok;
+        report.add(sr);
+    }
+
+    // mati session-harvest — archive session + run passive promotion
+    {
+        let r = h_run(&mati, &repo, home, &["session-harvest"]);
+        let mut sr = StepResult::new("session-harvest", &r);
+        sr.add_metric("result", if r.exit_ok { "✓ (exit 0)" } else { "FAILED" });
+        summary.session_ok = summary.session_ok && r.exit_ok;
+        report.add(sr);
+    }
+
+    // mati doc-capture — capture doc comments for a real file
+    {
+        let r = h_run(&mati, &repo, home, &["doc-capture", &explain_path]);
+        let mut sr = StepResult::new("doc-capture", &r);
+        sr.add_metric("result", if r.exit_ok { "✓ (exit 0)" } else { "FAILED" });
+        report.add(sr);
+    }
+
+    // mati edit-hook — combined log-hit + reparse (post-edit hook command)
+    {
+        let r = h_run(&mati, &repo, home, &["edit-hook", &explain_path]);
+        let mut sr = StepResult::new("edit-hook", &r);
+        sr.add_metric("result", if r.exit_ok { "✓ (exit 0)" } else { "FAILED" });
+        report.add(sr);
+    }
 
     // Final export — accumulation check
     let final_export = h_run(&mati, &repo, home, &["export", "--format", "json"]);
@@ -268,13 +438,38 @@ fn e2e_full_lifecycle() {
     }
     report.add(sr);
 
-    // mati import round-trip (idempotent)
+    // mati import round-trip — verify import reads back the exported count
     {
+        let before_count = count_json_records(&final_export.stdout);
+        summary.import_count_before = before_count;
+
         let tmp = home_dir.path().join("mati_e2e_export.json");
         if std::fs::write(&tmp, &final_export.stdout).is_ok() {
             let r = h_run(&mati, &repo, home, &["import", tmp.to_str().unwrap_or("")]);
             let mut sr = StepResult::new("import", &r);
-            sr.add_metric("✓ idempotent", "");
+
+            // Parse imported count from the import command's own stdout:
+            // "Imported N records from JSON."
+            let imported_count = r
+                .stdout
+                .lines()
+                .find(|l| l.contains("Imported") && l.contains("records"))
+                .and_then(|l| first_number(l))
+                .unwrap_or(0);
+            summary.import_count_after = imported_count;
+
+            let delta = (imported_count as i64) - (before_count as i64);
+            sr.add_metric("exported", &before_count.to_string());
+            sr.add_metric("imported", &imported_count.to_string());
+            if delta == 0 && r.exit_ok {
+                sr.add_metric("✓ idempotent", "delta=0");
+            } else if !r.exit_ok {
+                // sr.failed already set by StepResult::new
+                sr.add_metric("error", "non-zero exit");
+            } else {
+                sr.failed = true;
+                sr.add_metric("delta", &format!("{delta:+} DRIFT"));
+            }
             report.add(sr);
         }
     }
@@ -293,6 +488,202 @@ fn e2e_full_lifecycle() {
         let mut sr = StepResult::new("stats final", &r);
         extract_stats_metrics(&r.stdout, &mut sr, &mut summary);
         report.add(sr);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Iteration 6 — MCP tools against the populated store
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Spawn `mati serve` with the same HOME/CWD as all prior steps so it opens
+    // the same store.  Then drive mem_get / mem_query / mem_bootstrap over the
+    // real JSON-RPC stdio transport and verify results against real knowledge.
+    {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::sync::mpsc;
+
+        struct MatiChild(std::process::Child);
+        impl Drop for MatiChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn mcp_recv(rx: &mpsc::Receiver<String>, id: u64) -> Option<serde_json::Value> {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let rem = deadline.saturating_duration_since(std::time::Instant::now());
+                if rem.is_zero() {
+                    return None;
+                }
+                let line = match rx.recv_timeout(rem) {
+                    Ok(l) => l,
+                    Err(_) => return None,
+                };
+                let v: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                    return Some(v);
+                }
+            }
+        }
+
+        let spawn_result = std::process::Command::new(&mati)
+            .arg("serve")
+            .current_dir(&repo)
+            .env("HOME", home)
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        if let Ok(mut child) = spawn_result {
+            let mut stdin = child.stdin.take().expect("mati serve stdin");
+            let stdout = child.stdout.take().expect("mati serve stdout");
+            let _guard = MatiChild(child);
+
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    match reader.read_line(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let line = buf.trim_end().to_string();
+                            if !line.is_empty() {
+                                let _ = tx.send(line);
+                            }
+                        }
+                    }
+                }
+            });
+
+            // initialize
+            let _ = stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"e2e\",\"version\":\"0.1\"}}}\n");
+            let _ = stdin.flush();
+            mcp_recv(&rx, 1);
+            let _ = stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n");
+            let _ = stdin.flush();
+
+            // ── mem_get: the gotcha we created should return non-null ────────
+            let mcp_get_start = Instant::now();
+            let get_msg = if !gotcha_key.is_empty() {
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"mem_get\",\"arguments\":{{\"key\":\"{}\"}}}}}}\n",
+                    gotcha_key
+                )
+            } else {
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mem_get\",\"arguments\":{\"key\":\"file:nonexistent\"}}}\n".to_string()
+            };
+            let _ = stdin.write_all(get_msg.as_bytes());
+            let _ = stdin.flush();
+            let get_resp = mcp_recv(&rx, 2);
+            let get_text = get_resp
+                .as_ref()
+                .and_then(|v| v["result"]["content"].as_array())
+                .and_then(|a| a.first())
+                .and_then(|item| item["text"].as_str())
+                .unwrap_or("null");
+            let get_hit = get_text != "null" && !get_text.is_empty() && !gotcha_key.is_empty();
+            summary.mcp_get_hit = get_hit;
+
+            let mut sr = StepResult {
+                label: "mcp mem_get",
+                elapsed: mcp_get_start.elapsed(),
+                failed: !gotcha_key.is_empty() && !get_hit,
+                skipped: gotcha_key.is_empty(),
+                skip_reason: if gotcha_key.is_empty() {
+                    Some("no gotcha key from iter2".into())
+                } else {
+                    None
+                },
+                metrics: vec![],
+                metrics2: vec![],
+                raw_stderr: None,
+            };
+            sr.add_metric("hit", if get_hit { "✓" } else { "null" });
+            if get_hit {
+                let preview: String = strip_ansi(get_text).chars().take(50).collect();
+                sr.add_metric2("content", &format!("\"{}...\"", preview));
+            }
+            report.add(sr);
+
+            // ── mem_query: search for a term present in the gotcha rule ──────
+            let mcp_query_start = Instant::now();
+            let query_term = "regex";
+            let query_msg = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"mem_query\",\"arguments\":{{\"query\":\"{query_term}\",\"limit\":5}}}}}}\n"
+            );
+            let _ = stdin.write_all(query_msg.as_bytes());
+            let _ = stdin.flush();
+            let query_resp = mcp_recv(&rx, 3);
+            let query_text = query_resp
+                .as_ref()
+                .and_then(|v| v["result"]["content"].as_array())
+                .and_then(|a| a.first())
+                .and_then(|item| item["text"].as_str())
+                .unwrap_or("");
+            // A hit means the response is non-empty and not just "No results found"
+            let query_hit = !query_text.is_empty()
+                && !query_text.to_lowercase().contains("no results")
+                && query_text != "null";
+            summary.mcp_query_hit = query_hit;
+
+            let mut sr = StepResult {
+                label: "mcp mem_query",
+                elapsed: mcp_query_start.elapsed(),
+                failed: false, // empty results are valid (gotcha may not be confirmed)
+                skipped: false,
+                skip_reason: None,
+                metrics: vec![],
+                metrics2: vec![],
+                raw_stderr: None,
+            };
+            sr.add_metric("query", &format!("\"{query_term}\""));
+            sr.add_metric("results", if query_hit { "✓ hit" } else { "empty" });
+            report.add(sr);
+
+            // ── mem_bootstrap: should carry [mati] Vector B marker ───────────
+            let mcp_boot_start = Instant::now();
+            let _ = stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"mem_bootstrap\",\"arguments\":{}}}\n");
+            let _ = stdin.flush();
+            let boot_resp = mcp_recv(&rx, 4);
+            let boot_text = boot_resp
+                .as_ref()
+                .and_then(|v| v["result"]["content"].as_array())
+                .and_then(|a| a.first())
+                .and_then(|item| item["text"].as_str())
+                .unwrap_or("");
+            let has_marker = boot_text.contains("[mati]");
+            summary.mcp_bootstrap_has_gotcha = has_marker;
+
+            let mut sr = StepResult {
+                label: "mcp mem_bootstrap",
+                elapsed: mcp_boot_start.elapsed(),
+                failed: !has_marker,
+                skipped: false,
+                skip_reason: None,
+                metrics: vec![],
+                metrics2: vec![],
+                raw_stderr: None,
+            };
+            sr.add_metric("[mati] marker", if has_marker { "✓" } else { "MISSING" });
+            let token_est = boot_text.len() / 4;
+            if token_est > 0 {
+                sr.add_metric("~tokens", &token_est.to_string());
+            }
+            // Check if our gotcha made it into the bootstrap context
+            let gotcha_in_boot = !gotcha_key.is_empty() && boot_text.contains(&gotcha_key);
+            if gotcha_in_boot {
+                sr.add_metric2("gotcha in context", "✓");
+            }
+            report.add(sr);
+        }
     }
 
     // ── Print report ────────────────────────────────────────────────────────
@@ -332,6 +723,7 @@ struct StepResult<'a> {
     metrics: Vec<(String, String)>,
     // second-line metrics (wrap)
     metrics2: Vec<(String, String)>,
+    raw_stderr: Option<String>,
 }
 
 impl<'a> StepResult<'a> {
@@ -344,6 +736,11 @@ impl<'a> StepResult<'a> {
             skip_reason: None,
             metrics: Vec::new(),
             metrics2: Vec::new(),
+            raw_stderr: if !r.exit_ok && !r.stderr.is_empty() {
+                Some(r.stderr.clone())
+            } else {
+                None
+            },
         }
     }
 
@@ -418,6 +815,15 @@ impl<'a> Report<'a> {
             };
             println!("{first_line}");
 
+            // Dump raw stderr for failed steps (aids debugging)
+            if step.failed {
+                if let Some(ref raw) = step.raw_stderr {
+                    for line in raw.lines().take(25) {
+                        println!("    | {line}");
+                    }
+                }
+            }
+
             // Second line (overflow metrics): indented 24 chars to align with metrics
             if !m2.is_empty() {
                 println!("  {:<24}{}", "", m2);
@@ -461,10 +867,14 @@ impl<'a> Report<'a> {
             );
         }
         if summary.files > 0 {
-            println!(
-                "  Files:        {}      Entry points: {}    Imports: {}",
-                summary.files, summary.entry_points, summary.imports
-            );
+            if summary.entry_points > 0 || summary.imports > 0 {
+                println!(
+                    "  Files:        {}      Entry points: {}    Imports: {}",
+                    summary.files, summary.entry_points, summary.imports
+                );
+            } else {
+                println!("  Files:        {}", summary.files);
+            }
         }
         if summary.gotcha_cands > 0 || summary.todos > 0 || summary.doc_comments > 0 || summary.hotspots > 0 {
             println!(
@@ -556,8 +966,70 @@ impl<'a> Report<'a> {
             "  Incremental:  {}  (0 parsed on unchanged re-init)",
             if summary.warm_parsed == 0 { "✓" } else { "?" }
         );
+        let import_ok = summary.import_count_after == summary.import_count_before
+            && summary.import_count_before > 0;
         println!(
-            "  Export:       ✓  (valid JSON, round-trip import idempotent)"
+            "  Export:       {}  (JSON valid, import delta={})",
+            if import_ok { "✓" } else { "?" },
+            (summary.import_count_after as i64) - (summary.import_count_before as i64)
+        );
+
+        println!();
+        println!("  ── Hook fast-path ──");
+        println!(
+            "  get (hit):    {}  (populated key returns record JSON)",
+            if summary.hook_get_hit { "✓" } else { "?" }
+        );
+        println!(
+            "  Confirmed:    {}  (gotcha ready for hook injection)",
+            if summary.gotcha_confirmed { "✓" } else { "?" }
+        );
+        println!(
+            "  Injectable:   {}  (confirmed=true + confidence≥0.6 + quality≥0.4)",
+            if summary.hook_inject_ready { "✓" } else { "not yet" }
+        );
+        println!(
+            "  Session:      {}  (flush + harvest lifecycle)",
+            if summary.session_ok { "✓" } else { "?" }
+        );
+        if summary.history_versions > 0 {
+            println!(
+                "  History:      {}  versions for improved gotcha (expected ≥2)",
+                summary.history_versions
+            );
+        }
+        println!(
+            "  reparse:      {}  (single-file incremental reparse)",
+            if summary.reparse_ok { "✓" } else { "?" }
+        );
+        if summary.history_since_count > 0 {
+            println!(
+                "  history 7d:   {}  records changed in window",
+                summary.history_since_count
+            );
+        }
+        if summary.quality_before > 0.0 || summary.quality_after > 0.0 {
+            println!(
+                "  Quality:      {:.2} → {:.2}  (improve progression {})",
+                summary.quality_before,
+                summary.quality_after,
+                if summary.quality_after > summary.quality_before { "✓" } else { "?" }
+            );
+        }
+
+        println!();
+        println!("  ── MCP (populated store) ──");
+        println!(
+            "  mem_get:      {}  (gotcha key lookup against real store)",
+            if summary.mcp_get_hit { "✓" } else { "?" }
+        );
+        println!(
+            "  mem_query:    {}  (BM25 search with results)",
+            if summary.mcp_query_hit { "✓" } else { "empty (may need confirmed record)" }
+        );
+        println!(
+            "  mem_bootstrap:{}  ([mati] Vector B marker present)",
+            if summary.mcp_bootstrap_has_gotcha { "✓" } else { "?" }
         );
         println!();
     }
@@ -628,8 +1100,33 @@ struct Summary {
     // Stale
     stale_count: u64,
 
+    // Hook fast-path
+    hook_get_hit: bool,
+    // Single-file reparse
+    reparse_ok: bool,
+    // History window
+    history_since_count: u64,
+    // History versions
+    history_versions: u64,
+    // Quality progression
+    quality_before: f32,
+    quality_after: f32,
+    // Import idempotency
+    import_count_before: u64,
+    import_count_after: u64,
+    // MCP against populated store
+    mcp_get_hit: bool,
+    mcp_query_hit: bool,
+    mcp_bootstrap_has_gotcha: bool,
+
     // Lifecycle flags
     change_detected: bool,
+
+    // Gotcha confirmation
+    gotcha_confirmed: bool,
+    hook_inject_ready: bool,
+    // Session lifecycle
+    session_ok: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1221,7 +1718,7 @@ fn extract_show_gotcha_metrics(output: &str, sr: &mut StepResult, _summary: &mut
 
 /// Returns the key of the created gotcha (e.g. "gotcha:always-call-regex-...")
 /// Also checks stderr since the quality gate failure message lands there.
-fn extract_gotcha_add_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _summary: &mut Summary) -> String {
+fn extract_gotcha_add_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, summary: &mut Summary) -> String {
     // "Created gotcha:always-call-regex-...  (quality: 0.78, confidence: 0.80)"
     // Output may be on stdout (success) or the error on stderr (quality gate fail)
     let combined = format!("{stdout}\n{stderr}");
@@ -1248,6 +1745,9 @@ fn extract_gotcha_add_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _
 
     if !key.is_empty() {
         sr.add_metric("key", &key);
+        // Count the successfully added gotcha so Persistence check works
+        // even when Layer 0 produced 0 initial gotchas.
+        summary.gotcha_count_after_add += 1;
     }
     if quality > 0.0 {
         sr.add_metric("quality", &format!("{quality:.2}"));
@@ -1276,7 +1776,7 @@ fn extract_note_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _summar
 
 // ── mati improve ─────────────────────────────────────────────────────────────
 
-fn extract_improve_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _summary: &mut Summary) {
+fn extract_improve_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, summary: &mut Summary) {
     let output = &format!("{stdout}\n{stderr}");
     // "Updated gotcha:...  (quality: 0.42 -> 0.71)"
     // or "Current quality: 0.42 ..." and later "Updated ... (quality: ... -> 0.71)"
@@ -1291,12 +1791,21 @@ fn extract_improve_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _sum
             l.split("->").nth(1).and_then(|s| first_float(s))
         });
 
+    if let Some(b) = before { summary.quality_before = b; }
+    if let Some(a) = after { summary.quality_after = a; }
+    let progression_ok = matches!((before, after), (Some(b), Some(a)) if a > b);
+
     if let (Some(b), Some(a)) = (before, after) {
         sr.add_metric("quality", &format!("{b:.2}→{a:.2}"));
     } else if let Some(a) = after {
         sr.add_metric("quality", &format!("→{a:.2}"));
     } else if let Some(b) = before {
         sr.add_metric("quality", &format!("{b:.2}→?"));
+    }
+    if progression_ok {
+        sr.add_metric("✓ improved", "");
+    } else if before.is_some() && after.is_some() {
+        sr.add_metric("regression", "SAME_OR_WORSE");
     }
 }
 
@@ -1364,10 +1873,22 @@ fn extract_diff_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summar
 
 // ── mati history ─────────────────────────────────────────────────────────────
 
-fn extract_history_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summary) {
-    // "history  gotcha:key  (N versions)"
-    let versions = extract_number(output, "version");
+fn extract_history_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary) {
+    // Output: "history  gotcha:...  (N versions)" — count is BEFORE "versions"
+    let versions = extract_int_before_word(output, " version").max(
+        // also count table rows as version entries
+        output.lines().filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('│') && !t.to_lowercase().contains("version") && !t.contains('─')
+        }).count() as u64
+    );
+    summary.history_versions = versions;
     sr.add_metric("versions", &versions.to_string());
+    if versions >= 2 {
+        sr.add_metric("✓ ≥2 versions", "(create+improve)");
+    } else if versions == 1 {
+        sr.add_metric("warn", "only 1 version — improve may not have written a new version");
+    }
 }
 
 // ── mati stale ────────────────────────────────────────────────────────────────
@@ -1396,14 +1917,15 @@ fn extract_review_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _summ
     let shown = extract_number(&combined, "pending review");
     let skipped = extract_number(&combined, "skipped");
 
+    // Count confirmed from stdout: look for "Review complete: N confirmed" or "N confirmed"
+    let confirmed = extract_int_before_word(&combined, " confirmed");
+
     if candidates > 0 || shown > 0 {
         sr.add_metric("candidates", &(candidates.max(shown)).to_string());
         if skipped > 0 { sr.add_metric("skipped", &skipped.to_string()); }
+        if confirmed > 0 { sr.add_metric("confirmed", &confirmed.to_string()); }
     } else {
-        // 0 is expected on shallow clones: review only shows gotcha:* records
-        // with confirmed=false AND quality>=0.4. Auto-stubs (co-change, revert,
-        // ownership) require git history depth > 5 to be generated.
-        sr.add_metric("candidates", "0 (expected: no auto-stubs on shallow clone)");
+        sr.add_metric("candidates", "0");
     }
 }
 
@@ -1456,6 +1978,61 @@ fn extract_tier_count(output: &str, tier_label: &str) -> u64 {
         }
     }
     0
+}
+
+// ── mati get (hook fast-path) ──────────────────────────────────────────────
+
+fn extract_get_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary) {
+    let trimmed = output.trim();
+    let hit = trimmed != "null" && !trimmed.is_empty();
+    summary.hook_get_hit = summary.hook_get_hit || hit;
+    if hit {
+        sr.add_metric("hit", "✓");
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(cat) = v.get("record")
+                .and_then(|r| r.get("category"))
+                .and_then(|c| c.as_str())
+            {
+                sr.add_metric("category", cat);
+            }
+        }
+    } else {
+        sr.add_metric("result", "null (miss)");
+    }
+}
+
+// ── mati reparse ──────────────────────────────────────────────────────────
+
+fn extract_reparse_metrics(exit_ok: bool, sr: &mut StepResult, summary: &mut Summary) {
+    summary.reparse_ok = exit_ok;
+    sr.add_metric("result", if exit_ok { "✓ (exit 0)" } else { "FAILED" });
+}
+
+// ── mati history --since ──────────────────────────────────────────────────
+
+fn extract_history_since_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary) {
+    // Table rows or "N records changed in last X"
+    let direct = extract_int_before_word(output, " records");
+    let rows = output
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with('│') && !t.to_lowercase().contains("key") && !t.contains('─')
+        })
+        .count() as u64;
+    let total = direct.max(rows);
+    summary.history_since_count = total;
+    sr.add_metric("records", &total.to_string());
+    sr.add_metric("window", "7d");
+}
+
+// ── JSON record count helper ───────────────────────────────────────────────
+
+fn count_json_records(json: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len() as u64))
+        .unwrap_or(0)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

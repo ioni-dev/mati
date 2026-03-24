@@ -80,12 +80,12 @@ impl MatiServer {
         let store = graph.store();
         match store.get(&params.key).await {
             Ok(Some(mut record)) => {
+                // M-12-B: bump access_count on every MCP hit (mirrors mati log-hit hook path).
+                record.access_count += 1;
                 let new_confidence = confidence::recompute(&record);
-                if (new_confidence.value - record.confidence.value).abs() > 1e-4 {
-                    record.confidence = new_confidence;
-                    // Best-effort write-back; don't fail the read on write error.
-                    let _ = store.put(&params.key, &record).await;
-                }
+                record.confidence = new_confidence;
+                // Best-effort write-back; don't fail the read on write error.
+                let _ = store.put(&params.key, &record).await;
                 serde_json::to_string_pretty(&record).unwrap_or_else(|e| {
                     format!("{{\"error\": \"serialization failed: {e}\"}}")
                 })

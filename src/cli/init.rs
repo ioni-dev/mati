@@ -40,22 +40,28 @@ pub async fn run(args: InitArgs) -> Result<()> {
     };
     let root = std::fs::canonicalize(&root)?;
 
-    // Stop daemon if running — SurrealKV requires exclusive store access.
-    // The daemon must release its lock before init can open the store.
+    // Guard: mati init needs exclusive store access. If the daemon is running it
+    // holds the SurrealKV lock — attempting Store::open would hang or fail with a
+    // cryptic error. Detect this early and give a clear remediation message.
     {
-        use crate::cli::daemon::mati_root_for;
-        if let Ok(mati_root) = mati_root_for(&root) {
-            if mati_root.join("mati.sock").exists() {
-                print!("  Stopping daemon for exclusive store access...");
-                let _ = crate::cli::daemon::run_daemon_stop().await;
-                // Wait up to 3s for the socket to disappear (daemon cleanup).
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                while mati_root.join("mati.sock").exists()
-                    && std::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                println!(" done");
+        use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+        let mati_root = mati_root_for(&root)?;
+        match daemon_result(&mati_root, "ping", serde_json::json!({})).await {
+            DaemonResult::Ok(_) => {
+                anyhow::bail!(
+                    "mati daemon is running and holds the store lock.\n\
+                     Stop it first, then re-run init:\n\n  \
+                     mati daemon stop\n"
+                );
+            }
+            DaemonResult::Unresponsive => {
+                anyhow::bail!(
+                    "mati daemon socket exists but is not responding (may hold the store lock).\n\
+                     Stop it first:\n\n  mati daemon stop\n"
+                );
+            }
+            DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+                // Safe to proceed — no daemon holds the lock.
             }
         }
     }

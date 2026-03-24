@@ -3,9 +3,10 @@
 //! Drains the backlog of Layer 0 stubs that need developer confirmation
 //! before they can be injected by the pre-read hook.
 //!
-//! Candidates: `gotcha:*` records with `GotchaRecord.confirmed == false`,
-//! `lifecycle == Active`, and `quality >= 0.4`. Sorted by `access_count DESC`
-//! so the most-accessed files surface first.
+//! Candidates: `gotcha:*` records with `GotchaRecord.confirmed == false` and
+//! `lifecycle == Active`. Includes Layer 0 stubs (Suppressed quality) so
+//! developers can review and improve them before the injection gate. Sorted by
+//! `access_count DESC` so the most-accessed files surface first.
 //!
 //! Actions per candidate:
 //! - **Confirm** — sets `confirmed=true`, promotes source to `DeveloperManual`,
@@ -184,7 +185,10 @@ pub async fn run(_args: ReviewArgs) -> Result<()> {
 
 // ── Candidate collection ──────────────────────────────────────────────────────
 
-/// Scan `gotcha:*` for Active records with `confirmed=false` and `quality >= 0.4`.
+/// Scan `gotcha:*` for Active records with `confirmed=false`.
+/// Includes Layer 0 stubs (quality < 0.4, Suppressed tier) so developers can
+/// review and promote auto-generated candidates via `mati improve` before
+/// confirming. The injection quality gate (>= 0.4) is enforced separately.
 /// Sorted by `access_count DESC` — most-accessed candidates first.
 async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
     let all = store.scan_prefix("gotcha:").await?;
@@ -192,9 +196,6 @@ async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
         .into_iter()
         .filter(|r| {
             if !matches!(r.lifecycle, RecordLifecycle::Active) {
-                return false;
-            }
-            if r.quality.value < 0.4 {
                 return false;
             }
             match r.payload_as::<GotchaRecord>() {
@@ -485,15 +486,18 @@ mod tests {
     }
 
     #[test]
-    fn collect_candidates_filters_low_quality() {
+    fn collect_candidates_includes_low_quality() {
+        // Layer 0 stubs (Suppressed tier, quality < 0.4) must be surfaced for review
+        // so developers can improve + confirm them. The injection gate is enforced
+        // separately by the pre-read hook.
         let low_quality = make_record("gotcha:low-q", &make_gotcha_record(false), 0.35);
         assert!(
             low_quality.quality.value < 0.4,
-            "quality 0.35 should be below threshold"
+            "quality 0.35 is in the Suppressed tier"
         );
-        // The filter `quality.value < 0.4 → return false` should exclude this.
-        let passes = !(low_quality.quality.value < 0.4);
-        assert!(!passes, "low-quality candidate should be excluded");
+        let payload: GotchaRecord = low_quality.payload_as().unwrap();
+        // confirmed=false + Active lifecycle → should be a candidate regardless of quality
+        assert!(!payload.confirmed, "unconfirmed gotcha is a review candidate");
     }
 
     #[test]

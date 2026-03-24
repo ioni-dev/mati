@@ -17,7 +17,7 @@ use mati_core::store::{
     Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
     RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, Store,
 };
-use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+use crate::cli::daemon::{daemon_result, mati_root_for, try_auto_start, DaemonResult};
 
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
 
@@ -43,7 +43,9 @@ pub async fn run_get(key: &str) -> Result<()> {
             println!("{json}");
             return Ok(());
         }
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
         DaemonResult::Unresponsive => {
             tracing::warn!("mati get: daemon unresponsive — degrading gracefully");
             println!("null");
@@ -159,10 +161,22 @@ pub async fn run_log_miss(key: &str) -> Result<()> {
 
     match daemon_result(&root, "log_miss", serde_json::json!({ "key": key })).await {
         DaemonResult::Ok(_) => return Ok(()),
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
         DaemonResult::Unresponsive => {
-            tracing::warn!("log_miss: daemon unresponsive — skipping (non-fatal)");
-            return Ok(());
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati log-miss: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati log-miss: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
         }
     }
 
@@ -185,10 +199,22 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
 
     match daemon_result(&root, "log_hit", serde_json::json!({ "key": key })).await {
         DaemonResult::Ok(_) => return Ok(()),
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
         DaemonResult::Unresponsive => {
-            tracing::warn!("log_hit: daemon unresponsive — skipping (non-fatal)");
-            return Ok(());
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati log-hit: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati log-hit: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
         }
     }
 
@@ -231,12 +257,22 @@ pub async fn run_edit_hook(path: &str) -> Result<()> {
 
     match daemon_result(&root, "edit_hook", serde_json::json!({ "path": path })).await {
         DaemonResult::Ok(_) => return Ok(()),
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
         DaemonResult::Unresponsive => {
-            // Daemon holds the store lock — cannot fall back to Store::open.
-            // Degrade gracefully: skip this hook invocation (P9).
-            tracing::warn!(path, "edit_hook: daemon unresponsive — skipping (non-fatal)");
-            return Ok(());
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati edit-hook: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati edit-hook: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
         }
     }
 
@@ -405,10 +441,22 @@ pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
 
     match daemon_result(&root, "log_compliance_miss", serde_json::json!({ "key": key })).await {
         DaemonResult::Ok(_) => return Ok(()),
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
         DaemonResult::Unresponsive => {
-            tracing::warn!("log_compliance_miss: daemon unresponsive — skipping (non-fatal)");
-            return Ok(());
+            // No fallback: an unresponsive daemon likely holds the SurrealKV lock,
+            // so Store::open would block. P9: analytics loss is preferable to hanging.
+            // Exception: if the daemon process has since died, the lock is free — fall through.
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!(
+                    "mati log-compliance-miss: daemon unresponsive (process alive, lock held) — dropping event"
+                );
+                return Ok(());
+            }
+            tracing::debug!("mati log-compliance-miss: daemon unresponsive + process dead — falling back to direct store");
+            // fall through to Store::open below
         }
     }
 
@@ -438,7 +486,9 @@ pub async fn run_session_check_consulted(key: &str) -> Result<()> {
             println!("{consulted}");
             return Ok(());
         }
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => {}
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
         DaemonResult::Unresponsive => {
             tracing::warn!("session_check_consulted: daemon unresponsive — returning false");
             println!("false");
