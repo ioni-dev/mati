@@ -4,19 +4,16 @@
 //! in `.claude/hooks/`. They must be FAST (<50ms) — use `Store::open`, not
 //! `open_and_rebuild`.
 //!
-//! Each `run_*` function is a thin CLI wrapper around an internal `*_impl`
-//! that accepts `&Store` for testability.
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! Each `run_*` function is a thin CLI wrapper. When the MCP server (mati serve)
+//! is running it holds the SurrealKV exclusive lock, so all store writes are
+//! routed through the daemon Unix socket first. The `*_impl` functions in
+//! `mati_core::store::session` are used for the direct-store fallback path.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use mati_core::health::staleness::StalenessAnalyzer;
-use mati_core::store::{
-    Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, Store,
-};
+use mati_core::store::{Category, GotchaRecord, Record, Store};
+use mati_core::store::session as sess;
 use crate::cli::daemon::{daemon_result, mati_root_for, try_auto_start, DaemonResult};
 
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
@@ -85,73 +82,6 @@ fn extract_confirmed(record: &Record) -> bool {
 
 // ── M-09-G: Internal hook commands ──────────────────────────────────────────
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn today_key(prefix: &str) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d");
-    format!("{prefix}{now}")
-}
-
-fn new_device_id() -> uuid::Uuid {
-    uuid::Uuid::new_v4()
-}
-
-fn session_record(key: &str, value: String) -> Record {
-    let now = now_secs();
-    Record {
-        key: key.to_string(),
-        value,
-        category: Category::Session,
-        priority: Priority::Normal,
-        tags: vec![],
-        created_at: now,
-        updated_at: now,
-        ref_url: None,
-        staleness: StalenessScore::fresh(),
-        lifecycle: RecordLifecycle::Active,
-        version: RecordVersion {
-            device_id: new_device_id(),
-            logical_clock: 1,
-            wall_clock: now,
-        },
-        quality: QualityScore::layer0_default(),
-        access_count: 0,
-        last_accessed: 0,
-        source: RecordSource::SessionHook,
-        confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
-        gap_analysis_score: 0.0,
-        payload: None,
-    }
-}
-
-fn analytics_record(key: &str, value: String) -> Record {
-    let mut r = session_record(key, value);
-    r.category = Category::Analytics;
-    r
-}
-
-/// Daily aggregation record value.
-#[derive(Serialize, Deserialize, Debug)]
-struct DailyAgg {
-    count: u64,
-    keys: Vec<String>,
-}
-
-const MAX_AGG_KEYS: usize = 100;
-
-/// Minimum staleness value for a record to be included in the daily stale review.
-const STALE_REVIEW_MIN: f32 = 0.4;
-
-/// Maximum staleness value for stale review inclusion (Liability and above are excluded).
-const STALE_REVIEW_MAX: f32 = 0.7;
-
-/// Maximum number of entries in a single daily stale review record.
-const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 
 // ── log-miss ─────────────────────────────────────────────────────────────────
 
@@ -187,8 +117,7 @@ pub async fn run_log_miss(key: &str) -> Result<()> {
 }
 
 async fn log_miss_impl(store: &Store, key: &str) -> Result<()> {
-    let agg_key = today_key("analytics:miss_");
-    upsert_daily_agg(store, &agg_key, key).await
+    sess::log_miss(store, key).await
 }
 
 // ── log-hit ──────────────────────────────────────────────────────────────────
@@ -225,27 +154,9 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
 }
 
 async fn log_hit_impl(store: &Store, key: &str) -> Result<()> {
-    let now = now_secs();
-
-    // 1. Daily hit aggregation
-    let agg_key = today_key("analytics:hit_");
-    upsert_daily_agg(store, &agg_key, key).await?;
-
-    // 2. Mark as consulted for session tracking
-    let consulted_key = format!("session:consulted:{key}");
-    store
-        .put(&consulted_key, &session_record(&consulted_key, String::new()))
-        .await?;
-
-    // 3. Bump access_count and last_accessed on the target record
-    if let Some(mut record) = store.get(key).await? {
-        record.access_count += 1;
-        record.last_accessed = now;
-        store.put(key, &record).await?;
-    }
-
-    Ok(())
+    sess::log_hit(store, key).await
 }
+
 
 // ── edit-hook (combined log-hit + reparse) ───────────────────────────────────
 
@@ -254,6 +165,14 @@ async fn log_hit_impl(store: &Store, key: &str) -> Result<()> {
 pub async fn run_edit_hook(path: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
+
+    // Normalize to repo-relative. post-edit.sh passes absolute paths;
+    // store keys always use relative (e.g. "file:src/main.rs").
+    let rel = std::path::Path::new(path)
+        .strip_prefix(&cwd)
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let path = rel.as_str();
 
     match daemon_result(&root, "edit_hook", serde_json::json!({ "path": path })).await {
         DaemonResult::Ok(_) => return Ok(()),
@@ -294,141 +213,37 @@ pub async fn run_edit_hook(path: &str) -> Result<()> {
 /// Read first lines of new file content from stdin, detect a canonical doc
 /// comment, and update the `file:*` record's purpose + confidence.
 ///
-/// Called by `post_edit.sh` in the background — must be fast and non-blocking.
-/// Gracefully no-ops when no record exists yet or content has no doc comment.
+/// Tries the daemon socket first (content passed as JSON payload). Falls back
+/// to direct store open when daemon is not running.
 pub async fn run_doc_capture(path: &str) -> Result<()> {
     use std::io::Read as _;
     let mut content = String::new();
     std::io::stdin().read_to_string(&mut content)?;
 
-    let purpose = extract_doc_comment(path, &content);
-    if purpose.is_empty() {
-        return Ok(());
-    }
-
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
-    let file_key = format!("file:{path}");
+    let root = mati_root_for(&cwd)?;
 
-    let mut record = match store.get(&file_key).await? {
-        Some(r) => r,
-        None => {
-            store.close().await?;
+    match daemon_result(
+        &root,
+        "doc_capture",
+        serde_json::json!({ "path": path, "content": content }),
+    )
+    .await
+    {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            tracing::warn!("doc_capture: daemon unresponsive — dropping");
             return Ok(());
         }
-    };
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Only update purpose when the record's current source is static analysis
-    // (Layer 0 stub) — don't overwrite developer-manual or higher-quality records.
-    if record.source != RecordSource::StaticAnalysis {
-        store.close().await?;
-        return Ok(());
     }
 
-    if let Some(mut fr) = record.payload_as::<mati_core::store::FileRecord>() {
-        fr.purpose = purpose.clone();
-        record.payload = serde_json::to_value(&fr).ok();
-    } else {
-        store.close().await?;
-        return Ok(());
-    }
-
-    record.value = purpose;
-    record.source = RecordSource::SessionHook;
-    record.confidence.value = 0.65;
-    record.quality = QualityScore::doc_comment_default();
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-
-    if let Err(e) = store.put(&file_key, &record).await {
-        tracing::warn!(path, "doc-capture put failed: {e}");
-    }
+    let store = Store::open(&cwd).await?;
+    sess::doc_capture(&store, path, &content).await?;
     store.close().await?;
     Ok(())
-}
-
-/// Detect a canonical module-level doc comment from the first few lines of content.
-/// Returns the cleaned comment text, or an empty string if none found.
-fn extract_doc_comment(path: &str, content: &str) -> String {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-
-    match ext {
-        "rs" => extract_rust_module_doc(content),
-        "py" => extract_python_docstring(content),
-        "go" => extract_go_package_doc_comment(content),
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => extract_jsdoc(content),
-        _ => String::new(),
-    }
-}
-
-/// Collect consecutive `//!` lines at the top of a Rust file.
-fn extract_rust_module_doc(content: &str) -> String {
-    let lines: Vec<&str> = content
-        .lines()
-        .take_while(|l| l.trim_start().starts_with("//!"))
-        .map(|l| l.trim_start().trim_start_matches("//!").trim())
-        .collect();
-    lines.join(" ").trim().to_string()
-}
-
-/// Extract the first line of a Python module docstring (`"""` or `'''`).
-fn extract_python_docstring(content: &str) -> String {
-    let trimmed = content.trim_start();
-    for delim in &[r#"""""#, "'''"] {
-        if let Some(rest) = trimmed.strip_prefix(delim) {
-            if let Some(end) = rest.find(delim) {
-                return rest[..end]
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-/// Collect the `//` comment block that appears immediately before `package X`.
-fn extract_go_package_doc_comment(content: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let t = line.trim();
-        if t.starts_with("//") {
-            lines.push(t.trim_start_matches("//").trim().to_string());
-        } else if t.starts_with("package ") {
-            break;
-        } else if !t.is_empty() {
-            lines.clear(); // non-comment, non-empty line resets the block
-        }
-    }
-    lines.join(" ").trim().to_string()
-}
-
-/// Extract a JSDoc `/** ... */` block at the top of a JS/TS file.
-fn extract_jsdoc(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("/**") {
-        if let Some(end) = rest.find("*/") {
-            let text: Vec<&str> = rest[..end]
-                .lines()
-                .map(|l| l.trim().trim_start_matches('*').trim())
-                .filter(|l| !l.is_empty())
-                .collect();
-            return text.join(" ").trim().to_string();
-        }
-    }
-    String::new()
 }
 
 // ── log-compliance-miss ──────────────────────────────────────────────────────
@@ -465,8 +280,7 @@ pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
 }
 
 async fn log_compliance_miss_impl(store: &Store, key: &str) -> Result<()> {
-    let agg_key = today_key("compliance:miss_");
-    upsert_daily_agg(store, &agg_key, key).await
+    sess::log_compliance_miss(store, key).await
 }
 
 // ── session-check-consulted ──────────────────────────────────────────────────
@@ -502,14 +316,26 @@ pub async fn run_session_check_consulted(key: &str) -> Result<()> {
 }
 
 async fn check_consulted_impl(store: &Store, key: &str) -> Result<bool> {
-    let consulted_key = format!("session:consulted:{key}");
-    Ok(store.get(&consulted_key).await?.is_some())
+    sess::check_consulted(store, key).await
 }
 
 // ── session-flush ────────────────────────────────────────────────────────────
 
 pub async fn run_session_flush() -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "session_flush", serde_json::json!({})).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            tracing::warn!("session_flush: daemon unresponsive — dropping");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     session_flush_impl(&store).await?;
     store.close().await?;
@@ -517,31 +343,26 @@ pub async fn run_session_flush() -> Result<()> {
 }
 
 async fn session_flush_impl(store: &Store) -> Result<()> {
-    let now = now_secs();
-
-    // Scan all consulted markers
-    let consulted_keys = store.scan_keys("session:consulted:").await?;
-    let stripped: Vec<String> = consulted_keys
-        .iter()
-        .map(|k| k.strip_prefix("session:consulted:").unwrap_or(k).to_string())
-        .collect();
-
-    // Write session:current
-    let session_data = serde_json::json!({
-        "consulted_keys": stripped,
-        "flushed_at": now,
-    });
-    let mut rec = session_record("session:current", String::new());
-    rec.payload = Some(session_data);
-
-    store.put("session:current", &rec).await?;
-    Ok(())
+    sess::session_flush(store).await
 }
 
 // ── session-harvest ──────────────────────────────────────────────────────────
 
 pub async fn run_session_harvest() -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "session_harvest", serde_json::json!({})).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            tracing::warn!("session_harvest: daemon unresponsive — dropping");
+            return Ok(());
+        }
+    }
+
     let store = Store::open(&cwd).await?;
     session_harvest_impl(&store, &cwd).await?;
     store.close().await?;
@@ -549,319 +370,33 @@ pub async fn run_session_harvest() -> Result<()> {
 }
 
 async fn session_harvest_impl(store: &Store, cwd: &std::path::Path) -> Result<()> {
-    let now = now_secs();
-
-    // M-12-D: promote gotcha candidates before archiving
-    match promote_gotcha_candidates(store).await {
-        Ok(n) if n > 0 => tracing::info!(promoted = n, "gotcha candidates auto-promoted"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "gotcha promotion failed"),
-    }
-
-    // M-13-A: run full staleness analysis
-    match StalenessAnalyzer::new(cwd).analyze_all(store).await {
-        Ok(report) if report.updated > 0 => {
-            tracing::info!(
-                scanned = report.scanned,
-                updated = report.updated,
-                tombstoned = report.tombstoned,
-                liability = report.liability,
-                "staleness analysis complete"
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "staleness analysis failed"),
-    }
-
-    // Read session:current (written by session-flush)
-    let session_rec = match store.get("session:current").await? {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-
-    // Reconstruct the session value string for callers that still use &str
-    let session_value = match session_rec.payload.as_ref() {
-        Some(p) => serde_json::to_string(p).unwrap_or_default(),
-        None => session_rec.value.clone(),
-    };
-
-    // M-13-C: collect and store stale reviews for consulted keys
-    match collect_and_store_stale_reviews(store, &session_value, now).await {
-        Ok(n) if n > 0 => tracing::info!(entries = n, "stale review entries collected"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "stale review collection failed"),
-    }
-
-    // Write permanent session record — propagate payload so consumers can read structured data
-    let session_key = format!("session:{now}");
-    let mut perm = session_record(&session_key, session_value);
-    perm.payload = session_rec.payload;
-    store.put(&session_key, &perm).await?;
-
-    // Clean up session:consulted:* markers
-    let consulted_keys = store.scan_keys("session:consulted:").await?;
-    for k in &consulted_keys {
-        store.delete(k).await?;
-    }
-
-    // Update stage:current with last session timestamp (overwrite, not append)
-    if let Some(mut stage) = store.get("stage:current").await? {
-        stage.updated_at = now;
-        stage.version.logical_clock += 1;
-        stage.version.wall_clock = now;
-        let base = stage
-            .value
-            .lines()
-            .filter(|l| !l.starts_with("last_session:"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        stage.value = if base.is_empty() {
-            format!("last_session: {session_key}")
-        } else {
-            format!("{base}\nlast_session: {session_key}")
-        };
-        store.put("stage:current", &stage).await?;
-    }
-
-    Ok(())
+    sess::session_harvest(store, cwd).await
 }
 
-// ── M-12-D: Gotcha auto-promotion ───────────────────────────────────────
+// ── Test-only delegates ───────────────────────────────────────────────────────
+// Expose mati_core::store::session functions under the names the test suite
+// expects via `use super::*`.
 
-/// Minimum access count before an unconfirmed gotcha is auto-promoted.
-const GOTCHA_PROMOTION_ACCESS_THRESHOLD: u32 = 3;
-
-/// Promote gotcha candidates with sufficient access to confirmed status.
-///
-/// Scans `gotcha:*` records. For each with `confirmed == false` AND
-/// `access_count >= 3`: sets `confirmed = true`, bumps `confirmation_count`.
-/// Returns the number of promoted records.
+#[cfg(test)]
 async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
-    let gotchas = store.scan_prefix("gotcha:").await?;
-    let now = now_secs();
-    let mut promoted = 0u32;
-
-    for mut record in gotchas {
-        if record.access_count < GOTCHA_PROMOTION_ACCESS_THRESHOLD {
-            continue;
-        }
-
-        let mut gotcha: GotchaRecord = match record.payload_as::<GotchaRecord>() {
-            Some(g) => g,
-            None => continue,
-        };
-
-        if gotcha.confirmed {
-            continue;
-        }
-
-        gotcha.confirmed = true;
-        record.payload = serde_json::to_value(&gotcha).ok();
-        // NOTE: confirmation_count includes auto-promotions. Downstream consumers
-        // should not assume this counter reflects only human confirmations.
-        record.confidence.confirmation_count += 1;
-        record.updated_at = now;
-        record.version.logical_clock += 1;
-        record.version.wall_clock = now;
-
-        store.put(&record.key, &record).await?;
-        promoted += 1;
-    }
-
-    Ok(promoted)
+    sess::promote_gotcha_candidates(store).await
 }
 
-// ── M-13-C: Stale review collection ─────────────────────────────────────
-
-/// Format a date key for stale review analytics records.
-fn format_review_date(now_secs: u64) -> String {
-    let dt = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-        .unwrap_or_else(chrono::Utc::now);
-    dt.format("%Y-%m-%d").to_string()
-}
-
-/// Collect stale entries from consulted keys and store/merge into a daily review record.
-///
-/// Merges with any existing daily review (not overwrites). Deduplicates by key,
-/// sorts descending by staleness, and truncates to MAX_STALE_REVIEW_ENTRIES.
-/// Returns the number of new entries added.
+#[cfg(test)]
 async fn collect_and_store_stale_reviews(
     store: &Store,
     session_value: &str,
     now: u64,
 ) -> Result<usize> {
-    // Parse consulted keys from session value
-    let session: serde_json::Value = serde_json::from_str(session_value)?;
-    let consulted_keys = match session["consulted_keys"].as_array() {
-        Some(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect::<Vec<_>>(),
-        None => return Ok(0),
-    };
-
-    if consulted_keys.is_empty() {
-        return Ok(0);
-    }
-
-    // Collect entries from consulted keys that are in the stale range
-    let new_entries = collect_stale_entries(store, &consulted_keys).await?;
-    if new_entries.is_empty() {
-        return Ok(0);
-    }
-
-    let date = format_review_date(now);
-    let review_key = format!("analytics:stale_review_{date}");
-    let new_count = new_entries.len();
-
-    // Merge with existing daily review if present
-    let mut payload = match store.get(&review_key).await? {
-        Some(existing) => {
-            existing.payload_as::<StaleReviewPayload>()
-                .unwrap_or(StaleReviewPayload {
-                    session_timestamp: now,
-                    entries: vec![],
-                })
-        }
-        None => StaleReviewPayload {
-            session_timestamp: now,
-            entries: vec![],
-        },
-    };
-
-    // Merge: add new entries, dedup by key (newest wins)
-    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut merged = Vec::new();
-
-    // Add new entries first (they take priority)
-    for entry in new_entries {
-        if seen_keys.insert(entry.key.clone()) {
-            merged.push(entry);
-        }
-    }
-
-    // Then existing entries (skip duplicates)
-    for entry in payload.entries {
-        if seen_keys.insert(entry.key.clone()) {
-            merged.push(entry);
-        }
-    }
-
-    // Sort descending by staleness
-    merged.sort_by(|a, b| {
-        b.staleness_value
-            .partial_cmp(&a.staleness_value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Truncate
-    merged.truncate(MAX_STALE_REVIEW_ENTRIES);
-
-    payload.session_timestamp = now;
-    payload.entries = merged;
-
-    let mut record = analytics_record(&review_key, String::new());
-    record.payload = serde_json::to_value(&payload).ok();
-    store.put(&review_key, &record).await?;
-
-    Ok(new_count)
+    sess::collect_and_store_stale_reviews(store, session_value, now).await
 }
 
-/// Scan consulted keys, filter those in [STALE_REVIEW_MIN, STALE_REVIEW_MAX),
-/// excluding Liability/Tombstone tiers. Sort descending, truncate.
+#[cfg(test)]
 async fn collect_stale_entries(
     store: &Store,
     consulted_keys: &[String],
-) -> Result<Vec<StaleReviewEntry>> {
-    let mut entries = Vec::new();
-
-    for key in consulted_keys {
-        let record = match store.get(key).await? {
-            Some(r) => r,
-            None => continue,
-        };
-
-        // Exclude non-Active lifecycle
-        if !matches!(record.lifecycle, RecordLifecycle::Active) {
-            continue;
-        }
-
-        // Exclude Liability and Tombstone tiers
-        if matches!(
-            record.staleness.tier,
-            mati_core::store::StalenessTier::Liability | mati_core::store::StalenessTier::Tombstone
-        ) {
-            continue;
-        }
-
-        // Filter to [STALE_REVIEW_MIN, STALE_REVIEW_MAX) range
-        if record.staleness.value < STALE_REVIEW_MIN || record.staleness.value >= STALE_REVIEW_MAX {
-            continue;
-        }
-
-        let top_signals: Vec<String> = record
-            .staleness
-            .signals
-            .iter()
-            .take(3)
-            .map(|s| s.to_string())
-            .collect();
-
-        entries.push(StaleReviewEntry {
-            key: key.clone(),
-            staleness_value: record.staleness.value,
-            tier: record.staleness.tier.clone(),
-            last_updated: record.updated_at,
-            signals: top_signals,
-        });
-    }
-
-    // Sort descending by staleness
-    entries.sort_by(|a, b| {
-        b.staleness_value
-            .partial_cmp(&a.staleness_value)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    entries.truncate(MAX_STALE_REVIEW_ENTRIES);
-
-    Ok(entries)
-}
-
-// ── Shared helpers ───────────────────────────────────────────────────────────
-
-/// Upsert a daily aggregation record (miss or hit counter).
-async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
-    let now = now_secs();
-
-    match store.get(agg_key).await? {
-        Some(mut record) => {
-            let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
-                count: 0,
-                keys: vec![],
-            });
-            agg.count += 1;
-            if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
-                agg.keys.push(target_key.to_string());
-            }
-            record.payload = serde_json::to_value(&agg).ok();
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
-            store.put(agg_key, &record).await?;
-        }
-        None => {
-            let agg = DailyAgg {
-                count: 1,
-                keys: vec![target_key.to_string()],
-            };
-            let mut record = analytics_record(agg_key, String::new());
-            record.payload = serde_json::to_value(&agg).ok();
-            store.put(agg_key, &record).await?;
-        }
-    }
-
-    Ok(())
+) -> Result<Vec<mati_core::store::StaleReviewEntry>> {
+    sess::collect_stale_entries(store, consulted_keys).await
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -870,6 +405,17 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // Session helpers needed by tests — imported from mati_core::store::session.
+    use mati_core::store::session::{
+        analytics_record, format_review_date, session_record, today_key, now_secs,
+        upsert_daily_agg, DailyAgg, GOTCHA_PROMOTION_ACCESS_THRESHOLD, MAX_AGG_KEYS,
+        MAX_STALE_REVIEW_ENTRIES,
+    };
+    use mati_core::store::{
+        ConfidenceScore, Priority, QualityScore, RecordLifecycle, RecordSource, RecordVersion,
+        StaleReviewPayload, StalenessScore,
+    };
 
     // ── Test helpers ─────────────────────────────────────────────────────────
 

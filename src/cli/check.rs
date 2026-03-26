@@ -86,8 +86,8 @@ pub async fn run_silent(cwd: &Path) -> Vec<CheckItem> {
     // ── Check 3: mati on PATH ────────────────────────────────────────────────
     items.push(check_mati_on_path());
 
-    // ── Check 4: bc float math ───────────────────────────────────────────────
-    items.push(check_bc_float_math());
+    // ── Check 4: awk float math ──────────────────────────────────────────────
+    items.push(check_awk_float_math());
 
     // ── Check 5: hooks installed + executable ────────────────────────────────
     items.push(check_hooks(cwd));
@@ -179,10 +179,12 @@ fn check_mati_on_path() -> CheckItem {
     }
 }
 
-fn check_bc_float_math() -> CheckItem {
+fn check_awk_float_math() -> CheckItem {
+    // Hooks use awk for float comparison: `awk "BEGIN { exit !(0.7 >= 0.6) }"`
+    // Exit code 0 = true, non-zero = false.
     let result = std::process::Command::new("sh")
         .arg("-c")
-        .arg("echo '0.7 >= 0.6' | bc -l")
+        .arg(r#"awk "BEGIN { exit !(0.7 >= 0.6) }" && echo ok"#)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output();
@@ -190,26 +192,24 @@ fn check_bc_float_math() -> CheckItem {
     match result {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.trim() == "1" {
-                CheckItem::pass("bc float math", None)
+            if stdout.trim() == "ok" {
+                CheckItem::pass("awk float math", None)
             } else {
                 CheckItem::fail(
-                    "bc float math",
-                    "bc float math failed",
+                    "awk float math",
+                    "awk float math failed",
                     Some(
-                        "pre-read hook decision matrix will silently allow all reads until fixed\n\
-                         install: brew install bc (macOS) or apt install bc (Linux)"
+                        "pre-read hook decision matrix will silently allow all reads until fixed"
                             .to_string(),
                     ),
                 )
             }
         }
         Err(_) => CheckItem::fail(
-            "bc float math",
-            "bc not found",
+            "awk float math",
+            "awk not found",
             Some(
-                "pre-read hook decision matrix will silently allow all reads until fixed\n\
-                 install: brew install bc (macOS) or apt install bc (Linux)"
+                "pre-read hook decision matrix requires awk — install gawk or ensure awk is on PATH"
                     .to_string(),
             ),
         ),
@@ -447,14 +447,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // ── Check 4: bc float math ────────────────────────────────────────────────
+    // ── Check 4: awk float math ───────────────────────────────────────────────
 
     #[test]
-    fn check_bc_float_math_passes() {
-        // Spawn bc directly — if this machine has bc installed the check must pass.
+    fn check_awk_float_math_passes() {
+        // awk is available on all platforms where hooks run.
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg("echo '0.7 >= 0.6' | bc -l")
+            .arg(r#"awk "BEGIN { exit !(0.7 >= 0.6) }" && echo ok"#)
             .output();
 
         match out {
@@ -462,32 +462,30 @@ mod tests {
                 let stdout = String::from_utf8_lossy(&o.stdout);
                 assert_eq!(
                     stdout.trim(),
-                    "1",
-                    "bc should return 1 for 0.7 >= 0.6; got: {stdout:?}"
+                    "ok",
+                    "awk should exit 0 for 0.7 >= 0.6; got: {stdout:?}"
                 );
             }
             Err(e) => {
-                // bc not installed — skip rather than fail the test.
-                eprintln!("bc not available on this machine, skipping test: {e}");
+                eprintln!("awk not available on this machine, skipping test: {e}");
             }
         }
     }
 
     #[test]
-    fn check_bc_fail_produces_non_one_output() {
-        // Simulate bc failing by running a nonsense pipeline that echoes "0".
+    fn check_awk_fail_produces_non_ok_output() {
+        // Simulate awk failing — exit code 1 means false.
         let result = std::process::Command::new("sh")
             .arg("-c")
-            .arg("echo '0.7 >= 0.6' | no_such_program_bc_xyz -l 2>/dev/null || echo '0'")
+            .arg(r#"awk "BEGIN { exit !(0.5 >= 0.6) }" && echo ok || echo fail"#)
             .output();
 
         if let Ok(out) = result {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            // Output is "0" — which the check function would treat as failure.
-            assert_ne!(
+            assert_eq!(
                 stdout.trim(),
-                "1",
-                "expected failure output, got: {stdout:?}"
+                "fail",
+                "expected fail output for 0.5 >= 0.6; got: {stdout:?}"
             );
         }
     }

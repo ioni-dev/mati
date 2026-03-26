@@ -14,7 +14,6 @@ use rmcp::tool_router;
 
 use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
-use crate::health::confidence;
 use crate::store::record::{
     ContextPacket, FileRecord, GotchaRecord, Priority, QualityTier, Record, RecordLifecycle,
     StaleReviewPayload, StalenessTier,
@@ -64,6 +63,21 @@ impl MatiServer {
             tool_router: Self::tool_router(),
         }
     }
+
+    /// Construct from an already-wrapped Arc so callers can clone and share it
+    /// (e.g. to also start the daemon socket listener in the same process).
+    pub fn with_graph_arc(graph: Arc<tokio::sync::RwLock<Graph>>) -> Self {
+        Self {
+            graph,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Expose the inner Arc so the caller can share the graph with other tasks
+    /// (e.g. the daemon socket listener spawned alongside `mati serve`).
+    pub fn graph_arc(&self) -> Arc<tokio::sync::RwLock<Graph>> {
+        Arc::clone(&self.graph)
+    }
 }
 
 #[tool_router]
@@ -82,10 +96,16 @@ impl MatiServer {
             Ok(Some(mut record)) => {
                 // M-12-B: bump access_count on every MCP hit (mirrors mati log-hit hook path).
                 record.access_count += 1;
-                let new_confidence = confidence::recompute(&record);
-                record.confidence = new_confidence;
+                // Do NOT recompute confidence here. Confidence recomputation belongs in
+                // the health pipeline (mati stats / mati stale), not on every read.
+                // Writing back a formula-derived value would override confidence values
+                // intentionally bumped by mati init (e.g. co-change quality bump sets
+                // confidence=0.45 so pre-read hooks surface additionalContext).
                 // Best-effort write-back; don't fail the read on write error.
                 let _ = store.put(&params.key, &record).await;
+                // Write session:consulted marker so pre-read/pre-bash hooks know this key
+                // was looked up via MCP and can downgrade deny → allow+context on next access.
+                let _ = crate::store::session::log_hit(store, &params.key).await;
                 serde_json::to_string_pretty(&record).unwrap_or_else(|e| {
                     format!("{{\"error\": \"serialization failed: {e}\"}}")
                 })

@@ -149,6 +149,21 @@ async fn main() -> Result<()> {
         },
         Commands::Ping => {
             let cwd = std::env::current_dir()?;
+            // Try daemon socket first (avoids store open conflict when mati serve is running).
+            let root = cli::daemon::mati_root_for(&cwd)?;
+            match cli::daemon::daemon_result(&root, "ping", serde_json::json!({})).await {
+                cli::daemon::DaemonResult::Ok(_) => {
+                    println!("mati ok");
+                    return Ok(());
+                }
+                cli::daemon::DaemonResult::Unresponsive => {
+                    // Daemon alive but not responding — don't try to open store.
+                    anyhow::bail!("mati daemon unresponsive");
+                }
+                cli::daemon::DaemonResult::NotRunning | cli::daemon::DaemonResult::StaleSocket => {
+                    // No daemon — fall through to direct store open.
+                }
+            }
             let store = Store::open(&cwd).await?;
             let latency_us = store.ping().await?;
             println!("mati ok  {latency_us}µs");

@@ -210,11 +210,12 @@ fn parse_ecma(
         unwrap_count: 0,
         panic_count: 0,
         branch_count: 0,
-        module_doc: None, // TypeScript @fileoverview not implemented yet
+        module_doc: None,
         content_hash: None,
         line_count: 0,
     };
 
+    let mut doc_lines: Vec<(usize, String)> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     for m in cursor.matches(query, tree.root_node(), src) {
         for capture in m.captures {
@@ -247,12 +248,54 @@ fn parse_ecma(
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
-                    let line = node.start_position().row as u32 + 1;
+                    let row = node.start_position().row;
+                    let line = row as u32 + 1;
                     if let Some(todo) = extract_todo(text, line) {
                         out.todos.push(todo);
                     }
+                    // Capture file-top comments as module doc.
+                    // Handles JSDoc block (`/** ... */`) and line (`// ...`) styles.
+                    if row < 5 {
+                        if text.starts_with("/**") {
+                            let inner = text
+                                .trim_start_matches("/**")
+                                .trim_end_matches("*/")
+                                .trim();
+                            let collapsed: String = inner
+                                .lines()
+                                .map(|l| l.trim().trim_start_matches('*').trim())
+                                .filter(|l| !l.is_empty() && !l.starts_with('@'))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            if !collapsed.is_empty() {
+                                doc_lines.push((row, collapsed));
+                            }
+                        } else if text.starts_with("//") {
+                            let stripped = text
+                                .trim_start_matches("//")
+                                .trim()
+                                .to_string();
+                            if !stripped.is_empty() {
+                                doc_lines.push((row, stripped));
+                            }
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    if !doc_lines.is_empty() {
+        doc_lines.sort_by_key(|(r, _)| *r);
+        let start_row = doc_lines[0].0;
+        let contiguous: Vec<&str> = doc_lines
+            .iter()
+            .enumerate()
+            .take_while(|(i, (r, _))| *r == start_row + i)
+            .map(|(_, (_, text))| text.as_str())
+            .collect();
+        if !contiguous.is_empty() {
+            out.module_doc = Some(super::normalize_doc(&contiguous.join(" ")));
         }
     }
 

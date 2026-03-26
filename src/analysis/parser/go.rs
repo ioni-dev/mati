@@ -115,6 +115,7 @@ pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnal
         line_count: 0,
     };
 
+    let mut doc_lines: Vec<(usize, String)> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     for m in cursor.matches(query, tree.root_node(), src) {
         for capture in m.captures {
@@ -143,12 +144,39 @@ pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnal
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
-                    let line = node.start_position().row as u32 + 1;
+                    let row = node.start_position().row;
+                    let line = row as u32 + 1;
                     if let Some(todo) = extract_todo(text, line) {
                         out.todos.push(todo);
                     }
+                    // Capture file-top `// ...` comments as package doc.
+                    // Go convention: package doc is a block of // comments
+                    // immediately before the package declaration.
+                    if row < 10 {
+                        let stripped = text.trim_start_matches("//").trim().to_string();
+                        if !stripped.is_empty()
+                            && !stripped.starts_with("go:build")
+                            && !stripped.starts_with("+build")
+                        {
+                            doc_lines.push((row, stripped));
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    if !doc_lines.is_empty() {
+        doc_lines.sort_by_key(|(r, _)| *r);
+        let start_row = doc_lines[0].0;
+        let contiguous: Vec<&str> = doc_lines
+            .iter()
+            .enumerate()
+            .take_while(|(i, (r, _))| *r == start_row + i)
+            .map(|(_, (_, text))| text.as_str())
+            .collect();
+        if !contiguous.is_empty() {
+            out.module_doc = Some(super::normalize_doc(&contiguous.join(" ")));
         }
     }
 
