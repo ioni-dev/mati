@@ -154,7 +154,7 @@ async fn serve_daemon_socket(
             return;
         }
     };
-    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    let _ = std::fs::write(&pid_path, format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()));
     tracing::debug!("daemon socket ready at {} (MCP-embedded)", sock_path.display());
 
     loop {
@@ -348,6 +348,24 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                     Ok(val) => SocketResponse::ok(val),
                     Err(e) => SocketResponse::err(format!("serialize: {e}")),
                 },
+                Err(e) => SocketResponse::err(format!("store: {e}")),
+            }
+        }
+
+        "put" => {
+            use crate::store::Record;
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            let record: Record = match req.args.get("record")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            {
+                Some(r) => r,
+                None => return SocketResponse::err("put: invalid record"),
+            };
+            match store.put(key, &record).await {
+                Ok(()) => SocketResponse::ok(serde_json::Value::Null),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
         }

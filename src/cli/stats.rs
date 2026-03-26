@@ -12,6 +12,7 @@ use mati_core::store::{
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct StatsArgs {}
@@ -85,19 +86,19 @@ fn now_secs() -> u64 {
 
 pub async fn run(_args: StatsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
-    let current_seq = store.read_write_seq();
-    if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
+    let current_seq = proxy.read_write_seq();
+    if let Ok(Some(cached)) = proxy.get(SNAPSHOT_KEY).await {
         if let Some(snapshot) = cached.payload_as::<HealthSnapshot>() {
             let age = now.saturating_sub(snapshot.computed_at);
             if snapshot.write_seq == current_seq
                 && age < SNAPSHOT_MAX_AGE_SECS
             {
                 display_cached_stats(&snapshot, age, &cwd);
-                store.close().await?;
+                proxy.close().await?;
                 return Ok(());
             }
         }
@@ -123,11 +124,11 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // ── Scan all namespaces (once — results are reused by gaps + onboarding) ──
 
     let (files, gotchas, decisions, notes, deps) = tokio::try_join!(
-        store.scan_prefix("file:"),
-        store.scan_prefix("gotcha:"),
-        store.scan_prefix("decision:"),
-        store.scan_prefix("dev_note:"),
-        store.scan_prefix("dep:"),
+        proxy.scan_prefix("file:"),
+        proxy.scan_prefix("gotcha:"),
+        proxy.scan_prefix("decision:"),
+        proxy.scan_prefix("dev_note:"),
+        proxy.scan_prefix("dep:"),
     )?;
 
     // ── Project name ───────────────────────────────────────────────────────────
@@ -308,7 +309,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
     println!("  {bold}{blue}Compliance (7d){reset}");
 
-    let (hits_7d, misses_7d, bypasses_7d) = scan_compliance_7d(&store, now).await;
+    let (hits_7d, misses_7d, bypasses_7d) = scan_compliance_7d(&proxy, now).await;
 
     let total_lookups = hits_7d + misses_7d;
     let hit_rate = if total_lookups > 0 {
@@ -383,13 +384,13 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         write_seq: current_seq,
     };
 
-    write_snapshot_record(&store, &snapshot, now).await?;
+    write_snapshot_record_proxy(&proxy, &snapshot, now).await?;
 
     println!(
         "  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}\n"
     );
 
-    store.close().await?;
+    proxy.close().await?;
     Ok(())
 }
 
@@ -422,6 +423,35 @@ async fn write_snapshot_record(store: &Store, snapshot: &HealthSnapshot, now: u6
         gap_analysis_score: 0.0,
     };
     store.put(SNAPSHOT_KEY, &record).await
+}
+
+/// Write a `HealthSnapshot` via a `StoreProxy` (used by `run()`).
+async fn write_snapshot_record_proxy(proxy: &StoreProxy, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+    let record = Record {
+        key: SNAPSHOT_KEY.to_string(),
+        value: String::new(),
+        payload: serde_json::to_value(snapshot).ok(),
+        category: Category::Analytics,
+        priority: Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::StaticAnalysis,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+        gap_analysis_score: 0.0,
+    };
+    proxy.put(SNAPSHOT_KEY, &record).await
 }
 
 /// Compute and persist a `HealthSnapshot` from pre-loaded record slices.
@@ -695,7 +725,7 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 
 /// Scan analytics:hit_*, analytics:miss_*, and compliance:miss_* for the last
 /// 7 days and return (total_hits, total_misses, total_bypasses).
-async fn scan_compliance_7d(store: &Store, now: u64) -> (u64, u64, u64) {
+async fn scan_compliance_7d(proxy: &StoreProxy, now: u64) -> (u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
     let mut bypasses: u64 = 0;
@@ -709,19 +739,19 @@ async fn scan_compliance_7d(store: &Store, now: u64) -> (u64, u64, u64) {
         let miss_key = format!("analytics:miss_{date}");
         let bypass_key = format!("compliance:miss_{date}");
 
-        if let Ok(Some(record)) = store.get(&hit_key).await {
+        if let Ok(Some(record)) = proxy.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 hits += agg.count;
             }
         }
 
-        if let Ok(Some(record)) = store.get(&miss_key).await {
+        if let Ok(Some(record)) = proxy.get(&miss_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 misses += agg.count;
             }
         }
 
-        if let Ok(Some(record)) = store.get(&bypass_key).await {
+        if let Ok(Some(record)) = proxy.get(&bypass_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 bypasses += agg.count;
             }

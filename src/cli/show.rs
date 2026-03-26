@@ -11,6 +11,7 @@ use mati_core::store::{
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 // ── Arg types ─────────────────────────────────────────────────────────────────
 
@@ -65,15 +66,16 @@ pub struct ImportArgs {
 
 pub async fn run_show(args: ShowArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
-    let record = match store.get(&args.key).await? {
+    let record = match proxy.get(&args.key).await? {
         Some(r) => r,
         None => anyhow::bail!("no record found for key '{}'", args.key),
     };
 
     let use_color = std::io::stdout().is_terminal();
     print_record(&record, use_color);
+    proxy.close().await?;
     Ok(())
 }
 
@@ -592,13 +594,15 @@ async fn ls_decisions(store: &Store, _use_color: bool) -> Result<()> {
 
 pub async fn run_export(args: ExportArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
     let output = match args.format.as_str() {
-        "json" => export_json(&store).await?,
-        "md" | "markdown" => export_md(&store).await?,
+        "json" => export_json(&proxy).await?,
+        "md" | "markdown" => export_md(&proxy).await?,
         other => anyhow::bail!("unknown format '{other}'. Valid: md, json"),
     };
+
+    proxy.close().await?;
 
     match args.output {
         Some(path) => std::fs::write(&path, &output)?,
@@ -607,15 +611,15 @@ pub async fn run_export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-async fn export_json(store: &Store) -> Result<String> {
+async fn export_json(proxy: &StoreProxy) -> Result<String> {
     let mut all: Vec<Record> = Vec::new();
     for prefix in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
-        all.extend(store.scan_prefix(prefix).await?);
+        all.extend(proxy.scan_prefix(prefix).await?);
     }
     Ok(serde_json::to_string_pretty(&all)?)
 }
 
-async fn export_md(store: &Store) -> Result<String> {
+async fn export_md(proxy: &StoreProxy) -> Result<String> {
     let mut out = String::from("# mati knowledge export\n\n");
 
     let sections: &[(&str, &str)] = &[
@@ -627,7 +631,7 @@ async fn export_md(store: &Store) -> Result<String> {
     ];
 
     for &(prefix, heading) in sections {
-        let records = store.scan_prefix(prefix).await?;
+        let records = proxy.scan_prefix(prefix).await?;
         if records.is_empty() {
             continue;
         }

@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, QualityTier,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, Store,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct StatusArgs {}
@@ -64,17 +65,17 @@ fn now_secs() -> u64 {
 
 pub async fn run(_args: StatusArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
-    let current_seq = store.read_write_seq();
-    if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
+    let current_seq = proxy.read_write_seq();
+    if let Ok(Some(cached)) = proxy.get(SNAPSHOT_KEY).await {
         if let Some(snap) = cached.payload_as::<StatusSnapshot>() {
             let age = now.saturating_sub(snap.computed_at);
             if snap.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
                 display_cached_status(&snap, age, &cwd);
-                store.close().await?;
+                proxy.close().await?;
                 return Ok(());
             }
         }
@@ -98,11 +99,11 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
 
     // ── Scan all namespaces in parallel ───────────────────────────────────
     let (files, gotchas, decisions, notes, deps) = tokio::try_join!(
-        store.scan_prefix("file:"),
-        store.scan_prefix("gotcha:"),
-        store.scan_prefix("decision:"),
-        store.scan_prefix("dev_note:"),
-        store.scan_prefix("dep:"),
+        proxy.scan_prefix("file:"),
+        proxy.scan_prefix("gotcha:"),
+        proxy.scan_prefix("decision:"),
+        proxy.scan_prefix("dev_note:"),
+        proxy.scan_prefix("dep:"),
     )?;
 
     // ── Project name from cwd ─────────────────────────────────────────────
@@ -245,14 +246,14 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         write_seq: current_seq,
         computed_at: now,
     };
-    let _ = write_snapshot_record(&store, &snap, now).await;
+    let _ = write_snapshot_record(&proxy, &snap, now).await;
 
-    store.close().await?;
+    proxy.close().await?;
     Ok(())
 }
 
-/// Write a `StatusSnapshot` to `SNAPSHOT_KEY` in the store.
-async fn write_snapshot_record(store: &Store, snap: &StatusSnapshot, now: u64) -> Result<()> {
+/// Write a `StatusSnapshot` to `SNAPSHOT_KEY` via a `StoreProxy`.
+async fn write_snapshot_record(proxy: &StoreProxy, snap: &StatusSnapshot, now: u64) -> Result<()> {
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
         value: String::new(),
@@ -277,7 +278,7 @@ async fn write_snapshot_record(store: &Store, snap: &StatusSnapshot, now: u64) -
         confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
         gap_analysis_score: 0.0,
     };
-    store.put(SNAPSHOT_KEY, &record).await
+    proxy.put(SNAPSHOT_KEY, &record).await
 }
 
 /// Render status output from a cached snapshot.
