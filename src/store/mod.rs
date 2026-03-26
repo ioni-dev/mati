@@ -9,6 +9,7 @@
 pub mod db;
 pub mod durability;
 pub mod record;
+pub mod session;
 
 pub use db::{derive_slug, Store};
 pub use durability::Durability;

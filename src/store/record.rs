@@ -193,6 +193,19 @@ impl QualityScore {
     /// Paired with `confidence = 0.45` (0.3–0.6 band) → additionalContext injection.
     /// `confirmed: true` is set on the gotcha because co-change is objective git data,
     /// but the confidence band keeps it out of the deny+inject path.
+    /// Quality for a developer-manually-added record (`mati gotcha add`, `mati note`).
+    ///
+    /// `Good` tier (0.65): developer is explicitly asserting the record is important.
+    /// Paired with `DeveloperManual` confidence (0.80) + `confirmed=true` → deny+inject path.
+    pub fn developer_entry_default() -> Self {
+        Self {
+            value: 0.65,
+            tier: QualityTier::Good,
+            signals: vec![],
+            computed_at: 0,
+        }
+    }
+
     pub fn cochange_default() -> Self {
         Self {
             value: 0.40,

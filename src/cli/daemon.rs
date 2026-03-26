@@ -51,7 +51,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use mati_core::store::{derive_slug, Store};
+use mati_core::graph::edges::{Edge, EdgeKind};
+use mati_core::store::{derive_slug, Store, TombstoneReason};
 
 // ── CLI subcommand types ──────────────────────────────────────────────────────
 
@@ -386,6 +387,9 @@ async fn dispatch(store: &Store, repo_root: &Path, req: &Request) -> Response {
         "session_check_consulted" => cmd_session_check_consulted(store, &req.args).await,
         "edit_hook"               => cmd_edit_hook(store, repo_root, &req.args).await,
         "session_flush"           => cmd_session_flush(store).await,
+        "scan_prefix"             => cmd_scan_prefix(store, &req.args).await,
+        "gotcha_write"            => cmd_gotcha_write(store, &req.args).await,
+        "gotcha_tombstone"        => cmd_gotcha_tombstone(store, &req.args).await,
         "ping"                    => Response::ok(serde_json::Value::String("pong".into())),
         other => Response::err(format!("unknown command: {other}")),
     }
@@ -399,10 +403,23 @@ async fn cmd_get(store: &Store, args: &serde_json::Value) -> Response {
         None => return Response::err("missing args.key"),
     };
     match store.get(key).await {
-        Ok(Some(record)) => match serde_json::to_value(&record) {
-            Ok(val) => Response::ok(val),
-            Err(e) => Response::err(format!("serialize error: {e}")),
-        },
+        Ok(Some(record)) => {
+            // Add top-level `confirmed` field so hook scripts can read `.confirmed`
+            // without knowing the category. Mirrors extract_confirmed in cli/hooks.rs.
+            let confirmed = record
+                .payload_as::<mati_core::store::GotchaRecord>()
+                .map(|g| g.confirmed)
+                .unwrap_or(false);
+            match serde_json::to_value(&record) {
+                Ok(mut val) => {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("confirmed".to_string(), serde_json::Value::Bool(confirmed));
+                    }
+                    Response::ok(val)
+                }
+                Err(e) => Response::err(format!("serialize error: {e}")),
+            }
+        }
         Ok(None) => Response::ok(serde_json::Value::Null),
         Err(e) => Response::err(format!("store error: {e}")),
     }
@@ -526,6 +543,116 @@ async fn cmd_session_flush(store: &Store) -> Response {
         Ok(()) => Response::ok(serde_json::Value::String("flushed".into())),
         Err(e) => Response::err(format!("store error: {e}")),
     }
+}
+
+async fn cmd_scan_prefix(store: &Store, args: &serde_json::Value) -> Response {
+    let prefix = match args.get("prefix").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return Response::err("missing args.prefix"),
+    };
+    match store.scan_prefix(prefix).await {
+        Ok(records) => match serde_json::to_value(&records) {
+            Ok(val) => Response::ok(val),
+            Err(e) => Response::err(format!("serialize error: {e}")),
+        },
+        Err(e) => Response::err(format!("store error: {e}")),
+    }
+}
+
+/// Write a gotcha record + update affected file records + persist graph edges.
+/// Used by `mati gotcha add/edit` when the daemon holds the store lock.
+async fn cmd_gotcha_write(store: &Store, args: &serde_json::Value) -> Response {
+    let record: Record = match args.get("record").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        Some(r) => r,
+        None => return Response::err("missing or invalid args.record"),
+    };
+    let key = record.key.clone();
+
+    let new_files: Vec<String> = args.get("new_files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let old_files: Vec<String> = args.get("old_files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    if let Err(e) = store.put(&key, &record).await {
+        return Response::err(format!("store put: {e}"));
+    }
+
+    let old_set: std::collections::HashSet<&str> = old_files.iter().map(String::as_str).collect();
+    let new_set: std::collections::HashSet<&str> = new_files.iter().map(String::as_str).collect();
+
+    // Add gotcha_keys + edges for new files
+    for file_path in &new_files {
+        let file_key = format!("file:{file_path}");
+        if let Ok(Some(mut file_record)) = store.get(&file_key).await {
+            match file_record.payload.as_mut() {
+                Some(payload) => {
+                    if let Some(arr) = payload.get_mut("gotcha_keys").and_then(|v| v.as_array_mut()) {
+                        if !arr.iter().any(|v| v.as_str() == Some(key.as_str())) {
+                            arr.push(serde_json::Value::String(key.clone()));
+                        }
+                    } else if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("gotcha_keys".into(), serde_json::json!([&key]));
+                    }
+                }
+                None => file_record.payload = Some(serde_json::json!({ "gotcha_keys": [&key] })),
+            }
+            let _ = store.put(&file_key, &file_record).await;
+        }
+        if !old_set.contains(file_path.as_str()) {
+            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
+            let ts = now_secs().to_le_bytes();
+            let _ = store.put_raw(&edge_key, &ts).await;
+        }
+    }
+
+    // Remove edges for files no longer affected
+    for file_path in &old_files {
+        if !new_set.contains(file_path.as_str()) {
+            let file_key = format!("file:{file_path}");
+            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
+            let _ = store.delete(&edge_key).await;
+        }
+    }
+
+    Response::ok(serde_json::Value::String("written".into()))
+}
+
+/// Tombstone a gotcha record and remove its HasGotcha graph edges.
+/// Used by `mati gotcha delete` when the daemon holds the store lock.
+async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Response {
+    let key = match args.get("key").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return Response::err("missing args.key"),
+    };
+    let affected_files: Vec<String> = args.get("affected_files")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    match store.get(key).await {
+        Ok(Some(mut record)) => {
+            let now = now_secs();
+            record.lifecycle =
+                RecordLifecycle::Tombstoned { reason: TombstoneReason::ManualDeletion, at: now };
+            record.updated_at = now;
+            record.version.logical_clock += 1;
+            record.version.wall_clock = now;
+            if let Err(e) = store.put(key, &record).await {
+                return Response::err(format!("store put: {e}"));
+            }
+        }
+        Ok(None) => return Response::err(format!("record not found: {key}")),
+        Err(e) => return Response::err(format!("store get: {e}")),
+    }
+
+    for file_path in &affected_files {
+        let file_key = format!("file:{file_path}");
+        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
+        let _ = store.delete(&edge_key).await;
+    }
+
+    Response::ok(serde_json::Value::String("tombstoned".into()))
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────

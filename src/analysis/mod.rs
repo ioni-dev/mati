@@ -12,6 +12,7 @@ pub mod deps;
 pub mod edges;
 pub mod git;
 pub mod parser;
+pub mod reparse;
 pub mod walker;
 
 pub use claude_md::{import_claude_md, ClaudeMdImport};

@@ -43,7 +43,7 @@ const SETTINGS_JSON: &str = r#"{
     ],
     "PostToolUse": [
       {
-        "matcher": "Read|Glob|Grep|Bash",
+        "matcher": "Read|Glob|Grep",
         "hooks": [
           {
             "type": "command",
@@ -122,6 +122,9 @@ pub enum InstallResult {
 ///
 /// - Merges mati's `hooks` key into existing `.claude/settings.json`,
 ///   preserving any user-defined settings (permissions, env vars, etc.).
+/// - Writes `.mcp.json` to the project root for MCP server registration.
+///   Claude Code reads `mcpServers` from `.mcp.json` at the project root;
+///   the `mcpServers` key in `.claude/settings.json` is kept as a fallback.
 /// - Creates `.claude/hooks/` and writes pass-through stub scripts.
 /// - Existing scripts are overwritten (mati owns these files).
 /// - Only proceeds if `.claude/` already exists.
@@ -135,6 +138,11 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
     let settings_path = claude_dir.join("settings.json");
     merge_hooks_into_settings(&settings_path)
         .with_context(|| format!("failed to update {}", settings_path.display()))?;
+
+    // Write .mcp.json to project root — Claude Code's primary MCP config location.
+    let mcp_json_path = project_root.join(".mcp.json");
+    write_mcp_json(&mcp_json_path)
+        .with_context(|| format!("failed to write {}", mcp_json_path.display()))?;
 
     // Create hooks directory and write scripts.
     let hooks_dir = claude_dir.join("hooks");
@@ -156,13 +164,31 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
     })
 }
 
+/// Resolve the absolute path to the running mati binary.
+///
+/// Claude Code spawns MCP server processes with a restricted PATH that may not
+/// include `~/.cargo/bin`. Using the absolute path guarantees the server starts
+/// regardless of the subprocess environment.
+fn mati_binary_path() -> String {
+    // std::env::current_exe() returns the path of the currently-running binary.
+    // Fall back to the bare name if resolution fails (e.g. during tests).
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mati".to_owned())
+}
+
 /// Merge mati's hook and MCP server registration into an existing settings.json.
 ///
 /// If the file doesn't exist, writes the full settings. If it exists,
 /// parses it, replaces only the `hooks` and `mcpServers` keys, and writes
 /// back — preserving all other user settings.
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
-    let mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
+    let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
+    // Inject absolute binary path so Claude Code can find it regardless of PATH.
+    mati_settings["mcpServers"]["mati"]["command"] =
+        serde_json::Value::String(mati_binary_path());
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -188,6 +214,28 @@ fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     };
 
     let output = serde_json::to_string_pretty(&merged)?;
+    write_if_changed(path, &output)?;
+    Ok(())
+}
+
+/// Write `.mcp.json` to the project root with the mati MCP server registration.
+///
+/// Claude Code reads MCP server configuration from `.mcp.json` at the project
+/// root — this is the primary mechanism; `mcpServers` in `.claude/settings.json`
+/// is kept as a fallback for older Claude Code versions.
+///
+/// Uses the absolute binary path so Claude Code can find mati regardless of
+/// the restricted PATH it uses when spawning MCP server subprocesses.
+fn write_mcp_json(path: &Path) -> Result<()> {
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "mati": {
+                "command": mati_binary_path(),
+                "args": ["serve"]
+            }
+        }
+    });
+    let output = serde_json::to_string_pretty(&mcp_config)?;
     write_if_changed(path, &output)?;
     Ok(())
 }
@@ -265,7 +313,9 @@ mod tests {
         assert!(parsed["hooks"]["PreCompact"].is_array());
         assert!(parsed["hooks"]["SessionEnd"].is_array());
         // MCP server registered.
-        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
+        // command is an absolute path to the mati binary (not the bare name).
+        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
+        assert!(!cmd.is_empty(), "command should not be empty");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
     }
 
@@ -289,8 +339,9 @@ mod tests {
         assert_eq!(parsed["env"]["DEBUG"], "true");
         // Hooks added.
         assert!(parsed["hooks"]["PreToolUse"].is_array());
-        // MCP server added.
-        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
+        // MCP server added with absolute path.
+        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
+        assert!(!cmd.is_empty());
     }
 
     #[test]
@@ -310,8 +361,9 @@ mod tests {
 
         // Existing server preserved.
         assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
-        // mati server added alongside.
-        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
+        // mati server added alongside with absolute path.
+        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
+        assert!(!cmd.is_empty());
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
     }
 
@@ -344,6 +396,23 @@ mod tests {
     }
 
     #[test]
+    fn writes_mcp_json_to_project_root() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+
+        install_hooks(dir.path()).unwrap();
+
+        let mcp_json_path = dir.path().join(".mcp.json");
+        assert!(mcp_json_path.exists(), ".mcp.json should be written to project root");
+
+        let content = std::fs::read_to_string(&mcp_json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
+        assert!(!cmd.is_empty(), "command must not be empty");
+        assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
+    }
+
+    #[test]
     fn idempotent_on_rerun() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
@@ -351,11 +420,14 @@ mod tests {
         install_hooks(dir.path()).unwrap();
         let first_content =
             std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        let first_mcp = std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
 
         install_hooks(dir.path()).unwrap();
         let second_content =
             std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        let second_mcp = std::fs::read_to_string(dir.path().join(".mcp.json")).unwrap();
 
         assert_eq!(first_content, second_content);
+        assert_eq!(first_mcp, second_mcp);
     }
 }
