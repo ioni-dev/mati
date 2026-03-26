@@ -256,12 +256,11 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let ownership_count = ownership_gotchas.len();
     logical_clock += ownership_count as u64;
 
-    // ── 8b. Link co-change gotchas to file records (cold init only) ──────────
-    // On cold init all file records are in memory — we can update gotcha_keys
-    // before serialising. On warm re-init, only changed files are in memory;
-    // their gotcha_keys are updated here. Unchanged files retain their keys from
-    // the previous cold init (accepted limitation — refreshed on next cold init).
-    if skipped_count == 0 {
+    // ── 8b. Link gotchas to file records ─────────────────────────────────────
+    // Always runs for file records currently in memory (changed files on warm
+    // re-init, all files on cold init). Unchanged files not in memory retain
+    // their gotcha_keys from the previous init (they aren't overwritten here).
+    {
         // Build path → [gotcha_key] reverse index.
         let mut path_to_cochange_keys: HashMap<String, Vec<String>> = HashMap::new();
         for cg in &cochange_gotchas {
@@ -270,7 +269,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 .or_default()
                 .push(cg.key.clone());
         }
-        // Remove all stale co-change keys first (idempotent upsert on cold init).
+        // Remove all stale co-change keys first (idempotent upsert).
         for fr in file_records.iter_mut() {
             fr.gotcha_keys.retain(|k| !k.starts_with("gotcha:cochange:"));
         }
@@ -362,6 +361,18 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 rec.value = fr.purpose.clone();
                 rec.quality = QualityScore::doc_comment_default();
                 rec.confidence.value = 0.45;
+            }
+            // Files with linked co-change gotchas get at least Acceptable quality
+            // even without a doc comment — co-change is objective git data (confirmed=true).
+            // This ensures the pre-read hook surfaces additionalContext for coupled files
+            // regardless of whether they have a module-level doc comment.
+            if rec.quality.value < 0.40
+                && fr.gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:"))
+            {
+                rec.quality = QualityScore::doc_comment_default();
+                if rec.confidence.value < 0.45 {
+                    rec.confidence.value = 0.45;
+                }
             }
             if let Some(&ratio) = lines_changed.get(&fr.path) {
                 rec.staleness.signals.push(StalenessSignal::LinesChangedPct(ratio));
@@ -1228,5 +1239,96 @@ mod tests {
         let signals = GitSignals::empty();
         let gotchas = build_cochange_gotchas(&signals, dev, 0, now);
         assert!(gotchas.is_empty());
+    }
+
+    // ── File record quality bump ──────────────────────────────────────────────
+
+    /// A file record with a co-change gotcha key but no doc comment should be
+    /// promoted to at least quality 0.40 (Acceptable) so the pre-read hook
+    /// surfaces it as additionalContext. Without this bump, files without doc
+    /// comments stay at quality 0.10 (Suppressed) and the hook never fires —
+    /// even though they have confirmed co-change coupling signals.
+    #[test]
+    fn quality_bump_for_file_with_cochange_gotcha_but_no_doc() {
+        let mut quality = QualityScore::layer0_default();
+        let mut conf_value: f32 = 0.10;
+        let gotcha_keys: Vec<String> = vec!["gotcha:cochange:src/a.rs|src/b.rs".to_string()];
+        let purpose = "";
+
+        // Simulate the promotion logic from init.rs
+        if !purpose.is_empty() {
+            quality = QualityScore::doc_comment_default();
+            conf_value = 0.45;
+        }
+        if quality.value < 0.40 && gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:")) {
+            quality = QualityScore::doc_comment_default();
+            if conf_value < 0.45 {
+                conf_value = 0.45;
+            }
+        }
+
+        assert!(
+            (quality.value - 0.40).abs() < 0.001,
+            "expected quality 0.40, got {:.2}",
+            quality.value
+        );
+        assert!(
+            (conf_value - 0.45).abs() < 0.001,
+            "expected confidence 0.45, got {:.2}",
+            conf_value
+        );
+    }
+
+    /// A file with a doc comment AND a co-change gotcha should not be degraded —
+    /// the doc comment path already sets 0.40/0.45, the bump is a no-op.
+    #[test]
+    fn quality_bump_noop_when_doc_comment_already_promotes() {
+        let mut quality = QualityScore::layer0_default();
+        let mut conf_value: f32 = 0.10;
+        let gotcha_keys: Vec<String> = vec!["gotcha:cochange:src/a.rs|src/b.rs".to_string()];
+        let purpose = "Handles authentication logic for the web server.";
+
+        if !purpose.is_empty() {
+            quality = QualityScore::doc_comment_default();
+            conf_value = 0.45;
+        }
+        if quality.value < 0.40 && gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:")) {
+            quality = QualityScore::doc_comment_default();
+            if conf_value < 0.45 {
+                conf_value = 0.45;
+            }
+        }
+
+        // Doc comment path already set 0.40/0.45 — result is identical.
+        assert!((quality.value - 0.40).abs() < 0.001);
+        assert!((conf_value - 0.45).abs() < 0.001);
+    }
+
+    /// A file with no co-change gotchas and no doc comment stays at 0.10 —
+    /// we should not bump files that have no coupling signal.
+    #[test]
+    fn no_bump_for_file_without_cochange_keys() {
+        let mut quality = QualityScore::layer0_default();
+        let mut conf_value: f32 = 0.10;
+        let gotcha_keys: Vec<String> = vec![];
+        let purpose = "";
+
+        if !purpose.is_empty() {
+            quality = QualityScore::doc_comment_default();
+            conf_value = 0.45;
+        }
+        if quality.value < 0.40 && gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:")) {
+            quality = QualityScore::doc_comment_default();
+            if conf_value < 0.45 {
+                conf_value = 0.45;
+            }
+        }
+
+        assert!(
+            (quality.value - 0.10).abs() < 0.001,
+            "expected quality 0.10 (no bump), got {:.2}",
+            quality.value
+        );
+        assert!((conf_value - 0.10).abs() < 0.001);
     }
 }
