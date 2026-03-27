@@ -25,11 +25,11 @@ use crate::store::record::{
 
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
-/// Vector B — appended to every mem_bootstrap result.
-const VECTOR_B: &str = "\n\n[mati] Before reading any file, call mem_get(\"file:<path>\") first.\n\
-    Records with confirmed=true and confidence >= 0.6 replace file reads.\n\
-    The PreToolUse hook enforces this automatically.\n\
-    Low-confidence records (confidence < 0.3) should be verified by file read.";
+/// Vector B — appended to every mem_bootstrap result (70 tokens, budget 77).
+const VECTOR_B: &str = "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
+    confidence>=0.6 + confirmed=true \u{2192} use record, skip file read.\n\
+    confidence<0.3 \u{2192} read file, then consider mem_set to improve.\n\
+    Dev says \"add that as a gotcha\" \u{2192} call mem_set (category=Gotcha, confirmed=false).";
 
 /// Token budget for mem_bootstrap output (ARCHITECTURE.md §6).
 const TOKEN_BUDGET: usize = 2_000;
@@ -211,7 +211,7 @@ impl MatiServer {
     /// to confirm and activate hook enforcement.
     #[rmcp::tool(
         name = "mem_set",
-        description = "Write an enriched knowledge record to the mati store. Used during /mati-enrich sessions. Key must start with file:, gotcha:, decision:, or dev_note:. Gotchas land as unconfirmed — developer runs `mati review` to activate hook enforcement."
+        description = "Write enriched knowledge to the mati store. \n\nUSE FOR: (1) /mati-enrich file/directory enrichment, (2) inline capture when developer says 'add that as a gotcha' / 'remember this' / 'note that'. \n\nGOTCHA RULES: rule MUST start with imperative verb (Always/Never/Ensure/Do not). reason MUST state causality — what breaks and why. confirmed MUST be false. \n\nFILE RULES: value and purpose MUST start with a verb (Handles/Manages/Validates). Preserve all existing structural fields from mem_get — only update purpose and gotcha_keys. \n\nAFTER WRITING GOTCHAS: always remind developer to run `mati review` to activate hooks. \n\nQUALITY GATE: records with quality < 0.2 are suppressed and never injected. Imperative verb + causality reason = quality >= 0.4 (injectable)."
     )]
     async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
         let graph = self.graph.read().await;

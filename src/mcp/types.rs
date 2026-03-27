@@ -47,20 +47,43 @@ fn default_priority() -> String {
 /// Parameters for the `mem_set` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MemSetParams {
-    /// Namespaced key: "file:src/payments/stripe.go" or "gotcha:stripe-idempotency"
+    #[schemars(description = "\
+        Namespaced key. Patterns: \
+        file:src/payments/stripe.go | \
+        gotcha:stripe-idempotency-key-required | \
+        decision:unified-retry-strategy | \
+        dev_note:deployment-checklist")]
     pub key: String,
-    /// Human-readable value (tantivy-indexed). For files: purpose sentence.
-    /// For gotchas: "{rule} because {reason}"
+
+    #[schemars(description = "\
+        Human-readable text (tantivy-indexed). \
+        Gotcha: '{rule} because {reason}'. \
+        File: purpose sentence starting with a verb. \
+        Decision: 'We use X because Y'. \
+        DevNote: freeform observation.")]
     pub value: String,
-    /// Record category: "File", "Gotcha", "Decision", or "DevNote"
+
+    #[schemars(description = "Exactly one of: File | Gotcha | Decision | DevNote")]
     pub category: String,
-    /// Structured payload — FileRecord or GotchaRecord fields as JSON object
+
+    #[schemars(description = "\
+        Structured payload. \
+        Gotcha: {rule:string, reason:string, severity:Critical|High|Normal|Low, \
+                affected_files:[string], ref_url:null, discovered_session:0, confirmed:false}. \
+        File: {path:string, purpose:string, entry_points:[string], imports:[string], \
+               gotcha_keys:[string], decision_keys:[string], todos:[], \
+               unsafe_count:0, unwrap_count:0, change_frequency:0, \
+               last_author:null, is_hotspot:false, content_hash:null, line_count:0}. \
+        Decision: {summary:string, rationale:string}. \
+        DevNote: omit or null.")]
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
-    /// Free-form tags for search and filtering
+
+    #[schemars(description = "Optional list of lowercase tag strings. Empty array is fine.")]
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Priority: "Low", "Normal", "High", or "Critical"
+
+    #[schemars(description = "Exactly one of: Normal | High | Critical | Low. Default: Normal.")]
     #[serde(default = "default_priority")]
     pub priority: String,
 }
