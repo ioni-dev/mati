@@ -29,6 +29,48 @@ This project uses mati. Before reading any file, call mem_get(\"file:<path>\").
 High-confidence records (confidence >= 0.6, confirmed=true) replace file reads.
 The PreToolUse hook enforces this at the environment level.
 Run `mati status` to see current knowledge health.
+
+## /mati-enrich — Knowledge Enrichment
+
+When the developer types `/mati-enrich [target]`, execute this flow:
+
+### Target Resolution
+
+- `/mati-enrich` (no args) — call `mem_query(\"gap hotspot unenriched\", mode=\"text\", limit=10)`,
+  enrich the returned files sorted by gap_analysis_score DESC
+- `/mati-enrich src/payments/` — enrich all source files in that directory
+- `/mati-enrich src/main.rs` — enrich a single file
+
+### Per-File Flow
+
+1. **Fetch existing record**: `mem_get(\"file:<path>\")` — extract entry_points, imports,
+   change_frequency, todos, gotcha_keys, is_hotspot.
+
+2. **Read file**: Use Read tool on the actual file.
+
+3. **Analyze and generate**:
+   - `purpose`: 1-2 sentences starting with a verb. What this file does and why.
+   - `gotchas`: Max 5. Each needs an imperative-verb rule + causality reason.
+     Only write gotchas inferable from the code. Zero is correct if none exist.
+   - `decisions`: Architectural choices visible in the code.
+
+4. **Write file record**: `mem_set` with key=`file:<path>`, category=`File`,
+   value=purpose, payload preserving existing Layer 0 fields + updated purpose/gotcha_keys.
+
+5. **Write each gotcha**: `mem_set` with key=`gotcha:<slug>`, category=`Gotcha`,
+   value=`{rule} because {reason}`, payload with confirmed=false.
+
+6. **Report per file**:
+   ```
+   Enriched: src/payments/stripe.go
+     Purpose:    Handles Stripe charge creation and webhook verification
+     Gotchas:    3 written (pending review)
+     Confidence: 0.60 — run `mati review` to confirm and reach 0.80
+   ```
+
+### After Enrichment
+
+Print: `Run \\`mati review\\` to confirm gotchas and activate hook enforcement.`
 ";
 
 /// Write the Vector C stub to `.claude/CLAUDE.md`.

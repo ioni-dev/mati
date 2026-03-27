@@ -1,12 +1,14 @@
-//! MCP tool implementations (M-07).
+//! MCP tool implementations (M-07, M-11).
 //!
-//! Exactly 3 tools — hard limit per CLAUDE.md:
+//! 4 tools:
 //! - `mem_get`       — direct key lookup
 //! - `mem_query`     — BM25 text search or graph traversal
 //! - `mem_bootstrap` — context packet assembly with token budget
+//! - `mem_set`       — write enriched knowledge records (M-11)
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -14,12 +16,14 @@ use rmcp::tool_router;
 
 use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
+use crate::health::quality;
 use crate::store::record::{
-    ContextPacket, FileRecord, GotchaRecord, Priority, QualityTier, Record, RecordLifecycle,
+    Category, ConfidenceScore, ContextPacket, FileRecord, GotchaRecord, Priority, QualityScore,
+    QualityTier, Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
     StaleReviewPayload, StalenessTier,
 };
 
-use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams};
+use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 /// Vector B — appended to every mem_bootstrap result.
 const VECTOR_B: &str = "\n\n[mati] Before reading any file, call mem_get(\"file:<path>\") first.\n\
@@ -197,6 +201,135 @@ impl MatiServer {
         match assemble_context_packet(store, &graph, &context_files).await {
             Ok(packet) => packet.injection_string,
             Err(e) => format!("[mati] bootstrap error: {e}{VECTOR_B}"),
+        }
+    }
+
+    /// Write an enriched knowledge record to the mati store.
+    ///
+    /// Used during `/mati-enrich` sessions. Source is always `ClaudeEnrich`.
+    /// Gotcha records land with `confirmed=false` — developer runs `mati review`
+    /// to confirm and activate hook enforcement.
+    #[rmcp::tool(
+        name = "mem_set",
+        description = "Write an enriched knowledge record to the mati store. Used during /mati-enrich sessions. Key must start with file:, gotcha:, decision:, or dev_note:. Gotchas land as unconfirmed — developer runs `mati review` to activate hook enforcement."
+    )]
+    async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
+        let graph = self.graph.read().await;
+        let store = graph.store();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Validate key namespace
+        let valid_prefix = ["file:", "gotcha:", "decision:", "dev_note:"]
+            .iter()
+            .any(|p| params.key.starts_with(p));
+        if !valid_prefix {
+            return serde_json::json!({
+                "error": "key must start with file:, gotcha:, decision:, or dev_note:"
+            })
+            .to_string();
+        }
+
+        // Parse category
+        let category = match params.category.as_str() {
+            "File" => Category::File,
+            "Gotcha" => Category::Gotcha,
+            "Decision" => Category::Decision,
+            "DevNote" => Category::DevNote,
+            other => {
+                return serde_json::json!({
+                    "error": format!("unknown category: {other}. Valid: File, Gotcha, Decision, DevNote")
+                })
+                .to_string();
+            }
+        };
+
+        // Parse priority
+        let priority = match params.priority.as_str() {
+            "Critical" => Priority::Critical,
+            "High" => Priority::High,
+            "Low" => Priority::Low,
+            _ => Priority::Normal,
+        };
+
+        // Fetch existing record to preserve Layer 0 structural data
+        let mut record = match store.get(&params.key).await {
+            Ok(Some(existing)) => existing,
+            _ => Record {
+                key: params.key.clone(),
+                value: String::new(),
+                category: category.clone(),
+                priority: Priority::Normal,
+                tags: vec![],
+                created_at: now,
+                updated_at: now,
+                ref_url: None,
+                staleness: StalenessScore::fresh(),
+                lifecycle: RecordLifecycle::Active,
+                version: RecordVersion {
+                    device_id: uuid::Uuid::new_v4(),
+                    logical_clock: 0,
+                    wall_clock: now,
+                },
+                quality: QualityScore::layer0_default(),
+                access_count: 0,
+                last_accessed: 0,
+                source: RecordSource::StaticAnalysis,
+                confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+                gap_analysis_score: 0.0,
+                payload: None,
+            },
+        };
+
+        // Apply enrichment fields
+        record.value = params.value;
+        record.category = category;
+        record.source = RecordSource::ClaudeEnrich;
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+        record.tags = params.tags;
+        record.priority = priority;
+
+        // Merge payload: for existing records, preserve structural fields from
+        // Layer 0 (entry_points, imports, etc.) while overlaying enrichment.
+        if let Some(new_payload) = params.payload {
+            if let Some(existing_payload) = &record.payload {
+                // Merge: new values override, existing keys preserved
+                let mut merged = existing_payload.clone();
+                if let (Some(base), Some(overlay)) =
+                    (merged.as_object_mut(), new_payload.as_object())
+                {
+                    for (k, v) in overlay {
+                        base.insert(k.clone(), v.clone());
+                    }
+                    record.payload = Some(serde_json::Value::Object(base.clone()));
+                } else {
+                    record.payload = Some(new_payload);
+                }
+            } else {
+                record.payload = Some(new_payload);
+            }
+        }
+
+        // Recompute confidence + quality
+        record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+        record.quality = quality::analyze(&record);
+
+        // Write
+        let tier_label = format!("{:?}", record.quality.tier);
+        match store.put(&record.key, &record).await {
+            Ok(_) => serde_json::json!({
+                "ok": true,
+                "key": record.key,
+                "confidence": record.confidence.value,
+                "quality": record.quality.value,
+                "tier": tier_label,
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
         }
     }
 }
@@ -1307,5 +1440,193 @@ mod tests {
         assert!(packet.file_records.is_empty());
         assert!(packet.stale_warnings.is_empty());
         assert!(packet.related_decisions.is_empty());
+    }
+
+    // ── mem_set tests ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_set_writes_new_file_record() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                key: "file:src/main.rs".to_string(),
+                value: "Handles CLI dispatch and binary entry point".to_string(),
+                category: "File".to_string(),
+                payload: Some(serde_json::json!({
+                    "path": "src/main.rs",
+                    "purpose": "Handles CLI dispatch and binary entry point"
+                })),
+                tags: vec!["entry-point".to_string()],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["key"], "file:src/main.rs");
+        assert!((parsed["confidence"].as_f64().unwrap() - 0.60).abs() < 0.01);
+
+        // Read back and verify
+        let graph = server.graph.read().await;
+        let record = graph.store().get("file:src/main.rs").await.unwrap().unwrap();
+        assert_eq!(record.value, "Handles CLI dispatch and binary entry point");
+        assert_eq!(record.source, RecordSource::ClaudeEnrich);
+        assert!(record.payload.is_some());
+    }
+
+    #[tokio::test]
+    async fn mem_set_writes_gotcha_with_quality_score() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                key: "gotcha:always-use-idempotency-keys".to_string(),
+                value: "Always pass idempotency_key to Stripe charge creation because duplicate charges cause customer refund disputes".to_string(),
+                category: "Gotcha".to_string(),
+                payload: Some(serde_json::json!({
+                    "rule": "Always pass idempotency_key to Stripe charge creation",
+                    "reason": "duplicate charges cause customer refund disputes",
+                    "severity": "Critical",
+                    "affected_files": ["src/payments/stripe.go"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                })),
+                tags: vec![],
+                priority: "Critical".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+        // Quality should be > 0.2 (passes gate) since rule has imperative verb + reason has causality
+        assert!(parsed["quality"].as_f64().unwrap() > 0.2);
+
+        // Read back
+        let graph = server.graph.read().await;
+        let record = graph
+            .store()
+            .get("gotcha:always-use-idempotency-keys")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.priority, Priority::Critical);
+        assert_eq!(record.source, RecordSource::ClaudeEnrich);
+    }
+
+    #[tokio::test]
+    async fn mem_set_preserves_existing_layer0_data() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Pre-populate a Layer 0 file record
+        let mut layer0 = Record::layer0_file_stub("file:src/db.rs", device_id(), 1, now());
+        layer0.payload = Some(serde_json::json!({
+            "path": "src/db.rs",
+            "purpose": "",
+            "entry_points": ["fn connect", "fn query"],
+            "imports": ["tokio", "sqlx"],
+            "gotcha_keys": [],
+            "decision_keys": [],
+            "todos": [],
+            "unsafe_count": 0,
+            "unwrap_count": 2,
+            "change_frequency": 45,
+            "last_author": "alice",
+            "is_hotspot": true,
+            "token_cost_estimate": 120,
+            "last_modified_session": 0
+        }));
+        store.put("file:src/db.rs", &layer0).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Enrich — only send purpose and updated gotcha_keys
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                key: "file:src/db.rs".to_string(),
+                value: "Manages database connection pooling and query execution".to_string(),
+                category: "File".to_string(),
+                payload: Some(serde_json::json!({
+                    "purpose": "Manages database connection pooling and query execution",
+                    "gotcha_keys": ["gotcha:always-close-connections"]
+                })),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+
+        // Verify Layer 0 fields preserved via merge
+        let graph = server.graph.read().await;
+        let record = graph.store().get("file:src/db.rs").await.unwrap().unwrap();
+        let payload = record.payload.unwrap();
+
+        // Enrichment fields updated
+        assert_eq!(payload["purpose"], "Manages database connection pooling and query execution");
+        assert_eq!(payload["gotcha_keys"][0], "gotcha:always-close-connections");
+
+        // Layer 0 structural fields preserved
+        assert_eq!(payload["entry_points"][0], "fn connect");
+        assert_eq!(payload["imports"][0], "tokio");
+        assert_eq!(payload["change_frequency"], 45);
+        assert_eq!(payload["is_hotspot"], true);
+
+        // Source upgraded to ClaudeEnrich
+        assert_eq!(record.source, RecordSource::ClaudeEnrich);
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_invalid_key_prefix() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                key: "session:12345".to_string(),
+                value: "test".to_string(),
+                category: "File".to_string(),
+                payload: None,
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("must start with"));
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_invalid_category() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                key: "file:test.rs".to_string(),
+                value: "test".to_string(),
+                category: "Unknown".to_string(),
+                payload: None,
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["error"].as_str().unwrap().contains("unknown category"));
     }
 }
