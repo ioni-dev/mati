@@ -110,9 +110,28 @@ impl StoreProxy {
             ProxyInner::Socket { root } => {
                 let record_value = serde_json::to_value(record)?;
                 match daemon_result(root, "put", json!({ "key": key, "record": record_value })).await {
-                    DaemonResult::Ok(_) => Ok(()),
-                    // Non-fatal: cache write failure is acceptable.
-                    _ => Ok(()),
+                    DaemonResult::Ok(resp) => {
+                        if resp["ok"] == true {
+                            Ok(())
+                        } else {
+                            let error = resp["error"].as_str().unwrap_or("unknown error");
+                            if error.contains("unknown command") {
+                                anyhow::bail!(
+                                    "daemon does not support 'put' — run `mati daemon restart` to upgrade"
+                                )
+                            } else {
+                                anyhow::bail!("daemon put failed: {}", error)
+                            }
+                        }
+                    }
+                    DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+                        anyhow::bail!("daemon stopped mid-operation; record not written")
+                    }
+                    DaemonResult::Unresponsive => {
+                        anyhow::bail!(
+                            "daemon not responding; record not written — try: mati daemon restart"
+                        )
+                    }
                 }
             }
         }
