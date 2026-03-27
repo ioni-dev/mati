@@ -167,7 +167,7 @@ async fn run_triage_mode(candidates: Vec<Record>, cwd: &Path) -> Result<()> {
     ];
 
     // Print summary table
-    println!("  {:<14}  {:<8}  {}", "type", "count", "description");
+    println!("  {:<14}  {:<8}  description", "type", "count");
     println!("  {}  {}  {}", "─".repeat(14), "─".repeat(8), "─".repeat(44));
     for kind in &group_order {
         let count = groups.get(kind.label()).map(|v| v.len()).unwrap_or(0);
@@ -191,15 +191,12 @@ async fn run_triage_mode(candidates: Vec<Record>, cwd: &Path) -> Result<()> {
             }
         }));
 
-        let sel = match Select::new(&theme)
+        let sel = Select::new(&theme)
             .with_prompt("select group  [Esc to quit]")
             .items(&group_options)
             .default(1)
             .interact()
-        {
-            Ok(s) => s,
-            Err(_) => 0,
-        };
+            .unwrap_or_default();
 
         if sel == 0 {
             break;
@@ -333,15 +330,12 @@ async fn run_card_session(
         let mut items = vec!["── quit ──".to_string()];
         items.extend(visible.iter().map(|r| format_list_item(r)));
 
-        let sel = match FuzzySelect::with_theme(theme)
+        let sel = FuzzySelect::with_theme(theme)
             .with_prompt(format!("{} remaining  [Esc / q to quit]", visible.len()))
             .items(&items)
             .default(1)
             .interact()
-        {
-            Ok(s) => s,
-            Err(_) => 0, // Esc or Ctrl+C → treat as quit
-        };
+            .unwrap_or_default(); // Esc or Ctrl+C → treat as quit
 
         if sel == 0 {
             // quit selected or Esc pressed
@@ -680,9 +674,10 @@ fn print_session_summary(stats: &SessionStats) {
 
 // ── dialoguer Select helper ───────────────────────────────────────────────────
 
-/// Thin newtype so we can call `Select::new(&theme)` and `Select::with_theme(theme)`.
+/// Thin newtype so we can call `Select::create(&theme)` and `Select::with_theme(theme)`.
 struct Select;
 
+#[allow(clippy::new_ret_no_self)]
 impl Select {
     fn new(theme: &ColorfulTheme) -> dialoguer::Select<'_> {
         dialoguer::Select::with_theme(theme)
@@ -950,7 +945,7 @@ mod tests {
         high.confidence.value = 0.80;
         high.access_count = 10;
 
-        let mut candidates = vec![low, high];
+        let mut candidates = [low, high];
         candidates.sort_by(|a, b| {
             let risk_a = a.confidence.value * (1.0 + a.access_count as f32 * 0.1);
             let risk_b = b.confidence.value * (1.0 + b.access_count as f32 * 0.1);
@@ -1028,7 +1023,7 @@ mod tests {
         let groups = group_by_type(&records);
         assert_eq!(groups.get("co-change").map(|v| v.len()), Some(2));
         assert_eq!(groups.get("ownership").map(|v| v.len()), Some(1));
-        assert!(groups.get("revert").is_none());
+        assert!(!groups.contains_key("revert"));
     }
 
     #[test]

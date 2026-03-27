@@ -62,15 +62,35 @@ When the developer types `/mati-enrich [target]`, execute this flow:
 
 6. **Report per file**:
    ```
-   Enriched: src/payments/stripe.go
-     Purpose:    Handles Stripe charge creation and webhook verification
-     Gotchas:    3 written (pending review)
-     Confidence: 0.60 — run `mati review` to confirm and reach 0.80
+   ✅ Enriched: <path>
+      Purpose:    \"<purpose string>\"
+      Gotchas:    <N> written
+      Decisions:  <N> written
+      Confidence: 0.60 → 0.80 after review
+
+   ⚠️  NEXT STEP REQUIRED:
+       Run `mati review` in your terminal to confirm gotchas
+       and activate hook enforcement. Takes ~2 minutes.
+       Without this step, hooks will not deny file reads.
    ```
 
-### After Enrichment
+### Batch Report (when enriching multiple files)
 
-Print: `Run \\`mati review\\` to confirm gotchas and activate hook enforcement.`
+```
+✅ Enrichment complete
+   Files enriched:  <N>
+   Gotchas written: <N> (not yet active)
+   Decisions:        <N>
+
+⚠️  NEXT STEP REQUIRED — hooks are NOT active yet:
+    Run `mati review` in your terminal now.
+    Takes ~2–3 minutes. Without this, mati hooks will
+    not block any file reads.
+```
+
+## Rule: always end every /mati-enrich response with this exact line
+
+> ⚠️ **Run `mati review` in your terminal now to activate hook enforcement.**
 ";
 
 /// Write the Vector C stub to `.claude/CLAUDE.md`.

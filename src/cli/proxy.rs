@@ -14,6 +14,7 @@ use mati_core::store::db::HistoryEntry;
 
 use super::daemon::{daemon_result, mati_root_for, DaemonResult};
 
+#[allow(clippy::large_enum_variant)]
 enum ProxyInner {
     Direct(Store),
     Socket { root: PathBuf },
@@ -121,6 +122,7 @@ impl StoreProxy {
     ///
     /// Only works in direct mode. In socket mode this errors with a message
     /// telling the user to stop the daemon first.
+    #[allow(dead_code)]
     pub fn history(&self, key: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
         match &self.inner {
             ProxyInner::Direct(s) => s.history(key, limit),
@@ -138,6 +140,7 @@ impl StoreProxy {
     ///
     /// Only works in direct mode. In socket mode this errors with a message
     /// explaining why and what to do.
+    #[allow(dead_code)]
     pub fn history_since(&self, key: &str, since_ts: u64, limit: usize) -> Result<Vec<HistoryEntry>> {
         match &self.inner {
             ProxyInner::Direct(s) => s.history_since(key, since_ts, limit),
@@ -154,6 +157,7 @@ impl StoreProxy {
     /// All records updated since `since_ts` (seconds), newest first.
     ///
     /// Implemented via `scan_prefix` so it works in both direct and socket modes.
+    #[allow(dead_code)]
     pub async fn records_since(&self, since_ts: u64, limit: usize) -> Result<Vec<Record>> {
         let namespaces = &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"];
         let mut results: Vec<Record> = Vec::new();
