@@ -117,7 +117,7 @@ impl StoreProxy {
                             let error = resp["error"].as_str().unwrap_or("unknown error");
                             if error.contains("unknown command") {
                                 anyhow::bail!(
-                                    "daemon does not support 'put' — run `mati daemon restart` to upgrade"
+                                    "daemon does not support 'put' — run `mati daemon stop && mati daemon start` to upgrade"
                                 )
                             } else {
                                 anyhow::bail!("daemon put failed: {}", error)
@@ -129,7 +129,7 @@ impl StoreProxy {
                     }
                     DaemonResult::Unresponsive => {
                         anyhow::bail!(
-                            "daemon not responding; record not written — try: mati daemon restart"
+                            "daemon not responding; record not written — try: mati daemon stop && mati daemon start"
                         )
                     }
                 }
