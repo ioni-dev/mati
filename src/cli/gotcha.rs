@@ -410,7 +410,16 @@ async fn run_gotcha_edit(key: &str) -> Result<()> {
 
     let old_gotcha: GotchaRecord = match record.payload_as::<GotchaRecord>() {
         Some(g) => g,
-        None => anyhow::bail!("'{key}' is not a gotcha record"),
+        None => {
+            let mut payload = record.payload.clone().unwrap_or_default();
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                    obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                }
+            }
+            serde_json::from_value::<GotchaRecord>(payload)
+                .map_err(|_| anyhow::anyhow!("'{key}' is not a gotcha record"))?
+        }
     };
 
     let old_files: HashSet<String> = old_gotcha.affected_files.iter().cloned().collect();
@@ -580,7 +589,17 @@ async fn run_gotcha_delete(key: &str) -> Result<()> {
 
     let gotcha: GotchaRecord = match record.payload_as::<GotchaRecord>() {
         Some(g) => g,
-        None => anyhow::bail!("'{key}' is not a gotcha record"),
+        None => {
+            // Retry with normalized severity (MCP-written records may have PascalCase)
+            let mut payload = record.payload.clone().unwrap_or_default();
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                    obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                }
+            }
+            serde_json::from_value::<GotchaRecord>(payload)
+                .map_err(|_| anyhow::anyhow!("'{key}' is not a gotcha record"))?
+        }
     };
 
     // Show what will be deleted

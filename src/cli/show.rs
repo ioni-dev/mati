@@ -11,6 +11,7 @@ use mati_core::store::{
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 // ── Arg types ─────────────────────────────────────────────────────────────────
 
@@ -65,7 +66,7 @@ pub struct ImportArgs {
 
 pub async fn run_show(args: ShowArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let store = StoreProxy::open(&cwd).await?;
 
     let record = match store.get(&args.key).await? {
         Some(r) => r,
@@ -313,7 +314,7 @@ fn ls_cache_record(key: &str, value: String) -> Record {
 
 pub async fn run_ls(args: LsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let store = StoreProxy::open(&cwd).await?;
     let use_color = std::io::stdout().is_terminal();
     let limit = args.limit;
 
@@ -337,7 +338,7 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
 
 const LS_FILES_CACHE_KEY: &str = "analytics:ls_files_cache";
 
-async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
+async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<()> {
     // ── Cache check ───────────────────────────────────────────────────────
     let current_seq = store.read_write_seq();
     if let Ok(Some(cached)) = store.get(LS_FILES_CACHE_KEY).await {
@@ -358,48 +359,47 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
     let mut rows: Vec<LsFileRow> = Vec::new();
     let mut printed_count: usize = 0;
 
-    store
-        .scan_prefix_each("file:", |r| {
-            if !matches!(r.lifecycle, RecordLifecycle::Active) { return; }
-            let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
-            let (purpose, entry_count, is_hotspot) =
-                match r.payload_as::<FileRecord>() {
-                    Some(fr) => {
-                        let purpose = if fr.purpose.is_empty() {
-                            "(pending enrichment)".to_string()
-                        } else {
-                            truncate(&fr.purpose, 40)
-                        };
-                        (purpose, fr.entry_points.len(), fr.is_hotspot)
-                    }
-                    None => {
-                        let purpose = if r.value.is_empty() {
-                            "(pending enrichment)".to_string()
-                        } else {
-                            truncate(&r.value, 40)
-                        };
-                        (purpose, 0, false)
-                    }
-                };
-            let row = LsFileRow {
-                path,
-                purpose,
-                entry_count,
-                confidence: r.confidence.value,
-                quality: r.quality.value,
-                is_hotspot,
-            };
-            if limit == 0 || printed_count < limit {
-                if first {
-                    print_ls_files_stream_header();
-                    first = false;
+    let all_records = store.scan_prefix("file:").await?;
+    for r in &all_records {
+        if !matches!(r.lifecycle, RecordLifecycle::Active) { continue; }
+        let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
+        let (purpose, entry_count, is_hotspot) =
+            match r.payload_as::<FileRecord>() {
+                Some(fr) => {
+                    let purpose = if fr.purpose.is_empty() {
+                        "(pending enrichment)".to_string()
+                    } else {
+                        truncate(&fr.purpose, 40)
+                    };
+                    (purpose, fr.entry_points.len(), fr.is_hotspot)
                 }
-                print_ls_files_stream_row(&row);
-                printed_count += 1;
+                None => {
+                    let purpose = if r.value.is_empty() {
+                        "(pending enrichment)".to_string()
+                    } else {
+                        truncate(&r.value, 40)
+                    };
+                    (purpose, 0, false)
+                }
+            };
+        let row = LsFileRow {
+            path,
+            purpose,
+            entry_count,
+            confidence: r.confidence.value,
+            quality: r.quality.value,
+            is_hotspot,
+        };
+        if limit == 0 || printed_count < limit {
+            if first {
+                print_ls_files_stream_header();
+                first = false;
             }
-            rows.push(row);
-        })
-        .await?;
+            print_ls_files_stream_row(&row);
+            printed_count += 1;
+        }
+        rows.push(row);
+    }
 
     if rows.is_empty() {
         println!("No file records found.");
@@ -500,7 +500,7 @@ fn render_ls_files_table(rows: &[LsFileRow], total: usize, limit: usize) {
     }
 }
 
-async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
+async fn ls_gotchas(store: &StoreProxy, _use_color: bool) -> Result<()> {
     let mut records = store.scan_prefix("gotcha:").await?;
     records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
     if records.is_empty() {
@@ -552,7 +552,7 @@ async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
     Ok(())
 }
 
-async fn ls_decisions(store: &Store, _use_color: bool) -> Result<()> {
+async fn ls_decisions(store: &StoreProxy, _use_color: bool) -> Result<()> {
     let mut records = store.scan_prefix("decision:").await?;
     records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
     if records.is_empty() {
@@ -597,7 +597,7 @@ async fn ls_decisions(store: &Store, _use_color: bool) -> Result<()> {
 
 pub async fn run_export(args: ExportArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let store = StoreProxy::open(&cwd).await?;
 
     let output = match args.format.as_str() {
         "json" => export_json(&store).await?,
@@ -612,7 +612,7 @@ pub async fn run_export(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-async fn export_json(store: &Store) -> Result<String> {
+async fn export_json(store: &StoreProxy) -> Result<String> {
     let mut all: Vec<Record> = Vec::new();
     for prefix in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
         all.extend(store.scan_prefix(prefix).await?);
@@ -620,7 +620,7 @@ async fn export_json(store: &Store) -> Result<String> {
     Ok(serde_json::to_string_pretty(&all)?)
 }
 
-async fn export_md(store: &Store) -> Result<String> {
+async fn export_md(store: &StoreProxy) -> Result<String> {
     let mut out = String::from("# mati knowledge export\n\n");
 
     let sections: &[(&str, &str)] = &[

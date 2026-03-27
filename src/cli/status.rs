@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, QualityTier,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, Store,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct StatusArgs {}
@@ -64,7 +65,7 @@ fn now_secs() -> u64 {
 
 pub async fn run(_args: StatusArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let store = StoreProxy::open(&cwd).await?;
 
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
@@ -251,8 +252,8 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
-/// Write a `StatusSnapshot` to `SNAPSHOT_KEY` in the store.
-async fn write_snapshot_record(store: &Store, snap: &StatusSnapshot, now: u64) -> Result<()> {
+/// Write a `StatusSnapshot` to `SNAPSHOT_KEY` via proxy.
+async fn write_snapshot_record(store: &StoreProxy, snap: &StatusSnapshot, now: u64) -> Result<()> {
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
         value: String::new(),
