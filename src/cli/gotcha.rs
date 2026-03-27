@@ -56,7 +56,7 @@ pub async fn run(args: GotchaArgs) -> Result<()> {
             const NON_GOTCHA_PREFIXES: &[&str] = &["file:", "decision:", "dev_note:", "dep:", "stage:"];
             if let Some(prefix) = NON_GOTCHA_PREFIXES.iter().find(|&&p| key.starts_with(p)) {
                 let category = prefix.trim_end_matches(':');
-                let slug = key.splitn(2, ':').nth(1).unwrap_or(&key);
+                let slug = key.split_once(':').map(|x| x.1).unwrap_or(&key);
                 anyhow::bail!(
                     "'{key}' has category '{category}', not 'gotcha'.\n\
                      Pass just the slug (e.g., '{slug}') or the full gotcha: key."
