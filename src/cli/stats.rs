@@ -12,6 +12,7 @@ use mati_core::store::{
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct StatsArgs {}
@@ -85,7 +86,7 @@ fn now_secs() -> u64 {
 
 pub async fn run(_args: StatsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let store = StoreProxy::open(&cwd).await?;
 
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
@@ -422,8 +423,8 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
 // ── Snapshot persistence ──────────────────────────────────────────────────────
 
-/// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` in the store.
-async fn write_snapshot_record(store: &Store, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+/// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` via proxy.
+async fn write_snapshot_record(store: &StoreProxy, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
         value: String::new(),
@@ -552,7 +553,36 @@ pub async fn seed_snapshot(
         write_seq,
     };
 
-    write_snapshot_record(store, &snapshot, now).await
+    write_snapshot_record_direct(store, &snapshot, now).await
+}
+
+/// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` via direct Store.
+async fn write_snapshot_record_direct(store: &Store, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+    let record = Record {
+        key: SNAPSHOT_KEY.to_string(),
+        value: String::new(),
+        payload: serde_json::to_value(snapshot).ok(),
+        category: Category::Analytics,
+        priority: Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::StaticAnalysis,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+        gap_analysis_score: 0.0,
+    };
+    store.put(SNAPSHOT_KEY, &record).await
 }
 
 // ── Cached display ───────────────────────────────────────────────────────────
@@ -722,7 +752,7 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 
 /// Scan analytics:hit_*, analytics:miss_*, and compliance:miss_* for the last
 /// 7 days and return (total_hits, total_misses, total_bypasses).
-async fn scan_compliance_7d(store: &Store, now: u64) -> (u64, u64, u64) {
+async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
     let mut bypasses: u64 = 0;

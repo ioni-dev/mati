@@ -314,6 +314,18 @@ impl MatiServer {
             }
         }
 
+        // Normalize gotcha payload: severity must be snake_case for GotchaRecord deserialization.
+        // Claude sends "Critical"/"High"/"Normal"/"Low" but serde expects "critical"/"high"/etc.
+        if record.key.starts_with("gotcha:") {
+            if let Some(ref mut payload) = record.payload {
+                if let Some(obj) = payload.as_object_mut() {
+                    if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                        obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                    }
+                }
+            }
+        }
+
         // Recompute confidence + quality
         record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
         record.quality = quality::analyze(&record);
