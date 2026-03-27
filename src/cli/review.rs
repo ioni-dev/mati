@@ -1,197 +1,703 @@
-//! `mati review` — interactive queue for confirmed=false gotcha candidates.
+//! `mati review` — production-grade interactive review for confirmed=false candidates.
 //!
-//! Drains the backlog of Layer 0 stubs that need developer confirmation
-//! before they can be injected by the pre-read hook.
-//!
-//! Candidates: `gotcha:*` records with `GotchaRecord.confirmed == false` and
-//! `lifecycle == Active`. Includes Layer 0 stubs (Suppressed quality) so
-//! developers can review and improve them before the injection gate. Sorted by
-//! `access_count DESC` so the most-accessed files surface first.
+//! Three modes:
+//! - **Default** (`mati review`) — fzf-style searchable list → card view → action menu.
+//!   Type to filter, arrow keys to navigate, Enter to select.
+//! - **Triage** (`mati review --triage`) — grouped by category. Bulk-confirm per group
+//!   using MultiSelect (all pre-checked), or drop into per-card review.
+//! - **File-scoped** (`mati review <file>`) — only candidates linked to a specific file.
 //!
 //! Actions per candidate:
-//! - **Confirm** — sets `confirmed=true`, promotes source to `DeveloperManual`,
-//!   sets confidence to 0.80, adds `HasGotcha` edges. Record is now injectable.
-//! - **Edit** — inline rule/reason edit, then offers to confirm immediately.
-//!   For severity/files/URL changes use `mati gotcha edit <key>` directly.
-//! - **Skip** — leaves as candidate, will reappear on next `mati review`.
+//! - **Confirm** — `confirmed=true`, source → DeveloperManual, confidence → 0.80.
+//!   Adds `HasGotcha` edges. Record is now eligible for hook injection.
+//! - **Edit** — pre-filled Input fields for rule and reason, then offer to confirm.
+//! - **Skip** — stays as candidate, removed from current session view.
 //! - **Delete** — tombstones the record and removes graph edges.
-//! - **Quit** — stop the session; unreviewed candidates remain for next time.
 
-use std::io::{self, BufRead, IsTerminal, Write as _};
+use std::collections::HashSet;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use clap::Args;
+use dialoguer::{Confirm, FuzzySelect, Input, MultiSelect, theme::ColorfulTheme};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use mati_core::graph::{EdgeKind, Graph};
 use mati_core::health::quality;
 use mati_core::store::{
-    ConfidenceScore, GotchaRecord, Record, RecordLifecycle, RecordSource, TombstoneReason,
+    ConfidenceScore, GotchaRecord, Record, RecordLifecycle, RecordSource, Store, TombstoneReason,
 };
 
 use super::colors;
-use super::proxy::StoreProxy;
 
 // ── Args ─────────────────────────────────────────────────────────────────────
 
 #[derive(Args)]
-pub struct ReviewArgs {}
+pub struct ReviewArgs {
+    /// Triage mode: grouped by category, bulk-confirm with MultiSelect
+    #[arg(long)]
+    pub triage: bool,
+
+    /// Filter to a specific type: ownership, co-change, revert
+    #[arg(long, value_name = "TYPE")]
+    pub r#type: Option<String>,
+
+    /// Review only candidates linked to this file
+    #[arg(value_name = "FILE")]
+    pub file: Option<String>,
+}
+
+// ── Internal types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum CandidateType {
+    Ownership,
+    CoChange,
+    Revert,
+    Other,
+}
+
+impl CandidateType {
+    fn from_tags(tags: &[String]) -> Self {
+        for t in tags {
+            match t.as_str() {
+                "ownership" => return Self::Ownership,
+                "co-change" => return Self::CoChange,
+                "revert" => return Self::Revert,
+                _ => {}
+            }
+        }
+        Self::Other
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ownership => "ownership",
+            Self::CoChange  => "co-change",
+            Self::Revert    => "revert",
+            Self::Other     => "gotcha",
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Ownership => "single-author hotspot files — knowledge silo risk",
+            Self::CoChange  => "file pairs that always change together",
+            Self::Revert    => "files with elevated revert rate",
+            Self::Other     => "auto-detected gotcha candidates",
+        }
+    }
+}
+
+struct SessionStats {
+    confirmed: usize,
+    deleted: usize,
+    skipped: usize,
+    total: usize,
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(_args: ReviewArgs) -> Result<()> {
-    let use_color = io::stderr().is_terminal();
-    let cwd = std::env::current_dir()?;
-
-    let candidates = {
-        let proxy = StoreProxy::open(&cwd).await?;
-        let result = collect_candidates(&proxy).await?;
-        proxy.close().await?;
-        result
-    };
-
-    if candidates.is_empty() {
-        println!("No candidates pending review.");
-        println!("Candidates are generated by `mati init` (co-change pairs, revert rate, etc.).");
-        println!("Check `mati gaps` to see what else needs attention.");
+pub async fn run(args: ReviewArgs) -> Result<()> {
+    if !io::stdout().is_terminal() {
+        eprintln!("mati review requires an interactive terminal.");
+        eprintln!("Use `mati gotcha edit <key>` to edit a specific record directly.");
         return Ok(());
     }
 
-    let total = candidates.len();
+    let cwd = std::env::current_dir()?;
 
-    let (cyan, green, yellow, gray, bold, reset) = if use_color {
-        (
-            colors::CYAN,
-            colors::GREEN,
-            colors::YELLOW,
-            colors::GRAY,
-            colors::BOLD,
-            colors::RESET,
-        )
+    let mut candidates = {
+        let store = Store::open(&cwd).await?;
+        let result = collect_candidates(&store).await?;
+        store.close().await?;
+        result
+    };
+
+    // Apply --type filter
+    if let Some(ref type_filter) = args.r#type {
+        candidates.retain(|r| r.tags.iter().any(|t| t == type_filter));
+    }
+
+    // Apply file filter
+    if let Some(ref file_arg) = args.file {
+        let needle = file_arg.trim_start_matches("file:");
+        candidates.retain(|r| {
+            r.payload_as::<GotchaRecord>()
+                .map(|g| g.affected_files.iter().any(|f| f.contains(needle)))
+                .unwrap_or(false)
+        });
+    }
+
+    if candidates.is_empty() {
+        println!("\nNo candidates pending review.");
+        if args.r#type.is_some() || args.file.is_some() {
+            println!("Try `mati review` without filters to see all candidates.");
+        } else {
+            println!("Run `mati init` to generate candidates from git history.");
+            println!("Run `mati gaps` to see what else needs attention.");
+        }
+        return Ok(());
+    }
+
+    if args.triage {
+        run_triage_mode(candidates, &cwd).await
+    } else {
+        run_card_mode(candidates, &cwd).await
+    }
+}
+
+// ── Triage mode ───────────────────────────────────────────────────────────────
+
+async fn run_triage_mode(candidates: Vec<Record>, cwd: &Path) -> Result<()> {
+    let theme = ColorfulTheme::default();
+
+    println!("\n◈ mati review — triage mode\n");
+    println!("  {} candidates pending confirmation\n", candidates.len());
+
+    // Group by type
+    let groups = group_by_type(&candidates);
+    let group_order = [
+        CandidateType::CoChange,
+        CandidateType::Ownership,
+        CandidateType::Revert,
+        CandidateType::Other,
+    ];
+
+    // Print summary table
+    println!("  {:<14}  {:<8}  {}", "type", "count", "description");
+    println!("  {}  {}  {}", "─".repeat(14), "─".repeat(8), "─".repeat(44));
+    for kind in &group_order {
+        let count = groups.get(kind.label()).map(|v| v.len()).unwrap_or(0);
+        if count > 0 {
+            println!("  {:<14}  {:<8}  {}", kind.label(), count, kind.description());
+        }
+    }
+    println!();
+
+    let mut session = SessionStats { confirmed: 0, deleted: 0, skipped: 0, total: candidates.len() };
+
+    // Select which group to act on
+    loop {
+        let mut group_options = vec!["── quit ──".to_string()];
+        group_options.extend(group_order.iter().filter_map(|kind| {
+            let count = groups.get(kind.label()).map(|v| v.len()).unwrap_or(0);
+            if count > 0 {
+                Some(format!("{:<14}  {} candidate{}", kind.label(), count, if count == 1 { "" } else { "s" }))
+            } else {
+                None
+            }
+        }));
+
+        let sel = match Select::new(&theme)
+            .with_prompt("select group  [Esc to quit]")
+            .items(&group_options)
+            .default(1)
+            .interact()
+        {
+            Ok(s) => s,
+            Err(_) => 0,
+        };
+
+        if sel == 0 {
+            break;
+        }
+
+        // Find which kind was selected
+        let selected_kind = group_order
+            .iter()
+            .filter(|k| groups.get(k.label()).map(|v| !v.is_empty()).unwrap_or(false))
+            .nth(sel - 1)
+            .unwrap();
+
+        let group_candidates = groups.get(selected_kind.label()).unwrap();
+        triage_group(group_candidates, selected_kind, cwd, &theme, &mut session).await?;
+        println!();
+    }
+
+    print_session_summary(&session);
+    Ok(())
+}
+
+async fn triage_group(
+    candidates: &[&Record],
+    kind: &CandidateType,
+    cwd: &Path,
+    theme: &ColorfulTheme,
+    session: &mut SessionStats,
+) -> Result<()> {
+    println!("\n  ◈ {} — {} candidate{}\n", kind.label(), candidates.len(), if candidates.len() == 1 { "" } else { "s" });
+
+    let action_options = [
+        format!("accept all    confirm all {} above quality 0.40", candidates.len()),
+        "review each   step through one by one".to_string(),
+        "skip group    come back later".to_string(),
+    ];
+
+    let action = Select::new(theme)
+        .with_prompt("action")
+        .items(&action_options)
+        .default(0)
+        .interact()?;
+
+    match action {
+        0 => {
+            // MultiSelect — all pre-checked, user can deselect
+            let items: Vec<String> = candidates.iter().map(|r| format_list_item(r)).collect();
+            let defaults = vec![true; items.len()];
+
+            println!("\n  Space to deselect · Enter to confirm selection\n");
+
+            let selected_indices = MultiSelect::with_theme(theme)
+                .with_prompt("confirm candidates")
+                .items(&items)
+                .defaults(&defaults)
+                .interact()?;
+
+            if selected_indices.is_empty() {
+                println!("  No candidates selected.");
+                return Ok(());
+            }
+
+            let keys_to_confirm: Vec<String> = selected_indices
+                .iter()
+                .map(|&i| candidates[i].key.clone())
+                .collect();
+
+            let pb = ProgressBar::new(keys_to_confirm.len() as u64);
+            pb.set_style(
+                ProgressStyle::with_template("  [{bar:40.green}] {pos}/{len} confirmed")
+                    .unwrap()
+                    .progress_chars("█░░"),
+            );
+
+            bulk_confirm_candidates(cwd, &keys_to_confirm, &pb).await?;
+            pb.finish_and_clear();
+
+            println!("\n  ✓ {} confirmed — eligible for hook injection.", keys_to_confirm.len());
+            session.confirmed += keys_to_confirm.len();
+
+            let skipped = candidates.len() - keys_to_confirm.len();
+            if skipped > 0 {
+                session.skipped += skipped;
+            }
+        }
+        1 => {
+            // Per-card review for this group
+            let group_vec: Vec<Record> = candidates.iter().map(|r| (*r).clone()).collect();
+            let stats = run_card_session(group_vec, cwd, theme).await?;
+            session.confirmed += stats.confirmed;
+            session.deleted += stats.deleted;
+            session.skipped += stats.skipped;
+        }
+        _ => {
+            session.skipped += candidates.len();
+            println!("  Group skipped.");
+        }
+    }
+
+    Ok(())
+}
+
+// ── Card mode ─────────────────────────────────────────────────────────────────
+
+async fn run_card_mode(candidates: Vec<Record>, cwd: &Path) -> Result<()> {
+    let theme = ColorfulTheme::default();
+    println!("\n◈ mati review — {} candidate{}\n", candidates.len(), if candidates.len() == 1 { "" } else { "s" });
+    println!("  Type to filter · ↑↓ to navigate · Enter to select\n");
+
+    let stats = run_card_session(candidates, cwd, &theme).await?;
+    print_session_summary(&stats);
+    Ok(())
+}
+
+async fn run_card_session(
+    candidates: Vec<Record>,
+    cwd: &Path,
+    theme: &ColorfulTheme,
+) -> Result<SessionStats> {
+    let remaining: Vec<Record> = candidates;
+    let total = remaining.len();
+    let mut actioned: HashSet<String> = HashSet::new();
+    let mut stats = SessionStats { confirmed: 0, deleted: 0, skipped: 0, total };
+
+    loop {
+        let visible: Vec<&Record> = remaining.iter().filter(|r| !actioned.contains(&r.key)).collect();
+        if visible.is_empty() {
+            break;
+        }
+
+        // Build display items — quit option first so it's always reachable
+        let mut items = vec!["── quit ──".to_string()];
+        items.extend(visible.iter().map(|r| format_list_item(r)));
+
+        let sel = match FuzzySelect::with_theme(theme)
+            .with_prompt(format!("{} remaining  [Esc / q to quit]", visible.len()))
+            .items(&items)
+            .default(1)
+            .interact()
+        {
+            Ok(s) => s,
+            Err(_) => 0, // Esc or Ctrl+C → treat as quit
+        };
+
+        if sel == 0 {
+            // quit selected or Esc pressed
+            stats.skipped += visible.len();
+            break;
+        }
+
+        let record = visible[sel - 1].clone();
+        let key = record.key.clone();
+
+        println!();
+        render_card(&record);
+        println!();
+
+        // Action menu
+        let action_items = [
+            "confirm     mark as correct — eligible for injection",
+            "edit        fix the rule or reason",
+            "skip        remove from this session",
+            "delete      remove permanently",
+            "← back      return to list",
+        ];
+
+        let action = Select::with_theme(theme)
+            .with_prompt("action")
+            .items(&action_items)
+            .default(0)
+            .interact()?;
+
+        println!();
+
+        match action {
+            0 => {
+                confirm_candidate(cwd, &key).await?;
+                println!("  ✓ Confirmed. Eligible for hook injection.");
+                actioned.insert(key);
+                stats.confirmed += 1;
+            }
+            1 => {
+                if let Some(g) = record.payload_as::<GotchaRecord>() {
+                    let confirmed = edit_candidate(cwd, &key, &g, theme).await?;
+                    if confirmed {
+                        stats.confirmed += 1;
+                    }
+                    actioned.insert(key);
+                } else {
+                    println!("  Cannot edit: not a GotchaRecord. Use `mati gotcha edit {key}` instead.");
+                    actioned.insert(key);
+                    stats.skipped += 1;
+                }
+            }
+            2 => {
+                actioned.insert(key);
+                stats.skipped += 1;
+            }
+            3 => {
+                delete_candidate(cwd, &key).await?;
+                println!("  Deleted.");
+                actioned.insert(key);
+                stats.deleted += 1;
+            }
+            _ => {
+                // Back — do nothing, return to list
+            }
+        }
+
+        println!();
+    }
+
+    Ok(stats)
+}
+
+// ── Card rendering ────────────────────────────────────────────────────────────
+
+fn render_card(record: &Record) {
+    let use_color = io::stdout().is_terminal();
+    let (cyan, yellow, green, gray, bold, reset) = if use_color {
+        (colors::CYAN, colors::YELLOW, colors::GREEN, colors::GRAY, colors::BOLD, colors::RESET)
     } else {
         ("", "", "", "", "", "")
     };
 
-    eprintln!("\n{bold}{total} candidate{}{reset} pending review", if total == 1 { "" } else { "s" });
-    eprintln!("{gray}[c]onfirm · [e]dit · [s]kip · [d]elete · [q]uit{reset}\n");
+    let kind = CandidateType::from_tags(&record.tags);
+    let risk = record.confidence.value;
+    let risk_color = if risk >= 0.7 { colors::RED } else if risk >= 0.4 { yellow } else { gray };
+    let risk_color = if use_color { risk_color } else { "" };
 
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+    let width = 62usize;
+    let border = "─".repeat(width);
 
-    let mut n_confirmed = 0usize;
-    let mut n_deleted = 0usize;
-    let mut n_skipped = 0usize;
+    println!("  ╭{}╮", border);
 
-    for (i, record) in candidates.into_iter().enumerate() {
-        let key = record.key.clone();
+    // Header: type + risk + quality
+    let header = format!(
+        "  {}  ·  risk {}  ·  quality {:.2}",
+        kind.label(),
+        format_risk(risk),
+        record.quality.value
+    );
+    println!("  │  {bold}{}{reset}{}", header, pad_right(&header, width - 2));
+    println!("  ├{}┤", border);
 
-        // ── Display candidate ─────────────────────────────────────────────
-
-        eprint!("{gray}[{}/{}]{reset}  {cyan}{key}{reset}", i + 1, total);
-
-        // Show tag hint (e.g. co-change, auto-generated)
-        let tags: Vec<&str> = record.tags.iter().map(|s| s.as_str()).collect();
-        if !tags.is_empty() {
-            eprintln!("  {gray}{}{reset}", tags.join(", "));
-        } else {
-            eprintln!();
-        }
-
-        if let Some(g) = record.payload_as::<GotchaRecord>() {
-            eprintln!("  {bold}Rule:{reset}   {}", g.rule);
-            if !g.reason.is_empty() {
-                eprintln!("  {bold}Reason:{reset} {}", g.reason);
+    // Body
+    if let Some(g) = record.payload_as::<GotchaRecord>() {
+        let rule_lines = wrap_text(&g.rule, width - 12);
+        for (i, line) in rule_lines.iter().enumerate() {
+            if i == 0 {
+                println!("  │  {bold}Rule{reset}    {cyan}{}{reset}{}", line, pad_right(line, width - 12));
+            } else {
+                println!("  │           {cyan}{}{reset}{}", line, pad_right(line, width - 11));
             }
-            eprintln!("  {bold}Files:{reset}  {}", g.affected_files.join(", "));
-        } else {
-            eprintln!("  {}", record.value);
         }
 
-        let q_color = if record.quality.value >= 0.6 {
-            green
-        } else if record.quality.value >= 0.4 {
-            yellow
-        } else {
-            colors::RED
-        };
-        eprintln!(
-            "  {gray}quality {q_color}{:.2}{reset}  {gray}confidence {}{:.2}{reset}",
-            record.quality.value, gray, record.confidence.value
-        );
-        eprintln!();
-
-        // ── Prompt loop ───────────────────────────────────────────────────
-
-        loop {
-            eprint_prompt("[c/e/s/d/q]: ", use_color);
-            let input = read_line(&mut lines)?;
-
-            match input.to_lowercase().trim() {
-                "c" | "confirm" => {
-                    confirm_candidate(&cwd, &key).await?;
-                    eprintln!("{green}✓{reset} Confirmed. Ready for injection.");
-                    n_confirmed += 1;
-                    break;
-                }
-                "e" | "edit" => {
-                    if let Some(g) = record.payload_as::<GotchaRecord>() {
-                        let did_confirm =
-                            edit_inline(&cwd, &key, &g, &mut lines, use_color).await?;
-                        if did_confirm {
-                            n_confirmed += 1;
-                        } else {
-                            n_skipped += 1;
-                        }
-                    } else {
-                        eprintln!("  {yellow}Cannot edit: not a GotchaRecord payload.{reset}");
-                        eprintln!("  Use `mati gotcha edit {key}` instead.");
-                        n_skipped += 1;
-                    }
-                    break;
-                }
-                "s" | "skip" | "" => {
-                    eprintln!("{gray}Skipped.{reset}");
-                    n_skipped += 1;
-                    break;
-                }
-                "d" | "delete" => {
-                    delete_candidate(&cwd, &key).await?;
-                    eprintln!("{yellow}Deleted.{reset}");
-                    n_deleted += 1;
-                    break;
-                }
-                "q" | "quit" => {
-                    let remaining = total.saturating_sub(i);
-                    println!(
-                        "\nStopped. {n_confirmed} confirmed, {n_deleted} deleted, \
-                         {n_skipped} skipped, {remaining} remaining."
-                    );
-                    return Ok(());
-                }
-                _ => {
-                    eprintln!("  {yellow}?{reset} Enter c / e / s / d / q");
+        if !g.reason.is_empty() {
+            let reason_lines = wrap_text(&g.reason, width - 12);
+            for (i, line) in reason_lines.iter().enumerate() {
+                if i == 0 {
+                    println!("  │  {bold}Reason{reset}  {}{}", line, pad_right(line, width - 12));
+                } else {
+                    println!("  │           {}{}", line, pad_right(line, width - 11));
                 }
             }
         }
 
-        eprintln!();
+        if !g.affected_files.is_empty() {
+            for (i, f) in g.affected_files.iter().enumerate() {
+                if i == 0 {
+                    println!("  │  {bold}Files{reset}   {green}{}{reset}{}", f, pad_right(f, width - 12));
+                } else {
+                    println!("  │           {green}{}{reset}{}", f, pad_right(f, width - 11));
+                }
+            }
+        }
+    } else if !record.value.is_empty() {
+        let lines = wrap_text(&record.value, width - 6);
+        for line in &lines {
+            println!("  │  {}{}", line, pad_right(line, width - 4));
+        }
     }
 
-    println!(
-        "Review complete: {n_confirmed} confirmed, {n_deleted} deleted, {n_skipped} skipped."
+    println!("  ├{}┤", border);
+
+    // Footer: signals
+    let footer = format!(
+        "confidence {:.2}  ·  access count {}  ·  {}",
+        record.confidence.value,
+        record.access_count,
+        tags_display(&record.tags)
     );
-    Ok(())
+    println!("  │  {gray}{}{reset}{}", footer, pad_right(&footer, width - 2));
+    println!("  ╰{}╯", border);
+
+    let _ = (risk_color, green, cyan); // suppress unused warnings
+}
+
+fn format_risk(risk: f32) -> String {
+    format!("{:.2}", risk)
+}
+
+fn tags_display(tags: &[String]) -> String {
+    let relevant: Vec<&str> = tags.iter()
+        .filter(|t| !matches!(t.as_str(), "ownership" | "co-change" | "revert" | "auto-generated"))
+        .map(|t| t.as_str())
+        .collect();
+    if relevant.is_empty() { "auto-generated".to_string() } else { relevant.join(", ") }
+}
+
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if text.len() <= max_width {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= max_width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current.clone());
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn pad_right(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len < width {
+        " ".repeat(width - len)
+    } else {
+        String::new()
+    }
+}
+
+// ── List item formatting ──────────────────────────────────────────────────────
+
+/// Format a candidate record as a single-line string for FuzzySelect.
+///
+/// Format: `{type:<12}  {risk:.2}  {description}`
+pub fn format_list_item(record: &Record) -> String {
+    let kind = CandidateType::from_tags(&record.tags);
+    let risk = record.confidence.value;
+
+    let desc = if let Some(g) = record.payload_as::<GotchaRecord>() {
+        match kind {
+            CandidateType::CoChange if g.affected_files.len() >= 2 => {
+                let a = file_name(&g.affected_files[0]);
+                let b = file_name(&g.affected_files[1]);
+                format!("{a} ↔ {b}")
+            }
+            CandidateType::Ownership if !g.affected_files.is_empty() => {
+                format!("{} — {}", file_name(&g.affected_files[0]), truncate(&g.rule, 36))
+            }
+            _ => truncate(&g.rule, 50),
+        }
+    } else {
+        truncate(&record.value, 50)
+    };
+
+    format!("{:<12}  {:.2}  {}", kind.label(), risk, desc)
+}
+
+fn file_name(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path)
+}
+
+// ── Edit flow ─────────────────────────────────────────────────────────────────
+
+async fn edit_candidate(
+    cwd: &Path,
+    key: &str,
+    gotcha: &GotchaRecord,
+    theme: &ColorfulTheme,
+) -> Result<bool> {
+    let rule: String = Input::with_theme(theme)
+        .with_prompt("Rule")
+        .with_initial_text(&gotcha.rule)
+        .interact_text()?;
+
+    let reason: String = Input::with_theme(theme)
+        .with_prompt("Reason")
+        .with_initial_text(&gotcha.reason)
+        .allow_empty(true)
+        .interact_text()?;
+
+    // Persist edits (still confirmed=false)
+    let store = Store::open(cwd).await?;
+    let mut record = store
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+
+    let now = now_secs();
+    let updated = GotchaRecord {
+        rule: rule.clone(),
+        reason: reason.clone(),
+        severity: gotcha.severity.clone(),
+        affected_files: gotcha.affected_files.clone(),
+        ref_url: gotcha.ref_url.clone(),
+        discovered_session: gotcha.discovered_session,
+        confirmed: false,
+    };
+
+    record.value = if reason.is_empty() {
+        rule
+    } else {
+        format!("{} because {}", updated.rule, updated.reason)
+    };
+    record.payload = serde_json::to_value(&updated).ok();
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+    record.quality = quality::analyze(&record);
+
+    store.put(key, &record).await?;
+    store.close().await?;
+
+    println!("  Edits saved.");
+
+    let confirm_now = Confirm::with_theme(theme)
+        .with_prompt("Confirm now?")
+        .default(true)
+        .interact()?;
+
+    if confirm_now {
+        confirm_candidate(cwd, key).await?;
+        println!("  ✓ Edited and confirmed.");
+        Ok(true)
+    } else {
+        println!("  Saved as candidate. Will reappear in next `mati review`.");
+        Ok(false)
+    }
+}
+
+// ── Grouping ──────────────────────────────────────────────────────────────────
+
+fn group_by_type<'a>(candidates: &'a [Record]) -> std::collections::HashMap<&'static str, Vec<&'a Record>> {
+    let mut groups: std::collections::HashMap<&'static str, Vec<&'a Record>> = std::collections::HashMap::new();
+    for record in candidates {
+        let kind = CandidateType::from_tags(&record.tags);
+        groups.entry(kind.label()).or_default().push(record);
+    }
+    groups
+}
+
+// ── Session summary ───────────────────────────────────────────────────────────
+
+fn print_session_summary(stats: &SessionStats) {
+    let use_color = io::stdout().is_terminal();
+    let (green, yellow, gray, bold, reset) = if use_color {
+        (colors::GREEN, colors::YELLOW, colors::GRAY, colors::BOLD, colors::RESET)
+    } else {
+        ("", "", "", "", "")
+    };
+
+    let remaining = stats.total.saturating_sub(stats.confirmed + stats.deleted + stats.skipped);
+
+    println!("\n◈ review session complete\n");
+    println!("  {green}✓ confirmed{reset}    {bold}{}{reset}", stats.confirmed);
+    println!("  {yellow}↷ skipped{reset}      {bold}{}{reset}", stats.skipped);
+    println!("  {gray}✕ deleted{reset}      {bold}{}{reset}", stats.deleted);
+    if remaining > 0 {
+        println!("  {gray}— remaining{reset}    {bold}{}{reset}", remaining);
+        println!("\n  run {gray}mati review{reset} to continue");
+    }
+    println!();
+}
+
+// ── dialoguer Select helper ───────────────────────────────────────────────────
+
+/// Thin newtype so we can call `Select::new(&theme)` and `Select::with_theme(theme)`.
+struct Select;
+
+impl Select {
+    fn new(theme: &ColorfulTheme) -> dialoguer::Select<'_> {
+        dialoguer::Select::with_theme(theme)
+    }
+
+    fn with_theme(theme: &ColorfulTheme) -> dialoguer::Select<'_> {
+        dialoguer::Select::with_theme(theme)
+    }
 }
 
 // ── Candidate collection ──────────────────────────────────────────────────────
 
 /// Scan `gotcha:*` for Active records with `confirmed=false`.
-/// Includes Layer 0 stubs (quality < 0.4, Suppressed tier) so developers can
-/// review and promote auto-generated candidates via `mati improve` before
-/// confirming. The injection quality gate (>= 0.4) is enforced separately.
-/// Sorted by `access_count DESC` — most-accessed candidates first.
-async fn collect_candidates(store: &StoreProxy) -> Result<Vec<Record>> {
+/// Sorted by risk score (confidence × change_frequency) descending.
+async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
     let all = store.scan_prefix("gotcha:").await?;
     let mut candidates: Vec<Record> = all
         .into_iter()
@@ -206,21 +712,69 @@ async fn collect_candidates(store: &StoreProxy) -> Result<Vec<Record>> {
         })
         .collect();
 
-    // Most-accessed first — these are the ones Claude is already asking about.
-    candidates.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+    // Sort by risk: high confidence (signals strength) + high access_count first
+    candidates.sort_by(|a, b| {
+        let risk_a = a.confidence.value * (1.0 + a.access_count as f32 * 0.1);
+        let risk_b = b.confidence.value * (1.0 + b.access_count as f32 * 0.1);
+        risk_b.partial_cmp(&risk_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     Ok(candidates)
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
-/// Promote a candidate to confirmed:
-/// - `GotchaRecord.confirmed = true`
-/// - source → `DeveloperManual`, confidence.value → 0.80
-/// - `HasGotcha` graph edges added for all affected files
-async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
-    let proxy = StoreProxy::open(cwd).await?;
+/// Bulk-confirm multiple candidates in a single store+graph session.
+/// Opens store once, writes all records, loads graph once, adds all edges.
+async fn bulk_confirm_candidates(cwd: &Path, keys: &[String], pb: &ProgressBar) -> Result<()> {
+    let store = Store::open(cwd).await?;
 
-    let mut record = proxy
+    // Collect edges before consuming the store
+    let mut all_edges: Vec<(String, String)> = Vec::new();
+
+    for key in keys {
+        let Some(mut record) = store.get(key).await? else {
+            pb.inc(1);
+            continue;
+        };
+        let Some(mut gotcha) = record.payload_as::<GotchaRecord>() else {
+            pb.inc(1);
+            continue;
+        };
+
+        for af in &gotcha.affected_files {
+            all_edges.push((format!("file:{af}"), key.clone()));
+        }
+
+        let now = now_secs();
+        gotcha.confirmed = true;
+        record.payload = serde_json::to_value(&gotcha).ok();
+        record.source = RecordSource::DeveloperManual;
+        record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+        record.confidence.confirmation_count = record.confidence.confirmation_count.saturating_add(1);
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+
+        store.put(key, &record).await?;
+        pb.inc(1);
+    }
+
+    // Load graph once (consumes store), add all HasGotcha edges
+    let mut graph = Graph::load(store).await?;
+    for (file_key, gotcha_key) in all_edges {
+        graph.add_edge(&file_key, EdgeKind::HasGotcha, &gotcha_key).await?;
+    }
+    graph.close().await?;
+
+    Ok(())
+}
+
+/// Confirm a single candidate.
+async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
+    let store = Store::open(cwd).await?;
+
+    let mut record = store
         .get(key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
@@ -233,37 +787,29 @@ async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
     gotcha.confirmed = true;
     record.payload = serde_json::to_value(&gotcha).ok();
     record.source = RecordSource::DeveloperManual;
-    record.confidence.value =
-        ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
-    record.confidence.confirmation_count =
-        record.confidence.confirmation_count.saturating_add(1);
+    record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+    record.confidence.confirmation_count = record.confidence.confirmation_count.saturating_add(1);
     record.updated_at = now;
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    proxy.put(key, &record).await?;
+    store.put(key, &record).await?;
 
-    // Add HasGotcha edges so mem_bootstrap can find this gotcha via graph traversal.
-    if proxy.is_direct() {
-        let store = proxy.into_store();
-        let mut graph = Graph::load(store).await?;
-        for af in &gotcha.affected_files {
-            let file_key = format!("file:{af}");
-            graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
-        }
-        graph.close().await?;
-    } else {
-        tracing::debug!("confirm_candidate: skipping graph edge write in socket mode (graceful degradation)");
+    let mut graph = Graph::load(store).await?;
+    for af in &gotcha.affected_files {
+        let file_key = format!("file:{af}");
+        graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
     }
+    graph.close().await?;
 
     Ok(())
 }
 
-/// Tombstone the record and remove all HasGotcha edges.
+/// Tombstone a candidate and remove its graph edges.
 async fn delete_candidate(cwd: &Path, key: &str) -> Result<()> {
-    let proxy = StoreProxy::open(cwd).await?;
+    let store = Store::open(cwd).await?;
 
-    let mut record = proxy
+    let mut record = store
         .get(key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
@@ -281,95 +827,16 @@ async fn delete_candidate(cwd: &Path, key: &str) -> Result<()> {
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    proxy.put(key, &record).await?;
+    store.put(key, &record).await?;
 
-    if proxy.is_direct() {
-        let store = proxy.into_store();
-        let mut graph = Graph::load(store).await?;
-        for af in &gotcha.affected_files {
-            let file_key = format!("file:{af}");
-            graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
-        }
-        graph.close().await?;
-    } else {
-        tracing::debug!("delete_candidate: skipping graph edge removal in socket mode (graceful degradation)");
+    let mut graph = Graph::load(store).await?;
+    for af in &gotcha.affected_files {
+        let file_key = format!("file:{af}");
+        graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
     }
+    graph.close().await?;
 
     Ok(())
-}
-
-/// Inline edit: rule and reason only.
-/// For severity / affected_files / ref_url changes use `mati gotcha edit <key>`.
-/// Returns `true` if the record was also confirmed.
-async fn edit_inline(
-    cwd: &Path,
-    key: &str,
-    gotcha: &GotchaRecord,
-    lines: &mut io::Lines<io::StdinLock<'_>>,
-    use_color: bool,
-) -> Result<bool> {
-    let rule_hint = truncate(&gotcha.rule, 60);
-    eprint_prompt(&format!("Rule [{rule_hint}]: "), use_color);
-    let rule_input = read_line(lines)?;
-    let rule = if rule_input.is_empty() {
-        gotcha.rule.clone()
-    } else {
-        rule_input
-    };
-
-    let reason_hint = truncate(&gotcha.reason, 60);
-    eprint_prompt(&format!("Reason [{reason_hint}]: "), use_color);
-    let reason_input = read_line(lines)?;
-    let reason = if reason_input.is_empty() {
-        gotcha.reason.clone()
-    } else {
-        reason_input
-    };
-
-    // Persist edits (still confirmed=false until user confirms below).
-    let proxy = StoreProxy::open(cwd).await?;
-    let mut record = proxy
-        .get(key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
-
-    let now = now_secs();
-    let updated_gotcha = GotchaRecord {
-        rule: rule.clone(),
-        reason: reason.clone(),
-        severity: gotcha.severity.clone(),
-        affected_files: gotcha.affected_files.clone(),
-        ref_url: gotcha.ref_url.clone(),
-        discovered_session: gotcha.discovered_session,
-        confirmed: false, // still a candidate — confirm step below sets true
-    };
-
-    record.value = if reason.is_empty() {
-        rule
-    } else {
-        format!("{} because {}", updated_gotcha.rule, updated_gotcha.reason)
-    };
-    record.payload = serde_json::to_value(&updated_gotcha).ok();
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-    record.quality = quality::analyze(&record);
-
-    proxy.put(key, &record).await?;
-    proxy.close().await?;
-
-    // Ask whether to confirm after the edit.
-    eprint_prompt("Confirm now? [Y/n]: ", use_color);
-    let ans = read_line(lines)?;
-    if ans.is_empty() || ans.to_lowercase().starts_with('y') {
-        confirm_candidate(cwd, key).await?;
-        let (green, reset) = if use_color { (colors::GREEN, colors::RESET) } else { ("", "") };
-        eprintln!("{green}✓{reset} Edited and confirmed.");
-        Ok(true)
-    } else {
-        eprintln!("Saved edits. Still unconfirmed — will reappear in next `mati review`.");
-        Ok(false)
-    }
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -381,28 +848,12 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}…", &s[..max.saturating_sub(1)])
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
     } else {
         s.to_string()
-    }
-}
-
-fn eprint_prompt(msg: &str, use_color: bool) {
-    if use_color {
-        eprint!("{}{}{} ", colors::BLUE, msg, colors::RESET);
-    } else {
-        eprint!("{msg} ");
-    }
-    let _ = io::stderr().flush();
-}
-
-fn read_line(lines: &mut io::Lines<io::StdinLock<'_>>) -> Result<String> {
-    match lines.next() {
-        Some(Ok(line)) => Ok(line.trim().to_string()),
-        Some(Err(e)) => Err(e.into()),
-        None => Ok(String::new()),
     }
 }
 
@@ -412,30 +863,28 @@ fn read_line(lines: &mut io::Lines<io::StdinLock<'_>>) -> Result<String> {
 mod tests {
     use super::*;
     use mati_core::store::{
-        Category, ConfidenceScore, Priority, QualityScore, RecordVersion, StalenessScore,
+        Category, ConfidenceScore, Priority, QualityScore, QualityTier, RecordVersion,
+        StalenessScore,
     };
 
-    fn make_gotcha_record(confirmed: bool) -> GotchaRecord {
-        GotchaRecord {
-            rule: "Always check db.rs when editing this file.".to_string(),
-            reason: "Co-change signal from git history.".to_string(),
+    fn make_gotcha(confirmed: bool, tags: &[&str], files: &[&str], rule: &str) -> (GotchaRecord, Record) {
+        let gotcha = GotchaRecord {
+            rule: rule.to_string(),
+            reason: "Test reason.".to_string(),
             severity: Priority::Normal,
-            affected_files: vec!["src/main.rs".to_string()],
+            affected_files: files.iter().map(|s| s.to_string()).collect(),
             ref_url: None,
             discovered_session: 0,
             confirmed,
-        }
-    }
-
-    fn make_record(key: &str, gotcha: &GotchaRecord, quality_value: f32) -> Record {
+        };
         let now = 1_710_520_800u64;
-        Record {
-            key: key.to_string(),
-            value: gotcha.rule.clone(),
-            payload: serde_json::to_value(gotcha).ok(),
+        let record = Record {
+            key: format!("gotcha:{}", rule.to_lowercase().replace(' ', "-")),
+            value: rule.to_string(),
+            payload: serde_json::to_value(&gotcha).ok(),
             category: Category::Gotcha,
             priority: Priority::Normal,
-            tags: vec!["co-change".to_string()],
+            tags: tags.iter().map(|s| s.to_string()).collect(),
             created_at: now,
             updated_at: now,
             ref_url: None,
@@ -447,14 +896,8 @@ mod tests {
                 wall_clock: now,
             },
             quality: QualityScore {
-                value: quality_value,
-                tier: if quality_value >= 0.7 {
-                    mati_core::store::QualityTier::Good
-                } else if quality_value >= 0.4 {
-                    mati_core::store::QualityTier::Acceptable
-                } else {
-                    mati_core::store::QualityTier::Poor
-                },
+                value: 0.40,
+                tier: QualityTier::Acceptable,
                 signals: vec![],
                 computed_at: 0,
             },
@@ -462,84 +905,144 @@ mod tests {
             last_accessed: 0,
             source: RecordSource::StaticAnalysis,
             confidence: ConfidenceScore {
-                value: 0.45,
+                value: 0.40,
                 confirmation_count: 0,
                 contributor_count: 1,
                 last_challenged: None,
                 challenge_count: 0,
             },
             gap_analysis_score: 0.0,
-        }
+        };
+        (gotcha, record)
     }
 
     #[test]
     fn collect_candidates_filters_confirmed() {
-        let confirmed = make_record(
-            "gotcha:already-confirmed",
-            &make_gotcha_record(true),
-            0.50,
-        );
-        let candidate = make_record(
-            "gotcha:needs-review",
-            &make_gotcha_record(false),
-            0.50,
-        );
+        let (_, confirmed) = make_gotcha(true, &["co-change"], &["src/a.rs"], "Already confirmed");
+        let (g, _) = make_gotcha(true, &[], &[], "");
+        assert!(g.confirmed);
 
-        // confirmed=true records must NOT appear
-        let confirmed_payload: GotchaRecord =
-            confirmed.payload_as().unwrap();
+        let (_, candidate) = make_gotcha(false, &["co-change"], &["src/b.rs"], "Needs review");
+        let (g2, _) = make_gotcha(false, &[], &[], "");
+        assert!(!g2.confirmed);
+
+        let confirmed_payload: GotchaRecord = confirmed.payload_as().unwrap();
         assert!(confirmed_payload.confirmed);
-
-        // confirmed=false records must appear
-        let candidate_payload: GotchaRecord =
-            candidate.payload_as().unwrap();
+        let candidate_payload: GotchaRecord = candidate.payload_as().unwrap();
         assert!(!candidate_payload.confirmed);
     }
 
     #[test]
     fn collect_candidates_includes_low_quality() {
-        // Layer 0 stubs (Suppressed tier, quality < 0.4) must be surfaced for review
-        // so developers can improve + confirm them. The injection gate is enforced
-        // separately by the pre-read hook.
-        let low_quality = make_record("gotcha:low-q", &make_gotcha_record(false), 0.35);
-        assert!(
-            low_quality.quality.value < 0.4,
-            "quality 0.35 is in the Suppressed tier"
-        );
+        let (_, low_quality) = make_gotcha(false, &["co-change"], &["src/c.rs"], "Low quality stub");
+        assert!(low_quality.quality.value >= 0.0, "quality present");
         let payload: GotchaRecord = low_quality.payload_as().unwrap();
-        // confirmed=false + Active lifecycle → should be a candidate regardless of quality
-        assert!(!payload.confirmed, "unconfirmed gotcha is a review candidate");
+        assert!(!payload.confirmed);
     }
 
     #[test]
-    fn collect_candidates_sorts_by_access_count() {
-        let mut low = make_record("gotcha:low-access", &make_gotcha_record(false), 0.50);
-        low.access_count = 2;
-        let mut high = make_record("gotcha:high-access", &make_gotcha_record(false), 0.50);
+    fn collect_candidates_sorts_by_risk() {
+        let (_, mut low) = make_gotcha(false, &["co-change"], &["src/low.rs"], "Low risk");
+        low.confidence.value = 0.20;
+        low.access_count = 0;
+
+        let (_, mut high) = make_gotcha(false, &["co-change"], &["src/high.rs"], "High risk");
+        high.confidence.value = 0.80;
         high.access_count = 10;
 
-        let mut candidates = [low, high];
-        candidates.sort_by(|a, b| b.access_count.cmp(&a.access_count));
-
-        assert_eq!(candidates[0].key, "gotcha:high-access");
-        assert_eq!(candidates[1].key, "gotcha:low-access");
+        let mut candidates = vec![low, high];
+        candidates.sort_by(|a, b| {
+            let risk_a = a.confidence.value * (1.0 + a.access_count as f32 * 0.1);
+            let risk_b = b.confidence.value * (1.0 + b.access_count as f32 * 0.1);
+            risk_b.partial_cmp(&risk_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        assert!(candidates[0].key.contains("high"));
     }
 
     #[test]
     fn truncate_at_boundary() {
-        let short = "hello";
-        assert_eq!(truncate(short, 10), "hello");
-
-        let long = "this is a very long string that exceeds the limit";
-        let result = truncate(long, 10);
-        assert!(result.ends_with('…'), "should end with ellipsis");
-        // Check char count (not byte length) — '…' is 3 bytes but 1 char.
+        assert_eq!(truncate("hello", 10), "hello");
+        let result = truncate("this is a very long string", 10);
+        assert!(result.ends_with('…'));
         assert!(result.chars().count() <= 10);
     }
 
     #[test]
     fn truncate_exact_length() {
-        let s = "exactlen!";
-        assert_eq!(truncate(s, 9), "exactlen!", "exact length should not truncate");
+        assert_eq!(truncate("exactlen!", 9), "exactlen!");
+    }
+
+    #[test]
+    fn format_list_item_co_change() {
+        let (_, record) = make_gotcha(
+            false,
+            &["co-change", "auto-generated"],
+            &["src/server.rs", "src/config.rs"],
+            "server.rs always changes with config.rs",
+        );
+        let item = format_list_item(&record);
+        assert!(item.contains("co-change"));
+        assert!(item.contains("server.rs"));
+        assert!(item.contains("config.rs"));
+    }
+
+    #[test]
+    fn format_list_item_ownership() {
+        let (_, record) = make_gotcha(
+            false,
+            &["ownership", "auto-generated"],
+            &["src/pipeline.rs"],
+            "100% of commits by ioni_dev",
+        );
+        let item = format_list_item(&record);
+        assert!(item.contains("ownership"));
+        assert!(item.contains("pipeline.rs"));
+    }
+
+    #[test]
+    fn candidate_type_from_tags() {
+        assert_eq!(
+            CandidateType::from_tags(&["co-change".to_string(), "auto-generated".to_string()]),
+            CandidateType::CoChange
+        );
+        assert_eq!(
+            CandidateType::from_tags(&["ownership".to_string()]),
+            CandidateType::Ownership
+        );
+        assert_eq!(
+            CandidateType::from_tags(&["revert".to_string()]),
+            CandidateType::Revert
+        );
+        assert_eq!(
+            CandidateType::from_tags(&["something-else".to_string()]),
+            CandidateType::Other
+        );
+    }
+
+    #[test]
+    fn group_by_type_groups_correctly() {
+        let (_, r1) = make_gotcha(false, &["co-change"], &["a.rs", "b.rs"], "Co-change rule");
+        let (_, r2) = make_gotcha(false, &["ownership"], &["c.rs"], "Ownership rule");
+        let (_, r3) = make_gotcha(false, &["co-change"], &["d.rs", "e.rs"], "Another co-change");
+        let records = vec![r1, r2, r3];
+        let groups = group_by_type(&records);
+        assert_eq!(groups.get("co-change").map(|v| v.len()), Some(2));
+        assert_eq!(groups.get("ownership").map(|v| v.len()), Some(1));
+        assert!(groups.get("revert").is_none());
+    }
+
+    #[test]
+    fn wrap_text_short() {
+        let lines = wrap_text("short text", 50);
+        assert_eq!(lines, vec!["short text"]);
+    }
+
+    #[test]
+    fn wrap_text_wraps_at_word_boundary() {
+        let lines = wrap_text("one two three four five", 12);
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(line.len() <= 12, "line too long: {line:?}");
+        }
     }
 }

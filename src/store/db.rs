@@ -112,8 +112,10 @@ impl Store {
         std::fs::create_dir_all(&root)
             .with_context(|| format!("cannot create mati dir at {}", root.display()))?;
 
-        let knowledge = open_knowledge_tree(root.join("knowledge.db"))?;
-        let sessions  = open_sessions_tree(root.join("sessions.db"))?;
+        let knowledge = open_knowledge_tree(root.join("knowledge.db"))
+            .map_err(|e| lock_error_hint(e, &root.join("knowledge.db")))?;
+        let sessions  = open_sessions_tree(root.join("sessions.db"))
+            .map_err(|e| lock_error_hint(e, &root.join("sessions.db")))?;
 
         // Tantivy is NOT initialized here — it is lazily created on first use
         // via `ensure_search()`. This saves ~30-50ms for hook commands that
@@ -779,6 +781,23 @@ impl Store {
 // ---------------------------------------------------------------------------
 // Tree construction helpers
 // ---------------------------------------------------------------------------
+
+/// If a store open fails and the LOCK file exists, another mati process (MCP
+/// server or daemon) holds the exclusive SurrealKV lock. Replace the raw OS
+/// error with an actionable message.
+fn lock_error_hint(err: anyhow::Error, db_path: &std::path::Path) -> anyhow::Error {
+    let lock_file = db_path.join("LOCK");
+    if lock_file.exists() {
+        anyhow::anyhow!(
+            "cannot open {} — another mati process (MCP server or daemon) holds the lock.\n\
+             Stop the process first, or use `mem_get`/`mem_query` via the MCP tools in Claude.\n\
+             To stop the daemon: `mati daemon stop`",
+            db_path.display()
+        )
+    } else {
+        err
+    }
+}
 
 fn open_knowledge_tree(path: PathBuf) -> Result<Tree> {
     // vlog_value_threshold must be 0 when versioning is enabled — SurrealKV

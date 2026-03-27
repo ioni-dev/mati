@@ -1,7 +1,5 @@
-//! Single-file reparse logic (M-12-A) — library entry point.
-//!
-//! `reparse_impl` is called by both the MCP server's daemon socket (`edit_hook`
-//! command) and by the standalone `mati reparse` CLI subcommand.
+//! Incremental file reparse — used by `mati reparse`, `edit-hook`, and the MCP
+//! server socket handler.
 //!
 //! Steps:
 //! 1. Read file from disk. Missing → add FileDeleted staleness signal, return.
@@ -9,7 +7,7 @@
 //! 3. Parse failure → log warning, return Ok (graceful degradation P9).
 //! 4. Fetch existing file:<path> record.
 //! 5. No record → create Layer 0 stub, persist, return.
-//! 6. Deserialize record.value as FileRecord, compare structural fields.
+//! 6. Deserialize record.payload as FileRecord, compare structural fields.
 //! 7. Nothing changed → return early (no write).
 //! 8. Merge new analysis, preserve: purpose, gotcha_keys, decision_keys,
 //!    change_frequency, last_author, is_hotspot.
@@ -23,9 +21,7 @@ use anyhow::Result;
 
 use crate::analysis::walker::{detect_language, WalkedFile};
 use crate::analysis::{parse_file, StaticFileAnalysis};
-use crate::health::staleness::{
-    apply_reparse_staleness, cascade_staleness_to_gotchas, ReparseDiff,
-};
+use crate::health::staleness::{apply_reparse_staleness, cascade_staleness_to_gotchas, ReparseDiff};
 use crate::store::record::{
     Category, ConfidenceScore, FileRecord, QualityScore, Record, RecordLifecycle, RecordSource,
     RecordVersion, StalenessScore, StalenessSignal, StalenessTier,
@@ -39,6 +35,15 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Re-parse a single file and update its store record in place.
+///
+/// Called by:
+/// - `mati reparse <path>` CLI command
+/// - `mati edit-hook <path>` (via daemon socket or direct store)
+/// - MCP server socket `edit_hook` handler
+///
+/// Gracefully degrades on parse failure (P9). Never returns an error for
+/// missing files or parse issues — those are logged as warnings.
 pub async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str) -> Result<()> {
     let abs_path = repo_root.join(rel_path);
     let file_key = format!("file:{rel_path}");
@@ -211,11 +216,9 @@ fn build_file_record_from_analysis(
 }
 
 /// Compute the structural diff between an old FileRecord and new analysis.
-fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
-    let old_eps: HashSet<&str> =
-        old.entry_points.iter().map(|s| s.as_str()).collect();
-    let new_eps: HashSet<&str> =
-        new.entry_points.iter().map(|s| s.as_str()).collect();
+pub fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
+    let old_eps: HashSet<&str> = old.entry_points.iter().map(|s| s.as_str()).collect();
+    let new_eps: HashSet<&str> = new.entry_points.iter().map(|s| s.as_str()).collect();
 
     let entry_points_added: Vec<String> = new_eps
         .difference(&old_eps)
@@ -226,10 +229,8 @@ fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
         .map(|s| s.to_string())
         .collect();
 
-    let old_imports: HashSet<&str> =
-        old.imports.iter().map(|s| s.as_str()).collect();
-    let new_imports: HashSet<&str> =
-        new.imports.iter().map(|s| s.as_str()).collect();
+    let old_imports: HashSet<&str> = old.imports.iter().map(|s| s.as_str()).collect();
+    let new_imports: HashSet<&str> = new.imports.iter().map(|s| s.as_str()).collect();
 
     let imports_added: Vec<String> = new_imports
         .difference(&old_imports)
@@ -258,5 +259,337 @@ fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
         todos_changed,
         unsafe_delta,
         unwrap_delta,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::walker::Language;
+    use tempfile::TempDir;
+
+    fn make_old_file_record() -> FileRecord {
+        FileRecord {
+            path: "src/main.rs".into(),
+            purpose: "Main entry point".into(),
+            entry_points: vec!["main".into(), "old_fn".into()],
+            imports: vec!["std::io".into()],
+            gotcha_keys: vec!["gotcha:test".into()],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 1,
+            change_frequency: 5,
+            last_author: Some("dev".into()),
+            is_hotspot: true,
+            token_cost_estimate: 100,
+            last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
+        }
+    }
+
+    fn make_new_analysis() -> StaticFileAnalysis {
+        StaticFileAnalysis {
+            path: "src/main.rs".into(),
+            language: Language::Rust,
+            entry_points: vec!["main".into(), "new_fn".into()],
+            exported_types: vec![],
+            imports: vec!["std::io".into(), "anyhow".into()],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            panic_count: 0,
+            branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
+        }
+    }
+
+    #[test]
+    fn compute_diff_detects_entry_point_changes() {
+        let old = make_old_file_record();
+        let new = make_new_analysis();
+        let diff = compute_diff(&old, &new);
+
+        assert!(diff.entry_points_added.contains(&"new_fn".to_string()));
+        assert!(diff.entry_points_removed.contains(&"old_fn".to_string()));
+    }
+
+    #[test]
+    fn compute_diff_detects_import_changes() {
+        let old = make_old_file_record();
+        let new = make_new_analysis();
+        let diff = compute_diff(&old, &new);
+
+        assert!(diff.imports_added.contains(&"anyhow".to_string()));
+        assert!(diff.imports_removed.is_empty());
+    }
+
+    #[test]
+    fn compute_diff_detects_unwrap_delta() {
+        let old = make_old_file_record();
+        let new = make_new_analysis();
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.unwrap_delta, -1);
+    }
+
+    #[test]
+    fn compute_diff_empty_when_identical() {
+        let old = FileRecord {
+            path: "src/main.rs".into(),
+            purpose: "test".into(),
+            entry_points: vec!["main".into()],
+            imports: vec!["std::io".into()],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+        };
+        let new = StaticFileAnalysis {
+            path: "src/main.rs".into(),
+            language: Language::Rust,
+            entry_points: vec!["main".into()],
+            exported_types: vec![],
+            imports: vec!["std::io".into()],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            panic_count: 0,
+            branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
+        };
+        let diff = compute_diff(&old, &new);
+        assert!(diff.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reparse_creates_stub_for_unknown_file() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("new_file.rs"), "pub fn hello() {}").unwrap();
+
+        let store = Store::open(repo).await.unwrap();
+        reparse_impl(&store, repo, "new_file.rs").await.unwrap();
+
+        let record = store.get("file:new_file.rs").await.unwrap();
+        assert!(record.is_some());
+        let r = record.unwrap();
+        assert_eq!(r.category, Category::File);
+
+        let fr: FileRecord = r.payload_as::<FileRecord>().unwrap();
+        assert!(fr.purpose.is_empty());
+        assert!(fr.entry_points.contains(&"hello".to_string()));
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reparse_marks_deleted_file_as_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+
+        let store = Store::open(repo).await.unwrap();
+
+        let fr = FileRecord {
+            path: "gone.rs".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+        };
+        let record = Record {
+            key: "file:gone.rs".into(),
+            value: serde_json::to_string(&fr).unwrap(),
+            category: Category::File,
+            priority: crate::store::record::Priority::Normal,
+            tags: vec![],
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 1_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+            payload: None,
+        };
+        store.put("file:gone.rs", &record).await.unwrap();
+
+        reparse_impl(&store, repo, "gone.rs").await.unwrap();
+
+        let updated = store.get("file:gone.rs").await.unwrap().unwrap();
+        assert_eq!(updated.staleness.tier, StalenessTier::Tombstone);
+        assert!(updated.staleness.value >= 1.0 - f32::EPSILON);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reparse_preserves_enrichment_fields_and_bumps_staleness() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("lib.rs"), "pub fn new_fn() {}\npub fn kept() {}").unwrap();
+
+        let store = Store::open(repo).await.unwrap();
+
+        let fr = FileRecord {
+            path: "lib.rs".into(),
+            purpose: "Core library".into(),
+            entry_points: vec!["old_fn".into(), "kept".into()],
+            imports: vec![],
+            gotcha_keys: vec!["gotcha:important".into()],
+            decision_keys: vec!["decision:arch".into()],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 10,
+            last_author: Some("ioni".into()),
+            is_hotspot: true,
+            token_cost_estimate: 50,
+            last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
+        };
+        let record = Record {
+            key: "file:lib.rs".into(),
+            value: fr.purpose.clone(),
+            payload: serde_json::to_value(&fr).ok(),
+            category: Category::File,
+            priority: crate::store::record::Priority::Normal,
+            tags: vec![],
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 1_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 3,
+            last_accessed: 1_000_000,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        };
+        store.put("file:lib.rs", &record).await.unwrap();
+
+        reparse_impl(&store, repo, "lib.rs").await.unwrap();
+
+        let updated = store.get("file:lib.rs").await.unwrap().unwrap();
+        let updated_fr: FileRecord = updated.payload_as::<FileRecord>().unwrap();
+
+        // Preserved enrichment
+        assert_eq!(updated_fr.purpose, "Core library");
+        assert_eq!(updated_fr.gotcha_keys, vec!["gotcha:important"]);
+        assert_eq!(updated_fr.decision_keys, vec!["decision:arch"]);
+        assert_eq!(updated_fr.change_frequency, 10);
+        assert_eq!(updated_fr.last_author.as_deref(), Some("ioni"));
+        assert!(updated_fr.is_hotspot);
+
+        // Updated structural fields
+        assert!(updated_fr.entry_points.contains(&"new_fn".to_string()));
+        assert!(updated_fr.entry_points.contains(&"kept".to_string()));
+        assert!(!updated_fr.entry_points.contains(&"old_fn".to_string()));
+
+        // Staleness should have bumped (entry point changes)
+        assert!(updated.staleness.value > 0.0);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reparse_noop_when_no_structural_changes() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("stable.rs"), "pub fn run() {}").unwrap();
+
+        let store = Store::open(repo).await.unwrap();
+
+        let fr = FileRecord {
+            path: "stable.rs".into(),
+            purpose: "Stable module".into(),
+            entry_points: vec!["run".into()],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 50,
+            last_modified_session: 1_000_000,
+            content_hash: None,
+            line_count: 0,
+        };
+        let record = Record {
+            key: "file:stable.rs".into(),
+            value: fr.purpose.clone(),
+            payload: serde_json::to_value(&fr).ok(),
+            category: Category::File,
+            priority: crate::store::record::Priority::Normal,
+            tags: vec![],
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 1_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        };
+        store.put("file:stable.rs", &record).await.unwrap();
+
+        reparse_impl(&store, repo, "stable.rs").await.unwrap();
+
+        // Version should NOT have changed (no write)
+        let after = store.get("file:stable.rs").await.unwrap().unwrap();
+        assert_eq!(after.version.logical_clock, 1);
+        assert_eq!(after.updated_at, 1_000_000);
+
+        store.close().await.unwrap();
     }
 }

@@ -219,24 +219,8 @@ async fn write_socket_response(
     Ok(())
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn today_key(prefix: &str) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d");
-    format!("{prefix}{now}")
-}
-
 async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -> SocketResponse {
-    use crate::store::{
-        Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle,
-        RecordSource, RecordVersion, StalenessScore, TombstoneReason,
-    };
-    use crate::graph::edges::{Edge, EdgeKind};
+    use crate::store::session as sess;
 
     match req.cmd.as_str() {
         "ping" => SocketResponse::ok(serde_json::Value::String("pong".into())),
@@ -272,18 +256,8 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let now = now_secs();
-            let agg_key = today_key("analytics:hit_");
-            if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-                tracing::warn!("daemon socket log_hit agg: {e}");
-            }
-            let consulted_key = format!("session:consulted:{key}");
-            let session_rec = make_session_record(&consulted_key, String::new(), now);
-            let _ = store.put(&consulted_key, &session_rec).await;
-            if let Ok(Some(mut record)) = store.get(key).await {
-                record.access_count += 1;
-                record.last_accessed = now;
-                let _ = store.put(key, &record).await;
+            if let Err(e) = sess::log_hit(store, key).await {
+                tracing::warn!("daemon socket log_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
         }
@@ -293,8 +267,7 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let agg_key = today_key("analytics:miss_");
-            if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
+            if let Err(e) = sess::log_miss(store, key).await {
                 tracing::warn!("daemon socket log_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -305,8 +278,7 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let agg_key = today_key("compliance:miss_");
-            if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
+            if let Err(e) = sess::log_compliance_miss(store, key).await {
                 tracing::warn!("daemon socket log_compliance_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -317,61 +289,24 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let consulted_key = format!("session:consulted:{key}");
-            match store.get(&consulted_key).await {
-                Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found.is_some())),
+            match sess::check_consulted(store, key).await {
+                Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
         }
 
         "session_flush" => {
-            let now = now_secs();
-            let consulted_keys = match store.scan_keys("session:consulted:").await {
-                Ok(keys) => keys,
-                Err(e) => return SocketResponse::err(format!("scan_keys: {e}")),
-            };
-            let stripped: Vec<String> = consulted_keys
-                .iter()
-                .map(|k| k.strip_prefix("session:consulted:").unwrap_or(k).to_string())
-                .collect();
-            let value = match serde_json::to_string(&serde_json::json!({
-                "consulted_keys": stripped,
-                "flushed_at": now,
-            })) {
-                Ok(v) => v,
-                Err(e) => return SocketResponse::err(format!("serialize: {e}")),
-            };
-            let rec = make_session_record("session:current", value, now);
-            if let Err(e) = store.put("session:current", &rec).await {
+            if let Err(e) = sess::session_flush(store).await {
                 tracing::warn!("daemon socket session_flush: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
         }
 
         "session_harvest" => {
-            // Lightweight harvest: write permanent session record without staleness analysis.
-            // Staleness analysis (git2) is !Send and runs on the CLI-path harvest instead.
-            let now = now_secs();
-            let session_rec = match store.get("session:current").await {
-                Ok(Some(r)) => r,
-                Ok(None) => return SocketResponse::ok(serde_json::Value::Null),
-                Err(e) => return SocketResponse::err(format!("store: {e}")),
-            };
-            let session_value = match session_rec.payload.as_ref() {
-                Some(p) => serde_json::to_string(p).unwrap_or_default(),
-                None => session_rec.value.clone(),
-            };
-            let session_key = format!("session:{now}");
-            let mut perm = make_session_record(&session_key, session_value, now);
-            perm.payload = session_rec.payload;
-            if let Err(e) = store.put(&session_key, &perm).await {
+            // Note: uses no-staleness variant because StalenessAnalyzer (git2) is !Send.
+            // Git-based staleness analysis runs on the next CLI-path harvest.
+            if let Err(e) = sess::session_harvest_no_staleness(store).await {
                 tracing::warn!("daemon socket session_harvest: {e}");
-            }
-            // Clean up consulted markers
-            if let Ok(keys) = store.scan_keys("session:consulted:").await {
-                for k in &keys {
-                    let _ = store.delete(k).await;
-                }
             }
             SocketResponse::ok(serde_json::Value::Null)
         }
@@ -382,19 +317,23 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 None => return SocketResponse::err("missing args.path"),
             };
             let file_key = format!("file:{path}");
-            let now = now_secs();
-            let agg_key = today_key("analytics:hit_");
-            let _ = upsert_daily_agg(store, &agg_key, &file_key).await;
-            let consulted_key = format!("session:consulted:{file_key}");
-            let session_rec = make_session_record(&consulted_key, String::new(), now);
-            let _ = store.put(&consulted_key, &session_rec).await;
-            if let Ok(Some(mut record)) = store.get(&file_key).await {
-                record.access_count += 1;
-                record.last_accessed = now;
-                let _ = store.put(&file_key, &record).await;
+            if let Err(e) = sess::log_hit(store, &file_key).await {
+                tracing::warn!("daemon socket edit_hook: log_hit failed: {e}");
             }
             if let Err(e) = crate::analysis::reparse::reparse_impl(store, repo_root, path).await {
                 tracing::warn!("daemon socket edit_hook: reparse failed (non-fatal): {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
+        "doc_capture" => {
+            let path = match req.args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return SocketResponse::err("missing args.path"),
+            };
+            let content = req.args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(e) = sess::doc_capture(store, path, content).await {
+                tracing::warn!("daemon socket doc_capture: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
         }
@@ -413,24 +352,11 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
             }
         }
 
-        "put" => {
-            let key = match req.args.get("key").and_then(|v| v.as_str()) {
-                Some(k) => k,
-                None => return SocketResponse::err("missing args.key"),
-            };
-            let record: Record = match req.args.get("record")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-            {
-                Some(r) => r,
-                None => return SocketResponse::err("put: invalid record"),
-            };
-            match store.put(key, &record).await {
-                Ok(()) => SocketResponse::ok(serde_json::Value::Null),
-                Err(e) => SocketResponse::err(format!("store: {e}")),
-            }
-        }
-
         "gotcha_write" => {
+            use crate::graph::edges::{Edge, EdgeKind};
+            use crate::store::Record;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
             let record: Record = match req.args.get("record")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
             {
@@ -477,8 +403,12 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 }
                 if !old_set.contains(file_path.as_str()) {
                     let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
-                    let ts = now_secs().to_le_bytes();
-                    let _ = store.put_raw(&edge_key, &ts).await;
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .to_le_bytes();
+                    let _ = store.put_raw(&edge_key, &now).await;
                 }
             }
             for file_path in &old_files {
@@ -492,6 +422,10 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
         }
 
         "gotcha_tombstone" => {
+            use crate::graph::edges::{Edge, EdgeKind};
+            use crate::store::{RecordLifecycle, TombstoneReason};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
@@ -502,7 +436,10 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
 
             match store.get(key).await {
                 Ok(Some(mut record)) => {
-                    let now = now_secs();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
                     record.lifecycle = RecordLifecycle::Tombstoned {
                         reason: TombstoneReason::ManualDeletion,
                         at: now,
@@ -527,76 +464,4 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
 
         other => SocketResponse::err(format!("unknown command: {other}")),
     }
-}
-
-fn make_session_record(key: &str, value: String, now: u64) -> crate::store::Record {
-    use crate::store::{
-        Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle,
-        RecordSource, RecordVersion, StalenessScore,
-    };
-    Record {
-        key: key.to_string(),
-        value,
-        category: Category::Session,
-        priority: Priority::Normal,
-        tags: vec![],
-        created_at: now,
-        updated_at: now,
-        ref_url: None,
-        staleness: StalenessScore::fresh(),
-        lifecycle: RecordLifecycle::Active,
-        version: RecordVersion {
-            device_id: uuid::Uuid::new_v4(),
-            logical_clock: 1,
-            wall_clock: now,
-        },
-        quality: QualityScore::layer0_default(),
-        access_count: 0,
-        last_accessed: 0,
-        source: RecordSource::SessionHook,
-        confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
-        gap_analysis_score: 0.0,
-        payload: None,
-    }
-}
-
-fn make_analytics_record(key: &str, value: String, now: u64) -> crate::store::Record {
-    let mut r = make_session_record(key, value, now);
-    r.category = crate::store::Category::Analytics;
-    r
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct DailyAgg {
-    count: u64,
-    keys: Vec<String>,
-}
-
-const MAX_AGG_KEYS: usize = 100;
-
-async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> anyhow::Result<()> {
-    let now = now_secs();
-    match store.get(agg_key).await? {
-        Some(mut record) => {
-            let mut agg: DailyAgg = record
-                .payload_as::<DailyAgg>()
-                .unwrap_or(DailyAgg { count: 0, keys: vec![] });
-            agg.count += 1;
-            if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
-                agg.keys.push(target_key.to_string());
-            }
-            record.payload = serde_json::to_value(&agg).ok();
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
-            store.put(agg_key, &record).await?;
-        }
-        None => {
-            let agg = DailyAgg { count: 1, keys: vec![target_key.to_string()] };
-            let mut record = make_analytics_record(agg_key, String::new(), now);
-            record.payload = serde_json::to_value(&agg).ok();
-            store.put(agg_key, &record).await?;
-        }
-    }
-    Ok(())
 }
