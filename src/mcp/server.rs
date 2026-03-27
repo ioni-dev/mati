@@ -154,7 +154,7 @@ async fn serve_daemon_socket(
             return;
         }
     };
-    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    let _ = std::fs::write(&pid_path, format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()));
     tracing::debug!("daemon socket ready at {} (MCP-embedded)", sock_path.display());
 
     loop {

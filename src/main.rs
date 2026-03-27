@@ -11,6 +11,7 @@ use mati_core::store::{
     Category, ConfidenceScore, QualityScore, QualityTier, Record, RecordLifecycle, RecordSource,
     RecordVersion, StalenessScore, Store,
 };
+use cli::proxy::StoreProxy;
 
 mod cli;
 
@@ -230,8 +231,8 @@ async fn run_note(text: &str) -> Result<()> {
     record.quality = score.clone();
 
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
-    store.put(&key, &record).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    proxy.put(&key, &record).await?;
 
     println!("Created {key}  (quality: {:.2})", score.value);
     Ok(())
@@ -241,11 +242,15 @@ async fn run_note(text: &str) -> Result<()> {
 
 async fn run_quality_check() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
     let mut all: Vec<Record> = Vec::new();
     for prefix in &["file:", "gotcha:", "decision:", "dev_note:"] {
-        all.extend(store.scan_prefix(prefix).await?);
+        all.extend(
+            proxy.scan_prefix(prefix).await?
+                .into_iter()
+                .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+        );
     }
 
     if all.is_empty() {
@@ -335,10 +340,10 @@ async fn run_quality_check() -> Result<()> {
 
 async fn run_improve(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
     let use_color = io::stderr().is_terminal();
 
-    let mut record = match store.get(key).await? {
+    let mut record = match proxy.get(key).await? {
         Some(r) => r,
         None => anyhow::bail!("no record found for key '{key}'"),
     };
@@ -396,7 +401,7 @@ async fn run_improve(key: &str) -> Result<()> {
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    store.put(key, &record).await?;
+    proxy.put(key, &record).await?;
 
     println!(
         "Updated {key}  (quality: {:.2} -> {:.2})",

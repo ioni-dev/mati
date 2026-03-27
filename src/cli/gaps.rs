@@ -15,6 +15,7 @@ use mati_core::store::{
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 /// Wrapper around the cached gap list that includes write-seq for invalidation.
 #[derive(Serialize, Deserialize)]
@@ -72,13 +73,13 @@ fn cache_record(key: &str, value: String) -> Record {
 
 pub async fn run(args: GapsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
     let use_color = std::io::stdout().is_terminal();
 
     // ── Cache check: reuse when write-seq unchanged ───────────────────────
     let cache_key = "analytics:gaps_cache";
-    let current_seq = store.read_write_seq();
-    if let Ok(Some(cached)) = store.get(cache_key).await {
+    let current_seq = proxy.read_write_seq();
+    if let Ok(Some(cached)) = proxy.get(cache_key).await {
         if let Ok(entry) = serde_json::from_str::<GapsCacheEntry>(&cached.value) {
             let now = now_secs();
             let age = now.saturating_sub(cached.updated_at);
@@ -89,7 +90,7 @@ pub async fn run(args: GapsArgs) -> Result<()> {
                     .take(args.limit)
                     .collect();
                 display_gaps(&filtered, Some(age), use_color);
-                store.close().await?;
+                proxy.close().await?;
                 return Ok(());
             }
         }
@@ -97,40 +98,63 @@ pub async fn run(args: GapsArgs) -> Result<()> {
 
     // ── Compute gaps — scan records and load graph for fan-in ─────────────
     let (files, gotchas, decisions, deps) = tokio::try_join!(
-        store.scan_prefix("file:"),
-        store.scan_prefix("gotcha:"),
-        store.scan_prefix("decision:"),
-        store.scan_prefix("dep:"),
+        proxy.scan_prefix("file:"),
+        proxy.scan_prefix("gotcha:"),
+        proxy.scan_prefix("decision:"),
+        proxy.scan_prefix("dep:"),
     )?;
 
-    // Load graph to compute import fan-in (how many files import each file).
-    // Fan-in drives HighFanInNoContract detection. Gracefully degrade if the
-    // graph fails to load — all other gap types still work.
-    let fan_in = match Graph::load(store).await {
-        Ok(graph) => {
-            let fi = compute_fan_in(&graph, &files);
-            graph.close().await?;
-            fi
-        }
-        Err(e) => {
-            tracing::warn!("gaps: graph load failed, HighFanInNoContract skipped: {e}");
-            eprintln!("  note: HighFanInNoContract analysis skipped — {e:#}");
-            HashMap::new()
-        }
-    };
+    // Fan-in computation requires Graph::load which takes ownership of the store.
+    // In socket mode, skip fan-in analysis and degrade gracefully — all other
+    // gap types still work without it.
+    if proxy.is_direct() {
+        let store = proxy.into_store();
+        let fan_in = match Graph::load(store).await {
+            Ok(graph) => {
+                let fi = compute_fan_in(&graph, &files);
+                graph.close().await?;
+                fi
+            }
+            Err(e) => {
+                tracing::warn!("gaps: graph load failed, HighFanInNoContract skipped: {e}");
+                eprintln!("  note: HighFanInNoContract analysis skipped — {e:#}");
+                HashMap::new()
+            }
+        };
 
+        let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps, &fan_in);
+
+        // Re-open store for cache write (graph took ownership above).
+        let cwd2 = std::env::current_dir()?;
+        let store2 = Store::open(&cwd2).await?;
+        let cache_entry = GapsCacheEntry { write_seq: current_seq, gaps: all_gaps.clone() };
+        if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
+            let record = cache_record(cache_key, cache_value);
+            let _ = store2.put(cache_key, &record).await;
+        }
+        store2.close().await?;
+
+        let filtered: Vec<_> = all_gaps
+            .into_iter()
+            .filter(|g| g.risk_score >= args.min_risk)
+            .take(args.limit)
+            .collect();
+        display_gaps(&filtered, None, use_color);
+        return Ok(());
+    }
+
+    // Socket mode: skip fan-in, run all other gap types.
+    eprintln!("[mati] note: fan-in analysis skipped (running via daemon socket)");
+    let fan_in = HashMap::new();
     let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps, &fan_in);
 
-    // ── Write cache (best-effort) ────────────────────────────────────────
-    // Re-open store for cache write (graph took ownership above).
-    let cwd2 = std::env::current_dir()?;
-    let store2 = Store::open(&cwd2).await?;
+    // Write cache via proxy (best-effort).
     let cache_entry = GapsCacheEntry { write_seq: current_seq, gaps: all_gaps.clone() };
     if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
         let record = cache_record(cache_key, cache_value);
-        let _ = store2.put(cache_key, &record).await;
+        let _ = proxy.put(cache_key, &record).await;
     }
-    store2.close().await?;
+    proxy.close().await?;
 
     let filtered: Vec<_> = all_gaps
         .into_iter()

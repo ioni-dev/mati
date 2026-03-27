@@ -182,7 +182,7 @@ pub async fn run_daemon_start() -> Result<()> {
     // Remove stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(&sock_path);
 
-    std::fs::write(&pid_path, std::process::id().to_string())
+    std::fs::write(&pid_path, format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()))
         .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
     // PID is written — remove the starting sentinel so try_auto_start won't block.
     let _ = std::fs::remove_file(&starting_path);
@@ -388,6 +388,7 @@ async fn dispatch(store: &Store, repo_root: &Path, req: &Request) -> Response {
         "edit_hook"               => cmd_edit_hook(store, repo_root, &req.args).await,
         "session_flush"           => cmd_session_flush(store).await,
         "scan_prefix"             => cmd_scan_prefix(store, &req.args).await,
+        "put"                     => cmd_put(store, &req.args).await,
         "gotcha_write"            => cmd_gotcha_write(store, &req.args).await,
         "gotcha_tombstone"        => cmd_gotcha_tombstone(store, &req.args).await,
         "ping"                    => Response::ok(serde_json::Value::String("pong".into())),
@@ -556,6 +557,21 @@ async fn cmd_scan_prefix(store: &Store, args: &serde_json::Value) -> Response {
             Err(e) => Response::err(format!("serialize error: {e}")),
         },
         Err(e) => Response::err(format!("store error: {e}")),
+    }
+}
+
+async fn cmd_put(store: &Store, args: &serde_json::Value) -> Response {
+    let key = match args.get("key").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => return Response::err("missing args.key"),
+    };
+    let record: Record = match args.get("record").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        Some(r) => r,
+        None => return Response::err("put: invalid record"),
+    };
+    match store.put(key, &record).await {
+        Ok(()) => Response::ok(serde_json::Value::Null),
+        Err(e) => Response::err(format!("store put: {e}")),
     }
 }
 
@@ -849,16 +865,40 @@ pub fn mati_root_for(cwd: &Path) -> Result<PathBuf> {
     Ok(home.join(".mati").join(slug))
 }
 
+/// Parse the PID file and return `(pid, owner)`.
+///
+/// Supports both the new JSON format `{"pid":1234,"owner":"daemon"}` and
+/// the legacy plain-text PID format `1234` for backward compatibility.
+/// When the owner field is absent (legacy format) it defaults to `"daemon"`.
+pub fn read_pid_file(root: &Path) -> Option<(u32, String)> {
+    let content = std::fs::read_to_string(root.join("mati.pid")).ok()?;
+    let trimmed = content.trim();
+
+    // Try JSON format first.
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let pid = val.get("pid").and_then(|v| v.as_u64())? as u32;
+        let owner = val
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon")
+            .to_string();
+        return Some((pid, owner));
+    }
+
+    // Fall back to legacy plain PID.
+    if let Ok(pid) = trimmed.parse::<u32>() {
+        return Some((pid, "daemon".to_string()));
+    }
+
+    None
+}
+
 /// Returns `true` if the PID recorded in the PID file is no longer alive.
 /// Uses `kill -0` (no signal sent, just checks process existence).
 /// Returns `true` (assume dead) if the PID file is absent or unreadable.
 pub fn is_pid_dead(root: &Path) -> bool {
-    let pid_path = root.join("mati.pid");
-    match std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-    {
-        Some(pid) => !std::process::Command::new("kill")
+    match read_pid_file(root) {
+        Some((pid, _)) => !std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .output()
             .map(|o| o.status.success())
@@ -976,24 +1016,73 @@ pub async fn run_daemon_stop() -> Result<()> {
         return Ok(());
     }
 
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            let status = std::process::Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    println!("mati daemon stopped (pid {pid})");
-                }
-                Ok(_) => {
-                    println!("mati daemon process {pid} already exited — cleaning up");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, pid, "failed to send SIGTERM");
-                    println!("mati daemon: failed to signal pid {pid} — cleaning up stale files");
-                }
+    let pid_info = read_pid_file(&root);
+
+    // Refuse if owned by MCP server (PID file present and says "mcp").
+    if let Some((_, ref owner)) = pid_info {
+        if owner == "mcp" {
+            println!(
+                "mati daemon stop: the socket is owned by the active MCP server (mati serve).\n\
+                 Stopping it would disconnect Claude Code's MCP tools.\n\
+                 To stop it: close the Claude Code session that uses mati."
+            );
+            return Ok(());
+        }
+    }
+
+    // PID file absent but socket file exists — ownership unknown.
+    // This happens when the socket was created by an older mati binary that
+    // did not write a PID file (e.g. the MCP server before v0.1 PID format change).
+    // Ping the socket: if it is alive we refuse to avoid disconnecting a live
+    // session. If it is unresponsive we clean it up as stale.
+    if pid_info.is_none() && sock_path.exists() {
+        match daemon_result(&root, "ping", serde_json::json!({})).await {
+            DaemonResult::Ok(_) => {
+                // Live socket with unknown owner — assume MCP to be safe.
+                println!(
+                    "mati daemon stop: socket is live but owner is unknown (PID file absent).\n\
+                     This is likely an active MCP server session (mati serve).\n\
+                     Stopping it would disconnect Claude Code's MCP tools.\n\
+                     To stop it: close the Claude Code session that uses mati.\n\
+                     To remove a confirmed stale socket: rm {}",
+                    sock_path.display()
+                );
+                return Ok(());
+            }
+            DaemonResult::StaleSocket => {
+                // daemon_result already deleted the socket file.
+                println!("mati daemon: stale socket cleaned up");
+                return Ok(());
+            }
+            DaemonResult::Unresponsive => {
+                println!("mati daemon: socket unresponsive — cleaning up stale files");
+                let _ = std::fs::remove_file(&sock_path);
+                let _ = std::fs::remove_file(&pid_path);
+                return Ok(());
+            }
+            DaemonResult::NotRunning => {
+                println!("mati daemon is not running");
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some((pid, _)) = pid_info {
+        let status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                println!("mati daemon stopped (pid {pid})");
+            }
+            Ok(_) => {
+                println!("mati daemon process {pid} already exited — cleaning up");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, pid, "failed to send SIGTERM");
+                println!("mati daemon: failed to signal pid {pid} — cleaning up stale files");
             }
         }
     }
@@ -1009,26 +1098,26 @@ pub async fn run_daemon_stop() -> Result<()> {
 pub async fn run_daemon_status() -> Result<()> {
     let root = project_root()?;
     let sock_path = root.join("mati.sock");
-    let pid_path = root.join("mati.pid");
 
     if !sock_path.exists() {
         println!("mati daemon is not running (no socket)");
         return Ok(());
     }
 
-    let pid_info = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+    let pid_info = read_pid_file(&root);
 
     match daemon_result(&root, "ping", serde_json::json!({})).await {
         DaemonResult::Ok(resp)
             if resp.get("ok") == Some(&serde_json::Value::Bool(true)) =>
         {
-            if let Some(pid) = pid_info {
+            if let Some((pid, owner)) = &pid_info {
                 println!("mati daemon is running (pid {pid})");
+                println!("  owner: {owner}");
             } else {
-                println!("mati daemon is running (pid unknown — PID file missing)");
-                println!("  run `mati daemon stop` to restore clean state");
+                println!("mati daemon is running (pid unknown — PID file absent)");
+                println!("  owner: likely mcp (socket created by older binary without PID file)");
+                println!("  note: mati daemon stop will refuse to close a live unknown-owner socket");
+                println!("  to stop: close the Claude Code session that uses mati");
             }
             println!("  socket: {}", sock_path.display());
             println!(
@@ -1042,8 +1131,9 @@ pub async fn run_daemon_status() -> Result<()> {
         DaemonResult::Unresponsive => {
             println!("mati daemon socket exists but is not responding");
             println!("  socket: {}", sock_path.display());
-            if let Some(pid) = pid_info {
+            if let Some((pid, owner)) = &pid_info {
                 println!("  pid: {pid} (alive)");
+                println!("  owner: {owner}");
             }
             println!("  run `mati daemon stop` to clean up");
         }
@@ -1052,7 +1142,7 @@ pub async fn run_daemon_status() -> Result<()> {
         }
         _ => {
             println!("mati daemon is not running");
-            if let Some(pid) = pid_info {
+            if let Some((pid, _)) = &pid_info {
                 println!("  stale pid: {pid}");
             }
             println!("  run `mati daemon stop` to clean up");

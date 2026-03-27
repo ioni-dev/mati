@@ -132,9 +132,12 @@ impl MatiServer {
                 let graph = self.graph.read().await;
                 let store = graph.store();
                 match store.search(&params.query, limit).await {
-                    Ok(records) => serde_json::to_string_pretty(&records).unwrap_or_else(|e| {
-                        format!("{{\"error\": \"serialization failed: {e}\"}}")
-                    }),
+                    Ok(mut records) => {
+                        records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+                        serde_json::to_string_pretty(&records).unwrap_or_else(|e| {
+                            format!("{{\"error\": \"serialization failed: {e}\"}}")
+                        })
+                    }
                     Err(e) => format!("{{\"error\": \"{e}\"}}"),
                 }
             }
@@ -160,7 +163,9 @@ impl MatiServer {
                 let mut records = Vec::new();
                 for key in neighbor_keys.iter().take(limit) {
                     if let Ok(Some(record)) = store.get(key).await {
-                        records.push(record);
+                        if matches!(record.lifecycle, RecordLifecycle::Active) {
+                            records.push(record);
+                        }
                     }
                 }
                 serde_json::to_string_pretty(&records).unwrap_or_else(|e| {

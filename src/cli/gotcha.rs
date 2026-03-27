@@ -119,8 +119,9 @@ fn print_existing_gotchas(records: &[Record], file: &str, use_color: bool) {
         } else {
             r.value.clone()
         };
-        let truncated = if rule.len() > 60 {
-            format!("{}…", &rule[..59])
+        let truncated = if rule.chars().count() > 60 {
+            let cut: String = rule.chars().take(59).collect();
+            format!("{cut}…")
         } else {
             rule
         };
