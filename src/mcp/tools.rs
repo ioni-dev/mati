@@ -25,11 +25,11 @@ use crate::store::record::{
 
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
-/// Vector B — appended to every mem_bootstrap result (70 tokens, budget 77).
+/// Vector B — appended to every mem_bootstrap result (64 tokens, budget 77).
 const VECTOR_B: &str = "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
     confidence>=0.6 + confirmed=true \u{2192} use record, skip file read.\n\
-    confidence<0.3 \u{2192} read file, then consider mem_set to improve.\n\
-    Dev says \"add that as a gotcha\" \u{2192} call mem_set (category=Gotcha, confirmed=false).";
+    confidence<0.3 \u{2192} read file, consider mem_set to improve.\n\
+    \"add gotcha\" \u{2192} mem_set(Gotcha) then mati gotcha confirm <key>.";
 
 /// Token budget for mem_bootstrap output (ARCHITECTURE.md §6).
 const TOKEN_BUDGET: usize = 2_000;
