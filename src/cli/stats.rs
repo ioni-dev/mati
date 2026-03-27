@@ -390,8 +390,31 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     write_snapshot_record(&store, &snapshot, now).await?;
 
     println!(
-        "  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}\n"
+        "  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}"
     );
+
+    // Unconfirmed gotcha warning — gotchas vec is already scanned + filtered for Active
+    let unconfirmed_count = gotchas
+        .iter()
+        .filter(|r| {
+            r.payload
+                .as_ref()
+                .and_then(|p| p.get("confirmed"))
+                .and_then(|v| v.as_bool())
+                == Some(false)
+        })
+        .count();
+
+    if unconfirmed_count > 0 {
+        println!();
+        println!(
+            "  {yellow}\u{26a0}\u{fe0f}  {unconfirmed_count} unconfirmed gotcha{} pending review{reset}",
+            if unconfirmed_count == 1 { "" } else { "s" }
+        );
+        println!("  {yellow}    Run `mati review` to activate hook enforcement{reset}");
+    }
+
+    println!();
 
     store.close().await?;
     Ok(())
