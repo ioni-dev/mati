@@ -29,6 +29,68 @@ This project uses mati. Before reading any file, call mem_get(\"file:<path>\").
 High-confidence records (confidence >= 0.6, confirmed=true) replace file reads.
 The PreToolUse hook enforces this at the environment level.
 Run `mati status` to see current knowledge health.
+
+## /mati-enrich — Knowledge Enrichment
+
+When the developer types `/mati-enrich [target]`, execute this flow:
+
+### Target Resolution
+
+- `/mati-enrich` (no args) — call `mem_query(\"gap hotspot unenriched\", mode=\"text\", limit=10)`,
+  enrich the returned files sorted by gap_analysis_score DESC
+- `/mati-enrich src/payments/` — enrich all source files in that directory
+- `/mati-enrich src/main.rs` — enrich a single file
+
+### Per-File Flow
+
+1. **Fetch existing record**: `mem_get(\"file:<path>\")` — extract entry_points, imports,
+   change_frequency, todos, gotcha_keys, is_hotspot.
+
+2. **Read file**: Use Read tool on the actual file.
+
+3. **Analyze and generate**:
+   - `purpose`: 1-2 sentences starting with a verb. What this file does and why.
+   - `gotchas`: Max 5. Each needs an imperative-verb rule + causality reason.
+     Only write gotchas inferable from the code. Zero is correct if none exist.
+   - `decisions`: Architectural choices visible in the code.
+
+4. **Write file record**: `mem_set` with key=`file:<path>`, category=`File`,
+   value=purpose, payload preserving existing Layer 0 fields + updated purpose/gotcha_keys.
+
+5. **Write each gotcha**: `mem_set` with key=`gotcha:<slug>`, category=`Gotcha`,
+   value=`{rule} because {reason}`, payload with confirmed=false.
+
+6. **Report per file**:
+   ```
+   ✅ Enriched: <path>
+      Purpose:    \"<purpose string>\"
+      Gotchas:    <N> written
+      Decisions:  <N> written
+      Confidence: 0.60 → 0.80 after review
+
+   ⚠️  NEXT STEP REQUIRED:
+       Run `mati review` in your terminal to confirm gotchas
+       and activate hook enforcement. Takes ~2 minutes.
+       Without this step, hooks will not deny file reads.
+   ```
+
+### Batch Report (when enriching multiple files)
+
+```
+✅ Enrichment complete
+   Files enriched:  <N>
+   Gotchas written: <N> (not yet active)
+   Decisions:        <N>
+
+⚠️  NEXT STEP REQUIRED — hooks are NOT active yet:
+    Run `mati review` in your terminal now.
+    Takes ~2–3 minutes. Without this, mati hooks will
+    not block any file reads.
+```
+
+## Rule: always end every /mati-enrich response with this exact line
+
+> ⚠️ **Run `mati review` in your terminal now to activate hook enforcement.**
 ";
 
 /// Write the Vector C stub to `.claude/CLAUDE.md`.
