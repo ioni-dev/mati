@@ -649,10 +649,8 @@ async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Respon
     match store.get(key).await {
         Ok(Some(mut record)) => {
             let now = now_secs();
-            record.lifecycle = mati_core::store::RecordLifecycle::Tombstoned {
-                reason: TombstoneReason::ManualDeletion,
-                at: now,
-            };
+            record.lifecycle =
+                RecordLifecycle::Tombstoned { reason: TombstoneReason::ManualDeletion, at: now };
             record.updated_at = now;
             record.version.logical_clock += 1;
             record.version.wall_clock = now;
@@ -660,14 +658,16 @@ async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Respon
                 return Response::err(format!("store put: {e}"));
             }
         }
-        Ok(None) => return Response::err(format!("not found: {key}")),
+        Ok(None) => return Response::err(format!("record not found: {key}")),
         Err(e) => return Response::err(format!("store get: {e}")),
     }
+
     for file_path in &affected_files {
         let file_key = format!("file:{file_path}");
         let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
         let _ = store.delete(&edge_key).await;
     }
+
     Response::ok(serde_json::Value::String("tombstoned".into()))
 }
 

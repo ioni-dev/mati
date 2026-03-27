@@ -119,6 +119,8 @@ schemars = "1.0"
 # --- CLI ---
 clap         = { version = "4.6.0", features = ["derive", "env", "color", "wrap_help"] }
 comfy-table  = "7.2.2"
+dialoguer    = { version = "0.11", features = ["fuzzy-select"] }
+indicatif    = "0.17"
 
 # --- Async runtime ---
 # Full features — hooks run async, Layer 1 uses buffer_unordered(3).

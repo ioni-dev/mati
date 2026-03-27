@@ -14,6 +14,8 @@ use mati_core::store::{
     RecordSource, RecordVersion, StalenessScore, Store, TombstoneReason,
 };
 
+use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+
 #[derive(Args)]
 pub struct GotchaArgs {
     #[command(subcommand)]
@@ -133,15 +135,119 @@ fn print_existing_gotchas(records: &[Record], file: &str, use_color: bool) {
     eprintln!("{table}");
 }
 
+// ── Daemon helpers ─────────────────────────────────────────────────────────────
+
+/// Return existing gotcha records for `file` via the daemon socket.
+/// Falls back to an empty list on any error (display is best-effort).
+async fn existing_gotchas_via_daemon(
+    root: &std::path::Path,
+    file: &str,
+) -> Vec<Record> {
+    let res = daemon_result(root, "scan_prefix", serde_json::json!({"prefix": "gotcha:"})).await;
+    if let DaemonResult::Ok(resp) = res {
+        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            if let Some(arr) = resp.get("data").and_then(|v| v.as_array()) {
+                return arr
+                    .iter()
+                    .filter_map(|v| serde_json::from_value::<Record>(v.clone()).ok())
+                    .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+                    .filter(|r| {
+                        r.payload_as::<GotchaRecord>()
+                            .map(|g| g.affected_files.iter().any(|af| af == file))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+            }
+        }
+    }
+    vec![]
+}
+
+/// Write gotcha record + file-record updates + edges through daemon.
+/// Returns `Ok(true)` if routed through daemon, `Ok(false)` if no daemon running.
+async fn daemon_gotcha_write(
+    root: &std::path::Path,
+    record: &Record,
+    new_files: &[String],
+    old_files: &[String],
+) -> Result<bool> {
+    match daemon_result(root, "gotcha_write", serde_json::json!({
+        "record": serde_json::to_value(record)?,
+        "new_files": new_files,
+        "old_files": old_files,
+    })).await {
+        DaemonResult::Ok(resp) => {
+            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                Ok(true)
+            } else {
+                let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                anyhow::bail!("daemon gotcha_write failed: {err}");
+            }
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => Ok(false),
+        DaemonResult::Unresponsive => {
+            anyhow::bail!(
+                "mati daemon is running but unresponsive — store is locked. \
+                 Run `mati daemon stop` and retry."
+            );
+        }
+    }
+}
+
+/// Write gotcha directly to store (no daemon). Assumes caller has checked no daemon running.
+async fn direct_gotcha_write(
+    store: &Store,
+    key: &str,
+    record: &Record,
+    affected_files: &[String],
+) -> Result<()> {
+    store.put(key, record).await?;
+    for af in affected_files {
+        let file_key = format!("file:{af}");
+        if let Ok(Some(mut file_record)) = store.get(&file_key).await {
+            match file_record.payload.as_mut() {
+                Some(payload) => {
+                    if let Some(arr) = payload.get_mut("gotcha_keys")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        if !arr.iter().any(|v| v.as_str() == Some(key)) {
+                            arr.push(serde_json::Value::String(key.to_string()));
+                        }
+                    } else if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("gotcha_keys".into(), serde_json::json!([key]));
+                    }
+                }
+                None => file_record.payload = Some(serde_json::json!({ "gotcha_keys": [key] })),
+            }
+            let _ = store.put(&file_key, &file_record).await;
+        }
+    }
+    Ok(())
+}
+
 // ── Add ───────────────────────────────────────────────────────────────────────
 
 async fn run_gotcha_add(file: &str) -> Result<()> {
     let use_color = io::stderr().is_terminal();
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let root = mati_root_for(&cwd)?;
+
+    // Check if daemon is alive (holds the exclusive store lock).
+    let daemon_alive = matches!(
+        daemon_result(&root, "ping", serde_json::json!({})).await,
+        DaemonResult::Ok(_)
+    );
 
     // Show existing gotchas for this file before any prompts.
-    let existing = existing_gotchas_for_file(&store, file).await?;
+    let existing = if daemon_alive {
+        existing_gotchas_via_daemon(&root, file).await
+    } else {
+        let store = Store::open(&cwd).await?;
+        let records = existing_gotchas_for_file(&store, file).await?;
+        store.close().await?;
+        records
+    };
+
     if !existing.is_empty() {
         print_existing_gotchas(&existing, file, use_color);
 
@@ -154,7 +260,6 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
         if !input.is_empty() {
             let key = normalize_key(&input);
             if existing.iter().any(|r| r.key == key) {
-                store.close().await?;
                 return run_gotcha_edit(&key).await;
             }
             eprintln!("  Key '{key}' not found for this file — adding new record.");
@@ -228,7 +333,7 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion { device_id, logical_clock: 1, wall_clock: now },
-        quality: QualityScore::layer0_default(),
+        quality: QualityScore::developer_entry_default(),
         access_count: 0,
         last_accessed: 0,
         source: RecordSource::DeveloperManual,
@@ -247,20 +352,24 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
         quality::print_quality_caveat(&score, use_color);
     }
 
-    store.put(&key, &record).await?;
-
-    let mut graph = Graph::load(store).await?;
-    for af in &affected_files {
-        let file_key = format!("file:{af}");
-        graph.add_edge(&file_key, EdgeKind::HasGotcha, &key).await?;
+    if daemon_gotcha_write(&root, &record, &affected_files, &[]).await? {
+        // Wrote through daemon — graph edges handled by daemon handler.
+    } else {
+        // No daemon — direct write + graph edges.
+        let store = Store::open(&cwd).await?;
+        direct_gotcha_write(&store, &key, &record, &affected_files).await?;
+        let mut graph = Graph::load(store).await?;
+        for af in &affected_files {
+            let file_key = format!("file:{af}");
+            graph.add_edge(&file_key, EdgeKind::HasGotcha, &key).await?;
+        }
+        graph.close().await?;
     }
 
     println!("Created {key}  (quality: {:.2}, confidence: {:.2})", score.value, record.confidence.value);
     for af in &affected_files {
         println!("  -> file:{af} HasGotcha {key}");
     }
-
-    graph.close().await?;
     Ok(())
 }
 
@@ -269,12 +378,35 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
 async fn run_gotcha_edit(key: &str) -> Result<()> {
     let use_color = io::stderr().is_terminal();
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let root = mati_root_for(&cwd)?;
 
-    let mut record = match store.get(key).await? {
-        Some(r) => r,
-        None => anyhow::bail!("no record found for '{key}'"),
+    // Check daemon first to avoid lock conflict.
+    let daemon_alive = matches!(
+        daemon_result(&root, "ping", serde_json::json!({})).await,
+        DaemonResult::Ok(_)
+    );
+
+    // Fetch record — via daemon if alive, direct otherwise.
+    let record_json = if daemon_alive {
+        match daemon_result(&root, "get", serde_json::json!({"key": key})).await {
+            DaemonResult::Ok(resp) => resp.get("data").cloned().unwrap_or(serde_json::Value::Null),
+            _ => anyhow::bail!("daemon unreachable while fetching '{key}'"),
+        }
+    } else {
+        let store = Store::open(&cwd).await?;
+        let r = store.get(key).await?;
+        store.close().await?;
+        match r {
+            Some(rec) => serde_json::to_value(&rec)?,
+            None => serde_json::Value::Null,
+        }
     };
+
+    if record_json.is_null() {
+        anyhow::bail!("no record found for '{key}'");
+    }
+
+    let mut record: Record = serde_json::from_value(record_json)?;
 
     let old_gotcha: GotchaRecord = match record.payload_as::<GotchaRecord>() {
         Some(g) => g,
@@ -385,24 +517,28 @@ async fn run_gotcha_edit(key: &str) -> Result<()> {
         quality::print_quality_caveat(&score, use_color);
     }
 
-    store.put(key, &record).await?;
-
-    // Update graph edges if affected_files changed
+    let old_files_vec: Vec<String> = old_files.iter().cloned().collect();
+    let new_files_vec: Vec<String> = new_affected_files.clone();
     let new_files: HashSet<String> = new_affected_files.iter().cloned().collect();
-    let mut graph = Graph::load(store).await?;
 
-    if old_files != new_files {
-        for removed in old_files.difference(&new_files) {
-            let file_key = format!("file:{removed}");
-            graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
+    if daemon_gotcha_write(&root, &record, &new_files_vec, &old_files_vec).await? {
+        // Wrote through daemon.
+    } else {
+        let store = Store::open(&cwd).await?;
+        direct_gotcha_write(&store, key, &record, &new_files_vec).await?;
+        let mut graph = Graph::load(store).await?;
+        if old_files != new_files {
+            for removed in old_files.difference(&new_files) {
+                let file_key = format!("file:{removed}");
+                graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
+            }
+            for added in new_files.difference(&old_files) {
+                let file_key = format!("file:{added}");
+                graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
+            }
         }
-        for added in new_files.difference(&old_files) {
-            let file_key = format!("file:{added}");
-            graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
-        }
+        graph.close().await?;
     }
-
-    graph.close().await?;
 
     println!("Updated {key}  (quality: {:.2})", score.value);
     Ok(())
@@ -413,12 +549,34 @@ async fn run_gotcha_edit(key: &str) -> Result<()> {
 async fn run_gotcha_delete(key: &str) -> Result<()> {
     let use_color = io::stderr().is_terminal();
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let root = mati_root_for(&cwd)?;
 
-    let mut record = match store.get(key).await? {
-        Some(r) => r,
-        None => anyhow::bail!("no record found for '{key}'"),
+    let daemon_alive = matches!(
+        daemon_result(&root, "ping", serde_json::json!({})).await,
+        DaemonResult::Ok(_)
+    );
+
+    // Fetch record to display + confirm.
+    let record_json = if daemon_alive {
+        match daemon_result(&root, "get", serde_json::json!({"key": key})).await {
+            DaemonResult::Ok(resp) => resp.get("data").cloned().unwrap_or(serde_json::Value::Null),
+            _ => anyhow::bail!("daemon unreachable while fetching '{key}'"),
+        }
+    } else {
+        let store = Store::open(&cwd).await?;
+        let r = store.get(key).await?;
+        store.close().await?;
+        match r {
+            Some(rec) => serde_json::to_value(&rec)?,
+            None => serde_json::Value::Null,
+        }
     };
+
+    if record_json.is_null() {
+        anyhow::bail!("no record found for '{key}'");
+    }
+
+    let record: Record = serde_json::from_value(record_json)?;
 
     let gotcha: GotchaRecord = match record.payload_as::<GotchaRecord>() {
         Some(g) => g,
@@ -450,30 +608,58 @@ async fn run_gotcha_delete(key: &str) -> Result<()> {
 
     if confirm.to_lowercase() != "y" && confirm.to_lowercase() != "yes" {
         println!("Aborted.");
-        store.close().await?;
         return Ok(());
     }
 
+    if daemon_alive {
+        match daemon_result(&root, "gotcha_tombstone", serde_json::json!({
+            "key": key,
+            "affected_files": &gotcha.affected_files,
+        })).await {
+            DaemonResult::Ok(resp) if resp.get("ok") == Some(&serde_json::Value::Bool(true)) => {}
+            DaemonResult::Ok(resp) => {
+                let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                anyhow::bail!("daemon gotcha_tombstone failed: {err}");
+            }
+            DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+                let store = Store::open(&cwd).await?;
+                direct_delete(store, key, &gotcha.affected_files).await?;
+            }
+            DaemonResult::Unresponsive => {
+                anyhow::bail!(
+                    "mati daemon is running but unresponsive — store is locked. \
+                     Run `mati daemon stop` and retry."
+                );
+            }
+        }
+    } else {
+        let store = Store::open(&cwd).await?;
+        direct_delete(store, key, &gotcha.affected_files).await?;
+    }
+
+    println!("Deleted {key}  (tombstoned, graph edges removed)");
+    Ok(())
+}
+
+async fn direct_delete(store: Store, key: &str, affected_files: &[String]) -> Result<()> {
     let now = now_secs();
-    record.lifecycle = RecordLifecycle::Tombstoned {
-        reason: TombstoneReason::ManualDeletion,
-        at: now,
-    };
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-
-    store.put(key, &record).await?;
-
-    // Remove HasGotcha edges for all affected files
+    if let Ok(Some(mut record)) = store.get(key).await {
+        record.lifecycle = RecordLifecycle::Tombstoned {
+            reason: TombstoneReason::ManualDeletion,
+            at: now,
+        };
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+        store.put(key, &record).await?;
+    }
+    // Graph::load takes ownership of store; tombstone write must be done first.
     let mut graph = Graph::load(store).await?;
-    for af in &gotcha.affected_files {
+    for af in affected_files {
         let file_key = format!("file:{af}");
         graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
     }
     graph.close().await?;
-
-    println!("Deleted {key}  (tombstoned, graph edges removed)");
     Ok(())
 }
 

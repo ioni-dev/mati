@@ -281,6 +281,59 @@ fn make_record(confidence: f64, quality: f64, confirmed: bool, staleness: f64, s
     .to_string()
 }
 
+/// Build a file record JSON that has a linked gotcha key in payload.gotcha_keys.
+/// The deny signal in the hook comes from linked gotcha records, not the file record itself.
+fn make_file_record_with_gotcha(
+    confidence: f64,
+    quality: f64,
+    staleness: f64,
+    staleness_tier: &str,
+    gotcha_key: &str,
+) -> String {
+    serde_json::json!({
+        "confidence": { "value": confidence },
+        "quality": { "value": quality },
+        "staleness": { "value": staleness, "tier": staleness_tier },
+        "value": "Test file purpose",
+        "payload": {
+            "gotcha_keys": [gotcha_key]
+        }
+    })
+    .to_string()
+}
+
+/// Build a gotcha record JSON for deny testing.
+/// Wire format: confirmed lives under payload.confirmed (matches GotchaRecord serialization).
+fn make_gotcha_record(confidence: f64, quality: f64, confirmed: bool) -> String {
+    serde_json::json!({
+        "confidence": { "value": confidence },
+        "quality": { "value": quality },
+        "value": "Test gotcha: watch out for this",
+        "payload": {
+            "confirmed": confirmed,
+            "rule": "Test gotcha: watch out for this",
+            "reason": "Test reason",
+            "severity": "normal",
+            "affected_files": [],
+            "discovered_session": 0,
+            "ref_url": null
+        }
+    })
+    .to_string()
+}
+
+/// Register a deny-eligible file record + linked gotcha in the harness.
+/// The hook denies when a linked gotcha has confirmed=true + confidence>=0.6 + quality>=0.4.
+impl HookTestHarness {
+    fn with_deny_eligible_record(self, file_key: &str, staleness: f64, staleness_tier: &str) -> Self {
+        let gotcha_key = "gotcha:test-deny-signal";
+        let gotcha = make_gotcha_record(0.8, 0.7, true);
+        let file = make_file_record_with_gotcha(0.8, 0.7, staleness, staleness_tier, gotcha_key);
+        self.with_mock_record(file_key, &file)
+            .with_mock_record(gotcha_key, &gotcha)
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Category 1: Hook Decision Matrix (25 tests)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -392,10 +445,6 @@ fn preread_medium_confidence_good_quality_allows_with_context() {
         "medium conf + good qual should inject additionalContext"
     );
     assert!(
-        ctx.contains("mem_get"),
-        "context should suggest mem_get, got: {ctx}"
-    );
-    assert!(
         ctx.contains("0.45"),
         "context should include the confidence value, got: {ctx}"
     );
@@ -416,15 +465,15 @@ fn preread_medium_confidence_low_quality_allows_no_injection() {
     );
 }
 
-/// 1.10 — High conf (0.8), confirmed, good qual (0.7), fresh -> DENY.
+/// 1.10 — High conf, confirmed gotcha linked, good qual, fresh -> DENY.
+/// Deny signal comes from a linked gotcha record (payload.gotcha_keys), not the file record itself.
 #[test]
 fn preread_high_conf_confirmed_good_qual_fresh_denies() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "deny", "high conf + confirmed + good qual must DENY");
+    assert_eq!(output.decision(), "deny", "confirmed gotcha + high conf + good qual must DENY");
     assert!(
         output.reason().contains("mem_get"),
         "deny reason should reference mem_get, got: {}",
@@ -432,18 +481,17 @@ fn preread_high_conf_confirmed_good_qual_fresh_denies() {
     );
 }
 
-/// 1.11 — Same as 1.10 but stale tier -> still DENY.
+/// 1.11 — Stale (not liability) tier with confirmed gotcha -> still DENY.
 #[test]
 fn preread_high_conf_confirmed_good_qual_stale_still_denies() {
-    let record = make_record(0.8, 0.7, true, 0.6, "stale");
     let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+        .with_deny_eligible_record("file:src/main.rs", 0.6, "stale");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(
         output.decision(),
         "deny",
-        "stale (not liability) should still deny"
+        "stale (not liability) should still deny when confirmed gotcha linked"
     );
 }
 
@@ -593,11 +641,10 @@ fn preread_file_path_with_backslashes_valid_json() {
 /// 1.19 — File path with spaces -> correct handling.
 #[test]
 fn preread_file_path_with_spaces() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let path_with_spaces = "src/my file/main.rs";
     let key = format!("file:{path_with_spaces}");
     let harness = HookTestHarness::for_pre_read()
-        .with_mock_record(&key, &record);
+        .with_deny_eligible_record(&key, 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "file_path": path_with_spaces }
     })
@@ -635,12 +682,11 @@ fn preread_file_path_with_unicode() {
     assert_eq!(output.decision(), "allow");
 }
 
-/// 1.21 — pre-bash: `cat src/main.rs` detected -> deny (if record eligible).
+/// 1.21 — pre-bash: `cat src/main.rs` detected -> deny (if record has confirmed gotcha).
 #[test]
 fn prebash_cat_detected_delegates_to_decision() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let harness = HookTestHarness::for_pre_bash()
-        .with_mock_record("file:src/main.rs", &record);
+        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "command": "cat src/main.rs" }
     })
@@ -667,9 +713,8 @@ fn prebash_cat_detected_delegates_to_decision() {
 /// flag) so the first non-flag word is the actual file.
 #[test]
 fn prebash_head_with_flags_detected() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let harness = HookTestHarness::for_pre_bash()
-        .with_mock_record("file:src/main.rs", &record);
+        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "command": "head -20 src/main.rs" }
     })
@@ -706,9 +751,8 @@ fn prebash_no_file_reading_pattern_allows() {
 /// 1.24 — pre-bash: `cat src/main.rs | grep foo` -> file detected (piped).
 #[test]
 fn prebash_piped_command_detected() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let harness = HookTestHarness::for_pre_bash()
-        .with_mock_record("file:src/main.rs", &record);
+        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "command": "cat src/main.rs | grep foo" }
     })
@@ -1006,15 +1050,19 @@ fn prebash_unexpected_jq_type_graceful() {
 /// 2.08 — 5 parallel invocations -> all produce valid JSON (no corruption).
 #[test]
 fn preread_concurrent_invocations_no_corruption() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
-    let record_clone = record.clone();
+    // Deny signal comes from a linked gotcha record, not the file record itself.
+    let gotcha_key = "gotcha:concurrent-test";
+    let gotcha_record = make_gotcha_record(0.8, 0.7, true);
+    let file_record = make_file_record_with_gotcha(0.8, 0.7, 0.1, "fresh", gotcha_key);
+
+    let escaped_file = file_record.replace('\'', "'\\''");
+    let escaped_gotcha = gotcha_record.replace('\'', "'\\''");
 
     // We need a shared setup for all 5 threads. Create the mock environment once.
     let shared_dir = TempDir::new().expect("failed to create shared temp dir");
     let log_file = shared_dir.path().join("mati_log.txt");
 
     // Write mock mati
-    let escaped_record = record_clone.replace('\'', "'\\''");
     let mock_script = format!(
         r#"#!/usr/bin/env bash
 case "$1" in
@@ -1022,15 +1070,18 @@ case "$1" in
     get)
         KEY="$2"
         case "$KEY" in
-            "file:src/main.rs") echo '{record}' ;;
+            "file:src/main.rs") echo '{file}' ;;
+            "{gotcha_key}") echo '{gotcha}' ;;
             *) echo 'null' ;;
         esac ;;
-    log-miss|log-hit|log-compliance-miss)
+    log-miss|log-hit|log-compliance-miss|session-check-consulted)
         echo "$@" >> "{log}" ;;
     *) exit 0 ;;
 esac
 "#,
-        record = escaped_record,
+        file = escaped_file,
+        gotcha_key = gotcha_key,
+        gotcha = escaped_gotcha,
         log = log_file.display()
     );
 

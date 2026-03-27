@@ -195,6 +195,10 @@ fn parse_file_record(record: &Record) -> Option<FileRecord> {
 /// After the MessagePack migration, FileRecord lives in `record.payload`.
 fn detect_hot_file_no_record(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) {
     for record in file_records {
+        let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
+        if !is_testable_source_file(path) {
+            continue;
+        }
         match parse_file_record(record) {
             None => {
                 // No FileRecord payload at all — genuine empty stub.
@@ -234,6 +238,10 @@ fn detect_hot_file_no_purpose(file_records: &[Record], gaps: &mut Vec<KnowledgeG
     for record in file_records {
         let Some(fr) = parse_file_record(record) else { continue };
         if !fr.is_hotspot || !fr.purpose.is_empty() {
+            continue;
+        }
+        let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
+        if !is_testable_source_file(path) {
             continue;
         }
         // Skip if already caught as HotFileNoRecord (completely empty).
@@ -408,6 +416,9 @@ fn detect_hot_file_no_tests(file_records: &[Record], gaps: &mut Vec<KnowledgeGap
             continue;
         }
         let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
+        if !is_testable_source_file(path) {
+            continue;
+        }
         if has_test_file(path, &all_paths) {
             continue;
         }
@@ -419,6 +430,24 @@ fn detect_hot_file_no_tests(file_records: &[Record], gaps: &mut Vec<KnowledgeGap
             action_hint: action_hint_for_gap(&GapType::HotFileNoTests, path),
         });
     }
+}
+
+/// Return `true` if `path` is a source file that can reasonably have tests.
+///
+/// Excludes docs (md, txt, rst), config files (toml, json, yaml, lock),
+/// and any other non-source extension so the gap detector never suggests
+/// "add tests for README.md" or "add tests for Cargo.toml".
+fn is_testable_source_file(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    matches!(
+        ext,
+        "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs"
+            | "py" | "pyi" | "java" | "rb" | "kt" | "scala" | "cs"
+            | "cpp" | "cc" | "c" | "h" | "hpp" | "swift" | "ex" | "exs"
+    )
 }
 
 /// Return `true` if a test file for `path` exists in `all_paths`.
