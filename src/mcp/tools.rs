@@ -64,6 +64,15 @@ impl MatiServer {
             tool_router: Self::tool_router(),
         }
     }
+
+    /// Construct from a pre-existing Arc so the same graph lock can be shared
+    /// with the daemon socket task spawned by `mcp::server::serve`.
+    pub fn with_graph_arc(graph: Arc<tokio::sync::RwLock<Graph>>) -> Self {
+        Self {
+            graph,
+            tool_router: Self::tool_router(),
+        }
+    }
 }
 
 #[tool_router]
@@ -112,9 +121,12 @@ impl MatiServer {
                 let graph = self.graph.read().await;
                 let store = graph.store();
                 match store.search(&params.query, limit).await {
-                    Ok(records) => serde_json::to_string_pretty(&records).unwrap_or_else(|e| {
-                        format!("{{\"error\": \"serialization failed: {e}\"}}")
-                    }),
+                    Ok(mut records) => {
+                        records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+                        serde_json::to_string_pretty(&records).unwrap_or_else(|e| {
+                            format!("{{\"error\": \"serialization failed: {e}\"}}")
+                        })
+                    }
                     Err(e) => format!("{{\"error\": \"{e}\"}}"),
                 }
             }
@@ -140,7 +152,9 @@ impl MatiServer {
                 let mut records = Vec::new();
                 for key in neighbor_keys.iter().take(limit) {
                     if let Ok(Some(record)) = store.get(key).await {
-                        records.push(record);
+                        if matches!(record.lifecycle, RecordLifecycle::Active) {
+                            records.push(record);
+                        }
                     }
                 }
                 serde_json::to_string_pretty(&records).unwrap_or_else(|e| {

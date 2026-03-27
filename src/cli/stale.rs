@@ -11,6 +11,8 @@ use mati_core::store::{
     RecordVersion, StalenessScore, StalenessSignal, StalenessTier, Store,
 };
 
+use super::proxy::StoreProxy;
+
 use super::colors;
 use super::show::{format_date, staleness_color, truncate};
 
@@ -106,16 +108,16 @@ pub struct StaleArgs {
 
 pub async fn run(args: StaleArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
     // ── Cache check: reuse when write-seq unchanged ───────────────────────────
-    let current_seq = store.read_write_seq();
-    if let Ok(Some(cached)) = store.get(STALE_CACHE_KEY).await {
+    let current_seq = proxy.read_write_seq();
+    if let Ok(Some(cached)) = proxy.get(STALE_CACHE_KEY).await {
         if let Some(entry) = cached.payload_as::<StaleCache>() {
             if entry.write_seq == current_seq {
                 let mut stale = entry.records;
                 stale.truncate(args.limit);
-                store.close().await?;
+                proxy.close().await?;
                 display_stale(&stale, args.verbose);
                 return Ok(());
             }
@@ -124,10 +126,10 @@ pub async fn run(args: StaleArgs) -> Result<()> {
 
     // ── Cache miss: scan all four prefixes concurrently ───────────────────────
     let (gotchas, decisions, files, notes) = tokio::try_join!(
-        store.scan_prefix("gotcha:"),
-        store.scan_prefix("decision:"),
-        store.scan_prefix("file:"),
-        store.scan_prefix("dev_note:"),
+        proxy.scan_prefix("gotcha:"),
+        proxy.scan_prefix("decision:"),
+        proxy.scan_prefix("file:"),
+        proxy.scan_prefix("dev_note:"),
     )?;
 
     let mut stale: Vec<Record> = gotchas
@@ -155,12 +157,12 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     let cache_entry = StaleCache { write_seq: current_seq, records: stale.clone() };
     let mut rec = cache_record(String::new());
     rec.payload = serde_json::to_value(&cache_entry).ok();
-    let _ = store.put(STALE_CACHE_KEY, &rec).await;
+    let _ = proxy.put(STALE_CACHE_KEY, &rec).await;
 
     // Limit
     stale.truncate(args.limit);
 
-    store.close().await?;
+    proxy.close().await?;
     display_stale(&stale, args.verbose);
     Ok(())
 }

@@ -8,6 +8,7 @@ pub mod gaps;
 pub mod gotcha;
 pub mod hooks;
 pub mod init;
+pub mod proxy;
 pub mod reparse;
 pub mod review;
 pub mod show;

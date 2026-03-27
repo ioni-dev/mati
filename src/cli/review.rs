@@ -27,10 +27,11 @@ use clap::Args;
 use mati_core::graph::{EdgeKind, Graph};
 use mati_core::health::quality;
 use mati_core::store::{
-    ConfidenceScore, GotchaRecord, Record, RecordLifecycle, RecordSource, Store, TombstoneReason,
+    ConfidenceScore, GotchaRecord, Record, RecordLifecycle, RecordSource, TombstoneReason,
 };
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 // ── Args ─────────────────────────────────────────────────────────────────────
 
@@ -44,9 +45,9 @@ pub async fn run(_args: ReviewArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     let candidates = {
-        let store = Store::open(&cwd).await?;
-        let result = collect_candidates(&store).await?;
-        store.close().await?;
+        let proxy = StoreProxy::open(&cwd).await?;
+        let result = collect_candidates(&proxy).await?;
+        proxy.close().await?;
         result
     };
 
@@ -190,7 +191,7 @@ pub async fn run(_args: ReviewArgs) -> Result<()> {
 /// review and promote auto-generated candidates via `mati improve` before
 /// confirming. The injection quality gate (>= 0.4) is enforced separately.
 /// Sorted by `access_count DESC` — most-accessed candidates first.
-async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
+async fn collect_candidates(store: &StoreProxy) -> Result<Vec<Record>> {
     let all = store.scan_prefix("gotcha:").await?;
     let mut candidates: Vec<Record> = all
         .into_iter()
@@ -217,9 +218,9 @@ async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
 /// - source → `DeveloperManual`, confidence.value → 0.80
 /// - `HasGotcha` graph edges added for all affected files
 async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
-    let store = Store::open(cwd).await?;
+    let proxy = StoreProxy::open(cwd).await?;
 
-    let mut record = store
+    let mut record = proxy
         .get(key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
@@ -240,24 +241,29 @@ async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    store.put(key, &record).await?;
+    proxy.put(key, &record).await?;
 
     // Add HasGotcha edges so mem_bootstrap can find this gotcha via graph traversal.
-    let mut graph = Graph::load(store).await?;
-    for af in &gotcha.affected_files {
-        let file_key = format!("file:{af}");
-        graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
+    if proxy.is_direct() {
+        let store = proxy.into_store();
+        let mut graph = Graph::load(store).await?;
+        for af in &gotcha.affected_files {
+            let file_key = format!("file:{af}");
+            graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
+        }
+        graph.close().await?;
+    } else {
+        tracing::debug!("confirm_candidate: skipping graph edge write in socket mode (graceful degradation)");
     }
-    graph.close().await?;
 
     Ok(())
 }
 
 /// Tombstone the record and remove all HasGotcha edges.
 async fn delete_candidate(cwd: &Path, key: &str) -> Result<()> {
-    let store = Store::open(cwd).await?;
+    let proxy = StoreProxy::open(cwd).await?;
 
-    let mut record = store
+    let mut record = proxy
         .get(key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
@@ -275,14 +281,19 @@ async fn delete_candidate(cwd: &Path, key: &str) -> Result<()> {
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    store.put(key, &record).await?;
+    proxy.put(key, &record).await?;
 
-    let mut graph = Graph::load(store).await?;
-    for af in &gotcha.affected_files {
-        let file_key = format!("file:{af}");
-        graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
+    if proxy.is_direct() {
+        let store = proxy.into_store();
+        let mut graph = Graph::load(store).await?;
+        for af in &gotcha.affected_files {
+            let file_key = format!("file:{af}");
+            graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
+        }
+        graph.close().await?;
+    } else {
+        tracing::debug!("delete_candidate: skipping graph edge removal in socket mode (graceful degradation)");
     }
-    graph.close().await?;
 
     Ok(())
 }
@@ -316,8 +327,8 @@ async fn edit_inline(
     };
 
     // Persist edits (still confirmed=false until user confirms below).
-    let store = Store::open(cwd).await?;
-    let mut record = store
+    let proxy = StoreProxy::open(cwd).await?;
+    let mut record = proxy
         .get(key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
@@ -344,8 +355,8 @@ async fn edit_inline(
     record.version.wall_clock = now;
     record.quality = quality::analyze(&record);
 
-    store.put(key, &record).await?;
-    store.close().await?;
+    proxy.put(key, &record).await?;
+    proxy.close().await?;
 
     // Ask whether to confirm after the edit.
     eprint_prompt("Confirm now? [Y/n]: ", use_color);

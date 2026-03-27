@@ -360,6 +360,7 @@ async fn ls_files(store: &Store, _use_color: bool, limit: usize) -> Result<()> {
 
     store
         .scan_prefix_each("file:", |r| {
+            if !matches!(r.lifecycle, RecordLifecycle::Active) { return; }
             let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
             let (purpose, entry_count, is_hotspot) =
                 match r.payload_as::<FileRecord>() {
@@ -447,8 +448,10 @@ fn print_ls_files_stream_header() {
 /// Print a single row in fixed-width format during the streaming cold-path scan.
 fn print_ls_files_stream_row(row: &LsFileRow) {
     // Left-truncate paths so the filename is always visible.
-    let path = if row.path.len() > COL_PATH {
-        format!("…{}", &row.path[row.path.len() - (COL_PATH - 1)..])
+    let path = if row.path.chars().count() > COL_PATH {
+        let chars: Vec<char> = row.path.chars().collect();
+        let start = chars.len() - (COL_PATH - 1);
+        format!("…{}", chars[start..].iter().collect::<String>())
     } else {
         row.path.clone()
     };
@@ -499,6 +502,7 @@ fn render_ls_files_table(rows: &[LsFileRow], total: usize, limit: usize) {
 
 async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
     let mut records = store.scan_prefix("gotcha:").await?;
+    records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
     if records.is_empty() {
         println!("No gotcha records found.");
         return Ok(());
@@ -550,6 +554,7 @@ async fn ls_gotchas(store: &Store, _use_color: bool) -> Result<()> {
 
 async fn ls_decisions(store: &Store, _use_color: bool) -> Result<()> {
     let mut records = store.scan_prefix("decision:").await?;
+    records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
     if records.is_empty() {
         println!("No decision records found.");
         return Ok(());

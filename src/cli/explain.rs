@@ -9,9 +9,10 @@ use std::io::IsTerminal as _;
 use anyhow::Result;
 use clap::Args;
 
-use mati_core::store::{FileRecord, GotchaRecord, Priority, Record, RecordLifecycle, Store};
+use mati_core::store::{FileRecord, GotchaRecord, Priority, Record, RecordLifecycle};
 
 use super::colors;
+use super::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct ExplainArgs {
@@ -22,13 +23,13 @@ pub struct ExplainArgs {
 pub async fn run(args: ExplainArgs) -> Result<()> {
     let use_color = std::io::stdout().is_terminal();
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = StoreProxy::open(&cwd).await?;
 
     // Strip leading "./" for consistency with stored keys.
     let path = args.path.trim_start_matches("./").to_string();
     let file_key = format!("file:{path}");
 
-    let file_rec = match store.get(&file_key).await? {
+    let file_rec = match proxy.get(&file_key).await? {
         Some(r) => r,
         None => {
             eprintln!("No record for '{path}'. Run `mati init` first.");
@@ -87,7 +88,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
 
     let mut gotchas: Vec<Record> = Vec::new();
     for key in &gotcha_keys {
-        if let Some(r) = store.get(key).await? {
+        if let Some(r) = proxy.get(key).await? {
             if matches!(r.lifecycle, RecordLifecycle::Active) {
                 gotchas.push(r);
             }
@@ -97,7 +98,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     // Fallback: scan gotcha: prefix for any with this file in affected_files.
     // Catches records not yet linked via gotcha_keys (e.g. warm re-init gap).
     if gotchas.is_empty() {
-        let all = store.scan_prefix("gotcha:").await?;
+        let all = proxy.scan_prefix("gotcha:").await?;
         for r in all {
             if !matches!(r.lifecycle, RecordLifecycle::Active) {
                 continue;
@@ -139,7 +140,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         println!();
         print_section_header("Decisions linked", colors::PURPLE, use_color);
         for key in &decision_keys {
-            if let Some(r) = store.get(key).await? {
+            if let Some(r) = proxy.get(key).await? {
                 println!("  ● {} — {}", r.key, r.value);
             }
         }
@@ -147,7 +148,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
 
     // ── Co-changes ────────────────────────────────────────────────────────────
     let cochange_prefix = format!("gotcha:cochange:{path}|");
-    let cochange_gotchas = store.scan_prefix(&cochange_prefix).await?;
+    let cochange_gotchas = proxy.scan_prefix(&cochange_prefix).await?;
     if !cochange_gotchas.is_empty() {
         println!();
         print_section_header("Co-changes with", colors::BLUE, use_color);
@@ -172,8 +173,8 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     }
 
     // ── Stability ─────────────────────────────────────────────────────────────
-    let revert_rec = store.get(&format!("gotcha:revert:{path}")).await?;
-    let ownership_rec = store.get(&format!("gotcha:ownership:{path}")).await?;
+    let revert_rec = proxy.get(&format!("gotcha:revert:{path}")).await?;
+    let ownership_rec = proxy.get(&format!("gotcha:ownership:{path}")).await?;
 
     if revert_rec.is_some()
         || ownership_rec.is_some()
@@ -213,7 +214,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     }
 
     println!();
-    store.close().await?;
+    proxy.close().await?;
     Ok(())
 }
 

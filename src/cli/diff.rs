@@ -14,7 +14,9 @@ use std::process::Command;
 use anyhow::Result;
 use clap::Args;
 
-use mati_core::store::{FileRecord, GotchaRecord, RecordLifecycle, Store};
+use mati_core::store::{FileRecord, GotchaRecord, RecordLifecycle};
+
+use super::proxy::StoreProxy;
 
 use super::colors;
 
@@ -50,7 +52,7 @@ pub async fn run(args: DiffArgs) -> Result<()> {
         return Ok(());
     }
 
-    let store = Store::open(&cwd).await?;
+    let store = StoreProxy::open(&cwd).await?;
 
     println!();
     if use_color {
@@ -146,5 +148,6 @@ pub async fn run(args: DiffArgs) -> Result<()> {
     println!();
 
     store.close().await?;
+
     Ok(())
 }
