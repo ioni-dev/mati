@@ -39,3 +39,28 @@ pub struct MemBootstrapParams {
     #[serde(default)]
     pub context_files: Option<Vec<String>>,
 }
+
+fn default_priority() -> String {
+    "Normal".to_string()
+}
+
+/// Parameters for the `mem_set` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct MemSetParams {
+    /// Namespaced key: "file:src/payments/stripe.go" or "gotcha:stripe-idempotency"
+    pub key: String,
+    /// Human-readable value (tantivy-indexed). For files: purpose sentence.
+    /// For gotchas: "{rule} because {reason}"
+    pub value: String,
+    /// Record category: "File", "Gotcha", "Decision", or "DevNote"
+    pub category: String,
+    /// Structured payload — FileRecord or GotchaRecord fields as JSON object
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    /// Free-form tags for search and filtering
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Priority: "Low", "Normal", "High", or "Critical"
+    #[serde(default = "default_priority")]
+    pub priority: String,
+}

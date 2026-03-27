@@ -408,8 +408,8 @@ mod tests {
 
     // Session helpers needed by tests — imported from mati_core::store::session.
     use mati_core::store::session::{
-        analytics_record, format_review_date, session_record, today_key, now_secs,
-        upsert_daily_agg, DailyAgg, GOTCHA_PROMOTION_ACCESS_THRESHOLD, MAX_AGG_KEYS,
+        format_review_date, today_key, now_secs,
+        upsert_daily_agg, DailyAgg, GOTCHA_PROMOTION_ACCESS_THRESHOLD,
         MAX_STALE_REVIEW_ENTRIES,
     };
     use mati_core::store::{
