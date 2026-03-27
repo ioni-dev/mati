@@ -48,11 +48,24 @@ pub async fn run(args: InitArgs) -> Result<()> {
         let mati_root = mati_root_for(&root)?;
         match daemon_result(&mati_root, "ping", serde_json::json!({})).await {
             DaemonResult::Ok(_) => {
-                anyhow::bail!(
-                    "mati daemon is running and holds the store lock.\n\
-                     Stop it first, then re-run init:\n\n  \
-                     mati daemon stop\n"
-                );
+                // Check who owns the socket to give accurate remediation advice.
+                let owner = crate::cli::daemon::read_pid_file(&mati_root)
+                    .map(|(_, o)| o)
+                    .unwrap_or_else(|| "unknown".to_string());
+                if owner == "mcp" {
+                    anyhow::bail!(
+                        "mati daemon is running and holds the store lock.\n\
+                         The socket is owned by the active MCP server (mati serve).\n\
+                         To run mati init: close your Claude Code session first, then re-run:\n\n  \
+                         mati init\n"
+                    );
+                } else {
+                    anyhow::bail!(
+                        "mati daemon is running and holds the store lock.\n\
+                         Stop it first, then re-run init:\n\n  \
+                         mati daemon stop\n"
+                    );
+                }
             }
             DaemonResult::Unresponsive => {
                 anyhow::bail!(
