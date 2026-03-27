@@ -649,6 +649,11 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
 
     // ── 12. Scaffold: CLAUDE.md stub ─────────────────────────────────────────
+    // Ensure .claude/ exists so scaffold functions can write into it.
+    let claude_dir = root.join(".claude");
+    if !claude_dir.is_dir() {
+        let _ = std::fs::create_dir_all(&claude_dir);
+    }
     let t = Instant::now();
     match write_claude_md_stub(&root) {
         Ok(_) => println!(
