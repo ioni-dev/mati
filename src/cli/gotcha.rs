@@ -15,6 +15,7 @@ use mati_core::store::{
 };
 
 use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+use crate::cli::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct GotchaArgs {
@@ -39,6 +40,11 @@ pub enum GotchaCommand {
         /// Gotcha key (e.g., "gotcha:session-token-expiry" or just "session-token-expiry")
         key: String,
     },
+    /// Confirm a gotcha — activates hook enforcement (non-interactive, no TTY required)
+    Confirm {
+        /// Gotcha key (e.g., "gotcha:session-token-expiry" or just "session-token-expiry")
+        key: String,
+    },
 }
 
 pub async fn run(args: GotchaArgs) -> Result<()> {
@@ -46,6 +52,7 @@ pub async fn run(args: GotchaArgs) -> Result<()> {
         GotchaCommand::Add { file } => run_gotcha_add(&file).await,
         GotchaCommand::Edit { key } => run_gotcha_edit(&normalize_key(&key)).await,
         GotchaCommand::Delete { key } => run_gotcha_delete(&normalize_key(&key)).await,
+        GotchaCommand::Confirm { key } => run_gotcha_confirm(&normalize_key(&key)).await,
     }
 }
 
@@ -712,5 +719,139 @@ fn parse_severity(input: &str) -> Priority {
         "high" => Priority::High,
         "critical" | "crit" => Priority::Critical,
         _ => Priority::Normal,
+    }
+}
+
+// ── Confirm ───────────────────────────────────────────────────────────────────
+
+/// Core confirm logic extracted for testability. Takes a proxy directly.
+pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> {
+    let mut record = match proxy.get(key).await? {
+        Some(r) => r,
+        None => anyhow::bail!("no record found for '{key}'"),
+    };
+
+    if record.category != Category::Gotcha {
+        anyhow::bail!("'{key}' is not a Gotcha record (category: {:?})", record.category);
+    }
+
+    if let Some(ref mut payload) = record.payload {
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                obj.insert("severity".to_string(), serde_json::Value::String(sev));
+            }
+            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+
+    record.source = RecordSource::DeveloperManual;
+    record.confidence = ConfidenceScore::for_new_record(&RecordSource::DeveloperManual);
+    record.quality = quality::analyze(&record);
+    record.updated_at = now_secs();
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now_secs();
+
+    proxy.put(key, &record).await?;
+    Ok(())
+}
+
+async fn run_gotcha_confirm(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+
+    confirm_gotcha(&proxy, key).await?;
+    proxy.close().await?;
+
+    println!("\u{2705} Confirmed: {key}  (confidence \u{2192} 0.80, hook enforcement active)");
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mati_core::store::Store;
+    use tempfile::TempDir;
+
+    fn make_gotcha_record(key: &str) -> Record {
+        let now = 1_700_000_000u64;
+        let gotcha = GotchaRecord {
+            rule: "Always check input".to_string(),
+            reason: "unchecked input causes panics".to_string(),
+            severity: Priority::High,
+            affected_files: vec!["src/main.rs".to_string()],
+            ref_url: None,
+            discovered_session: now,
+            confirmed: false,
+        };
+        Record {
+            key: key.to_string(),
+            value: "Always check input because unchecked input causes panics".to_string(),
+            payload: serde_json::to_value(&gotcha).ok(),
+            category: Category::Gotcha,
+            priority: Priority::High,
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: now,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::ClaudeEnrich,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich),
+            gap_analysis_score: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn confirm_sets_confirmed_true() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let record = make_gotcha_record("gotcha:test-confirm");
+        store.put("gotcha:test-confirm", &record).await.unwrap();
+        store.close().await.unwrap();
+
+        let proxy = StoreProxy::open(dir.path()).await.unwrap();
+        confirm_gotcha(&proxy, "gotcha:test-confirm").await.unwrap();
+
+        let updated = proxy.get("gotcha:test-confirm").await.unwrap().unwrap();
+        let payload = updated.payload.unwrap();
+        assert_eq!(payload["confirmed"], true);
+    }
+
+    #[tokio::test]
+    async fn confirm_updates_source_to_developer_manual() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let record = make_gotcha_record("gotcha:test-source");
+        store.put("gotcha:test-source", &record).await.unwrap();
+        store.close().await.unwrap();
+
+        let proxy = StoreProxy::open(dir.path()).await.unwrap();
+        confirm_gotcha(&proxy, "gotcha:test-source").await.unwrap();
+
+        let updated = proxy.get("gotcha:test-source").await.unwrap().unwrap();
+        assert_eq!(updated.source, RecordSource::DeveloperManual);
+        assert!((updated.confidence.value - 0.80).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn confirm_fails_on_nonexistent_key() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store.close().await.unwrap();
+
+        let proxy = StoreProxy::open(dir.path()).await.unwrap();
+        let result = confirm_gotcha(&proxy, "gotcha:does-not-exist").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no record found"));
     }
 }
