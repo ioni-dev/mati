@@ -52,6 +52,74 @@ fn priority_weight(priority: &Priority) -> f32 {
     }
 }
 
+/// Strip a Record to its agent-facing shape. Removes internal metadata
+/// (device_id, clocks, gap_analysis_score, computed_at, sha, counters)
+/// that agents never use. Cuts ~40% of response size.
+fn record_to_agent_json(record: &Record) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("key".into(), serde_json::json!(record.key));
+    obj.insert("value".into(), serde_json::json!(record.value));
+    obj.insert("category".into(), serde_json::json!(record.category));
+    obj.insert("priority".into(), serde_json::json!(record.priority));
+    if !record.tags.is_empty() {
+        obj.insert("tags".into(), serde_json::json!(record.tags));
+    }
+    obj.insert("confidence".into(), serde_json::json!(record.confidence.value));
+    obj.insert("confirmation_count".into(), serde_json::json!(record.confidence.confirmation_count));
+    obj.insert("quality".into(), serde_json::json!(record.quality.value));
+    obj.insert("quality_tier".into(), serde_json::json!(record.quality.tier));
+    if !record.quality.signals.is_empty() {
+        obj.insert("quality_signals".into(), serde_json::json!(record.quality.signals));
+    }
+    obj.insert("source".into(), serde_json::json!(record.source));
+    obj.insert("staleness_tier".into(), serde_json::json!(record.staleness.tier));
+    if let Some(ref url) = record.ref_url {
+        obj.insert("ref_url".into(), serde_json::json!(url));
+    }
+    if let Some(ref payload) = record.payload {
+        obj.insert("payload".into(), strip_payload(payload, &record.category));
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Strip internal-only fields from the payload based on record category.
+fn strip_payload(payload: &serde_json::Value, category: &Category) -> serde_json::Value {
+    let Some(obj) = payload.as_object() else {
+        return payload.clone();
+    };
+
+    // Fields to remove per category
+    let internal_fields: &[&str] = match category {
+        Category::File => &[
+            "token_cost_estimate",
+            "last_modified_session",
+            "content_hash",
+        ],
+        Category::Gotcha => &[
+            "discovered_session",
+        ],
+        _ => &[],
+    };
+
+    if internal_fields.is_empty() {
+        return payload.clone();
+    }
+
+    let mut stripped = obj.clone();
+    for field in internal_fields {
+        stripped.remove(*field);
+    }
+
+    // Remove empty arrays from file payloads to save space
+    if matches!(category, Category::File) {
+        stripped.retain(|_, v| {
+            !matches!(v, serde_json::Value::Array(a) if a.is_empty())
+        });
+    }
+
+    serde_json::Value::Object(stripped)
+}
+
 /// The MCP server struct. Holds an `Arc<tokio::sync::RwLock<Graph>>` which
 /// owns the Store internally.
 #[derive(Clone)]
@@ -110,9 +178,8 @@ impl MatiServer {
                 // Write session:consulted marker so pre-read/pre-bash hooks know this key
                 // was looked up via MCP and can downgrade deny → allow+context on next access.
                 let _ = crate::store::session::log_hit(store, &params.key).await;
-                serde_json::to_string_pretty(&record).unwrap_or_else(|e| {
-                    format!("{{\"error\": \"serialization failed: {e}\"}}")
-                })
+                serde_json::to_string_pretty(&record_to_agent_json(&record))
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
             }
             Ok(None) => "null".to_string(),
             Err(e) => format!("{{\"error\": \"{e}\"}}"),
@@ -138,7 +205,10 @@ impl MatiServer {
                 match store.search(&params.query, limit).await {
                     Ok(mut records) => {
                         records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
-                        serde_json::to_string_pretty(&records).unwrap_or_else(|e| {
+                        let stripped: Vec<serde_json::Value> = records.iter()
+                            .map(record_to_agent_json)
+                            .collect();
+                        serde_json::to_string_pretty(&stripped).unwrap_or_else(|e| {
                             format!("{{\"error\": \"serialization failed: {e}\"}}")
                         })
                     }
@@ -627,12 +697,17 @@ pub async fn assemble_context_packet(
         }
     }
 
-    // Gotchas section
+    // Gotchas section — separate co-change gotchas (grouped) from regular gotchas (individual)
     if !critical_gotchas.is_empty() {
         let mut gotcha_section = String::from("## Gotchas\n");
+
+        // Regular gotchas (non-co-change) — listed individually
         for record in &critical_gotchas {
+            if record.key.starts_with("gotcha:cochange:") {
+                continue;
+            }
             let caveat = if record.staleness.tier == StalenessTier::Liability {
-                " [STALE — verify before trusting]"
+                " [STALE — verify]"
             } else if record.quality.tier == QualityTier::Poor {
                 " [LOW QUALITY — verify]"
             } else {
@@ -646,7 +721,49 @@ pub async fn assemble_context_packet(
             gotcha_section.push_str(&line);
             used_tokens += tokens;
         }
-        sections.push(gotcha_section);
+
+        // Co-change gotchas — grouped by source file into one-liners
+        let mut cochange_map: std::collections::BTreeMap<String, Vec<(String, String)>> =
+            std::collections::BTreeMap::new();
+        for record in &critical_gotchas {
+            if !record.key.starts_with("gotcha:cochange:") {
+                continue;
+            }
+            // key format: gotcha:cochange:file_a|file_b
+            if let Some(pair) = record.key.strip_prefix("gotcha:cochange:") {
+                if let Some((src, tgt)) = pair.split_once('|') {
+                    // Extract percentage: "... (78%)." → "78%"
+                    // Robust: find last '(' then take until '%' or ')'
+                    let pct = record.value.rfind('(')
+                        .and_then(|i| record.value[i+1..].find(')').map(|j| &record.value[i+1..i+1+j]))
+                        .unwrap_or("?");
+                    cochange_map.entry(src.to_string())
+                        .or_default()
+                        .push((tgt.to_string(), pct.to_string()));
+                }
+            }
+        }
+        if !cochange_map.is_empty() {
+            let all_pairs: Vec<String> = cochange_map.iter()
+                .flat_map(|(src, targets)| {
+                    targets.iter().map(move |(tgt, pct)| format!("{src}\u{2194}{tgt} ({pct})"))
+                })
+                .collect();
+            let total = all_pairs.len();
+            // Show up to 10 pairs, truncate with count
+            let display: Vec<&str> = all_pairs.iter().take(10).map(|s| s.as_str()).collect();
+            let suffix = if total > 10 { format!(", +{} more", total - 10) } else { String::new() };
+            let line = format!("- **Co-change partners**: {}{suffix}\n", display.join(", "));
+            let tokens = estimate_tokens(&line);
+            if used_tokens + tokens <= available_tokens {
+                gotcha_section.push_str(&line);
+                used_tokens += tokens;
+            }
+        }
+
+        if gotcha_section.len() > "## Gotchas\n".len() {
+            sections.push(gotcha_section);
+        }
     }
 
     // File records section
