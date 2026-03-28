@@ -211,7 +211,7 @@ impl MatiServer {
     /// to confirm and activate hook enforcement.
     #[rmcp::tool(
         name = "mem_set",
-        description = "Write enriched knowledge to the mati store. \n\nUSE FOR: (1) /mati-enrich file/directory enrichment, (2) inline capture when developer says 'add that as a gotcha' / 'remember this' / 'note that'. \n\nGOTCHA RULES: rule MUST start with imperative verb (Always/Never/Ensure/Do not). reason MUST state causality — what breaks and why. confirmed MUST be false. \n\nFILE RULES: value and purpose MUST start with a verb (Handles/Manages/Validates). Preserve all existing structural fields from mem_get — only update purpose and gotcha_keys. \n\nAFTER WRITING GOTCHAS: always remind developer to run `mati review` to activate hooks. \n\nQUALITY GATE: records with quality < 0.2 are suppressed and never injected. Imperative verb + causality reason = quality >= 0.4 (injectable)."
+        description = "Write enriched knowledge to the mati store. \n\nUSE FOR: (1) /mati-enrich file/directory enrichment, (2) inline capture when developer says 'add that as a gotcha' / 'remember this' / 'note that'. \n\nGOTCHA RULES: rule MUST start with imperative verb (Always/Never/Ensure/Do not). reason MUST state causality — what breaks and why. confirmed MUST be false. \n\nFILE RULES: value and purpose MUST start with a verb (Handles/Manages/Validates). Preserve all existing structural fields from mem_get — only update purpose and gotcha_keys. \n\nCONFIRM ROUTING: \n- SINGLE GOTCHA (developer said 'add gotcha' / 'remember this' / 'that's a gotcha'): mem_set then immediately run `mati gotcha confirm <key>` via Bash. Developer is the authority — no review needed. \n- SINGLE FILE ENRICHMENT (/mati-enrich one file): mem_set then `mati gotcha confirm <key>` for each gotcha. Developer is supervising. \n- BATCH ENRICHMENT (/mati-enrich directory or multiple files): mem_set with confirmed=false. Do NOT auto-confirm. End with 'N gotchas written. Run `mati review` to confirm and activate hooks.' \n\nQUALITY GATE: records with quality < 0.2 are suppressed and never injected. Imperative verb + causality reason = quality >= 0.4 (injectable)."
     )]
     async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
         let graph = self.graph.read().await;
@@ -255,6 +255,10 @@ impl MatiServer {
         };
 
         // Fetch existing record to preserve Layer 0 structural data
+        let was_confirmed = store.get(&params.key).await.ok().flatten().as_ref().map(|r| {
+            r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80
+        }).unwrap_or(false);
+
         let mut record = match store.get(&params.key).await {
             Ok(Some(existing)) => existing,
             _ => Record {
@@ -286,12 +290,24 @@ impl MatiServer {
         // Apply enrichment fields
         record.value = params.value;
         record.category = category;
-        record.source = RecordSource::ClaudeEnrich;
         record.updated_at = now;
         record.version.logical_clock += 1;
         record.version.wall_clock = now;
-        record.tags = params.tags;
         record.priority = priority;
+
+        // Preserve confirmation state: if the existing record was previously confirmed
+        // (source=DeveloperManual or confidence>=0.80), keep source/confidence/tags.
+        // Otherwise set to ClaudeEnrich defaults.
+        if was_confirmed {
+            // Only update tags if the caller explicitly provided non-empty tags.
+            if !params.tags.is_empty() {
+                record.tags = params.tags;
+            }
+        } else {
+            record.source = RecordSource::ClaudeEnrich;
+            record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+            record.tags = params.tags;
+        }
 
         // Merge payload: for existing records, preserve structural fields from
         // Layer 0 (entry_points, imports, etc.) while overlaying enrichment.
@@ -326,8 +342,11 @@ impl MatiServer {
             }
         }
 
-        // Recompute confidence + quality
-        record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+        // Recompute quality. Only reset confidence for non-confirmed records —
+        // confirmed records keep their DeveloperManual confidence (0.80).
+        if !was_confirmed {
+            record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+        }
         record.quality = quality::analyze(&record);
 
         // Write
@@ -1640,5 +1659,58 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["error"].as_str().unwrap().contains("unknown category"));
+    }
+
+    #[tokio::test]
+    async fn mem_set_preserves_confirmation_state_on_update() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Create a confirmed gotcha (simulates post-mati gotcha confirm state)
+        let mut record = make_gotcha_record("gotcha:confirmed-edit-test", "Always test first", true, 0.70);
+        record.source = RecordSource::DeveloperManual;
+        record.confidence = ConfidenceScore {
+            value: 0.80,
+            confirmation_count: 1,
+            contributor_count: 1,
+            last_challenged: None,
+            challenge_count: 0,
+        };
+        record.tags = vec!["important".to_string()];
+        store.put("gotcha:confirmed-edit-test", &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Update the gotcha's value via mem_set (simulates Claude editing the reason)
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                key: "gotcha:confirmed-edit-test".to_string(),
+                value: "Always test first because untested changes cause regressions".to_string(),
+                category: "Gotcha".to_string(),
+                payload: Some(serde_json::json!({
+                    "rule": "Always test first",
+                    "reason": "untested changes cause regressions",
+                    "severity": "High",
+                    "affected_files": ["src/main.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": true
+                })),
+                tags: vec![],  // empty — should NOT clear existing tags
+                priority: "High".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+
+        // Verify confirmation state preserved
+        let graph = server.graph.read().await;
+        let updated = graph.store().get("gotcha:confirmed-edit-test").await.unwrap().unwrap();
+        assert_eq!(updated.source, RecordSource::DeveloperManual);
+        assert!((updated.confidence.value - 0.80).abs() < 0.01, "confidence should stay 0.80, got {}", updated.confidence.value);
+        assert_eq!(updated.confidence.confirmation_count, 1);
+        assert_eq!(updated.tags, vec!["important".to_string()], "tags should be preserved when caller sends empty");
     }
 }
