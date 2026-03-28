@@ -15,6 +15,13 @@ command -v jq &>/dev/null || exit 0
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
 [ -z "$FILE_PATH" ] && exit 0
 
+# Convert absolute path to repo-relative path.
+# Claude Code always passes absolute paths; mati store keys use relative paths.
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+if [ -n "$REPO_ROOT" ]; then
+  FILE_PATH="${FILE_PATH#$REPO_ROOT/}"
+fi
+
 # 2.3: Capture canonical doc comment from new content.
 # Write: tool_input.content  |  Edit: tool_input.new_string
 # Only the first 15 lines — doc comments live at the top of the file.
