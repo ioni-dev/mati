@@ -352,6 +352,24 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
             }
         }
 
+        "put" => {
+            use crate::store::Record;
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            let record: Record = match req.args.get("record")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            {
+                Some(r) => r,
+                None => return SocketResponse::err("put: invalid record"),
+            };
+            match store.put(key, &record).await {
+                Ok(()) => SocketResponse::ok(serde_json::Value::Null),
+                Err(e) => SocketResponse::err(format!("store put: {e}")),
+            }
+        }
+
         "gotcha_write" => {
             use crate::graph::edges::{Edge, EdgeKind};
             use crate::store::Record;

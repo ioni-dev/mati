@@ -37,15 +37,14 @@ When the developer says any of these:
 - \"note that down\" / \"mati note: ...\" / \"we decided to...\"
 
 Call mem_set immediately. Do not ask for confirmation.
-After writing a gotcha via mem_set, immediately run:
-  mati gotcha confirm <key>
-This activates hook enforcement without requiring a terminal.
+Single gotcha from developer request: mem_set then `mati gotcha confirm <key>`.
+Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
 
 ## /mati-enrich
 
-Run /mati-enrich [path] to enrich a file, directory, or (no args) top gaps.
-Full enrichment spec: see mem_set tool description for payload formats.
-After each gotcha mem_set, run `mati gotcha confirm <key>` to activate immediately.
+Run /mati-enrich [path] to enrich a file or directory.
+Single file: mem_set + `mati gotcha confirm <key>` for each gotcha.
+Directory/batch: mem_set only, end with \"Run `mati review` to confirm N gotchas.\"
 ";
 
 /// Write the Vector C stub to `.claude/CLAUDE.md`.
