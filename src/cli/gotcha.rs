@@ -52,7 +52,18 @@ pub async fn run(args: GotchaArgs) -> Result<()> {
         GotchaCommand::Add { file } => run_gotcha_add(&file).await,
         GotchaCommand::Edit { key } => run_gotcha_edit(&normalize_key(&key)).await,
         GotchaCommand::Delete { key } => run_gotcha_delete(&normalize_key(&key)).await,
-        GotchaCommand::Confirm { key } => run_gotcha_confirm(&normalize_key(&key)).await,
+        GotchaCommand::Confirm { key } => {
+            const NON_GOTCHA_PREFIXES: &[&str] = &["file:", "decision:", "dev_note:", "dep:", "stage:"];
+            if let Some(prefix) = NON_GOTCHA_PREFIXES.iter().find(|&&p| key.starts_with(p)) {
+                let category = prefix.trim_end_matches(':');
+                let slug = key.split_once(':').map(|x| x.1).unwrap_or(&key);
+                anyhow::bail!(
+                    "'{key}' has category '{category}', not 'gotcha'.\n\
+                     Pass just the slug (e.g., '{slug}') or the full gotcha: key."
+                );
+            }
+            run_gotcha_confirm(&normalize_key(&key)).await
+        }
     }
 }
 
@@ -745,7 +756,8 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
     }
 
     record.source = RecordSource::DeveloperManual;
-    record.confidence = ConfidenceScore::for_new_record(&RecordSource::DeveloperManual);
+    record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+    record.confidence.confirmation_count += 1;
     record.quality = quality::analyze(&record);
     record.updated_at = now_secs();
     record.version.logical_clock += 1;
