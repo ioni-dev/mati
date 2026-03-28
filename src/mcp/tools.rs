@@ -122,10 +122,10 @@ impl MatiServer {
     /// Search the knowledge store using BM25 text search or graph traversal.
     ///
     /// Modes: "text" (default) for full-text BM25, "graph" for 1-hop traversal.
-    /// Returns a JSON array of matching records.
+    /// Text mode returns a JSON array. Graph mode returns a grouped JSON object.
     #[rmcp::tool(
         name = "mem_query",
-        description = "Search the mati knowledge store. Modes: \"text\" (default, BM25 full-text search) or \"graph\" (1-hop traversal from query as seed key). Returns matching records as JSON array."
+        description = "Search the mati knowledge store. Modes: \"text\" (default, BM25 full-text search) or \"graph\" (1-hop traversal from seed key, returns JSON object grouped by relationship: gotchas, co_changes, imports, decisions, notes — each group is an array of records with a summary one-liner)."
     )]
     async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
         let mode = params.mode.as_deref().unwrap_or("text");
@@ -149,30 +149,89 @@ impl MatiServer {
                 let graph = self.graph.read().await;
                 let store = graph.store();
 
-                // Use the query as a seed key, traverse all edge kinds 1-hop
-                let mut neighbor_keys = HashSet::new();
-                for kind in &[
-                    EdgeKind::HasGotcha,
-                    EdgeKind::Imports,
-                    EdgeKind::AffectedBy,
-                    EdgeKind::HasNote,
-                    EdgeKind::CoChanges,
-                    EdgeKind::DependencyAffects,
-                ] {
-                    for key in graph.neighbors(&params.query, kind) {
-                        neighbor_keys.insert(key);
+                // Per-kind limits ensure gotchas always surface
+                const GOTCHA_LIMIT: usize = 10;
+                const COCHANGE_LIMIT: usize = 5;
+                const IMPORT_LIMIT: usize = 5;
+                const DECISION_LIMIT: usize = 3;
+                const NOTE_LIMIT: usize = 3;
+
+                let edge_groups: &[(EdgeKind, &str, usize)] = &[
+                    (EdgeKind::HasGotcha, "gotchas", GOTCHA_LIMIT),
+                    (EdgeKind::CoChanges, "co_changes", COCHANGE_LIMIT),
+                    (EdgeKind::Imports, "imports", IMPORT_LIMIT),
+                    (EdgeKind::AffectedBy, "decisions", DECISION_LIMIT),
+                    (EdgeKind::HasNote, "notes", NOTE_LIMIT),
+                ];
+
+                let mut result = serde_json::Map::new();
+                result.insert(
+                    "seed".to_string(),
+                    serde_json::Value::String(params.query.clone()),
+                );
+
+                let mut summary_parts = Vec::new();
+
+                for (kind, group_name, group_limit) in edge_groups {
+                    let keys = graph.neighbors(&params.query, kind);
+                    let mut group_records = Vec::new();
+
+                    for key in keys.iter().take(*group_limit) {
+                        if let Ok(Some(record)) = store.get(key).await {
+                            if matches!(record.lifecycle, RecordLifecycle::Active) {
+                                let mut entry = serde_json::Map::new();
+                                entry.insert("key".to_string(), serde_json::Value::String(record.key.clone()));
+                                entry.insert("relationship".to_string(), serde_json::Value::String(format!("{kind:?}")));
+                                entry.insert("value".to_string(), serde_json::Value::String(record.value.clone()));
+                                entry.insert("confidence".to_string(), serde_json::json!(record.confidence.value));
+                                entry.insert("quality".to_string(), serde_json::json!(record.quality.value));
+                                if let Some(payload) = &record.payload {
+                                    if let Some(confirmed) = payload.get("confirmed") {
+                                        entry.insert("confirmed".to_string(), confirmed.clone());
+                                    }
+                                }
+                                group_records.push(serde_json::Value::Object(entry));
+                            }
+                        }
                     }
+
+                    if !group_records.is_empty() {
+                        summary_parts.push(format!("{} {}", group_records.len(), group_name));
+                    }
+                    result.insert(
+                        group_name.to_string(),
+                        serde_json::Value::Array(group_records),
+                    );
                 }
 
-                let mut records = Vec::new();
-                for key in neighbor_keys.iter().take(limit) {
+                // DependencyAffects — add to decisions group
+                let dep_keys = graph.neighbors(&params.query, &EdgeKind::DependencyAffects);
+                for key in dep_keys.iter().take(DECISION_LIMIT) {
                     if let Ok(Some(record)) = store.get(key).await {
                         if matches!(record.lifecycle, RecordLifecycle::Active) {
-                            records.push(record);
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("key".to_string(), serde_json::Value::String(record.key.clone()));
+                            entry.insert("relationship".to_string(), serde_json::Value::String("DependencyAffects".to_string()));
+                            entry.insert("value".to_string(), serde_json::Value::String(record.value.clone()));
+                            entry.insert("confidence".to_string(), serde_json::json!(record.confidence.value));
+                            entry.insert("quality".to_string(), serde_json::json!(record.quality.value));
+                            if let Some(decisions) = result.get_mut("decisions") {
+                                if let Some(arr) = decisions.as_array_mut() {
+                                    arr.push(serde_json::Value::Object(entry));
+                                }
+                            }
                         }
                     }
                 }
-                serde_json::to_string_pretty(&records).unwrap_or_else(|e| {
+
+                let summary = if summary_parts.is_empty() {
+                    "No related records found".to_string()
+                } else {
+                    summary_parts.join(", ")
+                };
+                result.insert("summary".to_string(), serde_json::Value::String(summary));
+
+                serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
                     format!("{{\"error\": \"serialization failed: {e}\"}}")
                 })
             }
@@ -349,19 +408,42 @@ impl MatiServer {
         }
         record.quality = quality::analyze(&record);
 
-        // Write
+        // Write record
         let tier_label = format!("{:?}", record.quality.tier);
-        match store.put(&record.key, &record).await {
-            Ok(_) => serde_json::json!({
-                "ok": true,
-                "key": record.key,
-                "confidence": record.confidence.value,
-                "quality": record.quality.value,
-                "tier": tier_label,
-            })
-            .to_string(),
-            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+        let record_key = record.key.clone();
+        if let Err(e) = store.put(&record.key, &record).await {
+            return serde_json::json!({"error": e.to_string()}).to_string();
         }
+
+        // Extract affected_files for edge creation (gotchas only)
+        let affected_files: Vec<String> = if record_key.starts_with("gotcha:") {
+            record.payload.as_ref()
+                .and_then(|p| p.get("affected_files"))
+                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        drop(graph); // release read lock before taking write lock
+
+        // Add HasGotcha edges: file:<path> → gotcha:<key>
+        if !affected_files.is_empty() {
+            let mut graph = self.graph.write().await;
+            for file_path in &affected_files {
+                let file_key = format!("file:{file_path}");
+                let _ = graph.add_edge(&file_key, EdgeKind::HasGotcha, &record_key).await;
+            }
+        }
+
+        serde_json::json!({
+            "ok": true,
+            "key": record_key,
+            "confidence": record.confidence.value,
+            "quality": record.quality.value,
+            "tier": tier_label,
+        })
+        .to_string()
     }
 }
 
