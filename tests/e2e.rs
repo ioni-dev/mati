@@ -45,7 +45,7 @@ fn e2e_full_lifecycle() {
     // Iteration 1 — cold init
     // ═══════════════════════════════════════════════════════════════════════════
 
-    let r = h_run(&mati, &repo, home, &["init", "--no-hooks", "--no-settings"]);
+    let r = h_run(&mati, &repo, home, &["init", "--no-hooks"]);
     let mut sr = StepResult::new("init", &r);
     extract_init_metrics(&r.stdout, &mut sr, &mut summary);
     report.add(sr);
@@ -290,7 +290,7 @@ fn e2e_full_lifecycle() {
     // Iteration 4 — incremental init / staleness
     // ═══════════════════════════════════════════════════════════════════════════
 
-    let warm_init = h_run(&mati, &repo, home, &["init", "--no-hooks", "--no-settings"]);
+    let warm_init = h_run(&mati, &repo, home, &["init", "--no-hooks"]);
     let mut sr = StepResult::new("init warm", &warm_init);
     extract_warm_init_metrics(&warm_init.stdout, &mut sr, &mut summary);
     report.add(sr);
@@ -324,7 +324,7 @@ fn e2e_full_lifecycle() {
         let _ = f.write_all(b"\n// e2e-test-marker\n");
     }
 
-    let changed_init = h_run(&mati, &repo, home, &["init", "--no-hooks", "--no-settings"]);
+    let changed_init = h_run(&mati, &repo, home, &["init", "--no-hooks"]);
     let mut sr = StepResult::new("init changed", &changed_init);
     extract_changed_init_metrics(&changed_init.stdout, &mut sr, &mut summary);
     report.add(sr);

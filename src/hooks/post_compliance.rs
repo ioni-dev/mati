@@ -13,15 +13,8 @@ INPUT=$(cat)
 command -v jq &>/dev/null || exit 0
 
 # Extract file path from tool input (Read/Glob/Grep have file_path or path)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || true)
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || echo "")
 [ -z "$FILE_PATH" ] && exit 0
-
-# Skip non-file paths (pattern strings, bare words, etc.)
-case "$FILE_PATH" in
-  *.*) ;;  # has extension — likely a file
-  */*)  ;;  # has directory separator — treat as path
-  *)    exit 0 ;;  # bare word (regex pattern, etc.) — skip
-esac
 
 # Convert absolute path to repo-relative (same as pre-read.sh)
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
@@ -30,6 +23,20 @@ if [ -n "$REPO_ROOT" ]; then
 else
   REL_PATH="$FILE_PATH"
 fi
+
+# Skip obvious non-file paths, but keep extensionless real files like Dockerfile.
+case "$REL_PATH" in
+  *.*|*/*) ;;  # extension or directory separator — likely a file path
+  *)
+    if [ -e "$FILE_PATH" ]; then
+      :
+    elif [ -n "$REPO_ROOT" ] && [ -e "$REPO_ROOT/$REL_PATH" ]; then
+      :
+    else
+      exit 0
+    fi
+    ;;
+esac
 
 # Guard: mati must be reachable
 mati ping &>/dev/null || exit 0

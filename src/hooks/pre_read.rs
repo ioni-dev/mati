@@ -11,14 +11,14 @@ set -euo pipefail
 INPUT=$(cat)
 
 # ── Guards ─────────────────────────────────────────────────────────────────
-if ! command -v jq &>/dev/null; then
+if ! command -v jq &>/dev/null || ! command -v awk &>/dev/null; then
   echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
   exit 0
 fi
 
 
 # ── Extract file path ─────────────────────────────────────────────────────
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""')
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || echo "")
 if [ -z "$FILE_PATH" ]; then
   echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
   exit 0
@@ -48,6 +48,12 @@ RECORD=$(mati get "file:$REL_PATH" 2>/dev/null || echo "null")
 if [ "$RECORD" = "null" ] || [ -z "$RECORD" ]; then
   # No record — allow + log miss in background
   mati log-miss "file:$REL_PATH" &>/dev/null &
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
+  exit 0
+fi
+
+# Invalid or unexpected JSON from mati get -> fail open with structured allow.
+if ! echo "$RECORD" | jq -e 'type == "object"' >/dev/null 2>&1; then
   echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
   exit 0
 fi
@@ -95,6 +101,9 @@ while IFS= read -r gkey; do
   [ -z "$gkey" ] && continue
   GREC=$(mati get "$gkey" 2>/dev/null || echo "null")
   [ "$GREC" = "null" ] || [ -z "$GREC" ] && continue
+  if ! echo "$GREC" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    continue
+  fi
 
   GCONFIRMED=$(echo "$GREC" | jq -r '.payload.confirmed // false')
   GCONFIDENCE=$(echo "$GREC" | jq -r '.confidence.value // 0')

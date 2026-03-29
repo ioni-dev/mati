@@ -696,7 +696,7 @@ mod tests {
             (Category::File, "file:src/main.rs"),
             (Category::Decision, "decision:arch"),
             (Category::DevNote, "dev_note:tip"),
-            (Category::Dependency, "dep:tokio"),
+            (Category::Dependency, "dep:cargo:tokio"),
         ];
 
         for (cat, key) in &categories_and_keys {

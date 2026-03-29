@@ -9,14 +9,14 @@ set -euo pipefail
 INPUT=$(cat)
 
 # ── Guards ─────────────────────────────────────────────────────────────────
-if ! command -v jq &>/dev/null; then
+if ! command -v jq &>/dev/null || ! command -v awk &>/dev/null; then
   echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
   exit 0
 fi
 
 
 # ── Extract command ───────────────────────────────────────────────────────
-CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""' 2>/dev/null || echo "")
 if [ -z "$CMD" ]; then
   echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
   exit 0
@@ -80,6 +80,11 @@ if [ "$RECORD" = "null" ] || [ -z "$RECORD" ]; then
   exit 0
 fi
 
+if ! echo "$RECORD" | jq -e 'type == "object"' >/dev/null 2>&1; then
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
+  exit 0
+fi
+
 CONFIDENCE=$(echo "$RECORD" | jq -r '.confidence.value // 0')
 QUALITY=$(echo "$RECORD" | jq -r '.quality.value // 0')
 STALENESS=$(echo "$RECORD" | jq -r '.staleness.value // 0')
@@ -112,6 +117,9 @@ while IFS= read -r gkey; do
   [ -z "$gkey" ] && continue
   GREC=$(mati get "$gkey" 2>/dev/null || echo "null")
   [ "$GREC" = "null" ] || [ -z "$GREC" ] && continue
+  if ! echo "$GREC" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    continue
+  fi
 
   GCONFIRMED=$(echo "$GREC" | jq -r '.payload.confirmed // false')
   GCONFIDENCE=$(echo "$GREC" | jq -r '.confidence.value // 0')

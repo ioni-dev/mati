@@ -260,7 +260,6 @@ fn run_pass(
                 "--path",
                 repo_path.to_str().unwrap(),
                 "--no-hooks",
-                "--no-settings",
             ],
             repo_path,
         );

@@ -222,7 +222,7 @@ pub(crate) fn analyze_file_bytes(file: &WalkedFile, bytes: &[u8]) -> Result<Stat
     let source = String::from_utf8_lossy(bytes);
     let mut analysis = parse_file_from_source(file, &source)?;
     analysis.content_hash = Some(format!("{:x}", Sha256::digest(bytes)));
-    analysis.line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
+    analysis.line_count = count_lines(bytes);
     Ok(analysis)
 }
 
@@ -244,6 +244,18 @@ fn read_source_bytes(file: &WalkedFile) -> Option<Vec<u8>> {
             tracing::warn!("parser: cannot read {}: {e}", file.rel_path);
             None
         }
+    }
+}
+
+fn count_lines(bytes: &[u8]) -> u32 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let newline_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
+    if bytes.last() == Some(&b'\n') {
+        newline_count
+    } else {
+        newline_count + 1
     }
 }
 
@@ -439,5 +451,45 @@ mod tests {
         let analysis = parse_file(&file).unwrap();
         assert!(analysis.content_hash.is_some());
         assert_eq!(analysis.line_count, 1);
+    }
+
+    #[test]
+    fn parse_file_counts_single_line_without_trailing_newline() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let abs = dir.path().join("f.rs");
+        std::fs::write(&abs, "pub fn f() {}").unwrap();
+
+        let file = WalkedFile {
+            abs_path: abs,
+            rel_path: "f.rs".to_string(),
+            language: Language::Rust,
+            size_bytes: 12,
+            mtime_secs: 0,
+        };
+
+        let analysis = parse_file(&file).unwrap();
+        assert_eq!(analysis.line_count, 1);
+    }
+
+    #[test]
+    fn parse_file_counts_multiple_lines_without_trailing_newline() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let abs = dir.path().join("f.rs");
+        std::fs::write(&abs, "pub fn f() {}\npub fn g() {}").unwrap();
+
+        let file = WalkedFile {
+            abs_path: abs,
+            rel_path: "f.rs".to_string(),
+            language: Language::Rust,
+            size_bytes: 27,
+            mtime_secs: 0,
+        };
+
+        let analysis = parse_file(&file).unwrap();
+        assert_eq!(analysis.line_count, 2);
     }
 }

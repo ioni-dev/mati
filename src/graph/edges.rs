@@ -31,10 +31,11 @@ impl Edge {
     /// Parse an edge back from a `graph:edge:...` key.
     ///
     /// `from` and `to` may contain colons (e.g. `file:src/main.rs`), so the
-    /// parser scans for kind segments left-to-right and validates that the
-    /// candidate `from` value starts with a known node-key namespace. This
-    /// prevents false matches when a slug itself equals a kind name (e.g.
-    /// `gotcha:touched`).
+    /// parser scans for kind segments left-to-right and validates that both
+    /// endpoint values start with known node-key namespaces. This prevents
+    /// false matches when a slug itself equals a kind name (e.g.
+    /// `gotcha:touched`) and skips corrupt persisted keys whose `to` endpoint
+    /// is not a real node key.
     pub fn from_key(key: &str) -> Option<Self> {
         let rest = key.strip_prefix("graph:edge:")?;
         let segments: Vec<&str> = rest.split(':').collect();
@@ -42,7 +43,11 @@ impl Edge {
             if let Some(kind) = EdgeKind::from_key_segment(segments[kind_idx]) {
                 let from = segments[..kind_idx].join(":");
                 let to = segments[kind_idx + 1..].join(":");
-                if !from.is_empty() && !to.is_empty() && is_valid_node_key(&from) {
+                if !from.is_empty()
+                    && !to.is_empty()
+                    && is_valid_node_key(&from)
+                    && is_valid_node_key(&to)
+                {
                     return Some(Edge { from, kind, to });
                 }
             }
@@ -229,6 +234,28 @@ mod tests {
         );
     }
 
+    /// `to` with an unknown namespace must also be rejected — otherwise corrupt
+    /// persisted keys can create phantom graph nodes during Graph::load.
+    #[test]
+    fn edge_from_key_unknown_to_namespace_returns_none() {
+        let key = "graph:edge:file:src/main.rs:imports:unknown_ns:target";
+        assert!(
+            Edge::from_key(key).is_none(),
+            "unknown to namespace must not be accepted"
+        );
+    }
+
+    /// `to` with a known namespace but empty slug must be rejected for the same
+    /// reason as `from="file:"` — it can never match a real stored record.
+    #[test]
+    fn edge_from_key_empty_to_slug_rejected() {
+        let key = "graph:edge:file:src/main.rs:imports:file:";
+        assert!(
+            Edge::from_key(key).is_none(),
+            "empty to slug must not be accepted as a valid node key"
+        );
+    }
+
     #[test]
     fn edge_key_prefix_is_graph_edge() {
         let e = Edge::new("file:a", EdgeKind::Imports, "file:b");
@@ -290,7 +317,7 @@ mod tests {
     #[test]
     fn edge_from_key_from_has_multiple_colons() {
         let e = Edge::new(
-            "dep:tokio:1.40",
+            "dep:cargo:tokio",
             EdgeKind::DependencyAffects,
             "file:src/main.rs",
         );

@@ -30,8 +30,8 @@ impl ServerHandler for MatiServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "mati — engineering knowledge that survives turnover. \
-                 Use mem_get to look up records, mem_query to search, \
-                 and mem_bootstrap at session start.",
+                 Use mem_get to inspect records, mem_query to search, \
+                 mem_bootstrap at session start, and mem_set to save knowledge.",
         )
     }
 }
