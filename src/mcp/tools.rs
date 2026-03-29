@@ -19,8 +19,8 @@ use crate::graph::Graph;
 use crate::health::quality;
 use crate::store::record::{
     Category, ConfidenceScore, ContextPacket, FileRecord, GotchaRecord, Priority, QualityScore,
-    QualityTier, Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
-    StaleReviewPayload, StalenessTier,
+    QualityTier, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewPayload,
+    StalenessScore, StalenessTier,
 };
 
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
@@ -64,15 +64,30 @@ fn record_to_agent_json(record: &Record) -> serde_json::Value {
     if !record.tags.is_empty() {
         obj.insert("tags".into(), serde_json::json!(record.tags));
     }
-    obj.insert("confidence".into(), serde_json::json!(record.confidence.value));
-    obj.insert("confirmation_count".into(), serde_json::json!(record.confidence.confirmation_count));
+    obj.insert(
+        "confidence".into(),
+        serde_json::json!(record.confidence.value),
+    );
+    obj.insert(
+        "confirmation_count".into(),
+        serde_json::json!(record.confidence.confirmation_count),
+    );
     obj.insert("quality".into(), serde_json::json!(record.quality.value));
-    obj.insert("quality_tier".into(), serde_json::json!(record.quality.tier));
+    obj.insert(
+        "quality_tier".into(),
+        serde_json::json!(record.quality.tier),
+    );
     if !record.quality.signals.is_empty() {
-        obj.insert("quality_signals".into(), serde_json::json!(record.quality.signals));
+        obj.insert(
+            "quality_signals".into(),
+            serde_json::json!(record.quality.signals),
+        );
     }
     obj.insert("source".into(), serde_json::json!(record.source));
-    obj.insert("staleness_tier".into(), serde_json::json!(record.staleness.tier));
+    obj.insert(
+        "staleness_tier".into(),
+        serde_json::json!(record.staleness.tier),
+    );
     if let Some(ref url) = record.ref_url {
         obj.insert("ref_url".into(), serde_json::json!(url));
     }
@@ -95,9 +110,7 @@ fn strip_payload(payload: &serde_json::Value, category: &Category) -> serde_json
             "last_modified_session",
             "content_hash",
         ],
-        Category::Gotcha => &[
-            "discovered_session",
-        ],
+        Category::Gotcha => &["discovered_session"],
         _ => &[],
     };
 
@@ -112,9 +125,7 @@ fn strip_payload(payload: &serde_json::Value, category: &Category) -> serde_json
 
     // Remove empty arrays from file payloads to save space
     if matches!(category, Category::File) {
-        stripped.retain(|_, v| {
-            !matches!(v, serde_json::Value::Array(a) if a.is_empty())
-        });
+        stripped.retain(|_, v| !matches!(v, serde_json::Value::Array(a) if a.is_empty()));
     }
 
     serde_json::Value::Object(stripped)
@@ -205,9 +216,8 @@ impl MatiServer {
                 match store.search(&params.query, limit).await {
                     Ok(mut records) => {
                         records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
-                        let stripped: Vec<serde_json::Value> = records.iter()
-                            .map(record_to_agent_json)
-                            .collect();
+                        let stripped: Vec<serde_json::Value> =
+                            records.iter().map(record_to_agent_json).collect();
                         serde_json::to_string_pretty(&stripped).unwrap_or_else(|e| {
                             format!("{{\"error\": \"serialization failed: {e}\"}}")
                         })
@@ -250,11 +260,26 @@ impl MatiServer {
                         if let Ok(Some(record)) = store.get(key).await {
                             if matches!(record.lifecycle, RecordLifecycle::Active) {
                                 let mut entry = serde_json::Map::new();
-                                entry.insert("key".to_string(), serde_json::Value::String(record.key.clone()));
-                                entry.insert("relationship".to_string(), serde_json::Value::String(format!("{kind:?}")));
-                                entry.insert("value".to_string(), serde_json::Value::String(record.value.clone()));
-                                entry.insert("confidence".to_string(), serde_json::json!(record.confidence.value));
-                                entry.insert("quality".to_string(), serde_json::json!(record.quality.value));
+                                entry.insert(
+                                    "key".to_string(),
+                                    serde_json::Value::String(record.key.clone()),
+                                );
+                                entry.insert(
+                                    "relationship".to_string(),
+                                    serde_json::Value::String(format!("{kind:?}")),
+                                );
+                                entry.insert(
+                                    "value".to_string(),
+                                    serde_json::Value::String(record.value.clone()),
+                                );
+                                entry.insert(
+                                    "confidence".to_string(),
+                                    serde_json::json!(record.confidence.value),
+                                );
+                                entry.insert(
+                                    "quality".to_string(),
+                                    serde_json::json!(record.quality.value),
+                                );
                                 if let Some(payload) = &record.payload {
                                     if let Some(confirmed) = payload.get("confirmed") {
                                         entry.insert("confirmed".to_string(), confirmed.clone());
@@ -280,11 +305,26 @@ impl MatiServer {
                     if let Ok(Some(record)) = store.get(key).await {
                         if matches!(record.lifecycle, RecordLifecycle::Active) {
                             let mut entry = serde_json::Map::new();
-                            entry.insert("key".to_string(), serde_json::Value::String(record.key.clone()));
-                            entry.insert("relationship".to_string(), serde_json::Value::String("DependencyAffects".to_string()));
-                            entry.insert("value".to_string(), serde_json::Value::String(record.value.clone()));
-                            entry.insert("confidence".to_string(), serde_json::json!(record.confidence.value));
-                            entry.insert("quality".to_string(), serde_json::json!(record.quality.value));
+                            entry.insert(
+                                "key".to_string(),
+                                serde_json::Value::String(record.key.clone()),
+                            );
+                            entry.insert(
+                                "relationship".to_string(),
+                                serde_json::Value::String("DependencyAffects".to_string()),
+                            );
+                            entry.insert(
+                                "value".to_string(),
+                                serde_json::Value::String(record.value.clone()),
+                            );
+                            entry.insert(
+                                "confidence".to_string(),
+                                serde_json::json!(record.confidence.value),
+                            );
+                            entry.insert(
+                                "quality".to_string(),
+                                serde_json::json!(record.quality.value),
+                            );
                             if let Some(decisions) = result.get_mut("decisions") {
                                 if let Some(arr) = decisions.as_array_mut() {
                                     arr.push(serde_json::Value::Object(entry));
@@ -301,15 +341,17 @@ impl MatiServer {
                 };
                 result.insert("summary".to_string(), serde_json::Value::String(summary));
 
-                serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
-                    format!("{{\"error\": \"serialization failed: {e}\"}}")
-                })
+                serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
             }
             "semantic" => {
-                "{\"error\": \"semantic search requires --features semantic (not enabled)\"}".to_string()
+                "{\"error\": \"semantic search requires --features semantic (not enabled)\"}"
+                    .to_string()
             }
             _ => {
-                format!("{{\"error\": \"unknown mode: {mode}. Valid modes: text, graph, semantic\"}}")
+                format!(
+                    "{{\"error\": \"unknown mode: {mode}. Valid modes: text, graph, semantic\"}}"
+                )
             }
         }
     }
@@ -384,12 +426,23 @@ impl MatiServer {
         };
 
         // Fetch existing record to preserve Layer 0 structural data
-        let was_confirmed = store.get(&params.key).await.ok().flatten().as_ref().map(|r| {
-            r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80
-        }).unwrap_or(false);
+        let existing_record = store.get(&params.key).await.ok().flatten();
 
-        let mut record = match store.get(&params.key).await {
-            Ok(Some(existing)) => existing,
+        let was_confirmed = existing_record
+            .as_ref()
+            .map(|r| r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80)
+            .unwrap_or(false);
+
+        // Capture old affected_files before mutation (for file-link sync)
+        let old_affected_files: Vec<String> = existing_record
+            .as_ref()
+            .filter(|r| r.key.starts_with("gotcha:"))
+            .and_then(|r| r.payload_as::<GotchaRecord>())
+            .map(|g| g.affected_files)
+            .unwrap_or_default();
+
+        let mut record = match existing_record {
+            Some(existing) => existing,
             _ => Record {
                 key: params.key.clone(),
                 value: String::new(),
@@ -464,7 +517,11 @@ impl MatiServer {
         if record.key.starts_with("gotcha:") {
             if let Some(ref mut payload) = record.payload {
                 if let Some(obj) = payload.as_object_mut() {
-                    if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                    if let Some(sev) = obj
+                        .get("severity")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase())
+                    {
                         obj.insert("severity".to_string(), serde_json::Value::String(sev));
                     }
                 }
@@ -485,9 +542,11 @@ impl MatiServer {
             return serde_json::json!({"error": e.to_string()}).to_string();
         }
 
-        // Extract affected_files for edge creation (gotchas only)
+        // Extract affected_files for edge creation and file-link sync (gotchas only)
         let affected_files: Vec<String> = if record_key.starts_with("gotcha:") {
-            record.payload.as_ref()
+            record
+                .payload
+                .as_ref()
                 .and_then(|p| p.get("affected_files"))
                 .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
                 .unwrap_or_default()
@@ -495,14 +554,69 @@ impl MatiServer {
             vec![]
         };
 
+        // Sync file:*.gotcha_keys — the derived index that diff and pre-read hooks use.
+        // This was previously skipped, leaving MCP-created gotchas invisible to
+        // enforcement surfaces even after confirmation.
+        if record_key.starts_with("gotcha:") {
+            if let Err(e) = crate::store::gotcha_ops::sync_gotcha_file_links(
+                store,
+                &record_key,
+                &old_affected_files,
+                &affected_files,
+            )
+            .await
+            {
+                tracing::warn!("mem_set: file link sync failed for {record_key}: {e}");
+                crate::store::repair::mark_dirty(
+                    store,
+                    &record_key,
+                    &format!("mem_set link sync failed: {e}"),
+                )
+                .await;
+            }
+        }
+
+        let old_affected_set: HashSet<&str> = old_affected_files.iter().map(String::as_str).collect();
+        let new_affected_set: HashSet<&str> = affected_files.iter().map(String::as_str).collect();
+
         drop(graph); // release read lock before taking write lock
 
-        // Add HasGotcha edges: file:<path> → gotcha:<key>
-        if !affected_files.is_empty() {
+        // Keep the in-memory graph in sync with the persisted edge state.
+        // mem_set already updated file links above; here we remove stale
+        // HasGotcha edges for moved gotchas and add edges for newly-affected files.
+        if record_key.starts_with("gotcha:") {
             let mut graph = self.graph.write().await;
-            for file_path in &affected_files {
+
+            for file_path in old_affected_set.difference(&new_affected_set) {
                 let file_key = format!("file:{file_path}");
-                let _ = graph.add_edge(&file_key, EdgeKind::HasGotcha, &record_key).await;
+                if let Err(e) = graph
+                    .remove_edge(&file_key, &EdgeKind::HasGotcha, &record_key)
+                    .await
+                {
+                    tracing::warn!("mem_set: stale edge removal failed for {file_key} → {record_key}: {e}");
+                    crate::store::repair::mark_dirty(
+                        graph.store(),
+                        &record_key,
+                        &format!("mem_set edge remove failed: {e}"),
+                    )
+                    .await;
+                }
+            }
+
+            for file_path in new_affected_set.difference(&old_affected_set) {
+                let file_key = format!("file:{file_path}");
+                if let Err(e) = graph
+                    .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
+                    .await
+                {
+                    tracing::warn!("mem_set: edge add failed for {file_key} → {record_key}: {e}");
+                    crate::store::repair::mark_dirty(
+                        graph.store(),
+                        &record_key,
+                        &format!("mem_set edge add failed: {e}"),
+                    )
+                    .await;
+                }
             }
         }
 
@@ -610,8 +724,7 @@ pub async fn assemble_context_packet(
 
             if let Some(fr) = record.payload_as::<FileRecord>() {
                 // Nudge detection: hot file (access_count >= 3) with no gotchas
-                let is_nudge_candidate =
-                    record.access_count >= 3 && fr.gotcha_keys.is_empty();
+                let is_nudge_candidate = record.access_count >= 3 && fr.gotcha_keys.is_empty();
                 file_records.push(fr);
                 if is_nudge_candidate {
                     unconfirmed_candidates.push(file_key.clone());
@@ -734,25 +847,39 @@ pub async fn assemble_context_packet(
                 if let Some((src, tgt)) = pair.split_once('|') {
                     // Extract percentage: "... (78%)." → "78%"
                     // Robust: find last '(' then take until '%' or ')'
-                    let pct = record.value.rfind('(')
-                        .and_then(|i| record.value[i+1..].find(')').map(|j| &record.value[i+1..i+1+j]))
+                    let pct = record
+                        .value
+                        .rfind('(')
+                        .and_then(|i| {
+                            record.value[i + 1..]
+                                .find(')')
+                                .map(|j| &record.value[i + 1..i + 1 + j])
+                        })
                         .unwrap_or("?");
-                    cochange_map.entry(src.to_string())
+                    cochange_map
+                        .entry(src.to_string())
                         .or_default()
                         .push((tgt.to_string(), pct.to_string()));
                 }
             }
         }
         if !cochange_map.is_empty() {
-            let all_pairs: Vec<String> = cochange_map.iter()
+            let all_pairs: Vec<String> = cochange_map
+                .iter()
                 .flat_map(|(src, targets)| {
-                    targets.iter().map(move |(tgt, pct)| format!("{src}\u{2194}{tgt} ({pct})"))
+                    targets
+                        .iter()
+                        .map(move |(tgt, pct)| format!("{src}\u{2194}{tgt} ({pct})"))
                 })
                 .collect();
             let total = all_pairs.len();
             // Show up to 10 pairs, truncate with count
             let display: Vec<&str> = all_pairs.iter().take(10).map(|s| s.as_str()).collect();
-            let suffix = if total > 10 { format!(", +{} more", total - 10) } else { String::new() };
+            let suffix = if total > 10 {
+                format!(", +{} more", total - 10)
+            } else {
+                String::new()
+            };
             let line = format!("- **Co-change partners**: {}{suffix}\n", display.join(", "));
             let tokens = estimate_tokens(&line);
             if used_tokens + tokens <= available_tokens {
@@ -956,12 +1083,7 @@ mod tests {
     async fn mem_get_returns_record_for_existing_key() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-        let record = make_record(
-            "gotcha:test",
-            "test value",
-            Category::Gotcha,
-            0.8,
-        );
+        let record = make_record("gotcha:test", "test value", Category::Gotcha, 0.8);
         store.put("gotcha:test", &record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
@@ -1073,7 +1195,9 @@ mod tests {
 
         let graph = Graph::load(store).await.unwrap();
 
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
         let tokens = estimate_tokens(&packet.injection_string);
         assert!(
             tokens <= TOKEN_BUDGET,
@@ -1095,7 +1219,9 @@ mod tests {
         store.put("gotcha:good", &good).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
 
         assert!(
             !packet.injection_string.contains("gotcha:suppressed"),
@@ -1113,7 +1239,9 @@ mod tests {
         store.put("gotcha:poor", &poor).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
 
         // Poor records should appear with a caveat
         if packet.injection_string.contains("gotcha:poor") {
@@ -1134,12 +1262,7 @@ mod tests {
         store.put("gotcha:important", &gotcha).await.unwrap();
 
         // Create a file record
-        let file_record = make_record(
-            "file:src/main.rs",
-            "{}",
-            Category::File,
-            0.5,
-        );
+        let file_record = make_record("file:src/main.rs", "{}", Category::File, 0.5);
         store.put("file:src/main.rs", &file_record).await.unwrap();
 
         // Build graph with HasGotcha edge
@@ -1149,18 +1272,17 @@ mod tests {
             .await
             .unwrap();
 
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/main.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/main.rs".to_string()])
+            .await
+            .unwrap();
 
         // The gotcha should be in the context packet
         assert!(
             packet.injection_string.contains("gotcha:important")
-                || packet.critical_gotchas.iter().any(|g| g.key == "gotcha:important"),
+                || packet
+                    .critical_gotchas
+                    .iter()
+                    .any(|g| g.key == "gotcha:important"),
             "graph-connected gotcha must appear in context packet"
         );
     }
@@ -1190,27 +1312,20 @@ mod tests {
             content_hash: None,
             line_count: 0,
         };
-        let mut file_record = make_record(
-            "file:src/hot.rs",
-            &fr.purpose,
-            Category::File,
-            0.5,
-        );
+        let mut file_record = make_record("file:src/hot.rs", &fr.purpose, Category::File, 0.5);
         file_record.payload = serde_json::to_value(&fr).ok();
         file_record.access_count = 5; // >= 3 threshold
         store.put("file:src/hot.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/hot.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/hot.rs".to_string()])
+            .await
+            .unwrap();
 
         assert!(
-            packet.unconfirmed_candidates.contains(&"file:src/hot.rs".to_string()),
+            packet
+                .unconfirmed_candidates
+                .contains(&"file:src/hot.rs".to_string()),
             "hot file with no gotchas should be in unconfirmed_candidates"
         );
         assert!(
@@ -1246,24 +1361,15 @@ mod tests {
             content_hash: None,
             line_count: 0,
         };
-        let mut file_record = make_record(
-            "file:src/cold.rs",
-            &fr.purpose,
-            Category::File,
-            0.5,
-        );
+        let mut file_record = make_record("file:src/cold.rs", &fr.purpose, Category::File, 0.5);
         file_record.payload = serde_json::to_value(&fr).ok();
         file_record.access_count = 1; // < 3 threshold
         store.put("file:src/cold.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/cold.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/cold.rs".to_string()])
+            .await
+            .unwrap();
 
         assert!(
             packet.unconfirmed_candidates.is_empty(),
@@ -1301,16 +1407,16 @@ mod tests {
             0.5,
         );
         file_record.access_count = 10;
-        store.put("file:src/covered.rs", &file_record).await.unwrap();
+        store
+            .put("file:src/covered.rs", &file_record)
+            .await
+            .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/covered.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet =
+            assemble_context_packet(graph.store(), &graph, &["src/covered.rs".to_string()])
+                .await
+                .unwrap();
 
         assert!(
             packet.unconfirmed_candidates.is_empty(),
@@ -1341,7 +1447,9 @@ mod tests {
         store.put("gotcha:good", &good).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
 
         assert!(
             !packet.injection_string.contains("gotcha:tombstone"),
@@ -1369,7 +1477,9 @@ mod tests {
         store.put("gotcha:liability", &gotcha).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
 
         if packet.injection_string.contains("gotcha:liability") {
             assert!(
@@ -1418,13 +1528,9 @@ mod tests {
         store.put("file:src/stale.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/stale.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/stale.rs".to_string()])
+            .await
+            .unwrap();
 
         assert!(
             !packet.stale_warnings.is_empty(),
@@ -1475,13 +1581,9 @@ mod tests {
         store.put("file:src/dead.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/dead.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/dead.rs".to_string()])
+            .await
+            .unwrap();
 
         assert!(
             packet.file_records.is_empty(),
@@ -1549,13 +1651,9 @@ mod tests {
         store.put(&review_key, &review_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/dup.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/dup.rs".to_string()])
+            .await
+            .unwrap();
 
         // Should have exactly 1 warning, not 2 (dedup by key)
         let dup_count = packet
@@ -1563,7 +1661,10 @@ mod tests {
             .iter()
             .filter(|w| w.contains("dup.rs"))
             .count();
-        assert_eq!(dup_count, 1, "same key should not produce duplicate warnings");
+        assert_eq!(
+            dup_count, 1,
+            "same key should not produce duplicate warnings"
+        );
     }
 
     #[tokio::test]
@@ -1606,12 +1707,7 @@ mod tests {
         store.put("file:src/stale.rs", &file_record).await.unwrap();
 
         // Create a decision record reachable via graph edge
-        let decision = make_record(
-            "decision:arch",
-            "Use SurrealKV",
-            Category::Decision,
-            0.8,
-        );
+        let decision = make_record("decision:arch", "Use SurrealKV", Category::Decision, 0.8);
         store.put("decision:arch", &decision).await.unwrap();
 
         let mut graph = Graph::load(store).await.unwrap();
@@ -1620,22 +1716,15 @@ mod tests {
             .await
             .unwrap();
 
-        let packet = assemble_context_packet(
-            graph.store(),
-            &graph,
-            &["src/stale.rs".to_string()],
-        )
-        .await
-        .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/stale.rs".to_string()])
+            .await
+            .unwrap();
 
         let stale_pos = packet.injection_string.find("## Stale Warnings");
         let dec_pos = packet.injection_string.find("## Decisions");
 
         if let (Some(s), Some(d)) = (stale_pos, dec_pos) {
-            assert!(
-                s < d,
-                "Stale Warnings section must appear before Decisions"
-            );
+            assert!(s < d, "Stale Warnings section must appear before Decisions");
         }
     }
 
@@ -1649,7 +1738,9 @@ mod tests {
         store.put("gotcha:unconfirmed", &unconfirmed).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
 
         assert!(
             !packet.injection_string.contains("gotcha:unconfirmed"),
@@ -1663,7 +1754,9 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
 
-        let packet = assemble_context_packet(graph.store(), &graph, &[]).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
 
         assert!(packet.injection_string.contains("[mati] Before reading"));
         assert!(packet.critical_gotchas.is_empty());
@@ -1702,7 +1795,12 @@ mod tests {
 
         // Read back and verify
         let graph = server.graph.read().await;
-        let record = graph.store().get("file:src/main.rs").await.unwrap().unwrap();
+        let record = graph
+            .store()
+            .get("file:src/main.rs")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(record.value, "Handles CLI dispatch and binary entry point");
         assert_eq!(record.source, RecordSource::ClaudeEnrich);
         assert!(record.payload.is_some());
@@ -1803,7 +1901,10 @@ mod tests {
         let payload = record.payload.unwrap();
 
         // Enrichment fields updated
-        assert_eq!(payload["purpose"], "Manages database connection pooling and query execution");
+        assert_eq!(
+            payload["purpose"],
+            "Manages database connection pooling and query execution"
+        );
         assert_eq!(payload["gotcha_keys"][0], "gotcha:always-close-connections");
 
         // Layer 0 structural fields preserved
@@ -1835,7 +1936,10 @@ mod tests {
             .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["error"].as_str().unwrap().contains("must start with"));
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("must start with"));
     }
 
     #[tokio::test]
@@ -1857,7 +1961,10 @@ mod tests {
             .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["error"].as_str().unwrap().contains("unknown category"));
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown category"));
     }
 
     #[tokio::test]
@@ -1866,7 +1973,12 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
 
         // Create a confirmed gotcha (simulates post-mati gotcha confirm state)
-        let mut record = make_gotcha_record("gotcha:confirmed-edit-test", "Always test first", true, 0.70);
+        let mut record = make_gotcha_record(
+            "gotcha:confirmed-edit-test",
+            "Always test first",
+            true,
+            0.70,
+        );
         record.source = RecordSource::DeveloperManual;
         record.confidence = ConfidenceScore {
             value: 0.80,
@@ -1876,7 +1988,10 @@ mod tests {
             challenge_count: 0,
         };
         record.tags = vec!["important".to_string()];
-        store.put("gotcha:confirmed-edit-test", &record).await.unwrap();
+        store
+            .put("gotcha:confirmed-edit-test", &record)
+            .await
+            .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
         let server = MatiServer::new(graph);
@@ -1896,7 +2011,7 @@ mod tests {
                     "discovered_session": 0,
                     "confirmed": true
                 })),
-                tags: vec![],  // empty — should NOT clear existing tags
+                tags: vec![], // empty — should NOT clear existing tags
                 priority: "High".to_string(),
             }))
             .await;
@@ -1906,10 +2021,110 @@ mod tests {
 
         // Verify confirmation state preserved
         let graph = server.graph.read().await;
-        let updated = graph.store().get("gotcha:confirmed-edit-test").await.unwrap().unwrap();
+        let updated = graph
+            .store()
+            .get("gotcha:confirmed-edit-test")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.source, RecordSource::DeveloperManual);
-        assert!((updated.confidence.value - 0.80).abs() < 0.01, "confidence should stay 0.80, got {}", updated.confidence.value);
+        assert!(
+            (updated.confidence.value - 0.80).abs() < 0.01,
+            "confidence should stay 0.80, got {}",
+            updated.confidence.value
+        );
         assert_eq!(updated.confidence.confirmation_count, 1);
-        assert_eq!(updated.tags, vec!["important".to_string()], "tags should be preserved when caller sends empty");
+        assert_eq!(
+            updated.tags,
+            vec!["important".to_string()],
+            "tags should be preserved when caller sends empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_set_moves_gotcha_links_and_edges_on_edit() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Seed file records for both old and new affected files.
+        let old_file = Record::layer0_file_stub("file:src/old.rs", device_id(), 1, now());
+        let new_file = Record::layer0_file_stub("file:src/new.rs", device_id(), 1, now());
+        store
+            .put("file:src/old.rs", &old_file)
+            .await
+            .unwrap();
+        store
+            .put("file:src/new.rs", &new_file)
+            .await
+            .unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        server
+            .mem_set(Parameters(MemSetParams {
+                key: "gotcha:test-move".to_string(),
+                value: "Always update the paired file because drift breaks the feature".to_string(),
+                category: "Gotcha".to_string(),
+                payload: Some(serde_json::json!({
+                    "rule": "Always update the paired file",
+                    "reason": "drift breaks the feature",
+                    "severity": "High",
+                    "affected_files": ["src/old.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                })),
+                tags: vec![],
+                priority: "High".to_string(),
+            }))
+            .await;
+
+        server
+            .mem_set(Parameters(MemSetParams {
+                key: "gotcha:test-move".to_string(),
+                value: "Always update the paired file because drift breaks the feature".to_string(),
+                category: "Gotcha".to_string(),
+                payload: Some(serde_json::json!({
+                    "rule": "Always update the paired file",
+                    "reason": "drift breaks the feature",
+                    "severity": "High",
+                    "affected_files": ["src/new.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                })),
+                tags: vec![],
+                priority: "High".to_string(),
+            }))
+            .await;
+
+        let graph = server.graph.read().await;
+
+        let old_file = graph.store().get("file:src/old.rs").await.unwrap().unwrap();
+        let new_file = graph.store().get("file:src/new.rs").await.unwrap().unwrap();
+        let old_payload = old_file.payload.unwrap();
+        let new_payload = new_file.payload.unwrap();
+
+        assert!(
+            old_payload["gotcha_keys"]
+                .as_array()
+                .map(|arr| arr.is_empty())
+                .unwrap_or(true),
+            "old file should no longer reference moved gotcha"
+        );
+        assert_eq!(new_payload["gotcha_keys"][0], "gotcha:test-move");
+
+        assert!(
+            !graph
+                .neighbors("file:src/old.rs", &EdgeKind::HasGotcha)
+                .contains(&"gotcha:test-move".to_string()),
+            "old file should not keep stale HasGotcha edge"
+        );
+        assert!(
+            graph.neighbors("file:src/new.rs", &EdgeKind::HasGotcha)
+                .contains(&"gotcha:test-move".to_string()),
+            "new file should gain HasGotcha edge"
+        );
     }
 }
