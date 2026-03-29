@@ -789,9 +789,15 @@ pub async fn assemble_context_packet(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // 5. Quality filter: exclude Suppressed (<0.2), caveat Poor (0.2–0.4)
+    // 5. Context filter + quality filter:
+    //    - when context_files are provided, only inject graph-reachable gotchas
+    //    - when context_files are empty, preserve the global bootstrap behavior
+    //    - always exclude Suppressed (<0.2), caveat Poor (0.2–0.4)
     let critical_gotchas: Vec<Record> = confirmed_gotchas
         .into_iter()
+        .filter(|r| {
+            context_files.is_empty() || context_gotcha_keys.contains(&r.key)
+        })
         .filter(|r| r.quality.tier != QualityTier::Suppressed)
         .collect();
 
@@ -1284,6 +1290,46 @@ mod tests {
                     .iter()
                     .any(|g| g.key == "gotcha:important"),
             "graph-connected gotcha must appear in context packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn assemble_context_packet_excludes_unrelated_gotchas_for_context_files() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let relevant = make_gotcha_record("gotcha:relevant", "do not use unwrap", true, 0.80);
+        let unrelated = make_gotcha_record("gotcha:unrelated", "keep retries bounded", true, 0.80);
+        store.put("gotcha:relevant", &relevant).await.unwrap();
+        store.put("gotcha:unrelated", &unrelated).await.unwrap();
+
+        let file_record = make_record("file:src/main.rs", "{}", Category::File, 0.5);
+        store.put("file:src/main.rs", &file_record).await.unwrap();
+
+        let mut graph = Graph::load(store).await.unwrap();
+        graph
+            .add_edge("file:src/main.rs", EdgeKind::HasGotcha, "gotcha:relevant")
+            .await
+            .unwrap();
+
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/main.rs".to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            packet.critical_gotchas.iter().any(|g| g.key == "gotcha:relevant"),
+            "graph-connected gotcha must remain in context packet"
+        );
+        assert!(
+            !packet
+                .critical_gotchas
+                .iter()
+                .any(|g| g.key == "gotcha:unrelated"),
+            "unrelated gotcha must not be injected for scoped bootstrap"
+        );
+        assert!(
+            !packet.injection_string.contains("gotcha:unrelated"),
+            "injection string must not mention unrelated gotchas"
         );
     }
 
