@@ -12,12 +12,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
-use crate::health::staleness::StalenessAnalyzer;
 use super::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
     RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload,
     StalenessScore, StalenessTier, Store,
 };
+use crate::health::staleness::StalenessAnalyzer;
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -105,7 +105,10 @@ pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) ->
             store.put(agg_key, &record).await?;
         }
         None => {
-            let agg = DailyAgg { count: 1, keys: vec![target_key.to_string()] };
+            let agg = DailyAgg {
+                count: 1,
+                keys: vec![target_key.to_string()],
+            };
             let mut record = analytics_record(agg_key, String::new());
             record.payload = serde_json::to_value(&agg).ok();
             store.put(agg_key, &record).await?;
@@ -127,7 +130,12 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
 
     // 2. Mark as consulted for session tracking
     let consulted_key = format!("session:consulted:{key}");
-    store.put(&consulted_key, &session_record(&consulted_key, String::new())).await?;
+    store
+        .put(
+            &consulted_key,
+            &session_record(&consulted_key, String::new()),
+        )
+        .await?;
 
     // 3. Bump access_count and last_accessed on the target record
     if let Some(mut record) = store.get(key).await? {
@@ -172,7 +180,11 @@ pub async fn session_flush(store: &Store) -> Result<()> {
     let consulted_keys = store.scan_keys("session:consulted:").await?;
     let stripped: Vec<String> = consulted_keys
         .iter()
-        .map(|k| k.strip_prefix("session:consulted:").unwrap_or(k).to_string())
+        .map(|k| {
+            k.strip_prefix("session:consulted:")
+                .unwrap_or(k)
+                .to_string()
+        })
         .collect();
 
     let session_data = serde_json::json!({
@@ -492,8 +504,7 @@ pub async fn promote_gotcha_candidates(store: &Store) -> Result<u32> {
 // ── M-13-C: Stale review collection ──────────────────────────────────────────
 
 pub fn format_review_date(now_secs: u64) -> String {
-    let dt = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-        .unwrap_or_else(chrono::Utc::now);
+    let dt = chrono::DateTime::from_timestamp(now_secs as i64, 0).unwrap_or_else(chrono::Utc::now);
     dt.format("%Y-%m-%d").to_string()
 }
 
@@ -524,10 +535,18 @@ pub async fn collect_and_store_stale_reviews(
     let new_count = new_entries.len();
 
     let mut payload = match store.get(&review_key).await? {
-        Some(existing) => existing
-            .payload_as::<StaleReviewPayload>()
-            .unwrap_or(StaleReviewPayload { session_timestamp: now, entries: vec![] }),
-        None => StaleReviewPayload { session_timestamp: now, entries: vec![] },
+        Some(existing) => {
+            existing
+                .payload_as::<StaleReviewPayload>()
+                .unwrap_or(StaleReviewPayload {
+                    session_timestamp: now,
+                    entries: vec![],
+                })
+        }
+        None => StaleReviewPayload {
+            session_timestamp: now,
+            entries: vec![],
+        },
     };
 
     // Merge: new entries take priority, dedup by key
