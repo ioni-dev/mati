@@ -1,6 +1,6 @@
 // MCP stdio server — rmcp (M-07)
-// Exactly 3 tools: mem_get, mem_query, mem_bootstrap
-// Hard limit: never add a 4th tool
+// Tools: mem_get, mem_query, mem_bootstrap, mem_set
+// Keep the surface minimal: prefer extending existing tools over adding more.
 
 pub mod server;
 pub mod tools;

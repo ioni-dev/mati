@@ -1,8 +1,7 @@
 //! Install hooks into `.claude/` (M-06-J).
 //!
 //! Writes `.claude/settings.json` with hook registration and creates
-//! pass-through stub scripts in `.claude/hooks/`. The stubs unconditionally
-//! allow all operations — real hook logic is implemented in M-09.
+//! the real hook scripts in `.claude/hooks/`.
 //!
 //! Only writes if `.claude/` already exists — if the user isn't using Claude
 //! Code, hooks are skipped.
@@ -114,21 +113,21 @@ pub enum InstallResult {
     Installed {
         /// Number of hook scripts written.
         scripts: usize,
-        /// True if `jq` was not found on PATH — hooks will fail at runtime.
-        jq_missing: bool,
+        /// Missing runtime dependencies required by the installed hooks.
+        missing_deps: Vec<&'static str>,
     },
     /// `.claude/` directory doesn't exist — user isn't using Claude Code.
     NoClaude,
 }
 
-/// Install hook registration and stub scripts into `.claude/`.
+/// Install hook registration and hook scripts into `.claude/`.
 ///
 /// - Merges mati's `hooks` key into existing `.claude/settings.json`,
 ///   preserving any user-defined settings (permissions, env vars, etc.).
 /// - Writes `.mcp.json` to the project root for MCP server registration.
 ///   Claude Code reads `mcpServers` from `.mcp.json` at the project root;
 ///   the `mcpServers` key in `.claude/settings.json` is kept as a fallback.
-/// - Creates `.claude/hooks/` and writes pass-through stub scripts.
+/// - Creates `.claude/hooks/` and writes the real hook scripts.
 /// - Existing scripts are overwritten (mati owns these files).
 /// - Only proceeds if `.claude/` already exists.
 pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
@@ -159,11 +158,11 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
         make_executable(&path)?;
     }
 
-    let jq_missing = !jq_available();
+    let missing_deps = missing_hook_dependencies();
 
     Ok(InstallResult::Installed {
         scripts: HOOK_SCRIPTS.len(),
-        jq_missing,
+        missing_deps,
     })
 }
 
@@ -198,7 +197,7 @@ fn merge_hooks_into_settings(path: &Path) -> Result<()> {
             .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
 
         if let Value::Object(ref mut map) = existing {
-            map.insert("hooks".to_string(), mati_settings["hooks"].clone());
+            merge_hooks(map, &mati_settings["hooks"]);
             // Merge mcpServers: add "mati" entry without clobbering other servers.
             let mati_server = mati_settings["mcpServers"]["mati"].clone();
             if let Some(Value::Object(ref mut servers)) = map.get_mut("mcpServers") {
@@ -220,6 +219,65 @@ fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn merge_hooks(root: &mut serde_json::Map<String, Value>, mati_hooks: &Value) {
+    let Some(mati_events) = mati_hooks.as_object() else {
+        root.insert("hooks".to_string(), mati_hooks.clone());
+        return;
+    };
+
+    let hooks_value = root
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+
+    let Value::Object(existing_events) = hooks_value else {
+        *hooks_value = mati_hooks.clone();
+        return;
+    };
+
+    for (event_name, mati_entries_value) in mati_events {
+        let Some(mati_entries) = mati_entries_value.as_array() else {
+            existing_events.insert(event_name.clone(), mati_entries_value.clone());
+            continue;
+        };
+
+        let owned_commands = mati_hook_commands(mati_entries);
+        let existing_entries = existing_events
+            .entry(event_name.clone())
+            .or_insert_with(|| Value::Array(Vec::new()));
+
+        let Value::Array(existing_entries) = existing_entries else {
+            *existing_entries = Value::Array(mati_entries.clone());
+            continue;
+        };
+
+        existing_entries.retain(|entry| !entry_contains_owned_command(entry, &owned_commands));
+        existing_entries.extend(mati_entries.clone());
+    }
+}
+
+fn mati_hook_commands(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(entry_hook_commands)
+        .collect()
+}
+
+fn entry_hook_commands(entry: &Value) -> Vec<String> {
+    entry.get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn entry_contains_owned_command(entry: &Value, owned_commands: &[String]) -> bool {
+    entry_hook_commands(entry)
+        .iter()
+        .any(|command| owned_commands.iter().any(|owned| owned == command))
+}
+
 /// Write `.mcp.json` to the project root with the mati MCP server registration.
 ///
 /// Claude Code reads MCP server configuration from `.mcp.json` at the project
@@ -229,28 +287,66 @@ fn merge_hooks_into_settings(path: &Path) -> Result<()> {
 /// Uses the absolute binary path so Claude Code can find mati regardless of
 /// the restricted PATH it uses when spawning MCP server subprocesses.
 fn write_mcp_json(path: &Path) -> Result<()> {
-    let mcp_config = serde_json::json!({
-        "mcpServers": {
-            "mati": {
-                "command": mati_binary_path(),
-                "args": ["serve"]
-            }
-        }
+    let mati_server = serde_json::json!({
+        "command": mati_binary_path(),
+        "args": ["serve"]
     });
+
+    let mut mcp_config = if path.exists() {
+        let existing_str = std::fs::read_to_string(path)?;
+        serde_json::from_str(&existing_str).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    if let Value::Object(ref mut map) = mcp_config {
+        if let Some(Value::Object(ref mut servers)) = map.get_mut("mcpServers") {
+            servers.insert("mati".to_string(), mati_server);
+        } else {
+            map.insert(
+                "mcpServers".to_string(),
+                serde_json::json!({ "mati": mati_server }),
+            );
+        }
+    } else {
+        mcp_config = serde_json::json!({
+            "mcpServers": {
+                "mati": mati_server
+            }
+        });
+    }
+
     let output = serde_json::to_string_pretty(&mcp_config)?;
     write_if_changed(path, &output)?;
     Ok(())
 }
 
-/// Check if `jq` is available on PATH.
-fn jq_available() -> bool {
-    std::process::Command::new("jq")
+fn command_available(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn missing_hook_dependencies() -> Vec<&'static str> {
+    missing_hook_dependencies_with(command_available)
+}
+
+fn missing_hook_dependencies_with<F>(mut has_cmd: F) -> Vec<&'static str>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut missing = Vec::new();
+    if !has_cmd("jq") {
+        missing.push("jq");
+    }
+    if !has_cmd("awk") {
+        missing.push("awk");
+    }
+    missing
 }
 
 /// Write a file only if the content differs from what's on disk.
@@ -370,6 +466,61 @@ mod tests {
     }
 
     #[test]
+    fn merges_hooks_without_clobbering_unrelated_existing_hooks() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let existing = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Write",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": ".claude/hooks/custom-pre-write.sh"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        install_hooks(dir.path()).unwrap();
+
+        let settings = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        let pre_tool_use = parsed["hooks"]["PreToolUse"].as_array().unwrap();
+
+        assert!(
+            pre_tool_use.iter().any(|entry| {
+                entry["hooks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|hook| hook["command"] == ".claude/hooks/custom-pre-write.sh")
+            }),
+            "custom existing hook should be preserved"
+        );
+        assert!(
+            pre_tool_use.iter().any(|entry| {
+                entry["hooks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|hook| hook["command"] == ".claude/hooks/pre-read.sh")
+            }),
+            "mati pre-read hook should be present"
+        );
+    }
+
+    #[test]
     fn all_hook_scripts_exist_and_are_executable() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
@@ -415,6 +566,37 @@ mod tests {
         let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
         assert!(!cmd.is_empty(), "command must not be empty");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
+    }
+
+    #[test]
+    fn write_mcp_json_preserves_existing_servers() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "other-tool": {
+                    "command": "other",
+                    "args": ["run"]
+                }
+            }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+        write_mcp_json(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
+        assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
+    }
+
+    #[test]
+    fn detects_all_hook_runtime_dependencies() {
+        let missing = missing_hook_dependencies_with(|cmd| cmd == "jq");
+        assert_eq!(missing, vec!["awk"]);
+
+        let missing = missing_hook_dependencies_with(|_| false);
+        assert_eq!(missing, vec!["jq", "awk"]);
     }
 
     #[test]
