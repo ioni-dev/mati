@@ -20,9 +20,9 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use tantivy::collector::TopDocs;
 use tantivy::directory::error::OpenReadError;
-use tantivy::query::QueryParser;
+use tantivy::query::{PhraseQuery, QueryParser};
 use tantivy::schema::{NumericOptions, Schema, Value, FAST, STORED, STRING, TEXT};
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, TantivyError};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, TantivyError, Term};
 
 use crate::store::record::{Category, Priority, Record};
 
@@ -132,28 +132,30 @@ impl Search {
         })
     }
 
-    /// Index a single record and commit immediately.
+    /// Replace a single record in the search index and commit immediately.
     ///
-    /// Writes are additive — tantivy has no update primitive. If the same key
-    /// is indexed twice (e.g. on `mati enrich` re-run), both versions exist
-    /// in the index until a full rebuild (M-05-D / C4). Duplicates inflate BM25
-    /// scores and can cause the same key to appear twice in results. Use a full
-    /// rebuild (M-05-D) to de-duplicate after bulk re-indexing.
+    /// Search truth is keyed by `Record.key`. We first delete any existing
+    /// document for that key, then re-add the current record when it is
+    /// searchable. This keeps tantivy aligned with the latest KV state and
+    /// avoids stale top-k slots from previous versions.
     ///
     /// **Performance:** commits on every call. For bulk writes use
     /// [`Search::add_records`] via [`crate::store::Store::put_batch`] — that
     /// path stages the entire batch and commits once.
     pub fn add_record(&self, record: &Record) -> Result<()> {
-        let doc = record_to_doc(record, &self.fields);
         let mut writer = self.writer.lock().expect("search writer lock poisoned");
-        writer.add_document(doc)?;
+        delete_by_key(&self.index, &writer, self.fields.key, &record.key)?;
+        if is_searchable(record) {
+            writer.add_document(record_to_doc(record, &self.fields))?;
+        }
         writer.commit()?;
         Ok(())
     }
 
-    /// Index a batch of records with a single commit at the end.
+    /// Replace a batch of records with a single commit at the end.
     ///
-    /// Returns the total number of records successfully staged and committed.
+    /// Returns the total number of searchable records successfully staged and
+    /// committed.
     ///
     /// All documents are staged first, then a single `commit()` makes them
     /// searchable. Tantivy's worker threads auto-flush in-memory segments to
@@ -161,22 +163,42 @@ impl Search {
     /// update) and transparent. The single explicit commit at the end is the
     /// only expensive operation (~140 ms for meta persistence + merge policy).
     ///
+    /// All keys in the batch are deleted from tantivy first, then the latest
+    /// searchable version for each key is re-added. This avoids stale duplicate
+    /// docs after re-enrich / update flows and keeps delete-like replacements
+    /// consistent.
+    ///
     /// On staging error, the batch is rolled back — no partial state is
-    /// committed. This is safe because the primary caller (`mati init`) is
-    /// idempotent: a failed init is simply re-run.
+    /// committed. This is safe because the primary callers are idempotent.
     ///
     /// Use this from `Store::put_batch`. Single-record writes use [`Self::add_record`].
     pub fn add_records(&self, records: &[&Record]) -> Result<usize> {
-        // Skip Unknown-language file records — they have empty entry_points,
-        // imports, and value at Layer 0 and carry no BM25 signal worth indexing.
-        // Non-file records (gotcha:*, decision:*, dep:*, etc.) are always indexed.
-        let indexable: Vec<&&Record> = records.iter().filter(|r| is_searchable(r)).collect();
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let mut latest_by_key = std::collections::BTreeMap::<String, &Record>::new();
+        for &record in records {
+            latest_by_key.insert(record.key.clone(), record);
+        }
+
+        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+
+        for key in latest_by_key.keys() {
+            delete_by_key(&self.index, &writer, self.fields.key, key)?;
+        }
+
+        let indexable: Vec<&Record> = latest_by_key
+            .values()
+            .copied()
+            .filter(|r| is_searchable(r))
+            .collect();
         if indexable.is_empty() {
+            writer.commit()?;
             return Ok(0);
         }
 
         let total = indexable.len();
-        let mut writer = self.writer.lock().expect("search writer lock poisoned");
 
         // Stage all documents. Tantivy worker threads handle auto-flushing
         // when their heap share fills up — no explicit chunking needed.
@@ -211,6 +233,14 @@ impl Search {
             .writer
             .into_inner()
             .expect("search writer lock poisoned");
+        writer.commit()?;
+        Ok(())
+    }
+
+    /// Remove a record from the search index by key and commit immediately.
+    pub fn delete_key(&self, key: &str) -> Result<()> {
+        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+        delete_by_key(&self.index, &writer, self.fields.key, key)?;
         writer.commit()?;
         Ok(())
     }
@@ -293,8 +323,9 @@ impl Search {
 
 /// Returns `false` for `file:*` records whose extension has no tree-sitter
 /// grammar — config files, markdown, shell scripts, etc. These records carry
-/// empty `entry_points` and `imports` at Layer 0 and add no BM25 signal.
-/// All non-file records (gotcha:*, decision:*, dep:*, etc.) return `true`.
+/// empty `entry_points` and imports at Layer 0 and add little BM25 signal on
+/// the cold path. All non-file records (gotcha:*, decision:*, dep:*, etc.)
+/// return `true`.
 fn is_searchable(record: &Record) -> bool {
     let Some(path) = record.key.strip_prefix("file:") else {
         return true;
@@ -396,6 +427,30 @@ fn fields_from_schema(s: &Schema) -> Result<Fields> {
         priority: s.get_field("priority")?,
         updated_at: s.get_field("updated_at")?,
     })
+}
+
+fn delete_by_key(index: &Index, writer: &IndexWriter, key_field: tantivy::schema::Field, key: &str) -> Result<()> {
+    let mut tokenizer = index.tokenizer_for_field(key_field)?;
+    let mut stream = tokenizer.token_stream(key);
+    let mut tokens = Vec::new();
+    stream.process(&mut |token| tokens.push(token.text.clone()));
+
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    if tokens.len() == 1 {
+        writer.delete_term(Term::from_field_text(key_field, &tokens[0]));
+    } else {
+        let terms = tokens
+            .into_iter()
+            .map(|token| Term::from_field_text(key_field, &token))
+            .collect();
+        let query = PhraseQuery::new(terms);
+        writer.delete_query(Box::new(query))?;
+    }
+
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -850,8 +905,7 @@ mod tests {
 
     #[test]
     fn query_keys_duplicate_indexing_returns_key_exactly_once() {
-        // Simulates a re-enrich run that indexes the same key twice before
-        // M-05-D rebuild. The key must appear only once in results.
+        // Re-indexing the same key should replace the old doc, not duplicate it.
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         let r = make_record("gotcha:dup", "duplicate indexing scenario", &[]);
@@ -861,8 +915,37 @@ mod tests {
         assert_eq!(
             keys,
             vec!["gotcha:dup"],
-            "duplicate tantivy entries must be deduplicated in results"
+            "same key should only exist once in the index"
         );
+    }
+
+    #[test]
+    fn query_keys_updated_record_replaces_old_terms() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+
+        let old = make_record("gotcha:update", "oldterm sentinel", &[]);
+        let new = make_record("gotcha:update", "newterm sentinel", &[]);
+
+        s.add_record(&old).unwrap();
+        assert_eq!(s.query_keys("oldterm", 10).unwrap(), vec!["gotcha:update"]);
+
+        s.add_record(&new).unwrap();
+        assert!(s.query_keys("oldterm", 10).unwrap().is_empty());
+        assert_eq!(s.query_keys("newterm", 10).unwrap(), vec!["gotcha:update"]);
+    }
+
+    #[test]
+    fn delete_key_removes_record_from_results() {
+        let dir = TempDir::new().unwrap();
+        let s = open_search(&dir);
+
+        let r = make_record("gotcha:delete", "delete_me sentinel", &[]);
+        s.add_record(&r).unwrap();
+        assert_eq!(s.query_keys("delete_me", 10).unwrap(), vec!["gotcha:delete"]);
+
+        s.delete_key("gotcha:delete").unwrap();
+        assert!(s.query_keys("delete_me", 10).unwrap().is_empty());
     }
 
     // ── read-after-write ─────────────────────────────────────────────────────

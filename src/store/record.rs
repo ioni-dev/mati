@@ -7,7 +7,7 @@
 //! Key namespacing convention:
 //! ```text
 //! gotcha:<slug>          file:<path>          decision:<slug>
-//! stage:current          dep:<name>           dev_note:<slug>
+//! stage:current          dep:<ecosystem>:<name> dev_note:<slug>
 //! session:<timestamp>    analytics:<type>_<date>
 //! graph:edge:<from>:<kind>:<to>
 //! ```
@@ -535,7 +535,7 @@ pub struct RecordVersion {
 /// Key namespacing:
 /// ```text
 /// gotcha:<slug>     file:<path>     decision:<slug>
-/// stage:current     dep:<name>      dev_note:<slug>
+/// stage:current     dep:<ecosystem>:<name> dev_note:<slug>
 /// ```
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Record {

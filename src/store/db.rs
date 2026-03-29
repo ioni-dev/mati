@@ -147,12 +147,14 @@ impl Store {
 
         let search_path = store.root.join("search_index");
         let stale_marker = store.root.join(SEARCH_STALE_MARKER);
+        let has_sync_pending = store.root.join(SEARCH_SYNC_PENDING).exists();
 
         // Stale marker is written by `mati init` when tantivy indexing was
-        // deferred. Wipe the index before opening so the subsequent rebuild
-        // starts from an empty state (no duplicates).
+        // deferred. SEARCH_SYNC_PENDING means a crash or sync failure interrupted
+        // the KV → tantivy window. In both cases we must wipe the index before
+        // rebuild so removed keys and old versions cannot survive restart.
         let has_stale_marker = stale_marker.exists();
-        if has_stale_marker && search_path.exists() {
+        if (has_stale_marker || has_sync_pending) && search_path.exists() {
             std::fs::remove_dir_all(&search_path).with_context(|| {
                 format!(
                     "failed to remove stale search index at {}",
@@ -193,7 +195,7 @@ impl Store {
 
         // Detect crash-window desync: KV write committed but the tantivy
         // commit was interrupted before the fence could be cleared.
-        if store.root.join(SEARCH_SYNC_PENDING).exists() {
+        if has_sync_pending {
             tracing::warn!("tantivy crash-window desync detected — scheduling rebuild");
             store.index_needs_rebuild = true;
         }
@@ -318,10 +320,13 @@ impl Store {
         }
 
         // Update search index — KV write is primary, search is secondary.
-        // If tantivy fails to initialize, the KV write still succeeded.
+        // We replace by key rather than append, so tantivy stays aligned with
+        // the latest KV state without waiting for a full rebuild.
+        let mut search_synced = false;
         match self.ensure_search() {
             Ok(search) => {
                 search.add_record(record)?;
+                search_synced = true;
             }
             Err(e) => {
                 tracing::warn!("search index unavailable during put: {e}");
@@ -329,7 +334,9 @@ impl Store {
         }
         if is_knowledge_key(key) {
             self.bump_write_seq();
-            let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
+            if search_synced {
+                let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
+            }
         }
         Ok(())
     }
@@ -444,10 +451,12 @@ impl Store {
 
         // Update search index — KV write is primary, search is secondary.
         // If tantivy fails to initialize, the KV writes still succeeded.
+        let mut search_synced = false;
         match self.ensure_search() {
             Ok(search) => {
                 let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
                 let _ = search.add_records(&search_records)?;
+                search_synced = true;
             }
             Err(e) => {
                 tracing::warn!("search index unavailable during put_batch: {e}");
@@ -455,7 +464,9 @@ impl Store {
         }
         if has_knowledge {
             self.bump_write_seq();
-            let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
+            if search_synced {
+                let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
+            }
         }
         Ok(())
     }
@@ -467,6 +478,28 @@ impl Store {
         txn.set_durability(skv_durability(Durability::for_key(key)));
         txn.delete(key.as_bytes())?;
         txn.commit().await?;
+
+        if is_knowledge_key(key) {
+            let _ = std::fs::write(self.root.join(SEARCH_SYNC_PENDING), b"");
+        }
+
+        let mut search_synced = false;
+        match self.ensure_search() {
+            Ok(search) => {
+                search.delete_key(key)?;
+                search_synced = true;
+            }
+            Err(e) => {
+                tracing::warn!("search index unavailable during delete: {e}");
+            }
+        }
+
+        if is_knowledge_key(key) {
+            self.bump_write_seq();
+            if search_synced {
+                let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
+            }
+        }
         Ok(())
     }
 
@@ -2171,8 +2204,8 @@ mod tests {
 
     #[tokio::test]
     async fn search_deleted_record_not_returned() {
-        // A record deleted from SurrealKV after indexing must not appear in
-        // search results — the index key is silently skipped when get() → None.
+        // Delete should evict the tantivy entry too, not just rely on
+        // post-filtering missing keys after a search hit.
         let (store, _dir) = temp_store();
         let mut r = make_record("gotcha:deleted");
         r.value = "this_unique_sentinel_deleted_record".to_string();
@@ -2200,6 +2233,25 @@ mod tests {
             results.is_empty(),
             "deleted record must not appear in search results"
         );
+    }
+
+    #[tokio::test]
+    async fn search_delete_does_not_consume_top_k_slot() {
+        let (store, _dir) = temp_store();
+
+        let mut deleted = make_record("gotcha:deleted-slot");
+        deleted.value = "shared_sentinel_term".to_string();
+        store.put(&deleted.key, &deleted).await.unwrap();
+
+        let mut live = make_record("gotcha:live-slot");
+        live.value = "shared_sentinel_term".to_string();
+        store.put(&live.key, &live).await.unwrap();
+
+        store.delete(&deleted.key).await.unwrap();
+
+        let results = store.search("shared_sentinel_term", 1).await.unwrap();
+        assert_eq!(results.len(), 1, "live hit should still fill the top-k slot");
+        assert_eq!(results[0].key, "gotcha:live-slot");
     }
 
     #[tokio::test]
@@ -2398,6 +2450,54 @@ mod tests {
         }
     }
 
+    async fn reopen_store_open_and_rebuild_like(root: &std::path::Path) -> Store {
+        let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
+        let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+        let mut store = Store {
+            knowledge,
+            sessions,
+            search: OnceCell::new(),
+            root: root.to_path_buf(),
+            index_needs_rebuild: false,
+        };
+
+        let search_path = store.root.join("search_index");
+        let stale_marker = store.root.join(SEARCH_STALE_MARKER);
+        let has_stale_marker = stale_marker.exists();
+        let has_sync_pending = store.root.join(SEARCH_SYNC_PENDING).exists();
+
+        if (has_stale_marker || has_sync_pending) && search_path.exists() {
+            std::fs::remove_dir_all(&search_path).unwrap();
+        }
+
+        match Search::open(&search_path) {
+            Ok(s) => {
+                let _ = store.search.set(s);
+            }
+            Err(_) => {
+                if search_path.exists() {
+                    std::fs::remove_dir_all(&search_path).unwrap();
+                }
+                let _ = store.search.set(Search::open(&search_path).unwrap());
+                store.index_needs_rebuild = true;
+            }
+        }
+
+        if has_stale_marker || has_sync_pending {
+            store.index_needs_rebuild = true;
+        }
+
+        if store.index_needs_rebuild {
+            store.rebuild_search_index().await.unwrap();
+            let _ = std::fs::remove_file(store.root.join(SEARCH_SYNC_PENDING));
+            if has_stale_marker {
+                let _ = std::fs::remove_file(&stale_marker);
+            }
+        }
+
+        store
+    }
+
     /// Write records, close, delete search_index/, reopen with a fresh empty
     /// index, call rebuild_search_index — all records must be searchable again.
     #[tokio::test]
@@ -2528,6 +2628,59 @@ mod tests {
         assert_eq!(
             committed, 7,
             "committed count must equal number of records in SurrealKV"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_and_rebuild_like_wipes_stale_index_when_sync_pending_exists() {
+        let (store, _dir) = temp_store();
+        let root = store.root.clone();
+
+        let deleted = make_record_v("gotcha:deleted-after-crash", "shared_crash_sentinel");
+        let live = make_record_v("gotcha:live-after-crash", "shared_crash_sentinel");
+
+        store.put(&deleted.key, &deleted).await.unwrap();
+        store.put(&live.key, &live).await.unwrap();
+        store.delete(&deleted.key).await.unwrap();
+
+        // Simulate a stale tantivy entry surviving a crash window.
+        store.ensure_search().unwrap().add_record(&deleted).unwrap();
+        std::fs::write(root.join(SEARCH_SYNC_PENDING), b"").unwrap();
+        store.close().await.unwrap();
+
+        let reopened = reopen_store_open_and_rebuild_like(&root).await;
+        let results = reopened.search("shared_crash_sentinel", 1).await.unwrap();
+        assert_eq!(results.len(), 1, "live record should fill top-k after rebuild");
+        assert_eq!(results[0].key, "gotcha:live-after-crash");
+        assert!(
+            !root.join(SEARCH_SYNC_PENDING).exists(),
+            "successful rebuild should clear sync-pending marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_leaves_sync_pending_when_search_cannot_initialize() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("mati_test");
+        std::fs::create_dir_all(&root).unwrap();
+        let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
+        let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+        std::fs::write(root.join("search_index"), b"not a directory").unwrap();
+
+        let store = Store {
+            knowledge,
+            sessions,
+            search: OnceCell::new(),
+            root: root.clone(),
+            index_needs_rebuild: false,
+        };
+
+        let record = make_record("gotcha:search-sync-failure");
+        store.put(&record.key, &record).await.unwrap();
+
+        assert!(
+            root.join(SEARCH_SYNC_PENDING).exists(),
+            "failed search sync must leave the crash-fence marker in place"
         );
     }
 
@@ -2753,17 +2906,20 @@ mod tests {
         new_gotcha.updated_at = now;
         store.put("gotcha:new", &new_gotcha).await.unwrap();
 
-        let mut dep_rec = make_record("dep:serde");
+        let mut dep_rec = make_record("dep:cargo:serde");
         dep_rec.category = crate::store::record::Category::Dependency;
         dep_rec.updated_at = now;
-        store.put("dep:serde", &dep_rec).await.unwrap();
+        store.put("dep:cargo:serde", &dep_rec).await.unwrap();
 
         let since = now.saturating_sub(60);
         let results = store.records_since(since, 0).await.unwrap();
         let keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
 
         assert!(keys.contains(&"gotcha:new"), "new gotcha should appear");
-        assert!(keys.contains(&"dep:serde"), "dep record should appear");
+        assert!(
+            keys.contains(&"dep:cargo:serde"),
+            "dep record should appear"
+        );
         assert!(
             !keys.contains(&"gotcha:old"),
             "old gotcha should be excluded"
