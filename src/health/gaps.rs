@@ -121,7 +121,8 @@ fn description_for_gap(gap_type: &GapType, key: &str) -> String {
             format!("Decision {key} has no affected files — cannot be surfaced by hooks")
         }
         GapType::DependencyUnknown => {
-            format!("Dependency {key} has no confirmed gotchas — upgrade risks are invisible")
+            let dep = crate::analysis::dep_display_name_from_key(key);
+            format!("Dependency {dep} has no confirmed gotchas — upgrade risks are invisible")
         }
         GapType::CoChangePairUnmapped => {
             format!("{key} co-changes frequently with another file but has no graph edge")
@@ -148,28 +149,28 @@ fn action_hint_for_gap(gap_type: &GapType, key: &str) -> String {
 
     match gap_type {
         GapType::HotFileNoRecord => {
-            format!("mati show {bare}  # creates a stub, then: mati enrich {bare}")
+            format!("mati show {bare}  # inspect the file, then run mati enrich")
         }
         GapType::HotFileNoPurpose => {
-            format!("mati enrich {bare}")
+            format!("mati enrich  # in Claude Code: /mati-enrich {bare}")
         }
         GapType::HotFileNoGotchas => {
-            format!("mati gotcha add --file {bare}")
+            format!("mati gotcha add {bare} -r \"rule text\"")
         }
         GapType::FrequentlyReadNoEnrich => {
-            format!("mati enrich {bare}")
+            format!("mati enrich  # in Claude Code: /mati-enrich {bare}")
         }
         GapType::OrphanedDecision => {
             format!("mati show {bare}  # review and link affected files")
         }
         GapType::DependencyUnknown => {
-            format!("mati gotcha add --dep {bare}")
+            format!("mati show {key}  # inspect the dependency, then add gotchas to affected files")
         }
         GapType::CoChangePairUnmapped => {
             format!("mati show {bare}  # review co-change pairs")
         }
         GapType::StaleHotspot => {
-            format!("mati enrich --refresh {bare}")
+            format!("mati stale  # inspect staleness, then: mati enrich")
         }
         GapType::HotFileNoTests => {
             format!("add tests for {bare} before the next change")
@@ -362,7 +363,7 @@ fn detect_dependency_unknown(
     // Pre-compute dep names once to avoid repeated strip_prefix in hot loops.
     let dep_names: Vec<(&str, &str)> = deps
         .iter()
-        .map(|d| (d.key.as_str(), d.key.strip_prefix("dep:").unwrap_or(&d.key)))
+        .map(|d| (d.key.as_str(), crate::analysis::dep_display_name_from_key(&d.key)))
         .collect();
 
     // Build a set of dep keys that have at least one confirmed gotcha referencing them.
@@ -798,6 +799,32 @@ mod tests {
     }
 
     #[test]
+    fn action_hint_uses_quick_capture_syntax_for_missing_gotchas() {
+        let hint = action_hint_for_gap(&GapType::HotFileNoGotchas, "file:src/lib.rs");
+        assert!(
+            hint.contains("mati gotcha add src/lib.rs -r"),
+            "hint should use the supported quick-capture syntax: {hint}"
+        );
+        assert!(
+            !hint.contains("--file"),
+            "hint must not suggest unsupported --file syntax: {hint}"
+        );
+    }
+
+    #[test]
+    fn action_hint_does_not_suggest_removed_refresh_flag() {
+        let hint = action_hint_for_gap(&GapType::StaleHotspot, "file:src/lib.rs");
+        assert!(
+            !hint.contains("--refresh"),
+            "hint must not suggest unsupported --refresh syntax: {hint}"
+        );
+        assert!(
+            hint.contains("mati stale"),
+            "stale hotspot hint should start from the supported stale surface: {hint}"
+        );
+    }
+
+    #[test]
     fn action_hint_per_gap_type() {
         let cases = [
             (GapType::HotFileNoRecord, "file:src/a.rs", "enrich"),
@@ -805,8 +832,12 @@ mod tests {
             (GapType::HotFileNoGotchas, "file:src/c.rs", "gotcha add"),
             (GapType::FrequentlyReadNoEnrich, "file:src/d.rs", "enrich"),
             (GapType::OrphanedDecision, "decision:use-surrealkv", "show"),
-            (GapType::DependencyUnknown, "dep:serde", "gotcha add"),
-            (GapType::StaleHotspot, "file:src/e.rs", "enrich"),
+            (
+                GapType::DependencyUnknown,
+                "dep:cargo:serde",
+                "show dep:cargo:serde",
+            ),
+            (GapType::StaleHotspot, "file:src/e.rs", "mati stale"),
         ];
         for (gap_type, key, expected_cmd) in &cases {
             let hint = action_hint_for_gap(gap_type, key);
