@@ -16,12 +16,10 @@
 use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 
-use mati_core::analysis::{parse_file, parse_files_parallel, Walker, WalkedFile};
+use mati_core::analysis::{parse_file, parse_files_parallel, WalkedFile, Walker};
 
 // ── Scale configurations ────────────────────────────────────────────────────
 
@@ -180,7 +178,11 @@ mod synth {
             if j % 5 == 0 {
                 writeln!(s, "// TODO: refactor function process_{i}_{j}").unwrap();
             }
-            writeln!(s, "pub fn process_{i}_{j}(input: &str) -> Result<String> {{").unwrap();
+            writeln!(
+                s,
+                "pub fn process_{i}_{j}(input: &str) -> Result<String> {{"
+            )
+            .unwrap();
 
             // if/match branches
             writeln!(s, "    if input.is_empty() {{").unwrap();
@@ -287,8 +289,11 @@ mod synth {
             if j % 4 == 0 {
                 writeln!(s, "// TODO: optimize transform_{i}_{j}").unwrap();
             }
-            writeln!(s, "export function transform_{i}_{j}(data: string[]): string[] {{")
-                .unwrap();
+            writeln!(
+                s,
+                "export function transform_{i}_{j}(data: string[]): string[] {{"
+            )
+            .unwrap();
             writeln!(s, "  if (data.length === 0) {{ return []; }}").unwrap();
             if j % 2 == 0 {
                 writeln!(s, "  switch (data[0]) {{").unwrap();
@@ -582,28 +587,26 @@ fn bench_walker(c: &mut Criterion) {
         let repo = synth::TestRepo::generate(size);
         group.throughput(Throughput::Elements(repo.file_count as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("walk_batch", label),
-            &repo,
-            |b, repo| {
-                b.iter(|| {
-                    let files = Walker::new(&repo.root).walk().unwrap();
-                    black_box(files.len());
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("walk_batch", label), &repo, |b, repo| {
+            b.iter(|| {
+                let files = Walker::new(&repo.root).walk().unwrap();
+                black_box(files.len());
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("walk_channel", label),
-            &repo,
-            |b, repo| {
-                b.iter(|| {
-                    let rx = Walker::new(&repo.root).walk_channel().unwrap();
-                    let count: usize = rx.into_iter().map(|f| { black_box(&f); 1 }).sum();
-                    black_box(count);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("walk_channel", label), &repo, |b, repo| {
+            b.iter(|| {
+                let rx = Walker::new(&repo.root).walk_channel().unwrap();
+                let count: usize = rx
+                    .into_iter()
+                    .map(|f| {
+                        black_box(&f);
+                        1
+                    })
+                    .sum();
+                black_box(count);
+            });
+        });
     }
 
     group.finish();
@@ -864,9 +867,7 @@ fn bench_worst_case(c: &mut Criterion) {
 
 fn bench_kernel_scale(c: &mut Criterion) {
     if std::env::var("MATI_BENCH_KERNEL").is_err() {
-        eprintln!(
-            "Skipping kernel_scale benchmarks. Set MATI_BENCH_KERNEL=1 to enable."
-        );
+        eprintln!("Skipping kernel_scale benchmarks. Set MATI_BENCH_KERNEL=1 to enable.");
         return;
     }
 

@@ -96,12 +96,15 @@ const SETTINGS_JSON: &str = r#"{
 /// Each script is a Rust string constant defined in `crate::hooks::*`.
 /// Replaces the pass-through stubs from M-06-J with real hook logic (M-09).
 pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
-    ("pre-read.sh",             crate::hooks::pre_read::SCRIPT),
-    ("pre-bash.sh",             crate::hooks::pre_bash::SCRIPT),
-    ("post-read-compliance.sh", crate::hooks::post_compliance::SCRIPT),
-    ("post-edit.sh",            crate::hooks::post_edit::SCRIPT),
-    ("pre-compact.sh",          crate::hooks::pre_compact::SCRIPT),
-    ("session-end.sh",          crate::hooks::session_end::SCRIPT),
+    ("pre-read.sh", crate::hooks::pre_read::SCRIPT),
+    ("pre-bash.sh", crate::hooks::pre_bash::SCRIPT),
+    (
+        "post-read-compliance.sh",
+        crate::hooks::post_compliance::SCRIPT,
+    ),
+    ("post-edit.sh", crate::hooks::post_edit::SCRIPT),
+    ("pre-compact.sh", crate::hooks::pre_compact::SCRIPT),
+    ("session-end.sh", crate::hooks::session_end::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -187,8 +190,7 @@ fn mati_binary_path() -> String {
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
     // Inject absolute binary path so Claude Code can find it regardless of PATH.
-    mati_settings["mcpServers"]["mati"]["command"] =
-        serde_json::Value::String(mati_binary_path());
+    mati_settings["mcpServers"]["mati"]["command"] = serde_json::Value::String(mati_binary_path());
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -403,7 +405,10 @@ mod tests {
         install_hooks(dir.path()).unwrap();
 
         let mcp_json_path = dir.path().join(".mcp.json");
-        assert!(mcp_json_path.exists(), ".mcp.json should be written to project root");
+        assert!(
+            mcp_json_path.exists(),
+            ".mcp.json should be written to project root"
+        );
 
         let content = std::fs::read_to_string(&mcp_json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();

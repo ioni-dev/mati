@@ -160,10 +160,10 @@ fn recompute_at(record: &Record, now: u64) -> ConfidenceScore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Priority;
     use crate::store::{
         Category, QualityScore, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
     };
-    use crate::store::Priority;
     use uuid::Uuid;
 
     const NOW: u64 = 1_710_520_800; // 2024-03-15 ~20:00 UTC

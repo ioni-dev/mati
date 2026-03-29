@@ -83,9 +83,15 @@ pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
         .cloned()
         .collect();
     stale.sort_by(|a, b| {
-        b.staleness.value.partial_cmp(&a.staleness.value).unwrap_or(std::cmp::Ordering::Equal)
+        b.staleness
+            .value
+            .partial_cmp(&a.staleness.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let entry = StaleCache { write_seq, records: stale };
+    let entry = StaleCache {
+        write_seq,
+        records: stale,
+    };
     let mut rec = cache_record(String::new());
     rec.payload = serde_json::to_value(&entry).ok();
     store.put(STALE_CACHE_KEY, &rec).await?;
@@ -112,7 +118,7 @@ pub async fn run(args: StaleArgs) -> Result<()> {
 
     // ── Cache check: reuse when write-seq unchanged ───────────────────────────
     let current_seq = proxy.read_write_seq();
-    if let Ok(Some(cached)) = proxy.get(STALE_CACHE_KEY).await {
+    if let Some(cached) = proxy.get(STALE_CACHE_KEY).await? {
         if let Some(entry) = cached.payload_as::<StaleCache>() {
             if entry.write_seq == current_seq {
                 let mut stale = entry.records;
@@ -154,7 +160,10 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     });
 
     // Write cache (full sorted list, before limit)
-    let cache_entry = StaleCache { write_seq: current_seq, records: stale.clone() };
+    let cache_entry = StaleCache {
+        write_seq: current_seq,
+        records: stale.clone(),
+    };
     let mut rec = cache_record(String::new());
     rec.payload = serde_json::to_value(&cache_entry).ok();
     let _ = proxy.put(STALE_CACHE_KEY, &rec).await;
@@ -220,33 +229,67 @@ fn display_stale(stale: &[Record], verbose: bool) {
     // ── Summary + action hints ───────────────────────────────────────────────
 
     let (red, yellow, gray, bold, reset) = if use_color {
-        (colors::RED, colors::YELLOW, colors::GRAY, colors::BOLD, colors::RESET)
+        (
+            colors::RED,
+            colors::YELLOW,
+            colors::GRAY,
+            colors::BOLD,
+            colors::RESET,
+        )
     } else {
         ("", "", "", "", "")
     };
 
-    let n_liability = stale.iter().filter(|r| r.staleness.tier == StalenessTier::Liability).count();
-    let n_tombstone = stale.iter().filter(|r| r.staleness.tier == StalenessTier::Tombstone).count();
-    let n_stale = stale.iter().filter(|r| r.staleness.tier == StalenessTier::Stale).count();
+    let n_liability = stale
+        .iter()
+        .filter(|r| r.staleness.tier == StalenessTier::Liability)
+        .count();
+    let n_tombstone = stale
+        .iter()
+        .filter(|r| r.staleness.tier == StalenessTier::Tombstone)
+        .count();
+    let n_stale = stale
+        .iter()
+        .filter(|r| r.staleness.tier == StalenessTier::Stale)
+        .count();
 
     let mut parts: Vec<String> = Vec::new();
-    if n_tombstone > 0 { parts.push(format!("{red}{n_tombstone} tombstone{reset}")); }
-    if n_liability > 0 { parts.push(format!("{red}{n_liability} liability{reset}")); }
-    if n_stale > 0 { parts.push(format!("{yellow}{n_stale} stale{reset}")); }
-    let breakdown = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(", ")) };
+    if n_tombstone > 0 {
+        parts.push(format!("{red}{n_tombstone} tombstone{reset}"));
+    }
+    if n_liability > 0 {
+        parts.push(format!("{red}{n_liability} liability{reset}"));
+    }
+    if n_stale > 0 {
+        parts.push(format!("{yellow}{n_stale} stale{reset}"));
+    }
+    let breakdown = if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    };
 
-    println!("\n  {bold}{} stale records{reset}{breakdown}\n", stale.len());
+    println!(
+        "\n  {bold}{} stale records{reset}{breakdown}\n",
+        stale.len()
+    );
 
     let mut actions: Vec<String> = Vec::new();
     for r in stale {
         let hint = action_hint(r);
-        if !actions.contains(&hint) { actions.push(hint); }
-        if actions.len() >= 5 { break; }
+        if !actions.contains(&hint) {
+            actions.push(hint);
+        }
+        if actions.len() >= 5 {
+            break;
+        }
     }
 
     if !actions.is_empty() {
         println!("  {gray}Suggested actions:{reset}");
-        for a in &actions { println!("    {a}"); }
+        for a in &actions {
+            println!("    {a}");
+        }
         println!();
     }
 
@@ -255,8 +298,16 @@ fn display_stale(stale: &[Record], verbose: bool) {
     if verbose {
         println!();
         for r in stale {
-            let age_days = if r.updated_at > 0 { (now.saturating_sub(r.updated_at)) / 86400 } else { 0 };
-            let stc = if use_color { staleness_color(&r.staleness.tier) } else { "" };
+            let age_days = if r.updated_at > 0 {
+                (now.saturating_sub(r.updated_at)) / 86400
+            } else {
+                0
+            };
+            let stc = if use_color {
+                staleness_color(&r.staleness.tier)
+            } else {
+                ""
+            };
             let tier_label = tier_short_label(&r.staleness.tier).to_uppercase();
 
             println!(
@@ -450,7 +501,11 @@ mod tests {
 
     #[test]
     fn action_hint_for_gotcha() {
-        let r = make_record("gotcha:inference-async", Category::Gotcha, StalenessTier::Stale);
+        let r = make_record(
+            "gotcha:inference-async",
+            Category::Gotcha,
+            StalenessTier::Stale,
+        );
         assert_eq!(action_hint(&r), "mati show gotcha:inference-async");
     }
 
@@ -489,20 +544,37 @@ mod tests {
             make_record("file:fresh.rs", Category::File, StalenessTier::Fresh),
             make_record("file:aging.rs", Category::File, StalenessTier::Aging),
             make_record("file:stale.rs", Category::File, StalenessTier::Stale),
-            make_record("file:liability.rs", Category::File, StalenessTier::Liability),
-            make_record("file:tombstone.rs", Category::File, StalenessTier::Tombstone),
+            make_record(
+                "file:liability.rs",
+                Category::File,
+                StalenessTier::Liability,
+            ),
+            make_record(
+                "file:tombstone.rs",
+                Category::File,
+                StalenessTier::Tombstone,
+            ),
         ];
 
         let stale: Vec<&Record> = records
             .iter()
-            .filter(|r| matches!(
-                r.staleness.tier,
-                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
-            ))
+            .filter(|r| {
+                matches!(
+                    r.staleness.tier,
+                    StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
+                )
+            })
             .collect();
 
-        assert_eq!(stale.len(), 3, "only Stale, Liability, Tombstone should pass filter");
-        assert!(stale.iter().all(|r| !matches!(r.staleness.tier, StalenessTier::Fresh | StalenessTier::Aging)));
+        assert_eq!(
+            stale.len(),
+            3,
+            "only Stale, Liability, Tombstone should pass filter"
+        );
+        assert!(stale.iter().all(|r| !matches!(
+            r.staleness.tier,
+            StalenessTier::Fresh | StalenessTier::Aging
+        )));
     }
 
     /// 7.03: Records are sorted by staleness descending.
@@ -523,7 +595,10 @@ mod tests {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        assert_eq!(stale[0].key, "file:c.rs", "highest staleness should be first");
+        assert_eq!(
+            stale[0].key, "file:c.rs",
+            "highest staleness should be first"
+        );
         assert_eq!(stale[1].key, "file:b.rs", "second highest should be second");
         assert_eq!(stale[2].key, "file:a.rs", "lowest staleness should be last");
     }
@@ -557,8 +632,12 @@ mod tests {
             StalenessSignal::EntryPointsChanged(2),
             StalenessSignal::ImportsChanged(5),
             StalenessSignal::FileDeleted,
-            StalenessSignal::FileRenamed { new_path: "src/new.rs".to_string() },
-            StalenessSignal::LinkedFileChanged { path: "src/bar.rs".to_string() },
+            StalenessSignal::FileRenamed {
+                new_path: "src/new.rs".to_string(),
+            },
+            StalenessSignal::LinkedFileChanged {
+                path: "src/bar.rs".to_string(),
+            },
             StalenessSignal::TodosChanged,
             StalenessSignal::UnsafeCountChanged(3),
             StalenessSignal::UnwrapCountChanged(-2),
@@ -599,7 +678,11 @@ mod tests {
                     assert_eq!(label, "", "Fresh/Aging should have empty impact label");
                 }
                 _ => {
-                    assert!(!label.is_empty(), "{:?} should have a non-empty impact label", tier);
+                    assert!(
+                        !label.is_empty(),
+                        "{:?} should have a non-empty impact label",
+                        tier
+                    );
                 }
             }
         }

@@ -60,13 +60,17 @@ pub fn compute_from_records(
         .iter()
         .filter_map(|r| r.payload_as::<FileRecord>())
         .collect();
-    let hotspot_coverage  = compute_hotspot_coverage(&file_data);
-    let gotcha_coverage   = compute_gotcha_coverage(&file_data);
+    let hotspot_coverage = compute_hotspot_coverage(&file_data);
+    let gotcha_coverage = compute_gotcha_coverage(&file_data);
     let decision_coverage = compute_decision_coverage(decisions);
     let all_knowledge: Vec<_> = gotchas.iter().chain(decisions.iter()).collect();
-    let avg_confidence    = compute_avg_confidence(&all_knowledge);
-    let estimated_minutes =
-        compute_estimated_minutes(hotspot_coverage, gotcha_coverage, decision_coverage, avg_confidence);
+    let avg_confidence = compute_avg_confidence(&all_knowledge);
+    let estimated_minutes = compute_estimated_minutes(
+        hotspot_coverage,
+        gotcha_coverage,
+        decision_coverage,
+        avg_confidence,
+    );
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -84,10 +88,14 @@ pub fn compute_from_records(
 /// Compute the [`OnboardingScore`] by scanning the store for file, decision,
 /// and gotcha records.
 pub async fn compute(store: &Store) -> Result<OnboardingScore> {
-    let file_records    = store.scan_prefix("file:").await?;
+    let file_records = store.scan_prefix("file:").await?;
     let decision_records = store.scan_prefix("decision:").await?;
-    let gotcha_records  = store.scan_prefix("gotcha:").await?;
-    Ok(compute_from_records(&file_records, &decision_records, &gotcha_records))
+    let gotcha_records = store.scan_prefix("gotcha:").await?;
+    Ok(compute_from_records(
+        &file_records,
+        &decision_records,
+        &gotcha_records,
+    ))
 }
 
 // ── Pure helpers (testable without Store) ────────────────────────────────────
@@ -110,7 +118,10 @@ fn compute_gotcha_coverage(files: &[FileRecord]) -> f32 {
     if hotspots.is_empty() {
         return 0.0;
     }
-    let covered = hotspots.iter().filter(|f| !f.gotcha_keys.is_empty()).count();
+    let covered = hotspots
+        .iter()
+        .filter(|f| !f.gotcha_keys.is_empty())
+        .count();
     covered as f32 / hotspots.len() as f32
 }
 
@@ -120,7 +131,10 @@ fn compute_decision_coverage(decisions: &[crate::store::Record]) -> f32 {
     if decisions.is_empty() {
         return 0.0;
     }
-    let enriched = decisions.iter().filter(|r| !r.value.trim().is_empty()).count();
+    let enriched = decisions
+        .iter()
+        .filter(|r| !r.value.trim().is_empty())
+        .count();
     enriched as f32 / decisions.len() as f32
 }
 
@@ -249,10 +263,7 @@ mod tests {
     #[test]
     fn full_coverage_yields_near_zero() {
         let minutes = compute_estimated_minutes(1.0, 1.0, 1.0, 1.0);
-        assert!(
-            minutes.abs() < 0.01,
-            "expected ~0.0, got {minutes}"
-        );
+        assert!(minutes.abs() < 0.01, "expected ~0.0, got {minutes}");
     }
 
     #[test]
@@ -270,9 +281,12 @@ mod tests {
 
     #[test]
     fn hotspot_coverage_no_hotspots() {
-        let files = vec![
-            make_file_record("src/lib.rs", "library root", vec![], false),
-        ];
+        let files = vec![make_file_record(
+            "src/lib.rs",
+            "library root",
+            vec![],
+            false,
+        )];
         assert!((compute_hotspot_coverage(&files) - 0.0).abs() < f32::EPSILON);
     }
 
@@ -298,9 +312,12 @@ mod tests {
 
     #[test]
     fn gotcha_coverage_no_hotspots() {
-        let files = vec![
-            make_file_record("src/lib.rs", "", vec!["gotcha:x".into()], false),
-        ];
+        let files = vec![make_file_record(
+            "src/lib.rs",
+            "",
+            vec!["gotcha:x".into()],
+            false,
+        )];
         assert!((compute_gotcha_coverage(&files) - 0.0).abs() < f32::EPSILON);
     }
 
@@ -333,8 +350,16 @@ mod tests {
     #[test]
     fn decision_coverage_all_enriched() {
         let records = vec![
-            make_record("decision:use-surrealkv", "We chose SurrealKV because...", 0.8),
-            make_record("decision:three-tools", "MCP tools capped at 3 to save tokens", 0.7),
+            make_record(
+                "decision:use-surrealkv",
+                "We chose SurrealKV because...",
+                0.8,
+            ),
+            make_record(
+                "decision:three-tools",
+                "MCP tools capped at 3 to save tokens",
+                0.7,
+            ),
         ];
         assert!((compute_decision_coverage(&records) - 1.0).abs() < f32::EPSILON);
     }
@@ -342,7 +367,11 @@ mod tests {
     #[test]
     fn decision_coverage_half_stubs() {
         let records = vec![
-            make_record("decision:use-surrealkv", "We chose SurrealKV because...", 0.8),
+            make_record(
+                "decision:use-surrealkv",
+                "We chose SurrealKV because...",
+                0.8,
+            ),
             make_record("decision:three-tools", "", 0.1), // stub
         ];
         assert!((compute_decision_coverage(&records) - 0.5).abs() < f32::EPSILON);

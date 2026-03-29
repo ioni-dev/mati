@@ -14,13 +14,22 @@ use std::process::Command;
 use anyhow::Result;
 use clap::Args;
 
-use mati_core::store::{FileRecord, GotchaRecord, RecordLifecycle};
+use mati_core::store::{FileRecord, GotchaRecord, RecordLifecycle, StalenessTier};
 
 use super::proxy::StoreProxy;
+use super::show::source_short;
 
 use super::colors;
 
 #[derive(Args)]
+#[command(
+    long_about = "Pre-merge check — cross-reference a git diff against the knowledge store.\n\
+                  Surfaces confirmed gotchas for changed files before merge.\n\n\
+                  Examples:\n  \
+                    mati diff main\n  \
+                    mati diff main..feature-auth\n  \
+                    mati diff HEAD~3"
+)]
 pub struct DiffArgs {
     /// Git ref or range to diff (e.g. "main", "main..feature-auth", "HEAD~3")
     pub range: String,
@@ -93,7 +102,9 @@ pub async fn run(args: DiffArgs) -> Result<()> {
 
         let mut confirmed_gotchas = Vec::new();
         for key in &gotcha_keys {
-            let Some(gr) = store.get(key).await? else { continue };
+            let Some(gr) = store.get(key).await? else {
+                continue;
+            };
             if !matches!(gr.lifecycle, RecordLifecycle::Active) {
                 continue;
             }
@@ -121,12 +132,27 @@ pub async fn run(args: DiffArgs) -> Result<()> {
                 RESET = if use_color { colors::RESET } else { "" },
                 CYAN = if use_color { colors::CYAN } else { "" },
                 n = confirmed_gotchas.len(),
-                s = if confirmed_gotchas.len() == 1 { "" } else { "s" },
+                s = if confirmed_gotchas.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
             );
             for cg in &confirmed_gotchas {
                 let rule = cg.value.lines().next().unwrap_or(&cg.value);
+                let source = source_short(&cg.source);
+                let stale_hint = match cg.staleness.tier {
+                    StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
+                        if use_color {
+                            format!(" {YELLOW}stale{RESET}", YELLOW = colors::YELLOW, RESET = colors::RESET)
+                        } else {
+                            " stale".to_string()
+                        }
+                    }
+                    _ => String::new(),
+                };
                 println!(
-                    "     {YELLOW}→{RESET} {rule}  (confidence {conf:.2})",
+                    "     {YELLOW}→{RESET} {rule}  ({source}, {conf:.2}){stale_hint}",
                     YELLOW = if use_color { colors::YELLOW } else { "" },
                     RESET = if use_color { colors::RESET } else { "" },
                     conf = cg.confidence.value,
@@ -145,6 +171,13 @@ pub async fn run(args: DiffArgs) -> Result<()> {
         documented,
         unknown,
     );
+    if unknown > 0 {
+        let gray = if use_color { colors::GRAY } else { "" };
+        let reset = if use_color { colors::RESET } else { "" };
+        println!(
+            "  {gray}Run `mati explain <file>` for a full briefing on any file above.{reset}"
+        );
+    }
     println!();
 
     store.close().await?;

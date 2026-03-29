@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use mati_core::health::{gaps, onboarding};
 use mati_core::store::{
-    Category, ConfidenceScore, FileRecord, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore, Store, Priority, QualityScore,
+    Category, ConfidenceScore, FileRecord, Priority, QualityScore, Record, RecordLifecycle,
+    RecordSource, RecordVersion, StalenessScore, Store,
 };
 
 use super::colors;
@@ -94,9 +94,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
         if let Some(snapshot) = cached.payload_as::<HealthSnapshot>() {
             let age = now.saturating_sub(snapshot.computed_at);
-            if snapshot.write_seq == current_seq
-                && age < SNAPSHOT_MAX_AGE_SECS
-            {
+            if snapshot.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
                 display_cached_stats(&snapshot, age, &cwd);
                 store.close().await?;
                 return Ok(());
@@ -142,9 +140,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    println!(
-        "\n{bold}{blue}◈ mati stats{reset} — project: {bold}{white}{project}{reset}\n"
-    );
+    println!("\n{bold}{blue}◈ mati stats{reset} — project: {bold}{white}{project}{reset}\n");
 
     // ════════════════════════════════════════════════════════════════════════════
     // 1. Coverage
@@ -177,7 +173,11 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     } else {
         0.0
     };
-    let gph_color = if gotchas_per_hotspot >= 2.0 { green } else { yellow };
+    let gph_color = if gotchas_per_hotspot >= 2.0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Gotchas per hotspot    {gph_color}{gotchas_per_hotspot:.1}{reset}  (target >= 2.0)"
     );
@@ -185,9 +185,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // Decisions documented
     let decisions_count = decisions.len() as u32;
     let dec_color = if decisions_count > 0 { green } else { yellow };
-    println!(
-        "    Decisions documented   {dec_color}{decisions_count}{reset}"
-    );
+    println!("    Decisions documented   {dec_color}{decisions_count}{reset}");
 
     // Avg confidence score across gotcha + decision records
     let knowledge_records: Vec<&Record> = gotchas.iter().chain(decisions.iter()).collect();
@@ -210,12 +208,16 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // Knowledge gaps — pass pre-loaded records, no redundant scans.
     // Empty fan_in: stats skips graph load for speed; HighFanInNoContract
     // gaps appear in `mati gaps` which loads the full graph.
-    let gap_list = gaps::analyze(&files, &gotchas, &decisions, &deps, &std::collections::HashMap::new());
+    let gap_list = gaps::analyze(
+        &files,
+        &gotchas,
+        &decisions,
+        &deps,
+        &std::collections::HashMap::new(),
+    );
     let gap_count = gap_list.len() as u32;
     let gap_color = if gap_count == 0 { green } else { yellow };
-    println!(
-        "    Knowledge gaps         {gap_color}{gap_count}{reset}"
-    );
+    println!("    Knowledge gaps         {gap_color}{gap_count}{reset}");
 
     println!();
 
@@ -241,9 +243,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         .filter(|r| r.created_at >= thirty_days_ago)
         .count() as u32;
     let vel_color = if new_records_30d > 0 { green } else { yellow };
-    println!(
-        "    New records added      {vel_color}{new_records_30d}{reset}"
-    );
+    println!("    New records added      {vel_color}{new_records_30d}{reset}");
 
     // Records confirmed by 2+ devs
     let multi_contributor = all_records
@@ -251,9 +251,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         .filter(|r| r.confidence.contributor_count >= 2)
         .count() as u32;
     let mc_color = if multi_contributor > 0 { green } else { yellow };
-    println!(
-        "    Confirmed by 2+ devs  {mc_color}{multi_contributor}{reset}"
-    );
+    println!("    Confirmed by 2+ devs  {mc_color}{multi_contributor}{reset}");
 
     println!();
 
@@ -280,20 +278,24 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         .iter()
         .filter(|fr| fr.is_hotspot && fr.purpose.is_empty())
         .count();
-    let cu_color = if critical_uncovered == 0 { green } else { yellow };
-    println!(
-        "    Critical files uncov.  {cu_color}{critical_uncovered}{reset}"
-    );
+    let cu_color = if critical_uncovered == 0 {
+        green
+    } else {
+        yellow
+    };
+    println!("    Critical files uncov.  {cu_color}{critical_uncovered}{reset}");
 
     // Orphaned decisions (from gaps)
     let orphaned_decisions = gap_list
         .iter()
         .filter(|g| g.gap_type == mati_core::store::GapType::OrphanedDecision)
         .count();
-    let od_color = if orphaned_decisions == 0 { green } else { yellow };
-    println!(
-        "    Orphaned decisions     {od_color}{orphaned_decisions}{reset}"
-    );
+    let od_color = if orphaned_decisions == 0 {
+        green
+    } else {
+        yellow
+    };
+    println!("    Orphaned decisions     {od_color}{orphaned_decisions}{reset}");
 
     // Low-confidence records (confidence < 0.3)
     let low_confidence = all_records
@@ -301,9 +303,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         .filter(|r| r.confidence.value < 0.3)
         .count();
     let lc_color = if low_confidence == 0 { green } else { yellow };
-    println!(
-        "    Low-confidence (<0.3)  {lc_color}{low_confidence}{reset}"
-    );
+    println!("    Low-confidence (<0.3)  {lc_color}{low_confidence}{reset}");
 
     println!();
 
@@ -328,20 +328,14 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
             "    Hit rate               {hr_color}{hit_rate:.0}%{reset}  ({white}{hits_7d}{reset} hits / {white}{total_lookups}{reset} lookups)"
         );
     } else {
-        println!(
-            "    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)"
-        );
+        println!("    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)");
     }
 
     let bp_color = if bypasses_7d == 0 { green } else { yellow };
     if bypasses_7d > 0 || total_lookups > 0 {
-        println!(
-            "    Bypasses               {bp_color}{bypasses_7d}{reset}"
-        );
+        println!("    Bypasses               {bp_color}{bypasses_7d}{reset}");
     } else {
-        println!(
-            "    Bypasses               {gray}\u{2014}{reset}"
-        );
+        println!("    Bypasses               {gray}\u{2014}{reset}");
     }
 
     println!();
@@ -390,12 +384,10 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
     write_snapshot_record(&store, &snapshot, now).await?;
 
-    println!(
-        "  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}"
-    );
+    println!("  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}");
 
-    // Unconfirmed gotcha warning — gotchas vec is already scanned + filtered for Active
-    let unconfirmed_count = gotchas
+    // ── Review backlog ────────────────────────────────────────────────
+    let unconfirmed: Vec<&mati_core::store::Record> = gotchas
         .iter()
         .filter(|r| {
             r.payload
@@ -404,15 +396,33 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
                 .and_then(|v| v.as_bool())
                 == Some(false)
         })
-        .count();
+        .collect();
 
-    if unconfirmed_count > 0 {
+    if !unconfirmed.is_empty() {
+        let oldest_created = unconfirmed.iter().map(|r| r.created_at).min().unwrap_or(now);
+        let oldest_days = (now.saturating_sub(oldest_created)) / 86400;
+        let confirmed_total = gotchas.len() - unconfirmed.len();
+        let confirmation_rate = if gotchas.is_empty() {
+            0
+        } else {
+            (confirmed_total as f32 / gotchas.len() as f32 * 100.0) as u32
+        };
+
         println!();
+        println!("  {bold}{blue}Review backlog{reset}");
+
+        let age_color = if oldest_days > 14 { yellow } else { white };
         println!(
-            "  {yellow}\u{26a0}\u{fe0f}  {unconfirmed_count} unconfirmed gotcha{} pending review{reset}",
-            if unconfirmed_count == 1 { "" } else { "s" }
+            "    Pending            {yellow}{}{reset}",
+            unconfirmed.len()
         );
-        println!("  {yellow}    Run `mati review` to activate hook enforcement{reset}");
+        println!(
+            "    Confirmation rate  {white}{confirmation_rate}%{reset}  {gray}({confirmed_total}/{} gotchas){reset}",
+            gotchas.len()
+        );
+        println!(
+            "    Oldest pending     {age_color}{oldest_days}d{reset}"
+        );
     }
 
     println!();
@@ -424,7 +434,11 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 // ── Snapshot persistence ──────────────────────────────────────────────────────
 
 /// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` via proxy.
-async fn write_snapshot_record(store: &StoreProxy, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+async fn write_snapshot_record(
+    store: &StoreProxy,
+    snapshot: &HealthSnapshot,
+    now: u64,
+) -> Result<()> {
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
         value: String::new(),
@@ -557,7 +571,11 @@ pub async fn seed_snapshot(
 }
 
 /// Write a `HealthSnapshot` to the stable `SNAPSHOT_KEY` via direct Store.
-async fn write_snapshot_record_direct(store: &Store, snapshot: &HealthSnapshot, now: u64) -> Result<()> {
+async fn write_snapshot_record_direct(
+    store: &Store,
+    snapshot: &HealthSnapshot,
+    now: u64,
+) -> Result<()> {
     let record = Record {
         key: SNAPSHOT_KEY.to_string(),
         value: String::new(),
@@ -632,19 +650,31 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
         s.files_with_purpose, s.total_files
     );
 
-    let gph_color = if s.gotchas_per_hotspot >= 2.0 { green } else { yellow };
+    let gph_color = if s.gotchas_per_hotspot >= 2.0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Gotchas per hotspot    {gph_color}{:.1}{reset}  (target >= 2.0)",
         s.gotchas_per_hotspot
     );
 
-    let dec_color = if s.decisions_documented > 0 { green } else { yellow };
+    let dec_color = if s.decisions_documented > 0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Decisions documented   {dec_color}{}{reset}",
         s.decisions_documented
     );
 
-    let conf_color = if s.avg_confidence >= 0.6 { green } else { yellow };
+    let conf_color = if s.avg_confidence >= 0.6 {
+        green
+    } else {
+        yellow
+    };
     if s.avg_confidence == 0.0 && s.decisions_documented == 0 {
         println!("    Avg confidence         {gray}—  (no gotchas or decisions yet){reset}");
     } else {
@@ -672,7 +702,11 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
         s.new_records_30d
     );
 
-    let mc_color = if s.multi_contributor_records > 0 { green } else { yellow };
+    let mc_color = if s.multi_contributor_records > 0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Confirmed by 2+ devs  {mc_color}{}{reset}",
         s.multi_contributor_records
@@ -684,19 +718,31 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 
     println!("  {bold}{blue}Onboarding readiness{reset}");
 
-    let min_color = if s.estimated_minutes <= 10.0 { green } else { yellow };
+    let min_color = if s.estimated_minutes <= 10.0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Estimated onboarding   {min_color}{:.0} min{reset}",
         s.estimated_minutes
     );
 
-    let cu_color = if s.critical_uncovered == 0 { green } else { yellow };
+    let cu_color = if s.critical_uncovered == 0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Critical files uncov.  {cu_color}{}{reset}",
         s.critical_uncovered
     );
 
-    let od_color = if s.orphaned_decisions == 0 { green } else { yellow };
+    let od_color = if s.orphaned_decisions == 0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Orphaned decisions     {od_color}{}{reset}",
         s.orphaned_decisions
@@ -728,9 +774,7 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
             s.hits_7d
         );
     } else {
-        println!(
-            "    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)"
-        );
+        println!("    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)");
     }
 
     let bp_color = if s.bypasses_7d == 0 { green } else { yellow };
@@ -740,9 +784,7 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
             s.bypasses_7d
         );
     } else {
-        println!(
-            "    Bypasses               {gray}\u{2014}{reset}"
-        );
+        println!("    Bypasses               {gray}\u{2014}{reset}");
     }
 
     println!();
@@ -885,10 +927,16 @@ mod tests {
 
         assert_eq!(deserialized.files_with_purpose, snapshot.files_with_purpose);
         assert_eq!(deserialized.total_files, snapshot.total_files);
-        assert_eq!(deserialized.decisions_documented, snapshot.decisions_documented);
+        assert_eq!(
+            deserialized.decisions_documented,
+            snapshot.decisions_documented
+        );
         assert_eq!(deserialized.knowledge_gaps, snapshot.knowledge_gaps);
         assert_eq!(deserialized.new_records_30d, snapshot.new_records_30d);
-        assert_eq!(deserialized.multi_contributor_records, snapshot.multi_contributor_records);
+        assert_eq!(
+            deserialized.multi_contributor_records,
+            snapshot.multi_contributor_records
+        );
         assert_eq!(deserialized.critical_uncovered, snapshot.critical_uncovered);
         assert_eq!(deserialized.orphaned_decisions, snapshot.orphaned_decisions);
         assert_eq!(deserialized.low_confidence, snapshot.low_confidence);

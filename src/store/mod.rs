@@ -8,7 +8,9 @@
 
 pub mod db;
 pub mod durability;
+pub mod gotcha_ops;
 pub mod record;
+pub mod repair;
 pub mod session;
 
 pub use db::{derive_slug, Store};

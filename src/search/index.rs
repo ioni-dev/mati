@@ -51,11 +51,11 @@ const WRITER_HEAP_BYTES: usize = 50_000_000;
 /// need to call `schema.get_field(name)` (which panics on unknown names).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Fields {
-    pub(crate) key:        tantivy::schema::Field,
-    pub(crate) value:      tantivy::schema::Field,
-    pub(crate) category:   tantivy::schema::Field,
-    pub(crate) tags:       tantivy::schema::Field,
-    pub(crate) priority:   tantivy::schema::Field,
+    pub(crate) key: tantivy::schema::Field,
+    pub(crate) value: tantivy::schema::Field,
+    pub(crate) category: tantivy::schema::Field,
+    pub(crate) tags: tantivy::schema::Field,
+    pub(crate) priority: tantivy::schema::Field,
     pub(crate) updated_at: tantivy::schema::Field,
 }
 
@@ -68,7 +68,7 @@ pub(crate) struct Fields {
 /// an existing one. Corrupt indices must be detected and rebuilt by the caller
 /// (see C4 in ARCHITECTURE.md).
 pub struct Search {
-    pub(crate) index:  Index,
+    pub(crate) index: Index,
     pub(crate) fields: Fields,
     /// Tantivy index writer — held open for the session lifetime.
     /// Wrapped in `Mutex` so `add_record` can take `&self` (matching
@@ -124,7 +124,12 @@ impl Search {
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
 
-        Ok(Self { index, fields, writer: Mutex::new(writer), reader })
+        Ok(Self {
+            index,
+            fields,
+            writer: Mutex::new(writer),
+            reader,
+        })
     }
 
     /// Index a single record and commit immediately.
@@ -184,16 +189,15 @@ impl Search {
                         "tantivy rollback failed after staging error: {rb:#}"
                     );
                 }
-                return Err(anyhow::Error::from(e)).with_context(|| {
-                    format!("search index staging failed at record {i}/{total}")
-                });
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("search index staging failed at record {i}/{total}"));
             }
         }
 
         // Single commit — makes all staged documents searchable.
-        writer.commit().with_context(|| {
-            format!("tantivy commit failed after staging {total} records")
-        })?;
+        writer
+            .commit()
+            .with_context(|| format!("tantivy commit failed after staging {total} records"))?;
 
         Ok(total)
     }
@@ -203,7 +207,10 @@ impl Search {
     /// Must be called before dropping `Search` to ensure all indexed documents
     /// are committed. After `close`, the index is safe to reopen.
     pub fn close(self) -> Result<()> {
-        let mut writer = self.writer.into_inner().expect("search writer lock poisoned");
+        let mut writer = self
+            .writer
+            .into_inner()
+            .expect("search writer lock poisoned");
         writer.commit()?;
         Ok(())
     }
@@ -296,18 +303,21 @@ fn is_searchable(record: &Record) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "pyi" | "go" | "java")
+    matches!(
+        ext,
+        "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "pyi" | "go" | "java"
+    )
 }
 
 /// Convert a `Record` into a tantivy document ready for indexing.
 fn record_to_doc(record: &Record, fields: &Fields) -> TantivyDocument {
     let mut doc = TantivyDocument::default();
-    doc.add_text(fields.key,        &record.key);
-    doc.add_text(fields.value,      &record.value);
-    doc.add_text(fields.category,   category_str(&record.category));
-    doc.add_text(fields.tags,       record.tags.join(" "));
-    doc.add_u64(fields.priority,    priority_u64(&record.priority));
-    doc.add_u64(fields.updated_at,  record.updated_at);
+    doc.add_text(fields.key, &record.key);
+    doc.add_text(fields.value, &record.value);
+    doc.add_text(fields.category, category_str(&record.category));
+    doc.add_text(fields.tags, record.tags.join(" "));
+    doc.add_u64(fields.priority, priority_u64(&record.priority));
+    doc.add_u64(fields.updated_at, record.updated_at);
     doc
 }
 
@@ -315,23 +325,23 @@ fn record_to_doc(record: &Record, fields: &Fields) -> TantivyDocument {
 /// so tantivy category values are consistent with JSON serialization.
 fn category_str(cat: &Category) -> &'static str {
     match cat {
-        Category::Gotcha     => "gotcha",
-        Category::File       => "file",
-        Category::Decision   => "decision",
-        Category::Stage      => "stage",
+        Category::Gotcha => "gotcha",
+        Category::File => "file",
+        Category::Decision => "decision",
+        Category::Stage => "stage",
         Category::Dependency => "dependency",
-        Category::DevNote    => "dev_note",
-        Category::Session    => "session",
-        Category::Analytics  => "analytics",
+        Category::DevNote => "dev_note",
+        Category::Session => "session",
+        Category::Analytics => "analytics",
     }
 }
 
 /// Map `Priority` to a sortable u64 — matches the derived `Ord` ordering.
 fn priority_u64(p: &Priority) -> u64 {
     match p {
-        Priority::Low      => 0,
-        Priority::Normal   => 1,
-        Priority::High     => 2,
+        Priority::Low => 0,
+        Priority::Normal => 1,
+        Priority::High => 2,
         Priority::Critical => 3,
     }
 }
@@ -345,14 +355,24 @@ fn priority_u64(p: &Priority) -> u64 {
 pub(crate) fn schema() -> (Schema, Fields) {
     let mut b = Schema::builder();
 
-    let key        = b.add_text_field("key",        TEXT | STORED);
-    let value      = b.add_text_field("value",      TEXT | STORED);
-    let category   = b.add_text_field("category",   STRING | STORED | FAST);
-    let tags       = b.add_text_field("tags",        TEXT | STORED);
-    let priority   = b.add_u64_field("priority",    numeric_stored_fast());
-    let updated_at = b.add_u64_field("updated_at",  numeric_stored_fast());
+    let key = b.add_text_field("key", TEXT | STORED);
+    let value = b.add_text_field("value", TEXT | STORED);
+    let category = b.add_text_field("category", STRING | STORED | FAST);
+    let tags = b.add_text_field("tags", TEXT | STORED);
+    let priority = b.add_u64_field("priority", numeric_stored_fast());
+    let updated_at = b.add_u64_field("updated_at", numeric_stored_fast());
 
-    (b.build(), Fields { key, value, category, tags, priority, updated_at })
+    (
+        b.build(),
+        Fields {
+            key,
+            value,
+            category,
+            tags,
+            priority,
+            updated_at,
+        },
+    )
 }
 
 /// `STORED | FAST` for u64 fields — tantivy requires `NumericOptions`, not
@@ -369,11 +389,11 @@ fn numeric_stored_fast() -> NumericOptions {
 /// correct even if field insertion order ever changes across binary versions.
 fn fields_from_schema(s: &Schema) -> Result<Fields> {
     Ok(Fields {
-        key:        s.get_field("key")?,
-        value:      s.get_field("value")?,
-        category:   s.get_field("category")?,
-        tags:       s.get_field("tags")?,
-        priority:   s.get_field("priority")?,
+        key: s.get_field("key")?,
+        value: s.get_field("value")?,
+        category: s.get_field("category")?,
+        tags: s.get_field("tags")?,
+        priority: s.get_field("priority")?,
         updated_at: s.get_field("updated_at")?,
     })
 }
@@ -419,7 +439,8 @@ mod tests {
             .get_indexing_options()
             .expect("category must have indexing options");
         assert_eq!(
-            indexing.tokenizer(), "raw",
+            indexing.tokenizer(),
+            "raw",
             "category must use raw tokenizer (STRING), not default (TEXT)"
         );
     }
@@ -499,30 +520,30 @@ mod tests {
 
     fn make_record(key: &str, value: &str, tags: &[&str]) -> Record {
         use crate::store::record::{
-            Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle,
-            RecordSource, RecordVersion, StalenessScore,
+            Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle, RecordSource,
+            RecordVersion, StalenessScore,
         };
         Record {
-            key:               key.to_string(),
-            value:             value.to_string(),
-            category:          Category::Gotcha,
-            priority:          Priority::Normal,
-            tags:              tags.iter().map(|s| s.to_string()).collect(),
-            created_at:        0,
-            updated_at:        0,
-            ref_url:           None,
-            staleness:         StalenessScore::fresh(),
-            lifecycle:         RecordLifecycle::Active,
-            version:           RecordVersion {
-                device_id:     uuid::Uuid::new_v4(),
+            key: key.to_string(),
+            value: value.to_string(),
+            category: Category::Gotcha,
+            priority: Priority::Normal,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            created_at: 0,
+            updated_at: 0,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
                 logical_clock: 1,
-                wall_clock:    0,
+                wall_clock: 0,
             },
-            quality:           QualityScore::layer0_default(),
-            access_count:      0,
-            last_accessed:     0,
-            source:            RecordSource::StaticAnalysis,
-            confidence:        ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
             payload: None,
         }
@@ -564,7 +585,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         // "inference" only appears in value, not in key or tags
-        let r = make_record("gotcha:async-race", "never use inference in async context", &[]);
+        let r = make_record(
+            "gotcha:async-race",
+            "never use inference in async context",
+            &[],
+        );
         s.add_record(&r).unwrap();
         let keys = s.query_keys("inference", 10).unwrap();
         assert_eq!(keys, vec!["gotcha:async-race"]);
@@ -575,7 +600,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         // "performance" only in tags
-        let r = make_record("file:engine/mod.rs", "engine entry point", &["performance", "critical"]);
+        let r = make_record(
+            "file:engine/mod.rs",
+            "engine entry point",
+            &["performance", "critical"],
+        );
         s.add_record(&r).unwrap();
         let keys = s.query_keys("performance", 10).unwrap();
         assert_eq!(keys, vec!["file:engine/mod.rs"]);
@@ -586,7 +615,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         // "surrealkv" only in the key; value/tags have different terms
-        let r = make_record("gotcha:surrealkv-versioning", "retention is always enabled", &[]);
+        let r = make_record(
+            "gotcha:surrealkv-versioning",
+            "retention is always enabled",
+            &[],
+        );
         s.add_record(&r).unwrap();
         let keys = s.query_keys("surrealkv", 10).unwrap();
         assert_eq!(keys, vec!["gotcha:surrealkv-versioning"]);
@@ -601,7 +634,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         // Record A: "petgraph" in the key
-        let a = make_record("gotcha:petgraph-cycles", "watch for cycles in traversal", &[]);
+        let a = make_record(
+            "gotcha:petgraph-cycles",
+            "watch for cycles in traversal",
+            &[],
+        );
         // Record B: "petgraph" only in value, noisier text
         let b = make_record(
             "gotcha:graph-general",
@@ -613,7 +650,10 @@ mod tests {
 
         let keys = s.query_keys("petgraph", 10).unwrap();
         assert_eq!(keys.len(), 2, "both records must match");
-        assert_eq!(keys[0], "gotcha:petgraph-cycles", "key match must rank first");
+        assert_eq!(
+            keys[0], "gotcha:petgraph-cycles",
+            "key match must rank first"
+        );
     }
 
     // ── limit ────────────────────────────────────────────────────────────────
@@ -624,7 +664,13 @@ mod tests {
         let s = open_search(&dir);
         // Use add_records (batch path) — single commit, tests that path too
         let records: Vec<Record> = (0..20)
-            .map(|i| make_record(&format!("gotcha:item-{i:02}"), "tokio runtime executor gotcha", &[]))
+            .map(|i| {
+                make_record(
+                    &format!("gotcha:item-{i:02}"),
+                    "tokio runtime executor gotcha",
+                    &[],
+                )
+            })
             .collect();
         let refs: Vec<&Record> = records.iter().collect();
         s.add_records(&refs).unwrap();
@@ -649,26 +695,30 @@ mod tests {
         let device_id = uuid::Uuid::nil();
         let make = |key: &str, value: &str| -> Record {
             use crate::store::record::{
-                Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle,
-                RecordSource, RecordVersion, StalenessScore,
+                Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle, RecordSource,
+                RecordVersion, StalenessScore,
             };
             Record {
-                key:               key.to_string(),
-                value:             value.to_string(),
-                category:          Category::File,
-                priority:          Priority::Normal,
-                tags:              vec![],
-                created_at:        0,
-                updated_at:        0,
-                ref_url:           None,
-                staleness:         StalenessScore::fresh(),
-                lifecycle:         RecordLifecycle::Active,
-                version:           RecordVersion { device_id, logical_clock: 1, wall_clock: 0 },
-                quality:           QualityScore::layer0_default(),
-                access_count:      0,
-                last_accessed:     0,
-                source:            RecordSource::StaticAnalysis,
-                confidence:        ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+                key: key.to_string(),
+                value: value.to_string(),
+                category: Category::File,
+                priority: Priority::Normal,
+                tags: vec![],
+                created_at: 0,
+                updated_at: 0,
+                ref_url: None,
+                staleness: StalenessScore::fresh(),
+                lifecycle: RecordLifecycle::Active,
+                version: RecordVersion {
+                    device_id,
+                    logical_clock: 1,
+                    wall_clock: 0,
+                },
+                quality: QualityScore::layer0_default(),
+                access_count: 0,
+                last_accessed: 0,
+                source: RecordSource::StaticAnalysis,
+                confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
                 gap_analysis_score: 0.0,
                 payload: None,
             }
@@ -689,36 +739,50 @@ mod tests {
 
         // 20 target records containing the unique sentinel term
         let targets: Vec<Record> = (0..20_usize)
-            .map(|i| make(
-                &format!("gotcha:target-{i:02}"),
-                &format!("zqx_sentinel_500k_proof unique term record {i} extra text filler"),
-            ))
+            .map(|i| {
+                make(
+                    &format!("gotcha:target-{i:02}"),
+                    &format!("zqx_sentinel_500k_proof unique term record {i} extra text filler"),
+                )
+            })
             .collect();
         s.add_records(&targets.iter().collect::<Vec<_>>()).unwrap();
 
         // All 20 targets returned, zero noise leaks through
         let keys = s.query_keys("zqx_sentinel_500k_proof", 20).unwrap();
-        assert_eq!(keys.len(), 20,
-            "expected 20 hits from 500,020 records, got {}", keys.len());
+        assert_eq!(
+            keys.len(),
+            20,
+            "expected 20 hits from 500,020 records, got {}",
+            keys.len()
+        );
 
         let target_keys: Vec<String> = targets.iter().map(|r| r.key.clone()).collect();
         for k in &target_keys {
             assert!(keys.contains(k), "missing target key: {k}");
         }
         for k in &keys {
-            assert!(k.starts_with("gotcha:target-"),
-                "noise doc '{k}' leaked into results");
+            assert!(
+                k.starts_with("gotcha:target-"),
+                "noise doc '{k}' leaked into results"
+            );
         }
 
         // Limit enforcement at scale
         let limited = s.query_keys("zqx_sentinel_500k_proof", 5).unwrap();
-        assert_eq!(limited.len(), 5,
-            "limit=5 must cap results even with 20 matching docs in 500k corpus");
+        assert_eq!(
+            limited.len(),
+            5,
+            "limit=5 must cap results even with 20 matching docs in 500k corpus"
+        );
 
         // Over-limit returns exactly the matching set, not more
         let over = s.query_keys("zqx_sentinel_500k_proof", 999).unwrap();
-        assert_eq!(over.len(), 20,
-            "limit > match count must return all matches, not panic");
+        assert_eq!(
+            over.len(),
+            20,
+            "limit > match count must return all matches, not panic"
+        );
     }
 
     // ── adversarial / malformed queries ─────────────────────────────────────
@@ -732,8 +796,10 @@ mod tests {
         let r = make_record("gotcha:async-race", "inference in async context", &[]);
         s.add_record(&r).unwrap();
         let keys = s.query_keys("inference AND", 10).unwrap();
-        assert!(keys.contains(&"gotcha:async-race".to_string()),
-            "lenient parse must still match 'inference'");
+        assert!(
+            keys.contains(&"gotcha:async-race".to_string()),
+            "lenient parse must still match 'inference'"
+        );
     }
 
     #[test]
@@ -770,7 +836,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         // Value contains both ASCII and Unicode; the ASCII term must still match
-        let r = make_record("decision:i18n", "latency gotcha for データベース queries", &[]);
+        let r = make_record(
+            "decision:i18n",
+            "latency gotcha for データベース queries",
+            &[],
+        );
         s.add_record(&r).unwrap();
         let keys = s.query_keys("latency", 10).unwrap();
         assert_eq!(keys, vec!["decision:i18n"]);
@@ -788,8 +858,11 @@ mod tests {
         s.add_record(&r).unwrap();
         s.add_record(&r).unwrap(); // index same doc a second time
         let keys = s.query_keys("duplicate", 10).unwrap();
-        assert_eq!(keys, vec!["gotcha:dup"],
-            "duplicate tantivy entries must be deduplicated in results");
+        assert_eq!(
+            keys,
+            vec!["gotcha:dup"],
+            "duplicate tantivy entries must be deduplicated in results"
+        );
     }
 
     // ── read-after-write ─────────────────────────────────────────────────────
@@ -811,12 +884,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
         let records: Vec<Record> = (0..10)
-            .map(|i| make_record(&format!("gotcha:batch-{i}"), "batchwrite rayon parallel", &[]))
+            .map(|i| {
+                make_record(
+                    &format!("gotcha:batch-{i}"),
+                    "batchwrite rayon parallel",
+                    &[],
+                )
+            })
             .collect();
         let refs: Vec<&Record> = records.iter().collect();
         s.add_records(&refs).unwrap();
         let keys = s.query_keys("rayon", 20).unwrap();
-        assert_eq!(keys.len(), 10, "all 10 batch records must be searchable immediately");
+        assert_eq!(
+            keys.len(),
+            10,
+            "all 10 batch records must be searchable immediately"
+        );
     }
 
     // ── no match ─────────────────────────────────────────────────────────────
@@ -827,7 +910,10 @@ mod tests {
         let s = open_search(&dir);
         let r = make_record("gotcha:foo", "unrelated content about bananas", &[]);
         s.add_record(&r).unwrap();
-        assert!(s.query_keys("surrealdb_not_in_any_record", 10).unwrap().is_empty());
+        assert!(s
+            .query_keys("surrealdb_not_in_any_record", 10)
+            .unwrap()
+            .is_empty());
     }
 
     // ── result correctness ───────────────────────────────────────────────────
@@ -836,11 +922,18 @@ mod tests {
     fn query_keys_returns_key_strings_not_values() {
         let dir = TempDir::new().unwrap();
         let s = open_search(&dir);
-        let r = make_record("decision:use-surrealkv", "SurrealKV chosen for durability guarantees", &[]);
+        let r = make_record(
+            "decision:use-surrealkv",
+            "SurrealKV chosen for durability guarantees",
+            &[],
+        );
         s.add_record(&r).unwrap();
         let keys = s.query_keys("durability", 10).unwrap();
-        assert_eq!(keys, vec!["decision:use-surrealkv"],
-            "must return the key string, not the value body");
+        assert_eq!(
+            keys,
+            vec!["decision:use-surrealkv"],
+            "must return the key string, not the value body"
+        );
     }
 
     #[test]
@@ -856,7 +949,9 @@ mod tests {
         // Both-term record must score highest
         let keys = s.query_keys("tantivy petgraph", 10).unwrap();
         assert!(!keys.is_empty());
-        assert_eq!(keys[0], "gotcha:both-terms",
-            "record containing both query terms must rank first");
+        assert_eq!(
+            keys[0], "gotcha:both-terms",
+            "record containing both query terms must rank first"
+        );
     }
 }

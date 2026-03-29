@@ -51,7 +51,10 @@ fn spawn_reader(stdout: std::process::ChildStdout) -> mpsc::Receiver<String> {
             match reader.read_line(&mut buf) {
                 Ok(0) => break, // EOF — server exited
                 Ok(_) => {
-                    let line = buf.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                    let line = buf
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_string();
                     if line.is_empty() {
                         continue; // skip blank lines
                     }
@@ -132,7 +135,10 @@ fn mcp_stdio_all_three_tools() {
         .expect("failed to spawn `mati serve`");
 
     let stdin = child.stdin.take().expect("mati serve has no stdin handle");
-    let stdout = child.stdout.take().expect("mati serve has no stdout handle");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("mati serve has no stdout handle");
 
     // Move `child` into the guard *after* extracting stdin/stdout.
     let _guard = ChildGuard(child);

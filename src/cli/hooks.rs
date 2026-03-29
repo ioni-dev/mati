@@ -12,9 +12,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use mati_core::store::{Category, GotchaRecord, Record, Store};
-use mati_core::store::session as sess;
 use crate::cli::daemon::{daemon_result, mati_root_for, try_auto_start, DaemonResult};
+use mati_core::store::session as sess;
+use mati_core::store::{Category, GotchaRecord, Record, Store};
 
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
 
@@ -75,13 +75,13 @@ fn extract_confirmed(record: &Record) -> bool {
     if record.category != Category::Gotcha {
         return false;
     }
-    record.payload_as::<GotchaRecord>()
+    record
+        .payload_as::<GotchaRecord>()
         .map(|g| g.confirmed)
         .unwrap_or(false)
 }
 
 // ── M-09-G: Internal hook commands ──────────────────────────────────────────
-
 
 // ── log-miss ─────────────────────────────────────────────────────────────────
 
@@ -105,7 +105,9 @@ pub async fn run_log_miss(key: &str) -> Result<()> {
                 );
                 return Ok(());
             }
-            tracing::debug!("mati log-miss: daemon unresponsive + process dead — falling back to direct store");
+            tracing::debug!(
+                "mati log-miss: daemon unresponsive + process dead — falling back to direct store"
+            );
             // fall through to Store::open below
         }
     }
@@ -142,7 +144,9 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
                 );
                 return Ok(());
             }
-            tracing::debug!("mati log-hit: daemon unresponsive + process dead — falling back to direct store");
+            tracing::debug!(
+                "mati log-hit: daemon unresponsive + process dead — falling back to direct store"
+            );
             // fall through to Store::open below
         }
     }
@@ -156,7 +160,6 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
 async fn log_hit_impl(store: &Store, key: &str) -> Result<()> {
     sess::log_hit(store, key).await
 }
-
 
 // ── edit-hook (combined log-hit + reparse) ───────────────────────────────────
 
@@ -190,7 +193,9 @@ pub async fn run_edit_hook(path: &str) -> Result<()> {
                 );
                 return Ok(());
             }
-            tracing::debug!("mati edit-hook: daemon unresponsive + process dead — falling back to direct store");
+            tracing::debug!(
+                "mati edit-hook: daemon unresponsive + process dead — falling back to direct store"
+            );
             // fall through to Store::open below
         }
     }
@@ -252,7 +257,13 @@ pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
 
-    match daemon_result(&root, "log_compliance_miss", serde_json::json!({ "key": key })).await {
+    match daemon_result(
+        &root,
+        "log_compliance_miss",
+        serde_json::json!({ "key": key }),
+    )
+    .await
+    {
         DaemonResult::Ok(_) => return Ok(()),
         DaemonResult::NotRunning | DaemonResult::StaleSocket => {
             try_auto_start(&cwd);
@@ -289,12 +300,15 @@ pub async fn run_session_check_consulted(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
 
-    match daemon_result(&root, "session_check_consulted", serde_json::json!({ "key": key })).await {
+    match daemon_result(
+        &root,
+        "session_check_consulted",
+        serde_json::json!({ "key": key }),
+    )
+    .await
+    {
         DaemonResult::Ok(resp) => {
-            let consulted = resp
-                .get("data")
-                .and_then(|d| d.as_bool())
-                .unwrap_or(false);
+            let consulted = resp.get("data").and_then(|d| d.as_bool()).unwrap_or(false);
             println!("{consulted}");
             return Ok(());
         }
@@ -408,9 +422,8 @@ mod tests {
 
     // Session helpers needed by tests — imported from mati_core::store::session.
     use mati_core::store::session::{
-        format_review_date, today_key, now_secs,
-        upsert_daily_agg, DailyAgg, GOTCHA_PROMOTION_ACCESS_THRESHOLD,
-        MAX_STALE_REVIEW_ENTRIES,
+        format_review_date, now_secs, today_key, upsert_daily_agg, DailyAgg,
+        GOTCHA_PROMOTION_ACCESS_THRESHOLD, MAX_STALE_REVIEW_ENTRIES,
     };
     use mati_core::store::{
         ConfidenceScore, Priority, QualityScore, RecordLifecycle, RecordSource, RecordVersion,
@@ -621,7 +634,11 @@ mod tests {
             .await
             .unwrap();
 
-        let record = store.get("analytics:miss_2026-03-18").await.unwrap().unwrap();
+        let record = store
+            .get("analytics:miss_2026-03-18")
+            .await
+            .unwrap()
+            .unwrap();
         let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
         assert_eq!(agg.count, 1);
         assert_eq!(agg.keys, vec!["file:src/main.rs"]);
@@ -635,9 +652,15 @@ mod tests {
         let store = open_test_store(&dir).await;
 
         let agg_key = "analytics:miss_2026-03-18";
-        upsert_daily_agg(&store, agg_key, "file:a.rs").await.unwrap();
-        upsert_daily_agg(&store, agg_key, "file:b.rs").await.unwrap();
-        upsert_daily_agg(&store, agg_key, "file:c.rs").await.unwrap();
+        upsert_daily_agg(&store, agg_key, "file:a.rs")
+            .await
+            .unwrap();
+        upsert_daily_agg(&store, agg_key, "file:b.rs")
+            .await
+            .unwrap();
+        upsert_daily_agg(&store, agg_key, "file:c.rs")
+            .await
+            .unwrap();
 
         let record = store.get(agg_key).await.unwrap().unwrap();
         let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
@@ -653,9 +676,15 @@ mod tests {
         let store = open_test_store(&dir).await;
 
         let agg_key = "analytics:miss_2026-03-18";
-        upsert_daily_agg(&store, agg_key, "file:same.rs").await.unwrap();
-        upsert_daily_agg(&store, agg_key, "file:same.rs").await.unwrap();
-        upsert_daily_agg(&store, agg_key, "file:same.rs").await.unwrap();
+        upsert_daily_agg(&store, agg_key, "file:same.rs")
+            .await
+            .unwrap();
+        upsert_daily_agg(&store, agg_key, "file:same.rs")
+            .await
+            .unwrap();
+        upsert_daily_agg(&store, agg_key, "file:same.rs")
+            .await
+            .unwrap();
 
         let record = store.get(agg_key).await.unwrap().unwrap();
         let agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap();
@@ -692,8 +721,12 @@ mod tests {
         let store = open_test_store(&dir).await;
 
         let agg_key = "analytics:miss_2026-03-18";
-        upsert_daily_agg(&store, agg_key, "file:a.rs").await.unwrap();
-        upsert_daily_agg(&store, agg_key, "file:b.rs").await.unwrap();
+        upsert_daily_agg(&store, agg_key, "file:a.rs")
+            .await
+            .unwrap();
+        upsert_daily_agg(&store, agg_key, "file:b.rs")
+            .await
+            .unwrap();
 
         let record = store.get(agg_key).await.unwrap().unwrap();
         assert_eq!(
@@ -713,8 +746,14 @@ mod tests {
 
         log_hit_impl(&store, "file:src/main.rs").await.unwrap();
 
-        let marker = store.get("session:consulted:file:src/main.rs").await.unwrap();
-        assert!(marker.is_some(), "consulted marker should exist after log-hit");
+        let marker = store
+            .get("session:consulted:file:src/main.rs")
+            .await
+            .unwrap();
+        assert!(
+            marker.is_some(),
+            "consulted marker should exist after log-hit"
+        );
 
         store.close().await.unwrap();
     }
@@ -750,13 +789,11 @@ mod tests {
         log_hit_impl(&store, "file:ghost.rs").await.unwrap();
 
         // Consulted marker still created
-        assert!(
-            store
-                .get("session:consulted:file:ghost.rs")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get("session:consulted:file:ghost.rs")
+            .await
+            .unwrap()
+            .is_some());
 
         store.close().await.unwrap();
     }
@@ -784,7 +821,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = open_test_store(&dir).await;
 
-        let result = check_consulted_impl(&store, "file:src/main.rs").await.unwrap();
+        let result = check_consulted_impl(&store, "file:src/main.rs")
+            .await
+            .unwrap();
         assert!(!result);
 
         store.close().await.unwrap();
@@ -797,7 +836,9 @@ mod tests {
 
         log_hit_impl(&store, "file:src/main.rs").await.unwrap();
 
-        let result = check_consulted_impl(&store, "file:src/main.rs").await.unwrap();
+        let result = check_consulted_impl(&store, "file:src/main.rs")
+            .await
+            .unwrap();
         assert!(result);
 
         store.close().await.unwrap();
@@ -892,18 +933,22 @@ mod tests {
 
         // Consulted markers should be cleaned up
         let markers_after = store.scan_keys("session:consulted:").await.unwrap();
-        assert!(markers_after.is_empty(), "harvest should clean up consulted markers");
+        assert!(
+            markers_after.is_empty(),
+            "harvest should clean up consulted markers"
+        );
 
         // A permanent session:<timestamp> record should exist
         let all_sessions = store.scan_prefix("session:").await.unwrap();
         let permanent: Vec<_> = all_sessions
             .iter()
-            .filter(|r| {
-                r.key != "session:current"
-                    && !r.key.starts_with("session:consulted:")
-            })
+            .filter(|r| r.key != "session:current" && !r.key.starts_with("session:consulted:"))
             .collect();
-        assert_eq!(permanent.len(), 1, "should have exactly one permanent session record");
+        assert_eq!(
+            permanent.len(),
+            1,
+            "should have exactly one permanent session record"
+        );
 
         // Permanent record should contain the flushed data
         let parsed = permanent[0].payload.as_ref().unwrap();
@@ -1042,9 +1087,15 @@ mod tests {
             .unwrap();
 
         // 2. Verify consulted state
-        assert!(check_consulted_impl(&store, "file:src/main.rs").await.unwrap());
-        assert!(check_consulted_impl(&store, "file:src/lib.rs").await.unwrap());
-        assert!(!check_consulted_impl(&store, "file:src/unknown.rs").await.unwrap());
+        assert!(check_consulted_impl(&store, "file:src/main.rs")
+            .await
+            .unwrap());
+        assert!(check_consulted_impl(&store, "file:src/lib.rs")
+            .await
+            .unwrap());
+        assert!(!check_consulted_impl(&store, "file:src/unknown.rs")
+            .await
+            .unwrap());
 
         // 3. Verify access counts bumped
         let main = store.get("file:src/main.rs").await.unwrap().unwrap();
@@ -1060,8 +1111,12 @@ mod tests {
         session_harvest_impl(&store, dir.path()).await.unwrap();
 
         // Consulted markers gone
-        assert!(!check_consulted_impl(&store, "file:src/main.rs").await.unwrap());
-        assert!(!check_consulted_impl(&store, "file:src/lib.rs").await.unwrap());
+        assert!(!check_consulted_impl(&store, "file:src/main.rs")
+            .await
+            .unwrap());
+        assert!(!check_consulted_impl(&store, "file:src/lib.rs")
+            .await
+            .unwrap());
 
         // Stage updated
         let stage = store.get("stage:current").await.unwrap().unwrap();
@@ -1112,7 +1167,10 @@ mod tests {
 
         let mut record = make_gotcha_record("gotcha:already-confirmed", true);
         record.access_count = 10;
-        store.put("gotcha:already-confirmed", &record).await.unwrap();
+        store
+            .put("gotcha:already-confirmed", &record)
+            .await
+            .unwrap();
 
         let promoted = promote_gotcha_candidates(&store).await.unwrap();
         assert_eq!(promoted, 0);
@@ -1174,12 +1232,19 @@ mod tests {
 
         let entries = collect_stale_entries(
             &store,
-            &["file:src/stale.rs".to_string(), "file:src/fresh.rs".to_string()],
+            &[
+                "file:src/stale.rs".to_string(),
+                "file:src/fresh.rs".to_string(),
+            ],
         )
         .await
         .unwrap();
 
-        assert_eq!(entries.len(), 1, "only record in [0.4, 0.7) range should be included");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only record in [0.4, 0.7) range should be included"
+        );
         assert_eq!(entries[0].key, "file:src/stale.rs");
 
         store.close().await.unwrap();
@@ -1192,11 +1257,17 @@ mod tests {
 
         // Liability (0.7+)
         let liability = make_file_record_with_staleness("file:src/liability.rs", 0.75);
-        store.put("file:src/liability.rs", &liability).await.unwrap();
+        store
+            .put("file:src/liability.rs", &liability)
+            .await
+            .unwrap();
 
         // Tombstone (0.9+)
         let tombstone = make_file_record_with_staleness("file:src/tombstone.rs", 0.95);
-        store.put("file:src/tombstone.rs", &tombstone).await.unwrap();
+        store
+            .put("file:src/tombstone.rs", &tombstone)
+            .await
+            .unwrap();
 
         // In range
         let stale = make_file_record_with_staleness("file:src/stale.rs", 0.55);
@@ -1232,7 +1303,10 @@ mod tests {
 
         let entries = collect_stale_entries(
             &store,
-            &["file:src/low.rs".to_string(), "file:src/high.rs".to_string()],
+            &[
+                "file:src/low.rs".to_string(),
+                "file:src/high.rs".to_string(),
+            ],
         )
         .await
         .unwrap();
@@ -1285,7 +1359,11 @@ mod tests {
         let record = store.get(&review_key).await.unwrap().unwrap();
         let payload: StaleReviewPayload = record.payload_as::<StaleReviewPayload>().unwrap();
 
-        assert_eq!(payload.entries.len(), 2, "should merge entries from both sessions");
+        assert_eq!(
+            payload.entries.len(),
+            2,
+            "should merge entries from both sessions"
+        );
 
         store.close().await.unwrap();
     }
@@ -1469,7 +1547,10 @@ mod tests {
         store.put("file:src/consulted.rs", &stale1).await.unwrap();
 
         let stale2 = make_file_record_with_staleness("file:src/not-consulted.rs", 0.6);
-        store.put("file:src/not-consulted.rs", &stale2).await.unwrap();
+        store
+            .put("file:src/not-consulted.rs", &stale2)
+            .await
+            .unwrap();
 
         let session_value = serde_json::to_string(&serde_json::json!({
             "consulted_keys": ["file:src/consulted.rs"],
@@ -1492,4 +1573,3 @@ mod tests {
         store.close().await.unwrap();
     }
 }
-
