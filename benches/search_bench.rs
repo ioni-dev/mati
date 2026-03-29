@@ -12,16 +12,14 @@
 use std::hint::black_box;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use mati_core::search::Search;
 use mati_core::store::record::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, StalenessTier,
+    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore, StalenessTier,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -78,7 +76,11 @@ fn make_record(i: usize) -> Record {
         tags: vec![
             format!("tag_{}", i % 20),
             format!("team_{}", i % 5),
-            topics[i % topics.len()].split_whitespace().next().unwrap().to_string(),
+            topics[i % topics.len()]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string(),
         ],
         created_at: now,
         updated_at: now,
@@ -127,11 +129,7 @@ fn bench_index_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("search_build");
     group.sample_size(10);
 
-    for &(label, size) in &[
-        ("1k", 1_000),
-        ("10k", 10_000),
-        ("50k", 50_000),
-    ] {
+    for &(label, size) in &[("1k", 1_000), ("10k", 10_000), ("50k", 50_000)] {
         let records = generate_records(size);
         group.throughput(Throughput::Elements(size as u64));
 
@@ -172,43 +170,31 @@ fn bench_query(c: &mut Criterion) {
         "hook enforcement gotcha",
     ];
 
-    for &(label, size) in &[
-        ("1k", 1_000),
-        ("10k", 10_000),
-        ("50k", 50_000),
-    ] {
+    for &(label, size) in &[("1k", 1_000), ("10k", 10_000), ("50k", 50_000)] {
         let records = generate_records(size);
         let (_dir, search) = build_index(&records);
 
         // Standard query (limit=10)
-        group.bench_with_input(
-            BenchmarkId::new("top10", label),
-            &search,
-            |b, search| {
-                let mut idx = 0usize;
-                b.iter(|| {
-                    let q = queries[idx % queries.len()];
-                    let keys = search.query_keys(q, 10).unwrap();
-                    black_box(keys.len());
-                    idx += 1;
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("top10", label), &search, |b, search| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let q = queries[idx % queries.len()];
+                let keys = search.query_keys(q, 10).unwrap();
+                black_box(keys.len());
+                idx += 1;
+            });
+        });
 
         // Large limit (100 results)
-        group.bench_with_input(
-            BenchmarkId::new("top100", label),
-            &search,
-            |b, search| {
-                let mut idx = 0usize;
-                b.iter(|| {
-                    let q = queries[idx % queries.len()];
-                    let keys = search.query_keys(q, 100).unwrap();
-                    black_box(keys.len());
-                    idx += 1;
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("top100", label), &search, |b, search| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let q = queries[idx % queries.len()];
+                let keys = search.query_keys(q, 100).unwrap();
+                black_box(keys.len());
+                idx += 1;
+            });
+        });
 
         // Single-term query
         group.bench_with_input(
@@ -310,9 +296,7 @@ fn bench_search_worst_case(c: &mut Criterion) {
 
 fn bench_extreme_scale(c: &mut Criterion) {
     if std::env::var("MATI_BENCH_EXTREME").is_err() {
-        eprintln!(
-            "Skipping extreme_scale benchmarks. Set MATI_BENCH_EXTREME=1 to enable."
-        );
+        eprintln!("Skipping extreme_scale benchmarks. Set MATI_BENCH_EXTREME=1 to enable.");
         return;
     }
 

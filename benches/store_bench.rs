@@ -14,15 +14,13 @@ use std::hint::black_box;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use mati_core::store::record::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, StalenessTier,
+    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore, StalenessTier,
 };
 use mati_core::store::Store;
 
@@ -194,7 +192,9 @@ fn bench_single_ops(c: &mut Criterion) {
     // search (BM25 query)
     group.bench_function("search_bm25", |b| {
         b.iter(|| {
-            let results = rt.block_on(store.search("process architecture module", 10)).unwrap();
+            let results = rt
+                .block_on(store.search("process architecture module", 10))
+                .unwrap();
             black_box(results.len());
         });
     });
@@ -219,10 +219,7 @@ fn bench_batch_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("store_batch");
     group.sample_size(10);
 
-    for &(label, size) in &[
-        ("1k", 1_000),
-        ("10k", 10_000),
-    ] {
+    for &(label, size) in &[("1k", 1_000), ("10k", 10_000)] {
         let records = generate_records(size);
         group.throughput(Throughput::Elements(size as u64));
 
@@ -254,17 +251,12 @@ fn bench_batch_writes(c: &mut Criterion) {
 fn bench_reads_at_scale(c: &mut Criterion) {
     let mut group = c.benchmark_group("store_reads");
 
-    for &(label, size) in &[
-        ("1k", 1_000),
-        ("10k", 10_000),
-        ("50k", 50_000),
-    ] {
+    for &(label, size) in &[("1k", 1_000), ("10k", 10_000), ("50k", 50_000)] {
         let rt = rt();
         let dir = TempDir::new().unwrap();
         let store = rt.block_on(open_store(dir.path()));
         let records = generate_records(size);
-        let batch: Vec<(&str, &Record)> =
-            records.iter().map(|(k, r)| (k.as_str(), r)).collect();
+        let batch: Vec<(&str, &Record)> = records.iter().map(|(k, r)| (k.as_str(), r)).collect();
         rt.block_on(store.put_batch(&batch)).unwrap();
 
         // Random get (cycle through keys)
@@ -290,19 +282,15 @@ fn bench_reads_at_scale(c: &mut Criterion) {
             "component entry points",
             "issue configuration",
         ];
-        group.bench_with_input(
-            BenchmarkId::new("search_bm25", label),
-            &size,
-            |b, _| {
-                let mut idx = 0usize;
-                b.iter(|| {
-                    let q = queries[idx % queries.len()];
-                    let results = rt.block_on(store.search(q, 10)).unwrap();
-                    black_box(results.len());
-                    idx += 1;
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("search_bm25", label), &size, |b, _| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let q = queries[idx % queries.len()];
+                let results = rt.block_on(store.search(q, 10)).unwrap();
+                black_box(results.len());
+                idx += 1;
+            });
+        });
 
         // Full prefix scan
         group.bench_with_input(
@@ -368,7 +356,8 @@ fn bench_store_worst_case(c: &mut Criterion) {
             gap_analysis_score: 0.0,
             payload: None,
         };
-        rt.block_on(store.put("gotcha:large-value", &record)).unwrap();
+        rt.block_on(store.put("gotcha:large-value", &record))
+            .unwrap();
 
         group.bench_function("get_100kb_value", |b| {
             b.iter(|| {
@@ -379,7 +368,8 @@ fn bench_store_worst_case(c: &mut Criterion) {
 
         group.bench_function("put_100kb_value", |b| {
             b.iter(|| {
-                rt.block_on(store.put("gotcha:large-value", &record)).unwrap();
+                rt.block_on(store.put("gotcha:large-value", &record))
+                    .unwrap();
                 black_box(());
             });
         });
@@ -396,7 +386,8 @@ fn bench_store_worst_case(c: &mut Criterion) {
             b.iter(|| {
                 for i in 0..1_000 {
                     let (_, record) = make_record(i, Category::Gotcha, "gotcha:overwrite-");
-                    rt.block_on(store.put("gotcha:overwrite-target", &record)).unwrap();
+                    rt.block_on(store.put("gotcha:overwrite-target", &record))
+                        .unwrap();
                 }
                 black_box(());
             });
@@ -410,8 +401,7 @@ fn bench_store_worst_case(c: &mut Criterion) {
         let dir = TempDir::new().unwrap();
         let store = rt.block_on(open_store(dir.path()));
         let records = generate_records(10_000);
-        let batch: Vec<(&str, &Record)> =
-            records.iter().map(|(k, r)| (k.as_str(), r)).collect();
+        let batch: Vec<(&str, &Record)> = records.iter().map(|(k, r)| (k.as_str(), r)).collect();
         rt.block_on(store.put_batch(&batch)).unwrap();
 
         group.bench_function("search_no_matches_10k", |b| {
@@ -426,9 +416,7 @@ fn bench_store_worst_case(c: &mut Criterion) {
         // Search with very high limit
         group.bench_function("search_limit_1000_in_10k", |b| {
             b.iter(|| {
-                let results = rt
-                    .block_on(store.search("process module", 1_000))
-                    .unwrap();
+                let results = rt.block_on(store.search("process module", 1_000)).unwrap();
                 black_box(results.len());
             });
         });
@@ -441,8 +429,7 @@ fn bench_store_worst_case(c: &mut Criterion) {
         let dir = TempDir::new().unwrap();
         let store = rt.block_on(open_store(dir.path()));
         let records = generate_records(10_000);
-        let batch: Vec<(&str, &Record)> =
-            records.iter().map(|(k, r)| (k.as_str(), r)).collect();
+        let batch: Vec<(&str, &Record)> = records.iter().map(|(k, r)| (k.as_str(), r)).collect();
         rt.block_on(store.put_batch(&batch)).unwrap();
 
         group.sample_size(10);
@@ -465,9 +452,7 @@ fn bench_store_worst_case(c: &mut Criterion) {
 
 fn bench_extreme_scale(c: &mut Criterion) {
     if std::env::var("MATI_BENCH_EXTREME").is_err() {
-        eprintln!(
-            "Skipping extreme_scale benchmarks. Set MATI_BENCH_EXTREME=1 to enable."
-        );
+        eprintln!("Skipping extreme_scale benchmarks. Set MATI_BENCH_EXTREME=1 to enable.");
         return;
     }
 
@@ -505,8 +490,7 @@ fn bench_extreme_scale(c: &mut Criterion) {
         eprintln!("Writing 500k records to store...");
         // Write in chunks to avoid memory spike
         for chunk in records.chunks(50_000) {
-            let batch: Vec<(&str, &Record)> =
-                chunk.iter().map(|(k, r)| (k.as_str(), r)).collect();
+            let batch: Vec<(&str, &Record)> = chunk.iter().map(|(k, r)| (k.as_str(), r)).collect();
             rt.block_on(store.put_batch(&batch)).unwrap();
         }
         eprintln!("500k records written.");

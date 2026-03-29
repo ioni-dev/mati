@@ -24,8 +24,8 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use mati_core::analysis::walker::{Language, Walker};
     use mati_core::analysis::parser::parse_file;
+    use mati_core::analysis::walker::{Language, Walker};
     use mati_core::graph::{EdgeKind, Graph};
     use mati_core::health::staleness::{apply_reparse_staleness, ReparseDiff, StalenessAnalyzer};
     use mati_core::mcp::tools::assemble_context_packet;
@@ -167,10 +167,7 @@ mod tests {
         );
 
         // get returns individual records
-        let fetched = store
-            .get("file:src/test_0.rs")
-            .await
-            .expect("get failed");
+        let fetched = store.get("file:src/test_0.rs").await.expect("get failed");
         assert!(
             fetched.is_some(),
             "expected to find file:src/test_0.rs via get"
@@ -255,8 +252,9 @@ mod tests {
         let mut any_has_imports = false;
 
         for file in &rust_files {
-            let analysis = parse_file(file)
-                .unwrap_or_else(|e| panic!("parse_file panicked/errored on {}: {e}", file.rel_path));
+            let analysis = parse_file(file).unwrap_or_else(|e| {
+                panic!("parse_file panicked/errored on {}: {e}", file.rel_path)
+            });
 
             // Basic structural invariants
             assert_eq!(
@@ -297,7 +295,9 @@ mod tests {
 
         // Collect real .rs paths from src/ relative to project root.
         fn collect_rs(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
-            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
             for e in entries.flatten() {
                 let p = e.path();
                 if p.is_dir() {
@@ -321,7 +321,10 @@ mod tests {
         for path in &real_paths {
             let key = format!("file:{path}");
             let record = make_file_record(&key);
-            store.put(&key, &record).await.expect("failed to seed record");
+            store
+                .put(&key, &record)
+                .await
+                .expect("failed to seed record");
         }
 
         let seeded = real_paths.len();
@@ -504,9 +507,7 @@ mod tests {
 
         // Build a Graph (takes ownership of store) and add HasGotcha edge.
         // After this, use graph.store() for all store access.
-        let mut graph = Graph::load(store)
-            .await
-            .expect("Graph::load failed");
+        let mut graph = Graph::load(store).await.expect("Graph::load failed");
         graph
             .add_edge(file_key, EdgeKind::HasGotcha, gotcha_key)
             .await
@@ -570,9 +571,7 @@ mod tests {
         }
 
         // Retrieve history
-        let history = store
-            .history(key, 100)
-            .expect("history retrieval failed");
+        let history = store.history(key, 100).expect("history retrieval failed");
 
         // SurrealKV should have at least 2 versions (write timing may coalesce
         // very fast writes, but 4 distinct puts should produce > 1 version)
@@ -655,11 +654,14 @@ type internalState struct {
             .find(|f| f.language == Language::Go)
             .expect("walker must detect service.go as Language::Go");
 
-        let analysis = parse_file(go_file)
-            .expect("parse_file must not error on valid Go source");
+        let analysis = parse_file(go_file).expect("parse_file must not error on valid Go source");
 
         // Language tag
-        assert_eq!(analysis.language, Language::Go, "analysis.language must be Go");
+        assert_eq!(
+            analysis.language,
+            Language::Go,
+            "analysis.language must be Go"
+        );
 
         // Exported function captured
         assert!(
@@ -692,7 +694,9 @@ type internalState struct {
 
         // Unexported type excluded
         assert!(
-            !analysis.exported_types.contains(&"internalState".to_string()),
+            !analysis
+                .exported_types
+                .contains(&"internalState".to_string()),
             "unexported 'internalState' must not appear in exported_types"
         );
     }
@@ -797,15 +801,14 @@ type Handler struct{}
             eprintln!("[smoke_go_real_corpus] cloning {CHI_URL} @ {CHI_TAG}...");
             let status = Command::new("git")
                 .args([
-                    "clone",
-                    "--depth", "1",
-                    "--branch", CHI_TAG,
-                    CHI_URL,
-                    CACHE_PATH,
+                    "clone", "--depth", "1", "--branch", CHI_TAG, CHI_URL, CACHE_PATH,
                 ])
                 .status()
                 .expect("git not found on PATH — install git to run this test");
-            assert!(status.success(), "git clone failed for go-chi/chi {CHI_TAG}");
+            assert!(
+                status.success(),
+                "git clone failed for go-chi/chi {CHI_TAG}"
+            );
             eprintln!("[smoke_go_real_corpus] clone complete");
         } else {
             eprintln!("[smoke_go_real_corpus] reusing cached clone at {CACHE_PATH}");
@@ -830,11 +833,12 @@ type Handler struct{}
 
         // ── Parse all — zero errors allowed ───────────────────────────────────
         let mut parse_errors: Vec<String> = Vec::new();
-        let mut analyses: Vec<(String, mati_core::analysis::parser::StaticFileAnalysis)> = Vec::new();
+        let mut analyses: Vec<(String, mati_core::analysis::parser::StaticFileAnalysis)> =
+            Vec::new();
 
         for file in &go_files {
             match parse_file(file) {
-                Ok(a)  => analyses.push((file.rel_path.clone(), a)),
+                Ok(a) => analyses.push((file.rel_path.clone(), a)),
                 Err(e) => parse_errors.push(format!("{}: {e}", file.rel_path)),
             }
         }
@@ -921,8 +925,8 @@ type Handler struct{}
     async fn smoke_git_history_accessible() {
         let root = project_root();
 
-        let repo = git2::Repository::open(&root)
-            .expect("failed to open git repository at project root");
+        let repo =
+            git2::Repository::open(&root).expect("failed to open git repository at project root");
 
         // HEAD exists
         let head = repo
@@ -935,9 +939,7 @@ type Handler struct{}
 
         // Revwalk: at least 5 commits
         let mut revwalk = repo.revwalk().expect("revwalk creation failed");
-        revwalk
-            .push_head()
-            .expect("failed to push HEAD to revwalk");
+        revwalk.push_head().expect("failed to push HEAD to revwalk");
         let commit_count = revwalk.take(100).filter(|r| r.is_ok()).count();
         assert!(
             commit_count >= 5,

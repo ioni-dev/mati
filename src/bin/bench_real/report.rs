@@ -1,5 +1,5 @@
-use crate::RepoReport;
 use crate::runner::TimedResult;
+use crate::RepoReport;
 
 pub fn generate(reports: &[RepoReport], date: &str) -> String {
     let mut out = String::new();
@@ -31,7 +31,8 @@ fn section_repos_tested(reports: &[RepoReport]) -> String {
     s += "| Repo | Files (git) | Source files | Languages | Store size |\n";
     s += "|------|-------------|--------------|-----------|------------|\n";
     for r in reports {
-        let langs: String = r.lang_counts
+        let langs: String = r
+            .lang_counts
             .iter()
             .take(3)
             .map(|(l, n)| format!("{} ({})", l, n))
@@ -43,7 +44,10 @@ fn section_repos_tested(reports: &[RepoReport]) -> String {
             r.accuracy.file_count_git,
             r.accuracy.file_count_mati,
             langs,
-            r.accuracy.store_size_mb.map(|n| format!("{:.1}MB", n)).unwrap_or_else(|| "—".into()),
+            r.accuracy
+                .store_size_mb
+                .map(|n| format!("{:.1}MB", n))
+                .unwrap_or_else(|| "—".into()),
         );
     }
     s + "\n---\n\n"
@@ -69,7 +73,11 @@ fn section_init(reports: &[RepoReport]) -> String {
             ms(&i.stages, "deps"),
             i.edge_count,
             i.gotcha_cands,
-            if i.total_ms > 0 { format!("{}ms", i.total_ms) } else { "—".into() },
+            if i.total_ms > 0 {
+                format!("{}ms", i.total_ms)
+            } else {
+                "—".into()
+            },
         );
     }
     s + "\n---\n\n"
@@ -97,24 +105,24 @@ fn section_latency(reports: &[RepoReport]) -> String {
     s += &format!("| --- | {} |\n", sep.join(" | "));
 
     let rows: &[(&str, &str)] = &[
-        ("status",          "mati status"),
-        ("stats_first",     "mati stats (cache miss)"),
-        ("stats_avg",       "mati stats (cache hit)"),
-        ("gaps_first",      "mati gaps (cache miss)"),
-        ("gaps_avg",        "mati gaps (cache hit)"),
-        ("ls_files",        "mati ls files"),
-        ("ls_gotchas",      "mati ls gotchas"),
-        ("ls_decisions",    "mati ls decisions"),
-        ("stale",           "mati stale"),
-        ("quality_check",   "mati quality-check"),
-        ("get_1",           "mati get ×1"),
-        ("show",            "mati show"),
-        ("export_json",     "mati export --format json"),
-        ("history",         "mati history"),
-        ("edit_hook",       "mati edit-hook"),
+        ("status", "mati status"),
+        ("stats_first", "mati stats (cache miss)"),
+        ("stats_avg", "mati stats (cache hit)"),
+        ("gaps_first", "mati gaps (cache miss)"),
+        ("gaps_avg", "mati gaps (cache hit)"),
+        ("ls_files", "mati ls files"),
+        ("ls_gotchas", "mati ls gotchas"),
+        ("ls_decisions", "mati ls decisions"),
+        ("stale", "mati stale"),
+        ("quality_check", "mati quality-check"),
+        ("get_1", "mati get ×1"),
+        ("show", "mati show"),
+        ("export_json", "mati export --format json"),
+        ("history", "mati history"),
+        ("edit_hook", "mati edit-hook"),
         ("session_harvest", "mati session-harvest"),
-        ("log_miss",        "mati log-miss"),
-        ("log_hit",         "mati log-hit"),
+        ("log_miss", "mati log-miss"),
+        ("log_hit", "mati log-hit"),
     ];
 
     for (key, label) in rows {
@@ -163,7 +171,7 @@ fn section_cache(reports: &[RepoReport]) -> String {
     for r in reports {
         for (miss_key, hit_key, label) in &[
             ("stats_first", "stats_avg", "mati stats"),
-            ("gaps_first",  "gaps_avg",  "mati gaps"),
+            ("gaps_first", "gaps_avg", "mati gaps"),
         ] {
             let cold_ms = r.cold.commands.get(*miss_key).map(|t| t.mean_ms);
             let warm_ms = r.cold.commands.get(*hit_key).map(|t| t.mean_ms);
@@ -188,7 +196,9 @@ fn section_ping(reports: &[RepoReport]) -> String {
     s += "| --- | --- | --- |\n";
     for r in reports {
         let wall = fmt_result(r.cold.commands.get("ping"));
-        let reported = r.accuracy.ping_us
+        let reported = r
+            .accuracy
+            .ping_us
             .map(|us| format!("{}µs", us))
             .unwrap_or_else(|| "—".into());
         s += &format!("| {} | {} | {} |\n", r.repo_name, wall, reported);
@@ -206,7 +216,10 @@ fn section_accuracy(reports: &[RepoReport]) -> String {
     for r in reports {
         let a = &r.accuracy;
         let cov = if a.file_count_git > 0 {
-            format!("{:.0}%", 100.0 * a.file_count_mati as f64 / a.file_count_git as f64)
+            format!(
+                "{:.0}%",
+                100.0 * a.file_count_mati as f64 / a.file_count_git as f64
+            )
         } else {
             "—".into()
         };
@@ -234,7 +247,12 @@ fn section_gaps(reports: &[RepoReport]) -> String {
         let g = &r.accuracy.gaps;
         s += &format!(
             "| {} | {} | {} | {} | {} | {} |\n",
-            r.repo_name, g.critical, g.high, g.normal, g.low, g.total()
+            r.repo_name,
+            g.critical,
+            g.high,
+            g.normal,
+            g.low,
+            g.total()
         );
     }
     s + "\n---\n\n"
@@ -250,9 +268,7 @@ fn section_staleness(reports: &[RepoReport]) -> String {
         let st = &r.accuracy.stale;
         s += &format!(
             "| {} | {} | {} | {} | {} | {} |\n",
-            r.repo_name,
-            r.accuracy.total_records,
-            st.aging, st.stale, st.liability, st.tombstone,
+            r.repo_name, r.accuracy.total_records, st.aging, st.stale, st.liability, st.tombstone,
         );
     }
     s + "\n---\n\n"
@@ -293,7 +309,9 @@ fn section_store_size(reports: &[RepoReport]) -> String {
             "| {} | {} | {} |\n",
             r.repo_name,
             a.total_records,
-            a.store_size_mb.map(|n| format!("{:.1}MB", n)).unwrap_or_else(|| "—".into()),
+            a.store_size_mb
+                .map(|n| format!("{:.1}MB", n))
+                .unwrap_or_else(|| "—".into()),
         );
     }
     s + "\n"
@@ -318,5 +336,9 @@ fn fmt_result(r: Option<&TimedResult>) -> String {
 }
 
 fn ok(b: bool) -> &'static str {
-    if b { "yes" } else { "**FAIL**" }
+    if b {
+        "yes"
+    } else {
+        "**FAIL**"
+    }
 }

@@ -7,21 +7,21 @@ use std::time::Instant;
 #[derive(Debug, Clone)]
 pub struct TimedResult {
     /// Mean wall-clock time across all samples (ms).
-    pub mean_ms:   f64,
+    pub mean_ms: f64,
     /// Fastest sample (ms).
-    pub min_ms:    f64,
+    pub min_ms: f64,
     /// Slowest sample (ms).
-    pub max_ms:    f64,
+    pub max_ms: f64,
     /// Population standard deviation (ms).
     pub stddev_ms: f64,
     /// How many samples were taken.
-    pub samples:   usize,
+    pub samples: usize,
     /// stdout of the last run (ANSI stripped by caller if needed).
-    pub stdout:    String,
+    pub stdout: String,
     /// stderr of the last run.
-    pub stderr:    String,
+    pub stderr: String,
     /// Whether the last run exited with status 0.
-    pub success:   bool,
+    pub success: bool,
     /// Exit code of the last run.
     pub exit_code: i32,
 }
@@ -29,9 +29,15 @@ pub struct TimedResult {
 impl TimedResult {
     pub fn failed() -> Self {
         TimedResult {
-            mean_ms: 0.0, min_ms: 0.0, max_ms: 0.0, stddev_ms: 0.0,
-            samples: 0, stdout: String::new(), stderr: "not run".into(),
-            success: false, exit_code: -1,
+            mean_ms: 0.0,
+            min_ms: 0.0,
+            max_ms: 0.0,
+            stddev_ms: 0.0,
+            samples: 0,
+            stdout: String::new(),
+            stderr: "not run".into(),
+            success: false,
+            exit_code: -1,
         }
     }
 }
@@ -68,10 +74,10 @@ pub fn run_timed(bin: &Path, args: &[&str], cwd: &Path, n: usize) -> TimedResult
     let mut times: Vec<f64> = Vec::with_capacity(n);
     let mut last_stdout = String::new();
     let mut last_stderr = String::new();
-    let mut last_code   = 0i32;
+    let mut last_code = 0i32;
 
     for _ in 0..n {
-        let t0  = Instant::now();
+        let t0 = Instant::now();
         let out = Command::new(bin)
             .args(args)
             .current_dir(cwd)
@@ -85,7 +91,7 @@ pub fn run_timed(bin: &Path, args: &[&str], cwd: &Path, n: usize) -> TimedResult
         times.push(elapsed_ms);
         last_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         last_stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        last_code   = out.status.code().unwrap_or(-1);
+        last_code = out.status.code().unwrap_or(-1);
     }
 
     aggregate(times, last_stdout, last_stderr, last_code)
@@ -130,14 +136,14 @@ pub fn run_parallel_gets(bin: &Path, keys: &[String], cwd: &Path) -> TimedResult
     let total_ms = t0.elapsed().as_secs_f64() * 1_000.0;
 
     TimedResult {
-        mean_ms:   total_ms / keys.len() as f64, // per-get average
-        min_ms:    total_ms / keys.len() as f64,
-        max_ms:    total_ms / keys.len() as f64,
+        mean_ms: total_ms / keys.len() as f64, // per-get average
+        min_ms: total_ms / keys.len() as f64,
+        max_ms: total_ms / keys.len() as f64,
         stddev_ms: 0.0,
-        samples:   keys.len(),
-        stdout:    String::new(),
-        stderr:    String::new(),
-        success:   all_ok,
+        samples: keys.len(),
+        stdout: String::new(),
+        stderr: String::new(),
+        success: all_ok,
         exit_code: if all_ok { 0 } else { 1 },
     }
 }
@@ -152,7 +158,7 @@ pub fn run_edit_hook(bin: &Path, file_path: &Path, cwd: &Path, n: usize) -> Time
     }
 
     let original = match std::fs::read_to_string(file_path) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return TimedResult::failed(),
     };
 
@@ -164,14 +170,19 @@ pub fn run_edit_hook(bin: &Path, file_path: &Path, cwd: &Path, n: usize) -> Time
     let mut times: Vec<f64> = Vec::with_capacity(n);
     let mut last_stdout = String::new();
     let mut last_stderr = String::new();
-    let mut last_code   = 0i32;
+    let mut last_code = 0i32;
 
     for i in 0..n {
         // Mutate.
-        let modified = format!("{}\n{} bench_real edit {}\n", original.trim_end(), comment, i);
+        let modified = format!(
+            "{}\n{} bench_real edit {}\n",
+            original.trim_end(),
+            comment,
+            i
+        );
         let _ = std::fs::write(file_path, &modified);
 
-        let t0  = Instant::now();
+        let t0 = Instant::now();
         let out = Command::new(bin)
             .args(["edit-hook", file_path.to_str().unwrap_or("")])
             .current_dir(cwd)
@@ -184,7 +195,7 @@ pub fn run_edit_hook(bin: &Path, file_path: &Path, cwd: &Path, n: usize) -> Time
 
         last_stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         last_stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        last_code   = out.status.code().unwrap_or(-1);
+        last_code = out.status.code().unwrap_or(-1);
     }
 
     // Always restore.
@@ -196,21 +207,21 @@ pub fn run_edit_hook(bin: &Path, file_path: &Path, cwd: &Path, n: usize) -> Time
 // ── Internal ──────────────────────────────────────────────────────────────────
 
 fn aggregate(times: Vec<f64>, stdout: String, stderr: String, exit_code: i32) -> TimedResult {
-    let n       = times.len() as f64;
-    let mean    = times.iter().sum::<f64>() / n;
-    let min     = times.iter().cloned().fold(f64::INFINITY,     f64::min);
-    let max     = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let n = times.len() as f64;
+    let mean = times.iter().sum::<f64>() / n;
+    let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n;
 
     TimedResult {
-        mean_ms:   mean,
-        min_ms:    min,
-        max_ms:    max,
+        mean_ms: mean,
+        min_ms: min,
+        max_ms: max,
         stddev_ms: variance.sqrt(),
-        samples:   times.len(),
+        samples: times.len(),
         stdout,
         stderr,
-        success:   exit_code == 0,
+        success: exit_code == 0,
         exit_code,
     }
 }

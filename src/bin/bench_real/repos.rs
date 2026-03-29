@@ -8,15 +8,31 @@ use sha2::{Digest, Sha256};
 
 pub struct RepoSpec {
     pub name: &'static str,
-    pub url:  &'static str,
+    pub url: &'static str,
     pub depth: u32,
 }
 
 pub const REPOS: &[RepoSpec] = &[
-    RepoSpec { name: "ripgrep", url: "https://github.com/BurntSushi/ripgrep",  depth: 100 },
-    RepoSpec { name: "deno",    url: "https://github.com/denoland/deno",       depth: 100 },
-    RepoSpec { name: "nextjs",  url: "https://github.com/vercel/next.js",      depth:  50 },
-    RepoSpec { name: "tokio",   url: "https://github.com/tokio-rs/tokio",      depth: 100 },
+    RepoSpec {
+        name: "ripgrep",
+        url: "https://github.com/BurntSushi/ripgrep",
+        depth: 100,
+    },
+    RepoSpec {
+        name: "deno",
+        url: "https://github.com/denoland/deno",
+        depth: 100,
+    },
+    RepoSpec {
+        name: "nextjs",
+        url: "https://github.com/vercel/next.js",
+        depth: 50,
+    },
+    RepoSpec {
+        name: "tokio",
+        url: "https://github.com/tokio-rs/tokio",
+        depth: 100,
+    },
 ];
 
 pub fn find_spec(name: &str) -> Option<&'static RepoSpec> {
@@ -130,17 +146,17 @@ pub fn git_lang_counts(repo_root: &Path) -> Vec<(String, usize)> {
             .and_then(|e| e.to_str())
             .unwrap_or("other");
         let lang = match ext {
-            "rs"                         => "Rust",
-            "ts" | "tsx"                 => "TypeScript",
+            "rs" => "Rust",
+            "ts" | "tsx" => "TypeScript",
             "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
-            "py"                         => "Python",
-            "go"                         => "Go",
-            "java"                       => "Java",
-            "kt" | "kts"                 => "Kotlin",
-            "rb"                         => "Ruby",
-            "c" | "h"                    => "C",
+            "py" => "Python",
+            "go" => "Go",
+            "java" => "Java",
+            "kt" | "kts" => "Kotlin",
+            "rb" => "Ruby",
+            "c" | "h" => "C",
             "cpp" | "cc" | "cxx" | "hpp" => "C++",
-            _                            => "other",
+            _ => "other",
         };
         *counts.entry(lang).or_insert(0) += 1;
     }
