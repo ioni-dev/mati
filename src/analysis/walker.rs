@@ -32,7 +32,7 @@
 //! early enough for meaningful parse pipelining.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::Result;
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
@@ -138,10 +138,7 @@ impl Walker {
     /// Returns `Err` if `root` is not an accessible directory.
     pub fn walk_channel(&self) -> Result<mpsc::Receiver<WalkedFile>> {
         if !self.root.is_dir() {
-            anyhow::bail!(
-                "walk root is not a directory: {}",
-                self.root.display()
-            );
+            anyhow::bail!("walk root is not a directory: {}", self.root.display());
         }
 
         let (tx, rx) = mpsc::channel::<WalkedFile>();
@@ -221,7 +218,11 @@ impl<'s> ParallelVisitorBuilder<'s> for VisitorBuilder {
     fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
         // Clone the Sender once per thread. The Mutex is held only for the
         // duration of clone() — essentially free.
-        let tx = self.tx.lock().expect("VisitorBuilder mutex poisoned").clone();
+        let tx = self
+            .tx
+            .lock()
+            .expect("VisitorBuilder mutex poisoned")
+            .clone();
         Box::new(FileVisitor {
             local: Vec::with_capacity(FLUSH_THRESHOLD),
             tx,
@@ -315,10 +316,7 @@ impl ParallelVisitor for FileVisitor {
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!(
-                    "walker: cannot read metadata for {}: {e}",
-                    path.display()
-                );
+                tracing::warn!("walker: cannot read metadata for {}: {e}", path.display());
                 return WalkState::Continue;
             }
         };
@@ -521,7 +519,10 @@ mod tests {
 
         // .gitignore itself is included (it's a text file)
         assert!(paths.contains(&"kept.rs"));
-        assert!(!paths.contains(&"ignored.rs"), "ignored.rs should be excluded by .gitignore");
+        assert!(
+            !paths.contains(&"ignored.rs"),
+            "ignored.rs should be excluded by .gitignore"
+        );
         assert!(
             paths.iter().all(|p| !p.starts_with("target/")),
             "target/ should be excluded by .gitignore"
@@ -536,14 +537,14 @@ mod tests {
         fs::write(&big, vec![b'x'; 513]).unwrap();
         write(dir.path(), "small.rs", "fn main() {}");
 
-        let files = Walker::new(dir.path())
-            .max_file_size(512)
-            .walk()
-            .unwrap();
+        let files = Walker::new(dir.path()).max_file_size(512).walk().unwrap();
 
         let paths = rel_paths(&files);
         assert!(paths.contains(&"small.rs"));
-        assert!(!paths.contains(&"big.rs"), "big.rs should be excluded by size limit");
+        assert!(
+            !paths.contains(&"big.rs"),
+            "big.rs should be excluded by size limit"
+        );
     }
 
     #[test]
@@ -552,12 +553,13 @@ mod tests {
         let exact = dir.path().join("exact.rs");
         fs::write(&exact, vec![b'x'; 512]).unwrap();
 
-        let files = Walker::new(dir.path())
-            .max_file_size(512)
-            .walk()
-            .unwrap();
+        let files = Walker::new(dir.path()).max_file_size(512).walk().unwrap();
 
-        assert_eq!(files.len(), 1, "file at exact size limit should be included");
+        assert_eq!(
+            files.len(),
+            1,
+            "file at exact size limit should be included"
+        );
     }
 
     #[test]
@@ -615,8 +617,12 @@ mod tests {
         channel_paths.sort_unstable();
 
         // Batch walk (sorted)
-        let batch_paths: Vec<String> =
-            walker.walk().unwrap().into_iter().map(|f| f.rel_path).collect();
+        let batch_paths: Vec<String> = walker
+            .walk()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.rel_path)
+            .collect();
 
         assert_eq!(channel_paths, batch_paths);
     }
@@ -680,7 +686,10 @@ mod tests {
         assert_eq!(detect_language(Path::new("README.md")), Language::Unknown);
         assert_eq!(detect_language(Path::new("script.sh")), Language::Unknown);
         assert_eq!(detect_language(Path::new(".env")), Language::Unknown);
-        assert_eq!(detect_language(Path::new("no_extension")), Language::Unknown);
+        assert_eq!(
+            detect_language(Path::new("no_extension")),
+            Language::Unknown
+        );
     }
 
     // ── is_binary_extension ───────────────────────────────────────────────────

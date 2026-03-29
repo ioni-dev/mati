@@ -22,6 +22,24 @@ pub use git::{mine_git_history, GitSignals};
 pub use parser::{hash_and_parse_parallel, parse_file, parse_files_parallel, StaticFileAnalysis};
 pub use walker::{Language, WalkedFile, Walker};
 
+pub(crate) fn public_api_symbols(analysis: &StaticFileAnalysis) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut symbols =
+        Vec::with_capacity(analysis.entry_points.len() + analysis.exported_types.len());
+
+    for symbol in analysis
+        .entry_points
+        .iter()
+        .chain(analysis.exported_types.iter())
+    {
+        if seen.insert(symbol.as_str()) {
+            symbols.push(symbol.clone());
+        }
+    }
+
+    symbols
+}
+
 /// Build one `FileRecord` from the parsed Layer 0 signals for a file.
 ///
 /// If the parser extracted a module-level doc comment (`analysis.module_doc`),
@@ -47,10 +65,11 @@ pub fn build_file_record(
     };
 
     let token_cost_estimate = (file.size_bytes / 4).min(u32::MAX as u64) as u32;
+    let public_api = public_api_symbols(analysis);
 
     let mut fr = FileRecord::layer0_stub(
         path,
-        analysis.entry_points.clone(),
+        public_api,
         analysis.imports.clone(),
         analysis.todos.clone(),
         analysis.unsafe_count,
@@ -87,13 +106,21 @@ pub fn build_file_records(
         "build_file_records expects one analysis per walked file"
     );
 
-    let hotspot_files = git.map(|signals| signals.hotspot_files.iter().cloned().collect::<HashSet<_>>());
+    let hotspot_files = git.map(|signals| {
+        signals
+            .hotspot_files
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+    });
     let hotspot_files = hotspot_files.as_ref();
 
     files
         .iter()
         .zip(analyses)
-        .map(|(file, analysis)| build_file_record(file, analysis, git, hotspot_files, last_modified_session))
+        .map(|(file, analysis)| {
+            build_file_record(file, analysis, git, hotspot_files, last_modified_session)
+        })
         .collect()
 }
 
@@ -182,6 +209,38 @@ mod tests {
         };
         let record = build_file_record(&file, &analysis, None, None, 0);
         assert_eq!(record.purpose, "Handles JWT authentication.");
+    }
+
+    #[test]
+    fn exported_types_are_folded_into_stored_api_surface() {
+        let analysis = StaticFileAnalysis {
+            path: "src/models.rs".to_string(),
+            language: Language::Rust,
+            entry_points: vec!["build".to_string()],
+            exported_types: vec!["Widget".to_string(), "Widget".to_string()],
+            imports: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            panic_count: 0,
+            branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
+        };
+        let file = WalkedFile {
+            abs_path: std::path::PathBuf::from("/repo/src/models.rs"),
+            rel_path: "src/models.rs".to_string(),
+            language: Language::Rust,
+            size_bytes: 100,
+            mtime_secs: 0,
+        };
+
+        let record = build_file_record(&file, &analysis, None, None, 0);
+        assert_eq!(
+            record.entry_points,
+            vec!["build".to_string(), "Widget".to_string()]
+        );
     }
 
     #[test]

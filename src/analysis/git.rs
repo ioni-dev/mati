@@ -88,10 +88,7 @@ impl GitSignals {
 ///
 /// `walked_files` constrains output to files the walker discovered —
 /// git deltas for files outside this set are ignored.
-pub fn mine_git_history(
-    repo_path: &Path,
-    walked_files: &HashSet<String>,
-) -> Result<GitSignals> {
+pub fn mine_git_history(repo_path: &Path, walked_files: &HashSet<String>) -> Result<GitSignals> {
     // Phase 1: Open + setup
     let repo = match Repository::open(repo_path) {
         Ok(r) => r,
@@ -284,7 +281,11 @@ pub fn mine_git_history(
         }
 
         // Detect revert commits by conventional "Revert " subject prefix.
-        if commit.message().map(|m| m.starts_with("Revert ")).unwrap_or(false) {
+        if commit
+            .message()
+            .map(|m| m.starts_with("Revert "))
+            .unwrap_or(false)
+        {
             for &idx in &commit_files {
                 *revert_counts_intern.entry(idx).or_insert(0) += 1;
             }
@@ -361,8 +362,7 @@ pub fn mine_git_history(
 
 /// Convert a git2 `Path` to a forward-slash `String`. Returns `None` for non-UTF-8 paths.
 fn normalize_git_path(path: Option<&Path>) -> Option<String> {
-    path.and_then(|p| p.to_str())
-        .map(|s| s.replace('\\', "/"))
+    path.and_then(|p| p.to_str()).map(|s| s.replace('\\', "/"))
 }
 
 /// Compute hotspot files: top `ceil(n * HOTSPOT_PERCENTILE)` by frequency (min 1).
@@ -415,8 +415,7 @@ mod tests {
                 fs::create_dir_all(parent).expect("failed to create parent dirs");
             }
             // Write unique content to trigger a real diff
-            fs::write(&file_path, format!("{message}: {file}"))
-                .expect("failed to write file");
+            fs::write(&file_path, format!("{message}: {file}")).expect("failed to write file");
             index
                 .add_path(Path::new(file))
                 .expect("failed to add to index");
@@ -426,8 +425,12 @@ mod tests {
         index.write().expect("failed to write index");
         let tree = repo.find_tree(tree_oid).expect("failed to find tree");
 
-        let sig = Signature::new(author_name, &format!("{author_name}@test.com"), &Time::new(time_epoch, 0))
-            .expect("failed to create signature");
+        let sig = Signature::new(
+            author_name,
+            &format!("{author_name}@test.com"),
+            &Time::new(time_epoch, 0),
+        )
+        .expect("failed to create signature");
 
         let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
@@ -460,8 +463,8 @@ mod tests {
         index.write().expect("write index");
         let tree = repo.find_tree(tree_oid).expect("find tree");
 
-        let sig = Signature::new("merger", "merger@test.com", &Time::new(time_epoch, 0))
-            .expect("sig");
+        let sig =
+            Signature::new("merger", "merger@test.com", &Time::new(time_epoch, 0)).expect("sig");
 
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
         let branch_commit = repo.find_commit(branch_tip).unwrap();
@@ -505,8 +508,7 @@ mod tests {
         let repo = Repository::init(tmp.path()).unwrap();
         make_commit(&repo, &["src/main.rs"], "initial", "alice", 1000);
 
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["src/main.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["src/main.rs"])).unwrap();
 
         assert_eq!(signals.change_frequency.get("src/main.rs"), Some(&1));
         assert_eq!(
@@ -581,8 +583,7 @@ mod tests {
         // Create merge commit touching c.rs
         make_merge_commit(&repo, &["c.rs"], "merge", branch_oid, 3000);
 
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["a.rs", "b.rs", "c.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["a.rs", "b.rs", "c.rs"])).unwrap();
 
         // Merge commit's files should NOT appear in frequency from the merge itself
         // a.rs: 1 (main), b.rs: 1 (branch), c.rs: 0 (merge skipped)
@@ -633,8 +634,7 @@ mod tests {
             );
         }
 
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["a.rs", "b.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["a.rs", "b.rs"])).unwrap();
 
         assert_eq!(signals.co_change_pairs.len(), 1);
         let (a, b, count) = &signals.co_change_pairs[0];
@@ -652,7 +652,13 @@ mod tests {
 
         for i in 0..10 {
             if i < 2 {
-                make_commit(&repo, &["a.rs", "b.rs"], &format!("both-{i}"), "alice", 1000 + i);
+                make_commit(
+                    &repo,
+                    &["a.rs", "b.rs"],
+                    &format!("both-{i}"),
+                    "alice",
+                    1000 + i,
+                );
             } else {
                 make_commit(&repo, &["a.rs"], &format!("solo-{i}"), "alice", 1000 + i);
             }
@@ -680,26 +686,13 @@ mod tests {
                     1000 + i,
                 );
             } else if i % 2 == 0 {
-                make_commit(
-                    &repo,
-                    &["a.rs"],
-                    &format!("a-solo-{i}"),
-                    "alice",
-                    1000 + i,
-                );
+                make_commit(&repo, &["a.rs"], &format!("a-solo-{i}"), "alice", 1000 + i);
             } else {
-                make_commit(
-                    &repo,
-                    &["b.rs"],
-                    &format!("b-solo-{i}"),
-                    "alice",
-                    1000 + i,
-                );
+                make_commit(&repo, &["b.rs"], &format!("b-solo-{i}"), "alice", 1000 + i);
             }
         }
 
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["a.rs", "b.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["a.rs", "b.rs"])).unwrap();
 
         assert!(
             signals.co_change_pairs.is_empty(),
@@ -732,8 +725,7 @@ mod tests {
         repo.commit(Some("HEAD"), &sig, &sig, "rename", &tree, &[&parent])
             .unwrap();
 
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["old.rs", "new.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["old.rs", "new.rs"])).unwrap();
 
         assert!(
             signals
@@ -751,8 +743,7 @@ mod tests {
         make_commit(&repo, &["tracked.rs", "ignored.rs"], "init", "alice", 1000);
 
         // Only "tracked.rs" in walked set
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["tracked.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["tracked.rs"])).unwrap();
 
         assert!(signals.change_frequency.contains_key("tracked.rs"));
         assert!(
@@ -795,8 +786,7 @@ mod tests {
         let repo = Repository::init(tmp.path()).unwrap();
         make_commit(&repo, &["src/lib/mod.rs"], "init", "alice", 1000);
 
-        let signals =
-            mine_git_history(tmp.path(), &walked(&["src/lib/mod.rs"])).unwrap();
+        let signals = mine_git_history(tmp.path(), &walked(&["src/lib/mod.rs"])).unwrap();
 
         for key in signals.change_frequency.keys() {
             assert!(

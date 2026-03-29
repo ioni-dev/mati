@@ -13,8 +13,8 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
+use super::{extract_todo, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
-use super::{StaticFileAnalysis, extract_todo};
 
 // ── Static handles ────────────────────────────────────────────────────────────
 
@@ -100,10 +100,8 @@ static JS_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
 });
 
 // Capture indices: same names for TS and TSX (same query source).
-static TS_CAPTURES: LazyLock<EcmaCaptures> =
-    LazyLock::new(|| EcmaCaptures::new(&TS_QUERY));
-static JS_CAPTURES: LazyLock<EcmaCaptures> =
-    LazyLock::new(|| EcmaCaptures::new(&JS_QUERY));
+static TS_CAPTURES: LazyLock<EcmaCaptures> = LazyLock::new(|| EcmaCaptures::new(&TS_QUERY));
+static JS_CAPTURES: LazyLock<EcmaCaptures> = LazyLock::new(|| EcmaCaptures::new(&JS_QUERY));
 
 // ── Thread-local parsers ──────────────────────────────────────────────────────
 
@@ -140,7 +138,8 @@ struct EcmaCaptures {
 impl EcmaCaptures {
     fn new(query: &tree_sitter::Query) -> Self {
         let idx = |name: &str| {
-            query.capture_index_for_name(name)
+            query
+                .capture_index_for_name(name)
                 .unwrap_or_else(|| panic!("parser/typescript: query missing @{name}"))
         };
         Self {
@@ -257,10 +256,8 @@ fn parse_ecma(
                     // Handles JSDoc block (`/** ... */`) and line (`// ...`) styles.
                     if row < 5 {
                         if text.starts_with("/**") {
-                            let inner = text
-                                .trim_start_matches("/**")
-                                .trim_end_matches("*/")
-                                .trim();
+                            let inner =
+                                text.trim_start_matches("/**").trim_end_matches("*/").trim();
                             let collapsed: String = inner
                                 .lines()
                                 .map(|l| l.trim().trim_start_matches('*').trim())
@@ -271,10 +268,7 @@ fn parse_ecma(
                                 doc_lines.push((row, collapsed));
                             }
                         } else if text.starts_with("//") {
-                            let stripped = text
-                                .trim_start_matches("//")
-                                .trim()
-                                .to_string();
+                            let stripped = text.trim_start_matches("//").trim().to_string();
                             if !stripped.is_empty() {
                                 doc_lines.push((row, stripped));
                             }
@@ -377,7 +371,10 @@ mod tests {
     #[test]
     fn ts_exported_type_alias() {
         let dir = TempDir::new().unwrap();
-        let a = parse_ts(&dir, "export type Result<T> = { ok: true; value: T } | { ok: false };");
+        let a = parse_ts(
+            &dir,
+            "export type Result<T> = { ok: true; value: T } | { ok: false };",
+        );
         assert!(a.exported_types.contains(&"Result".to_owned()));
     }
 
