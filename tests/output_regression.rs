@@ -123,9 +123,9 @@ edition = "2021"
     (repo_dir, home_dir)
 }
 
-/// Run `mati init --no-hooks --no-settings` and return stdout.
+/// Run `mati init --no-hooks` and return stdout.
 fn init_repo(bin: &Path, repo: &Path, home: &Path) -> String {
-    let (stdout, stderr, ok) = run(bin, repo, home, &["init", "--no-hooks", "--no-settings"]);
+    let (stdout, stderr, ok) = run(bin, repo, home, &["init", "--no-hooks"]);
     if !ok {
         panic!("mati init failed:\nstdout: {stdout}\nstderr: {stderr}");
     }
