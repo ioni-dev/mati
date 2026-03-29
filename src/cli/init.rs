@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -13,9 +14,8 @@ use mati_core::analysis::{
 use mati_core::graph::Graph;
 use mati_core::scaffold::{install_hooks, write_claude_md_stub};
 use mati_core::store::{
-    Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
-    RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
-    derive_slug,
+    derive_slug, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
 };
 
 #[derive(Args)]
@@ -138,11 +138,17 @@ pub async fn run(args: InitArgs) -> Result<()> {
             rayon::join(
                 || {
                     let t = Instant::now();
-                    (hash_and_parse_parallel(&files, &stored_mtimes), t.elapsed().as_millis())
+                    (
+                        hash_and_parse_parallel(&files, &stored_mtimes),
+                        t.elapsed().as_millis(),
+                    )
                 },
                 || {
                     let t = Instant::now();
-                    (mine_git_history(&root, &walked_paths), t.elapsed().as_millis())
+                    (
+                        mine_git_history(&root, &walked_paths),
+                        t.elapsed().as_millis(),
+                    )
                 },
             )
         },
@@ -160,15 +166,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
     if skipped_count > 0 {
         println!(
             "  Mtime+parse (incremental)...   {:>4} changed  {:>4} skipped  {:>3}ms",
-            parse_count,
-            skipped_count,
-            parse_ms
+            parse_count, skipped_count, parse_ms
         );
     } else {
         println!(
             "  Mtime+parse (first run)...     {:>4} files             {:>3}ms",
-            parse_count,
-            parse_ms
+            parse_count, parse_ms
         );
     }
 
@@ -227,7 +230,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
     };
 
     // ── 7. Build file records (parsed files only) ────────────────────────────
-    let mut file_records = build_file_records(&files_to_parse, &analyses, git_signals.as_ref(), now);
+    let mut file_records =
+        build_file_records(&files_to_parse, &analyses, git_signals.as_ref(), now);
 
     // ── 8. Build edges (parsed files only) ───────────────────────────────────
     let t = Instant::now();
@@ -256,7 +260,13 @@ pub async fn run(args: InitArgs) -> Result<()> {
     logical_clock += cochange_count as u64;
 
     let revert_gotchas: Vec<RevertGotcha> = match &git_signals {
-        Some(signals) => build_revert_gotchas(signals, &signals.change_frequency, device_id, logical_clock, now),
+        Some(signals) => build_revert_gotchas(
+            signals,
+            &signals.change_frequency,
+            device_id,
+            logical_clock,
+            now,
+        ),
         None => vec![],
     };
     let revert_count = revert_gotchas.len();
@@ -284,7 +294,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
         // Remove all stale co-change keys first (idempotent upsert).
         for fr in file_records.iter_mut() {
-            fr.gotcha_keys.retain(|k| !k.starts_with("gotcha:cochange:"));
+            fr.gotcha_keys
+                .retain(|k| !k.starts_with("gotcha:cochange:"));
         }
         // Inject fresh keys.
         for fr in file_records.iter_mut() {
@@ -319,7 +330,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 .push(og.key.clone());
         }
         for fr in file_records.iter_mut() {
-            fr.gotcha_keys.retain(|k| !k.starts_with("gotcha:ownership:"));
+            fr.gotcha_keys
+                .retain(|k| !k.starts_with("gotcha:ownership:"));
         }
         for fr in file_records.iter_mut() {
             if let Some(keys) = path_to_ownership_keys.get(&fr.path) {
@@ -380,7 +392,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
             // This ensures the pre-read hook surfaces additionalContext for coupled files
             // regardless of whether they have a module-level doc comment.
             if rec.quality.value < 0.40
-                && fr.gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:"))
+                && fr
+                    .gotcha_keys
+                    .iter()
+                    .any(|k| k.starts_with("gotcha:cochange:"))
             {
                 rec.quality = QualityScore::doc_comment_default();
                 if rec.confidence.value < 0.45 {
@@ -388,7 +403,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 }
             }
             if let Some(&ratio) = lines_changed.get(&fr.path) {
-                rec.staleness.signals.push(StalenessSignal::LinesChangedPct(ratio));
+                rec.staleness
+                    .signals
+                    .push(StalenessSignal::LinesChangedPct(ratio));
             }
             rec
         })
@@ -402,8 +419,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .enumerate()
         .map(|(i, dep)| {
             let key = format!("dep:{}", dep.name);
-            let mut rec =
-                Record::layer0_file_stub(&key, device_id, logical_clock + i as u64, now);
+            let mut rec = Record::layer0_file_stub(&key, device_id, logical_clock + i as u64, now);
             rec.category = Category::Dependency;
             rec.source = RecordSource::StaticAnalysis;
             rec.value = match &dep.version {
@@ -468,7 +484,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 for rec in existing {
                     if !new_keys.contains(rec.key.as_str()) {
                         if let Err(e) = store.delete(&rec.key).await {
-                            tracing::warn!("failed to delete stale co-change gotcha {}: {e}", rec.key);
+                            tracing::warn!(
+                                "failed to delete stale co-change gotcha {}: {e}",
+                                rec.key
+                            );
                         }
                     }
                 }
@@ -504,7 +523,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 for rec in existing {
                     if !new_ownership_keys.contains(rec.key.as_str()) {
                         if let Err(e) = store.delete(&rec.key).await {
-                            tracing::warn!("failed to delete stale ownership gotcha {}: {e}", rec.key);
+                            tracing::warn!(
+                                "failed to delete stale ownership gotcha {}: {e}",
+                                rec.key
+                            );
                         }
                     }
                 }
@@ -526,10 +548,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .cloned()
         .collect();
 
-    let all_pairs: Vec<(&str, &Record)> = all_records
-        .iter()
-        .map(|r| (r.key.as_str(), r))
-        .collect();
+    let all_pairs: Vec<(&str, &Record)> = all_records.iter().map(|r| (r.key.as_str(), r)).collect();
 
     // ── 9. put_batch (KV only — tantivy indexed after graph ops) ─────────────
     // Separating KV write from search indexing lets us profile each cost and
@@ -662,10 +681,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         ),
         Err(e) => {
             tracing::warn!("CLAUDE.md stub write failed: {e}");
-            println!(
-                "  Writing .claude/CLAUDE.md stub...    skipped — {:#}",
-                e
-            );
+            println!("  Writing .claude/CLAUDE.md stub...    skipped — {:#}", e);
         }
     }
 
@@ -740,6 +756,26 @@ pub async fn run(args: InitArgs) -> Result<()> {
         "  Total: {}ms · 0 tokens · 0 Claude calls",
         total_start.elapsed().as_millis()
     );
+    println!();
+
+    // ── Next steps ───────────────────────────────────────────────────────
+    let use_color = std::io::stderr().is_terminal();
+    let (blue, gray, white, bold, reset) = if use_color {
+        (
+            super::colors::BLUE,
+            super::colors::GRAY,
+            super::colors::WHITE,
+            super::colors::BOLD,
+            super::colors::RESET,
+        )
+    } else {
+        ("", "", "", "", "")
+    };
+
+    println!("  {bold}{blue}Next steps{reset}");
+    println!("    {white}mati explain <file>{reset}   {gray}file briefing — gotchas and decisions before editing{reset}");
+    println!("    {white}mati review{reset}            {gray}confirm auto-detected candidates for hook enforcement{reset}");
+    println!("    {white}mati status{reset}            {gray}project memory dashboard{reset}");
     println!();
 
     Ok(())
@@ -847,12 +883,8 @@ fn build_cochange_gotchas(
         };
 
         let key = format!("gotcha:cochange:{source}|{target}");
-        let mut rec = Record::layer0_file_stub(
-            &key,
-            device_id,
-            logical_clock_start + clock_offset,
-            now,
-        );
+        let mut rec =
+            Record::layer0_file_stub(&key, device_id, logical_clock_start + clock_offset, now);
         rec.category = Category::Gotcha;
         rec.source = RecordSource::StaticAnalysis;
         rec.priority = severity;
@@ -951,12 +983,8 @@ fn build_revert_gotchas(
         };
 
         let key = format!("gotcha:revert:{path}");
-        let mut rec = Record::layer0_file_stub(
-            &key,
-            device_id,
-            logical_clock_start + clock_offset,
-            now,
-        );
+        let mut rec =
+            Record::layer0_file_stub(&key, device_id, logical_clock_start + clock_offset, now);
         rec.category = Category::Gotcha;
         rec.source = RecordSource::StaticAnalysis;
         rec.priority = Priority::Normal;
@@ -1004,8 +1032,7 @@ fn build_ownership_gotchas(
     // Require at least 5 commits before flagging — avoids noise on new files.
     const MIN_COMMITS: u32 = 5;
 
-    let hotspot_set: std::collections::HashSet<&String> =
-        signals.hotspot_files.iter().collect();
+    let hotspot_set: std::collections::HashSet<&String> = signals.hotspot_files.iter().collect();
 
     let mut candidates: Vec<(&String, String, u32, f64)> = Vec::new();
 
@@ -1020,9 +1047,7 @@ fn build_ownership_gotchas(
             continue;
         }
 
-        if let Some((top_author, &top_count)) =
-            author_counts.iter().max_by_key(|(_, &c)| c)
-        {
+        if let Some((top_author, &top_count)) = author_counts.iter().max_by_key(|(_, &c)| c) {
             let ratio = top_count as f64 / total as f64;
             if ratio >= CONCENTRATION_THRESHOLD {
                 candidates.push((path, top_author.clone(), top_count, ratio));
@@ -1064,12 +1089,8 @@ fn build_ownership_gotchas(
         };
 
         let key = format!("gotcha:ownership:{path}");
-        let mut rec = Record::layer0_file_stub(
-            &key,
-            device_id,
-            logical_clock_start + clock_offset,
-            now,
-        );
+        let mut rec =
+            Record::layer0_file_stub(&key, device_id, logical_clock_start + clock_offset, now);
         rec.category = Category::Gotcha;
         rec.source = RecordSource::StaticAnalysis;
         rec.priority = Priority::Normal;
@@ -1130,7 +1151,9 @@ mod tests {
     fn make_signals(pairs: &[(&str, &str, u32)], freq: &[(&str, u32)]) -> GitSignals {
         let mut signals = GitSignals::empty();
         for (a, b, count) in pairs {
-            signals.co_change_pairs.push((a.to_string(), b.to_string(), *count));
+            signals
+                .co_change_pairs
+                .push((a.to_string(), b.to_string(), *count));
         }
         for (path, f) in freq {
             signals.change_frequency.insert(path.to_string(), *f);
@@ -1153,7 +1176,10 @@ mod tests {
         let ga = gotchas.iter().find(|g| g.source_path == "a.rs").unwrap();
         assert!(ga.record.value.contains("9/10"), "rule should contain 9/10");
         assert!(ga.record.value.contains("90%"), "rule should contain 90%");
-        assert!(ga.record.value.contains("`b.rs`"), "rule should name the target");
+        assert!(
+            ga.record.value.contains("`b.rs`"),
+            "rule should name the target"
+        );
     }
 
     // ── Directionality ────────────────────────────────────────────────────────
@@ -1223,7 +1249,13 @@ mod tests {
         // hub.rs always co-changes with 7 other files — should be capped at 5.
         // All counts >= 3 to clear MIN_COUNT; ratios all = 1.0 (always together).
         let pairs: Vec<(&str, &str, u32)> = (0..7)
-            .map(|i| ("hub.rs", Box::leak(format!("dep{i}.rs").into_boxed_str()) as &str, 10 - i as u32))
+            .map(|i| {
+                (
+                    "hub.rs",
+                    Box::leak(format!("dep{i}.rs").into_boxed_str()) as &str,
+                    10 - i as u32,
+                )
+            })
             .collect();
         let mut freqs: Vec<(&str, u32)> = vec![("hub.rs", 10)];
         for i in 0..7u32 {
@@ -1231,8 +1263,15 @@ mod tests {
         }
         let signals = make_signals(&pairs, &freqs);
         let gotchas = build_cochange_gotchas(&signals, dev, 0, now);
-        let hub_gotchas: Vec<_> = gotchas.iter().filter(|g| g.source_path == "hub.rs").collect();
-        assert!(hub_gotchas.len() <= 5, "expected ≤ 5 gotchas for hub.rs, got {}", hub_gotchas.len());
+        let hub_gotchas: Vec<_> = gotchas
+            .iter()
+            .filter(|g| g.source_path == "hub.rs")
+            .collect();
+        assert!(
+            hub_gotchas.len() <= 5,
+            "expected ≤ 5 gotchas for hub.rs, got {}",
+            hub_gotchas.len()
+        );
     }
 
     // ── GotchaRecord payload ──────────────────────────────────────────────────
@@ -1278,7 +1317,11 @@ mod tests {
             quality = QualityScore::doc_comment_default();
             conf_value = 0.45;
         }
-        if quality.value < 0.40 && gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:")) {
+        if quality.value < 0.40
+            && gotcha_keys
+                .iter()
+                .any(|k| k.starts_with("gotcha:cochange:"))
+        {
             quality = QualityScore::doc_comment_default();
             if conf_value < 0.45 {
                 conf_value = 0.45;
@@ -1310,7 +1353,11 @@ mod tests {
             quality = QualityScore::doc_comment_default();
             conf_value = 0.45;
         }
-        if quality.value < 0.40 && gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:")) {
+        if quality.value < 0.40
+            && gotcha_keys
+                .iter()
+                .any(|k| k.starts_with("gotcha:cochange:"))
+        {
             quality = QualityScore::doc_comment_default();
             if conf_value < 0.45 {
                 conf_value = 0.45;
@@ -1335,7 +1382,11 @@ mod tests {
             quality = QualityScore::doc_comment_default();
             conf_value = 0.45;
         }
-        if quality.value < 0.40 && gotcha_keys.iter().any(|k| k.starts_with("gotcha:cochange:")) {
+        if quality.value < 0.40
+            && gotcha_keys
+                .iter()
+                .any(|k| k.starts_with("gotcha:cochange:"))
+        {
             quality = QualityScore::doc_comment_default();
             if conf_value < 0.45 {
                 conf_value = 0.45;

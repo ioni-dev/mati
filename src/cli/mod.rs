@@ -9,6 +9,7 @@ pub mod gotcha;
 pub mod hooks;
 pub mod init;
 pub mod proxy;
+pub mod repair;
 pub mod reparse;
 pub mod review;
 pub mod show;

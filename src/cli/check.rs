@@ -33,7 +33,11 @@ pub enum CheckStatus {
 
 impl CheckItem {
     fn pass(label: &'static str, detail: Option<String>) -> Self {
-        Self { label, status: CheckStatus::Pass(detail), hint: None }
+        Self {
+            label,
+            status: CheckStatus::Pass(detail),
+            hint: None,
+        }
     }
 
     fn warn(label: &'static str, msg: impl Into<String>, hint: impl Into<Option<String>>) -> Self {
@@ -313,15 +317,15 @@ fn check_settings_json(cwd: &Path) -> CheckItem {
     }
 
     // Check mcpServers.mati exists.
-    let mcp_ok = json
-        .get("mcpServers")
-        .and_then(|s| s.get("mati"))
-        .is_some();
+    let mcp_ok = json.get("mcpServers").and_then(|s| s.get("mati")).is_some();
 
     if absent_hooks.is_empty() && mcp_ok {
         return CheckItem::pass(
             "settings.json",
-            Some(format!("{} hooks + mcpServers registered", HOOK_SCRIPTS.len())),
+            Some(format!(
+                "{} hooks + mcpServers registered",
+                HOOK_SCRIPTS.len()
+            )),
         );
     }
 
@@ -344,11 +348,7 @@ async fn check_daemon(mati_root_opt: Option<PathBuf>) -> CheckItem {
     let root = match mati_root_opt {
         Some(r) => r,
         None => {
-            return CheckItem::warn(
-                "daemon",
-                "skipped (store not initialized)",
-                None::<String>,
-            );
+            return CheckItem::warn("daemon", "skipped (store not initialized)", None::<String>);
         }
     };
 
@@ -589,7 +589,10 @@ mod tests {
         std::fs::create_dir_all(&claude_dir).unwrap();
 
         // Only include the first hook entry — the rest are absent.
-        let first_hook = HOOK_SCRIPTS.first().map(|(n, _)| *n).unwrap_or("pre-read.sh");
+        let first_hook = HOOK_SCRIPTS
+            .first()
+            .map(|(n, _)| *n)
+            .unwrap_or("pre-read.sh");
 
         let json = format!(
             r#"{{
