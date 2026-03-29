@@ -10,24 +10,91 @@ use crate::store::{Priority, QualityScore, QualitySignal, Record};
 // ── Signal detection constants ───────────────────────────────────────────────
 
 const IMPERATIVE_VERBS: &[&str] = &[
-    "never", "always", "avoid", "use", "ensure", "do", "call", "wrap", "handle",
-    "add", "remove", "set", "pass", "return", "check", "run", "test", "import",
-    "export", "create", "delete", "update", "replace", "disable", "enable",
-    "require", "prefer", "pin", "lock", "bump", "drop", "close", "open",
-    "flush", "retry", "skip", "guard", "validate", "sanitize", "escape",
-    "encode", "decode", "serialize", "deserialize", "convert", "cast",
-    "assert", "verify", "confirm", "reject", "deny", "allow", "block",
-    "keep", "move", "copy", "clone", "initialize", "reset", "clear",
+    "never",
+    "always",
+    "avoid",
+    "use",
+    "ensure",
+    "do",
+    "call",
+    "wrap",
+    "handle",
+    "add",
+    "remove",
+    "set",
+    "pass",
+    "return",
+    "check",
+    "run",
+    "test",
+    "import",
+    "export",
+    "create",
+    "delete",
+    "update",
+    "replace",
+    "disable",
+    "enable",
+    "require",
+    "prefer",
+    "pin",
+    "lock",
+    "bump",
+    "drop",
+    "close",
+    "open",
+    "flush",
+    "retry",
+    "skip",
+    "guard",
+    "validate",
+    "sanitize",
+    "escape",
+    "encode",
+    "decode",
+    "serialize",
+    "deserialize",
+    "convert",
+    "cast",
+    "assert",
+    "verify",
+    "confirm",
+    "reject",
+    "deny",
+    "allow",
+    "block",
+    "keep",
+    "move",
+    "copy",
+    "clone",
+    "initialize",
+    "reset",
+    "clear",
 ];
 
 const CAUSALITY_MARKERS: &[&str] = &[
-    "because", "since", "otherwise", "to avoid", "to prevent", "due to",
-    "leads to", "results in", "causes", "reason:",
+    "because",
+    "since",
+    "otherwise",
+    "to avoid",
+    "to prevent",
+    "due to",
+    "leads to",
+    "results in",
+    "causes",
+    "reason:",
 ];
 
 const VAGUE_PHRASES: &[&str] = &[
-    "be careful", "watch out", "might", "maybe", "probably", "should work",
-    "seems to", "i think", "not sure",
+    "be careful",
+    "watch out",
+    "might",
+    "maybe",
+    "probably",
+    "should work",
+    "seems to",
+    "i think",
+    "not sure",
 ];
 
 // ── Quality formula weights (ARCHITECTURE.md §5) ────────────────────────────
@@ -161,8 +228,9 @@ pub fn generate_improvement_hints(score: &QualityScore) -> Vec<String> {
         );
     }
     if signals.contains(&QualitySignal::VaguePhrasing) {
-        hints
-            .push("Remove vague phrases: \"be careful\", \"might\", \"probably\", \"should work\"".into());
+        hints.push(
+            "Remove vague phrases: \"be careful\", \"might\", \"probably\", \"should work\"".into(),
+        );
     }
     if signals.contains(&QualitySignal::TooShort) {
         hints.push("Record is too short (<30 chars) — add detail".into());
@@ -213,16 +281,16 @@ pub fn print_quality_caveat(score: &QualityScore, use_color: bool) {
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 fn bool_weight(b: bool) -> f32 {
-    if b { 1.0 } else { 0.0 }
+    if b {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// Check if the first word of `text` is an imperative verb.
 fn detect_imperative_verb(text: &str) -> bool {
-    let first_word = text
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let first_word = text.split_whitespace().next().unwrap_or("").to_lowercase();
     // Strip trailing punctuation from the first word
     let first_word = first_word.trim_end_matches(|c: char| !c.is_alphanumeric());
     IMPERATIVE_VERBS.contains(&first_word)
@@ -256,7 +324,14 @@ fn specificity_score(text: &str) -> f32 {
     let checks = [
         text.contains("::"),
         text.contains("()"),
-        text.contains('/') && (text.contains(".rs") || text.contains(".ts") || text.contains(".py") || text.contains(".go") || text.contains(".js") || text.contains(".json") || text.contains(".toml")),
+        text.contains('/')
+            && (text.contains(".rs")
+                || text.contains(".ts")
+                || text.contains(".py")
+                || text.contains(".go")
+                || text.contains(".js")
+                || text.contains(".json")
+                || text.contains(".toml")),
         has_camel_case(text),
     ];
     let hit_count = checks.iter().filter(|&&b| b).count();
