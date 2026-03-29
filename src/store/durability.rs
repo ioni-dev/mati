@@ -141,7 +141,7 @@ mod tests {
             "file:src/store/db.rs",
             "stage:current",
             "dev_note:no-refactor",
-            "dep:tokio",
+            "dep:cargo:tokio",
         ];
         for key in cases {
             assert_eq!(
