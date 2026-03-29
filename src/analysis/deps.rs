@@ -26,6 +26,8 @@ use super::walker::WalkedFile;
 /// A single dependency extracted from a manifest file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepEntry {
+    /// Dependency ecosystem — used as part of the canonical dep:* key.
+    pub ecosystem: DepEcosystem,
     /// Dependency name (crate name, npm package, Go module path).
     pub name: String,
     /// Version resolution — explicit string or workspace-inherited.
@@ -34,6 +36,24 @@ pub struct DepEntry {
     pub manifest: ManifestKind,
     /// Whether this is a dev/test dependency.
     pub dev: bool,
+}
+
+/// Canonical dependency ecosystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DepEcosystem {
+    Cargo,
+    Npm,
+    Go,
+}
+
+impl DepEcosystem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Npm => "npm",
+            Self::Go => "go",
+        }
+    }
 }
 
 /// How a dependency version is declared.
@@ -62,6 +82,36 @@ pub struct DepSignals {
     pub manifests_found: Vec<(ManifestKind, String)>,
 }
 
+/// Build the canonical `dep:*` record key for a dependency.
+pub fn dep_record_key(dep: &DepEntry) -> String {
+    format!("dep:{}:{}", dep.ecosystem.as_str(), dep.name)
+}
+
+/// Extract the display name from a `dep:*` key.
+///
+/// Supports both the new `dep:<ecosystem>:<name>` format and the legacy
+/// `dep:<name>` form so read paths stay compatible with old stores.
+pub fn dep_display_name_from_key<'a>(key: &'a str) -> &'a str {
+    let Some(rest) = key.strip_prefix("dep:") else {
+        return key;
+    };
+    match rest.split_once(':') {
+        Some((ecosystem, name)) if matches!(ecosystem, "cargo" | "npm" | "go") => name,
+        _ => rest,
+    }
+}
+
+/// Extract ecosystem + display name from a `dep:*` key when available.
+pub fn parse_dep_key(key: &str) -> Option<(Option<DepEcosystem>, &str)> {
+    let rest = key.strip_prefix("dep:")?;
+    match rest.split_once(':') {
+        Some(("cargo", name)) => Some((Some(DepEcosystem::Cargo), name)),
+        Some(("npm", name)) => Some((Some(DepEcosystem::Npm), name)),
+        Some(("go", name)) => Some((Some(DepEcosystem::Go), name)),
+        _ => Some((None, rest)),
+    }
+}
+
 impl DepSignals {
     /// Empty result — used when no manifests are found.
     pub fn empty() -> Self {
@@ -79,8 +129,8 @@ impl DepSignals {
 /// Looks for `Cargo.toml`, `package.json`, `go.mod` in `walked_files`.
 /// Sync, pure I/O. Returns `DepSignals::empty()` on any systemic error (P9).
 ///
-/// Deduplication: if the same dep name appears from multiple manifests, the
-/// entry from the shallowest (fewest path separators) manifest wins.
+    /// Deduplication: if the same dep identity appears from multiple manifests,
+    /// the entry from the shallowest (fewest path separators) manifest wins.
 pub fn parse_dependencies(repo_path: &Path, walked_files: &[WalkedFile]) -> Result<DepSignals> {
     // Discover manifests, sorted by depth (shallowest first for dedup priority).
     let mut manifests: Vec<(ManifestKind, &str)> = walked_files
@@ -120,12 +170,13 @@ pub fn parse_dependencies(repo_path: &Path, walked_files: &[WalkedFile]) -> Resu
         manifests_found.push((*kind, rel_path.to_string()));
     }
 
-    // Dedup by name — first occurrence wins (shallowest manifest due to sort).
+    // Dedup by canonical dependency identity — first occurrence wins
+    // (shallowest manifest due to sort).
     let mut seen = HashSet::new();
     let mut deduped: Vec<DepEntry> = Vec::with_capacity(all_deps.len());
 
     for dep in all_deps {
-        if seen.insert(dep.name.clone()) {
+        if seen.insert((dep.ecosystem, dep.name.clone())) {
             deduped.push(dep);
         }
     }
@@ -185,6 +236,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
                     if let Some(name) = table_dep_name.take() {
                         deps.push(DepEntry {
                             name,
+                            ecosystem: DepEcosystem::Cargo,
                             version: DepVersion::Declared(String::new()),
                             manifest: ManifestKind::CargoToml,
                             dev: table_dev,
@@ -200,6 +252,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
             // Flush any pending table dep before switching sections.
             if let Some(name) = table_dep_name.take() {
                 deps.push(DepEntry {
+                    ecosystem: DepEcosystem::Cargo,
                     name,
                     version: DepVersion::Declared(String::new()),
                     manifest: ManifestKind::CargoToml,
@@ -257,6 +310,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
                 if key == "version" {
                     if let Some(version) = extract_quoted_string(val) {
                         deps.push(DepEntry {
+                            ecosystem: DepEcosystem::Cargo,
                             name: dep_name.clone(),
                             version: DepVersion::Declared(version),
                             manifest: ManifestKind::CargoToml,
@@ -266,6 +320,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
                     }
                 } else if key == "workspace" && val.trim() == "true" {
                     deps.push(DepEntry {
+                        ecosystem: DepEcosystem::Cargo,
                         name: dep_name.clone(),
                         version: DepVersion::Workspace,
                         manifest: ManifestKind::CargoToml,
@@ -288,6 +343,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
                 let sub_key = sub_key.trim();
                 if sub_key == "workspace" && !dep_name.is_empty() {
                     deps.push(DepEntry {
+                        ecosystem: DepEcosystem::Cargo,
                         name: dep_name.to_string(),
                         version: DepVersion::Workspace,
                         manifest: ManifestKind::CargoToml,
@@ -314,6 +370,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
 
             if let Some(version) = version {
                 deps.push(DepEntry {
+                    ecosystem: DepEcosystem::Cargo,
                     name: name.to_string(),
                     version: DepVersion::Declared(version),
                     manifest: ManifestKind::CargoToml,
@@ -327,6 +384,7 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
     if let Some(name) = table_dep_name {
         deps.push(DepEntry {
             name,
+            ecosystem: DepEcosystem::Cargo,
             version: DepVersion::Declared(String::new()),
             manifest: ManifestKind::CargoToml,
             dev: table_dev,
@@ -347,10 +405,11 @@ fn parse_package_json(content: &str) -> Vec<DepEntry> {
 
     if let Some(obj) = parsed.get("dependencies").and_then(|v| v.as_object()) {
         for (name, version) in obj {
-            deps.push(DepEntry {
-                name: name.clone(),
-                version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
-                manifest: ManifestKind::PackageJson,
+        deps.push(DepEntry {
+            ecosystem: DepEcosystem::Npm,
+            name: name.clone(),
+            version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
+            manifest: ManifestKind::PackageJson,
                 dev: false,
             });
         }
@@ -358,10 +417,11 @@ fn parse_package_json(content: &str) -> Vec<DepEntry> {
 
     if let Some(obj) = parsed.get("devDependencies").and_then(|v| v.as_object()) {
         for (name, version) in obj {
-            deps.push(DepEntry {
-                name: name.clone(),
-                version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
-                manifest: ManifestKind::PackageJson,
+        deps.push(DepEntry {
+            ecosystem: DepEcosystem::Npm,
+            name: name.clone(),
+            version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
+            manifest: ManifestKind::PackageJson,
                 dev: true,
             });
         }
@@ -457,6 +517,7 @@ fn parse_go_require_line(line: &str) -> Option<DepEntry> {
     let version = parts.next().unwrap_or("").to_string();
 
     Some(DepEntry {
+        ecosystem: DepEcosystem::Go,
         name: module.to_string(),
         version: DepVersion::Declared(version),
         manifest: ManifestKind::GoMod,
@@ -516,6 +577,7 @@ tokio = "1.40"
 
         assert_eq!(deps.len(), 3);
         let serde = find_dep(&deps, "serde").unwrap();
+        assert_eq!(serde.ecosystem, DepEcosystem::Cargo);
         assert_eq!(serde.version, DepVersion::Declared("1.0".into()));
         assert_eq!(serde.manifest, ManifestKind::CargoToml);
         assert!(!serde.dev);
@@ -649,6 +711,7 @@ version = "0.1.0"
 
         assert_eq!(deps.len(), 4);
         let react = find_dep(&deps, "react").unwrap();
+        assert_eq!(react.ecosystem, DepEcosystem::Npm);
         assert_eq!(react.version, DepVersion::Declared("^18.0.0".into()));
         assert!(!react.dev);
         assert_eq!(react.manifest, ManifestKind::PackageJson);
@@ -692,6 +755,7 @@ require (
 
         assert_eq!(deps.len(), 3);
         let gin = find_dep(&deps, "github.com/gin-gonic/gin").unwrap();
+        assert_eq!(gin.ecosystem, DepEcosystem::Go);
         assert_eq!(gin.version, DepVersion::Declared("v1.9.1".into()));
         assert_eq!(gin.manifest, ManifestKind::GoMod);
         assert!(!gin.dev);
@@ -845,5 +909,53 @@ anyhow = "1.0"
 
         // anyhow only in subcrate — should still be included
         assert!(find_dep(&signals.deps, "anyhow").is_some());
+    }
+
+    #[test]
+    fn same_name_in_different_ecosystems_do_not_collapse() {
+        let dir = TempDir::new().unwrap();
+
+        write(
+            dir.path(),
+            "Cargo.toml",
+            r#"
+[dependencies]
+react = "1.0"
+"#,
+        );
+
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"dependencies": {"react": "^18.0.0"}}"#,
+        );
+
+        let walked = vec![walked_file("Cargo.toml"), walked_file("package.json")];
+        let signals = parse_dependencies(dir.path(), &walked).unwrap();
+
+        let react_entries: Vec<&DepEntry> = signals.deps.iter().filter(|d| d.name == "react").collect();
+        assert_eq!(react_entries.len(), 2, "cross-ecosystem names must not collapse");
+        assert!(react_entries.iter().any(|d| d.ecosystem == DepEcosystem::Cargo));
+        assert!(react_entries.iter().any(|d| d.ecosystem == DepEcosystem::Npm));
+    }
+
+    #[test]
+    fn dep_key_helpers_support_new_and_legacy_formats() {
+        let dep = DepEntry {
+            ecosystem: DepEcosystem::Cargo,
+            name: "serde".into(),
+            version: DepVersion::Declared("1.0".into()),
+            manifest: ManifestKind::CargoToml,
+            dev: false,
+        };
+
+        assert_eq!(dep_record_key(&dep), "dep:cargo:serde");
+        assert_eq!(dep_display_name_from_key("dep:cargo:serde"), "serde");
+        assert_eq!(dep_display_name_from_key("dep:serde"), "serde");
+        assert_eq!(
+            parse_dep_key("dep:npm:react"),
+            Some((Some(DepEcosystem::Npm), "react"))
+        );
+        assert_eq!(parse_dep_key("dep:serde"), Some((None, "serde")));
     }
 }
