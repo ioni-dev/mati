@@ -16,13 +16,13 @@ use anyhow::{Context, Result};
 /// Marker comment used to detect whether the Vector C stub has already been
 /// written. Checked before appending to prevent duplicates on re-init.
 const MARKER: &str = "<!-- mati:vector-c -->";
+const END_MARKER: &str = "<!-- /mati:vector-c -->";
 
 /// The Vector C injection text (from ARCHITECTURE.md §9).
 ///
 /// Framing: "The PreToolUse hook enforces this" — environmental constraint,
 /// not a behavioral suggestion.
-const VECTOR_C_STUB: &str = "\
-<!-- mati:vector-c -->
+const VECTOR_C_BODY: &str = "\
 ## mati context store
 
 This project uses mati. Before reading any file, call mem_get(\"file:<path>\").
@@ -47,6 +47,10 @@ Single file: mem_set + `mati gotcha confirm <key>` for each gotcha.
 Directory/batch: mem_set only, end with \"Run `mati review` to confirm N gotchas.\"
 ";
 
+fn vector_c_stub() -> String {
+    format!("{MARKER}\n{VECTOR_C_BODY}\n{END_MARKER}\n")
+}
+
 /// Write the Vector C stub to `.claude/CLAUDE.md`.
 ///
 /// - If `.claude/` doesn't exist, the user isn't using Claude Code — skip.
@@ -61,12 +65,38 @@ pub fn write_claude_md_stub(project_root: &Path) -> Result<WriteResult> {
 
     let path = claude_dir.join("CLAUDE.md");
 
+    let stub = vector_c_stub();
+
     if path.exists() {
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
 
-        if content.contains(MARKER) {
-            return Ok(WriteResult::AlreadyPresent);
+        if let Some(start) = content.find(MARKER) {
+            let updated = if let Some(end_rel) = content[start..].find(END_MARKER) {
+                let end = start + end_rel + END_MARKER.len();
+                let mut next = String::with_capacity(content.len() + stub.len());
+                next.push_str(&content[..start]);
+                next.push_str(&stub);
+                if content[end..].starts_with('\n') {
+                    next.push_str(&content[end + 1..]);
+                } else {
+                    next.push_str(&content[end..]);
+                }
+                next
+            } else {
+                let mut next = String::with_capacity(content.len() + stub.len());
+                next.push_str(&content[..start]);
+                next.push_str(&stub);
+                next
+            };
+
+            if updated == content {
+                return Ok(WriteResult::AlreadyPresent);
+            }
+
+            std::fs::write(&path, updated)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            return Ok(WriteResult::Updated);
         }
 
         // Append with a blank line separator.
@@ -75,14 +105,14 @@ pub fn write_claude_md_stub(project_root: &Path) -> Result<WriteResult> {
             appended.push('\n');
         }
         appended.push('\n');
-        appended.push_str(VECTOR_C_STUB);
+        appended.push_str(&stub);
 
         std::fs::write(&path, appended)
             .with_context(|| format!("failed to write {}", path.display()))?;
 
         Ok(WriteResult::Appended)
     } else {
-        std::fs::write(&path, VECTOR_C_STUB)
+        std::fs::write(&path, &stub)
             .with_context(|| format!("failed to write {}", path.display()))?;
 
         Ok(WriteResult::Created)
@@ -96,6 +126,8 @@ pub enum WriteResult {
     Created,
     /// Stub appended to an existing file.
     Appended,
+    /// Existing scaffold block updated in place.
+    Updated,
     /// Marker already present — no write needed.
     AlreadyPresent,
     /// `.claude/` directory doesn't exist — user isn't using Claude Code.
@@ -119,6 +151,7 @@ mod tests {
 
         let content = std::fs::read_to_string(dir.path().join(".claude/CLAUDE.md")).unwrap();
         assert!(content.contains(MARKER));
+        assert!(content.contains(END_MARKER));
         assert!(content.contains("mem_get(\"file:<path>\")"));
         assert!(content.contains("PreToolUse hook enforces this"));
     }
@@ -181,5 +214,23 @@ mod tests {
         let content = std::fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
         // Should have a blank line between existing content and stub.
         assert!(content.contains("# Title\n\n<!-- mati:vector-c -->"));
+    }
+
+    #[test]
+    fn updates_existing_legacy_stub_block() {
+        let dir = TempDir::new().unwrap();
+        let claude_dir = dir.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let legacy = format!("{MARKER}\n## old mati block\nstale instructions\n");
+        std::fs::write(claude_dir.join("CLAUDE.md"), legacy).unwrap();
+
+        let result = write_claude_md_stub(dir.path()).unwrap();
+        assert_eq!(result, WriteResult::Updated);
+
+        let content = std::fs::read_to_string(claude_dir.join("CLAUDE.md")).unwrap();
+        assert!(content.contains("## mati context store"));
+        assert!(content.contains(END_MARKER));
+        assert!(!content.contains("## old mati block"));
     }
 }

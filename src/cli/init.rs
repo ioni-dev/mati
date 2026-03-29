@@ -13,6 +13,7 @@ use mati_core::analysis::{
 };
 use mati_core::graph::Graph;
 use mati_core::scaffold::{install_hooks, write_claude_md_stub};
+use mati_core::scaffold::settings::InstallResult;
 use mati_core::store::{
     derive_slug, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
     Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
@@ -27,10 +28,6 @@ pub struct InitArgs {
     /// Skip hook installation into .claude/hooks/
     #[arg(long)]
     pub no_hooks: bool,
-
-    /// Skip writing .claude/settings.json
-    #[arg(long)]
-    pub no_settings: bool,
 }
 
 pub async fn run(args: InitArgs) -> Result<()> {
@@ -418,7 +415,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .iter()
         .enumerate()
         .map(|(i, dep)| {
-            let key = format!("dep:{}", dep.name);
+            let key = mati_core::analysis::dep_record_key(dep);
             let mut rec = Record::layer0_file_stub(&key, device_id, logical_clock + i as u64, now);
             rec.category = Category::Dependency;
             rec.source = RecordSource::StaticAnalysis;
@@ -436,6 +433,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 mati_core::analysis::ManifestKind::GoMod => "manifest:go-mod",
             };
             rec.tags = vec![
+                format!("ecosystem:{}", dep.ecosystem.as_str()),
                 manifest_tag.to_string(),
                 if dep.dev {
                     "dev-dep".to_string()
@@ -532,6 +530,18 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 }
             }
             Err(e) => tracing::warn!("ownership tombstone scan failed (non-fatal): {e}"),
+        }
+
+        let new_dep_keys: HashSet<&str> = dep_record_structs.iter().map(|r| r.key.as_str()).collect();
+        match store.scan_prefix("dep:").await {
+            Ok(existing) => {
+                for key in stale_dependency_keys(&existing, &new_dep_keys) {
+                    if let Err(e) = store.delete(&key).await {
+                        tracing::warn!("failed to delete stale dependency record {}: {e}", key);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("dependency cleanup scan failed (non-fatal): {e}"),
         }
     }
 
@@ -689,7 +699,22 @@ pub async fn run(args: InitArgs) -> Result<()> {
     if !args.no_hooks {
         let t = Instant::now();
         match install_hooks(&root) {
-            Ok(_) => println!(
+            Ok(InstallResult::Installed { missing_deps, .. }) => {
+                println!(
+                    "  Installing hooks into .claude/...                   {:>3}ms",
+                    t.elapsed().as_millis()
+                );
+                if !missing_deps.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: hook runtime dependencies missing: {}",
+                        missing_deps.join(", ")
+                    );
+                    eprintln!("  Hook enforcement will fail open until they are installed.");
+                    eprintln!();
+                }
+            }
+            Ok(InstallResult::NoClaude) => println!(
                 "  Installing hooks into .claude/...                   {:>3}ms",
                 t.elapsed().as_millis()
             ),
@@ -1141,6 +1166,15 @@ fn make_hash_record(key: &str, hash: &str, device_id: Uuid, now: u64) -> Record 
     }
 }
 
+fn stale_dependency_keys(existing: &[Record], new_keys: &HashSet<&str>) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|rec| rec.category == Category::Dependency)
+        .filter(|rec| !new_keys.contains(rec.key.as_str()))
+        .map(|rec| rec.key.clone())
+        .collect()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1163,6 +1197,33 @@ mod tests {
 
     fn dummy() -> (Uuid, u64) {
         (Uuid::new_v4(), 0)
+    }
+
+    fn make_record_with_category(key: &str, category: Category) -> Record {
+        Record {
+            key: key.to_string(),
+            value: "value".to_string(),
+            category,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 1,
+            updated_at: 1,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: Uuid::nil(),
+                logical_clock: 1,
+                wall_clock: 1,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+            payload: None,
+        }
     }
 
     // ── Rule text format ──────────────────────────────────────────────────────
@@ -1399,5 +1460,25 @@ mod tests {
             quality.value
         );
         assert!((conf_value - 0.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn stale_dependency_keys_delete_legacy_and_removed_dep_records() {
+        let existing = vec![
+            make_record_with_category("dep:serde", Category::Dependency),
+            make_record_with_category("dep:cargo:serde", Category::Dependency),
+            make_record_with_category("dep:npm:react", Category::Dependency),
+            make_record_with_category("dep:cargo:old", Category::Dependency),
+            make_record_with_category("file:src/main.rs", Category::File),
+        ];
+        let new_keys: HashSet<&str> = ["dep:cargo:serde", "dep:npm:react"]
+            .into_iter()
+            .collect();
+
+        let stale = stale_dependency_keys(&existing, &new_keys);
+
+        assert_eq!(stale.len(), 2);
+        assert!(stale.contains(&"dep:serde".to_string()));
+        assert!(stale.contains(&"dep:cargo:old".to_string()));
     }
 }
