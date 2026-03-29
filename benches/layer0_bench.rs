@@ -56,9 +56,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use git2::{IndexAddOption, Repository, Signature};
 use tantivy::schema::{NumericOptions, Schema, FAST, STORED, STRING, TEXT};
 use tantivy::{Index, IndexWriter, TantivyDocument};
@@ -66,11 +64,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 use mati_core::analysis::{
-    build_file_records, mine_git_history, parse_dependencies, parse_files_parallel, Walker,
-    WalkedFile,
+    build_file_records, mine_git_history, parse_dependencies, parse_files_parallel, WalkedFile,
+    Walker,
 };
-use mati_core::store::record::{Category, Priority, Record};
 use mati_core::search::Search;
+use mati_core::store::record::{Category, Priority, Record};
 use mati_core::store::Store;
 
 // ── Scale configurations ────────────────────────────────────────────────────
@@ -253,9 +251,7 @@ def compute_{i}(value: int) -> int:
 }
 
 fn other_source(i: usize) -> String {
-    format!(
-        "# generated doc {i}\n\nThis file exists to keep the file mix realistic.\n"
-    )
+    format!("# generated doc {i}\n\nThis file exists to keep the file mix realistic.\n")
 }
 
 struct Layer0Fixture {
@@ -347,7 +343,10 @@ impl Layer0Fixture {
 
         let walker = Walker::new(&root);
         let files = walker.walk().unwrap();
-        let walked_paths = files.iter().map(|f| f.rel_path.clone()).collect::<HashSet<_>>();
+        let walked_paths = files
+            .iter()
+            .map(|f| f.rel_path.clone())
+            .collect::<HashSet<_>>();
         let analyses = parse_files_parallel(&files);
         let git = mine_git_history(&root, &walked_paths).unwrap();
         let _deps = parse_dependencies(&root, &files).unwrap();
@@ -417,12 +416,16 @@ fn bench_parse(c: &mut Criterion) {
         let fixture = Layer0Fixture::prepare(size, commit_count_for(size));
         group.throughput(Throughput::Elements(fixture.files.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("parse_parallel", label), &fixture, |b, fixture| {
-            b.iter(|| {
-                let analyses = parse_files_parallel(&fixture.files);
-                black_box(analyses.len());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("parse_parallel", label),
+            &fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let analyses = parse_files_parallel(&fixture.files);
+                    black_box(analyses.len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -440,12 +443,16 @@ fn bench_git(c: &mut Criterion) {
         let fixture = Layer0Fixture::prepare(size, commit_count_for(size));
         group.throughput(Throughput::Elements(fixture.walked_paths.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("mine_git_history", label), &fixture, |b, fixture| {
-            b.iter(|| {
-                let signals = mine_git_history(&fixture.root, &fixture.walked_paths).unwrap();
-                black_box(signals.change_frequency.len());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("mine_git_history", label),
+            &fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let signals = mine_git_history(&fixture.root, &fixture.walked_paths).unwrap();
+                    black_box(signals.change_frequency.len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -463,12 +470,16 @@ fn bench_deps(c: &mut Criterion) {
         let fixture = Layer0Fixture::prepare(size, commit_count_for(size));
         group.throughput(Throughput::Elements(fixture.files.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("parse_dependencies", label), &fixture, |b, fixture| {
-            b.iter(|| {
-                let deps = parse_dependencies(&fixture.root, &fixture.files).unwrap();
-                black_box(deps.deps.len());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("parse_dependencies", label),
+            &fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let deps = parse_dependencies(&fixture.root, &fixture.files).unwrap();
+                    black_box(deps.deps.len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -486,13 +497,22 @@ fn bench_materialize(c: &mut Criterion) {
         let fixture = Layer0Fixture::prepare(size, commit_count_for(size));
         group.throughput(Throughput::Elements(fixture.files.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("build_file_records", label), &fixture, |b, fixture| {
-            b.iter(|| {
-                let records = build_file_records(&fixture.files, &fixture.analyses, Some(&fixture.git), now_secs());
-                black_box(records.len());
-                black_box(records[0].token_cost_estimate);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("build_file_records", label),
+            &fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let records = build_file_records(
+                        &fixture.files,
+                        &fixture.analyses,
+                        Some(&fixture.git),
+                        now_secs(),
+                    );
+                    black_box(records.len());
+                    black_box(records[0].token_cost_estimate);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -626,21 +646,25 @@ fn bench_full(c: &mut Criterion) {
         let fixture = Layer0Fixture::prepare(size, commit_count_for(size));
         group.throughput(Throughput::Elements(fixture.files.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("walk_parse_git_deps_materialize", label), &fixture, |b, fixture| {
-            b.iter(|| {
-                let files = Walker::new(&fixture.root).walk().unwrap();
-                let analyses = parse_files_parallel(&files);
-                let git = mine_git_history(&fixture.root, &fixture.walked_paths).unwrap();
-                let deps = parse_dependencies(&fixture.root, &files).unwrap();
-                let records = build_file_records(&files, &analyses, Some(&git), now_secs());
+        group.bench_with_input(
+            BenchmarkId::new("walk_parse_git_deps_materialize", label),
+            &fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let files = Walker::new(&fixture.root).walk().unwrap();
+                    let analyses = parse_files_parallel(&files);
+                    let git = mine_git_history(&fixture.root, &fixture.walked_paths).unwrap();
+                    let deps = parse_dependencies(&fixture.root, &files).unwrap();
+                    let records = build_file_records(&files, &analyses, Some(&git), now_secs());
 
-                black_box(files.len());
-                black_box(analyses.len());
-                black_box(git.change_frequency.len());
-                black_box(deps.deps.len());
-                black_box(records.len());
-            });
-        });
+                    black_box(files.len());
+                    black_box(analyses.len());
+                    black_box(git.change_frequency.len());
+                    black_box(deps.deps.len());
+                    black_box(records.len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -704,49 +728,71 @@ fn bench_persist_kv_only(c: &mut Criterion) {
 /// Mirrors `search::index::Fields` exactly — same schema, same field order.
 #[derive(Clone, Copy)]
 struct BenchFields {
-    key:        tantivy::schema::Field,
-    value:      tantivy::schema::Field,
-    category:   tantivy::schema::Field,
-    tags:       tantivy::schema::Field,
-    priority:   tantivy::schema::Field,
+    key: tantivy::schema::Field,
+    value: tantivy::schema::Field,
+    category: tantivy::schema::Field,
+    tags: tantivy::schema::Field,
+    priority: tantivy::schema::Field,
     updated_at: tantivy::schema::Field,
 }
 
 /// Build the same schema as `search::index::schema()`.
 fn bench_schema() -> (Schema, BenchFields) {
     let mut b = Schema::builder();
-    let key        = b.add_text_field("key",        TEXT | STORED);
-    let value      = b.add_text_field("value",      TEXT | STORED);
-    let category   = b.add_text_field("category",   STRING | STORED | FAST);
-    let tags       = b.add_text_field("tags",        TEXT | STORED);
-    let priority   = b.add_u64_field("priority",    NumericOptions::default().set_stored().set_fast());
-    let updated_at = b.add_u64_field("updated_at",  NumericOptions::default().set_stored().set_fast());
-    (b.build(), BenchFields { key, value, category, tags, priority, updated_at })
+    let key = b.add_text_field("key", TEXT | STORED);
+    let value = b.add_text_field("value", TEXT | STORED);
+    let category = b.add_text_field("category", STRING | STORED | FAST);
+    let tags = b.add_text_field("tags", TEXT | STORED);
+    let priority = b.add_u64_field(
+        "priority",
+        NumericOptions::default().set_stored().set_fast(),
+    );
+    let updated_at = b.add_u64_field(
+        "updated_at",
+        NumericOptions::default().set_stored().set_fast(),
+    );
+    (
+        b.build(),
+        BenchFields {
+            key,
+            value,
+            category,
+            tags,
+            priority,
+            updated_at,
+        },
+    )
 }
 
 /// Same conversion as `search::index::record_to_doc`.
 fn bench_record_to_doc(record: &Record, f: &BenchFields) -> TantivyDocument {
     let mut doc = TantivyDocument::default();
-    doc.add_text(f.key,        &record.key);
-    doc.add_text(f.value,      &record.value);
-    doc.add_text(f.category,   match &record.category {
-        Category::Gotcha     => "gotcha",
-        Category::File       => "file",
-        Category::Decision   => "decision",
-        Category::Stage      => "stage",
-        Category::Dependency => "dependency",
-        Category::DevNote    => "dev_note",
-        Category::Session    => "session",
-        Category::Analytics  => "analytics",
-    });
-    doc.add_text(f.tags,       record.tags.join(" "));
-    doc.add_u64(f.priority,    match &record.priority {
-        Priority::Low      => 0,
-        Priority::Normal   => 1,
-        Priority::High     => 2,
-        Priority::Critical => 3,
-    });
-    doc.add_u64(f.updated_at,  record.updated_at);
+    doc.add_text(f.key, &record.key);
+    doc.add_text(f.value, &record.value);
+    doc.add_text(
+        f.category,
+        match &record.category {
+            Category::Gotcha => "gotcha",
+            Category::File => "file",
+            Category::Decision => "decision",
+            Category::Stage => "stage",
+            Category::Dependency => "dependency",
+            Category::DevNote => "dev_note",
+            Category::Session => "session",
+            Category::Analytics => "analytics",
+        },
+    );
+    doc.add_text(f.tags, record.tags.join(" "));
+    doc.add_u64(
+        f.priority,
+        match &record.priority {
+            Priority::Low => 0,
+            Priority::Normal => 1,
+            Priority::High => 2,
+            Priority::Critical => 3,
+        },
+    );
+    doc.add_u64(f.updated_at, record.updated_at);
     doc
 }
 
@@ -783,7 +829,9 @@ fn bench_search_stage_only(c: &mut Criterion) {
                     },
                     |(mut writer, fields, _dir)| {
                         for record in &fixture.records {
-                            writer.add_document(bench_record_to_doc(record, &fields)).unwrap();
+                            writer
+                                .add_document(bench_record_to_doc(record, &fields))
+                                .unwrap();
                         }
                         // No commit — measure only doc construction + staging.
                         // Rollback to release the segment cleanly.
@@ -825,7 +873,9 @@ fn bench_search_commit_only(c: &mut Criterion) {
                         let dir = TempDir::new().unwrap();
                         let (_, writer, fields) = bench_open_writer(&dir.path().join("idx"));
                         for record in &fixture.records {
-                            writer.add_document(bench_record_to_doc(record, &fields)).unwrap();
+                            writer
+                                .add_document(bench_record_to_doc(record, &fields))
+                                .unwrap();
                         }
                         (writer, dir)
                     },
@@ -869,7 +919,9 @@ fn bench_search_chunk_sweep(c: &mut Criterion) {
                         let mut committed = 0usize;
                         for chunk in fixture.records.chunks(chunk_size) {
                             for record in chunk {
-                                writer.add_document(bench_record_to_doc(record, &fields)).unwrap();
+                                writer
+                                    .add_document(bench_record_to_doc(record, &fields))
+                                    .unwrap();
                             }
                             writer.commit().unwrap();
                             committed += chunk.len();

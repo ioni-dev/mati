@@ -34,23 +34,23 @@ pub fn strip_ansi(s: &str) -> String {
 pub struct InitMetrics {
     /// Wall-clock time per named stage (ms). Keys: "walk", "parse", "git",
     /// "deps", "records", "edges", "store", "scaffold", "close".
-    pub stages:        std::collections::HashMap<String, u64>,
+    pub stages: std::collections::HashMap<String, u64>,
     /// Total init time reported at the bottom (ms).
-    pub total_ms:      u64,
+    pub total_ms: u64,
     /// File records written.
-    pub file_count:    usize,
+    pub file_count: usize,
     /// Gotcha candidates found.
-    pub gotcha_cands:  usize,
+    pub gotcha_cands: usize,
     /// Dependency records.
-    pub dep_count:     usize,
+    pub dep_count: usize,
     /// Graph edges built.
-    pub edge_count:    usize,
+    pub edge_count: usize,
     /// CLAUDE.md sections imported.
     pub imported_secs: usize,
     /// Hotspot files.
     pub hotspot_count: usize,
     /// True if "Total:" line was found (init completed).
-    pub completed:     bool,
+    pub completed: bool,
 }
 
 pub fn parse_init(stdout: &str) -> InitMetrics {
@@ -113,7 +113,6 @@ pub fn parse_init(stdout: &str) -> InitMetrics {
                 m.stages.insert("hooks".into(), ms);
             }
         }
-
         // ── Summary lines ─────────────────────────────────────────────────
         // "  file records:          448   (stubs + entry points)"
         else if trimmed.starts_with("file records:") {
@@ -139,12 +138,11 @@ pub fn parse_init(stdout: &str) -> InitMetrics {
         else if trimmed.starts_with("hotspot files:") {
             m.hotspot_count = first_number(trimmed).unwrap_or(0);
         }
-
         // ── Total line ────────────────────────────────────────────────────
         // "  Total: 379ms · 0 tokens · 0 Claude calls"
         else if trimmed.starts_with("Total:") {
             if let Some(ms) = first_ms(trimmed) {
-                m.total_ms  = ms;
+                m.total_ms = ms;
                 m.completed = true;
             }
         }
@@ -157,17 +155,17 @@ pub fn parse_init(stdout: &str) -> InitMetrics {
 
 #[derive(Debug, Default)]
 pub struct StatusMetrics {
-    pub file_count:      usize,
-    pub gotcha_count:    usize,
-    pub decision_count:  usize,
-    pub note_count:      usize,
-    pub dep_count:       usize,
+    pub file_count: usize,
+    pub gotcha_count: usize,
+    pub decision_count: usize,
+    pub note_count: usize,
+    pub dep_count: usize,
     pub confirmed_count: usize,
-    pub confirmed_pct:   f64,
-    pub confidence_avg:  f64,
-    pub confidence_med:  f64,
-    pub hotspot_count:   usize,
-    pub total_files:     usize,
+    pub confirmed_pct: f64,
+    pub confidence_avg: f64,
+    pub confidence_med: f64,
+    pub hotspot_count: usize,
+    pub total_files: usize,
 }
 
 pub fn parse_status(stdout: &str) -> StatusMetrics {
@@ -182,11 +180,11 @@ pub fn parse_status(stdout: &str) -> StatusMetrics {
             // Extract counts in order: files gotchas decisions notes deps
             let nums: Vec<usize> = numbers_in(t);
             if nums.len() >= 5 {
-                m.file_count     = nums[0];
-                m.gotcha_count   = nums[1];
+                m.file_count = nums[0];
+                m.gotcha_count = nums[1];
                 m.decision_count = nums[2];
-                m.note_count     = nums[3];
-                m.dep_count      = nums[4];
+                m.note_count = nums[3];
+                m.dep_count = nums[4];
             }
         }
 
@@ -231,25 +229,25 @@ pub fn parse_status(stdout: &str) -> StatusMetrics {
 
 #[derive(Debug, Default, Clone)]
 pub struct StatsMetrics {
-    pub files_with_purpose:   usize,
-    pub total_files:          usize,
-    pub purpose_pct:          f64,
-    pub gotchas_per_hotspot:  f64,
-    pub decision_count:       usize,
-    pub avg_confidence:       f64,
-    pub gap_count:            usize,
-    pub new_records_30d:      usize,
-    pub multi_contributor:    usize,
-    pub onboarding_minutes:   f64,
-    pub critical_uncovered:   usize,
-    pub orphaned_decisions:   usize,
-    pub low_confidence:       usize,
-    pub hit_rate_pct:         f64,
-    pub hits_7d:              usize,
-    pub total_lookups:        usize,
-    pub bypasses_7d:          usize,
+    pub files_with_purpose: usize,
+    pub total_files: usize,
+    pub purpose_pct: f64,
+    pub gotchas_per_hotspot: f64,
+    pub decision_count: usize,
+    pub avg_confidence: f64,
+    pub gap_count: usize,
+    pub new_records_30d: usize,
+    pub multi_contributor: usize,
+    pub onboarding_minutes: f64,
+    pub critical_uncovered: usize,
+    pub orphaned_decisions: usize,
+    pub low_confidence: usize,
+    pub hit_rate_pct: f64,
+    pub hits_7d: usize,
+    pub total_lookups: usize,
+    pub bypasses_7d: usize,
     /// True if "(cached" appears in the header — this was a cache hit.
-    pub was_cached:           bool,
+    pub was_cached: bool,
 }
 
 pub fn parse_stats(stdout: &str) -> StatsMetrics {
@@ -268,7 +266,7 @@ pub fn parse_stats(stdout: &str) -> StatsMetrics {
             let nums: Vec<usize> = numbers_in(t);
             if nums.len() >= 2 {
                 m.files_with_purpose = nums[0];
-                m.total_files        = nums[1];
+                m.total_files = nums[1];
             }
             if let Some(pct) = percent_in(t) {
                 m.purpose_pct = pct;
@@ -338,7 +336,7 @@ pub fn parse_stats(stdout: &str) -> StatsMetrics {
             }
             let nums: Vec<usize> = numbers_in(t);
             if nums.len() >= 2 {
-                m.hits_7d       = nums[0];
+                m.hits_7d = nums[0];
                 m.total_lookups = nums[1];
             }
         }
@@ -357,9 +355,9 @@ pub fn parse_stats(stdout: &str) -> StatsMetrics {
 #[derive(Debug, Default, Clone)]
 pub struct GapsMetrics {
     pub critical: usize,
-    pub high:     usize,
-    pub normal:   usize,
-    pub low:      usize,
+    pub high: usize,
+    pub normal: usize,
+    pub low: usize,
 }
 
 impl GapsMetrics {
@@ -375,10 +373,15 @@ pub fn parse_gaps(stdout: &str) -> GapsMetrics {
     for line in clean.lines() {
         let t = line.trim();
         // Each gap line starts with "● TIER" after stripping ANSI.
-        if t.starts_with("● CRITICAL") || t.starts_with("●  CRITICAL") { m.critical += 1; }
-        else if t.starts_with("● HIGH")     || t.starts_with("●  HIGH")     { m.high     += 1; }
-        else if t.starts_with("● NORMAL")   || t.starts_with("●  NORMAL")   { m.normal   += 1; }
-        else if t.starts_with("● LOW")      || t.starts_with("●  LOW")      { m.low      += 1; }
+        if t.starts_with("● CRITICAL") || t.starts_with("●  CRITICAL") {
+            m.critical += 1;
+        } else if t.starts_with("● HIGH") || t.starts_with("●  HIGH") {
+            m.high += 1;
+        } else if t.starts_with("● NORMAL") || t.starts_with("●  NORMAL") {
+            m.normal += 1;
+        } else if t.starts_with("● LOW") || t.starts_with("●  LOW") {
+            m.low += 1;
+        }
     }
 
     m
@@ -388,8 +391,8 @@ pub fn parse_gaps(stdout: &str) -> GapsMetrics {
 
 #[derive(Debug, Default)]
 pub struct StaleMetrics {
-    pub aging:     usize,
-    pub stale:     usize,
+    pub aging: usize,
+    pub stale: usize,
     pub liability: usize,
     pub tombstone: usize,
 }
@@ -407,10 +410,18 @@ pub fn parse_stale(stdout: &str) -> StaleMetrics {
     for line in clean.lines() {
         let upper = line.to_uppercase();
         // Count rows that contain tier labels (table data rows).
-        if upper.contains("AGING")     && upper.contains('│') { m.aging     += 1; }
-        if upper.contains("LIABILITY") && upper.contains('│') { m.liability += 1; }
-        if upper.contains("TOMBSTONE") && upper.contains('│') { m.tombstone += 1; }
-        if upper.contains("│ STALE │") || (upper.contains("STALE") && upper.contains('│') && !upper.contains("AGING")) {
+        if upper.contains("AGING") && upper.contains('│') {
+            m.aging += 1;
+        }
+        if upper.contains("LIABILITY") && upper.contains('│') {
+            m.liability += 1;
+        }
+        if upper.contains("TOMBSTONE") && upper.contains('│') {
+            m.tombstone += 1;
+        }
+        if upper.contains("│ STALE │")
+            || (upper.contains("STALE") && upper.contains('│') && !upper.contains("AGING"))
+        {
             m.stale += 1;
         }
     }
@@ -424,12 +435,18 @@ pub fn parse_stale(stdout: &str) -> StaleMetrics {
 pub fn parse_ping_us(stdout: &str) -> Option<u64> {
     let clean = strip_ansi(stdout);
     for line in clean.lines() {
-        if !line.contains("ok") { continue; }
+        if !line.contains("ok") {
+            continue;
+        }
         // Look for the number before "µs" or "us".
         let hay = line.replace("µs", "us");
         if let Some(pos) = hay.find("us") {
             let before = &hay[..pos];
-            if let Some(n) = before.split_whitespace().last().and_then(|s| s.parse::<u64>().ok()) {
+            if let Some(n) = before
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
                 return Some(n);
             }
         }
@@ -457,29 +474,47 @@ pub fn extract_file_keys(stdout: &str) -> Vec<String> {
         if line.contains('┆') {
             // Hot-path format (comfy_table): ┆-separated columns.
             let t = line.trim();
-            if t.contains("Path") && t.contains("Purpose") { continue; }
+            if t.contains("Path") && t.contains("Purpose") {
+                continue;
+            }
             let cell = line
                 .split('┆')
                 .next()
                 .unwrap_or("")
                 .trim_matches(|c: char| c == '│' || c == ' ' || c == '┆');
             let path = cell.trim();
-            if !path.is_empty() && !path.starts_with('─') && !path.starts_with('═')
-                && !path.starts_with('╞') && !path.starts_with('┌')
+            if !path.is_empty()
+                && !path.starts_with('─')
+                && !path.starts_with('═')
+                && !path.starts_with('╞')
+                && !path.starts_with('┌')
             {
                 keys.push(format!("file:{}", path));
             }
         } else {
             // Cold-path format (streaming): fixed-width, path in first 42 chars.
             let t = line.trim();
-            if t.is_empty() { continue; }
+            if t.is_empty() {
+                continue;
+            }
             // Skip header, separator, and summary lines.
-            if t.starts_with("PATH") || t.starts_with("─") || t.starts_with("━")
-                || t.starts_with('╞') || t.starts_with('┌') || t.starts_with('═')
-                || t.ends_with("files total") || t.contains("files total")
-            { continue; }
+            if t.starts_with("PATH")
+                || t.starts_with("─")
+                || t.starts_with("━")
+                || t.starts_with('╞')
+                || t.starts_with('┌')
+                || t.starts_with('═')
+                || t.ends_with("files total")
+                || t.contains("files total")
+            {
+                continue;
+            }
             // Path occupies the first COL_PATH (42) characters.
-            let col_end = line.char_indices().nth(42).map(|(i, _)| i).unwrap_or(line.len());
+            let col_end = line
+                .char_indices()
+                .nth(42)
+                .map(|(i, _)| i)
+                .unwrap_or(line.len());
             let path = line[..col_end].trim();
             if !path.is_empty() && (path.contains('/') || path.contains('.')) {
                 keys.push(format!("file:{}", path));

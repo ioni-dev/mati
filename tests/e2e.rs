@@ -137,7 +137,13 @@ fn e2e_full_lifecycle() {
                          consume 100%+ CPU for seconds";
     let gotcha_input = format!("{gotcha_rule}\n{gotcha_reason}\nhigh\n{explain_path}\n\n");
 
-    let r = h_run_stdin(&mati, &repo, home, &["gotcha", "add", &explain_path], &gotcha_input);
+    let r = h_run_stdin(
+        &mati,
+        &repo,
+        home,
+        &["gotcha", "add", &explain_path],
+        &gotcha_input,
+    );
     let mut sr = StepResult::new("gotcha add", &r);
     let gotcha_key = extract_gotcha_add_metrics(&r.stdout, &r.stderr, &mut sr, &mut summary);
     report.add(sr);
@@ -176,7 +182,13 @@ fn e2e_full_lifecycle() {
     // Quality gate rejection — short/bad rule must be rejected (exit non-zero)
     {
         let bad_input = "bad\nno\nhigh\n\n\n".to_string();
-        let r = h_run_stdin(&mati, &repo, home, &["gotcha", "add", &explain_path], &bad_input);
+        let r = h_run_stdin(
+            &mati,
+            &repo,
+            home,
+            &["gotcha", "add", &explain_path],
+            &bad_input,
+        );
         let mut sr = StepResult::new("gotcha reject", &r);
         // Correct behaviour: exit non-zero (quality gate blocked it)
         sr.failed = r.exit_ok; // fails if the gate MISSED and let it through
@@ -193,7 +205,13 @@ fn e2e_full_lifecycle() {
             compiling patterns from user input; use size_limit() because adversarial patterns \
             without limits cause ReDoS attacks consuming 100%+ CPU for seconds\n"
             .to_string();
-        let r = h_run_stdin(&mati, &repo, home, &["improve", &gotcha_key], &improve_input);
+        let r = h_run_stdin(
+            &mati,
+            &repo,
+            home,
+            &["improve", &gotcha_key],
+            &improve_input,
+        );
         let mut sr = StepResult::new("improve", &r);
         extract_improve_metrics(&r.stdout, &r.stderr, &mut sr, &mut summary);
         report.add(sr);
@@ -264,10 +282,7 @@ fn e2e_full_lifecycle() {
             metrics2: vec![],
             raw_stderr: None,
         };
-        sr.add_metric(
-            "gotcha in export",
-            if contains { "✓" } else { "MISSING" },
-        );
+        sr.add_metric("gotcha in export", if contains { "✓" } else { "MISSING" });
         report.add(sr);
     }
 
@@ -287,7 +302,13 @@ fn e2e_full_lifecycle() {
         let n = extract_ls_gotchas_count(&r.stdout);
         sr.add_metric("total", &n.to_string());
         if n > summary.gotcha_count_after_add {
-            sr.add_metric("✓ persisted", &format!("+{} from iter2", n.saturating_sub(summary.gotcha_count_after_add)));
+            sr.add_metric(
+                "✓ persisted",
+                &format!(
+                    "+{} from iter2",
+                    n.saturating_sub(summary.gotcha_count_after_add)
+                ),
+            );
         } else if n == summary.gotcha_count_after_add {
             sr.add_metric("✓ persisted", "unchanged");
         }
@@ -363,13 +384,27 @@ fn e2e_full_lifecycle() {
         // GetOutput flattens Record, so fields are at top level: {"confidence":{"value":0.80,...},"confirmed":true,...}
         let json_conf_val = serde_json::from_str::<serde_json::Value>(r.stdout.trim())
             .ok()
-            .and_then(|v| v.get("confidence").and_then(|c| c.get("value")).and_then(|v| v.as_f64()))
+            .and_then(|v| {
+                v.get("confidence")
+                    .and_then(|c| c.get("value"))
+                    .and_then(|v| v.as_f64())
+            })
             .map(|v| v as f32);
-        sr.add_metric("confirmed_in_json", if json_confirmed { "✓" } else { "missing" });
+        sr.add_metric(
+            "confirmed_in_json",
+            if json_confirmed { "✓" } else { "missing" },
+        );
         if let Some(c) = json_conf_val {
             let inject_ready = c >= 0.6 && json_confirmed;
             sr.add_metric("confidence", &format!("{c:.2}"));
-            sr.add_metric("injectable", if inject_ready { "✓ (≥0.6 + confirmed)" } else { "not yet" });
+            sr.add_metric(
+                "injectable",
+                if inject_ready {
+                    "✓ (≥0.6 + confirmed)"
+                } else {
+                    "not yet"
+                },
+            );
             summary.hook_inject_ready = inject_ready;
         }
         summary.gotcha_confirmed = json_confirmed;
@@ -509,8 +544,7 @@ fn e2e_full_lifecycle() {
         }
 
         fn mcp_recv(rx: &mpsc::Receiver<String>, id: u64) -> Option<serde_json::Value> {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 let rem = deadline.saturating_duration_since(std::time::Instant::now());
                 if rem.is_zero() {
@@ -567,7 +601,9 @@ fn e2e_full_lifecycle() {
             let _ = stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"e2e\",\"version\":\"0.1\"}}}\n");
             let _ = stdin.flush();
             mcp_recv(&rx, 1);
-            let _ = stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n");
+            let _ = stdin.write_all(
+                b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\",\"params\":{}}\n",
+            );
             let _ = stdin.flush();
 
             // ── mem_get: the gotcha we created should return non-null ────────
@@ -696,11 +732,7 @@ fn e2e_full_lifecycle() {
         .filter(|s| s.failed && !s.skipped)
         .map(|s| s.label)
         .collect();
-    assert!(
-        failed.is_empty(),
-        "e2e steps failed: {:?}",
-        failed
-    );
+    assert!(failed.is_empty(), "e2e steps failed: {:?}", failed);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -857,7 +889,10 @@ impl<'a> Report<'a> {
         println!("  ── Init performance ──");
         if summary.cold_init_ms > 0 {
             let speedup = if summary.warm_init_ms > 0 {
-                format!("{:.1}x", summary.cold_init_ms as f64 / summary.warm_init_ms as f64)
+                format!(
+                    "{:.1}x",
+                    summary.cold_init_ms as f64 / summary.warm_init_ms as f64
+                )
             } else {
                 "?".to_string()
             };
@@ -876,7 +911,11 @@ impl<'a> Report<'a> {
                 println!("  Files:        {}", summary.files);
             }
         }
-        if summary.gotcha_cands > 0 || summary.todos > 0 || summary.doc_comments > 0 || summary.hotspots > 0 {
+        if summary.gotcha_cands > 0
+            || summary.todos > 0
+            || summary.doc_comments > 0
+            || summary.hotspots > 0
+        {
             println!(
                 "  Gotcha cands: {}   (unwrap+unsafe+panic+TODO)   Hotspots: {}",
                 summary.gotcha_cands, summary.hotspots
@@ -893,20 +932,22 @@ impl<'a> Report<'a> {
         println!("  ── Knowledge coverage ──");
         println!(
             "  Records:      {}      File: {}    Gotcha: {}    Decision: {}",
-            summary.export_total, summary.export_file, summary.export_gotcha, summary.export_decision
+            summary.export_total,
+            summary.export_file,
+            summary.export_gotcha,
+            summary.export_decision
         );
         if summary.confirmed_count > 0 || summary.gotcha_count_after_add > 0 {
             println!(
                 "  Confirmed:    {}        Unconfirmed: {}",
                 summary.confirmed_count,
-                summary.gotcha_count_after_add.saturating_sub(summary.confirmed_count)
+                summary
+                    .gotcha_count_after_add
+                    .saturating_sub(summary.confirmed_count)
             );
         }
         if summary.confidence_avg > 0.0 {
-            println!(
-                "  Confidence:   avg={:.2}",
-                summary.confidence_avg
-            );
+            println!("  Confidence:   avg={:.2}", summary.confidence_avg);
         }
         if summary.quality_suppressed > 0
             || summary.quality_poor > 0
@@ -986,7 +1027,11 @@ impl<'a> Report<'a> {
         );
         println!(
             "  Injectable:   {}  (confirmed=true + confidence≥0.6 + quality≥0.4)",
-            if summary.hook_inject_ready { "✓" } else { "not yet" }
+            if summary.hook_inject_ready {
+                "✓"
+            } else {
+                "not yet"
+            }
         );
         println!(
             "  Session:      {}  (flush + harvest lifecycle)",
@@ -1013,7 +1058,11 @@ impl<'a> Report<'a> {
                 "  Quality:      {:.2} → {:.2}  (improve progression {})",
                 summary.quality_before,
                 summary.quality_after,
-                if summary.quality_after > summary.quality_before { "✓" } else { "?" }
+                if summary.quality_after > summary.quality_before {
+                    "✓"
+                } else {
+                    "?"
+                }
             );
         }
 
@@ -1025,11 +1074,19 @@ impl<'a> Report<'a> {
         );
         println!(
             "  mem_query:    {}  (BM25 search with results)",
-            if summary.mcp_query_hit { "✓" } else { "empty (may need confirmed record)" }
+            if summary.mcp_query_hit {
+                "✓"
+            } else {
+                "empty (may need confirmed record)"
+            }
         );
         println!(
             "  mem_bootstrap:{}  ([mati] Vector B marker present)",
-            if summary.mcp_bootstrap_has_gotcha { "✓" } else { "?" }
+            if summary.mcp_bootstrap_has_gotcha {
+                "✓"
+            } else {
+                "?"
+            }
         );
         println!();
     }
@@ -1213,8 +1270,7 @@ fn first_float(s: &str) -> Option<f32> {
 fn extract_float_from_line(output: &str, label: &str) -> Option<f32> {
     for line in output.lines() {
         if line.to_lowercase().contains(label) {
-            let after =
-                &line[line.to_lowercase().find(label).unwrap_or(0) + label.len()..];
+            let after = &line[line.to_lowercase().find(label).unwrap_or(0) + label.len()..];
             if let Some(v) = first_float(after) {
                 return Some(v);
             }
@@ -1236,16 +1292,16 @@ fn extract_init_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
     // Pull entry_points and imports from the detailed parse line if present
     // "  Parsing with tree-sitter...   1847 ep  3201 imports  ..."
     // Fallback: extract from summary-style lines
-    let entry_points = extract_number(output, "entry points:")
-        .max(extract_number(output, "entry_points:"));
+    let entry_points =
+        extract_number(output, "entry points:").max(extract_number(output, "entry_points:"));
     let imports = extract_number(output, "imports:");
     let todos = extract_number(output, "todos:");
     let doc_comments = extract_number(output, "doc comments:");
     let co_change_pairs = extract_number(output, "co-change pairs:");
     let revert_stubs = extract_number(output, "revert stubs:");
     let ownership_stubs = extract_number(output, "ownership stubs:");
-    let cochange_stubs = extract_number(output, "cochange stubs:")
-        .max(extract_number(output, "co-change stubs:"));
+    let cochange_stubs =
+        extract_number(output, "cochange stubs:").max(extract_number(output, "co-change stubs:"));
 
     sr.add_metric("files", &files.to_string());
     if entry_points > 0 {
@@ -1379,11 +1435,13 @@ fn extract_status_metrics(output: &str, sr: &mut StepResult, summary: &mut Summa
 
     // "  Confirmed   0 / N gotchas (0%)"
     // Extract coverage percentage
-    let pct_line = output.lines()
+    let pct_line = output
+        .lines()
         .find(|l| l.contains('%') && (l.contains("gotchas") || l.contains("coverage")));
     let coverage = pct_line
         .and_then(|l| {
-            l.split('%').next()
+            l.split('%')
+                .next()
                 .and_then(|before| before.split_whitespace().last())
                 .and_then(|v| v.parse::<u32>().ok())
         })
@@ -1416,11 +1474,13 @@ fn extract_stats_metrics(output: &str, sr: &mut StepResult, summary: &mut Summar
     let gaps = extract_number(output, "knowledge gaps");
     // Quality tier lines from stats are not directly here; use compliance hit rate
     // "    Hit rate  —  (no hook data yet)"  or "  Hit rate  0%"
-    let compliance_line = output.lines()
+    let compliance_line = output
+        .lines()
         .find(|l| l.to_lowercase().contains("hit rate"));
     let compliance_pct = compliance_line
         .and_then(|l| {
-            l.split('%').next()
+            l.split('%')
+                .next()
                 .and_then(|b| b.split_whitespace().last())
                 .and_then(|v| v.parse::<u32>().ok())
         })
@@ -1450,7 +1510,8 @@ fn extract_gaps_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
     // First gap entry: "● CRITICAL  crates/core/src/search.rs"
     // Risk score not directly in the list output but embedded via description
     // Find the first "risk" or highest-risk entry from the structured data
-    let top_gap = output.lines()
+    let top_gap = output
+        .lines()
         .find(|l| l.contains('●') || l.starts_with("  ●"))
         .and_then(|l| {
             // After the tier label, extract the path
@@ -1461,11 +1522,13 @@ fn extract_gaps_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary
         .unwrap_or_else(|| "?".to_string());
 
     // Try to get risk from a line containing a decimal after the path
-    let top_risk = output.lines()
+    let top_risk = output
+        .lines()
         .find(|l| l.contains('●') || l.contains("CRITICAL") || l.contains("HIGH"))
         .and_then(|_l| {
             // Find risk score — look for risk in description lines
-            output.lines()
+            output
+                .lines()
                 .find(|l| l.contains("risk") || l.contains("score"))
                 .and_then(first_float)
         });
@@ -1490,32 +1553,40 @@ fn extract_ls_files_metrics(output: &str, sr: &mut StepResult, summary: &mut Sum
     let total = extract_int_before_word(output, " file records");
 
     // Hotspot marker: "┆ *   │" (comfy_table) or "    *" at line end (space-separated)
-    let hotspots = output.lines().filter(|l| {
-        let t = l.trim_end();
-        let is_data = !l.trim_start().starts_with("PATH") && !l.trim_start().starts_with('─');
-        // comfy_table: HOT column cell is "┆ *   │" or "┆ *│"
-        let comfy_hot = l.contains("\u{2506} *");
-        // space-separated: row ends with " *" after trimming
-        let plain_hot = t.ends_with('*') && is_data;
-        (comfy_hot || plain_hot) && !l.contains("Hot") && !l.contains("HOT")
-    }).count() as u64;
+    let hotspots = output
+        .lines()
+        .filter(|l| {
+            let t = l.trim_end();
+            let is_data = !l.trim_start().starts_with("PATH") && !l.trim_start().starts_with('─');
+            // comfy_table: HOT column cell is "┆ *   │" or "┆ *│"
+            let comfy_hot = l.contains("\u{2506} *");
+            // space-separated: row ends with " *" after trimming
+            let plain_hot = t.ends_with('*') && is_data;
+            (comfy_hot || plain_hot) && !l.contains("Hot") && !l.contains("HOT")
+        })
+        .count() as u64;
 
     // Count by extension — check first cell of data rows
     let ext_count = |ext: &str| -> u64 {
-        output.lines().filter(|l| {
-            let t = l.trim();
-            // comfy_table row: │ path.ext ┆ ...
-            if t.starts_with('│') {
-                let after = t.trim_start_matches('│');
-                let cell = after.split('\u{2506}').next().unwrap_or("").trim();
-                return cell.ends_with(ext) || cell.contains(&format!("{ext}/")) || cell.contains(&format!("{}/", ext.trim_start_matches('.')));
-            }
-            // space-separated row: first token is path
-            if let Some(tok) = t.split_whitespace().next() {
-                return tok.ends_with(ext) && !t.starts_with("PATH");
-            }
-            false
-        }).count() as u64
+        output
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                // comfy_table row: │ path.ext ┆ ...
+                if t.starts_with('│') {
+                    let after = t.trim_start_matches('│');
+                    let cell = after.split('\u{2506}').next().unwrap_or("").trim();
+                    return cell.ends_with(ext)
+                        || cell.contains(&format!("{ext}/"))
+                        || cell.contains(&format!("{}/", ext.trim_start_matches('.')));
+                }
+                // space-separated row: first token is path
+                if let Some(tok) = t.split_whitespace().next() {
+                    return tok.ends_with(ext) && !t.starts_with("PATH");
+                }
+                false
+            })
+            .count() as u64
     };
     let rs = ext_count(".rs");
     let toml = ext_count(".toml");
@@ -1525,11 +1596,21 @@ fn extract_ls_files_metrics(output: &str, sr: &mut StepResult, summary: &mut Sum
 
     sr.add_metric("files", &total.to_string());
     sr.add_metric("hotspots", &hotspots.to_string());
-    if rs > 0 { sr.add_metric("rs", &rs.to_string()); }
-    if toml > 0 { sr.add_metric("toml", &toml.to_string()); }
-    if py > 0 { sr.add_metric("py", &py.to_string()); }
-    if ts > 0 { sr.add_metric("ts", &ts.to_string()); }
-    if go > 0 { sr.add_metric("go", &go.to_string()); }
+    if rs > 0 {
+        sr.add_metric("rs", &rs.to_string());
+    }
+    if toml > 0 {
+        sr.add_metric("toml", &toml.to_string());
+    }
+    if py > 0 {
+        sr.add_metric("py", &py.to_string());
+    }
+    if ts > 0 {
+        sr.add_metric("ts", &ts.to_string());
+    }
+    if go > 0 {
+        sr.add_metric("go", &go.to_string());
+    }
 
     summary.hotspots = hotspots.max(summary.hotspots);
 }
@@ -1547,25 +1628,37 @@ fn extract_ls_gotchas_metrics(output: &str, sr: &mut StepResult, summary: &mut S
     // The comfy_table format uses ┆ as inner separators:
     // "│ key ┆ Rule ┆ Sev ┆ Conf ┆ Qual ┆ Y         │"
     // Confirmed = "Y" in the last column: line ends with "┆ Y         │" variant
-    let confirmed = output.lines().filter(|l| {
-        let t = l.trim_end();
-        // Last cell contains Y — look for "┆ Y" followed by spaces then │
-        (t.contains("\u{2506} Y") || t.contains("| Y |") || t.ends_with("| Y"))
-        && !l.contains("Confirmed") // skip header
-    }).count();
+    let confirmed = output
+        .lines()
+        .filter(|l| {
+            let t = l.trim_end();
+            // Last cell contains Y — look for "┆ Y" followed by spaces then │
+            (t.contains("\u{2506} Y") || t.contains("| Y |") || t.ends_with("| Y"))
+                && !l.contains("Confirmed") // skip header
+        })
+        .count();
     let unconfirmed = total.saturating_sub(confirmed);
 
     // Count by key prefix
     let revert = output.lines().filter(|l| l.contains("revert:")).count();
     let ownership = output.lines().filter(|l| l.contains("ownership:")).count();
-    let cochange = output.lines().filter(|l| l.contains("cochange:") || l.contains("co-change:")).count();
+    let cochange = output
+        .lines()
+        .filter(|l| l.contains("cochange:") || l.contains("co-change:"))
+        .count();
 
     sr.add_metric("total", &total.to_string());
     sr.add_metric("confirmed", &confirmed.to_string());
     sr.add_metric("unconfirmed", &unconfirmed.to_string());
-    if revert > 0 { sr.add_metric("revert", &revert.to_string()); }
-    if ownership > 0 { sr.add_metric("ownership", &ownership.to_string()); }
-    if cochange > 0 { sr.add_metric("cochange", &cochange.to_string()); }
+    if revert > 0 {
+        sr.add_metric("revert", &revert.to_string());
+    }
+    if ownership > 0 {
+        sr.add_metric("ownership", &ownership.to_string());
+    }
+    if cochange > 0 {
+        sr.add_metric("cochange", &cochange.to_string());
+    }
 
     summary.gotcha_count_after_add = total.max(summary.gotcha_count_after_add);
     summary.confirmed_count = confirmed.max(summary.confirmed_count);
@@ -1587,7 +1680,8 @@ fn extract_ls_decisions_metrics(output: &str, sr: &mut StepResult, _summary: &mu
 fn extract_explain_metrics(output: &str, path: &str, sr: &mut StepResult, _summary: &mut Summary) {
     // "  confidence 0.10  quality Suppressed"
     let conf = extract_float_from_line(output, "confidence");
-    let quality = output.lines()
+    let quality = output
+        .lines()
         .find(|l| l.contains("quality"))
         .and_then(|l| {
             // Extract the tier name: look for Known tier names
@@ -1603,8 +1697,11 @@ fn extract_explain_metrics(output: &str, path: &str, sr: &mut StepResult, _summa
     // Count gotchas section
     let gotchas = extract_number(output, "gotchas (");
     // Count co-changes
-    let co_changes = output.lines()
-        .filter(|l| l.contains('●') && !l.contains("Gotcha") && !l.contains("TODO") && !l.contains("TODO"))
+    let co_changes = output
+        .lines()
+        .filter(|l| {
+            l.contains('●') && !l.contains("Gotcha") && !l.contains("TODO") && !l.contains("TODO")
+        })
         .count() as u64;
     // Count todos
     let todos_header = extract_number(output, "todos (");
@@ -1619,16 +1716,26 @@ fn extract_explain_metrics(output: &str, path: &str, sr: &mut StepResult, _summa
         sr.add_metric("confidence", &format!("{c:.2}"));
     }
     sr.add_metric("quality", quality);
-    if gotchas > 0 { sr.add_metric("gotchas", &gotchas.to_string()); }
-    if co_changes > 0 { sr.add_metric("co_changes", &co_changes.to_string()); }
-    if todos_header > 0 { sr.add_metric("todos", &todos_header.to_string()); }
+    if gotchas > 0 {
+        sr.add_metric("gotchas", &gotchas.to_string());
+    }
+    if co_changes > 0 {
+        sr.add_metric("co_changes", &co_changes.to_string());
+    }
+    if todos_header > 0 {
+        sr.add_metric("todos", &todos_header.to_string());
+    }
 }
 
 fn extract_explain_staleness(output: &str, sr: &mut StepResult, _summary: &mut Summary) {
     // Look for staleness signals in explain output
     for line in output.lines() {
         let lower = line.to_lowercase();
-        if lower.contains("lineschangedpct") || lower.contains("lines changed") || lower.contains("entrypoints") || lower.contains("staleness") {
+        if lower.contains("lineschangedpct")
+            || lower.contains("lines changed")
+            || lower.contains("entrypoints")
+            || lower.contains("staleness")
+        {
             let signal = line.trim().to_string();
             sr.add_metric("staleness", &signal);
             break;
@@ -1636,7 +1743,8 @@ fn extract_explain_staleness(output: &str, sr: &mut StepResult, _summary: &mut S
     }
     // Also extract confidence/quality
     let conf = extract_float_from_line(output, "confidence");
-    let quality = output.lines()
+    let quality = output
+        .lines()
         .find(|l| l.contains("quality"))
         .and_then(|l| {
             for tier in &["Excellent", "Good", "Acceptable", "Poor", "Suppressed"] {
@@ -1659,7 +1767,8 @@ fn extract_explain_staleness(output: &str, sr: &mut StepResult, _summary: &mut S
 fn extract_show_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summary) {
     // "    value          0.10  (hook_label)"
     let conf = extract_float_from_line(output, "value");
-    let quality = output.lines()
+    let quality = output
+        .lines()
         .find(|l| l.contains("quality") || l.contains("tier"))
         .and_then(|l| {
             for tier in &["Excellent", "Good", "Acceptable", "Poor", "Suppressed"] {
@@ -1672,7 +1781,8 @@ fn extract_show_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summar
     // "    source      StaticAnalysis (Layer 0)"
     // Must match the metadata "source" line, not "base (source)  0.10" in the confidence section.
     // The metadata line has "source" as the first non-whitespace token.
-    let source = output.lines()
+    let source = output
+        .lines()
         .find(|l| l.trim_start().starts_with("source") && !l.contains("base (source)"))
         .and_then(|l| l.trim_start().strip_prefix("source"))
         .map(|s| s.trim().to_string());
@@ -1691,7 +1801,8 @@ fn extract_show_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summar
 
 fn extract_show_gotcha_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summary) {
     // Extract the value (gotcha rule text) and confidence
-    let value = output.lines()
+    let value = output
+        .lines()
         .skip_while(|l| !l.contains("value"))
         .nth(1) // line after "value" header
         .map(|l| l.trim().to_string())
@@ -1716,7 +1827,12 @@ fn extract_show_gotcha_metrics(output: &str, sr: &mut StepResult, _summary: &mut
 
 /// Returns the key of the created gotcha (e.g. "gotcha:always-call-regex-...")
 /// Also checks stderr since the quality gate failure message lands there.
-fn extract_gotcha_add_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, summary: &mut Summary) -> String {
+fn extract_gotcha_add_metrics(
+    stdout: &str,
+    stderr: &str,
+    sr: &mut StepResult,
+    summary: &mut Summary,
+) -> String {
     // "Created gotcha:always-call-regex-...  (quality: 0.78, confidence: 0.80)"
     // Output may be on stdout (success) or the error on stderr (quality gate fail)
     let combined = format!("{stdout}\n{stderr}");
@@ -1778,19 +1894,25 @@ fn extract_improve_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, summ
     let output = &format!("{stdout}\n{stderr}");
     // "Updated gotcha:...  (quality: 0.42 -> 0.71)"
     // or "Current quality: 0.42 ..." and later "Updated ... (quality: ... -> 0.71)"
-    let before = output.lines()
+    let before = output
+        .lines()
         .find(|l| l.contains("Current quality") || l.starts_with("Updated"))
         .and_then(first_float);
 
-    let after = output.lines()
+    let after = output
+        .lines()
         .find(|l| l.contains("->") && l.contains("quality"))
         .and_then(|l| {
             // Find the number after "->"
             l.split("->").nth(1).and_then(first_float)
         });
 
-    if let Some(b) = before { summary.quality_before = b; }
-    if let Some(a) = after { summary.quality_after = a; }
+    if let Some(b) = before {
+        summary.quality_before = b;
+    }
+    if let Some(a) = after {
+        summary.quality_after = a;
+    }
     let progression_ok = matches!((before, after), (Some(b), Some(a)) if a > b);
 
     if let (Some(b), Some(a)) = (before, after) {
@@ -1811,7 +1933,8 @@ fn extract_improve_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, summ
 
 fn extract_export_json_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary) {
     // Parse JSON array, count by category field (values are lowercase: "file", "gotcha", etc.)
-    let records: serde_json::Value = serde_json::from_str(output).unwrap_or(serde_json::Value::Array(vec![]));
+    let records: serde_json::Value =
+        serde_json::from_str(output).unwrap_or(serde_json::Value::Array(vec![]));
     let arr = records.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
 
     let cat = |r: &&serde_json::Value, s: &str| {
@@ -1824,8 +1947,14 @@ fn extract_export_json_metrics(output: &str, sr: &mut StepResult, summary: &mut 
     let file = arr.iter().filter(|r| cat(r, "file")).count() as u64;
     let gotcha = arr.iter().filter(|r| cat(r, "gotcha")).count() as u64;
     let decision = arr.iter().filter(|r| cat(r, "decision")).count() as u64;
-    let dev_note = arr.iter().filter(|r| cat(r, "dev_note") || cat(r, "devnote")).count() as u64;
-    let dep = arr.iter().filter(|r| cat(r, "dependency") || cat(r, "dep")).count() as u64;
+    let dev_note = arr
+        .iter()
+        .filter(|r| cat(r, "dev_note") || cat(r, "devnote"))
+        .count() as u64;
+    let dep = arr
+        .iter()
+        .filter(|r| cat(r, "dependency") || cat(r, "dep"))
+        .count() as u64;
 
     sr.add_metric("total", &total.to_string());
     sr.add_metric("file", &file.to_string());
@@ -1864,9 +1993,13 @@ fn extract_diff_metrics(output: &str, sr: &mut StepResult, _summary: &mut Summar
     let unknown = extract_int_before_word(output, " unknown");
 
     sr.add_metric("files_changed", &files_changed.to_string());
-    if with_gotchas > 0 { sr.add_metric("with_gotchas", &with_gotchas.to_string()); }
+    if with_gotchas > 0 {
+        sr.add_metric("with_gotchas", &with_gotchas.to_string());
+    }
     sr.add_metric("documented", &documented.to_string());
-    if unknown > 0 { sr.add_metric("unknown", &unknown.to_string()); }
+    if unknown > 0 {
+        sr.add_metric("unknown", &unknown.to_string());
+    }
 }
 
 // ── mati history ─────────────────────────────────────────────────────────────
@@ -1875,17 +2008,23 @@ fn extract_history_metrics(output: &str, sr: &mut StepResult, summary: &mut Summ
     // Output: "history  gotcha:...  (N versions)" — count is BEFORE "versions"
     let versions = extract_int_before_word(output, " version").max(
         // also count table rows as version entries
-        output.lines().filter(|l| {
-            let t = l.trim_start();
-            t.starts_with('│') && !t.to_lowercase().contains("version") && !t.contains('─')
-        }).count() as u64
+        output
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with('│') && !t.to_lowercase().contains("version") && !t.contains('─')
+            })
+            .count() as u64,
     );
     summary.history_versions = versions;
     sr.add_metric("versions", &versions.to_string());
     if versions >= 2 {
         sr.add_metric("✓ ≥2 versions", "(create+improve)");
     } else if versions == 1 {
-        sr.add_metric("warn", "only 1 version — improve may not have written a new version");
+        sr.add_metric(
+            "warn",
+            "only 1 version — improve may not have written a new version",
+        );
     }
 }
 
@@ -1895,12 +2034,19 @@ fn extract_stale_metrics(output: &str, sr: &mut StepResult, summary: &mut Summar
     // "  N stale records (M liability, K stale)"
     let total = extract_number(output, "stale records");
     // "implicit" co-change coupling
-    let implicit = output.lines().filter(|l| l.to_lowercase().contains("implicit")).count() as u64;
+    let implicit = output
+        .lines()
+        .filter(|l| l.to_lowercase().contains("implicit"))
+        .count() as u64;
     let direct = total.saturating_sub(implicit);
 
     sr.add_metric("stale", &total.to_string());
-    if direct > 0 { sr.add_metric("direct", &direct.to_string()); }
-    if implicit > 0 { sr.add_metric("implicit", &implicit.to_string()); }
+    if direct > 0 {
+        sr.add_metric("direct", &direct.to_string());
+    }
+    if implicit > 0 {
+        sr.add_metric("implicit", &implicit.to_string());
+    }
 
     summary.stale_count = total;
 }
@@ -1920,8 +2066,12 @@ fn extract_review_metrics(stdout: &str, stderr: &str, sr: &mut StepResult, _summ
 
     if candidates > 0 || shown > 0 {
         sr.add_metric("candidates", &(candidates.max(shown)).to_string());
-        if skipped > 0 { sr.add_metric("skipped", &skipped.to_string()); }
-        if confirmed > 0 { sr.add_metric("confirmed", &confirmed.to_string()); }
+        if skipped > 0 {
+            sr.add_metric("skipped", &skipped.to_string());
+        }
+        if confirmed > 0 {
+            sr.add_metric("confirmed", &confirmed.to_string());
+        }
     } else {
         sr.add_metric("candidates", "0");
     }
@@ -1987,7 +2137,8 @@ fn extract_get_metrics(output: &str, sr: &mut StepResult, summary: &mut Summary)
     if hit {
         sr.add_metric("hit", "✓");
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(cat) = v.get("record")
+            if let Some(cat) = v
+                .get("record")
                 .and_then(|r| r.get("category"))
                 .and_then(|c| c.as_str())
             {
@@ -2094,7 +2245,10 @@ fn cargo_bin(name: &str) -> PathBuf {
     }
     // Fallback: target/debug/<name>
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(manifest).join("target").join("debug").join(name)
+    PathBuf::from(manifest)
+        .join("target")
+        .join("debug")
+        .join(name)
 }
 
 /// Pick the first file path from `mati ls files` output.
@@ -2140,7 +2294,11 @@ fn pick_first_file_path(output: &str) -> Option<String> {
             continue;
         }
         // Separator line after PATH header (all ─ chars)
-        if !past_separator && trimmed.chars().all(|c| c == '\u{2500}' || c == '-' || c == ' ') {
+        if !past_separator
+            && trimmed
+                .chars()
+                .all(|c| c == '\u{2500}' || c == '-' || c == ' ')
+        {
             past_separator = true;
             continue;
         }
