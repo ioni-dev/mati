@@ -595,7 +595,9 @@ impl Record {
     /// Returns `None` when `payload` is absent or the JSON shape does not match `T`.
     /// Always prefer this over `serde_json::from_str(&self.value)`.
     pub fn payload_as<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
-        self.payload.as_ref().and_then(|p| serde_json::from_value(p.clone()).ok())
+        self.payload
+            .as_ref()
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
     }
 
     /// Construct a layer-0 file stub for `file:<path>`.
@@ -1211,16 +1213,28 @@ mod tests {
     fn quality_tier_non_finite_is_suppressed() {
         // NaN, +∞, and -∞ must never reach Excellent — they would satisfy the
         // hook injection gate (quality >= 0.4) and inject untrusted records.
-        assert_eq!(QualityScore::tier_from_value(f32::NAN), QualityTier::Suppressed);
-        assert_eq!(QualityScore::tier_from_value(f32::INFINITY), QualityTier::Suppressed);
-        assert_eq!(QualityScore::tier_from_value(f32::NEG_INFINITY), QualityTier::Suppressed);
+        assert_eq!(
+            QualityScore::tier_from_value(f32::NAN),
+            QualityTier::Suppressed
+        );
+        assert_eq!(
+            QualityScore::tier_from_value(f32::INFINITY),
+            QualityTier::Suppressed
+        );
+        assert_eq!(
+            QualityScore::tier_from_value(f32::NEG_INFINITY),
+            QualityTier::Suppressed
+        );
     }
 
     #[test]
     fn quality_tier_out_of_range_finite_saturates() {
         // Finite values outside [0, 1] saturate without panicking.
         assert_eq!(QualityScore::tier_from_value(-1.0), QualityTier::Suppressed);
-        assert_eq!(QualityScore::tier_from_value(-0.001), QualityTier::Suppressed);
+        assert_eq!(
+            QualityScore::tier_from_value(-0.001),
+            QualityTier::Suppressed
+        );
         assert_eq!(QualityScore::tier_from_value(1.001), QualityTier::Excellent);
         assert_eq!(QualityScore::tier_from_value(100.0), QualityTier::Excellent);
     }
@@ -1276,7 +1290,8 @@ mod tests {
             for j in (i + 1)..scores.len() {
                 assert!(
                     (scores[i] - scores[j]).abs() > f32::EPSILON,
-                    "sources {i} and {j} have identical base score {}", scores[i]
+                    "sources {i} and {j} have identical base score {}",
+                    scores[i]
                 );
             }
         }
@@ -1300,7 +1315,11 @@ mod tests {
             (Priority::Critical, Priority::Critical, Equal),
         ];
         for (a, b, expected) in pairs {
-            assert_eq!(a.cmp(&b), expected, "{a:?}.cmp({b:?}) should be {expected:?}");
+            assert_eq!(
+                a.cmp(&b),
+                expected,
+                "{a:?}.cmp({b:?}) should be {expected:?}"
+            );
             // Antisymmetry: if a < b then b > a
             if expected == Less {
                 assert_eq!(b.cmp(&a), std::cmp::Ordering::Greater, "{b:?}.cmp({a:?})");
@@ -1318,13 +1337,17 @@ mod tests {
             StalenessSignal::EntryPointsChanged(2),
             StalenessSignal::ImportsChanged(5),
             StalenessSignal::FileDeleted,
-            StalenessSignal::FileRenamed { new_path: "src/foo.rs".to_string() },
+            StalenessSignal::FileRenamed {
+                new_path: "src/foo.rs".to_string(),
+            },
             StalenessSignal::DependencyBumped {
                 dep: "tokio".to_string(),
                 old_ver: "1.40".to_string(),
                 new_ver: "1.50".to_string(),
             },
-            StalenessSignal::LinkedFileChanged { path: "src/bar.rs".to_string() },
+            StalenessSignal::LinkedFileChanged {
+                path: "src/bar.rs".to_string(),
+            },
             StalenessSignal::CascadeFromDecision("decision:arch".to_string()),
             StalenessSignal::TodosChanged,
             StalenessSignal::UnsafeCountChanged(3),
@@ -1333,8 +1356,7 @@ mod tests {
         ];
         for signal in &signals {
             let json = serde_json::to_string(signal).expect("serialize");
-            let restored: StalenessSignal =
-                serde_json::from_str(&json).expect("deserialize");
+            let restored: StalenessSignal = serde_json::from_str(&json).expect("deserialize");
             let json2 = serde_json::to_string(&restored).expect("re-serialize");
             assert_eq!(json, json2, "roundtrip failed for: {json}");
         }
@@ -1346,7 +1368,9 @@ mod tests {
     fn tombstone_reason_all_variants_serde() {
         let reasons = vec![
             TombstoneReason::FileDeleted,
-            TombstoneReason::FileRenamed { new_path: "src/new.rs".to_string() },
+            TombstoneReason::FileRenamed {
+                new_path: "src/new.rs".to_string(),
+            },
             TombstoneReason::ManualDeletion,
             TombstoneReason::Superseded,
         ];
@@ -1421,12 +1445,18 @@ mod tests {
             discovered_session: 0,
             confirmed: false,
         };
-        assert!(!stub.confirmed, "Layer 0 stubs must be unconfirmed on construction");
+        assert!(
+            !stub.confirmed,
+            "Layer 0 stubs must be unconfirmed on construction"
+        );
 
         // Serde roundtrip preserves the flag
         let json = serde_json::to_string(&stub).unwrap();
         let restored: GotchaRecord = serde_json::from_str(&json).unwrap();
-        assert!(!restored.confirmed, "confirmed flag must survive serde roundtrip");
+        assert!(
+            !restored.confirmed,
+            "confirmed flag must survive serde roundtrip"
+        );
         // The JSON wire format must contain "confirmed":false explicitly
         assert!(json.contains("\"confirmed\":false"), "wire format: {json}");
     }
@@ -1447,7 +1477,6 @@ mod tests {
         assert!(json.contains("\"confirmed\":true"));
     }
 
-
     // ─── Complex serde round-trips ────────────────────────────────────────────
 
     #[test]
@@ -1459,7 +1488,9 @@ mod tests {
                 StalenessSignal::NotAccessedDays(90),
                 StalenessSignal::LinesChangedPct(0.6),
                 StalenessSignal::EntryPointsChanged(3),
-                StalenessSignal::FileRenamed { new_path: "src/store/backend.rs".to_string() },
+                StalenessSignal::FileRenamed {
+                    new_path: "src/store/backend.rs".to_string(),
+                },
             ],
             computed_at: 1_710_520_800,
             last_record_sha: "deadbeefcafe0123".to_string(),
@@ -1522,8 +1553,14 @@ mod tests {
         r.ref_url = None;
         let json = serde_json::to_string(&r).unwrap();
         let restored: Record = serde_json::from_str(&json).unwrap();
-        assert!(restored.ref_url.is_none(), "ref_url: None must not become Some after roundtrip");
-        assert!(json.contains("\"ref_url\":null"), "wire format must encode None as null");
+        assert!(
+            restored.ref_url.is_none(),
+            "ref_url: None must not become Some after roundtrip"
+        );
+        assert!(
+            json.contains("\"ref_url\":null"),
+            "wire format must encode None as null"
+        );
     }
 
     #[test]
@@ -1558,7 +1595,10 @@ mod tests {
         r.tags = vec![];
         let json_empty = serde_json::to_string(&r).unwrap();
         let restored_empty: Record = serde_json::from_str(&json_empty).unwrap();
-        assert!(restored_empty.tags.is_empty(), "empty tags must remain empty");
+        assert!(
+            restored_empty.tags.is_empty(),
+            "empty tags must remain empty"
+        );
 
         r.tags = (0..50).map(|i| format!("tag-{i:03}")).collect();
         let json_many = serde_json::to_string(&r).unwrap();
@@ -1587,7 +1627,10 @@ mod tests {
         assert_serde_roundtrip(&stub);
         let json = serde_json::to_string(&stub).unwrap();
         let restored: FileRecord = serde_json::from_str(&json).unwrap();
-        assert!(restored.purpose.is_empty(), "empty purpose must remain empty");
+        assert!(
+            restored.purpose.is_empty(),
+            "empty purpose must remain empty"
+        );
         assert!(restored.entry_points.is_empty());
         assert!(restored.last_author.is_none());
         assert!(restored.is_hotspot);
@@ -1596,7 +1639,8 @@ mod tests {
 
     #[test]
     fn layer0_file_record_builder_sets_suppressed_quality() {
-        let record = Record::layer0_file_stub("file:src/analysis/walker.rs", device_id(), 7, 1_710_520_800);
+        let record =
+            Record::layer0_file_stub("file:src/analysis/walker.rs", device_id(), 7, 1_710_520_800);
 
         assert_eq!(record.key, "file:src/analysis/walker.rs");
         assert_eq!(record.category, Category::File);
@@ -1693,13 +1737,17 @@ mod tests {
             StalenessSignal::EntryPointsChanged(2),
             StalenessSignal::ImportsChanged(5),
             StalenessSignal::FileDeleted,
-            StalenessSignal::FileRenamed { new_path: "src/foo.rs".to_string() },
+            StalenessSignal::FileRenamed {
+                new_path: "src/foo.rs".to_string(),
+            },
             StalenessSignal::DependencyBumped {
                 dep: "tokio".to_string(),
                 old_ver: "1.40".to_string(),
                 new_ver: "1.50".to_string(),
             },
-            StalenessSignal::LinkedFileChanged { path: "src/bar.rs".to_string() },
+            StalenessSignal::LinkedFileChanged {
+                path: "src/bar.rs".to_string(),
+            },
             StalenessSignal::CascadeFromDecision("decision:arch".to_string()),
             StalenessSignal::TodosChanged,
             StalenessSignal::UnsafeCountChanged(3),
@@ -1708,8 +1756,10 @@ mod tests {
         ];
         for signal in &signals {
             let display = signal.to_string();
-            assert!(!display.is_empty(), "Display for {signal:?} should not be empty");
+            assert!(
+                !display.is_empty(),
+                "Display for {signal:?} should not be empty"
+            );
         }
     }
-
 }
