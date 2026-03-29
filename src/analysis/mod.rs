@@ -16,7 +16,10 @@ pub mod reparse;
 pub mod walker;
 
 pub use claude_md::{import_claude_md, ClaudeMdImport};
-pub use deps::{parse_dependencies, DepEntry, DepSignals, DepVersion, ManifestKind};
+pub use deps::{
+    dep_display_name_from_key, dep_record_key, parse_dep_key, parse_dependencies, DepEntry,
+    DepEcosystem, DepSignals, DepVersion, ManifestKind,
+};
 pub use edges::{build_edges, Layer0Edges};
 pub use git::{mine_git_history, GitSignals};
 pub use parser::{hash_and_parse_parallel, parse_file, parse_files_parallel, StaticFileAnalysis};
