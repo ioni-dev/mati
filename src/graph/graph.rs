@@ -816,6 +816,36 @@ mod tests {
         assert_eq!(g2.neighbors("file:a", &EdgeKind::Imports), vec!["file:b"]);
     }
 
+    /// Corrupt edge keys whose `to` endpoint is not a valid node key must be
+    /// skipped during load instead of creating phantom graph nodes.
+    #[tokio::test]
+    async fn load_skips_edge_keys_with_invalid_to_endpoint() {
+        let dir = TempDir::new().unwrap();
+        {
+            let store = Store::open(dir.path()).await.unwrap();
+            let mut g = Graph::load(store).await.unwrap();
+
+            g.add_edge("file:a", EdgeKind::Imports, "file:b")
+                .await
+                .unwrap();
+
+            let corrupt_key = "graph:edge:file:a:imports:unknown_ns:target";
+            let record = make_edge_stub_record(corrupt_key);
+            g.store.put(corrupt_key, &record).await.unwrap();
+
+            g.close().await.unwrap();
+        }
+
+        let store2 = Store::open(dir.path()).await.unwrap();
+        let g2 = Graph::load(store2).await.unwrap();
+        assert_eq!(g2.edge_count(), 1, "corrupt edge key must be skipped");
+        assert_eq!(g2.neighbors("file:a", &EdgeKind::Imports), vec!["file:b"]);
+        assert!(
+            !g2.node_index.contains_key("unknown_ns:target"),
+            "invalid to endpoint must not create a phantom node"
+        );
+    }
+
     /// Load 100 pre-persisted edges from SurrealKV — validates the bulk load path.
     #[tokio::test]
     async fn load_100_edges_from_store() {

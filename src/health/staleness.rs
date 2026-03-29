@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::store::record::{
     Category, FileRecord, GotchaRecord, Record, RecordLifecycle, StalenessScore, StalenessSignal,
@@ -371,12 +371,16 @@ impl StalenessAnalyzer {
         }
 
         // Batch write all updates.
+        // Reporting must reflect persisted reality, not attempted computation.
+        // If the batch write fails, surface that failure so callers do not log a
+        // successful analysis based on in-memory-only updates.
         if !updates.is_empty() {
             let batch: Vec<(&str, &Record)> =
                 updates.iter().map(|(k, r)| (k.as_str(), r)).collect();
-            if let Err(e) = store.put_batch(&batch).await {
-                tracing::warn!("staleness batch write failed: {e}");
-            }
+            store
+                .put_batch(&batch)
+                .await
+                .with_context(|| format!("staleness batch write failed for {} records", batch.len()))?;
         }
 
         Ok(report)
@@ -705,11 +709,11 @@ fn dep_factor(file_record: Option<&FileRecord>, dep_cache: &HashMap<String, Reco
     let mut checked_count = 0u32;
 
     for import in &fr.imports {
-        // Extract crate name from Rust use path: "tokio::sync::Mutex" -> "tokio"
-        let crate_name = import.split("::").next().unwrap_or(import);
-        let dep_key = format!("dep:{crate_name}");
+        let dep_record = dep_lookup_keys(import)
+            .into_iter()
+            .find_map(|key| dep_cache.get(&key));
 
-        if let Some(dep_record) = dep_cache.get(&dep_key) {
+        if let Some(dep_record) = dep_record {
             checked_count += 1;
 
             // Check if the dep was updated more recently than the file record.
@@ -734,6 +738,80 @@ fn dep_factor(file_record: Option<&FileRecord>, dep_cache: &HashMap<String, Reco
     // More bumped deps -> higher staleness. Cap at 1.0.
     let ratio = bumped_count as f32 / checked_count as f32;
     ratio.min(1.0)
+}
+
+fn dep_lookup_keys(import: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+
+    if let Some(crate_name) = import.split("::").next().filter(|name| *name != import || import.contains("::")) {
+        push_dep_key(&mut keys, "cargo", crate_name);
+        keys.push(format!("dep:{crate_name}"));
+    }
+
+    if let Some(package_name) = npm_package_name(import) {
+        push_dep_key(&mut keys, "npm", package_name);
+        keys.push(format!("dep:{package_name}"));
+    }
+
+    for module_name in go_module_candidates(import) {
+        push_dep_key(&mut keys, "go", &module_name);
+        keys.push(format!("dep:{module_name}"));
+    }
+
+    keys
+}
+
+fn push_dep_key(keys: &mut Vec<String>, ecosystem: &str, name: &str) {
+    let key = format!("dep:{ecosystem}:{name}");
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+fn npm_package_name(import: &str) -> Option<&str> {
+    if import.is_empty()
+        || import.starts_with('.')
+        || import.starts_with('/')
+        || import.contains("::")
+        || first_path_segment(import).is_some_and(|seg| seg.contains('.'))
+    {
+        return None;
+    }
+
+    if import.starts_with('@') {
+        let mut segments = import.split('/');
+        let scope = segments.next()?;
+        let package = segments.next()?;
+        let len = scope.len() + 1 + package.len();
+        Some(&import[..len])
+    } else {
+        first_path_segment(import)
+    }
+}
+
+fn go_module_candidates(import: &str) -> Vec<String> {
+    if import.is_empty()
+        || import.starts_with('.')
+        || import.starts_with('/')
+        || import.contains("::")
+        || !first_path_segment(import).is_some_and(|seg| seg.contains('.'))
+    {
+        return Vec::new();
+    }
+
+    let segments: Vec<&str> = import.split('/').collect();
+    let mut modules = Vec::new();
+    for len in (2..=segments.len()).rev() {
+        let module = segments[..len].join("/");
+        if !modules.contains(&module) {
+            modules.push(module);
+        }
+    }
+    modules
+}
+
+fn first_path_segment(import: &str) -> Option<&str> {
+    import.split('/').next().filter(|segment| !segment.is_empty())
 }
 
 /// Cascade factor: for file records, check if linked gotchas/decisions are stale.
@@ -1438,7 +1516,7 @@ mod tests {
 
         // Create a dep record for tokio that was updated after the file.
         let mut dep_rec = Record {
-            key: "dep:tokio".to_string(),
+            key: "dep:cargo:tokio".to_string(),
             value: String::new(),
             category: Category::Dependency,
             priority: Priority::Normal,
@@ -1473,7 +1551,7 @@ mod tests {
         };
 
         let mut cache = HashMap::new();
-        cache.insert("dep:tokio".to_string(), dep_rec.clone());
+        cache.insert("dep:cargo:tokio".to_string(), dep_rec.clone());
 
         let factor = dep_factor(Some(&fr), &cache);
         assert!(
@@ -1484,11 +1562,143 @@ mod tests {
         // With no bump signal and same updated_at, factor should be zero.
         dep_rec.staleness.signals.clear();
         dep_rec.updated_at = 1_000_000; // Same as file.
-        cache.insert("dep:tokio".to_string(), dep_rec);
+        cache.insert("dep:cargo:tokio".to_string(), dep_rec);
         let factor2 = dep_factor(Some(&fr), &cache);
         assert!(
             factor2.abs() < 0.001,
             "expected zero when dep not bumped, got {factor2}"
+        );
+    }
+
+    #[test]
+    fn dep_factor_detects_bumped_npm_dep_from_subpath_import() {
+        let fr = FileRecord {
+            path: "src/app.ts".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec!["@types/node/fs".into()],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            line_count: 0,
+            last_modified_session: 1_000_000,
+            content_hash: None,
+        };
+
+        let dep_rec = Record {
+            key: "dep:npm:@types/node".to_string(),
+            value: String::new(),
+            category: Category::Dependency,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 500_000,
+            updated_at: 2_000_000,
+            ref_url: None,
+            staleness: StalenessScore {
+                value: 0.0,
+                tier: StalenessTier::Fresh,
+                signals: vec![StalenessSignal::DependencyBumped {
+                    dep: "@types/node".into(),
+                    old_ver: "20.0.0".into(),
+                    new_ver: "20.1.0".into(),
+                }],
+                computed_at: 0,
+                last_record_sha: String::new(),
+            },
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 2_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+            payload: None,
+        };
+
+        let mut cache = HashMap::new();
+        cache.insert(dep_rec.key.clone(), dep_rec);
+
+        let factor = dep_factor(Some(&fr), &cache);
+        assert!(
+            factor > 0.5,
+            "expected high dep factor for bumped npm dep, got {factor}"
+        );
+    }
+
+    #[test]
+    fn dep_factor_detects_bumped_go_dep_from_subpackage_import() {
+        let fr = FileRecord {
+            path: "internal/server.go".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec!["github.com/gin-gonic/gin/render".into()],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            line_count: 0,
+            last_modified_session: 1_000_000,
+            content_hash: None,
+        };
+
+        let dep_rec = Record {
+            key: "dep:go:github.com/gin-gonic/gin".to_string(),
+            value: String::new(),
+            category: Category::Dependency,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 500_000,
+            updated_at: 2_000_000,
+            ref_url: None,
+            staleness: StalenessScore {
+                value: 0.0,
+                tier: StalenessTier::Fresh,
+                signals: vec![StalenessSignal::DependencyBumped {
+                    dep: "github.com/gin-gonic/gin".into(),
+                    old_ver: "1.9.0".into(),
+                    new_ver: "1.9.1".into(),
+                }],
+                computed_at: 0,
+                last_record_sha: String::new(),
+            },
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 2_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+            payload: None,
+        };
+
+        let mut cache = HashMap::new();
+        cache.insert(dep_rec.key.clone(), dep_rec);
+
+        let factor = dep_factor(Some(&fr), &cache);
+        assert!(
+            factor > 0.5,
+            "expected high dep factor for bumped go dep, got {factor}"
         );
     }
 
