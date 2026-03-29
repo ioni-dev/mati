@@ -67,7 +67,11 @@ pub fn analyze(
     }
 
     // Highest risk first.
-    gaps.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal));
+    gaps.sort_by(|a, b| {
+        b.risk_score
+            .partial_cmp(&a.risk_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     gaps
 }
 
@@ -103,7 +107,9 @@ fn description_for_gap(gap_type: &GapType, key: &str) -> String {
             format!("Hot file {key} has no knowledge record — high churn with zero context")
         }
         GapType::HotFileNoPurpose => {
-            format!("Hot file {key} has a record but no purpose — Claude cannot explain what it does")
+            format!(
+                "Hot file {key} has a record but no purpose — Claude cannot explain what it does"
+            )
         }
         GapType::HotFileNoGotchas => {
             format!("Hot file {key} has no gotchas — frequently changed with no documented traps")
@@ -121,10 +127,14 @@ fn description_for_gap(gap_type: &GapType, key: &str) -> String {
             format!("{key} co-changes frequently with another file but has no graph edge")
         }
         GapType::StaleHotspot => {
-            format!("Hot file {key} has stale knowledge — record may be outdated after recent changes")
+            format!(
+                "Hot file {key} has stale knowledge — record may be outdated after recent changes"
+            )
         }
         GapType::HotFileNoTests => {
-            format!("Hot file {key} has no test file — high-churn code with no visible test coverage")
+            format!(
+                "Hot file {key} has no test file — high-churn code with no visible test coverage"
+            )
         }
         GapType::HighFanInNoContract => {
             format!("{key} is imported by many files but has no gotchas or decisions — interface contracts are undocumented")
@@ -222,7 +232,10 @@ fn detect_hot_file_no_record(file_records: &[Record], gaps: &mut Vec<KnowledgeGa
                     let gap = KnowledgeGap {
                         key: record.key.clone(),
                         gap_type: GapType::HotFileNoRecord,
-                        risk_score: risk_score(fr.change_frequency as f32, COVERAGE_HOT_FILE_NO_RECORD),
+                        risk_score: risk_score(
+                            fr.change_frequency as f32,
+                            COVERAGE_HOT_FILE_NO_RECORD,
+                        ),
                         description: description_for_gap(&GapType::HotFileNoRecord, &record.key),
                         action_hint: action_hint_for_gap(&GapType::HotFileNoRecord, &record.key),
                     };
@@ -236,7 +249,9 @@ fn detect_hot_file_no_record(file_records: &[Record], gaps: &mut Vec<KnowledgeGa
 /// HotFileNoPurpose: hotspot files with a record but empty `purpose`.
 fn detect_hot_file_no_purpose(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) {
     for record in file_records {
-        let Some(fr) = parse_file_record(record) else { continue };
+        let Some(fr) = parse_file_record(record) else {
+            continue;
+        };
         if !fr.is_hotspot || !fr.purpose.is_empty() {
             continue;
         }
@@ -261,7 +276,9 @@ fn detect_hot_file_no_purpose(file_records: &[Record], gaps: &mut Vec<KnowledgeG
 /// HotFileNoGotchas: hotspot files with a purpose but no linked gotchas.
 fn detect_hot_file_no_gotchas(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) {
     for record in file_records {
-        let Some(fr) = parse_file_record(record) else { continue };
+        let Some(fr) = parse_file_record(record) else {
+            continue;
+        };
         if !fr.is_hotspot || fr.purpose.is_empty() || !fr.gotcha_keys.is_empty() {
             continue;
         }
@@ -411,7 +428,9 @@ fn detect_hot_file_no_tests(file_records: &[Record], gaps: &mut Vec<KnowledgeGap
         .collect();
 
     for record in file_records {
-        let Some(fr) = parse_file_record(record) else { continue };
+        let Some(fr) = parse_file_record(record) else {
+            continue;
+        };
         if !fr.is_hotspot {
             continue;
         }
@@ -444,9 +463,28 @@ fn is_testable_source_file(path: &str) -> bool {
         .unwrap_or("");
     matches!(
         ext,
-        "rs" | "go" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs"
-            | "py" | "pyi" | "java" | "rb" | "kt" | "scala" | "cs"
-            | "cpp" | "cc" | "c" | "h" | "hpp" | "swift" | "ex" | "exs"
+        "rs" | "go"
+            | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "py"
+            | "pyi"
+            | "java"
+            | "rb"
+            | "kt"
+            | "scala"
+            | "cs"
+            | "cpp"
+            | "cc"
+            | "c"
+            | "h"
+            | "hpp"
+            | "swift"
+            | "ex"
+            | "exs"
     )
 }
 
@@ -467,7 +505,11 @@ fn has_test_file(path: &str, all_paths: &HashSet<&str>) -> bool {
     let parent = p.parent().and_then(|p| p.to_str()).unwrap_or("");
 
     let join = |dir: &str, name: &str| -> String {
-        if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+        if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
     };
 
     let candidates: &[String] = &[
@@ -505,7 +547,9 @@ fn detect_high_fan_in_no_contract(
             Some(&n) if n >= FAN_IN_THRESHOLD => n,
             _ => continue,
         };
-        let Some(fr) = parse_file_record(record) else { continue };
+        let Some(fr) = parse_file_record(record) else {
+            continue;
+        };
         // Skip files that already have documented contracts.
         if !fr.gotcha_keys.is_empty() || !fr.decision_keys.is_empty() {
             continue;
@@ -535,7 +579,9 @@ fn detect_stale_hotspots(file_records: &[Record], gaps: &mut Vec<KnowledgeGap>) 
         if record.staleness.value < 0.5 {
             continue;
         }
-        let Some(fr) = parse_file_record(record) else { continue };
+        let Some(fr) = parse_file_record(record) else {
+            continue;
+        };
         if !fr.is_hotspot {
             continue;
         }
@@ -720,7 +766,9 @@ mod tests {
             assert!(
                 desc.contains(expected_substr),
                 "expected {:?} description to contain '{}', got: {}",
-                gap_type, expected_substr, desc
+                gap_type,
+                expected_substr,
+                desc
             );
         }
     }
@@ -730,14 +778,23 @@ mod tests {
     #[test]
     fn action_hint_strips_prefix() {
         let hint = action_hint_for_gap(&GapType::HotFileNoPurpose, "file:src/main.rs");
-        assert!(hint.contains("src/main.rs"), "hint should contain bare path: {hint}");
-        assert!(!hint.contains("file:src/"), "hint should not contain file: prefix: {hint}");
+        assert!(
+            hint.contains("src/main.rs"),
+            "hint should contain bare path: {hint}"
+        );
+        assert!(
+            !hint.contains("file:src/"),
+            "hint should not contain file: prefix: {hint}"
+        );
     }
 
     #[test]
     fn action_hint_suggests_mati_command() {
         let hint = action_hint_for_gap(&GapType::HotFileNoGotchas, "file:src/lib.rs");
-        assert!(hint.starts_with("mati "), "hint should suggest a mati command: {hint}");
+        assert!(
+            hint.starts_with("mati "),
+            "hint should suggest a mati command: {hint}"
+        );
     }
 
     #[test]
@@ -756,7 +813,9 @@ mod tests {
             assert!(
                 hint.contains(expected_cmd),
                 "expected {:?} hint to contain '{}', got: {}",
-                gap_type, expected_cmd, hint
+                gap_type,
+                expected_cmd,
+                hint
             );
         }
     }
@@ -829,7 +888,10 @@ mod tests {
         let records = vec![hotspot, mirror_rec];
         let mut gaps = vec![];
         detect_hot_file_no_tests(&records, &mut gaps);
-        assert!(gaps.is_empty(), "should not flag when tests/src/auth.rs exists");
+        assert!(
+            gaps.is_empty(),
+            "should not flag when tests/src/auth.rs exists"
+        );
     }
 
     #[test]
@@ -849,7 +911,10 @@ mod tests {
         let records = vec![hotspot, spec_rec];
         let mut gaps = vec![];
         detect_hot_file_no_tests(&records, &mut gaps);
-        assert!(gaps.is_empty(), "should not flag when parser.spec.ts exists");
+        assert!(
+            gaps.is_empty(),
+            "should not flag when parser.spec.ts exists"
+        );
     }
 
     #[test]
@@ -880,7 +945,10 @@ mod tests {
         let records = vec![hotspot, jest_rec];
         let mut gaps = vec![];
         detect_hot_file_no_tests(&records, &mut gaps);
-        assert!(gaps.is_empty(), "should not flag when src/__tests__/auth.ts exists");
+        assert!(
+            gaps.is_empty(),
+            "should not flag when src/__tests__/auth.ts exists"
+        );
     }
 
     #[test]
@@ -968,7 +1036,9 @@ mod tests {
         let records = vec![make_file_record_with("file:src/core.rs", fr)];
         // analyze() skips detect_high_fan_in_no_contract when map is empty
         let gaps = analyze(&records, &[], &[], &[], &HashMap::new());
-        assert!(!gaps.iter().any(|g| g.gap_type == GapType::HighFanInNoContract));
+        assert!(!gaps
+            .iter()
+            .any(|g| g.gap_type == GapType::HighFanInNoContract));
     }
 
     #[test]
@@ -979,7 +1049,10 @@ mod tests {
         let mut gaps = vec![];
         detect_high_fan_in_no_contract(&records, &fan_in, &mut gaps);
         assert_eq!(gaps.len(), 1);
-        assert!(gaps[0].description.contains("6"), "description should mention importer count");
+        assert!(
+            gaps[0].description.contains("6"),
+            "description should mention importer count"
+        );
     }
 
     // ── Sorting ─────────────────────────────────────────────────────────
@@ -1009,7 +1082,11 @@ mod tests {
                 action_hint: String::new(),
             },
         ];
-        gaps.sort_by(|a, b| b.risk_score.partial_cmp(&a.risk_score).unwrap_or(std::cmp::Ordering::Equal));
+        gaps.sort_by(|a, b| {
+            b.risk_score
+                .partial_cmp(&a.risk_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         assert_eq!(gaps[0].key, "file:high.rs");
         assert_eq!(gaps[1].key, "file:mid.rs");

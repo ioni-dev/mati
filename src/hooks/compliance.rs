@@ -86,7 +86,8 @@ impl HookTestHarness {
     }
 
     fn with_mock_record(mut self, key: &str, json: &str) -> Self {
-        self.mock_responses.insert(key.to_string(), json.to_string());
+        self.mock_responses
+            .insert(key.to_string(), json.to_string());
         self
     }
 
@@ -112,9 +113,7 @@ impl HookTestHarness {
         for (key, response) in &self.mock_responses {
             // Escape single quotes in the response for bash safety
             let escaped = response.replace('\'', "'\\''");
-            get_cases.push_str(&format!(
-                "            \"{key}\") echo '{escaped}' ;;\n"
-            ));
+            get_cases.push_str(&format!("            \"{key}\") echo '{escaped}' ;;\n"));
         }
         // Default case for unknown keys
         get_cases.push_str("            *) echo 'null' ;;\n");
@@ -157,8 +156,7 @@ esac
     /// Write the hook bash script to a temp file.
     fn write_hook_script(&self) -> PathBuf {
         let script_path = self.mock_dir.path().join("hook.sh");
-        std::fs::write(&script_path, &self.script_content)
-            .expect("failed to write hook script");
+        std::fs::write(&script_path, &self.script_content).expect("failed to write hook script");
 
         #[cfg(unix)]
         {
@@ -175,8 +173,7 @@ esac
     fn build_path(&self) -> String {
         if self.exclude_binaries.is_empty() {
             // No exclusions: prepend mock_dir to system PATH
-            let system_path =
-                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+            let system_path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
             return format!("{}:{}", self.mock_dir.path().display(), system_path);
         }
 
@@ -188,9 +185,9 @@ esac
         // Find system binaries we need: bash, cat, echo, printf, sed, grep, awk, test, [
         // and optionally jq, bc
         let essential_bins = [
-            "bash", "cat", "echo", "printf", "sed", "grep", "awk", "test", "env", "command",
-            "jq", "bc", "which", "dirname", "basename", "rm", "mkdir", "touch", "true",
-            "false", "expr", "tr", "sort", "cut", "wc",
+            "bash", "cat", "echo", "printf", "sed", "grep", "awk", "test", "env", "command", "jq",
+            "bc", "which", "dirname", "basename", "rm", "mkdir", "touch", "true", "false", "expr",
+            "tr", "sort", "cut", "wc",
         ];
 
         // Search standard system directories for each binary
@@ -271,7 +268,13 @@ esac
 
 // ─── Helper: build a mock record JSON ────────────────────────────────────────
 
-fn make_record(confidence: f64, quality: f64, confirmed: bool, staleness: f64, staleness_tier: &str) -> String {
+fn make_record(
+    confidence: f64,
+    quality: f64,
+    confirmed: bool,
+    staleness: f64,
+    staleness_tier: &str,
+) -> String {
     serde_json::json!({
         "confidence": { "value": confidence },
         "quality": { "value": quality },
@@ -325,7 +328,12 @@ fn make_gotcha_record(confidence: f64, quality: f64, confirmed: bool) -> String 
 /// Register a deny-eligible file record + linked gotcha in the harness.
 /// The hook denies when a linked gotcha has confirmed=true + confidence>=0.6 + quality>=0.4.
 impl HookTestHarness {
-    fn with_deny_eligible_record(self, file_key: &str, staleness: f64, staleness_tier: &str) -> Self {
+    fn with_deny_eligible_record(
+        self,
+        file_key: &str,
+        staleness: f64,
+        staleness_tier: &str,
+    ) -> Self {
         let gotcha_key = "gotcha:test-deny-signal";
         let gotcha = make_gotcha_record(0.8, 0.7, true);
         let file = make_file_record_with_gotcha(0.8, 0.7, staleness, staleness_tier, gotcha_key);
@@ -374,11 +382,7 @@ fn preread_mati_unreachable_allows() {
         .with_ping_failure();
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "unreachable mati must allow"
-    );
+    assert_eq!(output.decision(), "allow", "unreachable mati must allow");
 }
 
 /// 1.05 — get returns null -> allow + log-miss in background.
@@ -403,8 +407,7 @@ fn preread_no_record_allows_and_logs_miss() {
 #[test]
 fn preread_low_confidence_low_quality_allows_no_injection() {
     let record = make_record(0.2, 0.3, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.decision(), "allow");
@@ -419,8 +422,7 @@ fn preread_low_confidence_low_quality_allows_no_injection() {
 #[test]
 fn preread_low_confidence_high_quality_allows_no_injection() {
     let record = make_record(0.25, 0.8, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.decision(), "allow");
@@ -434,8 +436,7 @@ fn preread_low_confidence_high_quality_allows_no_injection() {
 #[test]
 fn preread_medium_confidence_good_quality_allows_with_context() {
     let record = make_record(0.45, 0.5, false, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.decision(), "allow");
@@ -454,8 +455,7 @@ fn preread_medium_confidence_good_quality_allows_with_context() {
 #[test]
 fn preread_medium_confidence_low_quality_allows_no_injection() {
     let record = make_record(0.5, 0.35, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.decision(), "allow");
@@ -469,11 +469,15 @@ fn preread_medium_confidence_low_quality_allows_no_injection() {
 /// Deny signal comes from a linked gotcha record (payload.gotcha_keys), not the file record itself.
 #[test]
 fn preread_high_conf_confirmed_good_qual_fresh_denies() {
-    let harness = HookTestHarness::for_pre_read()
-        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
+    let harness =
+        HookTestHarness::for_pre_read().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "deny", "confirmed gotcha + high conf + good qual must DENY");
+    assert_eq!(
+        output.decision(),
+        "deny",
+        "confirmed gotcha + high conf + good qual must DENY"
+    );
     assert!(
         output.reason().contains("mem_get"),
         "deny reason should reference mem_get, got: {}",
@@ -484,8 +488,8 @@ fn preread_high_conf_confirmed_good_qual_fresh_denies() {
 /// 1.11 — Stale (not liability) tier with confirmed gotcha -> still DENY.
 #[test]
 fn preread_high_conf_confirmed_good_qual_stale_still_denies() {
-    let harness = HookTestHarness::for_pre_read()
-        .with_deny_eligible_record("file:src/main.rs", 0.6, "stale");
+    let harness =
+        HookTestHarness::for_pre_read().with_deny_eligible_record("file:src/main.rs", 0.6, "stale");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(
@@ -499,8 +503,7 @@ fn preread_high_conf_confirmed_good_qual_stale_still_denies() {
 #[test]
 fn preread_high_conf_confirmed_good_qual_liability_downgrades() {
     let record = make_record(0.8, 0.7, true, 0.9, "liability");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(
@@ -523,8 +526,7 @@ fn preread_high_conf_confirmed_good_qual_liability_downgrades() {
 #[test]
 fn preread_high_conf_confirmed_good_qual_tombstone_passthrough() {
     let record = make_record(0.8, 0.7, true, 1.0, "tombstone");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(
@@ -542,8 +544,7 @@ fn preread_high_conf_confirmed_good_qual_tombstone_passthrough() {
 #[test]
 fn preread_high_conf_unconfirmed_allows() {
     let record = make_record(0.8, 0.7, false, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     // confirmed=false means the deny branch is skipped.
@@ -560,8 +561,7 @@ fn preread_high_conf_unconfirmed_allows() {
 #[test]
 fn preread_high_conf_confirmed_low_quality_allows() {
     let record = make_record(0.8, 0.35, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(
@@ -580,8 +580,7 @@ fn preread_high_conf_confirmed_low_quality_allows() {
 #[test]
 fn preread_medium_conf_liability_allows_with_stale_note() {
     let record = make_record(0.45, 0.5, false, 0.9, "liability");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.decision(), "allow");
@@ -602,8 +601,7 @@ fn preread_file_path_with_double_quotes_valid_json() {
     let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let path_with_quotes = r#"src/main"test.rs"#;
     let key = format!("file:{path_with_quotes}");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record(&key, &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record(&key, &record);
     let input = serde_json::json!({
         "tool_input": { "file_path": path_with_quotes }
     })
@@ -623,8 +621,7 @@ fn preread_file_path_with_backslashes_valid_json() {
     let record = make_record(0.8, 0.7, true, 0.1, "fresh");
     let path_with_backslash = r"src\main\test.rs";
     let key = format!("file:{path_with_backslash}");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record(&key, &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record(&key, &record);
     let input = serde_json::json!({
         "tool_input": { "file_path": path_with_backslash }
     })
@@ -643,8 +640,7 @@ fn preread_file_path_with_backslashes_valid_json() {
 fn preread_file_path_with_spaces() {
     let path_with_spaces = "src/my file/main.rs";
     let key = format!("file:{path_with_spaces}");
-    let harness = HookTestHarness::for_pre_read()
-        .with_deny_eligible_record(&key, 0.1, "fresh");
+    let harness = HookTestHarness::for_pre_read().with_deny_eligible_record(&key, 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "file_path": path_with_spaces }
     })
@@ -666,8 +662,7 @@ fn preread_file_path_with_unicode() {
     let record = make_record(0.45, 0.5, false, 0.1, "fresh");
     let path_unicode = "src/datos/archivo_\u{00f1}.rs";
     let key = format!("file:{path_unicode}");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record(&key, &record);
+    let harness = HookTestHarness::for_pre_read().with_mock_record(&key, &record);
     let input = serde_json::json!({
         "tool_input": { "file_path": path_unicode }
     })
@@ -685,8 +680,8 @@ fn preread_file_path_with_unicode() {
 /// 1.21 — pre-bash: `cat src/main.rs` detected -> deny (if record has confirmed gotcha).
 #[test]
 fn prebash_cat_detected_delegates_to_decision() {
-    let harness = HookTestHarness::for_pre_bash()
-        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
+    let harness =
+        HookTestHarness::for_pre_bash().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "command": "cat src/main.rs" }
     })
@@ -713,8 +708,8 @@ fn prebash_cat_detected_delegates_to_decision() {
 /// flag) so the first non-flag word is the actual file.
 #[test]
 fn prebash_head_with_flags_detected() {
-    let harness = HookTestHarness::for_pre_bash()
-        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
+    let harness =
+        HookTestHarness::for_pre_bash().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "command": "head -20 src/main.rs" }
     })
@@ -733,8 +728,7 @@ fn prebash_head_with_flags_detected() {
 fn prebash_no_file_reading_pattern_allows() {
     // Even if a record exists, git status should not trigger file detection
     let record = make_record(0.8, 0.7, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_bash()
-        .with_mock_record("file:src/main.rs", &record);
+    let harness = HookTestHarness::for_pre_bash().with_mock_record("file:src/main.rs", &record);
     let input = serde_json::json!({
         "tool_input": { "command": "git status" }
     })
@@ -751,8 +745,8 @@ fn prebash_no_file_reading_pattern_allows() {
 /// 1.24 — pre-bash: `cat src/main.rs | grep foo` -> file detected (piped).
 #[test]
 fn prebash_piped_command_detected() {
-    let harness = HookTestHarness::for_pre_bash()
-        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
+    let harness =
+        HookTestHarness::for_pre_bash().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
     let input = serde_json::json!({
         "tool_input": { "command": "cat src/main.rs | grep foo" }
     })
@@ -792,8 +786,7 @@ fn preread_mati_binary_not_in_path_allows() {
     // The easiest way: don't write it. Override run() behavior by
     // writing the hook script manually without calling write_mock_mati.
     let script_path = harness.mock_dir.path().join("hook.sh");
-    std::fs::write(&script_path, &harness.script_content)
-        .expect("failed to write hook script");
+    std::fs::write(&script_path, &harness.script_content).expect("failed to write hook script");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -807,8 +800,8 @@ fn preread_mati_binary_not_in_path_allows() {
     std::fs::create_dir_all(&filtered_dir).expect("failed to create no_mati_bin dir");
 
     let essential_bins = [
-        "bash", "cat", "echo", "printf", "sed", "grep", "awk", "env", "jq", "bc",
-        "which", "tr", "sort", "cut", "wc", "true", "false",
+        "bash", "cat", "echo", "printf", "sed", "grep", "awk", "env", "jq", "bc", "which", "tr",
+        "sort", "cut", "wc", "true", "false",
     ];
     let system_dirs = ["/usr/bin", "/bin", "/usr/local/bin"];
 
@@ -875,8 +868,8 @@ fn preread_mati_binary_not_in_path_allows() {
 /// doesn't produce the structured allow JSON. Tracked for hardening.
 #[test]
 fn preread_mati_get_returns_invalid_json_allows() {
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", "NOT_VALID_JSON{{{");
+    let harness =
+        HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", "NOT_VALID_JSON{{{");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     // jq fails on invalid JSON -> set -e kills the script with exit 5.
     // The hook does NOT produce allow JSON — it crashes. Claude Code
@@ -895,8 +888,7 @@ fn preread_mati_get_returns_invalid_json_allows() {
 /// 2.03 — mati get returns empty string -> allow + log-miss.
 #[test]
 fn preread_mati_get_returns_empty_string_allows() {
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", "");
+    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", "");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.decision(), "allow");
@@ -1027,8 +1019,8 @@ esac
 /// a jq type guard. Claude Code treats non-zero exit as fail-open (allow).
 #[test]
 fn prebash_unexpected_jq_type_graceful() {
-    let harness = HookTestHarness::for_pre_bash()
-        .with_mock_record("file:src/main.rs", r#"[1, 2, 3]"#);
+    let harness =
+        HookTestHarness::for_pre_bash().with_mock_record("file:src/main.rs", r#"[1, 2, 3]"#);
     let input = serde_json::json!({
         "tool_input": { "command": "cat src/main.rs" }
     })
@@ -1137,8 +1129,7 @@ esac
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let exit_code = output.status.code().unwrap_or(-1);
-            let json: Option<serde_json::Value> =
-                serde_json::from_str(stdout.trim()).ok();
+            let json: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
 
             (i, stdout, exit_code, json)
         }));
