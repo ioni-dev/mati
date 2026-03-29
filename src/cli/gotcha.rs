@@ -7,11 +7,11 @@ use clap::{Args, Subcommand};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
 use slugify::slugify;
 
-use mati_core::graph::{EdgeKind, Graph};
 use mati_core::health::quality;
+use mati_core::store::gotcha_ops::{apply_gotcha_tombstone, apply_gotcha_write};
 use mati_core::store::{
     Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, Store, TombstoneReason,
+    RecordSource, RecordVersion, StalenessScore, Store,
 };
 
 use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
@@ -26,9 +26,27 @@ pub struct GotchaArgs {
 #[derive(Subcommand)]
 pub enum GotchaCommand {
     /// Add a new gotcha for a file
+    #[command(
+        long_about = "Add a gotcha for a file. Pass -r for quick capture, or omit for interactive mode.\n\n\
+                      Quick:       mati gotcha add src/db.rs -r \"Never use unwrap in error paths\"\n\
+                      With reason: mati gotcha add src/db.rs -r \"Never use unwrap\" -m \"Causes panics in production\"\n\
+                      Interactive: mati gotcha add src/db.rs"
+    )]
     Add {
         /// File path to add gotcha for (e.g., "src/store/db.rs")
         file: String,
+
+        /// Rule text — what MUST Claude do/avoid. Skips interactive prompts.
+        #[arg(short, long)]
+        rule: Option<String>,
+
+        /// Reason — why this matters. Optional with -r.
+        #[arg(short = 'm', long)]
+        reason: Option<String>,
+
+        /// Severity (low/normal/high/critical). Defaults to normal.
+        #[arg(short, long)]
+        severity: Option<String>,
     },
     /// Edit an existing gotcha (pre-filled prompts — empty input keeps current value)
     Edit {
@@ -49,11 +67,17 @@ pub enum GotchaCommand {
 
 pub async fn run(args: GotchaArgs) -> Result<()> {
     match args.command {
-        GotchaCommand::Add { file } => run_gotcha_add(&file).await,
+        GotchaCommand::Add {
+            file,
+            rule,
+            reason,
+            severity,
+        } => run_gotcha_add(&file, rule, reason, severity).await,
         GotchaCommand::Edit { key } => run_gotcha_edit(&normalize_key(&key)).await,
         GotchaCommand::Delete { key } => run_gotcha_delete(&normalize_key(&key)).await,
         GotchaCommand::Confirm { key } => {
-            const NON_GOTCHA_PREFIXES: &[&str] = &["file:", "decision:", "dev_note:", "dep:", "stage:"];
+            const NON_GOTCHA_PREFIXES: &[&str] =
+                &["file:", "decision:", "dev_note:", "dep:", "stage:"];
             if let Some(prefix) = NON_GOTCHA_PREFIXES.iter().find(|&&p| key.starts_with(p)) {
                 let category = prefix.trim_end_matches(':');
                 let slug = key.split_once(':').map(|x| x.1).unwrap_or(&key);
@@ -121,11 +145,7 @@ fn print_existing_gotchas(records: &[Record], file: &str, use_color: bool) {
     table
         .load_preset(UTF8_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            Cell::new("Key"),
-            Cell::new("Conf"),
-            Cell::new("Rule"),
-        ]);
+        .set_header(vec![Cell::new("Key"), Cell::new("Conf"), Cell::new("Rule")]);
 
     if !use_color {
         table.force_no_tty();
@@ -157,11 +177,13 @@ fn print_existing_gotchas(records: &[Record], file: &str, use_color: bool) {
 
 /// Return existing gotcha records for `file` via the daemon socket.
 /// Falls back to an empty list on any error (display is best-effort).
-async fn existing_gotchas_via_daemon(
-    root: &std::path::Path,
-    file: &str,
-) -> Vec<Record> {
-    let res = daemon_result(root, "scan_prefix", serde_json::json!({"prefix": "gotcha:"})).await;
+async fn existing_gotchas_via_daemon(root: &std::path::Path, file: &str) -> Vec<Record> {
+    let res = daemon_result(
+        root,
+        "scan_prefix",
+        serde_json::json!({"prefix": "gotcha:"}),
+    )
+    .await;
     if let DaemonResult::Ok(resp) = res {
         if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
             if let Some(arr) = resp.get("data").and_then(|v| v.as_array()) {
@@ -186,19 +208,30 @@ async fn existing_gotchas_via_daemon(
 async fn daemon_gotcha_write(
     root: &std::path::Path,
     record: &Record,
-    new_files: &[String],
     old_files: &[String],
+    new_files: &[String],
+    is_new: bool,
 ) -> Result<bool> {
-    match daemon_result(root, "gotcha_write", serde_json::json!({
-        "record": serde_json::to_value(record)?,
-        "new_files": new_files,
-        "old_files": old_files,
-    })).await {
+    match daemon_result(
+        root,
+        "gotcha_write",
+        serde_json::json!({
+            "record": serde_json::to_value(record)?,
+            "old_files": old_files,
+            "new_files": new_files,
+            "is_new": is_new,
+        }),
+    )
+    .await
+    {
         DaemonResult::Ok(resp) => {
             if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
                 Ok(true)
             } else {
-                let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let err = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 anyhow::bail!("daemon gotcha_write failed: {err}");
             }
         }
@@ -215,41 +248,103 @@ async fn daemon_gotcha_write(
 /// Write gotcha directly to store (no daemon). Assumes caller has checked no daemon running.
 async fn direct_gotcha_write(
     store: &Store,
-    key: &str,
     record: &Record,
-    affected_files: &[String],
+    old_files: &[String],
+    new_files: &[String],
+    is_new: bool,
 ) -> Result<()> {
-    store.put(key, record).await?;
-    for af in affected_files {
-        let file_key = format!("file:{af}");
-        if let Ok(Some(mut file_record)) = store.get(&file_key).await {
-            match file_record.payload.as_mut() {
-                Some(payload) => {
-                    if let Some(arr) = payload.get_mut("gotcha_keys")
-                        .and_then(|v| v.as_array_mut())
-                    {
-                        if !arr.iter().any(|v| v.as_str() == Some(key)) {
-                            arr.push(serde_json::Value::String(key.to_string()));
-                        }
-                    } else if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("gotcha_keys".into(), serde_json::json!([key]));
-                    }
-                }
-                None => file_record.payload = Some(serde_json::json!({ "gotcha_keys": [key] })),
+    apply_gotcha_write(store, record, old_files, new_files, is_new).await
+}
+
+fn manual_gotcha_matches(record: &Record, candidate: &GotchaRecord) -> bool {
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        return false;
+    }
+
+    record
+        .payload_as::<GotchaRecord>()
+        .map(|existing| {
+            existing.rule == candidate.rule
+                && existing.reason == candidate.reason
+                && existing.severity == candidate.severity
+                && existing.affected_files == candidate.affected_files
+                && existing.ref_url == candidate.ref_url
+        })
+        .unwrap_or(false)
+}
+
+async fn choose_manual_gotcha_key(
+    cwd: &std::path::Path,
+    slug: &str,
+    gotcha: &GotchaRecord,
+) -> Result<String> {
+    let proxy = StoreProxy::open(cwd).await?;
+    let base_key = format!("gotcha:{slug}");
+    let mut suffix = 1usize;
+
+    loop {
+        let key = if suffix == 1 {
+            base_key.clone()
+        } else {
+            format!("{base_key}:{suffix}")
+        };
+
+        match proxy.get(&key).await? {
+            None => {
+                proxy.close().await?;
+                return Ok(key);
             }
-            let _ = store.put(&file_key, &file_record).await;
+            Some(existing) if manual_gotcha_matches(&existing, gotcha) => {
+                proxy.close().await?;
+                anyhow::bail!(
+                    "a matching gotcha already exists as '{key}'. Use `mati gotcha edit {key}` to update it."
+                );
+            }
+            Some(_) => suffix += 1,
         }
     }
-    Ok(())
 }
 
 // ── Add ───────────────────────────────────────────────────────────────────────
 
-async fn run_gotcha_add(file: &str) -> Result<()> {
+async fn run_gotcha_add(
+    file: &str,
+    inline_rule: Option<String>,
+    inline_reason: Option<String>,
+    inline_severity: Option<String>,
+) -> Result<()> {
     let use_color = io::stderr().is_terminal();
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
 
+    // ── Quick capture path (-r flag) ─────────────────────────────────────
+    // Skips all interactive prompts. Defaults: severity=normal, files=[file], no URL.
+    if let Some(rule) = inline_rule {
+        if rule.is_empty() {
+            anyhow::bail!("rule cannot be empty");
+        }
+        let reason = inline_reason.unwrap_or_default();
+        let severity = inline_severity
+            .as_deref()
+            .map(parse_severity)
+            .unwrap_or(Priority::Normal);
+        let affected_files = vec![file.to_string()];
+        let ref_url = None;
+
+        return finish_gotcha_add(
+            &cwd,
+            &root,
+            &rule,
+            &reason,
+            severity,
+            affected_files,
+            ref_url,
+            use_color,
+        )
+        .await;
+    }
+
+    // ── Interactive path ─────────────────────────────────────────────────
     // Check if daemon is alive (holds the exclusive store lock).
     let daemon_alive = matches!(
         daemon_result(&root, "ping", serde_json::json!({})).await,
@@ -272,7 +367,10 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
         let stdin = io::stdin();
         let mut lines = stdin.lock().lines();
 
-        eprint_prompt("Update an existing record? [key or Enter to add new]: ", use_color);
+        eprint_prompt(
+            "Update an existing record? [key or Enter to add new]: ",
+            use_color,
+        );
         let input = read_line(&mut lines)?;
 
         if !input.is_empty() {
@@ -288,51 +386,97 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
 
-    eprint_prompt("Rule (imperative — what MUST Claude do/avoid): ", use_color);
+    eprint_prompt("Rule (what MUST Claude do/avoid): ", use_color);
     let rule = read_line(&mut lines)?;
     if rule.is_empty() {
         anyhow::bail!("rule cannot be empty");
     }
 
-    eprint_prompt("Reason (why — what goes wrong otherwise): ", use_color);
+    eprint_prompt("Reason (why — what goes wrong otherwise, or Enter to skip): ", use_color);
     let reason = read_line(&mut lines)?;
 
-    eprint_prompt("Severity (low/normal/high/critical) [normal]: ", use_color);
-    let severity_input = read_line(&mut lines)?;
-    let severity = parse_severity(&severity_input);
+    // Remaining fields use defaults unless the user opts in
+    eprint_prompt(
+        &format!(
+            "Severity/files/URL? (Enter to accept defaults: normal, {file}) ",
+        ),
+        use_color,
+    );
+    let extra_input = read_line(&mut lines)?;
 
-    eprint_prompt(&format!("Affected files (comma-separated) [{file}]: "), use_color);
-    let files_input = read_line(&mut lines)?;
-    let affected_files: Vec<String> = if files_input.is_empty() {
-        vec![file.to_string()]
+    let (severity, affected_files, ref_url) = if extra_input.is_empty() {
+        (Priority::Normal, vec![file.to_string()], None)
     } else {
-        files_input
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
+        // User wants to customize — ask each field
+        let severity = parse_severity(&extra_input);
+
+        eprint_prompt(
+            &format!("Affected files (comma-separated) [{file}]: "),
+            use_color,
+        );
+        let files_input = read_line(&mut lines)?;
+        let affected_files: Vec<String> = if files_input.is_empty() {
+            vec![file.to_string()]
+        } else {
+            files_input
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        eprint_prompt("Reference URL (optional): ", use_color);
+        let ref_url_input = read_line(&mut lines)?;
+        let ref_url = if ref_url_input.is_empty() {
+            None
+        } else {
+            Some(ref_url_input)
+        };
+
+        (severity, affected_files, ref_url)
     };
 
-    eprint_prompt("Reference URL (optional): ", use_color);
-    let ref_url_input = read_line(&mut lines)?;
-    let ref_url = if ref_url_input.is_empty() { None } else { Some(ref_url_input) };
+    finish_gotcha_add(
+        &cwd,
+        &root,
+        &rule,
+        &reason,
+        severity,
+        affected_files,
+        ref_url,
+        use_color,
+    )
+    .await
+}
 
+/// Shared record-building and writing logic for both quick and interactive paths.
+#[allow(clippy::too_many_arguments)]
+async fn finish_gotcha_add(
+    cwd: &std::path::Path,
+    root: &std::path::Path,
+    rule: &str,
+    reason: &str,
+    severity: Priority,
+    affected_files: Vec<String>,
+    ref_url: Option<String>,
+    use_color: bool,
+) -> Result<()> {
     let now = now_secs();
     let slug = slugify!(&rule, max_length = 40);
-    let key = format!("gotcha:{slug}");
 
     let gotcha = GotchaRecord {
-        rule: rule.clone(),
-        reason: reason.clone(),
+        rule: rule.to_string(),
+        reason: reason.to_string(),
         severity: severity.clone(),
         affected_files: affected_files.clone(),
         ref_url: ref_url.clone(),
         discovered_session: now,
         confirmed: true,
     };
+    let key = choose_manual_gotcha_key(cwd, &slug, &gotcha).await?;
 
     let value = if reason.is_empty() {
-        rule.clone()
+        rule.to_string()
     } else {
         format!("{rule} because {reason}")
     };
@@ -350,7 +494,11 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
         ref_url,
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
-        version: RecordVersion { device_id, logical_clock: 1, wall_clock: now },
+        version: RecordVersion {
+            device_id,
+            logical_clock: 1,
+            wall_clock: now,
+        },
         quality: QualityScore::developer_entry_default(),
         access_count: 0,
         last_accessed: 0,
@@ -370,21 +518,18 @@ async fn run_gotcha_add(file: &str) -> Result<()> {
         quality::print_quality_caveat(&score, use_color);
     }
 
-    if daemon_gotcha_write(&root, &record, &affected_files, &[]).await? {
-        // Wrote through daemon — graph edges handled by daemon handler.
+    if daemon_gotcha_write(root, &record, &[], &affected_files, true).await? {
+        // Wrote through daemon.
     } else {
-        // No daemon — direct write + graph edges.
-        let store = Store::open(&cwd).await?;
-        direct_gotcha_write(&store, &key, &record, &affected_files).await?;
-        let mut graph = Graph::load(store).await?;
-        for af in &affected_files {
-            let file_key = format!("file:{af}");
-            graph.add_edge(&file_key, EdgeKind::HasGotcha, &key).await?;
-        }
-        graph.close().await?;
+        let store = Store::open(cwd).await?;
+        direct_gotcha_write(&store, &record, &[], &affected_files, true).await?;
+        store.close().await?;
     }
 
-    println!("Created {key}  (quality: {:.2}, confidence: {:.2})", score.value, record.confidence.value);
+    println!(
+        "Created {key}  (quality: {:.2}, confidence: {:.2})",
+        score.value, record.confidence.value
+    );
     for af in &affected_files {
         println!("  -> file:{af} HasGotcha {key}");
     }
@@ -431,7 +576,11 @@ async fn run_gotcha_edit(key: &str) -> Result<()> {
         None => {
             let mut payload = record.payload.clone().unwrap_or_default();
             if let Some(obj) = payload.as_object_mut() {
-                if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                if let Some(sev) = obj
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase())
+                {
                     obj.insert("severity".to_string(), serde_json::Value::String(sev));
                 }
             }
@@ -470,13 +619,24 @@ async fn run_gotcha_edit(key: &str) -> Result<()> {
 
     eprint_prompt(&format!("Rule [{}]: ", old_gotcha.rule), use_color);
     let rule_input = read_line(&mut lines)?;
-    let rule = if rule_input.is_empty() { old_gotcha.rule.clone() } else { rule_input };
+    let rule = if rule_input.is_empty() {
+        old_gotcha.rule.clone()
+    } else {
+        rule_input
+    };
 
     eprint_prompt(&format!("Reason [{}]: ", old_gotcha.reason), use_color);
     let reason_input = read_line(&mut lines)?;
-    let reason = if reason_input.is_empty() { old_gotcha.reason.clone() } else { reason_input };
+    let reason = if reason_input.is_empty() {
+        old_gotcha.reason.clone()
+    } else {
+        reason_input
+    };
 
-    eprint_prompt(&format!("Severity [{:?}]: ", old_gotcha.severity), use_color);
+    eprint_prompt(
+        &format!("Severity [{:?}]: ", old_gotcha.severity),
+        use_color,
+    );
     let severity_input = read_line(&mut lines)?;
     let severity = if severity_input.is_empty() {
         old_gotcha.severity.clone()
@@ -546,25 +706,13 @@ async fn run_gotcha_edit(key: &str) -> Result<()> {
 
     let old_files_vec: Vec<String> = old_files.iter().cloned().collect();
     let new_files_vec: Vec<String> = new_affected_files.clone();
-    let new_files: HashSet<String> = new_affected_files.iter().cloned().collect();
 
-    if daemon_gotcha_write(&root, &record, &new_files_vec, &old_files_vec).await? {
+    if daemon_gotcha_write(&root, &record, &old_files_vec, &new_files_vec, false).await? {
         // Wrote through daemon.
     } else {
         let store = Store::open(&cwd).await?;
-        direct_gotcha_write(&store, key, &record, &new_files_vec).await?;
-        let mut graph = Graph::load(store).await?;
-        if old_files != new_files {
-            for removed in old_files.difference(&new_files) {
-                let file_key = format!("file:{removed}");
-                graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
-            }
-            for added in new_files.difference(&old_files) {
-                let file_key = format!("file:{added}");
-                graph.add_edge(&file_key, EdgeKind::HasGotcha, key).await?;
-            }
-        }
-        graph.close().await?;
+        direct_gotcha_write(&store, &record, &old_files_vec, &new_files_vec, false).await?;
+        store.close().await?;
     }
 
     println!("Updated {key}  (quality: {:.2})", score.value);
@@ -611,7 +759,11 @@ async fn run_gotcha_delete(key: &str) -> Result<()> {
             // Retry with normalized severity (MCP-written records may have PascalCase)
             let mut payload = record.payload.clone().unwrap_or_default();
             if let Some(obj) = payload.as_object_mut() {
-                if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+                if let Some(sev) = obj
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase())
+                {
                     obj.insert("severity".to_string(), serde_json::Value::String(sev));
                 }
             }
@@ -623,12 +775,7 @@ async fn run_gotcha_delete(key: &str) -> Result<()> {
     // Show what will be deleted
     eprintln!();
     if use_color {
-        eprintln!(
-            "  {}{}{}",
-            super::colors::YELLOW,
-            key,
-            super::colors::RESET
-        );
+        eprintln!("  {}{}{}", super::colors::YELLOW, key, super::colors::RESET);
     } else {
         eprintln!("  {key}");
     }
@@ -649,13 +796,22 @@ async fn run_gotcha_delete(key: &str) -> Result<()> {
     }
 
     if daemon_alive {
-        match daemon_result(&root, "gotcha_tombstone", serde_json::json!({
-            "key": key,
-            "affected_files": &gotcha.affected_files,
-        })).await {
+        match daemon_result(
+            &root,
+            "gotcha_tombstone",
+            serde_json::json!({
+                "key": key,
+                "affected_files": &gotcha.affected_files,
+            }),
+        )
+        .await
+        {
             DaemonResult::Ok(resp) if resp.get("ok") == Some(&serde_json::Value::Bool(true)) => {}
             DaemonResult::Ok(resp) => {
-                let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let err = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 anyhow::bail!("daemon gotcha_tombstone failed: {err}");
             }
             DaemonResult::NotRunning | DaemonResult::StaleSocket => {
@@ -679,37 +835,14 @@ async fn run_gotcha_delete(key: &str) -> Result<()> {
 }
 
 async fn direct_delete(store: Store, key: &str, affected_files: &[String]) -> Result<()> {
-    let now = now_secs();
-    if let Ok(Some(mut record)) = store.get(key).await {
-        record.lifecycle = RecordLifecycle::Tombstoned {
-            reason: TombstoneReason::ManualDeletion,
-            at: now,
-        };
-        record.updated_at = now;
-        record.version.logical_clock += 1;
-        record.version.wall_clock = now;
-        store.put(key, &record).await?;
-    }
-    // Graph::load takes ownership of store; tombstone write must be done first.
-    let mut graph = Graph::load(store).await?;
-    for af in affected_files {
-        let file_key = format!("file:{af}");
-        graph.remove_edge(&file_key, &EdgeKind::HasGotcha, key).await?;
-    }
-    graph.close().await?;
+    apply_gotcha_tombstone(&store, key, affected_files).await?;
+    store.close().await?;
     Ok(())
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
-
 fn eprint_prompt(msg: &str, use_color: bool) {
     if use_color {
-        eprint!(
-            "{}{}{} ",
-            super::colors::BLUE,
-            msg,
-            super::colors::RESET
-        );
+        eprint!("{}{}{} ", super::colors::BLUE, msg, super::colors::RESET);
     } else {
         eprint!("{msg} ");
     }
@@ -736,6 +869,11 @@ fn parse_severity(input: &str) -> Priority {
 // ── Confirm ───────────────────────────────────────────────────────────────────
 
 /// Core confirm logic extracted for testability. Takes a proxy directly.
+///
+/// After confirming the record, syncs file-record `gotcha_keys` for all
+/// affected files. This ensures that gotchas created via mem_set (which
+/// previously skipped file-link sync) become visible to `mati diff` and
+/// the pre-read hook immediately after confirmation.
 pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> {
     let mut record = match proxy.get(key).await? {
         Some(r) => r,
@@ -743,12 +881,19 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
     };
 
     if record.category != Category::Gotcha {
-        anyhow::bail!("'{key}' is not a Gotcha record (category: {:?})", record.category);
+        anyhow::bail!(
+            "'{key}' is not a Gotcha record (category: {:?})",
+            record.category
+        );
     }
 
     if let Some(ref mut payload) = record.payload {
         if let Some(obj) = payload.as_object_mut() {
-            if let Some(sev) = obj.get("severity").and_then(|v| v.as_str()).map(|s| s.to_lowercase()) {
+            if let Some(sev) = obj
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_lowercase())
+            {
                 obj.insert("severity".to_string(), serde_json::Value::String(sev));
             }
             obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
@@ -763,7 +908,61 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
     record.version.logical_clock += 1;
     record.version.wall_clock = now_secs();
 
+    // Extract affected_files before writing (for file-link sync)
+    let affected_files: Vec<String> = record
+        .payload_as::<GotchaRecord>()
+        .map(|g| g.affected_files)
+        .unwrap_or_default();
+
     proxy.put(key, &record).await?;
+
+    // Sync file:*.gotcha_keys — ensure the confirmed gotcha is linked in
+    // all affected file records. This is best-effort: a failure here leaves
+    // the gotcha confirmed but invisible to diff/hooks until `mati repair`.
+    for file_path in &affected_files {
+        let file_key = format!("file:{file_path}");
+        match proxy.get(&file_key).await {
+            Ok(Some(mut file_record)) => {
+                let needs_link = file_record
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("gotcha_keys"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| !arr.iter().any(|v| v.as_str() == Some(key)))
+                    .unwrap_or(true);
+
+                if needs_link {
+                    if let Some(ref mut payload) = file_record.payload {
+                        if let Some(obj) = payload.as_object_mut() {
+                            let arr = obj
+                                .entry("gotcha_keys")
+                                .or_insert_with(|| serde_json::json!([]));
+                            if let Some(a) = arr.as_array_mut() {
+                                a.push(serde_json::Value::String(key.to_string()));
+                            }
+                        }
+                    }
+                    file_record.updated_at = now_secs();
+                    file_record.version.logical_clock += 1;
+                    file_record.version.wall_clock = now_secs();
+                    if let Err(e) = proxy.put(&file_key, &file_record).await {
+                        tracing::warn!("confirm_gotcha: file link sync failed for {file_key}: {e}");
+                        let _ = proxy
+                            .mark_dirty(key, &format!("confirm link sync failed for {file_key}: {e}"))
+                            .await;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("confirm_gotcha: file lookup failed for {file_key}: {e}");
+                let _ = proxy
+                    .mark_dirty(key, &format!("confirm file lookup failed for {file_key}: {e}"))
+                    .await;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -783,7 +982,8 @@ async fn run_gotcha_confirm(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mati_core::store::Store;
+    use mati_core::store::gotcha_ops::{ensure_gotcha_key_available, sync_gotcha_file_links};
+    use mati_core::store::{FileRecord, Store};
     use tempfile::TempDir;
 
     fn make_gotcha_record(key: &str) -> Record {
@@ -823,6 +1023,120 @@ mod tests {
         }
     }
 
+    fn make_file_record(key: &str, gotcha_keys: Vec<String>) -> Record {
+        let now = 1_700_000_000u64;
+        let path = key.strip_prefix("file:").unwrap_or(key);
+        let file = FileRecord {
+            path: path.to_string(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys,
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: now,
+            content_hash: None,
+            line_count: 0,
+        };
+        let mut record = Record::layer0_file_stub(key, uuid::Uuid::new_v4(), 1, now);
+        record.payload = serde_json::to_value(&file).ok();
+        record
+    }
+
+    #[tokio::test]
+    async fn sync_gotcha_links_adds_and_removes_exact_keys() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put(
+                "file:src/old.rs",
+                &make_file_record(
+                    "file:src/old.rs",
+                    vec!["gotcha:shared-rule".to_string(), "gotcha:keep".to_string()],
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                "file:src/new.rs",
+                &make_file_record("file:src/new.rs", vec![]),
+            )
+            .await
+            .unwrap();
+
+        sync_gotcha_file_links(
+            &store,
+            "gotcha:shared-rule",
+            &["src/old.rs".to_string()],
+            &["src/new.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let old = store.get("file:src/old.rs").await.unwrap().unwrap();
+        let old_payload = old.payload_as::<FileRecord>().unwrap();
+        assert_eq!(old_payload.gotcha_keys, vec!["gotcha:keep".to_string()]);
+        assert!(old.updated_at > 1_700_000_000u64);
+        assert_eq!(old.version.logical_clock, 2);
+
+        let new = store.get("file:src/new.rs").await.unwrap().unwrap();
+        let new_payload = new.payload_as::<FileRecord>().unwrap();
+        assert_eq!(
+            new_payload.gotcha_keys,
+            vec!["gotcha:shared-rule".to_string()]
+        );
+        assert!(new.updated_at > 1_700_000_000u64);
+        assert_eq!(new.version.logical_clock, 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_gotcha_key_available_rejects_existing_key() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let record = make_gotcha_record("gotcha:always-check");
+        store.put("gotcha:always-check", &record).await.unwrap();
+
+        let err = ensure_gotcha_key_available(&store, "gotcha:always-check")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn choose_manual_gotcha_key_adds_suffix_on_collision() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let record = make_gotcha_record("gotcha:always-check-input");
+        store
+            .put("gotcha:always-check-input", &record)
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let candidate = GotchaRecord {
+            rule: "Always check input".to_string(),
+            reason: "different context".to_string(),
+            severity: Priority::High,
+            affected_files: vec!["src/lib.rs".to_string()],
+            ref_url: None,
+            discovered_session: now_secs(),
+            confirmed: true,
+        };
+
+        let key = choose_manual_gotcha_key(dir.path(), "always-check-input", &candidate)
+            .await
+            .unwrap();
+        assert_eq!(key, "gotcha:always-check-input:2");
+    }
+
     #[tokio::test]
     async fn confirm_sets_confirmed_true() {
         let dir = TempDir::new().unwrap();
@@ -853,6 +1167,29 @@ mod tests {
         let updated = proxy.get("gotcha:test-source").await.unwrap().unwrap();
         assert_eq!(updated.source, RecordSource::DeveloperManual);
         assert!((updated.confidence.value - 0.80).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn confirm_backfills_missing_file_links() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("file:src/main.rs", &make_file_record("file:src/main.rs", vec![]))
+            .await
+            .unwrap();
+        store
+            .put("gotcha:test-backfill", &make_gotcha_record("gotcha:test-backfill"))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let proxy = StoreProxy::open(dir.path()).await.unwrap();
+        confirm_gotcha(&proxy, "gotcha:test-backfill").await.unwrap();
+
+        let updated_file = proxy.get("file:src/main.rs").await.unwrap().unwrap();
+        let payload = updated_file.payload_as::<FileRecord>().unwrap();
+        assert_eq!(payload.gotcha_keys, vec!["gotcha:test-backfill".to_string()]);
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, Priority, QualityScore, QualitySignal, QualityTier,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessTier, StalenessScore, Store,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessTier, Store,
 };
 
 use super::colors;
@@ -97,16 +97,32 @@ fn print_record(record: &Record, use_color: bool) {
     };
 
     let sc = |v: f32| -> &'static str {
-        if use_color { score_color(v) } else { "" }
+        if use_color {
+            score_color(v)
+        } else {
+            ""
+        }
     };
     let stc = |tier: &StalenessTier| -> &'static str {
-        if use_color { staleness_color(tier) } else { "" }
+        if use_color {
+            staleness_color(tier)
+        } else {
+            ""
+        }
     };
     let pc = |prio: &Priority| -> &'static str {
-        if use_color { priority_color(prio) } else { "" }
+        if use_color {
+            priority_color(prio)
+        } else {
+            ""
+        }
     };
     let cc = |cat: &Category| -> &'static str {
-        if use_color { category_color(cat) } else { "" }
+        if use_color {
+            category_color(cat)
+        } else {
+            ""
+        }
     };
 
     // ── Header ────────────────────────────────────────────────────────────────
@@ -242,10 +258,7 @@ fn print_record(record: &Record, use_color: bool) {
             record.gap_analysis_score
         );
     }
-    println!(
-        "    device      {gray}{}{reset}",
-        record.version.device_id
-    );
+    println!("    device      {gray}{}{reset}", record.version.device_id);
     println!(
         "    clock       {gray}logical={} wall={}{reset}",
         record.version.logical_clock,
@@ -322,9 +335,9 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
         Some("files") => ls_files(&store, use_color, limit).await?,
         Some("gotchas") => ls_gotchas(&store, use_color).await?,
         Some("decisions") => ls_decisions(&store, use_color).await?,
-        Some(other) => anyhow::bail!(
-            "unknown category '{other}'. Valid: files, gotchas, decisions"
-        ),
+        Some(other) => {
+            anyhow::bail!("unknown category '{other}'. Valid: files, gotchas, decisions")
+        }
         None => {
             ls_files(&store, use_color, limit).await?;
             println!();
@@ -341,7 +354,7 @@ const LS_FILES_CACHE_KEY: &str = "analytics:ls_files_cache";
 async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<()> {
     // ── Cache check ───────────────────────────────────────────────────────
     let current_seq = store.read_write_seq();
-    if let Ok(Some(cached)) = store.get(LS_FILES_CACHE_KEY).await {
+    if let Some(cached) = store.get(LS_FILES_CACHE_KEY).await? {
         if let Some(entry) = cached.payload_as::<LsFilesCache>() {
             if entry.write_seq == current_seq && entry.limit == limit {
                 render_ls_files_table(&entry.rows, entry.total, limit);
@@ -361,27 +374,28 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
 
     let all_records = store.scan_prefix("file:").await?;
     for r in &all_records {
-        if !matches!(r.lifecycle, RecordLifecycle::Active) { continue; }
+        if !matches!(r.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
         let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
-        let (purpose, entry_count, is_hotspot) =
-            match r.payload_as::<FileRecord>() {
-                Some(fr) => {
-                    let purpose = if fr.purpose.is_empty() {
-                        "(pending enrichment)".to_string()
-                    } else {
-                        truncate(&fr.purpose, 40)
-                    };
-                    (purpose, fr.entry_points.len(), fr.is_hotspot)
-                }
-                None => {
-                    let purpose = if r.value.is_empty() {
-                        "(pending enrichment)".to_string()
-                    } else {
-                        truncate(&r.value, 40)
-                    };
-                    (purpose, 0, false)
-                }
-            };
+        let (purpose, entry_count, is_hotspot) = match r.payload_as::<FileRecord>() {
+            Some(fr) => {
+                let purpose = if fr.purpose.is_empty() {
+                    "(pending enrichment)".to_string()
+                } else {
+                    truncate(&fr.purpose, 40)
+                };
+                (purpose, fr.entry_points.len(), fr.is_hotspot)
+            }
+            None => {
+                let purpose = if r.value.is_empty() {
+                    "(pending enrichment)".to_string()
+                } else {
+                    truncate(&r.value, 40)
+                };
+                (purpose, 0, false)
+            }
+        };
         let row = LsFileRow {
             path,
             purpose,
@@ -417,13 +431,22 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
     }
 
     // ── Write cache (sorted, best-effort) ────────────────────────────────
-    rows.sort_by(|a, b| b.is_hotspot.cmp(&a.is_hotspot).then_with(|| a.path.cmp(&b.path)));
+    rows.sort_by(|a, b| {
+        b.is_hotspot
+            .cmp(&a.is_hotspot)
+            .then_with(|| a.path.cmp(&b.path))
+    });
     let display_rows: Vec<LsFileRow> = if limit == 0 {
         rows
     } else {
         rows.into_iter().take(limit).collect()
     };
-    let cache = LsFilesCache { write_seq: current_seq, limit, total, rows: display_rows };
+    let cache = LsFilesCache {
+        write_seq: current_seq,
+        limit,
+        total,
+        rows: display_rows,
+    };
     let mut record = ls_cache_record(LS_FILES_CACHE_KEY, String::new());
     record.payload = serde_json::to_value(&cache).ok();
     let _ = store.put(LS_FILES_CACHE_KEY, &record).await;
@@ -541,7 +564,8 @@ async fn ls_gotchas(store: &StoreProxy, _use_color: bool) -> Result<()> {
             Cell::new(key_short),
             Cell::new(&rule),
             Cell::new(sev).fg(priority_comfy_color(&r.priority)),
-            Cell::new(format!("{:.2}", r.confidence.value)).fg(score_comfy_color(r.confidence.value)),
+            Cell::new(format!("{:.2}", r.confidence.value))
+                .fg(score_comfy_color(r.confidence.value)),
             Cell::new(format!("{:.2}", r.quality.value)).fg(score_comfy_color(r.quality.value)),
             Cell::new(if confirmed { "Y" } else { "-" }),
         ]);
@@ -582,7 +606,8 @@ async fn ls_decisions(store: &StoreProxy, _use_color: bool) -> Result<()> {
             Cell::new(key_short),
             Cell::new(truncate(&r.value, 40)),
             Cell::new(priority_short(&r.priority)).fg(priority_comfy_color(&r.priority)),
-            Cell::new(format!("{:.2}", r.confidence.value)).fg(score_comfy_color(r.confidence.value)),
+            Cell::new(format!("{:.2}", r.confidence.value))
+                .fg(score_comfy_color(r.confidence.value)),
             Cell::new(format!("{:.2}", r.quality.value)).fg(score_comfy_color(r.quality.value)),
             Cell::new(format_date(r.updated_at)),
         ]);
@@ -614,7 +639,14 @@ pub async fn run_export(args: ExportArgs) -> Result<()> {
 
 async fn export_json(store: &StoreProxy) -> Result<String> {
     let mut all: Vec<Record> = Vec::new();
-    for prefix in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
+    for prefix in &[
+        "gotcha:",
+        "decision:",
+        "file:",
+        "stage:",
+        "dev_note:",
+        "dep:",
+    ] {
         all.extend(store.scan_prefix(prefix).await?);
     }
     Ok(serde_json::to_string_pretty(&all)?)
@@ -660,33 +692,23 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
     let store = Store::open(&cwd).await?;
 
     let path = &args.file;
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
         "json" => {
             let content = std::fs::read_to_string(path)?;
             let records: Vec<Record> = serde_json::from_str(&content)?;
-            let pairs: Vec<(&str, &Record)> =
-                records.iter().map(|r| (r.key.as_str(), r)).collect();
+            let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
             store.put_batch(&pairs).await?;
             println!("Imported {} records from JSON.", records.len());
         }
         "md" => {
             let device_id = uuid::Uuid::new_v4();
             let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
-            let pairs: Vec<(&str, &Record)> = import
-                .records
-                .iter()
-                .map(|r| (r.key.as_str(), r))
-                .collect();
+            let pairs: Vec<(&str, &Record)> =
+                import.records.iter().map(|r| (r.key.as_str(), r)).collect();
             store.put_batch(&pairs).await?;
-            println!(
-                "Imported {} records from CLAUDE.md.",
-                import.records.len()
-            );
+            println!("Imported {} records from CLAUDE.md.", import.records.len());
         }
         _ => {
             // Try JSON first, fall back to CLAUDE.md import
@@ -700,16 +722,10 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
             } else {
                 let device_id = uuid::Uuid::new_v4();
                 let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
-                let pairs: Vec<(&str, &Record)> = import
-                    .records
-                    .iter()
-                    .map(|r| (r.key.as_str(), r))
-                    .collect();
+                let pairs: Vec<(&str, &Record)> =
+                    import.records.iter().map(|r| (r.key.as_str(), r)).collect();
                 store.put_batch(&pairs).await?;
-                println!(
-                    "Imported {} records from CLAUDE.md.",
-                    import.records.len()
-                );
+                println!("Imported {} records from CLAUDE.md.", import.records.len());
             }
         }
     }
@@ -743,7 +759,11 @@ async fn run_history_inner(store: &Store, args: &HistoryArgs) -> Result<()> {
             let since_ts = now_secs().saturating_sub(secs);
             let entries = store.history_since(key, since_ts, args.limit)?;
             if entries.is_empty() {
-                println!("No history for '{}' in the last {}.", key, duration_label(secs));
+                println!(
+                    "No history for '{}' in the last {}.",
+                    key,
+                    duration_label(secs)
+                );
                 return Ok(());
             }
             render_timeline(key, &entries, use_color);
@@ -822,13 +842,13 @@ fn render_timeline(key: &str, entries: &[mati_core::store::db::HistoryEntry], us
             }
             println!(
                 "     {gray}conf={:.2}  qual={:.2}  clock={}{reset}",
-                rec.confidence.value,
-                rec.quality.value,
-                rec.version.logical_clock,
+                rec.confidence.value, rec.quality.value, rec.version.logical_clock,
             );
         } else {
             // Non-tombstone but record could not be deserialized
-            println!("  {yellow}?{reset}  {gray}{ts_label}{reset}  {yellow}unreadable version{reset}");
+            println!(
+                "  {yellow}?{reset}  {gray}{ts_label}{reset}  {yellow}unreadable version{reset}"
+            );
         }
 
         if i < entries.len() - 1 {
@@ -880,9 +900,9 @@ fn parse_since_duration(s: &str) -> Result<u64> {
         anyhow::bail!("--since value must not be empty");
     }
     let (digits, suffix) = s.split_at(s.len() - 1);
-    let n: u64 = digits
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid --since format '{s}': expected <number><h|d|w|m|y>"))?;
+    let n: u64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!("invalid --since format '{s}': expected <number><h|d|w|m|y>")
+    })?;
     if n == 0 {
         anyhow::bail!("--since value must be positive, got '{s}'");
     }
@@ -1042,6 +1062,17 @@ pub(crate) fn source_label(src: &RecordSource) -> &'static str {
         RecordSource::SessionHook => "SessionHook (Layer 2)",
         RecordSource::DeveloperManual => "DeveloperManual",
         RecordSource::Import => "Import",
+    }
+}
+
+/// Compact source label for inline trust cues in explain/diff output.
+pub(crate) fn source_short(src: &RecordSource) -> &'static str {
+    match src {
+        RecordSource::DeveloperManual => "developer",
+        RecordSource::Import => "imported",
+        RecordSource::ClaudeEnrich => "enriched",
+        RecordSource::SessionHook => "session",
+        RecordSource::StaticAnalysis => "auto-detected",
     }
 }
 
