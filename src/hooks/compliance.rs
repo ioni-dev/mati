@@ -14,8 +14,12 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+use super::post_compliance;
+use super::post_edit;
+use super::pre_compact;
 use super::pre_bash;
 use super::pre_read;
+use super::session_end;
 
 // ─── Test Harness ────────────────────────────────────────────────────────────
 
@@ -85,6 +89,50 @@ impl HookTestHarness {
         }
     }
 
+    fn for_post_compliance() -> Self {
+        Self {
+            script_content: post_compliance::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_post_edit() -> Self {
+        Self {
+            script_content: post_edit::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_pre_compact() -> Self {
+        Self {
+            script_content: pre_compact::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_session_end() -> Self {
+        Self {
+            script_content: session_end::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_extra_cases: String::new(),
+        }
+    }
+
     fn with_mock_record(mut self, key: &str, json: &str) -> Self {
         self.mock_responses
             .insert(key.to_string(), json.to_string());
@@ -126,9 +174,14 @@ case "$1" in
         KEY="$2"
         case "$KEY" in
 {get_cases}        esac ;;
-    log-miss|log-hit|log-compliance-miss)
+    session-check-consulted)
+        echo "false" ;;
+    doc-capture)
+        cat >/dev/null
         echo "$@" >> "{log_file}" ;;
-    reparse|session-flush|session-harvest)
+    log-miss|log-hit|log-compliance-miss|edit-hook|session-flush|session-harvest)
+        echo "$@" >> "{log_file}" ;;
+    reparse)
         exit 0 ;;
     {extra}
     *) exit 0 ;;
@@ -229,6 +282,7 @@ esac
             .arg(script_path.to_str().expect("script path not valid UTF-8"))
             .env("PATH", &path)
             .env("HOME", self.mock_dir.path())
+            .current_dir(self.mock_dir.path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -263,6 +317,17 @@ esac
     fn read_log(&self) -> String {
         let log_file = self.mock_dir.path().join("mati_log.txt");
         std::fs::read_to_string(&log_file).unwrap_or_default()
+    }
+
+    fn wait_for_log_contains(&self, needle: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if self.read_log().contains(needle) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        false
     }
 }
 
@@ -355,13 +420,13 @@ fn preread_no_jq_allows() {
     assert_eq!(output.decision(), "allow", "missing jq must allow");
 }
 
-/// 1.02 — PATH excludes bc -> allow (guard fires).
+/// 1.02 — PATH excludes awk -> allow (guard fires).
 #[test]
-fn preread_no_bc_allows() {
-    let harness = HookTestHarness::for_pre_read().exclude_binary("bc");
+fn preread_no_awk_allows() {
+    let harness = HookTestHarness::for_pre_read().exclude_binary("awk");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
     assert_eq!(output.exit_code, 0, "hook should exit 0");
-    assert_eq!(output.decision(), "allow", "missing bc must allow");
+    assert_eq!(output.decision(), "allow", "missing awk must allow");
 }
 
 /// 1.03 — Empty file_path in tool_input -> allow.
@@ -855,33 +920,17 @@ fn preread_mati_binary_not_in_path_allows() {
     );
 }
 
-/// 2.02 — mati get returns invalid JSON (garbage) -> does not hang.
-///
-/// When `mati get` returns non-JSON, jq fails with exit code 5 on the
-/// `CONFIDENCE=$(...)` line. Because `set -euo pipefail` is active, the
-/// script exits immediately at that point — before reaching any output.
-/// This means NO allow JSON is emitted and the exit code is non-zero.
-///
-/// **This is a known gap**: the script lacks a jq parse guard after
-/// `mati get`. Claude Code treats a non-zero exit + no output as "allow"
-/// (fail-open), so the end-user effect is correct, but the hook itself
-/// doesn't produce the structured allow JSON. Tracked for hardening.
+/// 2.02 — mati get returns invalid JSON (garbage) -> structured allow.
 #[test]
 fn preread_mati_get_returns_invalid_json_allows() {
     let harness =
         HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", "NOT_VALID_JSON{{{");
     let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    // jq fails on invalid JSON -> set -e kills the script with exit 5.
-    // The hook does NOT produce allow JSON — it crashes. Claude Code
-    // treats this as fail-open (allow), so the safety contract holds.
-    assert_ne!(
-        output.exit_code, 0,
-        "invalid JSON from mati get should cause non-zero exit (jq failure + set -e)"
-    );
-    // Crucially: it must not hang
-    assert!(
-        output.stdout.trim().is_empty() || output.json.is_none(),
-        "no valid JSON output expected on jq crash"
+    assert_eq!(output.exit_code, 0, "invalid JSON should fail open cleanly");
+    assert_eq!(
+        output.decision(),
+        "allow",
+        "invalid JSON from mati get should produce a structured allow"
     );
 }
 
@@ -1011,12 +1060,7 @@ esac
     assert_eq!(decision, "allow", "slow mati should still result in allow");
 }
 
-/// 2.07 — pre-bash: mati get returns an array instead of object -> does not hang.
-///
-/// When `mati get` returns `[1,2,3]`, jq `.confidence.value` fails with
-/// "Cannot index array with string" and exits 5. With `set -euo pipefail`,
-/// the script dies immediately. Same gap as test 2.02 — the script lacks
-/// a jq type guard. Claude Code treats non-zero exit as fail-open (allow).
+/// 2.07 — pre-bash: mati get returns an array instead of object -> structured allow.
 #[test]
 fn prebash_unexpected_jq_type_graceful() {
     let harness =
@@ -1026,16 +1070,11 @@ fn prebash_unexpected_jq_type_graceful() {
     })
     .to_string();
     let output = harness.run(&input);
-    // jq fails on array input -> set -e kills the script with exit 5.
-    // Claude Code treats this as fail-open (allow).
-    assert_ne!(
-        output.exit_code, 0,
-        "jq type error on array should cause non-zero exit (set -e)"
-    );
-    // Must not hang — the key safety property
-    assert!(
-        output.stdout.trim().is_empty() || output.json.is_none(),
-        "no valid JSON output expected on jq type error crash"
+    assert_eq!(output.exit_code, 0, "unexpected jq type should fail open cleanly");
+    assert_eq!(
+        output.decision(),
+        "allow",
+        "unexpected jq type should produce a structured allow"
     );
 }
 
@@ -1152,4 +1191,79 @@ esac
             "thread {i} should deny (high conf + confirmed + good qual)"
         );
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Category 3: Post/Lifecycle Hook Contracts (4 tests)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// 3.01 — post-read compliance logs extensionless root-level files.
+#[test]
+fn post_compliance_logs_extensionless_root_file_miss() {
+    let harness = HookTestHarness::for_post_compliance();
+    let root_file = harness.mock_dir.path().join("Dockerfile");
+    std::fs::write(&root_file, "FROM rust:1.80").expect("failed to write Dockerfile");
+
+    let input = serde_json::json!({
+        "tool_input": { "path": "Dockerfile" }
+    })
+    .to_string();
+    let output = harness.run(&input);
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        harness.wait_for_log_contains("log-compliance-miss file:Dockerfile"),
+        "extensionless file should still be tracked as a compliance miss, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.02 — post-edit invokes both doc-capture and edit-hook.
+#[test]
+fn post_edit_invokes_doc_capture_and_edit_hook() {
+    let harness = HookTestHarness::for_post_edit();
+    let input = serde_json::json!({
+        "tool_input": {
+            "file_path": "src/main.rs",
+            "content": "/// Main entrypoint\nfn main() {}\n"
+        }
+    })
+    .to_string();
+    let output = harness.run(&input);
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        harness.wait_for_log_contains("doc-capture src/main.rs"),
+        "post-edit should invoke doc-capture, log: {}",
+        harness.read_log()
+    );
+    assert!(
+        harness.wait_for_log_contains("edit-hook src/main.rs"),
+        "post-edit should invoke edit-hook, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.03 — pre-compact flushes session state synchronously.
+#[test]
+fn pre_compact_invokes_session_flush() {
+    let harness = HookTestHarness::for_pre_compact();
+    let output = harness.run(r#"{"event":"PreCompact"}"#);
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        harness.wait_for_log_contains("session-flush"),
+        "pre-compact should invoke session-flush, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.04 — session-end triggers session harvest.
+#[test]
+fn session_end_invokes_session_harvest() {
+    let harness = HookTestHarness::for_session_end();
+    let output = harness.run("");
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        harness.wait_for_log_contains("session-harvest"),
+        "session-end should invoke session-harvest, log: {}",
+        harness.read_log()
+    );
 }
