@@ -12,9 +12,7 @@
 use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 
 use mati_core::graph::{EdgeKind, Graph};
@@ -113,19 +111,15 @@ fn bench_graph_load(c: &mut Criterion) {
         let (dir, n_edges) = rt.block_on(build_persisted_graph(n_files));
         group.throughput(Throughput::Elements(n_edges as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("load_from_kv", label),
-            &dir,
-            |b, dir| {
-                b.iter(|| {
-                    let store = rt.block_on(open_store(dir.path()));
-                    let graph = rt.block_on(Graph::load(store));
-                    let g = graph.unwrap();
-                    black_box(g.edge_count());
-                    rt.block_on(g.close()).unwrap();
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("load_from_kv", label), &dir, |b, dir| {
+            b.iter(|| {
+                let store = rt.block_on(open_store(dir.path()));
+                let graph = rt.block_on(Graph::load(store));
+                let g = graph.unwrap();
+                black_box(g.edge_count());
+                rt.block_on(g.close()).unwrap();
+            });
+        });
     }
 
     group.finish();
@@ -141,11 +135,7 @@ fn bench_edge_batch_insert(c: &mut Criterion) {
 
     let rt = rt();
 
-    for &(label, n_files) in &[
-        ("1k_edges", 800),
-        ("5k_edges", 4_000),
-        ("10k_edges", 8_000),
-    ] {
+    for &(label, n_files) in &[("1k_edges", 800), ("5k_edges", 4_000), ("10k_edges", 8_000)] {
         let edges = generate_edges(n_files);
         group.throughput(Throughput::Elements(edges.len() as u64));
 
@@ -235,8 +225,7 @@ fn bench_traversal(c: &mut Criterion) {
     // incoming traversal depth=5 ("what depends on this file?")
     group.bench_function("traverse_incoming_imports_depth5", |b| {
         b.iter(|| {
-            let result =
-                graph.traverse_incoming("file:src/module_100.rs", &EdgeKind::Imports, 5);
+            let result = graph.traverse_incoming("file:src/module_100.rs", &EdgeKind::Imports, 5);
             black_box(result.len());
         });
     });
@@ -318,8 +307,7 @@ fn bench_graph_worst_case(c: &mut Criterion) {
 
         group.bench_function("linear_chain_1000_traverse", |b| {
             b.iter(|| {
-                let result =
-                    graph.traverse("file:chain/0.rs", &EdgeKind::Imports, usize::MAX);
+                let result = graph.traverse("file:chain/0.rs", &EdgeKind::Imports, usize::MAX);
                 black_box(result.len());
             });
         });
@@ -350,8 +338,7 @@ fn bench_graph_worst_case(c: &mut Criterion) {
 
         group.bench_function("dense_100_nodes_traverse", |b| {
             b.iter(|| {
-                let result =
-                    graph.traverse("file:dense/0.rs", &EdgeKind::Imports, usize::MAX);
+                let result = graph.traverse("file:dense/0.rs", &EdgeKind::Imports, usize::MAX);
                 black_box(result.len());
             });
         });
@@ -368,9 +355,7 @@ fn bench_graph_worst_case(c: &mut Criterion) {
 
 fn bench_extreme_scale(c: &mut Criterion) {
     if std::env::var("MATI_BENCH_EXTREME").is_err() {
-        eprintln!(
-            "Skipping extreme_scale benchmarks. Set MATI_BENCH_EXTREME=1 to enable."
-        );
+        eprintln!("Skipping extreme_scale benchmarks. Set MATI_BENCH_EXTREME=1 to enable.");
         return;
     }
 
@@ -423,16 +408,14 @@ fn bench_extreme_scale(c: &mut Criterion) {
 
         group.bench_function("traverse_imports_depth5_in_200k", |b| {
             b.iter(|| {
-                let result =
-                    graph.traverse("file:src/module_0.rs", &EdgeKind::Imports, 5);
+                let result = graph.traverse("file:src/module_0.rs", &EdgeKind::Imports, 5);
                 black_box(result.len());
             });
         });
 
         group.bench_function("traverse_imports_unbounded_in_200k", |b| {
             b.iter(|| {
-                let result =
-                    graph.traverse("file:src/module_0.rs", &EdgeKind::Imports, usize::MAX);
+                let result = graph.traverse("file:src/module_0.rs", &EdgeKind::Imports, usize::MAX);
                 black_box(result.len());
             });
         });

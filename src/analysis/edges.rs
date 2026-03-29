@@ -61,8 +61,7 @@ pub fn build_edges(
                 continue;
             }
 
-            if let Some(target_rel) = resolver.resolve(import_path, &file.rel_path, file.language)
-            {
+            if let Some(target_rel) = resolver.resolve(import_path, &file.rel_path, file.language) {
                 let to_key = file_key(&target_rel);
                 // No self-edges.
                 if from_key != to_key {
@@ -101,9 +100,12 @@ fn file_key(rel_path: &str) -> String {
 /// and should be skipped without counting as unresolved.
 fn is_external_import(import_path: &str, language: Language) -> bool {
     match language {
-        // Rust: only `crate::` is intra-repo. Everything else (std, external crates,
-        // super, self) is either external or handled differently.
-        Language::Rust => !import_path.starts_with("crate::"),
+        // Rust: treat crate-relative and module-relative imports as internal.
+        Language::Rust => {
+            !(import_path.starts_with("crate::")
+                || import_path.starts_with("self::")
+                || import_path.starts_with("super::"))
+        }
         // TS/JS: bare specifiers (no `.` prefix) are npm packages.
         Language::TypeScript | Language::JavaScript => !import_path.starts_with('.'),
         // Python: can't easily distinguish stdlib from local without a venv scan.
@@ -145,7 +147,7 @@ impl ImportResolver {
         language: Language,
     ) -> Option<String> {
         match language {
-            Language::Rust => self.resolve_rust(import_path),
+            Language::Rust => self.resolve_rust(import_path, importing_file),
             Language::Python => self.resolve_python(import_path, importing_file),
             Language::TypeScript | Language::JavaScript => {
                 self.resolve_ts_js(import_path, importing_file)
@@ -154,16 +156,48 @@ impl ImportResolver {
         }
     }
 
-    /// Rust: `crate::foo::bar` → `src/foo/bar.rs` or `src/foo/bar/mod.rs`
+    /// Rust: resolve `crate::`, `self::`, and `super::` module paths.
     ///
-    /// Only resolves `crate::` prefixed paths (intra-crate imports).
-    /// `std::`, `super::`, `self::`, and external crate imports are filtered
-    /// by `is_external_import` before reaching this method.
-    fn resolve_rust(&self, import_path: &str) -> Option<String> {
-        let path = import_path.strip_prefix("crate::")?;
+    fn resolve_rust(&self, import_path: &str, importing_file: &str) -> Option<String> {
+        let clean = import_path
+            .split(" as ")
+            .next()
+            .unwrap_or(import_path)
+            .trim()
+            .trim_end_matches("::*");
+        let current_module = rust_module_segments(importing_file)?;
+        let segments = if let Some(path) = clean.strip_prefix("crate::") {
+            parse_rust_segments(path)
+        } else if let Some(path) = clean.strip_prefix("self::") {
+            current_module
+                .iter()
+                .cloned()
+                .chain(parse_rust_segments(path))
+                .collect()
+        } else if clean.starts_with("super::") {
+            let mut remaining = clean;
+            let mut up = 0usize;
+            while let Some(rest) = remaining.strip_prefix("super::") {
+                remaining = rest;
+                up += 1;
+            }
+            if up > current_module.len() {
+                return None;
+            }
+            current_module[..current_module.len() - up]
+                .iter()
+                .cloned()
+                .chain(parse_rust_segments(remaining))
+                .collect()
+        } else {
+            return None;
+        };
 
-        // Convert `foo::bar` → `src/foo/bar`
-        let fs_path = format!("src/{}", path.replace("::", "/"));
+        if segments.is_empty() {
+            return None;
+        }
+
+        let fs_path = format!("src/{}", segments.join("/"));
 
         // Try direct file: src/foo/bar.rs
         let direct = format!("{fs_path}.rs");
@@ -246,10 +280,7 @@ impl ImportResolver {
         // Resolve the relative path.
         let resolved = if parent.is_empty() {
             // File is at repo root.
-            clean
-                .strip_prefix("./")
-                .unwrap_or(clean)
-                .to_string()
+            clean.strip_prefix("./").unwrap_or(clean).to_string()
         } else {
             let stripped = clean.strip_prefix("./").unwrap_or(clean);
             normalize_path(&format!("{parent}/{stripped}"))
@@ -293,6 +324,45 @@ fn normalize_path(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+fn parse_rust_segments(path: &str) -> Vec<String> {
+    path.split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && *segment != "self")
+        .map(|segment| segment.to_string())
+        .collect()
+}
+
+fn rust_module_segments(importing_file: &str) -> Option<Vec<String>> {
+    let rel = importing_file.strip_prefix("src/")?;
+
+    if rel == "lib.rs" || rel == "main.rs" {
+        return Some(Vec::new());
+    }
+
+    if let Some(parent) = rel.strip_suffix("/mod.rs") {
+        return Some(
+            parent
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| segment.to_string())
+                .collect(),
+        );
+    }
+
+    let path = Path::new(rel);
+    let stem = path.file_stem()?.to_str()?;
+    let mut segments: Vec<String> = path
+        .parent()
+        .into_iter()
+        .flat_map(|parent| parent.iter())
+        .filter_map(|segment| segment.to_str())
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect();
+    segments.push(stem.to_string());
+    Some(segments)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -369,6 +439,54 @@ mod tests {
     }
 
     #[test]
+    fn rust_self_import_resolves_relative_module() {
+        let files = vec![
+            walked("src/store/mod.rs", Language::Rust),
+            walked("src/store/helpers.rs", Language::Rust),
+        ];
+        let analyses = vec![
+            analysis("src/store/mod.rs", Language::Rust, &["self::helpers"]),
+            analysis("src/store/helpers.rs", Language::Rust, &[]),
+        ];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].2, "file:src/store/helpers.rs");
+        assert_eq!(result.unresolved_imports, 0);
+    }
+
+    #[test]
+    fn rust_super_import_resolves_parent_module() {
+        let files = vec![
+            walked("src/store/db.rs", Language::Rust),
+            walked("src/store/helpers.rs", Language::Rust),
+        ];
+        let analyses = vec![
+            analysis("src/store/db.rs", Language::Rust, &["super::helpers"]),
+            analysis("src/store/helpers.rs", Language::Rust, &[]),
+        ];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].2, "file:src/store/helpers.rs");
+        assert_eq!(result.unresolved_imports, 0);
+    }
+
+    #[test]
+    fn rust_super_import_unresolved_when_target_missing() {
+        let files = vec![walked("src/store/db.rs", Language::Rust)];
+        let analyses = vec![analysis(
+            "src/store/db.rs",
+            Language::Rust,
+            &["super::helpers"],
+        )];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 0);
+        assert_eq!(result.unresolved_imports, 1);
+    }
+
+    #[test]
     fn rust_nested_crate_import() {
         let files = vec![
             walked("src/main.rs", Language::Rust),
@@ -417,11 +535,7 @@ mod tests {
     #[test]
     fn rust_no_self_edges() {
         let files = vec![walked("src/store.rs", Language::Rust)];
-        let analyses = vec![analysis(
-            "src/store.rs",
-            Language::Rust,
-            &["crate::store"],
-        )];
+        let analyses = vec![analysis("src/store.rs", Language::Rust, &["crate::store"])];
 
         let result = build_edges(&files, &analyses, &[]);
         assert_eq!(result.edges.len(), 0);
@@ -608,14 +722,10 @@ mod tests {
         assert_eq!(result.edges.len(), 2);
 
         let has_a_to_b = result.edges.iter().any(|(from, kind, to)| {
-            from == "file:src/a.rs"
-                && *kind == EdgeKind::CoChanges
-                && to == "file:src/b.rs"
+            from == "file:src/a.rs" && *kind == EdgeKind::CoChanges && to == "file:src/b.rs"
         });
         let has_b_to_a = result.edges.iter().any(|(from, kind, to)| {
-            from == "file:src/b.rs"
-                && *kind == EdgeKind::CoChanges
-                && to == "file:src/a.rs"
+            from == "file:src/b.rs" && *kind == EdgeKind::CoChanges && to == "file:src/a.rs"
         });
         assert!(has_a_to_b, "missing a→b edge");
         assert!(has_b_to_a, "missing b→a edge");
@@ -642,7 +752,11 @@ mod tests {
             walked("src/search.rs", Language::Rust),
         ];
         let analyses = vec![
-            analysis("src/lib.rs", Language::Rust, &["crate::store", "crate::search"]),
+            analysis(
+                "src/lib.rs",
+                Language::Rust,
+                &["crate::store", "crate::search"],
+            ),
             analysis("src/store.rs", Language::Rust, &[]),
             analysis("src/search.rs", Language::Rust, &[]),
         ];

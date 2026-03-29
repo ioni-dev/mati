@@ -11,8 +11,8 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
+use super::{extract_todo, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
-use super::{StaticFileAnalysis, extract_todo};
 
 // ── Static handles ────────────────────────────────────────────────────────────
 
@@ -39,12 +39,10 @@ const PY_QUERY_SRC: &str = r#"
 "#;
 
 static PY_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
-    tree_sitter::Query::new(&PY_LANGUAGE, PY_QUERY_SRC)
-        .expect("parser/python: invalid query")
+    tree_sitter::Query::new(&PY_LANGUAGE, PY_QUERY_SRC).expect("parser/python: invalid query")
 });
 
-static PY_CAPTURES: LazyLock<PyCaptures> =
-    LazyLock::new(|| PyCaptures::new(&PY_QUERY));
+static PY_CAPTURES: LazyLock<PyCaptures> = LazyLock::new(|| PyCaptures::new(&PY_QUERY));
 
 thread_local! {
     static PY_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
@@ -57,26 +55,27 @@ thread_local! {
 // ── Capture indices ───────────────────────────────────────────────────────────
 
 struct PyCaptures {
-    fn_name:    u32,
+    fn_name: u32,
     class_name: u32,
-    import:     u32,
-    branch:     u32,
-    comment:    u32,
+    import: u32,
+    branch: u32,
+    comment: u32,
     module_doc: u32,
 }
 
 impl PyCaptures {
     fn new(query: &tree_sitter::Query) -> Self {
         let idx = |name: &str| {
-            query.capture_index_for_name(name)
+            query
+                .capture_index_for_name(name)
                 .unwrap_or_else(|| panic!("parser/python: query missing @{name}"))
         };
         Self {
-            fn_name:    idx("fn_name"),
+            fn_name: idx("fn_name"),
             class_name: idx("class_name"),
-            import:     idx("import"),
-            branch:     idx("branch"),
-            comment:    idx("comment"),
+            import: idx("import"),
+            branch: idx("branch"),
+            comment: idx("comment"),
             module_doc: idx("module_doc"),
         }
     }
@@ -85,9 +84,7 @@ impl PyCaptures {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
-    let tree = PY_PARSER.with(|cell| {
-        cell.borrow_mut().parse(source.as_bytes(), None)
-    });
+    let tree = PY_PARSER.with(|cell| cell.borrow_mut().parse(source.as_bytes(), None));
 
     let tree = match tree {
         Some(t) => t,
@@ -182,11 +179,10 @@ pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFile
 fn is_top_level(node: tree_sitter::Node) -> bool {
     match node.parent().map(|p| p.kind()) {
         Some("module") => true,
-        Some("decorated_definition") => {
-            node.parent()
-                .and_then(|p| p.parent())
-                .is_some_and(|gp| gp.kind() == "module")
-        }
+        Some("decorated_definition") => node
+            .parent()
+            .and_then(|p| p.parent())
+            .is_some_and(|gp| gp.kind() == "module"),
         _ => false,
     }
 }
@@ -203,8 +199,7 @@ fn strip_python_docstring(raw: &str) -> Option<String> {
         && s.len() >= 6
     {
         &s[3..s.len() - 3]
-    } else if (s.starts_with('"') && s.ends_with('"')
-        || s.starts_with('\'') && s.ends_with('\''))
+    } else if (s.starts_with('"') && s.ends_with('"') || s.starts_with('\'') && s.ends_with('\''))
         && s.len() >= 2
     {
         &s[1..s.len() - 1]
@@ -212,7 +207,11 @@ fn strip_python_docstring(raw: &str) -> Option<String> {
         s
     };
     let trimmed = inner.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -291,7 +290,10 @@ mod tests {
     #[test]
     fn decorated_method_excluded() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, "class Foo:\n    @property\n    def name(self):\n        return self._name\n");
+        let a = parse(
+            &dir,
+            "class Foo:\n    @property\n    def name(self):\n        return self._name\n",
+        );
         assert!(!a.entry_points.contains(&"name".to_owned()));
     }
 
@@ -332,7 +334,10 @@ mod tests {
     fn import_dotted() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "import os.path\n");
-        assert!(a.imports.iter().any(|i| i.contains("os.path") || i.contains("os")));
+        assert!(a
+            .imports
+            .iter()
+            .any(|i| i.contains("os.path") || i.contains("os")));
     }
 
     #[test]
@@ -436,7 +441,10 @@ mod tests {
     #[test]
     fn triple_double_quote_docstring() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, "\"\"\"Handles payment processing.\"\"\"\ndef pay(): pass\n");
+        let a = parse(
+            &dir,
+            "\"\"\"Handles payment processing.\"\"\"\ndef pay(): pass\n",
+        );
         assert_eq!(a.module_doc.as_deref(), Some("Handles payment processing."));
     }
 

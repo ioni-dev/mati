@@ -9,12 +9,20 @@ use std::io::IsTerminal as _;
 use anyhow::Result;
 use clap::Args;
 
-use mati_core::store::{FileRecord, GotchaRecord, Priority, Record, RecordLifecycle};
+use mati_core::store::{
+    FileRecord, GotchaRecord, Priority, Record, RecordLifecycle, StalenessTier,
+};
 
 use super::colors;
 use super::proxy::StoreProxy;
+use super::show::source_short;
 
 #[derive(Args)]
+#[command(
+    long_about = "File briefing — everything mati knows before you edit a file.\n\
+                  Shows gotchas, decisions, co-change partners, stability signals, and TODOs.\n\n\
+                  Example: mati explain src/auth/session.rs"
+)]
 pub struct ExplainArgs {
     /// Repo-relative file path (e.g. src/auth/session.rs)
     pub path: String,
@@ -57,6 +65,8 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         .map(|_| "  hotspot")
         .unwrap_or("");
 
+    let source = source_short(&file_rec.source);
+
     println!();
     if use_color {
         println!(
@@ -65,7 +75,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
             RESET = colors::RESET
         );
         println!(
-            "  {GRAY}confidence {conf:.2}  quality {quality:?}{hotspot}{RESET}",
+            "  {GRAY}confidence {conf:.2}  quality {quality:?}  source: {source}{hotspot}{RESET}",
             GRAY = colors::GRAY,
             RESET = colors::RESET,
             conf = file_rec.confidence.value,
@@ -75,9 +85,38 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     } else {
         println!("  {filename} — {purpose}");
         println!(
-            "  confidence {:.2}  quality {:?}{}",
-            file_rec.confidence.value, file_rec.quality.tier, hotspot_tag
+            "  confidence {:.2}  quality {:?}  source: {}{}",
+            file_rec.confidence.value, file_rec.quality.tier, source, hotspot_tag
         );
+    }
+
+    // Staleness warning — show only when it matters
+    match file_rec.staleness.tier {
+        StalenessTier::Stale => {
+            if use_color {
+                println!(
+                    "  {YELLOW}stale{RESET} {GRAY}— file changed since last review. Verify before relying on this briefing.{RESET}",
+                    YELLOW = colors::YELLOW,
+                    GRAY = colors::GRAY,
+                    RESET = colors::RESET,
+                );
+            } else {
+                println!("  stale — file changed since last review. Verify before relying on this briefing.");
+            }
+        }
+        StalenessTier::Liability | StalenessTier::Tombstone => {
+            if use_color {
+                println!(
+                    "  {RED}outdated{RESET} {GRAY}— this briefing is unreliable. Record excluded from hook injection.{RESET}",
+                    RED = colors::RED,
+                    GRAY = colors::GRAY,
+                    RESET = colors::RESET,
+                );
+            } else {
+                println!("  outdated — this briefing is unreliable. Record excluded from hook injection.");
+            }
+        }
+        _ => {}
     }
 
     // ── Gotchas ───────────────────────────────────────────────────────────────
@@ -120,13 +159,14 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
                 .payload_as::<GotchaRecord>()
                 .map(|gr| gr.confirmed)
                 .unwrap_or(false);
-            let unconfirmed = if confirmed { "" } else { " (unconfirmed)" };
             let sev = match g.priority {
                 Priority::Critical => severity_label("CRITICAL", colors::RED, use_color),
                 Priority::High => severity_label("HIGH", colors::YELLOW, use_color),
                 _ => String::new(),
             };
-            println!("  ● {sev}{}{unconfirmed}", g.value);
+            let rule = g.value.lines().next().unwrap_or(&g.value);
+            let provenance = format_gotcha_provenance(g, confirmed, use_color);
+            println!("  ● {sev}{rule}  {provenance}");
         }
     }
 
@@ -213,6 +253,37 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         }
     }
 
+    // ── Review / capture hints ─────────────────────────────────────────────
+    let unconfirmed_count = gotchas
+        .iter()
+        .filter(|g| {
+            g.payload_as::<GotchaRecord>()
+                .map(|gr| !gr.confirmed)
+                .unwrap_or(false)
+        })
+        .count();
+
+    let is_hotspot = fr.as_ref().map(|f| f.is_hotspot).unwrap_or(false);
+    let gray = if use_color { colors::GRAY } else { "" };
+    let yellow = if use_color { colors::YELLOW } else { "" };
+    let reset = if use_color { colors::RESET } else { "" };
+
+    if unconfirmed_count > 0 {
+        println!();
+        println!(
+            "  {yellow}{unconfirmed_count} unconfirmed{reset} {gray}— run `mati review {path}` to confirm for hook enforcement{reset}"
+        );
+    } else if gotchas.is_empty() && is_hotspot {
+        println!();
+        println!("  {gray}Hotspot with no gotchas. Add one:{reset}");
+        println!("  {gray}  mati gotcha add {path} -r \"rule text\"{reset}");
+    } else if gotchas.is_empty() {
+        println!();
+        println!(
+            "  {gray}No gotchas for this file. Add one: mati gotcha add {path} -r \"rule text\"{reset}"
+        );
+    }
+
     println!();
     proxy.close().await?;
     Ok(())
@@ -231,5 +302,30 @@ fn severity_label(label: &str, color: &str, use_color: bool) -> String {
         format!("{color}{label}{} ", colors::RESET)
     } else {
         format!("{label} ")
+    }
+}
+
+fn format_gotcha_provenance(record: &Record, confirmed: bool, use_color: bool) -> String {
+    let source = source_short(&record.source);
+    let conf = record.confidence.value;
+
+    let (gray, yellow, green, reset) = if use_color {
+        (colors::GRAY, colors::YELLOW, colors::GREEN, colors::RESET)
+    } else {
+        ("", "", "", "")
+    };
+
+    if confirmed {
+        // Confirmed records show source + confidence in green/gray
+        let stale_note = match record.staleness.tier {
+            StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
+                format!(" {yellow}stale{reset}")
+            }
+            _ => String::new(),
+        };
+        format!("{gray}({green}confirmed{reset}{gray}, {source}, {conf:.2}){reset}{stale_note}")
+    } else {
+        // Unconfirmed records are clearly advisory
+        format!("{gray}({yellow}unconfirmed{reset}{gray}, {source}, {conf:.2}){reset}")
     }
 }

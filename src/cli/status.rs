@@ -70,7 +70,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
     let current_seq = store.read_write_seq();
-    if let Ok(Some(cached)) = store.get(SNAPSHOT_KEY).await {
+    if let Some(cached) = store.get(SNAPSHOT_KEY).await? {
         if let Some(snap) = cached.payload_as::<StatusSnapshot>() {
             let age = now.saturating_sub(snap.computed_at);
             if snap.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
@@ -112,9 +112,23 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    println!(
-        "\n{bold}{blue}◈ mati status{reset} — project: {bold}{white}{project}{reset}\n"
-    );
+    println!("\n{bold}{blue}◈ mati status{reset} — project: {bold}{white}{project}{reset}\n");
+
+    // ── Integrity warning ────────────────────────────────────────────────
+    if let Ok(Some(marker_record)) = store.get(mati_core::store::repair::DIRTY_MARKER_KEY).await {
+        if let Some(marker) = marker_record.payload_as::<mati_core::store::repair::DirtyMarker>() {
+            if marker.dirty {
+                println!(
+                    "  {yellow}⚠ Index drift detected{reset} — {gray}{}{reset}",
+                    marker.cause
+                );
+                println!(
+                    "    {gray}Affected keys: {}. Run `mati repair` to reconcile.{reset}\n",
+                    marker.affected_keys.len()
+                );
+            }
+        }
+    }
 
     // ── Record counts ─────────────────────────────────────────────────────
     println!(
@@ -185,8 +199,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         .collect();
 
     let (avg_confidence, median_confidence, has_confidence) = if !all_knowledge.is_empty() {
-        let mut conf_values: Vec<f32> =
-            all_knowledge.iter().map(|r| r.confidence.value).collect();
+        let mut conf_values: Vec<f32> = all_knowledge.iter().map(|r| r.confidence.value).collect();
         conf_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let avg = conf_values.iter().sum::<f32>() / conf_values.len() as f32;
         let n = conf_values.len();
@@ -222,6 +235,103 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     println!(
         "  {blue}Hotspots{reset}     {white}{hotspot_count}{reset} / {total_files} ({hot_pct}%)"
     );
+
+    // ── Trust health ─────────────────────────────────────────────────────
+    let stale_count = gotchas
+        .iter()
+        .chain(decisions.iter())
+        .filter(|r| {
+            matches!(
+                r.staleness.tier,
+                mati_core::store::StalenessTier::Stale
+                    | mati_core::store::StalenessTier::Liability
+                    | mati_core::store::StalenessTier::Tombstone
+            )
+        })
+        .count();
+    let low_confidence_count = gotchas
+        .iter()
+        .chain(decisions.iter())
+        .filter(|r| r.confidence.value < 0.3)
+        .count();
+
+    let unconfirmed = total_gotchas - confirmed_count;
+
+    // Compute oldest unconfirmed age for backlog visibility
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let oldest_unconfirmed_days = gotchas
+        .iter()
+        .filter(|r| {
+            r.payload_as::<GotchaRecord>()
+                .map(|g| !g.confirmed)
+                .unwrap_or(false)
+        })
+        .map(|r| (now.saturating_sub(r.created_at)) / 86400)
+        .max()
+        .unwrap_or(0);
+
+    // Count unconfirmed candidates on hotspot files
+    let unconfirmed_on_hotspots = gotchas
+        .iter()
+        .filter(|r| {
+            r.payload_as::<GotchaRecord>()
+                .map(|g| !g.confirmed)
+                .unwrap_or(false)
+        })
+        .filter(|r| {
+            r.payload_as::<GotchaRecord>()
+                .map(|g| {
+                    g.affected_files.iter().any(|af| {
+                        files
+                            .iter()
+                            .any(|f| f.key == format!("file:{af}") && f.payload_as::<FileRecord>().map(|fr| fr.is_hotspot).unwrap_or(false))
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .count();
+
+    let has_trust_issues = stale_count > 0 || low_confidence_count > 0 || unconfirmed > 0;
+
+    if has_trust_issues {
+        println!("\n  {blue}Trust{reset}");
+        if unconfirmed > 0 {
+            let mut detail_parts = Vec::new();
+            if unconfirmed_on_hotspots > 0 {
+                detail_parts.push(format!("{unconfirmed_on_hotspots} on hotspots"));
+            }
+            if oldest_unconfirmed_days > 0 {
+                detail_parts.push(format!("oldest {oldest_unconfirmed_days}d"));
+            }
+            let detail = if detail_parts.is_empty() {
+                String::new()
+            } else {
+                format!(" {gray}({}){reset}", detail_parts.join(", "))
+            };
+            println!(
+                "    {yellow}{unconfirmed} unconfirmed{reset}{detail} {gray}— run `mati review`{reset}"
+            );
+        }
+        if stale_count > 0 {
+            println!(
+                "    {yellow}{stale_count} stale{reset} {gray}— run `mati stale` to see which records need attention{reset}"
+            );
+        }
+        if low_confidence_count > 0 {
+            println!(
+                "    {yellow}{low_confidence_count} low-confidence{reset} {gray}(<0.3) — may need enrichment or manual review{reset}"
+            );
+        }
+    }
+
+    // ── Workflow guidance ────────────────────────────────────────────────
+    if total_gotchas == 0 {
+        println!();
+        println!("  {gray}No gotchas yet. Run `mati init` to scan for candidates.{reset}");
+    }
 
     println!();
 

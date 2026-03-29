@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rmp_serde as rmps;
 use once_cell::sync::OnceCell;
+use rmp_serde as rmps;
 use sha2::{Digest, Sha256};
 use surrealkv::{
     Durability as SkvDurability, HistoryOptions, LSMIterator, Mode, Options, Transaction, Tree,
@@ -45,7 +45,12 @@ const SEARCH_SYNC_PENDING: &str = "search_sync_pending";
 /// during normal `put`/`put_batch` calls. Must stay in sync with
 /// [`Durability::for_key`]'s Immediate set.
 const KNOWLEDGE_NAMESPACES: &[&str] = &[
-    "gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:",
+    "gotcha:",
+    "decision:",
+    "file:",
+    "stage:",
+    "dev_note:",
+    "dep:",
 ];
 
 /// Returns `true` for keys whose writes should invalidate cached stats snapshots.
@@ -66,9 +71,7 @@ fn is_knowledge_key(key: &str) -> bool {
 ///
 /// `graph:edge:*` is intentionally excluded — those values are raw 8-byte
 /// timestamps, not `Record` structs, and must not be fed to the search index.
-const SESSION_NAMESPACES: &[&str] = &[
-    "session:", "analytics:", "hook_event:", "compliance:",
-];
+const SESSION_NAMESPACES: &[&str] = &["session:", "analytics:", "hook_event:", "compliance:"];
 
 /// Persistent knowledge store for a single mati project.
 ///
@@ -114,7 +117,7 @@ impl Store {
 
         let knowledge = open_knowledge_tree(root.join("knowledge.db"))
             .map_err(|e| lock_error_hint(e, &root.join("knowledge.db")))?;
-        let sessions  = open_sessions_tree(root.join("sessions.db"))
+        let sessions = open_sessions_tree(root.join("sessions.db"))
             .map_err(|e| lock_error_hint(e, &root.join("sessions.db")))?;
 
         // Tantivy is NOT initialized here — it is lazily created on first use
@@ -317,8 +320,12 @@ impl Store {
         // Update search index — KV write is primary, search is secondary.
         // If tantivy fails to initialize, the KV write still succeeded.
         match self.ensure_search() {
-            Ok(search) => { search.add_record(record)?; }
-            Err(e) => { tracing::warn!("search index unavailable during put: {e}"); }
+            Ok(search) => {
+                search.add_record(record)?;
+            }
+            Err(e) => {
+                tracing::warn!("search index unavailable during put: {e}");
+            }
         }
         if is_knowledge_key(key) {
             self.bump_write_seq();
@@ -343,7 +350,7 @@ impl Store {
         for &(key, record) in records {
             match Durability::for_key(key) {
                 Durability::Immediate => immediate.push((key, record)),
-                Durability::Eventual  => eventual.push((key, record)),
+                Durability::Eventual => eventual.push((key, record)),
             }
         }
         if !immediate.is_empty() {
@@ -402,7 +409,7 @@ impl Store {
         for &(key, record) in records {
             match Durability::for_key(key) {
                 Durability::Immediate => immediate.push((key, record)),
-                Durability::Eventual  => eventual.push((key, record)),
+                Durability::Eventual => eventual.push((key, record)),
             }
         }
 
@@ -442,7 +449,9 @@ impl Store {
                 let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
                 let _ = search.add_records(&search_records)?;
             }
-            Err(e) => { tracing::warn!("search index unavailable during put_batch: {e}"); }
+            Err(e) => {
+                tracing::warn!("search index unavailable during put_batch: {e}");
+            }
         }
         if has_knowledge {
             self.bump_write_seq();
@@ -570,7 +579,7 @@ impl Store {
         for &(key, value) in records {
             match Durability::for_key(key) {
                 Durability::Immediate => immediate.push((key, value)),
-                Durability::Eventual  => eventual.push((key, value)),
+                Durability::Eventual => eventual.push((key, value)),
             }
         }
 
@@ -610,7 +619,7 @@ impl Store {
         while cursor.next()? {
             let user_key = cursor.key().user_key();
             match std::str::from_utf8(user_key) {
-                Ok(s)  => keys.push(s.to_string()),
+                Ok(s) => keys.push(s.to_string()),
                 Err(e) => tracing::warn!("skipping non-UTF8 key in scan_keys: {e}"),
             }
         }
@@ -731,7 +740,10 @@ impl Store {
 
         let txn = self.sessions.begin_with_mode(Mode::ReadOnly)?;
         let result = txn.get(sentinel_key.as_bytes())?;
-        anyhow::ensure!(result.is_some(), "ping sentinel write was not visible on read-back");
+        anyhow::ensure!(
+            result.is_some(),
+            "ping sentinel write was not visible on read-back"
+        );
 
         Ok(now_micros() - start)
     }
@@ -839,8 +851,8 @@ fn open_sessions_tree(path: PathBuf) -> Result<Tree> {
 ///
 /// Returns the first 8 hex characters of the SHA-256 digest.
 pub fn derive_slug(repo_root: &Path) -> String {
-    let input = read_remote_url(repo_root)
-        .unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
+    let input =
+        read_remote_url(repo_root).unwrap_or_else(|| repo_root.to_string_lossy().into_owned());
 
     let digest = Sha256::digest(input.as_bytes());
     hex::encode(&digest[..4]) // 4 bytes = 8 hex chars
@@ -852,7 +864,11 @@ fn read_remote_url(repo_root: &Path) -> Option<String> {
     config
         .lines()
         .find(|l| l.trim_start().starts_with("url ="))
-        .map(|l| l.split_once('=').map(|(_, v)| v.trim().to_owned()).unwrap_or_default())
+        .map(|l| {
+            l.split_once('=')
+                .map(|(_, v)| v.trim().to_owned())
+                .unwrap_or_default()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -924,11 +940,7 @@ fn history_impl(txn: &Transaction, key: &str, opts: &HistoryOptions) -> Result<V
     let mut upper = key.as_bytes().to_vec();
     upper.push(0x00);
 
-    let mut cursor = txn.history_with_options(
-        key.as_bytes(),
-        upper.as_slice(),
-        opts,
-    )?;
+    let mut cursor = txn.history_with_options(key.as_bytes(), upper.as_slice(), opts)?;
 
     let mut entries = Vec::new();
     while cursor.next()? {
@@ -990,10 +1002,16 @@ mod tests {
         let root = dir.path().join("mati_test");
         std::fs::create_dir_all(&root).unwrap();
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-        let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-        let search    = OnceCell::new();
-        let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-        let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
+        let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+        let search = OnceCell::new();
+        let _ = search.set(Search::open(&root.join("search_index")).unwrap());
+        let store = Store {
+            knowledge,
+            sessions,
+            search,
+            root: root.clone(),
+            index_needs_rebuild: false,
+        };
         (store, dir)
     }
 
@@ -1124,10 +1142,22 @@ mod tests {
             payload: None,
         };
 
-        store.put("gotcha:alpha", &make_record("gotcha:alpha")).await.unwrap();
-        store.put("gotcha:beta", &make_record("gotcha:beta")).await.unwrap();
-        store.put("gotcha:gamma", &make_record("gotcha:gamma")).await.unwrap();
-        store.put("file:src/main.rs", &make_record("file:src/main.rs")).await.unwrap();
+        store
+            .put("gotcha:alpha", &make_record("gotcha:alpha"))
+            .await
+            .unwrap();
+        store
+            .put("gotcha:beta", &make_record("gotcha:beta"))
+            .await
+            .unwrap();
+        store
+            .put("gotcha:gamma", &make_record("gotcha:gamma"))
+            .await
+            .unwrap();
+        store
+            .put("file:src/main.rs", &make_record("file:src/main.rs"))
+            .await
+            .unwrap();
 
         let results = store.scan_prefix("gotcha:").await.unwrap();
         assert_eq!(results.len(), 3);
@@ -1177,10 +1207,16 @@ mod tests {
         // Write 100 records, then explicitly close to release LOCK.
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = OnceCell::new();
-            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-            let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
+            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search = OnceCell::new();
+            let _ = search.set(Search::open(&root.join("search_index")).unwrap());
+            let store = Store {
+                knowledge,
+                sessions,
+                search,
+                root: root.clone(),
+                index_needs_rebuild: false,
+            };
             for i in 0..100 {
                 let r = make_record(i);
                 store.put(&r.key, &r).await.unwrap();
@@ -1191,12 +1227,23 @@ mod tests {
         // Reopen and verify all 100 are present.
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = OnceCell::new();
-            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-            let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
+            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search = OnceCell::new();
+            let _ = search.set(Search::open(&root.join("search_index")).unwrap());
+            let store = Store {
+                knowledge,
+                sessions,
+                search,
+                root: root.clone(),
+                index_needs_rebuild: false,
+            };
             let results = store.scan_prefix("gotcha:").await.unwrap();
-            assert_eq!(results.len(), 100, "expected 100 records after reopen, got {}", results.len());
+            assert_eq!(
+                results.len(),
+                100,
+                "expected 100 records after reopen, got {}",
+                results.len()
+            );
             store.close().await.unwrap();
         }
     }
@@ -1229,8 +1276,8 @@ mod tests {
 
     fn make_record(key: &str) -> Record {
         use crate::store::record::{
-            Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle,
-            RecordSource, RecordVersion, StalenessScore,
+            Category, ConfidenceScore, Priority, QualityScore, RecordLifecycle, RecordSource,
+            RecordVersion, StalenessScore,
         };
         Record {
             key: key.to_string(),
@@ -1289,10 +1336,19 @@ mod tests {
     #[tokio::test]
     async fn delete_does_not_remove_sibling_keys() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:keep",   &make_record("gotcha:keep")).await.unwrap();
-        store.put("gotcha:remove", &make_record("gotcha:remove")).await.unwrap();
+        store
+            .put("gotcha:keep", &make_record("gotcha:keep"))
+            .await
+            .unwrap();
+        store
+            .put("gotcha:remove", &make_record("gotcha:remove"))
+            .await
+            .unwrap();
         store.delete("gotcha:remove").await.unwrap();
-        assert!(store.get("gotcha:keep").await.unwrap().is_some(), "sibling must survive");
+        assert!(
+            store.get("gotcha:keep").await.unwrap().is_some(),
+            "sibling must survive"
+        );
         assert!(store.get("gotcha:remove").await.unwrap().is_none());
     }
 
@@ -1307,9 +1363,18 @@ mod tests {
     #[tokio::test]
     async fn scan_prefix_does_not_spill_across_namespaces() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:alpha",     &make_record("gotcha:alpha")).await.unwrap();
-        store.put("file:src/main.rs", &make_record("file:src/main.rs")).await.unwrap();
-        store.put("decision:arch",    &make_record("decision:arch")).await.unwrap();
+        store
+            .put("gotcha:alpha", &make_record("gotcha:alpha"))
+            .await
+            .unwrap();
+        store
+            .put("file:src/main.rs", &make_record("file:src/main.rs"))
+            .await
+            .unwrap();
+        store
+            .put("decision:arch", &make_record("decision:arch"))
+            .await
+            .unwrap();
 
         let gotcha = store.scan_prefix("gotcha:").await.unwrap();
         assert_eq!(gotcha.len(), 1);
@@ -1336,8 +1401,12 @@ mod tests {
         results.sort_by(|a, b| a.key.cmp(&b.key));
         assert_eq!(results.len(), 3);
         for r in &results {
-            assert_eq!(r.value, format!("sentinel:{}", r.key),
-                "value mismatch for key '{}'", r.key);
+            assert_eq!(
+                r.value,
+                format!("sentinel:{}", r.key),
+                "value mismatch for key '{}'",
+                r.key
+            );
         }
     }
 
@@ -1345,9 +1414,18 @@ mod tests {
     async fn scan_prefix_excludes_adjacent_namespaces() {
         // prefix_end("gotcha:") == "gotcha;" — "decision:" and "file:" fall outside.
         let (store, _dir) = temp_store();
-        store.put("gotcha:real",     &make_record("gotcha:real")).await.unwrap();
-        store.put("decision:before", &make_record("decision:before")).await.unwrap();
-        store.put("file:after",      &make_record("file:after")).await.unwrap();
+        store
+            .put("gotcha:real", &make_record("gotcha:real"))
+            .await
+            .unwrap();
+        store
+            .put("decision:before", &make_record("decision:before"))
+            .await
+            .unwrap();
+        store
+            .put("file:after", &make_record("file:after"))
+            .await
+            .unwrap();
 
         let results = store.scan_prefix("gotcha:").await.unwrap();
         assert_eq!(results.len(), 1, "only gotcha: keys should appear");
@@ -1359,20 +1437,34 @@ mod tests {
     #[tokio::test]
     async fn knowledge_and_session_trees_are_isolated() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:in-knowledge", &make_record("gotcha:in-knowledge")).await.unwrap();
-        store.put("session:12345",       &make_record("session:12345")).await.unwrap();
+        store
+            .put("gotcha:in-knowledge", &make_record("gotcha:in-knowledge"))
+            .await
+            .unwrap();
+        store
+            .put("session:12345", &make_record("session:12345"))
+            .await
+            .unwrap();
 
-        let gotcha_results  = store.scan_prefix("gotcha:").await.unwrap();
+        let gotcha_results = store.scan_prefix("gotcha:").await.unwrap();
         let session_results = store.scan_prefix("session:").await.unwrap();
 
         assert_eq!(gotcha_results.len(), 1);
         assert_eq!(gotcha_results[0].key, "gotcha:in-knowledge");
         assert_eq!(session_results.len(), 1);
         assert_eq!(session_results[0].key, "session:12345");
-        assert!(gotcha_results.iter().all(|r| !r.key.starts_with("session:")),
-            "session records must not appear in gotcha: scan");
-        assert!(session_results.iter().all(|r| !r.key.starts_with("gotcha:")),
-            "gotcha records must not appear in session: scan");
+        assert!(
+            gotcha_results
+                .iter()
+                .all(|r| !r.key.starts_with("session:")),
+            "session records must not appear in gotcha: scan"
+        );
+        assert!(
+            session_results
+                .iter()
+                .all(|r| !r.key.starts_with("gotcha:")),
+            "gotcha records must not appear in session: scan"
+        );
     }
 
     // ─── corrupt record tolerance ──────────────────────────────────────────────
@@ -1380,7 +1472,10 @@ mod tests {
     #[tokio::test]
     async fn scan_prefix_skips_corrupt_records_and_returns_valid_ones() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:good", &make_record("gotcha:good")).await.unwrap();
+        store
+            .put("gotcha:good", &make_record("gotcha:good"))
+            .await
+            .unwrap();
 
         // Inject garbage bytes directly — simulates disk corruption or schema mismatch.
         {
@@ -1406,7 +1501,11 @@ mod tests {
             txn.commit().await.unwrap();
         }
         let results = store.scan_prefix("gotcha:").await.unwrap();
-        assert_eq!(results.len(), 0, "all corrupt — must return empty, not panic");
+        assert_eq!(
+            results.len(),
+            0,
+            "all corrupt — must return empty, not panic"
+        );
     }
 
     // ─── ping ──────────────────────────────────────────────────────────────────
@@ -1415,7 +1514,9 @@ mod tests {
     async fn ping_multiple_calls_all_succeed() {
         let (store, _dir) = temp_store();
         for i in 0..10 {
-            let latency = store.ping().await
+            let latency = store
+                .ping()
+                .await
                 .unwrap_or_else(|e| panic!("ping #{i} failed: {e}"));
             assert!(latency < 5_000_000, "ping #{i} took >5 s: {latency} µs");
         }
@@ -1446,11 +1547,14 @@ mod tests {
         std::fs::write(
             git_dir.join("config"),
             format!("[remote \"origin\"]\n\turl = {url}\n"),
-        ).unwrap();
+        )
+        .unwrap();
 
         let actual_slug = derive_slug(dir.path());
-        assert_eq!(actual_slug, expected_slug,
-            "slug must equal SHA-256(remote URL)[0..4] hex");
+        assert_eq!(
+            actual_slug, expected_slug,
+            "slug must equal SHA-256(remote URL)[0..4] hex"
+        );
 
         // Also verify the path-derived slug for the same dir would differ
         // (i.e., the URL was actually preferred over the path).
@@ -1459,8 +1563,10 @@ mod tests {
             let digest = Sha256::digest(input.as_bytes());
             hex::encode(&digest[..4])
         };
-        assert_ne!(actual_slug, path_slug,
-            "URL slug must differ from the path slug for the same directory");
+        assert_ne!(
+            actual_slug, path_slug,
+            "URL slug must differ from the path slug for the same directory"
+        );
     }
 
     #[test]
@@ -1472,12 +1578,16 @@ mod tests {
             std::fs::write(
                 git_dir.join("config"),
                 format!("[remote \"origin\"]\n\turl = {url}\n"),
-            ).unwrap();
+            )
+            .unwrap();
             (derive_slug(dir.path()), dir)
         };
         let (slug_a, _dir_a) = make_repo("https://github.com/example/same-repo.git");
         let (slug_b, _dir_b) = make_repo("https://github.com/example/same-repo.git");
-        assert_eq!(slug_a, slug_b, "same remote URL must always produce the same slug");
+        assert_eq!(
+            slug_a, slug_b,
+            "same remote URL must always produce the same slug"
+        );
     }
 
     #[test]
@@ -1489,12 +1599,16 @@ mod tests {
             std::fs::write(
                 git_dir.join("config"),
                 format!("[remote \"origin\"]\n\turl = {url}\n"),
-            ).unwrap();
+            )
+            .unwrap();
             (derive_slug(dir.path()), dir)
         };
         let (slug_a, _dir_a) = make_repo("https://github.com/org/repo-alpha.git");
         let (slug_b, _dir_b) = make_repo("https://github.com/org/repo-beta.git");
-        assert_ne!(slug_a, slug_b, "different remote URLs must produce different slugs");
+        assert_ne!(
+            slug_a, slug_b,
+            "different remote URLs must produce different slugs"
+        );
     }
 
     // ─── prefix_end edge cases ─────────────────────────────────────────────────
@@ -1514,12 +1628,11 @@ mod tests {
     #[test]
     fn prefix_end_known_namespace_boundaries() {
         // ':' (0x3a) + 1 = ';' (0x3b) for every namespace prefix.
-        assert_eq!(prefix_end("gotcha:"),   "gotcha;");
-        assert_eq!(prefix_end("file:"),     "file;");
+        assert_eq!(prefix_end("gotcha:"), "gotcha;");
+        assert_eq!(prefix_end("file:"), "file;");
         assert_eq!(prefix_end("decision:"), "decision;");
-        assert_eq!(prefix_end("session:"),  "session;");
+        assert_eq!(prefix_end("session:"), "session;");
     }
-
 
     // ─── delete + scan interaction ─────────────────────────────────────────────
 
@@ -1559,7 +1672,11 @@ mod tests {
         store.put("gotcha:dedup-me", &r).await.unwrap();
 
         let results = store.scan_prefix("gotcha:").await.unwrap();
-        assert_eq!(results.len(), 1, "3 overwrites of the same key must yield 1 result in scan");
+        assert_eq!(
+            results.len(),
+            1,
+            "3 overwrites of the same key must yield 1 result in scan"
+        );
         assert_eq!(results[0].value, "v3", "scan must return the latest value");
         assert_eq!(results[0].version.logical_clock, 3);
     }
@@ -1569,9 +1686,9 @@ mod tests {
     #[tokio::test]
     async fn put_get_preserves_all_record_fields() {
         use crate::store::record::{
-            Category, ConfidenceScore, Priority, QualityScore, QualitySignal, QualityTier,
-            Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
-            StalenessSignal, StalenessTier,
+            Category, ConfidenceScore, Priority, QualityScore, QualitySignal, QualityTier, Record,
+            RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal,
+            StalenessTier,
         };
 
         let (store, _dir) = temp_store();
@@ -1583,7 +1700,11 @@ mod tests {
             value: "Never hold a write txn across an await point.".to_string(),
             category: Category::Gotcha,
             priority: Priority::Critical,
-            tags: vec!["async".to_string(), "tokio".to_string(), "surrealkv".to_string()],
+            tags: vec![
+                "async".to_string(),
+                "tokio".to_string(),
+                "surrealkv".to_string(),
+            ],
             created_at: 1_710_520_800,
             updated_at: 1_710_520_900,
             ref_url: Some("https://github.com/example/issue/99".to_string()),
@@ -1598,11 +1719,18 @@ mod tests {
                 last_record_sha: "abc123def456".to_string(),
             },
             lifecycle: RecordLifecycle::Active,
-            version: RecordVersion { device_id, logical_clock: 7, wall_clock: 1_710_520_900 },
+            version: RecordVersion {
+                device_id,
+                logical_clock: 7,
+                wall_clock: 1_710_520_900,
+            },
             quality: QualityScore {
                 value: 0.78,
                 tier: QualityTier::Good,
-                signals: vec![QualitySignal::HasImperativeVerb, QualitySignal::HasCausality],
+                signals: vec![
+                    QualitySignal::HasImperativeVerb,
+                    QualitySignal::HasCausality,
+                ],
                 computed_at: 1_710_520_800,
             },
             access_count: 12,
@@ -1632,7 +1760,10 @@ mod tests {
         assert_eq!(read.updated_at, written.updated_at);
         assert_eq!(read.ref_url, written.ref_url);
         assert_eq!(read.staleness.tier, written.staleness.tier);
-        assert_eq!(read.staleness.last_record_sha, written.staleness.last_record_sha);
+        assert_eq!(
+            read.staleness.last_record_sha,
+            written.staleness.last_record_sha
+        );
         assert_eq!(read.staleness.signals.len(), 2);
         assert_eq!(read.lifecycle, written.lifecycle);
         assert_eq!(read.version.device_id, written.version.device_id);
@@ -1643,10 +1774,22 @@ mod tests {
         assert_eq!(read.access_count, written.access_count);
         assert_eq!(read.last_accessed, written.last_accessed);
         assert_eq!(read.source, written.source);
-        assert_eq!(read.confidence.confirmation_count, written.confidence.confirmation_count);
-        assert_eq!(read.confidence.contributor_count, written.confidence.contributor_count);
-        assert_eq!(read.confidence.last_challenged, written.confidence.last_challenged);
-        assert_eq!(read.confidence.challenge_count, written.confidence.challenge_count);
+        assert_eq!(
+            read.confidence.confirmation_count,
+            written.confidence.confirmation_count
+        );
+        assert_eq!(
+            read.confidence.contributor_count,
+            written.confidence.contributor_count
+        );
+        assert_eq!(
+            read.confidence.last_challenged,
+            written.confidence.last_challenged
+        );
+        assert_eq!(
+            read.confidence.challenge_count,
+            written.confidence.challenge_count
+        );
         assert!((read.gap_analysis_score - written.gap_analysis_score).abs() < f32::EPSILON);
     }
 
@@ -1662,10 +1805,16 @@ mod tests {
 
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = OnceCell::new();
-            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-            let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
+            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search = OnceCell::new();
+            let _ = search.set(Search::open(&root.join("search_index")).unwrap());
+            let store = Store {
+                knowledge,
+                sessions,
+                search,
+                root: root.clone(),
+                index_needs_rebuild: false,
+            };
             for i in 0..10 {
                 let key = format!("session:{i:04}");
                 store.put(&key, &make_record(&key)).await.unwrap();
@@ -1675,13 +1824,22 @@ mod tests {
 
         {
             let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-            let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-            let search    = OnceCell::new();
-            let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-            let store = Store { knowledge, sessions, search, root: root.clone(), index_needs_rebuild: false };
+            let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+            let search = OnceCell::new();
+            let _ = search.set(Search::open(&root.join("search_index")).unwrap());
+            let store = Store {
+                knowledge,
+                sessions,
+                search,
+                root: root.clone(),
+                index_needs_rebuild: false,
+            };
             let results = store.scan_prefix("session:").await.unwrap();
-            assert_eq!(results.len(), 10,
-                "Eventual session records must survive a clean close+reopen");
+            assert_eq!(
+                results.len(),
+                10,
+                "Eventual session records must survive a clean close+reopen"
+            );
             store.close().await.unwrap();
         }
     }
@@ -1694,8 +1852,14 @@ mod tests {
         // valid records after the corrupt one would silently vanish.
         let (store, _dir) = temp_store();
 
-        store.put("gotcha:aaa", &make_record("gotcha:aaa")).await.unwrap(); // before corrupt
-        store.put("gotcha:zzz", &make_record("gotcha:zzz")).await.unwrap(); // after corrupt
+        store
+            .put("gotcha:aaa", &make_record("gotcha:aaa"))
+            .await
+            .unwrap(); // before corrupt
+        store
+            .put("gotcha:zzz", &make_record("gotcha:zzz"))
+            .await
+            .unwrap(); // after corrupt
 
         // Inject corruption lexicographically between the two valid records.
         {
@@ -1706,11 +1870,20 @@ mod tests {
         }
 
         let results = store.scan_prefix("gotcha:").await.unwrap();
-        assert_eq!(results.len(), 2,
-            "corruption in the middle must not truncate the scan");
+        assert_eq!(
+            results.len(),
+            2,
+            "corruption in the middle must not truncate the scan"
+        );
         let keys: Vec<_> = results.iter().map(|r| r.key.as_str()).collect();
-        assert!(keys.contains(&"gotcha:aaa"), "record before corruption must be returned");
-        assert!(keys.contains(&"gotcha:zzz"), "record after corruption must be returned");
+        assert!(
+            keys.contains(&"gotcha:aaa"),
+            "record before corruption must be returned"
+        );
+        assert!(
+            keys.contains(&"gotcha:zzz"),
+            "record after corruption must be returned"
+        );
     }
 
     // ─── tombstoned lifecycle through the store ───────────────────────────────
@@ -1740,7 +1913,9 @@ mod tests {
         use crate::store::record::RecordLifecycle;
         let (store, _dir) = temp_store();
         let mut r = make_record("gotcha:old-rule");
-        r.lifecycle = RecordLifecycle::Superseded { by_key: "gotcha:new-rule".to_string() };
+        r.lifecycle = RecordLifecycle::Superseded {
+            by_key: "gotcha:new-rule".to_string(),
+        };
         store.put("gotcha:old-rule", &r).await.unwrap();
         let got = store.get("gotcha:old-rule").await.unwrap().unwrap();
         match got.lifecycle {
@@ -1762,7 +1937,8 @@ mod tests {
         std::fs::write(
             git_dir.join("config"),
             "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let slug = derive_slug(dir.path());
         // Must fall back to path hash — same as if no .git/config existed at all.
@@ -1796,8 +1972,10 @@ mod tests {
         let input = String::from_utf8(vec![0x61, 0x7f]).unwrap(); // "a\x7f"
         let result = prefix_end(&input);
         // 0x7f increments to 0x80 — invalid UTF-8 → sentinel fallback
-        assert_eq!(result, "\u{ffff}",
-            "increment of 0x7f produces invalid UTF-8; must fall back to sentinel");
+        assert_eq!(
+            result, "\u{ffff}",
+            "increment of 0x7f produces invalid UTF-8; must fall back to sentinel"
+        );
     }
 
     #[test]
@@ -1821,7 +1999,10 @@ mod tests {
     async fn put_batch_single_record_readable() {
         let (store, _dir) = temp_store();
         let r = make_record("gotcha:batch-single");
-        store.put_batch(&[("gotcha:batch-single", &r)]).await.unwrap();
+        store
+            .put_batch(&[("gotcha:batch-single", &r)])
+            .await
+            .unwrap();
         let got = store.get("gotcha:batch-single").await.unwrap().unwrap();
         assert_eq!(got.key, "gotcha:batch-single");
         assert_eq!(got.value, r.value);
@@ -1830,10 +2011,10 @@ mod tests {
     #[tokio::test]
     async fn put_batch_all_records_readable() {
         let (store, _dir) = temp_store();
-        let records: Vec<Record> = (0..10).map(|i| make_record(&format!("gotcha:b{i}"))).collect();
-        let pairs: Vec<(&str, &Record)> = records.iter()
-            .map(|r| (r.key.as_str(), r))
+        let records: Vec<Record> = (0..10)
+            .map(|i| make_record(&format!("gotcha:b{i}")))
             .collect();
+        let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
         store.put_batch(&pairs).await.unwrap();
         let results = store.scan_prefix("gotcha:b").await.unwrap();
         assert_eq!(results.len(), 10);
@@ -1843,11 +2024,11 @@ mod tests {
     async fn put_batch_mixed_durability_both_trees_written() {
         let (store, _dir) = temp_store();
         let immediate = make_record("gotcha:imm");
-        let eventual  = make_record("session:evt");
-        store.put_batch(&[
-            ("gotcha:imm",  &immediate),
-            ("session:evt", &eventual),
-        ]).await.unwrap();
+        let eventual = make_record("session:evt");
+        store
+            .put_batch(&[("gotcha:imm", &immediate), ("session:evt", &eventual)])
+            .await
+            .unwrap();
         assert!(store.get("gotcha:imm").await.unwrap().is_some());
         assert!(store.get("session:evt").await.unwrap().is_some());
     }
@@ -1941,8 +2122,10 @@ mod tests {
         let r = make_record("gotcha:foo");
         store.put(&r.key, &r).await.unwrap();
         for blank in ["", "  ", "\t", "\n"] {
-            assert!(store.search(blank, 10).await.unwrap().is_empty(),
-                "blank query {blank:?} must return empty");
+            assert!(
+                store.search(blank, 10).await.unwrap().is_empty(),
+                "blank query {blank:?} must return empty"
+            );
         }
     }
 
@@ -1951,7 +2134,11 @@ mod tests {
         let (store, _dir) = temp_store();
         let r = make_record("gotcha:foo");
         store.put(&r.key, &r).await.unwrap();
-        assert!(store.search("absolutely_no_match_xyzzy99", 10).await.unwrap().is_empty());
+        assert!(store
+            .search("absolutely_no_match_xyzzy99", 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -1992,15 +2179,27 @@ mod tests {
         store.put(&r.key, &r).await.unwrap();
 
         // Confirm it is searchable before deletion
-        assert_eq!(store.search("this_unique_sentinel_deleted_record", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            store
+                .search("this_unique_sentinel_deleted_record", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         // Delete from SurrealKV (tantivy index still has the entry)
         store.delete("gotcha:deleted").await.unwrap();
 
         // Must return empty — the index hit is silently skipped
-        let results = store.search("this_unique_sentinel_deleted_record", 10).await.unwrap();
-        assert!(results.is_empty(),
-            "deleted record must not appear in search results");
+        let results = store
+            .search("this_unique_sentinel_deleted_record", 10)
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "deleted record must not appear in search results"
+        );
     }
 
     #[tokio::test]
@@ -2013,7 +2212,10 @@ mod tests {
         r.tags = vec!["production".to_string(), "critical-path".to_string()];
         store.put(&r.key, &r).await.unwrap();
 
-        let results = store.search("sentinel_fullrecord_uniqueterm_xqz", 10).await.unwrap();
+        let results = store
+            .search("sentinel_fullrecord_uniqueterm_xqz", 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].tags,
@@ -2047,18 +2249,28 @@ mod tests {
         let results = store.search("sentinel_m05f_unique", 20).await.unwrap();
         let result_keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
 
-        assert_eq!(results.len(), 5,
-            "expected exactly 5 results, got {}: {:?}", results.len(), result_keys);
+        assert_eq!(
+            results.len(),
+            5,
+            "expected exactly 5 results, got {}: {:?}",
+            results.len(),
+            result_keys
+        );
 
         for k in &target_keys {
-            assert!(result_keys.contains(&k.as_str()),
-                "target key '{k}' missing from results");
+            assert!(
+                result_keys.contains(&k.as_str()),
+                "target key '{k}' missing from results"
+            );
         }
 
         // No noise records leaked in
         for r in &results {
-            assert!(r.key.starts_with("gotcha:target-"),
-                "noise record '{}' must not appear in results", r.key);
+            assert!(
+                r.key.starts_with("gotcha:target-"),
+                "noise record '{}' must not appear in results",
+                r.key
+            );
         }
     }
 
@@ -2081,8 +2293,7 @@ mod tests {
                 r
             })
             .collect();
-        let noise_pairs: Vec<(&str, &Record)> =
-            noise.iter().map(|r| (r.key.as_str(), r)).collect();
+        let noise_pairs: Vec<(&str, &Record)> = noise.iter().map(|r| (r.key.as_str(), r)).collect();
         store.put_batch(&noise_pairs).await.unwrap();
 
         // 20 target records with unique sentinel + a meaningful tag we can
@@ -2102,8 +2313,12 @@ mod tests {
         // ── correctness at limit=100 ─────────────────────────────────────────
 
         let results = store.search("zqx_sentinel_5k_proof", 100).await.unwrap();
-        assert_eq!(results.len(), 20,
-            "expected 20 hits from 5,000 records, got {}", results.len());
+        assert_eq!(
+            results.len(),
+            20,
+            "expected 20 hits from 5,000 records, got {}",
+            results.len()
+        );
 
         let result_keys: Vec<&str> = results.iter().map(|r| r.key.as_str()).collect();
         let target_keys: Vec<&str> = targets.iter().map(|r| r.key.as_str()).collect();
@@ -2114,26 +2329,35 @@ mod tests {
         }
         // Zero noise leaked through
         for r in &results {
-            assert!(r.key.starts_with("gotcha:target-"),
-                "noise record '{}' must not appear in results", r.key);
+            assert!(
+                r.key.starts_with("gotcha:target-"),
+                "noise record '{}' must not appear in results",
+                r.key
+            );
         }
 
         // Full record came from SurrealKV — tantivy doesn't store tags
         for r in &results {
-            assert_eq!(r.tags, vec!["verified-from-surrealkv"],
-                "tags must be fetched from SurrealKV, key: {}", r.key);
+            assert_eq!(
+                r.tags,
+                vec!["verified-from-surrealkv"],
+                "tags must be fetched from SurrealKV, key: {}",
+                r.key
+            );
         }
 
         // ── limit enforcement at scale ────────────────────────────────────────
 
         let limited = store.search("zqx_sentinel_5k_proof", 5).await.unwrap();
-        assert_eq!(limited.len(), 5,
-            "limit=5 must cap results at scale");
+        assert_eq!(limited.len(), 5, "limit=5 must cap results at scale");
 
         // Over-limit returns exactly the matching set
         let over = store.search("zqx_sentinel_5k_proof", 999).await.unwrap();
-        assert_eq!(over.len(), 20,
-            "limit > match count must return all 20 matches, not panic");
+        assert_eq!(
+            over.len(),
+            20,
+            "limit > match count must return all 20 matches, not panic"
+        );
 
         // ── ensure noise records are NOT findable by sentinel term ────────────
 
@@ -2141,8 +2365,11 @@ mod tests {
         // that does NOT appear in sentinel records
         let noise_only_results = store.search("zqx_sentinel_5k_proof", 100).await.unwrap();
         for r in &noise_only_results {
-            assert!(!r.key.starts_with("file:src/module_"),
-                "noise module record should not match sentinel query: {}", r.key);
+            assert!(
+                !r.key.starts_with("file:src/module_"),
+                "noise module record should not match sentinel query: {}",
+                r.key
+            );
         }
     }
 
@@ -2159,10 +2386,16 @@ mod tests {
     // derivation so tests can point at a tempdir directly).
     fn reopen_store(root: &std::path::Path) -> Store {
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-        let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
-        let search    = OnceCell::new();
-        let _         = search.set(Search::open(&root.join("search_index")).unwrap());
-        Store { knowledge, sessions, search, root: root.to_path_buf(), index_needs_rebuild: false }
+        let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
+        let search = OnceCell::new();
+        let _ = search.set(Search::open(&root.join("search_index")).unwrap());
+        Store {
+            knowledge,
+            sessions,
+            search,
+            root: root.to_path_buf(),
+            index_needs_rebuild: false,
+        }
     }
 
     /// Write records, close, delete search_index/, reopen with a fresh empty
@@ -2174,10 +2407,12 @@ mod tests {
 
         // Write 10 records with a unique sentinel term in their values
         let records: Vec<Record> = (0..10)
-            .map(|i| make_record_v(
-                &format!("gotcha:rebuild-miss-{i:02}"),
-                "xq_rebuild_missing_sentinel unique term",
-            ))
+            .map(|i| {
+                make_record_v(
+                    &format!("gotcha:rebuild-miss-{i:02}"),
+                    "xq_rebuild_missing_sentinel unique term",
+                )
+            })
             .collect();
         let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
         store.put_batch(&pairs).await.unwrap();
@@ -2188,13 +2423,23 @@ mod tests {
 
         // Reopen with fresh empty index, then rebuild
         let store2 = reopen_store(&root);
-        assert!(!store2.index_needs_rebuild(), "reopen_store sets flag=false; we test rebuild directly");
+        assert!(
+            !store2.index_needs_rebuild(),
+            "reopen_store sets flag=false; we test rebuild directly"
+        );
 
         let committed = store2.rebuild_search_index().await.unwrap();
         assert_eq!(committed, 10, "rebuild must commit all 10 records");
 
-        let results = store2.search("xq_rebuild_missing_sentinel", 20).await.unwrap();
-        assert_eq!(results.len(), 10, "all records must be findable after rebuild");
+        let results = store2
+            .search("xq_rebuild_missing_sentinel", 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            10,
+            "all records must be findable after rebuild"
+        );
     }
 
     /// Corrupt meta.json → Store-level open logic must wipe and flag rebuild.
@@ -2204,16 +2449,23 @@ mod tests {
         let (store, _dir) = temp_store();
         let root = store.root.clone();
 
-        let r = make_record_v("gotcha:rebuild-corrupt", "xq_rebuild_corrupt_sentinel unique");
+        let r = make_record_v(
+            "gotcha:rebuild-corrupt",
+            "xq_rebuild_corrupt_sentinel unique",
+        );
         store.put("gotcha:rebuild-corrupt", &r).await.unwrap();
         store.close().await.unwrap();
 
         // Corrupt the index by overwriting meta.json with garbage
-        std::fs::write(root.join("search_index").join("meta.json"), b"not valid json {{{{").unwrap();
+        std::fs::write(
+            root.join("search_index").join("meta.json"),
+            b"not valid json {{{{",
+        )
+        .unwrap();
 
         // Replicate the Store::open_and_rebuild recovery path: Search::open fails → wipe → reopen
         let knowledge = open_knowledge_tree(root.join("knowledge.db")).unwrap();
-        let sessions  = open_sessions_tree(root.join("sessions.db")).unwrap();
+        let sessions = open_sessions_tree(root.join("sessions.db")).unwrap();
         let search_path = root.join("search_index");
         let (search_cell, needs_rebuild) = {
             let cell = OnceCell::new();
@@ -2229,14 +2481,30 @@ mod tests {
                 }
             }
         };
-        let store2 = Store { knowledge, sessions, search: search_cell, root: root.clone(), index_needs_rebuild: needs_rebuild };
+        let store2 = Store {
+            knowledge,
+            sessions,
+            search: search_cell,
+            root: root.clone(),
+            index_needs_rebuild: needs_rebuild,
+        };
 
-        assert!(store2.index_needs_rebuild(), "corrupt meta.json must trigger rebuild flag");
+        assert!(
+            store2.index_needs_rebuild(),
+            "corrupt meta.json must trigger rebuild flag"
+        );
 
         store2.rebuild_search_index().await.unwrap();
 
-        let results = store2.search("xq_rebuild_corrupt_sentinel", 10).await.unwrap();
-        assert_eq!(results.len(), 1, "record must be searchable after rebuild from corrupt state");
+        let results = store2
+            .search("xq_rebuild_corrupt_sentinel", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "record must be searchable after rebuild from corrupt state"
+        );
         assert_eq!(results[0].key, "gotcha:rebuild-corrupt");
     }
 
@@ -2257,7 +2525,10 @@ mod tests {
         std::fs::remove_dir_all(root.join("search_index")).unwrap();
         let store2 = reopen_store(&root);
         let committed = store2.rebuild_search_index().await.unwrap();
-        assert_eq!(committed, 7, "committed count must equal number of records in SurrealKV");
+        assert_eq!(
+            committed, 7,
+            "committed count must equal number of records in SurrealKV"
+        );
     }
 
     /// Calling rebuild_search_index twice must not panic; query deduplication
@@ -2271,8 +2542,15 @@ mod tests {
         store.rebuild_search_index().await.unwrap();
         store.rebuild_search_index().await.unwrap();
 
-        let results = store.search("xq_rebuild_idempotent_sentinel", 10).await.unwrap();
-        assert_eq!(results.len(), 1, "dedup must collapse duplicate tantivy entries to one result");
+        let results = store
+            .search("xq_rebuild_idempotent_sentinel", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "dedup must collapse duplicate tantivy entries to one result"
+        );
     }
 
     /// Normal open (healthy index) must not set index_needs_rebuild.
@@ -2294,7 +2572,10 @@ mod tests {
     #[tokio::test]
     async fn history_single_version() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:single", &make_record("gotcha:single")).await.unwrap();
+        store
+            .put("gotcha:single", &make_record("gotcha:single"))
+            .await
+            .unwrap();
 
         let entries = store.history("gotcha:single", 0).unwrap();
         assert!(!entries.is_empty(), "must return at least one version");
@@ -2317,7 +2598,11 @@ mod tests {
         store.put("gotcha:multi", &r).await.unwrap();
 
         let entries = store.history("gotcha:multi", 0).unwrap();
-        assert!(entries.len() >= 3, "expected >=3 versions, got {}", entries.len());
+        assert!(
+            entries.len() >= 3,
+            "expected >=3 versions, got {}",
+            entries.len()
+        );
 
         // Newest first: timestamps must be non-increasing
         for pair in entries.windows(2) {
@@ -2337,7 +2622,10 @@ mod tests {
     #[tokio::test]
     async fn history_includes_tombstones() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:tomb", &make_record("gotcha:tomb")).await.unwrap();
+        store
+            .put("gotcha:tomb", &make_record("gotcha:tomb"))
+            .await
+            .unwrap();
 
         // Use soft_delete (not hard delete) so SurrealKV retains the tombstone
         // marker in the version history. Store::delete is a hard delete that
@@ -2351,7 +2639,11 @@ mod tests {
         }
 
         let entries = store.history("gotcha:tomb", 0).unwrap();
-        assert!(entries.len() >= 2, "must have create + soft-delete, got {}", entries.len());
+        assert!(
+            entries.len() >= 2,
+            "must have create + soft-delete, got {}",
+            entries.len()
+        );
         // At least one tombstone must exist
         assert!(
             entries.iter().any(|e| e.is_tombstone),
@@ -2362,15 +2654,30 @@ mod tests {
     #[tokio::test]
     async fn history_no_key_spill() {
         let (store, _dir) = temp_store();
-        store.put("gotcha:alpha", &make_record("gotcha:alpha")).await.unwrap();
-        store.put("gotcha:alpha-extended", &make_record("gotcha:alpha-extended")).await.unwrap();
-        store.put("gotcha:beta", &make_record("gotcha:beta")).await.unwrap();
+        store
+            .put("gotcha:alpha", &make_record("gotcha:alpha"))
+            .await
+            .unwrap();
+        store
+            .put(
+                "gotcha:alpha-extended",
+                &make_record("gotcha:alpha-extended"),
+            )
+            .await
+            .unwrap();
+        store
+            .put("gotcha:beta", &make_record("gotcha:beta"))
+            .await
+            .unwrap();
 
         let entries = store.history("gotcha:alpha", 0).unwrap();
         for e in &entries {
             if let Some(ref rec) = e.record {
-                assert_eq!(rec.key, "gotcha:alpha",
-                    "spilled into adjacent key: {}", rec.key);
+                assert_eq!(
+                    rec.key, "gotcha:alpha",
+                    "spilled into adjacent key: {}",
+                    rec.key
+                );
             }
         }
     }
@@ -2386,7 +2693,11 @@ mod tests {
         }
 
         let entries = store.history("gotcha:limited", 2).unwrap();
-        assert!(entries.len() <= 2, "limit=2 but got {} entries", entries.len());
+        assert!(
+            entries.len() <= 2,
+            "limit=2 but got {} entries",
+            entries.len()
+        );
     }
 
     #[tokio::test]
@@ -2453,7 +2764,10 @@ mod tests {
 
         assert!(keys.contains(&"gotcha:new"), "new gotcha should appear");
         assert!(keys.contains(&"dep:serde"), "dep record should appear");
-        assert!(!keys.contains(&"gotcha:old"), "old gotcha should be excluded");
+        assert!(
+            !keys.contains(&"gotcha:old"),
+            "old gotcha should be excluded"
+        );
 
         // Verify newest-first ordering
         for pair in results.windows(2) {
@@ -2492,5 +2806,4 @@ mod tests {
         };
         assert_eq!(entry.timestamp_secs, entry.timestamp_ns / 1_000_000_000);
     }
-
 }

@@ -11,8 +11,8 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
+use super::{extract_todo, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
-use super::{StaticFileAnalysis, extract_todo};
 
 // ── Static handles ────────────────────────────────────────────────────────────
 
@@ -37,12 +37,10 @@ const GO_QUERY_SRC: &str = r#"
 "#;
 
 static GO_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
-    tree_sitter::Query::new(&GO_LANGUAGE, GO_QUERY_SRC)
-        .expect("parser/go: invalid query")
+    tree_sitter::Query::new(&GO_LANGUAGE, GO_QUERY_SRC).expect("parser/go: invalid query")
 });
 
-static GO_CAPTURES: LazyLock<GoCaptures> =
-    LazyLock::new(|| GoCaptures::new(&GO_QUERY));
+static GO_CAPTURES: LazyLock<GoCaptures> = LazyLock::new(|| GoCaptures::new(&GO_QUERY));
 
 thread_local! {
     static GO_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
@@ -66,7 +64,8 @@ struct GoCaptures {
 impl GoCaptures {
     fn new(query: &tree_sitter::Query) -> Self {
         let idx = |name: &str| {
-            query.capture_index_for_name(name)
+            query
+                .capture_index_for_name(name)
                 .unwrap_or_else(|| panic!("parser/go: query missing @{name}"))
         };
         Self {
@@ -83,9 +82,7 @@ impl GoCaptures {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
-    let tree = GO_PARSER.with(|cell| {
-        cell.borrow_mut().parse(source.as_bytes(), None)
-    });
+    let tree = GO_PARSER.with(|cell| cell.borrow_mut().parse(source.as_bytes(), None));
 
     let tree = match tree {
         Some(t) => t,

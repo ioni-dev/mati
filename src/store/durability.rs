@@ -36,7 +36,8 @@ impl Durability {
             || key.starts_with("compliance:")
             || key.starts_with("graph:edge:")
             || key.starts_with("health:") // derived/computed data, fully recomputable
-            || key.starts_with("parse:") // file content hashes — recomputable on re-init
+            || key.starts_with("parse:")
+        // file content hashes — recomputable on re-init
         {
             Self::Eventual
         } else {
@@ -187,7 +188,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn key_containing_eventual_prefix_as_embedded_substring_is_immediate() {
         // "gotcha:session:something" contains "session:" but does NOT start_with it.
@@ -208,5 +208,4 @@ mod tests {
             "embedded 'hook_event:' must not trigger Eventual routing"
         );
     }
-
 }

@@ -79,12 +79,13 @@ pub async fn run(args: GapsArgs) -> Result<()> {
     // ── Cache check: reuse when write-seq unchanged ───────────────────────
     let cache_key = "analytics:gaps_cache";
     let current_seq = proxy.read_write_seq();
-    if let Ok(Some(cached)) = proxy.get(cache_key).await {
+    if let Some(cached) = proxy.get(cache_key).await? {
         if let Ok(entry) = serde_json::from_str::<GapsCacheEntry>(&cached.value) {
             let now = now_secs();
             let age = now.saturating_sub(cached.updated_at);
             if entry.write_seq == current_seq {
-                let filtered: Vec<_> = entry.gaps
+                let filtered: Vec<_> = entry
+                    .gaps
                     .into_iter()
                     .filter(|g| g.risk_score >= args.min_risk)
                     .take(args.limit)
@@ -127,7 +128,10 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         // Re-open store for cache write (graph took ownership above).
         let cwd2 = std::env::current_dir()?;
         let store2 = Store::open(&cwd2).await?;
-        let cache_entry = GapsCacheEntry { write_seq: current_seq, gaps: all_gaps.clone() };
+        let cache_entry = GapsCacheEntry {
+            write_seq: current_seq,
+            gaps: all_gaps.clone(),
+        };
         if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
             let record = cache_record(cache_key, cache_value);
             let _ = store2.put(cache_key, &record).await;
@@ -149,7 +153,10 @@ pub async fn run(args: GapsArgs) -> Result<()> {
     let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps, &fan_in);
 
     // Write cache via proxy (best-effort).
-    let cache_entry = GapsCacheEntry { write_seq: current_seq, gaps: all_gaps.clone() };
+    let cache_entry = GapsCacheEntry {
+        write_seq: current_seq,
+        gaps: all_gaps.clone(),
+    };
     if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
         let record = cache_record(cache_key, cache_value);
         let _ = proxy.put(cache_key, &record).await;
@@ -220,15 +227,13 @@ fn display_gaps(gaps: &[KnowledgeGap], cache_age: Option<u64>, use_color: bool) 
         };
 
         // Strip namespace prefix from the key for display (e.g. "file:src/main.rs" -> "src/main.rs")
-        let display_key = gap.key.split_once(':').map_or(gap.key.as_str(), |(_, rest)| rest);
+        let display_key = gap
+            .key
+            .split_once(':')
+            .map_or(gap.key.as_str(), |(_, rest)| rest);
 
-        println!(
-            "{tier_color}{bold}\u{25cf} {tier_label:<9}{reset} {bold}{display_key}{reset}"
-        );
-        println!(
-            "            {gray}{}{reset}",
-            gap.description
-        );
+        println!("{tier_color}{bold}\u{25cf} {tier_label:<9}{reset} {bold}{display_key}{reset}");
+        println!("            {gray}{}{reset}", gap.description);
         println!(
             "            {gray}\u{2192} Action:{reset} {}\n",
             gap.action_hint

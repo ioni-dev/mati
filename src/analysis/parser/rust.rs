@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
+use super::{extract_todo, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
-use super::{StaticFileAnalysis, extract_todo};
 
 // ── Static handles ────────────────────────────────────────────────────────────
 
@@ -44,12 +44,10 @@ const RUST_QUERY_SRC: &str = r#"
 "#;
 
 static RUST_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
-    tree_sitter::Query::new(&RUST_LANGUAGE, RUST_QUERY_SRC)
-        .expect("parser/rust: invalid query")
+    tree_sitter::Query::new(&RUST_LANGUAGE, RUST_QUERY_SRC).expect("parser/rust: invalid query")
 });
 
-static RUST_CAPTURES: LazyLock<RustCaptures> =
-    LazyLock::new(|| RustCaptures::new(&RUST_QUERY));
+static RUST_CAPTURES: LazyLock<RustCaptures> = LazyLock::new(|| RustCaptures::new(&RUST_QUERY));
 
 thread_local! {
     static RUST_PARSER: RefCell<tree_sitter::Parser> = RefCell::new({
@@ -76,7 +74,8 @@ struct RustCaptures {
 impl RustCaptures {
     fn new(query: &tree_sitter::Query) -> Self {
         let idx = |name: &str| {
-            query.capture_index_for_name(name)
+            query
+                .capture_index_for_name(name)
                 .unwrap_or_else(|| panic!("parser/rust: query missing @{name}"))
         };
         Self {
@@ -96,9 +95,7 @@ impl RustCaptures {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
-    let tree = RUST_PARSER.with(|cell| {
-        cell.borrow_mut().parse(source.as_bytes(), None)
-    });
+    let tree = RUST_PARSER.with(|cell| cell.borrow_mut().parse(source.as_bytes(), None));
 
     let tree = match tree {
         Some(t) => t,
@@ -178,10 +175,8 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                                 inner_doc_lines.push((row, stripped));
                             }
                         } else if text.starts_with("/*!") {
-                            let inner = text
-                                .trim_start_matches("/*!")
-                                .trim_end_matches("*/")
-                                .trim();
+                            let inner =
+                                text.trim_start_matches("/*!").trim_end_matches("*/").trim();
                             // Collapse all lines into one summary.
                             let collapsed: String = inner
                                 .lines()
@@ -311,7 +306,10 @@ mod tests {
     #[test]
     fn pub_type_alias() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, "pub type Result<T> = std::result::Result<T, anyhow::Error>;");
+        let a = parse(
+            &dir,
+            "pub type Result<T> = std::result::Result<T, anyhow::Error>;",
+        );
         assert!(a.exported_types.contains(&"Result".to_owned()));
     }
 
@@ -343,14 +341,20 @@ mod tests {
     #[test]
     fn unsafe_blocks() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, "fn f() { unsafe { let _ = 1; } unsafe { let _ = 2; } }");
+        let a = parse(
+            &dir,
+            "fn f() { unsafe { let _ = 1; } unsafe { let _ = 2; } }",
+        );
         assert_eq!(a.unsafe_count, 2);
     }
 
     #[test]
     fn unwrap_calls() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, r#"fn f() { "x".parse::<u32>().unwrap(); "y".parse::<u32>().unwrap(); }"#);
+        let a = parse(
+            &dir,
+            r#"fn f() { "x".parse::<u32>().unwrap(); "y".parse::<u32>().unwrap(); }"#,
+        );
         assert_eq!(a.unwrap_count, 2);
     }
 

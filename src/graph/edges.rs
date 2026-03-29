@@ -11,12 +11,21 @@ pub struct Edge {
 
 impl Edge {
     pub fn new(from: impl Into<String>, kind: EdgeKind, to: impl Into<String>) -> Self {
-        Edge { from: from.into(), kind, to: to.into() }
+        Edge {
+            from: from.into(),
+            kind,
+            to: to.into(),
+        }
     }
 
     /// Encode to the SurrealKV key format: `graph:edge:<from>:<kind>:<to>`.
     pub fn to_key(&self) -> String {
-        format!("graph:edge:{}:{}:{}", self.from, self.kind.as_key_segment(), self.to)
+        format!(
+            "graph:edge:{}:{}:{}",
+            self.from,
+            self.kind.as_key_segment(),
+            self.to
+        )
     }
 
     /// Parse an edge back from a `graph:edge:...` key.
@@ -32,7 +41,7 @@ impl Edge {
         for kind_idx in 1..segments.len().saturating_sub(1) {
             if let Some(kind) = EdgeKind::from_key_segment(segments[kind_idx]) {
                 let from = segments[..kind_idx].join(":");
-                let to   = segments[kind_idx + 1..].join(":");
+                let to = segments[kind_idx + 1..].join(":");
                 if !from.is_empty() && !to.is_empty() && is_valid_node_key(&from) {
                     return Some(Edge { from, kind, to });
                 }
@@ -46,13 +55,19 @@ impl Edge {
 /// namespace prefix. This is the primary guard against ambiguous parses.
 fn is_valid_node_key(key: &str) -> bool {
     const NAMESPACES: &[&str] = &[
-        "file", "gotcha", "decision", "stage", "dep",
-        "dev_note", "session", "analytics", "graph",
+        "file",
+        "gotcha",
+        "decision",
+        "stage",
+        "dep",
+        "dev_note",
+        "session",
+        "analytics",
+        "graph",
     ];
     NAMESPACES.iter().any(|ns| {
-        key.starts_with(ns)
-            && key[ns.len()..].starts_with(':')
-            && key.len() > ns.len() + 1  // require at least one char after the colon
+        key.starts_with(ns) && key[ns.len()..].starts_with(':') && key.len() > ns.len() + 1
+        // require at least one char after the colon
     })
 }
 
@@ -87,32 +102,32 @@ impl EdgeKind {
     /// Canonical slug used as the key segment, e.g. `has_gotcha`.
     pub fn as_key_segment(&self) -> &'static str {
         match self {
-            EdgeKind::HasGotcha        => "has_gotcha",
-            EdgeKind::Imports          => "imports",
-            EdgeKind::AffectedBy       => "affected_by",
-            EdgeKind::HasNote          => "has_note",
-            EdgeKind::DiscoveredIn     => "discovered_in",
-            EdgeKind::CausedBy         => "caused_by",
-            EdgeKind::Supersedes       => "supersedes",
-            EdgeKind::Touched          => "touched",
+            EdgeKind::HasGotcha => "has_gotcha",
+            EdgeKind::Imports => "imports",
+            EdgeKind::AffectedBy => "affected_by",
+            EdgeKind::HasNote => "has_note",
+            EdgeKind::DiscoveredIn => "discovered_in",
+            EdgeKind::CausedBy => "caused_by",
+            EdgeKind::Supersedes => "supersedes",
+            EdgeKind::Touched => "touched",
             EdgeKind::DependencyAffects => "dependency_affects",
-            EdgeKind::CoChanges        => "co_changes",
+            EdgeKind::CoChanges => "co_changes",
         }
     }
 
     /// Parse a key segment back into an `EdgeKind`.
     pub fn from_key_segment(s: &str) -> Option<Self> {
         match s {
-            "has_gotcha"         => Some(EdgeKind::HasGotcha),
-            "imports"            => Some(EdgeKind::Imports),
-            "affected_by"        => Some(EdgeKind::AffectedBy),
-            "has_note"           => Some(EdgeKind::HasNote),
-            "discovered_in"      => Some(EdgeKind::DiscoveredIn),
-            "caused_by"          => Some(EdgeKind::CausedBy),
-            "supersedes"         => Some(EdgeKind::Supersedes),
-            "touched"            => Some(EdgeKind::Touched),
+            "has_gotcha" => Some(EdgeKind::HasGotcha),
+            "imports" => Some(EdgeKind::Imports),
+            "affected_by" => Some(EdgeKind::AffectedBy),
+            "has_note" => Some(EdgeKind::HasNote),
+            "discovered_in" => Some(EdgeKind::DiscoveredIn),
+            "caused_by" => Some(EdgeKind::CausedBy),
+            "supersedes" => Some(EdgeKind::Supersedes),
+            "touched" => Some(EdgeKind::Touched),
             "dependency_affects" => Some(EdgeKind::DependencyAffects),
-            "co_changes"         => Some(EdgeKind::CoChanges),
+            "co_changes" => Some(EdgeKind::CoChanges),
             _ => None,
         }
     }
@@ -120,8 +135,8 @@ impl EdgeKind {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn all_variants_have_a_key_segment() {
@@ -157,7 +172,10 @@ mod tests {
     #[test]
     fn edge_to_key_format() {
         let e = Edge::new("file:src/main.rs", EdgeKind::HasGotcha, "gotcha:write-txn");
-        assert_eq!(e.to_key(), "graph:edge:file:src/main.rs:has_gotcha:gotcha:write-txn");
+        assert_eq!(
+            e.to_key(),
+            "graph:edge:file:src/main.rs:has_gotcha:gotcha:write-txn"
+        );
     }
 
     #[test]
@@ -171,8 +189,8 @@ mod tests {
         for kind in all_variants() {
             let e = Edge::new("file:src/a.rs", kind, "file:src/b.rs");
             let key = e.to_key();
-            let parsed = Edge::from_key(&key)
-                .unwrap_or_else(|| panic!("failed to parse key '{key}'"));
+            let parsed =
+                Edge::from_key(&key).unwrap_or_else(|| panic!("failed to parse key '{key}'"));
             assert_eq!(parsed, e);
         }
     }
@@ -227,8 +245,7 @@ mod tests {
         // Without namespace validation the parser would greedily pick "touched"
         // as the kind, returning from="gotcha" (invalid). The fix rejects that
         // because "gotcha" alone is not a valid node key (no namespace colon).
-        let parsed = Edge::from_key(&key)
-            .unwrap_or_else(|| panic!("failed to parse key '{key}'"));
+        let parsed = Edge::from_key(&key).unwrap_or_else(|| panic!("failed to parse key '{key}'"));
         assert_eq!(parsed, e);
     }
 
@@ -272,7 +289,11 @@ mod tests {
     /// `from` contains multiple colons beyond the namespace separator.
     #[test]
     fn edge_from_key_from_has_multiple_colons() {
-        let e = Edge::new("dep:tokio:1.40", EdgeKind::DependencyAffects, "file:src/main.rs");
+        let e = Edge::new(
+            "dep:tokio:1.40",
+            EdgeKind::DependencyAffects,
+            "file:src/main.rs",
+        );
         let key = e.to_key();
         let parsed = Edge::from_key(&key).unwrap_or_else(|| panic!("failed to parse '{key}'"));
         assert_eq!(parsed, e);

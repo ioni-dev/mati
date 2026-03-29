@@ -71,10 +71,7 @@ impl ReparseDiff {
 ///
 /// Returns the new signals added (empty if diff is empty). The record's
 /// staleness value/tier/signals/computed_at are updated in place.
-pub fn apply_reparse_staleness(
-    record: &mut Record,
-    diff: &ReparseDiff,
-) -> Vec<StalenessSignal> {
+pub fn apply_reparse_staleness(record: &mut Record, diff: &ReparseDiff) -> Vec<StalenessSignal> {
     if diff.is_empty() {
         return vec![];
     }
@@ -87,16 +84,14 @@ pub fn apply_reparse_staleness(
     let mut new_signals = Vec::new();
     let mut increment: f32 = 0.0;
 
-    let ep_changes =
-        (diff.entry_points_added.len() + diff.entry_points_removed.len()) as u32;
+    let ep_changes = (diff.entry_points_added.len() + diff.entry_points_removed.len()) as u32;
     if ep_changes > 0 {
         let signal = StalenessSignal::EntryPointsChanged(ep_changes);
         new_signals.push(signal);
         increment += ep_changes as f32 * ENTRY_POINT_WEIGHT;
     }
 
-    let import_changes =
-        (diff.imports_added.len() + diff.imports_removed.len()) as u32;
+    let import_changes = (diff.imports_added.len() + diff.imports_removed.len()) as u32;
     if import_changes > 0 {
         let signal = StalenessSignal::ImportsChanged(import_changes);
         new_signals.push(signal);
@@ -141,10 +136,7 @@ pub fn apply_reparse_staleness(
 /// Cascade staleness to gotcha records linked from this file record.
 ///
 /// For each `gotcha_keys` entry: add `LinkedFileChanged`, bump staleness by 0.10.
-pub async fn cascade_staleness_to_gotchas(
-    store: &Store,
-    file_record: &FileRecord,
-) -> Result<u32> {
+pub async fn cascade_staleness_to_gotchas(store: &Store, file_record: &FileRecord) -> Result<u32> {
     if file_record.gotcha_keys.is_empty() {
         return Ok(0);
     }
@@ -380,10 +372,8 @@ impl StalenessAnalyzer {
 
         // Batch write all updates.
         if !updates.is_empty() {
-            let batch: Vec<(&str, &Record)> = updates
-                .iter()
-                .map(|(k, r)| (k.as_str(), r))
-                .collect();
+            let batch: Vec<(&str, &Record)> =
+                updates.iter().map(|(k, r)| (k.as_str(), r)).collect();
             if let Err(e) = store.put_batch(&batch).await {
                 tracing::warn!("staleness batch write failed: {e}");
             }
@@ -612,12 +602,7 @@ impl StalenessAnalyzer {
     /// Uses `total_iterations` (not walked-commit counter) for consistent
     /// merge-commit handling. Returns GIT_CAP_HIT_COMMITS if the revwalk cap
     /// is hit without finding `since_sha` and no commits were counted.
-    fn count_commits_since(
-        &self,
-        repo: &git2::Repository,
-        path: &str,
-        since_sha: &str,
-    ) -> u32 {
+    fn count_commits_since(&self, repo: &git2::Repository, path: &str, since_sha: &str) -> u32 {
         let head_oid = match repo.head().ok().and_then(|h| h.target()) {
             Some(oid) => oid,
             None => return 0,
@@ -706,10 +691,7 @@ fn semantic_factor() -> f32 {
 /// LIMITATION (v0.1): Only parses Rust `use` statements from `FileRecord.imports`.
 /// Other languages (TypeScript, Python, Go) will be supported when their import
 /// parsers emit normalized dependency names.
-fn dep_factor(
-    file_record: Option<&FileRecord>,
-    dep_cache: &HashMap<String, Record>,
-) -> f32 {
+fn dep_factor(file_record: Option<&FileRecord>, dep_cache: &HashMap<String, Record>) -> f32 {
     let fr = match file_record {
         Some(fr) => fr,
         None => return 0.0,
@@ -733,9 +715,11 @@ fn dep_factor(
             // Check if the dep was updated more recently than the file record.
             if dep_record.updated_at > fr.last_modified_session {
                 // Check for DependencyBumped signal on the dep record.
-                let has_bump_signal = dep_record.staleness.signals.iter().any(|s| {
-                    matches!(s, StalenessSignal::DependencyBumped { .. })
-                });
+                let has_bump_signal = dep_record
+                    .staleness
+                    .signals
+                    .iter()
+                    .any(|s| matches!(s, StalenessSignal::DependencyBumped { .. }));
                 if has_bump_signal || dep_record.updated_at > fr.last_modified_session + 1 {
                     bumped_count += 1;
                 }
@@ -754,11 +738,7 @@ fn dep_factor(
 
 /// Cascade factor: for file records, check if linked gotchas/decisions are stale.
 /// For gotcha records, check if affected_files have stale records.
-async fn cascade_factor(
-    record: &Record,
-    file_record: Option<&FileRecord>,
-    store: &Store,
-) -> f32 {
+async fn cascade_factor(record: &Record, file_record: Option<&FileRecord>, store: &Store) -> f32 {
     match record.category {
         Category::File => {
             let fr = match file_record {
@@ -843,11 +823,7 @@ fn blob_sha_at_head(repo: &git2::Repository, path: &str) -> Option<String> {
 }
 
 /// Get the blob SHA for a file at a specific commit.
-fn blob_sha_at_commit(
-    repo: &git2::Repository,
-    path: &str,
-    commit_sha: &str,
-) -> Option<String> {
+fn blob_sha_at_commit(repo: &git2::Repository, path: &str, commit_sha: &str) -> Option<String> {
     let oid = git2::Oid::from_str(commit_sha).ok()?;
     let commit = repo.find_commit(oid).ok()?;
     let tree = commit.tree().ok()?;
@@ -858,11 +834,7 @@ fn blob_sha_at_commit(
 /// Count recent commits touching a file path, with a total iteration limit
 /// for consistent merge-commit handling.
 #[allow(dead_code)]
-fn count_recent_commits(
-    repo: &git2::Repository,
-    path: &str,
-    limit: usize,
-) -> u32 {
+fn count_recent_commits(repo: &git2::Repository, path: &str, limit: usize) -> u32 {
     let head_oid = match repo.head().ok().and_then(|h| h.target()) {
         Some(oid) => oid,
         None => return 0,
@@ -924,11 +896,7 @@ fn commits_to_factor(commits: u32) -> f32 {
 
 /// Check whether a commit touches a specific file by comparing tree entries
 /// with the parent commit's tree.
-fn commit_touches_file(
-    repo: &git2::Repository,
-    commit_oid: git2::Oid,
-    path: &str,
-) -> bool {
+fn commit_touches_file(repo: &git2::Repository, commit_oid: git2::Oid, path: &str) -> bool {
     let commit = match repo.find_commit(commit_oid) {
         Ok(c) => c,
         Err(_) => return false,
@@ -961,8 +929,8 @@ fn commit_touches_file(
 
     match (file_entry, parent_entry) {
         (Some(cur), Some(par)) => cur.id() != par.id(),
-        (Some(_), None) => true,  // File added.
-        (None, Some(_)) => true,  // File deleted.
+        (Some(_), None) => true, // File added.
+        (None, Some(_)) => true, // File deleted.
         (None, None) => false,
     }
 }
@@ -1550,13 +1518,7 @@ mod tests {
             line_count: 0,
         };
 
-        let record = make_file_record_full(
-            "file:src/main.rs",
-            vec![],
-            vec![],
-            vec![],
-            0,
-        );
+        let record = make_file_record_full("file:src/main.rs", vec![], vec![], vec![], 0);
 
         let factor = cascade_factor(&record, Some(&fr), &store).await;
         assert!(factor.abs() < 0.001);

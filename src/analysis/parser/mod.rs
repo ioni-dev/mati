@@ -92,15 +92,14 @@ impl StaticFileAnalysis {
 /// - tree-sitter fails to produce a parse tree
 pub fn parse_file(file: &WalkedFile) -> Result<StaticFileAnalysis> {
     // Guard: skip disk read for unsupported languages.
-    match file.language {
-        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python | Language::Go => {}
-        _ => return Ok(StaticFileAnalysis::empty(file)),
+    if !is_parseable_language(file.language) {
+        return Ok(StaticFileAnalysis::empty(file));
     }
-    let source = match read_source(file) {
-        Some(s) => s,
+    let bytes = match read_source_bytes(file) {
+        Some(b) => b,
         None => return Ok(StaticFileAnalysis::empty(file)),
     };
-    parse_file_from_source(file, &source)
+    analyze_file_bytes(file, &bytes)
 }
 
 /// Parse a slice of files in parallel using rayon.
@@ -152,11 +151,6 @@ pub fn hash_and_parse_parallel(
         Unchanged,
     }
 
-    let parseable = |lang: Language| matches!(
-        lang,
-        Language::Rust | Language::TypeScript | Language::JavaScript | Language::Python | Language::Go
-    );
-
     let slots: Vec<Option<Slot>> = files
         .par_iter()
         .map(|f| {
@@ -165,23 +159,21 @@ pub fn hash_and_parse_parallel(
                 return Some(Slot::Unchanged);
             }
             // Non-parseable languages: record mtime from walker metadata — no disk read.
-            if !parseable(f.language) {
-                return Some(Slot::Changed(Box::new((f.clone(), StaticFileAnalysis::empty(f)))));
+            if !is_parseable_language(f.language) {
+                return Some(Slot::Changed(Box::new((
+                    f.clone(),
+                    StaticFileAnalysis::empty(f),
+                ))));
             }
             // Parseable, changed/new: read file bytes and run tree-sitter.
             let bytes = match std::fs::read(&f.abs_path) {
                 Ok(b) => b,
                 Err(_) => return None, // unreadable — skip silently
             };
-            let content_hash = format!("{:x}", Sha256::digest(&bytes));
-            let line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
-            let source = String::from_utf8_lossy(&bytes);
-            let mut analysis = parse_file_from_source(f, &source).unwrap_or_else(|e| {
+            let analysis = analyze_file_bytes(f, &bytes).unwrap_or_else(|e| {
                 tracing::warn!("parser: error on {}: {e}", f.rel_path);
                 StaticFileAnalysis::empty(f)
             });
-            analysis.content_hash = Some(content_hash);
-            analysis.line_count = line_count;
             Some(Slot::Changed(Box::new((f.clone(), analysis))))
         })
         .collect();
@@ -204,10 +196,35 @@ pub fn hash_and_parse_parallel(
     }
 
     let parse_count = parsed_files.len();
-    HashParseOutput { parsed_files, analyses, new_mtimes, parse_count, skipped_count }
+    HashParseOutput {
+        parsed_files,
+        analyses,
+        new_mtimes,
+        parse_count,
+        skipped_count,
+    }
 }
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
+
+fn is_parseable_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::Rust
+            | Language::TypeScript
+            | Language::JavaScript
+            | Language::Python
+            | Language::Go
+    )
+}
+
+pub(crate) fn analyze_file_bytes(file: &WalkedFile, bytes: &[u8]) -> Result<StaticFileAnalysis> {
+    let source = String::from_utf8_lossy(bytes);
+    let mut analysis = parse_file_from_source(file, &source)?;
+    analysis.content_hash = Some(format!("{:x}", Sha256::digest(bytes)));
+    analysis.line_count = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
+    Ok(analysis)
+}
 
 /// Dispatch parse to the language-specific parser using pre-read source text.
 fn parse_file_from_source(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
@@ -220,9 +237,9 @@ fn parse_file_from_source(file: &WalkedFile, source: &str) -> Result<StaticFileA
     }
 }
 
-fn read_source(file: &WalkedFile) -> Option<String> {
-    match std::fs::read_to_string(&file.abs_path) {
-        Ok(s) => Some(s),
+fn read_source_bytes(file: &WalkedFile) -> Option<Vec<u8>> {
+    match std::fs::read(&file.abs_path) {
+        Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::warn!("parser: cannot read {}: {e}", file.rel_path);
             None
@@ -401,5 +418,26 @@ mod tests {
         assert_eq!(results[0].path, "f0.rs");
         assert_eq!(results[1].path, "f1.rs");
         assert_eq!(results[2].path, "f2.rs");
+    }
+
+    #[test]
+    fn parse_file_populates_hash_and_line_count() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let abs = dir.path().join("f.rs");
+        std::fs::write(&abs, "pub fn f() {}\n").unwrap();
+
+        let file = WalkedFile {
+            abs_path: abs,
+            rel_path: "f.rs".to_string(),
+            language: Language::Rust,
+            size_bytes: 13,
+            mtime_secs: 0,
+        };
+
+        let analysis = parse_file(&file).unwrap();
+        assert!(analysis.content_hash.is_some());
+        assert_eq!(analysis.line_count, 1);
     }
 }

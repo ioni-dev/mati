@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::json;
 
-use mati_core::store::{Record, Store};
 use mati_core::store::db::HistoryEntry;
+use mati_core::store::repair::{DirtyMarker, DIRTY_MARKER_KEY};
+use mati_core::store::{
+    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore, Store,
+};
 
 use super::daemon::{daemon_result, mati_root_for, DaemonResult};
 
@@ -30,12 +34,14 @@ impl StoreProxy {
     pub async fn open(cwd: &Path) -> Result<Self> {
         let root = mati_root_for(cwd)?;
         match daemon_result(&root, "ping", json!({})).await {
-            DaemonResult::Ok(_) => {
-                Ok(Self { inner: ProxyInner::Socket { root } })
-            }
+            DaemonResult::Ok(_) => Ok(Self {
+                inner: ProxyInner::Socket { root },
+            }),
             DaemonResult::NotRunning | DaemonResult::StaleSocket => {
                 let store = Store::open(cwd).await?;
-                Ok(Self { inner: ProxyInner::Direct(store) })
+                Ok(Self {
+                    inner: ProxyInner::Direct(store),
+                })
             }
             DaemonResult::Unresponsive => {
                 anyhow::bail!(
@@ -76,7 +82,7 @@ impl StoreProxy {
                             ))
                         }
                     }
-                    _ => Ok(None),
+                    other => Err(socket_read_error("get", other)),
                 }
             }
         }
@@ -97,7 +103,7 @@ impl StoreProxy {
                                 .context("proxy scan_prefix: failed to deserialize records")?)
                         }
                     }
-                    _ => Ok(vec![]),
+                    other => Err(socket_read_error("scan_prefix", other)),
                 }
             }
         }
@@ -109,7 +115,9 @@ impl StoreProxy {
             ProxyInner::Direct(s) => s.put(key, record).await,
             ProxyInner::Socket { root } => {
                 let record_value = serde_json::to_value(record)?;
-                match daemon_result(root, "put", json!({ "key": key, "record": record_value })).await {
+                match daemon_result(root, "put", json!({ "key": key, "record": record_value }))
+                    .await
+                {
                     DaemonResult::Ok(resp) => {
                         if resp["ok"] == true {
                             Ok(())
@@ -137,6 +145,72 @@ impl StoreProxy {
         }
     }
 
+    /// Mark the gotcha index dirty after a best-effort link/edge sync failure.
+    ///
+    /// Works in both direct and socket modes so callers can preserve the
+    /// repair/status observability contract without needing raw store access.
+    pub async fn mark_dirty(&self, gotcha_key: &str, cause: &str) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                mati_core::store::repair::mark_dirty(store, gotcha_key, cause).await;
+                Ok(())
+            }
+            ProxyInner::Socket { .. } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let existing_record = self.get(DIRTY_MARKER_KEY).await?;
+                let mut marker = existing_record
+                    .as_ref()
+                    .and_then(|r| r.payload_as::<DirtyMarker>())
+                    .unwrap_or_else(DirtyMarker::clean);
+                marker.dirty = true;
+                if marker.dirty_since == 0 {
+                    marker.dirty_since = now;
+                }
+                marker.cause = cause.to_string();
+                if !marker.affected_keys.iter().any(|k| k == gotcha_key) {
+                    marker.affected_keys.push(gotcha_key.to_string());
+                }
+
+                let mut record = existing_record.unwrap_or(Record {
+                    key: DIRTY_MARKER_KEY.to_string(),
+                    value: cause.to_string(),
+                    category: Category::Analytics,
+                    priority: Priority::Normal,
+                    tags: vec![],
+                    created_at: now,
+                    updated_at: now,
+                    ref_url: None,
+                    staleness: StalenessScore::fresh(),
+                    lifecycle: RecordLifecycle::Active,
+                    version: RecordVersion {
+                        device_id: uuid::Uuid::new_v4(),
+                        logical_clock: 1,
+                        wall_clock: now,
+                    },
+                    quality: QualityScore::layer0_default(),
+                    access_count: 0,
+                    last_accessed: 0,
+                    source: RecordSource::StaticAnalysis,
+                    confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+                    gap_analysis_score: 0.0,
+                    payload: None,
+                });
+
+                record.value = cause.to_string();
+                record.updated_at = now;
+                record.version.logical_clock += 1;
+                record.version.wall_clock = now;
+                record.payload = serde_json::to_value(&marker).ok();
+
+                self.put(DIRTY_MARKER_KEY, &record).await
+            }
+        }
+    }
+
     /// Version history for a single key, newest first.
     ///
     /// Only works in direct mode. In socket mode this errors with a message
@@ -160,7 +234,12 @@ impl StoreProxy {
     /// Only works in direct mode. In socket mode this errors with a message
     /// explaining why and what to do.
     #[allow(dead_code)]
-    pub fn history_since(&self, key: &str, since_ts: u64, limit: usize) -> Result<Vec<HistoryEntry>> {
+    pub fn history_since(
+        &self,
+        key: &str,
+        since_ts: u64,
+        limit: usize,
+    ) -> Result<Vec<HistoryEntry>> {
         match &self.inner {
             ProxyInner::Direct(s) => s.history_since(key, since_ts, limit),
             ProxyInner::Socket { .. } => anyhow::bail!(
@@ -178,7 +257,14 @@ impl StoreProxy {
     /// Implemented via `scan_prefix` so it works in both direct and socket modes.
     #[allow(dead_code)]
     pub async fn records_since(&self, since_ts: u64, limit: usize) -> Result<Vec<Record>> {
-        let namespaces = &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"];
+        let namespaces = &[
+            "gotcha:",
+            "decision:",
+            "file:",
+            "stage:",
+            "dev_note:",
+            "dep:",
+        ];
         let mut results: Vec<Record> = Vec::new();
         for ns in namespaces {
             let records = self.scan_prefix(ns).await?;
@@ -217,5 +303,74 @@ impl StoreProxy {
             ProxyInner::Direct(s) => s.close().await,
             ProxyInner::Socket { .. } => Ok(()),
         }
+    }
+}
+
+fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
+    let detail = match result {
+        DaemonResult::NotRunning => "daemon stopped",
+        DaemonResult::StaleSocket => "daemon socket became stale",
+        DaemonResult::Unresponsive => "daemon did not respond",
+        DaemonResult::Ok(_) => unreachable!("socket_read_error only handles non-ok daemon results"),
+    };
+    anyhow::anyhow!(
+        "mati daemon {detail} while handling '{op}' read; retry after restarting the daemon"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn socket_get_errors_when_daemon_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Socket {
+                root: dir.path().to_path_buf(),
+            },
+        };
+
+        let err = proxy.get("file:missing").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("get"));
+        assert!(msg.contains("restarting the daemon"));
+    }
+
+    #[tokio::test]
+    async fn socket_scan_prefix_errors_when_daemon_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Socket {
+                root: dir.path().to_path_buf(),
+            },
+        };
+
+        let err = proxy.scan_prefix("file:").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("scan_prefix"));
+        assert!(msg.contains("restarting the daemon"));
+    }
+
+    #[tokio::test]
+    async fn direct_mark_dirty_writes_marker_record() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Direct(store),
+        };
+
+        proxy
+            .mark_dirty("gotcha:test", "link sync failed")
+            .await
+            .unwrap();
+
+        let marker = proxy.get(DIRTY_MARKER_KEY).await.unwrap().unwrap();
+        let payload = marker.payload_as::<DirtyMarker>().unwrap();
+        assert!(payload.dirty);
+        assert_eq!(payload.cause, "link sync failed");
+        assert_eq!(payload.affected_keys, vec!["gotcha:test".to_string()]);
     }
 }

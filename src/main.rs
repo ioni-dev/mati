@@ -6,12 +6,12 @@ use clap::{Parser, Subcommand};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
 use slugify::slugify;
 
+use cli::proxy::StoreProxy;
 use mati_core::health::quality;
 use mati_core::store::{
     Category, ConfidenceScore, QualityScore, QualityTier, Record, RecordLifecycle, RecordSource,
     RecordVersion, StalenessScore, Store,
 };
-use cli::proxy::StoreProxy;
 
 mod cli;
 
@@ -21,7 +21,12 @@ mod cli;
     version,
     about = "Engineering knowledge that survives turnover",
     long_about = "mati is a persistent, queryable knowledge store for codebases.\n\
-                  Exposed as a Claude Code plugin via MCP stdio."
+                  Exposed as a Claude Code plugin via MCP stdio.\n\n\
+                  Core workflow:\n  \
+                    mati init              build project memory\n  \
+                    mati explain <file>    file briefing before editing\n  \
+                    mati diff <range>      pre-merge check against knowledge store\n  \
+                    mati status            project memory dashboard"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,31 +35,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize mati in the current repository (Layer 0 scan + scaffold)
+    // ── Core workflow ────────────────────────────────────────────────────
+    /// Build project memory — scan files, mine git history, detect patterns
     Init(cli::init::InitArgs),
-    /// Batch-enrich file records using Claude API (Layer 1)
-    Enrich(cli::enrich::EnrichArgs),
-    /// Show project knowledge dashboard
+    /// File briefing — gotchas, decisions, and co-changes before editing
+    Explain(cli::explain::ExplainArgs),
+    /// Pre-merge check — surface gotchas for files in a diff range
+    Diff(cli::diff::DiffArgs),
+    /// Project memory dashboard — record counts, health, and next actions
     Status(cli::status::StatusArgs),
-    /// Show knowledge health metrics
-    Stats(cli::stats::StatsArgs),
-    /// Show knowledge gaps ranked by risk
-    Gaps(cli::gaps::GapsArgs),
+
+    // ── Knowledge management ─────────────────────────────────────────────
+    /// Manage gotcha records (add, edit, delete, confirm, list)
+    Gotcha(cli::gotcha::GotchaArgs),
     /// Show a record by key
     Show(cli::show::ShowArgs),
     /// List records by category (files, gotchas, decisions)
     Ls(cli::show::LsArgs),
     /// Show version history of a record
     History(cli::show::HistoryArgs),
-    /// Manage gotcha records
-    Gotcha(cli::gotcha::GotchaArgs),
-    /// List records by quality tier
-    QualityCheck,
-    /// Re-open a record for improvement
-    Improve {
-        /// Record key to improve (e.g., "gotcha:inference-async")
-        key: String,
-    },
+    /// Show knowledge gaps ranked by risk
+    Gaps(cli::gaps::GapsArgs),
+    /// Show knowledge health metrics
+    Stats(cli::stats::StatsArgs),
+    /// Batch-enrich file records using Claude API (Layer 1)
+    Enrich(cli::enrich::EnrichArgs),
     /// Add a quick developer note
     Note {
         /// Note text
@@ -64,16 +69,25 @@ enum Commands {
     Export(cli::show::ExportArgs),
     /// Import from CLAUDE.md or JSON
     Import(cli::show::ImportArgs),
-    /// Review auto-detected candidates (confirmed=false) — confirm, edit, skip, or delete
+
+    // ── Maintenance ──────────────────────────────────────────────────────
+    /// [Maintenance] Confirm auto-detected candidates for hook enforcement
     Review(cli::review::ReviewArgs),
-    /// Show everything mati knows about a file — purpose, gotchas, decisions, co-changes
-    Explain(cli::explain::ExplainArgs),
-    /// Cross-reference a git diff against the knowledge store, surface gotchas before merge
-    Diff(cli::diff::DiffArgs),
-    /// List stale records with signals, impact, and action hints
+    /// [Maintenance] List stale records with action hints
     Stale(cli::stale::StaleArgs),
-    /// Verify hook enforcement pipeline is operational
+    /// [Maintenance] Reconcile gotcha indexes from canonical records
+    Repair(cli::repair::RepairArgs),
+    /// [Maintenance] Verify hook enforcement pipeline
     Check,
+    /// [Maintenance] List records by quality tier
+    QualityCheck,
+    /// [Maintenance] Re-open a record for improvement
+    Improve {
+        /// Record key to improve (e.g., "gotcha:inference-async")
+        key: String,
+    },
+
+    // ── Infrastructure ───────────────────────────────────────────────────
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
@@ -142,6 +156,7 @@ async fn main() -> Result<()> {
         Commands::Explain(args) => cli::explain::run(args).await,
         Commands::Diff(args) => cli::diff::run(args).await,
         Commands::Stale(args) => cli::stale::run(args).await,
+        Commands::Repair(args) => cli::repair::run(args).await,
         Commands::Check => cli::check::run().await,
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
@@ -247,9 +262,11 @@ async fn run_quality_check() -> Result<()> {
     let mut all: Vec<Record> = Vec::new();
     for prefix in &["file:", "gotcha:", "decision:", "dev_note:"] {
         all.extend(
-            proxy.scan_prefix(prefix).await?
+            proxy
+                .scan_prefix(prefix)
+                .await?
                 .into_iter()
-                .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+                .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active)),
         );
     }
 
@@ -274,10 +291,7 @@ async fn run_quality_check() -> Result<()> {
     ];
 
     for tier in &tiers {
-        let tier_records: Vec<&Record> = all
-            .iter()
-            .filter(|r| r.quality.tier == *tier)
-            .collect();
+        let tier_records: Vec<&Record> = all.iter().filter(|r| r.quality.tier == *tier).collect();
 
         if tier_records.is_empty() {
             continue;
@@ -414,12 +428,7 @@ async fn run_improve(key: &str) -> Result<()> {
 
 fn eprint_prompt(msg: &str, use_color: bool) {
     if use_color {
-        eprint!(
-            "{}{}{}",
-            cli::colors::BLUE,
-            msg,
-            cli::colors::RESET
-        );
+        eprint!("{}{}{}", cli::colors::BLUE, msg, cli::colors::RESET);
     } else {
         eprint!("{msg}");
     }

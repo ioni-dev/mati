@@ -20,8 +20,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 
 use crate::analysis::walker::{detect_language, WalkedFile};
-use crate::analysis::{parse_file, StaticFileAnalysis};
-use crate::health::staleness::{apply_reparse_staleness, cascade_staleness_to_gotchas, ReparseDiff};
+use crate::analysis::{parse_file, public_api_symbols, StaticFileAnalysis};
+use crate::health::staleness::{
+    apply_reparse_staleness, cascade_staleness_to_gotchas, ReparseDiff,
+};
 use crate::store::record::{
     Category, ConfidenceScore, FileRecord, QualityScore, Record, RecordLifecycle, RecordSource,
     RecordVersion, StalenessScore, StalenessSignal, StalenessTier,
@@ -44,7 +46,11 @@ fn now_secs() -> u64 {
 ///
 /// Gracefully degrades on parse failure (P9). Never returns an error for
 /// missing files or parse issues — those are logged as warnings.
-pub async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: &str) -> Result<()> {
+pub async fn reparse_impl(
+    store: &Store,
+    repo_root: &std::path::Path,
+    rel_path: &str,
+) -> Result<()> {
     let abs_path = repo_root.join(rel_path);
     let file_key = format!("file:{rel_path}");
     let now = now_secs();
@@ -67,9 +73,7 @@ pub async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: 
 
     // 2. Detect language and construct WalkedFile
     let language = detect_language(&abs_path);
-    let size_bytes = std::fs::metadata(&abs_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size_bytes = std::fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
 
     let walked = WalkedFile {
         abs_path: abs_path.clone(),
@@ -148,7 +152,7 @@ pub async fn reparse_impl(store: &Store, repo_root: &std::path::Path, rel_path: 
     let merged = FileRecord {
         path: rel_path.to_string(),
         purpose: old_fr.purpose,
-        entry_points: analysis.entry_points,
+        entry_points: public_api_symbols(&analysis),
         imports: analysis.imports,
         gotcha_keys: old_fr.gotcha_keys.clone(),
         decision_keys: old_fr.decision_keys,
@@ -198,7 +202,7 @@ fn build_file_record_from_analysis(
     FileRecord {
         path: rel_path.to_string(),
         purpose: String::new(),
-        entry_points: analysis.entry_points.clone(),
+        entry_points: public_api_symbols(analysis),
         imports: analysis.imports.clone(),
         gotcha_keys: vec![],
         decision_keys: vec![],
@@ -217,8 +221,9 @@ fn build_file_record_from_analysis(
 
 /// Compute the structural diff between an old FileRecord and new analysis.
 pub fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
+    let new_public_api = public_api_symbols(new);
     let old_eps: HashSet<&str> = old.entry_points.iter().map(|s| s.as_str()).collect();
-    let new_eps: HashSet<&str> = new.entry_points.iter().map(|s| s.as_str()).collect();
+    let new_eps: HashSet<&str> = new_public_api.iter().map(|s| s.as_str()).collect();
 
     let entry_points_added: Vec<String> = new_eps
         .difference(&old_eps)
@@ -524,6 +529,8 @@ mod tests {
         assert!(updated_fr.entry_points.contains(&"new_fn".to_string()));
         assert!(updated_fr.entry_points.contains(&"kept".to_string()));
         assert!(!updated_fr.entry_points.contains(&"old_fn".to_string()));
+        assert!(updated_fr.content_hash.is_some());
+        assert!(updated_fr.line_count > 0);
 
         // Staleness should have bumped (entry point changes)
         assert!(updated.staleness.value > 0.0);
@@ -589,6 +596,24 @@ mod tests {
         let after = store.get("file:stable.rs").await.unwrap().unwrap();
         assert_eq!(after.version.logical_clock, 1);
         assert_eq!(after.updated_at, 1_000_000);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reparse_preserves_exported_types_in_entry_points() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::write(repo.join("models.rs"), "pub struct Widget;\n").unwrap();
+
+        let store = Store::open(repo).await.unwrap();
+        reparse_impl(&store, repo, "models.rs").await.unwrap();
+
+        let record = store.get("file:models.rs").await.unwrap().unwrap();
+        let fr: FileRecord = record.payload_as::<FileRecord>().unwrap();
+        assert!(fr.entry_points.contains(&"Widget".to_string()));
+        assert!(fr.content_hash.is_some());
+        assert!(fr.line_count > 0);
 
         store.close().await.unwrap();
     }

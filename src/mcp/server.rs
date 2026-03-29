@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, ServiceExt, tool_handler};
+use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -28,12 +28,11 @@ use super::tools::MatiServer;
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MatiServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "mati — engineering knowledge that survives turnover. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "mati — engineering knowledge that survives turnover. \
                  Use mem_get to look up records, mem_query to search, \
                  and mem_bootstrap at session start.",
-            )
+        )
     }
 }
 
@@ -58,7 +57,10 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
             let _ = store.delete(k).await;
         }
         if !keys.is_empty() {
-            tracing::debug!("serve: cleared {} stale session:consulted markers", keys.len());
+            tracing::debug!(
+                "serve: cleared {} stale session:consulted markers",
+                keys.len()
+            );
         }
     }
 
@@ -76,9 +78,10 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
     tokio::spawn(serve_daemon_socket(Arc::clone(&graph_arc), repo_root_arc));
 
     let transport = rmcp::transport::io::stdio();
-    let service = server.serve(transport).await.map_err(|e| {
-        anyhow::anyhow!("MCP server initialization failed: {e}")
-    })?;
+    let service = server
+        .serve(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
 
     service.waiting().await?;
     Ok(())
@@ -117,10 +120,20 @@ struct SocketResponse {
 
 impl SocketResponse {
     fn ok(data: serde_json::Value) -> Self {
-        Self { ok: true, version: PROTOCOL_VERSION, data: Some(data), error: None }
+        Self {
+            ok: true,
+            version: PROTOCOL_VERSION,
+            data: Some(data),
+            error: None,
+        }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, version: PROTOCOL_VERSION, data: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            version: PROTOCOL_VERSION,
+            data: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
@@ -150,17 +163,29 @@ async fn serve_daemon_socket(
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!("mati serve: failed to bind daemon socket at {}: {e}", sock_path.display());
+            tracing::warn!(
+                "mati serve: failed to bind daemon socket at {}: {e}",
+                sock_path.display()
+            );
             return;
         }
     };
-    let _ = std::fs::write(&pid_path, format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()));
-    tracing::debug!("daemon socket ready at {} (MCP-embedded)", sock_path.display());
+    let _ = std::fs::write(
+        &pid_path,
+        format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
+    );
+    tracing::debug!(
+        "daemon socket ready at {} (MCP-embedded)",
+        sock_path.display()
+    );
 
     loop {
         let stream = match listener.accept().await {
             Ok((s, _)) => s,
-            Err(e) => { tracing::warn!("daemon socket accept: {e}"); continue; }
+            Err(e) => {
+                tracing::warn!("daemon socket accept: {e}");
+                continue;
+            }
         };
         // Read lock covers one full request/response cycle.
         // Store methods use interior mutability — a read lock is sufficient.
@@ -239,7 +264,10 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                     match serde_json::to_value(&record) {
                         Ok(mut val) => {
                             if let Some(obj) = val.as_object_mut() {
-                                obj.insert("confirmed".to_string(), serde_json::Value::Bool(confirmed));
+                                obj.insert(
+                                    "confirmed".to_string(),
+                                    serde_json::Value::Bool(confirmed),
+                                );
                             }
                             SocketResponse::ok(val)
                         }
@@ -331,7 +359,11 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 Some(p) => p,
                 None => return SocketResponse::err("missing args.path"),
             };
-            let content = req.args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let content = req
+                .args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Err(e) = sess::doc_capture(store, path, content).await {
                 tracing::warn!("daemon socket doc_capture: {e}");
             }
@@ -358,7 +390,9 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let record: Record = match req.args.get("record")
+            let record: Record = match req
+                .args
+                .get("record")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
             {
                 Some(r) => r,
@@ -371,115 +405,376 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
         }
 
         "gotcha_write" => {
-            use crate::graph::edges::{Edge, EdgeKind};
+            use crate::store::gotcha_ops::apply_gotcha_write;
             use crate::store::Record;
-            use std::time::{SystemTime, UNIX_EPOCH};
 
-            let record: Record = match req.args.get("record")
+            let record: Record = match req
+                .args
+                .get("record")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
             {
                 Some(r) => r,
                 None => return SocketResponse::err("missing or invalid args.record"),
             };
-            let key = record.key.clone();
-            let new_files: Vec<String> = req.args.get("new_files")
+            let new_files: Vec<String> = req
+                .args
+                .get("new_files")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            let old_files: Vec<String> = req.args.get("old_files")
+            let old_files: Vec<String> = req
+                .args
+                .get("old_files")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
+            let is_new = req
+                .args
+                .get("is_new")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            if let Err(e) = store.put(&key, &record).await {
-                return SocketResponse::err(format!("store put: {e}"));
+            match apply_gotcha_write(store, &record, &old_files, &new_files, is_new).await {
+                Ok(()) => SocketResponse::ok(serde_json::Value::String("written".into())),
+                Err(e) => SocketResponse::err(format!("{e}")),
             }
-
-            let old_set: std::collections::HashSet<&str> =
-                old_files.iter().map(String::as_str).collect();
-            let new_set: std::collections::HashSet<&str> =
-                new_files.iter().map(String::as_str).collect();
-
-            for file_path in &new_files {
-                let file_key = format!("file:{file_path}");
-                if let Ok(Some(mut file_record)) = store.get(&file_key).await {
-                    match file_record.payload.as_mut() {
-                        Some(payload) => {
-                            if let Some(arr) = payload.get_mut("gotcha_keys")
-                                .and_then(|v| v.as_array_mut())
-                            {
-                                if !arr.iter().any(|v| v.as_str() == Some(key.as_str())) {
-                                    arr.push(serde_json::Value::String(key.clone()));
-                                }
-                            } else if let Some(obj) = payload.as_object_mut() {
-                                obj.insert("gotcha_keys".into(), serde_json::json!([&key]));
-                            }
-                        }
-                        None => {
-                            file_record.payload = Some(serde_json::json!({ "gotcha_keys": [&key] }));
-                        }
-                    }
-                    let _ = store.put(&file_key, &file_record).await;
-                }
-                if !old_set.contains(file_path.as_str()) {
-                    let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        .to_le_bytes();
-                    let _ = store.put_raw(&edge_key, &now).await;
-                }
-            }
-            for file_path in &old_files {
-                if !new_set.contains(file_path.as_str()) {
-                    let file_key = format!("file:{file_path}");
-                    let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
-                    let _ = store.delete(&edge_key).await;
-                }
-            }
-            SocketResponse::ok(serde_json::Value::String("written".into()))
         }
 
         "gotcha_tombstone" => {
-            use crate::graph::edges::{Edge, EdgeKind};
-            use crate::store::{RecordLifecycle, TombstoneReason};
-            use std::time::{SystemTime, UNIX_EPOCH};
+            use crate::store::gotcha_ops::apply_gotcha_tombstone;
 
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let affected_files: Vec<String> = req.args.get("affected_files")
+            let affected_files: Vec<String> = req
+                .args
+                .get("affected_files")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
-            match store.get(key).await {
-                Ok(Some(mut record)) => {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    record.lifecycle = RecordLifecycle::Tombstoned {
-                        reason: TombstoneReason::ManualDeletion,
-                        at: now,
-                    };
-                    record.updated_at = now;
-                    record.version.logical_clock += 1;
-                    record.version.wall_clock = now;
-                    if let Err(e) = store.put(key, &record).await {
-                        return SocketResponse::err(format!("store put: {e}"));
-                    }
-                }
-                Ok(None) => return SocketResponse::err(format!("not found: {key}")),
-                Err(e) => return SocketResponse::err(format!("store get: {e}")),
+            match apply_gotcha_tombstone(store, key, &affected_files).await {
+                Ok(()) => SocketResponse::ok(serde_json::Value::String("tombstoned".into())),
+                Err(e) => SocketResponse::err(format!("{e}")),
             }
-            for file_path in &affected_files {
-                let file_key = format!("file:{file_path}");
-                let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
-                let _ = store.delete(&edge_key).await;
-            }
-            SocketResponse::ok(serde_json::Value::String("tombstoned".into()))
         }
 
         other => SocketResponse::err(format!("unknown command: {other}")),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::record::{
+        Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
+        RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    };
+    use crate::store::Store;
+
+    fn make_gotcha_record(key: &str, files: &[&str]) -> Record {
+        let gotcha = GotchaRecord {
+            rule: "test rule".into(),
+            reason: "test reason".into(),
+            severity: Priority::High,
+            affected_files: files.iter().map(|s| s.to_string()).collect(),
+            ref_url: None,
+            discovered_session: 1_000_000,
+            confirmed: true,
+        };
+        Record {
+            key: key.to_string(),
+            value: "test rule because test reason".into(),
+            payload: serde_json::to_value(&gotcha).ok(),
+            category: Category::Gotcha,
+            priority: Priority::High,
+            tags: vec![],
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 1_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::DeveloperManual,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+            gap_analysis_score: 0.0,
+        }
+    }
+
+    fn make_file_record(path: &str) -> Record {
+        let file = FileRecord {
+            path: path.to_string(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+        };
+        Record {
+            key: format!("file:{path}"),
+            value: String::new(),
+            payload: serde_json::to_value(&file).ok(),
+            category: Category::File,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 1_000_000,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        }
+    }
+
+    fn file_gotcha_keys(record: &Record) -> Vec<String> {
+        record
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("gotcha_keys"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn dispatch(store: &Store, cmd: &str, args: serde_json::Value) -> SocketResponse {
+        let req = SocketRequest {
+            cmd: cmd.to_string(),
+            version: Some(PROTOCOL_VERSION),
+            args,
+        };
+        socket_dispatch(store, Path::new("/tmp/mati-test"), &req).await
+    }
+
+    // ── Regression: gotcha_write via socket syncs file links ─────────────
+
+    #[tokio::test]
+    async fn socket_gotcha_write_adds_keys_to_file_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("file:src/a.rs", &make_file_record("src/a.rs"))
+            .await
+            .unwrap();
+        store
+            .put("file:src/b.rs", &make_file_record("src/b.rs"))
+            .await
+            .unwrap();
+
+        let record = make_gotcha_record("gotcha:socket-test", &["src/a.rs", "src/b.rs"]);
+        let resp = dispatch(
+            &store,
+            "gotcha_write",
+            serde_json::json!({
+                "record": record,
+                "new_files": ["src/a.rs", "src/b.rs"],
+                "old_files": [],
+                "is_new": true,
+            }),
+        )
+        .await;
+
+        assert!(resp.ok, "gotcha_write failed: {:?}", resp.error);
+
+        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
+        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(file_gotcha_keys(&a).contains(&"gotcha:socket-test".into()));
+        assert!(file_gotcha_keys(&b).contains(&"gotcha:socket-test".into()));
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_gotcha_write_edit_removes_key_from_old_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("file:src/a.rs", &make_file_record("src/a.rs"))
+            .await
+            .unwrap();
+        store
+            .put("file:src/b.rs", &make_file_record("src/b.rs"))
+            .await
+            .unwrap();
+
+        // Initial write targeting src/a.rs
+        let record = make_gotcha_record("gotcha:edit-socket", &["src/a.rs"]);
+        let resp = dispatch(
+            &store,
+            "gotcha_write",
+            serde_json::json!({
+                "record": record,
+                "new_files": ["src/a.rs"],
+                "old_files": [],
+                "is_new": true,
+            }),
+        )
+        .await;
+        assert!(resp.ok);
+
+        // Edit: move from src/a.rs to src/b.rs
+        let record2 = make_gotcha_record("gotcha:edit-socket", &["src/b.rs"]);
+        let resp2 = dispatch(
+            &store,
+            "gotcha_write",
+            serde_json::json!({
+                "record": record2,
+                "new_files": ["src/b.rs"],
+                "old_files": ["src/a.rs"],
+                "is_new": false,
+            }),
+        )
+        .await;
+        assert!(resp2.ok);
+
+        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
+        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(
+            !file_gotcha_keys(&a).contains(&"gotcha:edit-socket".into()),
+            "old file should not have gotcha key after edit"
+        );
+        assert!(
+            file_gotcha_keys(&b).contains(&"gotcha:edit-socket".into()),
+            "new file should have gotcha key after edit"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    // ── Regression: gotcha_tombstone via socket cleans file links ─────────
+
+    #[tokio::test]
+    async fn socket_gotcha_tombstone_removes_keys_from_file_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("file:src/a.rs", &make_file_record("src/a.rs"))
+            .await
+            .unwrap();
+        store
+            .put("file:src/b.rs", &make_file_record("src/b.rs"))
+            .await
+            .unwrap();
+
+        // Write gotcha first
+        let record = make_gotcha_record("gotcha:tomb-socket", &["src/a.rs", "src/b.rs"]);
+        let resp = dispatch(
+            &store,
+            "gotcha_write",
+            serde_json::json!({
+                "record": record,
+                "new_files": ["src/a.rs", "src/b.rs"],
+                "old_files": [],
+                "is_new": true,
+            }),
+        )
+        .await;
+        assert!(resp.ok);
+
+        // Tombstone it
+        let resp2 = dispatch(
+            &store,
+            "gotcha_tombstone",
+            serde_json::json!({
+                "key": "gotcha:tomb-socket",
+                "affected_files": ["src/a.rs", "src/b.rs"],
+            }),
+        )
+        .await;
+        assert!(resp2.ok, "gotcha_tombstone failed: {:?}", resp2.error);
+
+        // Record should be tombstoned
+        let rec = store.get("gotcha:tomb-socket").await.unwrap().unwrap();
+        assert!(matches!(rec.lifecycle, RecordLifecycle::Tombstoned { .. }));
+
+        // File records should have empty gotcha_keys
+        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
+        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(
+            file_gotcha_keys(&a).is_empty(),
+            "file:src/a.rs should have no gotcha keys after tombstone, got: {:?}",
+            file_gotcha_keys(&a)
+        );
+        assert!(
+            file_gotcha_keys(&b).is_empty(),
+            "file:src/b.rs should have no gotcha keys after tombstone, got: {:?}",
+            file_gotcha_keys(&b)
+        );
+
+        store.close().await.unwrap();
+    }
+
+    // ── Regression: gotcha_write via socket rejects collisions ────────────
+
+    #[tokio::test]
+    async fn socket_gotcha_write_rejects_duplicate_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let record1 = make_gotcha_record("gotcha:dup-socket", &["src/a.rs"]);
+        store.put("gotcha:dup-socket", &record1).await.unwrap();
+
+        let record2 = make_gotcha_record("gotcha:dup-socket", &["src/b.rs"]);
+        let resp = dispatch(
+            &store,
+            "gotcha_write",
+            serde_json::json!({
+                "record": record2,
+                "new_files": ["src/b.rs"],
+                "old_files": [],
+                "is_new": true,
+            }),
+        )
+        .await;
+
+        assert!(!resp.ok, "duplicate key should be rejected");
+        assert!(
+            resp.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("already exists"),
+            "error should mention collision: {:?}",
+            resp.error
+        );
+
+        // Original should be untouched
+        let original = store.get("gotcha:dup-socket").await.unwrap().unwrap();
+        let payload = original.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(payload.affected_files, vec!["src/a.rs"]);
+
+        store.close().await.unwrap();
     }
 }

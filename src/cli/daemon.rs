@@ -51,8 +51,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use mati_core::graph::edges::{Edge, EdgeKind};
-use mati_core::store::{derive_slug, Store, TombstoneReason};
+use mati_core::store::gotcha_ops::{apply_gotcha_tombstone, apply_gotcha_write};
+use mati_core::store::{derive_slug, Store};
 
 // ── CLI subcommand types ──────────────────────────────────────────────────────
 
@@ -118,10 +118,20 @@ struct Response {
 
 impl Response {
     fn ok(data: serde_json::Value) -> Self {
-        Self { ok: true, version: PROTOCOL_VERSION, data: Some(data), error: None }
+        Self {
+            ok: true,
+            version: PROTOCOL_VERSION,
+            data: Some(data),
+            error: None,
+        }
     }
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, version: PROTOCOL_VERSION, data: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            version: PROTOCOL_VERSION,
+            data: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
@@ -182,8 +192,11 @@ pub async fn run_daemon_start() -> Result<()> {
     // Remove stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(&sock_path);
 
-    std::fs::write(&pid_path, format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()))
-        .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    std::fs::write(
+        &pid_path,
+        format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
+    )
+    .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
     // PID is written — remove the starting sentinel so try_auto_start won't block.
     let _ = std::fs::remove_file(&starting_path);
 
@@ -210,8 +223,7 @@ pub async fn run_daemon_start() -> Result<()> {
         let last_wall = last_wall.clone();
         let notify = idle_notify.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
+            let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
@@ -281,7 +293,7 @@ pub async fn run_daemon_start() -> Result<()> {
 
     // Cleanup — runs only AFTER serve_loop_graceful has finished the in-flight
     // connection. Store is closed cleanly with no concurrent writers.
-    let _ = std::fs::remove_file(&starting_path);  // belt-and-suspenders
+    let _ = std::fs::remove_file(&starting_path); // belt-and-suspenders
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     if let Err(e) = store.close().await {
@@ -326,11 +338,7 @@ async fn serve_loop_graceful(
 }
 
 /// Read one JSON request, dispatch, write one JSON response.
-async fn handle_connection(
-    store: &Store,
-    repo_root: &Path,
-    stream: UnixStream,
-) -> Result<()> {
+async fn handle_connection(store: &Store, repo_root: &Path, stream: UnixStream) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
@@ -380,18 +388,18 @@ async fn dispatch(store: &Store, repo_root: &Path, req: &Request) -> Response {
     }
 
     match req.cmd.as_str() {
-        "get"                     => cmd_get(store, &req.args).await,
-        "log_hit"                 => cmd_log_hit(store, &req.args).await,
-        "log_miss"                => cmd_log_miss(store, &req.args).await,
-        "log_compliance_miss"     => cmd_log_compliance_miss(store, &req.args).await,
+        "get" => cmd_get(store, &req.args).await,
+        "log_hit" => cmd_log_hit(store, &req.args).await,
+        "log_miss" => cmd_log_miss(store, &req.args).await,
+        "log_compliance_miss" => cmd_log_compliance_miss(store, &req.args).await,
         "session_check_consulted" => cmd_session_check_consulted(store, &req.args).await,
-        "edit_hook"               => cmd_edit_hook(store, repo_root, &req.args).await,
-        "session_flush"           => cmd_session_flush(store).await,
-        "scan_prefix"             => cmd_scan_prefix(store, &req.args).await,
-        "put"                     => cmd_put(store, &req.args).await,
-        "gotcha_write"            => cmd_gotcha_write(store, &req.args).await,
-        "gotcha_tombstone"        => cmd_gotcha_tombstone(store, &req.args).await,
-        "ping"                    => Response::ok(serde_json::Value::String("pong".into())),
+        "edit_hook" => cmd_edit_hook(store, repo_root, &req.args).await,
+        "session_flush" => cmd_session_flush(store).await,
+        "scan_prefix" => cmd_scan_prefix(store, &req.args).await,
+        "put" => cmd_put(store, &req.args).await,
+        "gotcha_write" => cmd_gotcha_write(store, &req.args).await,
+        "gotcha_tombstone" => cmd_gotcha_tombstone(store, &req.args).await,
+        "ping" => Response::ok(serde_json::Value::String("pong".into())),
         other => Response::err(format!("unknown command: {other}")),
     }
 }
@@ -439,7 +447,13 @@ async fn cmd_log_hit(store: &Store, args: &serde_json::Value) -> Response {
     }
 
     let consulted_key = format!("session:consulted:{key}");
-    if let Err(e) = store.put(&consulted_key, &session_record(&consulted_key, String::new())).await {
+    if let Err(e) = store
+        .put(
+            &consulted_key,
+            &session_record(&consulted_key, String::new()),
+        )
+        .await
+    {
         tracing::warn!(error = %e, "daemon: consulted marker failed");
     }
 
@@ -506,7 +520,12 @@ async fn cmd_edit_hook(store: &Store, repo_root: &Path, args: &serde_json::Value
     let agg_key = today_key("analytics:hit_");
     let _ = upsert_daily_agg(store, &agg_key, &file_key).await;
     let consulted_key = format!("session:consulted:{file_key}");
-    let _ = store.put(&consulted_key, &session_record(&consulted_key, String::new())).await;
+    let _ = store
+        .put(
+            &consulted_key,
+            &session_record(&consulted_key, String::new()),
+        )
+        .await;
     if let Ok(Some(mut record)) = store.get(&file_key).await {
         record.access_count += 1;
         record.last_accessed = now;
@@ -531,7 +550,11 @@ async fn cmd_session_flush(store: &Store) -> Response {
     };
     let stripped: Vec<String> = consulted_keys
         .iter()
-        .map(|k| k.strip_prefix("session:consulted:").unwrap_or(k).to_string())
+        .map(|k| {
+            k.strip_prefix("session:consulted:")
+                .unwrap_or(k)
+                .to_string()
+        })
         .collect();
     let value = match serde_json::to_string(&serde_json::json!({
         "consulted_keys": stripped,
@@ -540,7 +563,10 @@ async fn cmd_session_flush(store: &Store) -> Response {
         Ok(v) => v,
         Err(e) => return Response::err(format!("serialize error: {e}")),
     };
-    match store.put("session:current", &session_record("session:current", value)).await {
+    match store
+        .put("session:current", &session_record("session:current", value))
+        .await
+    {
         Ok(()) => Response::ok(serde_json::Value::String("flushed".into())),
         Err(e) => Response::err(format!("store error: {e}")),
     }
@@ -565,7 +591,10 @@ async fn cmd_put(store: &Store, args: &serde_json::Value) -> Response {
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-    let record: Record = match args.get("record").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+    let record: Record = match args
+        .get("record")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
         Some(r) => r,
         None => return Response::err("put: invalid record"),
     };
@@ -578,61 +607,30 @@ async fn cmd_put(store: &Store, args: &serde_json::Value) -> Response {
 /// Write a gotcha record + update affected file records + persist graph edges.
 /// Used by `mati gotcha add/edit` when the daemon holds the store lock.
 async fn cmd_gotcha_write(store: &Store, args: &serde_json::Value) -> Response {
-    let record: Record = match args.get("record").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+    let record: Record = match args
+        .get("record")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
         Some(r) => r,
         None => return Response::err("missing or invalid args.record"),
     };
-    let key = record.key.clone();
-
-    let new_files: Vec<String> = args.get("new_files")
+    let new_files: Vec<String> = args
+        .get("new_files")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
-    let old_files: Vec<String> = args.get("old_files")
+    let old_files: Vec<String> = args
+        .get("old_files")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    let is_new = args
+        .get("is_new")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    if let Err(e) = store.put(&key, &record).await {
-        return Response::err(format!("store put: {e}"));
+    match apply_gotcha_write(store, &record, &old_files, &new_files, is_new).await {
+        Ok(()) => Response::ok(serde_json::Value::String("written".into())),
+        Err(e) => Response::err(format!("{e}")),
     }
-
-    let old_set: std::collections::HashSet<&str> = old_files.iter().map(String::as_str).collect();
-    let new_set: std::collections::HashSet<&str> = new_files.iter().map(String::as_str).collect();
-
-    // Add gotcha_keys + edges for new files
-    for file_path in &new_files {
-        let file_key = format!("file:{file_path}");
-        if let Ok(Some(mut file_record)) = store.get(&file_key).await {
-            match file_record.payload.as_mut() {
-                Some(payload) => {
-                    if let Some(arr) = payload.get_mut("gotcha_keys").and_then(|v| v.as_array_mut()) {
-                        if !arr.iter().any(|v| v.as_str() == Some(key.as_str())) {
-                            arr.push(serde_json::Value::String(key.clone()));
-                        }
-                    } else if let Some(obj) = payload.as_object_mut() {
-                        obj.insert("gotcha_keys".into(), serde_json::json!([&key]));
-                    }
-                }
-                None => file_record.payload = Some(serde_json::json!({ "gotcha_keys": [&key] })),
-            }
-            let _ = store.put(&file_key, &file_record).await;
-        }
-        if !old_set.contains(file_path.as_str()) {
-            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
-            let ts = now_secs().to_le_bytes();
-            let _ = store.put_raw(&edge_key, &ts).await;
-        }
-    }
-
-    // Remove edges for files no longer affected
-    for file_path in &old_files {
-        if !new_set.contains(file_path.as_str()) {
-            let file_key = format!("file:{file_path}");
-            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, &key).to_key();
-            let _ = store.delete(&edge_key).await;
-        }
-    }
-
-    Response::ok(serde_json::Value::String("written".into()))
 }
 
 /// Tombstone a gotcha record and remove its HasGotcha graph edges.
@@ -642,33 +640,15 @@ async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Respon
         Some(k) => k,
         None => return Response::err("missing args.key"),
     };
-    let affected_files: Vec<String> = args.get("affected_files")
+    let affected_files: Vec<String> = args
+        .get("affected_files")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    match store.get(key).await {
-        Ok(Some(mut record)) => {
-            let now = now_secs();
-            record.lifecycle =
-                RecordLifecycle::Tombstoned { reason: TombstoneReason::ManualDeletion, at: now };
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
-            if let Err(e) = store.put(key, &record).await {
-                return Response::err(format!("store put: {e}"));
-            }
-        }
-        Ok(None) => return Response::err(format!("record not found: {key}")),
-        Err(e) => return Response::err(format!("store get: {e}")),
+    match apply_gotcha_tombstone(store, key, &affected_files).await {
+        Ok(()) => Response::ok(serde_json::Value::String("tombstoned".into())),
+        Err(e) => Response::err(format!("{e}")),
     }
-
-    for file_path in &affected_files {
-        let file_key = format!("file:{file_path}");
-        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
-        let _ = store.delete(&edge_key).await;
-    }
-
-    Response::ok(serde_json::Value::String("tombstoned".into()))
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -679,11 +659,7 @@ async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Respon
 /// - **No socket** → [`DaemonResult::NotRunning`] — safe to use `Store::open`
 /// - **ECONNREFUSED + PID dead** → clean up stale files, [`DaemonResult::StaleSocket`] — safe to use `Store::open`
 /// - **PID alive but not responding** → [`DaemonResult::Unresponsive`] — **unsafe** to use `Store::open`
-pub async fn daemon_result(
-    root: &Path,
-    cmd: &str,
-    args: serde_json::Value,
-) -> DaemonResult {
+pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> DaemonResult {
     let sock_path = root.join("mati.sock");
 
     if sock_path.as_os_str().len() > UNIX_SOCK_PATH_MAX {
@@ -915,7 +891,10 @@ fn project_root() -> Result<PathBuf> {
 
 /// Unix seconds from wall clock (not monotonic — survives sleep/wake).
 fn wall_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn now_secs() -> u64 {
@@ -932,8 +911,8 @@ fn new_device_id() -> uuid::Uuid {
 }
 
 use mati_core::store::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore,
+    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore,
 };
 
 fn session_record(key: &str, value: String) -> Record {
@@ -982,8 +961,10 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
     let now = now_secs();
     match store.get(agg_key).await? {
         Some(mut record) => {
-            let mut agg: DailyAgg =
-                serde_json::from_str(&record.value).unwrap_or(DailyAgg { count: 0, keys: vec![] });
+            let mut agg: DailyAgg = serde_json::from_str(&record.value).unwrap_or(DailyAgg {
+                count: 0,
+                keys: vec![],
+            });
             agg.count += 1;
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
@@ -995,7 +976,10 @@ async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Res
             store.put(agg_key, &record).await?;
         }
         None => {
-            let agg = DailyAgg { count: 1, keys: vec![target_key.to_string()] };
+            let agg = DailyAgg {
+                count: 1,
+                keys: vec![target_key.to_string()],
+            };
             let record = analytics_record(agg_key, serde_json::to_string(&agg)?);
             store.put(agg_key, &record).await?;
         }
@@ -1107,16 +1091,16 @@ pub async fn run_daemon_status() -> Result<()> {
     let pid_info = read_pid_file(&root);
 
     match daemon_result(&root, "ping", serde_json::json!({})).await {
-        DaemonResult::Ok(resp)
-            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) =>
-        {
+        DaemonResult::Ok(resp) if resp.get("ok") == Some(&serde_json::Value::Bool(true)) => {
             if let Some((pid, owner)) = &pid_info {
                 println!("mati daemon is running (pid {pid})");
                 println!("  owner: {owner}");
             } else {
                 println!("mati daemon is running (pid unknown — PID file absent)");
                 println!("  owner: likely mcp (socket created by older binary without PID file)");
-                println!("  note: mati daemon stop will refuse to close a live unknown-owner socket");
+                println!(
+                    "  note: mati daemon stop will refuse to close a live unknown-owner socket"
+                );
                 println!("  to stop: close the Claude Code session that uses mati");
             }
             println!("  socket: {}", sock_path.display());

@@ -6,8 +6,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
-use crate::store::Store;
 use super::edges::{Edge, EdgeKind};
+use crate::store::Store;
 
 const EDGE_PREFIX: &str = "graph:edge:";
 
@@ -123,8 +123,7 @@ impl Graph {
             .to_le_bytes();
 
         let keys: Vec<String> = new_edges.iter().map(|e| e.to_key()).collect();
-        let pairs: Vec<(&str, &[u8])> =
-            keys.iter().map(|k| (k.as_str(), now.as_ref())).collect();
+        let pairs: Vec<(&str, &[u8])> = keys.iter().map(|k| (k.as_str(), now.as_ref())).collect();
         self.store.put_batch_raw(&pairs).await?;
 
         // Update in-memory state only after the write succeeds.
@@ -138,10 +137,17 @@ impl Graph {
     pub async fn remove_edge(&mut self, from: &str, kind: &EdgeKind, to: &str) -> Result<()> {
         let edge = Edge::new(from, kind.clone(), to);
         self.store.delete(&edge.to_key()).await?;
-        let from_idx = match self.node_index.get(from) { Some(&i) => i, None => return Ok(()) };
-        let to_idx   = match self.node_index.get(to)   { Some(&i) => i, None => return Ok(()) };
+        let from_idx = match self.node_index.get(from) {
+            Some(&i) => i,
+            None => return Ok(()),
+        };
+        let to_idx = match self.node_index.get(to) {
+            Some(&i) => i,
+            None => return Ok(()),
+        };
         self.edge_set.remove(&(from_idx, to_idx, kind.clone()));
-        let to_remove: Vec<_> = self.inner
+        let to_remove: Vec<_> = self
+            .inner
             .edges_connecting(from_idx, to_idx)
             .filter(|e| e.weight() == kind)
             .map(|e| e.id())
@@ -155,17 +161,25 @@ impl Graph {
     /// BFS traversal from `seed` following `edge_kind` edges up to `depth` hops.
     /// Returns node keys reachable (seed itself excluded).
     pub fn traverse(&self, seed: &str, edge_kind: &EdgeKind, depth: usize) -> Vec<String> {
-        if depth == 0 { return vec![]; }
-        let Some(&start) = self.node_index.get(seed) else { return vec![]; };
+        if depth == 0 {
+            return vec![];
+        }
+        let Some(&start) = self.node_index.get(seed) else {
+            return vec![];
+        };
         let mut visited = HashSet::new();
-        let mut queue   = std::collections::VecDeque::new();
+        let mut queue = std::collections::VecDeque::new();
         queue.push_back((start, 0usize));
         visited.insert(start);
         let mut results = vec![];
         while let Some((node, d)) = queue.pop_front() {
-            if d >= depth { continue; }
+            if d >= depth {
+                continue;
+            }
             for e in self.inner.edges(node) {
-                if e.weight() != edge_kind { continue; }
+                if e.weight() != edge_kind {
+                    continue;
+                }
                 let target = e.target();
                 if visited.insert(target) {
                     results.push(self.inner[target].clone());
@@ -185,17 +199,25 @@ impl Graph {
     /// Returns node keys that have a path *to* `seed` (i.e. sources, not targets).
     /// Used for queries like "which files import this file?" (reverse Imports).
     pub fn traverse_incoming(&self, seed: &str, edge_kind: &EdgeKind, depth: usize) -> Vec<String> {
-        if depth == 0 { return vec![]; }
-        let Some(&start) = self.node_index.get(seed) else { return vec![]; };
+        if depth == 0 {
+            return vec![];
+        }
+        let Some(&start) = self.node_index.get(seed) else {
+            return vec![];
+        };
         let mut visited = HashSet::new();
-        let mut queue   = std::collections::VecDeque::new();
+        let mut queue = std::collections::VecDeque::new();
         queue.push_back((start, 0usize));
         visited.insert(start);
         let mut results = vec![];
         while let Some((node, d)) = queue.pop_front() {
-            if d >= depth { continue; }
+            if d >= depth {
+                continue;
+            }
             for e in self.inner.edges_directed(node, Direction::Incoming) {
-                if e.weight() != edge_kind { continue; }
+                if e.weight() != edge_kind {
+                    continue;
+                }
                 let source = e.source();
                 if visited.insert(source) {
                     results.push(self.inner[source].clone());
@@ -226,15 +248,21 @@ impl Graph {
     }
 
     /// Number of nodes in the graph.
-    pub fn node_count(&self) -> usize { self.inner.node_count() }
+    pub fn node_count(&self) -> usize {
+        self.inner.node_count()
+    }
 
     /// Number of edges in the graph.
-    pub fn edge_count(&self) -> usize { self.inner.edge_count() }
+    pub fn edge_count(&self) -> usize {
+        self.inner.edge_count()
+    }
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn get_or_insert_node(&mut self, key: &str) -> NodeIndex {
-        if let Some(&idx) = self.node_index.get(key) { return idx; }
+        if let Some(&idx) = self.node_index.get(key) {
+            return idx;
+        }
         let idx = self.inner.add_node(key.to_owned());
         self.node_index.insert(key.to_owned(), idx);
         idx
@@ -242,7 +270,7 @@ impl Graph {
 
     fn insert_edge_in_memory(&mut self, edge: &Edge) {
         let from_idx = self.get_or_insert_node(&edge.from);
-        let to_idx   = self.get_or_insert_node(&edge.to);
+        let to_idx = self.get_or_insert_node(&edge.to);
         // O(1) duplicate check via the edge set.
         if self.edge_set.insert((from_idx, to_idx, edge.kind.clone())) {
             self.inner.add_edge(from_idx, to_idx, edge.kind.clone());
@@ -291,12 +319,27 @@ mod tests {
             ref_url: None,
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
-            version: RecordVersion { device_id: uuid::Uuid::nil(), logical_clock: 0, wall_clock: now },
-            quality: QualityScore { value: 1.0, tier: QualityTier::Good, signals: vec![], computed_at: now },
+            version: RecordVersion {
+                device_id: uuid::Uuid::nil(),
+                logical_clock: 0,
+                wall_clock: now,
+            },
+            quality: QualityScore {
+                value: 1.0,
+                tier: QualityTier::Good,
+                signals: vec![],
+                computed_at: now,
+            },
             access_count: 0,
             last_accessed: 0,
             source: RecordSource::StaticAnalysis,
-            confidence: ConfidenceScore { value: 1.0, confirmation_count: 0, contributor_count: 0, last_challenged: None, challenge_count: 0 },
+            confidence: ConfidenceScore {
+                value: 1.0,
+                confirmation_count: 0,
+                contributor_count: 0,
+                last_challenged: None,
+                challenge_count: 0,
+            },
             gap_analysis_score: 0.0,
             payload: None,
         }
@@ -313,7 +356,8 @@ mod tests {
     async fn add_edge_increases_counts() {
         let (mut g, _dir) = temp_graph().await;
         g.add_edge("file:src/main.rs", EdgeKind::HasGotcha, "gotcha:write-txn")
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(g.node_count(), 2);
         assert_eq!(g.edge_count(), 1);
     }
@@ -323,7 +367,8 @@ mod tests {
         let (mut g, _dir) = temp_graph().await;
         for _ in 0..3 {
             g.add_edge("file:src/a.rs", EdgeKind::Imports, "file:src/b.rs")
-                .await.unwrap();
+                .await
+                .unwrap();
         }
         assert_eq!(g.edge_count(), 1);
     }
@@ -335,9 +380,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let mut g = Graph::load(store).await.unwrap();
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         let keys = g.store.scan_keys("graph:edge:").await.unwrap();
         assert_eq!(keys.len(), 1, "store must contain exactly 1 edge record");
     }
@@ -349,7 +400,8 @@ mod tests {
             let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             g.add_edge("file:src/a.rs", EdgeKind::CoChanges, "file:src/b.rs")
-                .await.unwrap();
+                .await
+                .unwrap();
             g.close().await.unwrap();
         }
         let store2 = Store::open(dir.path()).await.unwrap();
@@ -362,27 +414,44 @@ mod tests {
     #[tokio::test]
     async fn traverse_two_hops() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:b", EdgeKind::Imports, "file:c").await.unwrap();
-        g.add_edge("file:c", EdgeKind::Imports, "file:d").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:c")
+            .await
+            .unwrap();
+        g.add_edge("file:c", EdgeKind::Imports, "file:d")
+            .await
+            .unwrap();
         let two_hop = g.traverse("file:a", &EdgeKind::Imports, 2);
         assert!(two_hop.contains(&"file:b".to_string()));
         assert!(two_hop.contains(&"file:c".to_string()));
-        assert!(!two_hop.contains(&"file:d".to_string()), "depth=2 must not reach d");
+        assert!(
+            !two_hop.contains(&"file:d".to_string()),
+            "depth=2 must not reach d"
+        );
     }
 
     #[tokio::test]
     async fn traverse_unknown_node_returns_empty() {
         let (g, _dir) = temp_graph().await;
-        assert!(g.traverse("file:nonexistent", &EdgeKind::Imports, 5).is_empty());
+        assert!(g
+            .traverse("file:nonexistent", &EdgeKind::Imports, 5)
+            .is_empty());
     }
 
     #[tokio::test]
     async fn neighbors_returns_direct_targets_only() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:x").await.unwrap();
-        g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:y").await.unwrap();
-        g.add_edge("file:a", EdgeKind::Imports,   "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:x")
+            .await
+            .unwrap();
+        g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:y")
+            .await
+            .unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         let gotchas = g.neighbors("file:a", &EdgeKind::HasGotcha);
         assert_eq!(gotchas.len(), 2);
         assert!(gotchas.contains(&"gotcha:x".to_string()));
@@ -394,8 +463,12 @@ mod tests {
     #[tokio::test]
     async fn traverse_does_not_cross_edge_kinds() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports,   "file:b").await.unwrap();
-        g.add_edge("file:b", EdgeKind::HasGotcha, "gotcha:x").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::HasGotcha, "gotcha:x")
+            .await
+            .unwrap();
         let result = g.traverse("file:a", &EdgeKind::Imports, 5);
         assert!(result.contains(&"file:b".to_string()));
         assert!(!result.contains(&"gotcha:x".to_string()));
@@ -404,9 +477,13 @@ mod tests {
     #[tokio::test]
     async fn remove_edge_works() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 1);
-        g.remove_edge("file:a", &EdgeKind::Imports, "file:b").await.unwrap();
+        g.remove_edge("file:a", &EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 0);
         assert!(g.neighbors("file:a", &EdgeKind::Imports).is_empty());
     }
@@ -420,31 +497,46 @@ mod tests {
         {
             let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
-            g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:x").await.unwrap();
-            g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:y").await.unwrap();
+            g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:x")
+                .await
+                .unwrap();
+            g.add_edge("file:a", EdgeKind::HasGotcha, "gotcha:y")
+                .await
+                .unwrap();
             g.close().await.unwrap();
         }
         // Reload and remove one of the edges.
         let store2 = Store::open(dir.path()).await.unwrap();
         let mut g2 = Graph::load(store2).await.unwrap();
         assert_eq!(g2.edge_count(), 2);
-        g2.remove_edge("file:a", &EdgeKind::HasGotcha, "gotcha:x").await.unwrap();
+        g2.remove_edge("file:a", &EdgeKind::HasGotcha, "gotcha:x")
+            .await
+            .unwrap();
         assert_eq!(g2.edge_count(), 1);
-        assert!(g2.neighbors("file:a", &EdgeKind::HasGotcha).iter().all(|n| n != "gotcha:x"));
-        assert!(g2.neighbors("file:a", &EdgeKind::HasGotcha).contains(&"gotcha:y".to_string()));
+        assert!(g2
+            .neighbors("file:a", &EdgeKind::HasGotcha)
+            .iter()
+            .all(|n| n != "gotcha:x"));
+        assert!(g2
+            .neighbors("file:a", &EdgeKind::HasGotcha)
+            .contains(&"gotcha:y".to_string()));
 
         // Reload again — the removed edge must not come back.
         g2.close().await.unwrap();
         let store3 = Store::open(dir.path()).await.unwrap();
         let g3 = Graph::load(store3).await.unwrap();
         assert_eq!(g3.edge_count(), 1);
-        assert!(g3.neighbors("file:a", &EdgeKind::HasGotcha).contains(&"gotcha:y".to_string()));
+        assert!(g3
+            .neighbors("file:a", &EdgeKind::HasGotcha)
+            .contains(&"gotcha:y".to_string()));
     }
 
     #[tokio::test]
     async fn remove_nonexistent_edge_is_noop() {
         let (mut g, _dir) = temp_graph().await;
-        g.remove_edge("file:a", &EdgeKind::Imports, "file:b").await.unwrap();
+        g.remove_edge("file:a", &EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 0);
     }
 
@@ -452,8 +544,13 @@ mod tests {
     async fn ten_node_chain_correct_traversal() {
         let (mut g, _dir) = temp_graph().await;
         for i in 0..9usize {
-            g.add_edge(&format!("file:n{i}"), EdgeKind::Imports, &format!("file:n{}", i + 1))
-                .await.unwrap();
+            g.add_edge(
+                &format!("file:n{i}"),
+                EdgeKind::Imports,
+                &format!("file:n{}", i + 1),
+            )
+            .await
+            .unwrap();
         }
         assert_eq!(g.node_count(), 10);
         assert_eq!(g.edge_count(), 9);
@@ -469,8 +566,12 @@ mod tests {
     #[tokio::test]
     async fn traverse_cycle_terminates() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:b", EdgeKind::Imports, "file:a").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:a")
+            .await
+            .unwrap();
         let result = g.traverse("file:a", &EdgeKind::Imports, 10);
         // Only one unique non-seed node reachable.
         assert_eq!(result.len(), 1);
@@ -481,10 +582,18 @@ mod tests {
     #[tokio::test]
     async fn traverse_diamond_no_duplicates() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:a", EdgeKind::Imports, "file:c").await.unwrap();
-        g.add_edge("file:b", EdgeKind::Imports, "file:d").await.unwrap();
-        g.add_edge("file:c", EdgeKind::Imports, "file:d").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:c")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:d")
+            .await
+            .unwrap();
+        g.add_edge("file:c", EdgeKind::Imports, "file:d")
+            .await
+            .unwrap();
         let result = g.traverse("file:a", &EdgeKind::Imports, 3);
         assert_eq!(result.len(), 3, "b, c, d — no duplicates");
         assert!(result.contains(&"file:b".to_string()));
@@ -496,7 +605,9 @@ mod tests {
     #[tokio::test]
     async fn traverse_depth_zero_returns_empty() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert!(g.traverse("file:a", &EdgeKind::Imports, 0).is_empty());
     }
 
@@ -505,11 +616,17 @@ mod tests {
     #[tokio::test]
     async fn multiple_kinds_between_same_pair_are_independent() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports,   "file:b").await.unwrap();
-        g.add_edge("file:a", EdgeKind::CoChanges, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:a", EdgeKind::CoChanges, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 2);
 
-        g.remove_edge("file:a", &EdgeKind::Imports, "file:b").await.unwrap();
+        g.remove_edge("file:a", &EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 1);
         assert!(g.neighbors("file:a", &EdgeKind::Imports).is_empty());
         assert_eq!(g.neighbors("file:a", &EdgeKind::CoChanges), vec!["file:b"]);
@@ -519,10 +636,16 @@ mod tests {
     #[tokio::test]
     async fn remove_then_readd_edge_works() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.remove_edge("file:a", &EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.remove_edge("file:a", &EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 0);
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.edge_count(), 1);
         assert_eq!(g.neighbors("file:a", &EdgeKind::Imports), vec!["file:b"]);
     }
@@ -531,9 +654,13 @@ mod tests {
     #[tokio::test]
     async fn node_count_stable_after_edge_removal() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.node_count(), 2);
-        g.remove_edge("file:a", &EdgeKind::Imports, "file:b").await.unwrap();
+        g.remove_edge("file:a", &EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         assert_eq!(g.node_count(), 2, "nodes are never removed from the graph");
     }
 
@@ -543,8 +670,12 @@ mod tests {
     #[tokio::test]
     async fn traverse_incoming_finds_sources() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:c", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:c", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         // Two files import b — traverse_incoming from b should find both.
         let sources = g.traverse_incoming("file:b", &EdgeKind::Imports, 1);
         assert_eq!(sources.len(), 2);
@@ -555,17 +686,25 @@ mod tests {
     #[tokio::test]
     async fn traverse_incoming_does_not_return_outgoing() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         // traverse outgoing from a gives b; traverse_incoming from a gives nothing.
-        assert!(g.traverse_incoming("file:a", &EdgeKind::Imports, 5).is_empty());
+        assert!(g
+            .traverse_incoming("file:a", &EdgeKind::Imports, 5)
+            .is_empty());
     }
 
     #[tokio::test]
     async fn traverse_incoming_multi_hop() {
         let (mut g, _dir) = temp_graph().await;
         // Chain: c → b → a  (c imports b, b imports a)
-        g.add_edge("file:b", EdgeKind::Imports, "file:a").await.unwrap();
-        g.add_edge("file:c", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:a")
+            .await
+            .unwrap();
+        g.add_edge("file:c", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         // 1 hop from a: only b
         let one = g.traverse_incoming("file:a", &EdgeKind::Imports, 1);
         assert_eq!(one, vec!["file:b"]);
@@ -578,8 +717,12 @@ mod tests {
     #[tokio::test]
     async fn neighbors_incoming_returns_direct_sources_only() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:x", EdgeKind::HasGotcha, "gotcha:y").await.unwrap();
-        g.add_edge("file:z", EdgeKind::HasGotcha, "gotcha:y").await.unwrap();
+        g.add_edge("file:x", EdgeKind::HasGotcha, "gotcha:y")
+            .await
+            .unwrap();
+        g.add_edge("file:z", EdgeKind::HasGotcha, "gotcha:y")
+            .await
+            .unwrap();
         let sources = g.neighbors_incoming("gotcha:y", &EdgeKind::HasGotcha);
         assert_eq!(sources.len(), 2);
         assert!(sources.contains(&"file:x".to_string()));
@@ -589,7 +732,9 @@ mod tests {
     #[tokio::test]
     async fn traverse_is_directed() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
         // Forward: a can reach b.
         assert!(!g.traverse("file:a", &EdgeKind::Imports, 1).is_empty());
         // Reverse: b cannot reach a — no back edge exists.
@@ -605,7 +750,9 @@ mod tests {
         for _ in 0..2 {
             let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
-            g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+            g.add_edge("file:a", EdgeKind::Imports, "file:b")
+                .await
+                .unwrap();
             g.close().await.unwrap();
         }
         let store = Store::open(dir.path()).await.unwrap();
@@ -620,10 +767,16 @@ mod tests {
     async fn disconnected_components_do_not_bleed() {
         let (mut g, _dir) = temp_graph().await;
         // Component 1: a → b → c
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:b", EdgeKind::Imports, "file:c").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:c")
+            .await
+            .unwrap();
         // Component 2: x → y
-        g.add_edge("file:x", EdgeKind::Imports, "file:y").await.unwrap();
+        g.add_edge("file:x", EdgeKind::Imports, "file:y")
+            .await
+            .unwrap();
 
         let from_a = g.traverse("file:a", &EdgeKind::Imports, 10);
         assert!(!from_a.contains(&"file:x".to_string()));
@@ -644,7 +797,9 @@ mod tests {
             let mut g = Graph::load(store).await.unwrap();
 
             // Add one legitimate edge.
-            g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+            g.add_edge("file:a", EdgeKind::Imports, "file:b")
+                .await
+                .unwrap();
 
             // Manually insert a record whose key has the graph:edge: prefix
             // but is not a valid edge key (no parseable from/kind/to triple).
@@ -675,7 +830,8 @@ mod tests {
                     EdgeKind::Imports,
                     &format!("file:src/dep{i}.rs"),
                 )
-                .await.unwrap();
+                .await
+                .unwrap();
             }
             g.close().await.unwrap();
         }
@@ -697,29 +853,50 @@ mod tests {
     async fn add_edges_batch_correctness() {
         let (mut g, _dir) = temp_graph().await;
         let batch = vec![
-            ("file:a".to_string(), EdgeKind::Imports,   "file:b".to_string()),
-            ("file:a".to_string(), EdgeKind::HasGotcha, "gotcha:x".to_string()),
-            ("file:b".to_string(), EdgeKind::CoChanges, "file:c".to_string()),
+            (
+                "file:a".to_string(),
+                EdgeKind::Imports,
+                "file:b".to_string(),
+            ),
+            (
+                "file:a".to_string(),
+                EdgeKind::HasGotcha,
+                "gotcha:x".to_string(),
+            ),
+            (
+                "file:b".to_string(),
+                EdgeKind::CoChanges,
+                "file:c".to_string(),
+            ),
         ];
         g.add_edges_batch(&batch).await.unwrap();
         assert_eq!(g.edge_count(), 3);
-        assert_eq!(g.neighbors("file:a", &EdgeKind::Imports),   vec!["file:b"]);
-        assert_eq!(g.neighbors("file:a", &EdgeKind::HasGotcha), vec!["gotcha:x"]);
+        assert_eq!(g.neighbors("file:a", &EdgeKind::Imports), vec!["file:b"]);
+        assert_eq!(
+            g.neighbors("file:a", &EdgeKind::HasGotcha),
+            vec!["gotcha:x"]
+        );
         assert_eq!(g.neighbors("file:b", &EdgeKind::CoChanges), vec!["file:c"]);
     }
 
     #[tokio::test]
     async fn add_edges_batch_is_idempotent() {
         let (mut g, _dir) = temp_graph().await;
-        let batch = vec![
-            ("file:a".to_string(), EdgeKind::Imports, "file:b".to_string()),
-        ];
+        let batch = vec![(
+            "file:a".to_string(),
+            EdgeKind::Imports,
+            "file:b".to_string(),
+        )];
         g.add_edges_batch(&batch).await.unwrap();
         g.add_edges_batch(&batch).await.unwrap();
         g.add_edges_batch(&batch).await.unwrap();
         assert_eq!(g.edge_count(), 1);
         let keys = g.store.scan_keys("graph:edge:").await.unwrap();
-        assert_eq!(keys.len(), 1, "store must have exactly 1 record after duplicate batches");
+        assert_eq!(
+            keys.len(),
+            1,
+            "store must have exactly 1 record after duplicate batches"
+        );
     }
 
     #[tokio::test]
@@ -729,7 +906,13 @@ mod tests {
             let store = Store::open(dir.path()).await.unwrap();
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..50)
-                .map(|i| (format!("file:a{i}"), EdgeKind::Imports, format!("file:b{i}")))
+                .map(|i| {
+                    (
+                        format!("file:a{i}"),
+                        EdgeKind::Imports,
+                        format!("file:b{i}"),
+                    )
+                })
                 .collect();
             g.add_edges_batch(&batch).await.unwrap();
             g.close().await.unwrap();
@@ -743,7 +926,13 @@ mod tests {
     async fn add_edges_batch_faster_than_sequential() {
         use std::time::Instant;
         let edges: Vec<(String, EdgeKind, String)> = (0..500)
-            .map(|i| (format!("file:m{i}"), EdgeKind::Imports, format!("file:d{i}")))
+            .map(|i| {
+                (
+                    format!("file:m{i}"),
+                    EdgeKind::Imports,
+                    format!("file:d{i}"),
+                )
+            })
             .collect();
 
         // Sequential baseline.
@@ -801,11 +990,13 @@ mod tests {
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
                 .flat_map(|i| {
-                    all_kinds.iter().map(move |kind| (
-                        format!("file:src/module{i}.rs"),
-                        kind.clone(),
-                        format!("file:src/target{i}.rs"),
-                    ))
+                    all_kinds.iter().map(move |kind| {
+                        (
+                            format!("file:src/module{i}.rs"),
+                            kind.clone(),
+                            format!("file:src/target{i}.rs"),
+                        )
+                    })
                 })
                 .collect();
             g.add_edges_batch(&batch).await.unwrap();
@@ -848,12 +1039,21 @@ mod tests {
                     kind.clone(),
                     &format!("file:src/target{i}.rs"),
                 )
-                .await.unwrap();
+                .await
+                .unwrap();
             }
         }
-        assert_eq!(g3.edge_count(), 1_200, "duplicate adds must not grow the graph");
+        assert_eq!(
+            g3.edge_count(),
+            1_200,
+            "duplicate adds must not grow the graph"
+        );
         let store_keys = g3.store.scan_keys("graph:edge:").await.unwrap();
-        assert_eq!(store_keys.len(), 1_200, "store must not contain duplicate records");
+        assert_eq!(
+            store_keys.len(),
+            1_200,
+            "store must not contain duplicate records"
+        );
 
         // ── Traversal correctness on a hub node ──────────────────────────────
         // Connect all 120 source files to a single hub via CoChanges.
@@ -863,10 +1063,15 @@ mod tests {
                 EdgeKind::CoChanges,
                 "file:src/hub.rs",
             )
-            .await.unwrap();
+            .await
+            .unwrap();
         }
         let hub_sources = g3.neighbors_incoming("file:src/hub.rs", &EdgeKind::CoChanges);
-        assert_eq!(hub_sources.len(), n_files, "hub must have {n_files} incoming CoChanges");
+        assert_eq!(
+            hub_sources.len(),
+            n_files,
+            "hub must have {n_files} incoming CoChanges"
+        );
 
         // ── Timing assertions ─────────────────────────────────────────────────
         // Build uses add_edges_batch → 1 fsync. Load is sequential reads.
@@ -912,11 +1117,13 @@ mod tests {
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
                 .flat_map(|i| {
-                    all_kinds.iter().map(move |kind| (
-                        format!("file:src/module{i}.rs"),
-                        kind.clone(),
-                        format!("file:src/target{i}.rs"),
-                    ))
+                    all_kinds.iter().map(move |kind| {
+                        (
+                            format!("file:src/module{i}.rs"),
+                            kind.clone(),
+                            format!("file:src/target{i}.rs"),
+                        )
+                    })
                 })
                 .collect();
             g.add_edges_batch(&batch).await.unwrap();
@@ -954,30 +1161,46 @@ mod tests {
         let mut g3 = Graph::load(store3).await.unwrap();
         let dup_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
             .flat_map(|i| {
-                all_kinds.iter().map(move |kind| (
-                    format!("file:src/module{i}.rs"),
-                    kind.clone(),
-                    format!("file:src/target{i}.rs"),
-                ))
+                all_kinds.iter().map(move |kind| {
+                    (
+                        format!("file:src/module{i}.rs"),
+                        kind.clone(),
+                        format!("file:src/target{i}.rs"),
+                    )
+                })
             })
             .collect();
         g3.add_edges_batch(&dup_batch).await.unwrap();
-        assert_eq!(g3.edge_count(), 15_000, "duplicate adds must not grow the graph");
+        assert_eq!(
+            g3.edge_count(),
+            15_000,
+            "duplicate adds must not grow the graph"
+        );
         let store_keys = g3.store.scan_keys("graph:edge:").await.unwrap();
-        assert_eq!(store_keys.len(), 15_000, "store must not contain duplicate records");
+        assert_eq!(
+            store_keys.len(),
+            15_000,
+            "store must not contain duplicate records"
+        );
 
         // ── Traversal correctness on a hub node ──────────────────────────────
         // Connect all 1,500 source files to a single hub via CoChanges.
         let hub_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
-            .map(|i| (
-                format!("file:src/module{i}.rs"),
-                EdgeKind::CoChanges,
-                "file:src/hub.rs".to_string(),
-            ))
+            .map(|i| {
+                (
+                    format!("file:src/module{i}.rs"),
+                    EdgeKind::CoChanges,
+                    "file:src/hub.rs".to_string(),
+                )
+            })
             .collect();
         g3.add_edges_batch(&hub_batch).await.unwrap();
         let hub_sources = g3.neighbors_incoming("file:src/hub.rs", &EdgeKind::CoChanges);
-        assert_eq!(hub_sources.len(), n_files, "hub must have {n_files} incoming CoChanges");
+        assert_eq!(
+            hub_sources.len(),
+            n_files,
+            "hub must have {n_files} incoming CoChanges"
+        );
 
         // ── Timing assertions ─────────────────────────────────────────────────
         println!("stress_15000  build={build_ms}ms  load={load_ms}ms");
@@ -1021,11 +1244,13 @@ mod tests {
             let mut g = Graph::load(store).await.unwrap();
             let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
                 .flat_map(|i| {
-                    all_kinds.iter().map(move |kind| (
-                        format!("file:src/module{i}.rs"),
-                        kind.clone(),
-                        format!("file:src/target{i}.rs"),
-                    ))
+                    all_kinds.iter().map(move |kind| {
+                        (
+                            format!("file:src/module{i}.rs"),
+                            kind.clone(),
+                            format!("file:src/target{i}.rs"),
+                        )
+                    })
                 })
                 .collect();
             g.add_edges_batch(&batch).await.unwrap();
@@ -1062,29 +1287,45 @@ mod tests {
         let mut g3 = Graph::load(store3).await.unwrap();
         let dup_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
             .flat_map(|i| {
-                all_kinds.iter().map(move |kind| (
-                    format!("file:src/module{i}.rs"),
-                    kind.clone(),
-                    format!("file:src/target{i}.rs"),
-                ))
+                all_kinds.iter().map(move |kind| {
+                    (
+                        format!("file:src/module{i}.rs"),
+                        kind.clone(),
+                        format!("file:src/target{i}.rs"),
+                    )
+                })
             })
             .collect();
         g3.add_edges_batch(&dup_batch).await.unwrap();
-        assert_eq!(g3.edge_count(), 100_000, "duplicate adds must not grow the graph");
+        assert_eq!(
+            g3.edge_count(),
+            100_000,
+            "duplicate adds must not grow the graph"
+        );
         let store_keys = g3.store.scan_keys("graph:edge:").await.unwrap();
-        assert_eq!(store_keys.len(), 100_000, "store must not contain duplicate records");
+        assert_eq!(
+            store_keys.len(),
+            100_000,
+            "store must not contain duplicate records"
+        );
 
         // ── Hub traversal: 10,000 incoming edges on a single node ─────────────
         let hub_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
-            .map(|i| (
-                format!("file:src/module{i}.rs"),
-                EdgeKind::CoChanges,
-                "file:src/hub.rs".to_string(),
-            ))
+            .map(|i| {
+                (
+                    format!("file:src/module{i}.rs"),
+                    EdgeKind::CoChanges,
+                    "file:src/hub.rs".to_string(),
+                )
+            })
             .collect();
         g3.add_edges_batch(&hub_batch).await.unwrap();
         let hub_sources = g3.neighbors_incoming("file:src/hub.rs", &EdgeKind::CoChanges);
-        assert_eq!(hub_sources.len(), n_files, "hub must have {n_files} incoming CoChanges");
+        assert_eq!(
+            hub_sources.len(),
+            n_files,
+            "hub must have {n_files} incoming CoChanges"
+        );
 
         // ── Timing assertions ─────────────────────────────────────────────────
         println!("stress_100000  build={build_ms}ms  load={load_ms}ms");
@@ -1125,11 +1366,13 @@ mod tests {
         let t0 = Instant::now();
         let batch: Vec<(String, EdgeKind, String)> = (0..n_files)
             .flat_map(|i| {
-                all_kinds.iter().map(move |kind| (
-                    format!("file:src/module{i}.rs"),
-                    kind.clone(),
-                    format!("file:src/target{i}.rs"),
-                ))
+                all_kinds.iter().map(move |kind| {
+                    (
+                        format!("file:src/module{i}.rs"),
+                        kind.clone(),
+                        format!("file:src/target{i}.rs"),
+                    )
+                })
             })
             .collect();
         let batch_construct_ms = t0.elapsed().as_millis();
@@ -1180,11 +1423,13 @@ mod tests {
         let store3 = Store::open(dir.path()).await.unwrap();
         let mut g3 = Graph::load(store3).await.unwrap();
         let hub_batch: Vec<(String, EdgeKind, String)> = (0..n_files)
-            .map(|i| (
-                format!("file:src/module{i}.rs"),
-                EdgeKind::Imports,
-                "file:include/linux/types.h".to_string(),
-            ))
+            .map(|i| {
+                (
+                    format!("file:src/module{i}.rs"),
+                    EdgeKind::Imports,
+                    "file:include/linux/types.h".to_string(),
+                )
+            })
             .collect();
         g3.add_edges_batch(&hub_batch).await.unwrap();
         let t6 = Instant::now();
@@ -1192,23 +1437,26 @@ mod tests {
         let traversal_us = t6.elapsed().as_micros();
         assert_eq!(hub_sources.len(), n_files);
 
-
         // ── Breakdown ─────────────────────────────────────────────────────────
         let build_ms = batch_construct_ms + open_ms + add_batch_ms + close_ms;
-        let load_ms  = reopen_ms + graph_load_ms;
+        let load_ms = reopen_ms + graph_load_ms;
         println!("\nstress_700000  Linux kernel scale — step breakdown");
         println!("  BUILD  total={build_ms}ms");
         println!("    batch Vec construction : {batch_construct_ms}ms");
         println!("    Store::open (empty)    : {open_ms}ms");
-        println!("    add_edges_batch        : {add_batch_ms}ms  ← SurrealKV writes + in-mem insert");
+        println!(
+            "    add_edges_batch        : {add_batch_ms}ms  ← SurrealKV writes + in-mem insert"
+        );
         println!("    g.close / flush        : {close_ms}ms");
         println!("  LOAD   total={load_ms}ms");
         println!("    Store::open (cold)     : {reopen_ms}ms");
-        println!("    Graph::load (scan+petgraph): {graph_load_ms}ms  ← scan_keys + DiGraph rebuild");
+        println!(
+            "    Graph::load (scan+petgraph): {graph_load_ms}ms  ← scan_keys + DiGraph rebuild"
+        );
         println!("  TRAVERSAL");
         println!("    neighbors_incoming (70k edges): {traversal_us}µs  ← pure RAM");
 
         assert!(build_ms < 60_000, "build took {build_ms}ms");
-        assert!(load_ms  < 30_000, "load took {load_ms}ms");
+        assert!(load_ms < 30_000, "load took {load_ms}ms");
     }
 }
