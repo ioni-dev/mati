@@ -137,7 +137,10 @@ fn heading_to_category(heading: &str) -> Category {
         Category::Gotcha
     } else if lower.contains("decision") || lower.contains("adr") {
         Category::Decision
-    } else if lower.contains("sprint") || lower.contains("status") || lower.contains("current stage") {
+    } else if lower.contains("sprint")
+        || lower.contains("status")
+        || lower.contains("current stage")
+    {
         Category::Stage
     } else {
         Category::DevNote
@@ -314,7 +317,10 @@ Real content.
     fn heading_decisions_maps_to_decision() {
         assert_eq!(heading_to_category("Decisions"), Category::Decision);
         assert_eq!(heading_to_category("ADR"), Category::Decision);
-        assert_eq!(heading_to_category("Architecture Decision Records"), Category::Decision);
+        assert_eq!(
+            heading_to_category("Architecture Decision Records"),
+            Category::Decision
+        );
     }
 
     #[test]

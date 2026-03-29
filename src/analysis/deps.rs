@@ -81,10 +81,7 @@ impl DepSignals {
 ///
 /// Deduplication: if the same dep name appears from multiple manifests, the
 /// entry from the shallowest (fewest path separators) manifest wins.
-pub fn parse_dependencies(
-    repo_path: &Path,
-    walked_files: &[WalkedFile],
-) -> Result<DepSignals> {
+pub fn parse_dependencies(repo_path: &Path, walked_files: &[WalkedFile]) -> Result<DepSignals> {
     // Discover manifests, sorted by depth (shallowest first for dedup priority).
     let mut manifests: Vec<(ManifestKind, &str)> = walked_files
         .iter()
@@ -182,22 +179,23 @@ fn parse_cargo_toml(content: &str) -> Vec<DepEntry> {
         // Detect section headers — strip exactly one bracket from each end.
         if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             // Skip TOML array-of-tables `[[...]]`
-            let header = if let Some(inner2) = inner.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-                // Flush any pending table dep before switching sections.
-                if let Some(name) = table_dep_name.take() {
-                    deps.push(DepEntry {
-                        name,
-                        version: DepVersion::Declared(String::new()),
-                        manifest: ManifestKind::CargoToml,
-                        dev: table_dev,
-                    });
-                }
-                section = Section::None;
-                let _ = inner2;
-                continue;
-            } else {
-                inner.trim()
-            };
+            let header =
+                if let Some(inner2) = inner.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                    // Flush any pending table dep before switching sections.
+                    if let Some(name) = table_dep_name.take() {
+                        deps.push(DepEntry {
+                            name,
+                            version: DepVersion::Declared(String::new()),
+                            manifest: ManifestKind::CargoToml,
+                            dev: table_dev,
+                        });
+                    }
+                    section = Section::None;
+                    let _ = inner2;
+                    continue;
+                } else {
+                    inner.trim()
+                };
 
             // Flush any pending table dep before switching sections.
             if let Some(name) = table_dep_name.take() {
@@ -668,7 +666,10 @@ version = "0.1.0"
     #[test]
     fn package_json_malformed() {
         let deps = parse_package_json("{ this is not json }");
-        assert!(deps.is_empty(), "malformed JSON should return empty, not error");
+        assert!(
+            deps.is_empty(),
+            "malformed JSON should return empty, not error"
+        );
     }
 
     // ── go.mod ──────────────────────────────────────────────────────────────
@@ -836,7 +837,11 @@ anyhow = "1.0"
         let serde_entries: Vec<&DepEntry> =
             signals.deps.iter().filter(|d| d.name == "serde").collect();
         assert_eq!(serde_entries.len(), 1, "serde should be deduplicated");
-        assert_eq!(serde_entries[0].version, DepVersion::Declared("1.0".into()), "root manifest should win");
+        assert_eq!(
+            serde_entries[0].version,
+            DepVersion::Declared("1.0".into()),
+            "root manifest should win"
+        );
 
         // anyhow only in subcrate — should still be included
         assert!(find_dep(&signals.deps, "anyhow").is_some());
