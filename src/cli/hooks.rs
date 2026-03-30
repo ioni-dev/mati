@@ -294,6 +294,114 @@ async fn log_compliance_miss_impl(store: &Store, key: &str) -> Result<()> {
     sess::log_compliance_miss(store, key).await
 }
 
+pub async fn run_log_compliance_hit(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(
+        &root,
+        "log_compliance_hit",
+        serde_json::json!({ "key": key }),
+    )
+    .await
+    {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!("mati log-compliance-hit: daemon unresponsive — dropping event");
+                return Ok(());
+            }
+        }
+    }
+
+    let store = Store::open(&cwd).await?;
+    sess::log_compliance_hit(&store, key).await?;
+    store.close().await?;
+    Ok(())
+}
+
+pub async fn run_log_codex_shell_miss(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(
+        &root,
+        "log_codex_shell_miss",
+        serde_json::json!({ "key": key }),
+    )
+    .await
+    {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!("mati log-codex-shell-miss: daemon unresponsive — dropping event");
+                return Ok(());
+            }
+        }
+    }
+
+    let store = Store::open(&cwd).await?;
+    sess::log_codex_shell_miss(&store, key).await?;
+    store.close().await?;
+    Ok(())
+}
+
+pub async fn run_log_bootstrap(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_bootstrap", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!("mati log-bootstrap: daemon unresponsive — dropping event");
+                return Ok(());
+            }
+        }
+    }
+
+    let store = Store::open(&cwd).await?;
+    sess::log_bootstrap(&store, key).await?;
+    store.close().await?;
+    Ok(())
+}
+
+pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(&root, "log_prompt_nudge", serde_json::json!({ "key": key })).await {
+        DaemonResult::Ok(_) => return Ok(()),
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            let root = mati_root_for(&cwd)?;
+            if !crate::cli::daemon::is_pid_dead(&root) {
+                tracing::warn!("mati log-prompt-nudge: daemon unresponsive — dropping event");
+                return Ok(());
+            }
+        }
+    }
+
+    let store = Store::open(&cwd).await?;
+    sess::log_prompt_nudge(&store, key).await?;
+    store.close().await?;
+    Ok(())
+}
+
 // ── session-check-consulted ──────────────────────────────────────────────────
 
 pub async fn run_session_check_consulted(key: &str) -> Result<()> {
@@ -331,6 +439,39 @@ pub async fn run_session_check_consulted(key: &str) -> Result<()> {
 
 async fn check_consulted_impl(store: &Store, key: &str) -> Result<bool> {
     sess::check_consulted(store, key).await
+}
+
+pub async fn run_session_check_consulted_recent(key: &str, ttl_secs: u64) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    match daemon_result(
+        &root,
+        "session_check_consulted_recent",
+        serde_json::json!({ "key": key, "ttl_secs": ttl_secs }),
+    )
+    .await
+    {
+        DaemonResult::Ok(resp) => {
+            let value = resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("{value}");
+            return Ok(());
+        }
+        DaemonResult::NotRunning | DaemonResult::StaleSocket => {
+            try_auto_start(&cwd);
+        }
+        DaemonResult::Unresponsive => {
+            tracing::warn!("session-check-consulted-recent: daemon unresponsive — false");
+            println!("false");
+            return Ok(());
+        }
+    }
+
+    let store = Store::open(&cwd).await?;
+    let found = sess::check_consulted_recent(&store, key, ttl_secs).await?;
+    println!("{found}");
+    store.close().await?;
+    Ok(())
 }
 
 // ── session-flush ────────────────────────────────────────────────────────────

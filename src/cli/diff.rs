@@ -93,6 +93,7 @@ pub async fn run(args: DiffArgs) -> Result<()> {
             unknown += 1;
             continue;
         };
+        let _ = store.log_hit(&file_key).await;
 
         // Collect confirmed gotchas via gotcha_keys on the file record.
         let gotcha_keys = file_rec
@@ -144,7 +145,11 @@ pub async fn run(args: DiffArgs) -> Result<()> {
                 let stale_hint = match cg.staleness.tier {
                     StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
                         if use_color {
-                            format!(" {YELLOW}stale{RESET}", YELLOW = colors::YELLOW, RESET = colors::RESET)
+                            format!(
+                                " {YELLOW}stale{RESET}",
+                                YELLOW = colors::YELLOW,
+                                RESET = colors::RESET
+                            )
                         } else {
                             " stale".to_string()
                         }
@@ -174,9 +179,7 @@ pub async fn run(args: DiffArgs) -> Result<()> {
     if unknown > 0 {
         let gray = if use_color { colors::GRAY } else { "" };
         let reset = if use_color { colors::RESET } else { "" };
-        println!(
-            "  {gray}Run `mati explain <file>` for a full briefing on any file above.{reset}"
-        );
+        println!("  {gray}Run `mati explain <file>` for a full briefing on any file above.{reset}");
     }
     println!();
 
