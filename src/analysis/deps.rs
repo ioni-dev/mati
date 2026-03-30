@@ -91,12 +91,12 @@ pub fn dep_record_key(dep: &DepEntry) -> String {
 ///
 /// Supports both the new `dep:<ecosystem>:<name>` format and the legacy
 /// `dep:<name>` form so read paths stay compatible with old stores.
-pub fn dep_display_name_from_key<'a>(key: &'a str) -> &'a str {
+pub fn dep_display_name_from_key(key: &str) -> &str {
     let Some(rest) = key.strip_prefix("dep:") else {
         return key;
     };
     match rest.split_once(':') {
-        Some((ecosystem, name)) if matches!(ecosystem, "cargo" | "npm" | "go") => name,
+        Some(("cargo" | "npm" | "go", name)) => name,
         _ => rest,
     }
 }
