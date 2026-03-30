@@ -881,7 +881,7 @@ fn format_sentinel(ts: u64, pid: u32) -> String {
 }
 
 pub fn parse_sentinel(content: &str) -> Option<(u64, u32)> {
-    let mut parts = content.trim().split_whitespace();
+    let mut parts = content.split_whitespace();
     let ts = parts.next()?.parse::<u64>().ok()?;
     let pid = parts.next()?.parse::<u32>().ok()?;
     Some((ts, pid))

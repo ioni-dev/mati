@@ -29,7 +29,7 @@ use super::tools::MatiServer;
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 enum ServerOpen {
-    Direct(Store),
+    Direct(Box<Store>),
     Proxy(PathBuf),
 }
 
@@ -95,7 +95,7 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
                 }
             }
 
-            let graph = Graph::load(store)
+            let graph = Graph::load(*store)
                 .await
                 .context("failed to load knowledge graph")?;
 
@@ -219,7 +219,7 @@ async fn open_with_retry(
     let mati_root = mati_root_for(repo_root)?;
     for attempt in 0..=max_retries {
         match Store::open_and_rebuild(repo_root).await {
-            Ok(store) => return Ok(ServerOpen::Direct(store)),
+            Ok(store) => return Ok(ServerOpen::Direct(Box::new(store))),
             Err(e) => {
                 let is_lock = e.chain().any(|cause| {
                     let msg = cause.to_string();
