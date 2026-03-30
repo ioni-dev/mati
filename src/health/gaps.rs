@@ -169,9 +169,7 @@ fn action_hint_for_gap(gap_type: &GapType, key: &str) -> String {
         GapType::CoChangePairUnmapped => {
             format!("mati show {bare}  # review co-change pairs")
         }
-        GapType::StaleHotspot => {
-            "mati stale  # inspect staleness, then: mati enrich".to_string()
-        }
+        GapType::StaleHotspot => "mati stale  # inspect staleness, then: mati enrich".to_string(),
         GapType::HotFileNoTests => {
             format!("add tests for {bare} before the next change")
         }
