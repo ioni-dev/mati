@@ -1,11 +1,12 @@
 //! M-07-J: MCP stdio integration test.
 //!
-//! Spawns `mati serve` as a subprocess and drives all 3 MCP tools over the
+//! Spawns `mati serve` as a subprocess and drives all 4 MCP tools over the
 //! actual JSON-RPC 2.0 / stdio transport:
 //!
 //!   - `mem_get`       — direct key lookup (nonexistent key → null, no error)
 //!   - `mem_query`     — BM25 text search (empty store → empty results, no error)
 //!   - `mem_bootstrap` — context packet assembly (empty store → valid packet, no error)
+//!   - `mem_set`       — write enriched knowledge (M-11)
 //!
 //! The server is given a fresh temporary directory as its CWD so a new store
 //! is created in `~/.mati/<slug>/` without touching any real project store.
@@ -112,11 +113,11 @@ fn read_until_id(rx: &mpsc::Receiver<String>, expected_id: u64) -> serde_json::V
 
 // ── Main test ─────────────────────────────────────────────────────────────────
 
-/// Drive all 3 MCP tools over the real stdio transport.
+/// Drive all 4 MCP tools over the real stdio transport.
 ///
 /// Uses a fresh tempdir as the project root so no real store is modified.
 #[test]
-fn mcp_stdio_all_three_tools() {
+fn mcp_stdio_all_four_tools() {
     // ── 1. Set up a fresh project directory ──────────────────────────────────
     let project_dir = TempDir::new().expect("failed to create tempdir for MCP test");
 
@@ -191,24 +192,44 @@ fn mcp_stdio_all_three_tools() {
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .collect();
 
-    assert!(
-        tool_names.contains(&"mem_get"),
-        "tools/list missing mem_get. Got: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"mem_query"),
-        "tools/list missing mem_query. Got: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"mem_bootstrap"),
-        "tools/list missing mem_bootstrap. Got: {tool_names:?}"
-    );
+    for expected in &["mem_get", "mem_query", "mem_bootstrap", "mem_set"] {
+        assert!(
+            tool_names.contains(expected),
+            "tools/list missing {expected}. Got: {tool_names:?}"
+        );
+    }
     assert_eq!(
         tool_names.len(),
-        3,
-        "expected exactly 3 tools (hard limit), got {}: {tool_names:?}",
+        4,
+        "expected exactly 4 tools (hard limit), got {}: {tool_names:?}",
         tool_names.len()
     );
+
+    // Read tools must have readOnlyHint annotation
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("");
+        let read_only = tool
+            .get("annotations")
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(|v| v.as_bool());
+        match name {
+            "mem_get" | "mem_query" | "mem_bootstrap" => {
+                assert_eq!(
+                    read_only,
+                    Some(true),
+                    "{name} must have readOnlyHint=true"
+                );
+            }
+            "mem_set" => {
+                assert_eq!(
+                    read_only,
+                    Some(false),
+                    "mem_set must have readOnlyHint=false"
+                );
+            }
+            _ => {}
+        }
+    }
 
     // ── 5. mem_get — nonexistent key returns null content, no error ───────────
     send(
@@ -277,7 +298,35 @@ fn mcp_stdio_all_three_tools() {
         "mem_bootstrap content should contain '[mati]' Vector B marker. Got: {bootstrap_text}"
     );
 
-    // ── 8. Cleanup ────────────────────────────────────────────────────────────
+    // ── 8. mem_set — write a gotcha record, verify ok response ────────────
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"mem_set","arguments":{"key":"gotcha:test-write","value":"Never call unwrap in error paths because it panics in production","category":"Gotcha","payload":{"rule":"Never call unwrap in error paths","reason":"Causes panics in production","severity":"High","affected_files":["src/main.rs"],"confirmed":false}}}}"#,
+    );
+
+    let mem_set_response = read_until_id(&rx, 6);
+
+    assert!(
+        mem_set_response.get("error").is_none(),
+        "mem_set should not return a JSON-RPC error: {mem_set_response}"
+    );
+    assert!(
+        mem_set_response["result"].get("content").is_some(),
+        "mem_set result missing 'content' field: {}",
+        mem_set_response["result"]
+    );
+    let set_text = mem_set_response["result"]["content"]
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    assert!(
+        set_text.contains("\"ok\"") || set_text.contains("gotcha:test-write"),
+        "mem_set should confirm the write. Got: {set_text}"
+    );
+
+    // ── 9. Cleanup ────────────────────────────────────────────────────────────
     // `_guard` is dropped here → kill() + wait() called automatically.
     // `project_dir` is dropped here → temp directory cleaned up.
 }

@@ -29,7 +29,10 @@ fn mati_bin() -> PathBuf {
         return PathBuf::from(p);
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(manifest).join("target").join("debug").join("mati")
+    PathBuf::from(manifest)
+        .join("target")
+        .join("debug")
+        .join("mati")
 }
 
 /// Run mati with the given args, isolating HOME to `home` and CWD to `repo`.
@@ -132,6 +135,26 @@ fn init_repo(bin: &Path, repo: &Path, home: &Path) -> String {
     stdout
 }
 
+/// Run `mati init --codex` after creating a repo-local `.codex/` dir.
+fn init_repo_codex(bin: &Path, repo: &Path, home: &Path) -> String {
+    std::fs::create_dir_all(repo.join(".codex")).expect("mkdir .codex");
+    let (stdout, stderr, ok) = run(bin, repo, home, &["init", "--codex"]);
+    if !ok {
+        panic!("mati init --codex failed:\nstdout: {stdout}\nstderr: {stderr}");
+    }
+    stdout
+}
+
+/// Run plain `mati init` in a repo that already has `.codex/`.
+fn init_repo_autodetect_codex(bin: &Path, repo: &Path, home: &Path) -> String {
+    std::fs::create_dir_all(repo.join(".codex")).expect("mkdir .codex");
+    let (stdout, stderr, ok) = run(bin, repo, home, &["init"]);
+    if !ok {
+        panic!("mati init failed in codex repo:\nstdout: {stdout}\nstderr: {stderr}");
+    }
+    stdout
+}
+
 // Strip ANSI escape codes (safety net if NO_COLOR isn't respected)
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -160,7 +183,6 @@ fn assert_contains(haystack: &str, needle: &str) {
     );
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -170,12 +192,7 @@ fn assert_contains(haystack: &str, needle: &str) {
 #[test]
 fn help_workflow_framing() {
     let bin = mati_bin();
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        Path::new("."),
-        Path::new("/tmp"),
-        &["--help"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, Path::new("."), Path::new("/tmp"), &["--help"]);
     assert!(ok, "mati --help should succeed");
     let out = strip_ansi(&stdout);
 
@@ -198,12 +215,7 @@ fn help_workflow_framing() {
 #[test]
 fn help_subcommands_present() {
     let bin = mati_bin();
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        Path::new("."),
-        Path::new("/tmp"),
-        &["--help"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, Path::new("."), Path::new("/tmp"), &["--help"]);
     assert!(ok);
     let out = strip_ansi(&stdout);
 
@@ -269,6 +281,34 @@ fn init_summary_has_candidate_categories() {
     assert_contains(&stdout, "gotcha candidates:");
     assert_contains(&stdout, "dep records:");
     assert_contains(&stdout, "hotspot files:");
+}
+
+#[test]
+fn init_codex_reports_platform_capability() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let stdout = init_repo_codex(&bin, repo_dir.path(), home_dir.path());
+
+    assert_contains(&stdout, "integration:");
+    assert_contains(&stdout, "Codex");
+    assert_contains(&stdout, "Codex capability:");
+    assert_contains(&stdout, "hard Bash enforcement");
+    assert_contains(&stdout, "soft native-read enforcement");
+}
+
+#[test]
+fn init_autodetects_codex_without_forcing_claude() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let stdout = init_repo_autodetect_codex(&bin, repo_dir.path(), home_dir.path());
+
+    assert_contains(&stdout, "integration:");
+    assert_contains(&stdout, "Codex");
+    assert!(
+        !strip_ansi(&stdout).contains("Claude + Codex"),
+        "plain init in a codex-only repo should not force Claude installation\n--- stdout ---\n{}",
+        strip_ansi(&stdout)
+    );
 }
 
 // ── 3. Explain: output sections and trust cues ─────────────────────────────
@@ -366,12 +406,7 @@ fn diff_output_structure() {
         .output()
         .expect("git commit");
 
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        repo,
-        home_dir.path(),
-        &["diff", "HEAD~1"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["diff", "HEAD~1"]);
     assert!(ok, "mati diff should succeed");
 
     // Header shows the range
@@ -399,8 +434,11 @@ fn diff_summary_line_format() {
     init_repo(&bin, repo, home_dir.path());
 
     // Second commit
-    std::fs::write(repo.join("src/lib.rs"), "pub fn sub(a: i32, b: i32) -> i32 { a - b }\n")
-        .expect("update lib.rs");
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        "pub fn sub(a: i32, b: i32) -> i32 { a - b }\n",
+    )
+    .expect("update lib.rs");
     Command::new("git")
         .args(["add", "src/lib.rs"])
         .current_dir(repo)
@@ -412,12 +450,7 @@ fn diff_summary_line_format() {
         .output()
         .expect("git commit");
 
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        repo,
-        home_dir.path(),
-        &["diff", "HEAD~1"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["diff", "HEAD~1"]);
     assert!(ok);
 
     // Summary line must include all three counters
@@ -434,12 +467,7 @@ fn status_dashboard_sections() {
     let (repo_dir, home_dir) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        repo_dir.path(),
-        home_dir.path(),
-        &["status"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, repo_dir.path(), home_dir.path(), &["status"]);
     assert!(ok, "mati status should succeed");
 
     // Dashboard header
@@ -462,19 +490,13 @@ fn status_trust_section_with_unconfirmed() {
     let (repo_dir, home_dir) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        repo_dir.path(),
-        home_dir.path(),
-        &["status"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, repo_dir.path(), home_dir.path(), &["status"]);
     assert!(ok);
 
     // After init, there are unconfirmed candidates — trust section should appear
     // with guidance to run review. If no gotcha candidates were generated,
     // the "No gotchas yet" guidance should appear instead.
-    let has_trust_guidance = stdout.contains("mati review")
-        || stdout.contains("No gotchas yet");
+    let has_trust_guidance = stdout.contains("mati review") || stdout.contains("No gotchas yet");
     assert!(
         has_trust_guidance,
         "status should show trust guidance or no-gotchas hint\n--- stdout ---\n{stdout}"
@@ -525,8 +547,14 @@ fn repair_check_json_output() {
     // Output should be valid JSON with expected fields
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .expect("repair --check --json should produce valid JSON");
-    assert!(v.get("scanned_gotchas").is_some(), "JSON should have scanned_gotchas");
-    assert!(v.get("scanned_files").is_some(), "JSON should have scanned_files");
+    assert!(
+        v.get("scanned_gotchas").is_some(),
+        "JSON should have scanned_gotchas"
+    );
+    assert!(
+        v.get("scanned_files").is_some(),
+        "JSON should have scanned_files"
+    );
 }
 
 // ── 7. Review help: explains the workflow ──────────────────────────────────
@@ -573,6 +601,22 @@ fn repair_help_explains_semantics() {
     assert_contains(&stdout, "integrity");
 }
 
+#[test]
+fn status_shows_codex_platform_mode() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    init_repo_codex(&bin, repo, home_dir.path());
+
+    let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["status"]);
+    assert!(ok, "mati status should succeed");
+
+    assert_contains(&stdout, "Platform");
+    assert_contains(&stdout, "Codex");
+    assert_contains(&stdout, "hard Bash enforcement");
+    assert_contains(&stdout, "soft native-read enforcement");
+}
+
 // ── 9. Explain help: describes the briefing ────────────────────────────────
 
 #[test]
@@ -597,12 +641,7 @@ fn explain_help_describes_briefing() {
 #[test]
 fn diff_help_describes_premerge() {
     let bin = mati_bin();
-    let (stdout, _stderr, ok) = run(
-        &bin,
-        Path::new("."),
-        Path::new("/tmp"),
-        &["diff", "--help"],
-    );
+    let (stdout, _stderr, ok) = run(&bin, Path::new("."), Path::new("/tmp"), &["diff", "--help"]);
     assert!(ok);
 
     assert_contains(&stdout, "Pre-merge");
