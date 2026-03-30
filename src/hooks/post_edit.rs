@@ -6,6 +6,7 @@
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # mati post-edit hook — edit activity tracking + doc comment capture
 set -euo pipefail
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 
 INPUT=$(cat)
 

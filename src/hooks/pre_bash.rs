@@ -5,6 +5,7 @@
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # mati pre-bash hook — file-reading command detection (M-09-B, M-13-D staleness)
 set -euo pipefail
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 
 INPUT=$(cat)
 
