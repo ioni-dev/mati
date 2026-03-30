@@ -830,13 +830,29 @@ impl Store {
 /// If a store open fails and the LOCK file exists, another mati process (MCP
 /// server or daemon) holds the exclusive SurrealKV lock. Replace the raw OS
 /// error with an actionable message.
+/// Improve SurrealKV open errors with actionable context.
+///
+/// SurrealKV's LOCK file always exists after first use — it is never deleted.
+/// The OS-level flock is what prevents concurrent access, not the file's
+/// existence. So we detect lock contention by checking the *error message*,
+/// not by checking if the LOCK file exists.
 fn lock_error_hint(err: anyhow::Error, db_path: &std::path::Path) -> anyhow::Error {
-    let lock_file = db_path.join("LOCK");
-    if lock_file.exists() {
+    let msg = format!("{err}");
+    if msg.contains("already locked") || msg.contains("WouldBlock") {
+        // Real lock contention — another process holds the flock.
+        // Read the PID from the LOCK file if available.
+        let lock_file = db_path.join("LOCK");
+        let pid_hint = std::fs::read_to_string(&lock_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|pid| format!(" (holder PID: {pid})"))
+            .unwrap_or_default();
         anyhow::anyhow!(
-            "cannot open {} — another mati process (MCP server or daemon) holds the lock.\n\
-             Stop the process first, or use `mem_get`/`mem_query` via the MCP tools in Claude.\n\
-             To stop the daemon: `mati daemon stop`",
+            "cannot open {} — another mati process holds the lock{pid_hint}.\n\
+             This is usually the MCP server (mati serve) or a background daemon.\n\
+             To stop the daemon: `mati daemon stop`\n\
+             To check: `lsof {}/LOCK`",
+            db_path.display(),
             db_path.display()
         )
     } else {
@@ -2250,7 +2266,11 @@ mod tests {
         store.delete(&deleted.key).await.unwrap();
 
         let results = store.search("shared_sentinel_term", 1).await.unwrap();
-        assert_eq!(results.len(), 1, "live hit should still fill the top-k slot");
+        assert_eq!(
+            results.len(),
+            1,
+            "live hit should still fill the top-k slot"
+        );
         assert_eq!(results[0].key, "gotcha:live-slot");
     }
 
@@ -2650,7 +2670,11 @@ mod tests {
 
         let reopened = reopen_store_open_and_rebuild_like(&root).await;
         let results = reopened.search("shared_crash_sentinel", 1).await.unwrap();
-        assert_eq!(results.len(), 1, "live record should fill top-k after rebuild");
+        assert_eq!(
+            results.len(),
+            1,
+            "live record should fill top-k after rebuild"
+        );
         assert_eq!(results[0].key, "gotcha:live-after-crash");
         assert!(
             !root.join(SEARCH_SYNC_PENDING).exists(),
@@ -2961,5 +2985,51 @@ mod tests {
             is_tombstone: false,
         };
         assert_eq!(entry.timestamp_secs, entry.timestamp_ns / 1_000_000_000);
+    }
+
+    // ─── lock_error_hint ──────────────────────────────────────────────────
+
+    #[test]
+    fn lock_error_hint_rewrites_real_lock_contention_error() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("knowledge.db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // Write a fake LOCK file with a PID
+        std::fs::write(db_path.join("LOCK"), "12345\n").unwrap();
+
+        let err = anyhow::anyhow!("Database at /foo/LOCK is already locked by another process");
+        let result = lock_error_hint(err, &db_path);
+        let msg = format!("{result}");
+        assert!(
+            msg.contains("another mati process holds the lock"),
+            "should rewrite lock error, got: {msg}"
+        );
+        assert!(
+            msg.contains("PID: 12345"),
+            "should include holder PID, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn lock_error_hint_passes_through_non_lock_errors() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("knowledge.db");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        // LOCK file exists (as it always does after first use)
+        std::fs::write(db_path.join("LOCK"), "99999\n").unwrap();
+
+        let err = anyhow::anyhow!("WAL segment corrupt at offset 1234");
+        let result = lock_error_hint(err, &db_path);
+        let msg = format!("{result}");
+        assert!(
+            msg.contains("WAL segment corrupt"),
+            "non-lock errors must pass through unchanged, got: {msg}"
+        );
+        assert!(
+            !msg.contains("another mati process"),
+            "non-lock errors must NOT be rewritten to lock errors, got: {msg}"
+        );
     }
 }
