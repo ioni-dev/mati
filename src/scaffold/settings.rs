@@ -143,7 +143,7 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
 
     // Write .mcp.json to project root — Claude Code's primary MCP config location.
     let mcp_json_path = project_root.join(".mcp.json");
-    write_mcp_json(&mcp_json_path)
+    write_mcp_json(&mcp_json_path, project_root)
         .with_context(|| format!("failed to write {}", mcp_json_path.display()))?;
 
     // Create hooks directory and write scripts.
@@ -158,27 +158,15 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
         make_executable(&path)?;
     }
 
+    // Write mati binary wrapper so hooks resolve the same binary as MCP.
+    super::write_mati_wrapper(&hooks_dir)?;
+
     let missing_deps = missing_hook_dependencies();
 
     Ok(InstallResult::Installed {
         scripts: HOOK_SCRIPTS.len(),
         missing_deps,
     })
-}
-
-/// Resolve the absolute path to the running mati binary.
-///
-/// Claude Code spawns MCP server processes with a restricted PATH that may not
-/// include `~/.cargo/bin`. Using the absolute path guarantees the server starts
-/// regardless of the subprocess environment.
-fn mati_binary_path() -> String {
-    // std::env::current_exe() returns the path of the currently-running binary.
-    // Fall back to the bare name if resolution fails (e.g. during tests).
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.canonicalize().ok())
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "mati".to_owned())
 }
 
 /// Merge mati's hook and MCP server registration into an existing settings.json.
@@ -189,7 +177,7 @@ fn mati_binary_path() -> String {
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
     // Inject absolute binary path so Claude Code can find it regardless of PATH.
-    mati_settings["mcpServers"]["mati"]["command"] = serde_json::Value::String(mati_binary_path());
+    mati_settings["mcpServers"]["mati"]["command"] = serde_json::Value::String(super::mati_binary_path());
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -256,14 +244,12 @@ fn merge_hooks(root: &mut serde_json::Map<String, Value>, mati_hooks: &Value) {
 }
 
 fn mati_hook_commands(entries: &[Value]) -> Vec<String> {
-    entries
-        .iter()
-        .flat_map(entry_hook_commands)
-        .collect()
+    entries.iter().flat_map(entry_hook_commands).collect()
 }
 
 fn entry_hook_commands(entry: &Value) -> Vec<String> {
-    entry.get("hooks")
+    entry
+        .get("hooks")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -286,15 +272,18 @@ fn entry_contains_owned_command(entry: &Value, owned_commands: &[String]) -> boo
 ///
 /// Uses the absolute binary path so Claude Code can find mati regardless of
 /// the restricted PATH it uses when spawning MCP server subprocesses.
-fn write_mcp_json(path: &Path) -> Result<()> {
+fn write_mcp_json(path: &Path, project_root: &Path) -> Result<()> {
+    let canonical = std::fs::canonicalize(project_root)
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let mati_server = serde_json::json!({
-        "command": mati_binary_path(),
-        "args": ["serve"]
+        "command": super::mati_binary_path(),
+        "args": ["serve", "--path", canonical.to_string_lossy()]
     });
 
     let mut mcp_config = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
-        serde_json::from_str(&existing_str).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+        serde_json::from_str(&existing_str)
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
     } else {
         Value::Object(serde_json::Map::new())
     };
@@ -349,34 +338,7 @@ where
     missing
 }
 
-/// Write a file only if the content differs from what's on disk.
-/// Avoids unnecessary writes and timestamp churn.
-fn write_if_changed(path: &Path, content: &str) -> Result<()> {
-    if path.exists() {
-        if let Ok(existing) = std::fs::read_to_string(path) {
-            if existing == content {
-                return Ok(());
-            }
-        }
-    }
-    std::fs::write(path, content)?;
-    Ok(())
-}
-
-/// Set the executable bit on a file (Unix only).
-#[cfg(unix)]
-fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) -> Result<()> {
-    Ok(())
-}
+use super::{make_executable, write_if_changed};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -582,12 +544,13 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
 
-        write_mcp_json(&path).unwrap();
+        write_mcp_json(&path, dir.path()).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
+        assert_eq!(parsed["mcpServers"]["mati"]["args"][1], "--path");
     }
 
     #[test]
@@ -616,5 +579,59 @@ mod tests {
 
         assert_eq!(first_content, second_content);
         assert_eq!(first_mcp, second_mcp);
+    }
+
+    #[test]
+    fn claude_wrapper_exists_and_matches_mcp_config() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        install_hooks(dir.path()).unwrap();
+
+        // Wrapper must exist
+        let wrapper_path = dir.path().join(".claude/hooks/mati");
+        assert!(
+            wrapper_path.exists(),
+            ".claude/hooks/mati wrapper must exist"
+        );
+
+        let wrapper = std::fs::read_to_string(&wrapper_path).unwrap();
+        assert!(wrapper.contains("exec"), "wrapper must use exec");
+
+        // Extract exec target
+        let exec_line = wrapper.lines().find(|l| l.contains("exec")).unwrap();
+        let exec_target = exec_line
+            .strip_prefix("exec \"")
+            .and_then(|s| s.strip_suffix("\" \"$@\""))
+            .expect("exec line must follow format: exec \"<path>\" \"$@\"");
+
+        // MCP config must point to the same binary
+        let settings =
+            std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        let mcp_command = parsed["mcpServers"]["mati"]["command"]
+            .as_str()
+            .expect("mcpServers.mati.command must be a string");
+
+        assert_eq!(
+            exec_target, mcp_command,
+            "wrapper and MCP config must use the same binary path"
+        );
+    }
+
+    #[test]
+    fn claude_hook_scripts_prepend_hooks_dir_to_path() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        install_hooks(dir.path()).unwrap();
+
+        for (name, _) in HOOK_SCRIPTS {
+            let path = dir.path().join(".claude/hooks").join(name);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("hook script {name} must exist"));
+            assert!(
+                content.contains("HOOKS_DIR=") && content.contains("export PATH="),
+                "hook script {name} must prepend HOOKS_DIR to PATH"
+            );
+        }
     }
 }

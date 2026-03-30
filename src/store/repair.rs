@@ -61,8 +61,8 @@ use serde::{Deserialize, Serialize};
 use crate::graph::edges::{Edge, EdgeKind};
 use crate::store::db::Store;
 use crate::store::record::{
-    Category, GotchaRecord, Priority, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore,
+    Category, GotchaRecord, Priority, Record, RecordLifecycle, RecordSource, RecordVersion,
+    StalenessScore,
 };
 
 fn now_secs() -> u64 {
@@ -145,7 +145,9 @@ pub async fn mark_dirty(store: &Store, gotcha_key: &str, cause: &str) {
     let now = now_secs();
 
     // Try to read existing marker to preserve history
-    let mut marker = read_dirty_marker(store).await.unwrap_or_else(DirtyMarker::clean);
+    let mut marker = read_dirty_marker(store)
+        .await
+        .unwrap_or_else(DirtyMarker::clean);
     marker.dirty = true;
     if marker.dirty_since == 0 {
         marker.dirty_since = now;
@@ -210,8 +212,7 @@ pub async fn is_dirty(store: &Store) -> bool {
 /// Does not write anything.
 pub async fn check_gotcha_indexes(store: &Store) -> Result<RepairReport> {
     // Phase 1: derive desired state from canonical gotcha records
-    let (desired_file_links, desired_edges, scanned_gotchas) =
-        derive_desired_state(store).await?;
+    let (desired_file_links, desired_edges, scanned_gotchas) = derive_desired_state(store).await?;
 
     // Phase 2: diff against actual state
     let (actual_file_links, scanned_files) = read_actual_file_links(store).await?;
@@ -255,8 +256,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     }
 
     // Phase 1: derive desired state
-    let (desired_file_links, desired_edges, scanned_gotchas) =
-        derive_desired_state(store).await?;
+    let (desired_file_links, desired_edges, scanned_gotchas) = derive_desired_state(store).await?;
 
     // Phase 2: diff
     let (actual_file_links, scanned_files) = read_actual_file_links(store).await?;
@@ -266,10 +266,8 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
         diff_file_links(&desired_file_links, &actual_file_links);
     let (missing_edges, stale_edges) = diff_edges(&desired_edges, &actual_edges);
 
-    let total_drift = missing_file_links.len()
-        + stale_file_links.len()
-        + missing_edges.len()
-        + stale_edges.len();
+    let total_drift =
+        missing_file_links.len() + stale_file_links.len() + missing_edges.len() + stale_edges.len();
 
     if total_drift == 0 {
         // Already clean — clear dirty marker if set
@@ -299,10 +297,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
             let current_sorted: Vec<&String> = current_keys.iter().collect();
 
             if desired_sorted != current_sorted {
-                set_gotcha_keys(
-                    &mut record,
-                    desired_keys.iter().cloned().collect(),
-                );
+                set_gotcha_keys(&mut record, desired_keys.iter().cloned().collect());
                 record.updated_at = now;
                 record.version.logical_clock += 1;
                 record.version.wall_clock = now;
@@ -394,12 +389,10 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
     for gotcha_key in &marker.affected_keys {
         // Read canonical state for this gotcha
         let desired_files: Vec<String> = match store.get(gotcha_key).await? {
-            Some(record) if matches!(record.lifecycle, RecordLifecycle::Active) => {
-                record
-                    .payload_as::<GotchaRecord>()
-                    .map(|g| g.affected_files)
-                    .unwrap_or_default()
-            }
+            Some(record) if matches!(record.lifecycle, RecordLifecycle::Active) => record
+                .payload_as::<GotchaRecord>()
+                .map(|g| g.affected_files)
+                .unwrap_or_default(),
             // Tombstoned or missing — desired state is empty
             _ => vec![],
         };
@@ -463,7 +456,8 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
                     }
                 }
                 // Also remove stale HasGotcha edge
-                let edge_key = Edge::new(&file_record.key, EdgeKind::HasGotcha, gotcha_key.as_str()).to_key();
+                let edge_key =
+                    Edge::new(&file_record.key, EdgeKind::HasGotcha, gotcha_key.as_str()).to_key();
                 let _ = store.delete(&edge_key).await;
             }
         }
@@ -649,11 +643,7 @@ fn set_gotcha_keys(record: &mut Record, keys: Vec<String>) {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
                 "gotcha_keys".into(),
-                serde_json::Value::Array(
-                    keys.into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
+                serde_json::Value::Array(keys.into_iter().map(serde_json::Value::String).collect()),
             );
         }
     }
@@ -797,10 +787,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .put(
-                "file:src/a.rs",
-                &make_file("src/a.rs", &["gotcha:g1"]),
-            )
+            .put("file:src/a.rs", &make_file("src/a.rs", &["gotcha:g1"]))
             .await
             .unwrap();
 
@@ -849,10 +836,7 @@ mod tests {
 
         // No active gotcha, but file still references one
         store
-            .put(
-                "file:src/a.rs",
-                &make_file("src/a.rs", &["gotcha:deleted"]),
-            )
+            .put("file:src/a.rs", &make_file("src/a.rs", &["gotcha:deleted"]))
             .await
             .unwrap();
 
@@ -885,7 +869,9 @@ mod tests {
             .await
             .unwrap();
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full).await.unwrap();
+        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+            .await
+            .unwrap();
         assert!(report.verification_passed);
         assert!(report.repaired_count > 0);
         assert!(report.dirty_marker_cleared);
@@ -898,10 +884,8 @@ mod tests {
 
         // Verify edges exist
         let edges = store.scan_keys("graph:edge:").await.unwrap();
-        let edge_a =
-            Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:g1").to_key();
-        let edge_b =
-            Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:g1").to_key();
+        let edge_a = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:g1").to_key();
+        let edge_b = Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:g1").to_key();
         assert!(edges.contains(&edge_a));
         assert!(edges.contains(&edge_b));
 
@@ -915,14 +899,13 @@ mod tests {
 
         // File references a gotcha that doesn't exist
         store
-            .put(
-                "file:src/a.rs",
-                &make_file("src/a.rs", &["gotcha:ghost"]),
-            )
+            .put("file:src/a.rs", &make_file("src/a.rs", &["gotcha:ghost"]))
             .await
             .unwrap();
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full).await.unwrap();
+        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+            .await
+            .unwrap();
         assert!(report.verification_passed);
 
         let a = store.get("file:src/a.rs").await.unwrap().unwrap();
@@ -1013,10 +996,18 @@ mod tests {
 
         // ── Repair restores consistency ───────────────────────────────────
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full).await.unwrap();
+        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+            .await
+            .unwrap();
         assert!(report.repaired_count > 0, "repair should fix something");
-        assert!(report.verification_passed, "post-repair verification must pass");
-        assert!(report.dirty_marker_cleared, "dirty marker must be cleared after verified repair");
+        assert!(
+            report.verification_passed,
+            "post-repair verification must pass"
+        );
+        assert!(
+            report.dirty_marker_cleared,
+            "dirty marker must be cleared after verified repair"
+        );
 
         // File links now correct
         let a2 = store.get("file:src/a.rs").await.unwrap().unwrap();
@@ -1074,8 +1065,7 @@ mod tests {
             .unwrap();
 
         // Also add a stale edge for A
-        let stale_edge =
-            Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:moved");
+        let stale_edge = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:moved");
         store
             .put_raw(&stale_edge.to_key(), &now_secs().to_le_bytes())
             .await
@@ -1086,7 +1076,10 @@ mod tests {
 
         // Run fast repair
         let report = repair_fast(&store, now_secs()).await.unwrap();
-        assert!(report.repaired_count > 0, "fast repair should fix something");
+        assert!(
+            report.repaired_count > 0,
+            "fast repair should fix something"
+        );
         assert!(report.dirty_marker_cleared);
 
         // A should no longer reference the gotcha

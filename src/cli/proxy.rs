@@ -211,6 +211,19 @@ impl StoreProxy {
         }
     }
 
+    /// Record a consultation receipt for a key.
+    pub async fn log_hit(&self, key: &str) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(store) => mati_core::store::session::log_hit(store, key).await,
+            ProxyInner::Socket { root } => {
+                match daemon_result(root, "log_hit", json!({ "key": key })).await {
+                    DaemonResult::Ok(_) => Ok(()),
+                    other => Err(socket_read_error("log_hit", other)),
+                }
+            }
+        }
+    }
+
     /// Version history for a single key, newest first.
     ///
     /// Only works in direct mode. In socket mode this errors with a message

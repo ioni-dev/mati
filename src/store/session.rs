@@ -80,6 +80,8 @@ pub const MAX_AGG_KEYS: usize = 100;
 const STALE_REVIEW_MIN: f32 = 0.4;
 /// Maximum staleness value for stale review inclusion (Liability and above excluded).
 const STALE_REVIEW_MAX: f32 = 0.7;
+/// Default TTL for recent consultation receipts (15 minutes).
+pub const CONSULTED_RECENT_TTL_SECS: u64 = 900;
 /// Maximum entries in a single daily stale review record.
 pub const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 /// Minimum access count before an unconfirmed gotcha is auto-promoted.
@@ -163,12 +165,46 @@ pub async fn log_compliance_miss(store: &Store, key: &str) -> Result<()> {
     upsert_daily_agg(store, &agg_key, key).await
 }
 
+/// Record a Codex shell compliance hit: Bash file inspection after consultation.
+pub async fn log_compliance_hit(store: &Store, key: &str) -> Result<()> {
+    let agg_key = today_key("compliance:codex_shell_hit_");
+    upsert_daily_agg(store, &agg_key, key).await
+}
+
+/// Record a Codex shell compliance miss: Bash file inspection without consultation.
+pub async fn log_codex_shell_miss(store: &Store, key: &str) -> Result<()> {
+    let agg_key = today_key("compliance:codex_shell_miss_");
+    upsert_daily_agg(store, &agg_key, key).await
+}
+
+/// Record a Codex prompt nudge: prompt indicated code work before clear consultation.
+pub async fn log_prompt_nudge(store: &Store, key: &str) -> Result<()> {
+    let agg_key = today_key("analytics:codex_prompt_nudge_");
+    upsert_daily_agg(store, &agg_key, key).await
+}
+
+/// Record a bootstrap event. Used to measure Codex/agent bootstrap adoption.
+pub async fn log_bootstrap(store: &Store, key: &str) -> Result<()> {
+    let agg_key = today_key("analytics:bootstrap_");
+    upsert_daily_agg(store, &agg_key, key).await
+}
+
 // ── check_consulted ───────────────────────────────────────────────────────────
 
 /// Return true if `session:consulted:{key}` exists (set by `log_hit`).
 pub async fn check_consulted(store: &Store, key: &str) -> Result<bool> {
     let consulted_key = format!("session:consulted:{key}");
     Ok(store.get(&consulted_key).await?.is_some())
+}
+
+/// Return true if the consulted marker exists and is newer than `ttl_secs`.
+pub async fn check_consulted_recent(store: &Store, key: &str, ttl_secs: u64) -> Result<bool> {
+    let consulted_key = format!("session:consulted:{key}");
+    let Some(record) = store.get(&consulted_key).await? else {
+        return Ok(false);
+    };
+    let age = now_secs().saturating_sub(record.updated_at);
+    Ok(age <= ttl_secs)
 }
 
 // ── session_flush ─────────────────────────────────────────────────────────────
@@ -636,4 +672,52 @@ pub async fn collect_stale_entries(
     entries.truncate(MAX_STALE_REVIEW_ENTRIES);
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    async fn temp_store() -> (TempDir, Store) {
+        let dir = TempDir::new().expect("tempdir");
+        let store = Store::open(dir.path()).await.expect("open store");
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn log_bootstrap_creates_daily_aggregate() {
+        let (_dir, store) = temp_store().await;
+
+        log_bootstrap(&store, "__bootstrap__")
+            .await
+            .expect("log bootstrap");
+
+        let key = today_key("analytics:bootstrap_");
+        let record = store
+            .get(&key)
+            .await
+            .expect("get bootstrap aggregate")
+            .expect("bootstrap record exists");
+        let agg = record.payload_as::<DailyAgg>().expect("daily agg payload");
+        assert_eq!(agg.count, 1);
+        assert_eq!(agg.keys, vec!["__bootstrap__".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn check_consulted_recent_uses_receipt_ttl() {
+        let (_dir, store) = temp_store().await;
+        let key = "file:src/main.rs";
+
+        assert!(!check_consulted_recent(&store, key, 900)
+            .await
+            .expect("no receipt yet"));
+
+        log_hit(&store, key).await.expect("log consultation hit");
+
+        assert!(check_consulted_recent(&store, key, 900)
+            .await
+            .expect("fresh receipt should be valid"));
+    }
 }

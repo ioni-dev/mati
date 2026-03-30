@@ -399,7 +399,11 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         .collect();
 
     if !unconfirmed.is_empty() {
-        let oldest_created = unconfirmed.iter().map(|r| r.created_at).min().unwrap_or(now);
+        let oldest_created = unconfirmed
+            .iter()
+            .map(|r| r.created_at)
+            .min()
+            .unwrap_or(now);
         let oldest_days = (now.saturating_sub(oldest_created)) / 86400;
         let confirmed_total = gotchas.len() - unconfirmed.len();
         let confirmation_rate = if gotchas.is_empty() {
@@ -420,9 +424,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
             "    Confirmation rate  {white}{confirmation_rate}%{reset}  {gray}({confirmed_total}/{} gotchas){reset}",
             gotchas.len()
         );
-        println!(
-            "    Oldest pending     {age_color}{oldest_days}d{reset}"
-        );
+        println!("    Oldest pending     {age_color}{oldest_days}d{reset}");
     }
 
     println!();

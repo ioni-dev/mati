@@ -21,7 +21,7 @@ mod cli;
     version,
     about = "Engineering knowledge that survives turnover",
     long_about = "mati is a persistent, queryable knowledge store for codebases.\n\
-                  Exposed as a Claude Code plugin via MCP stdio.\n\n\
+                  Exposed to agents via MCP stdio, with Claude and Codex integration paths.\n\n\
                   Core workflow:\n  \
                     mati init              build project memory\n  \
                     mati explain <file>    file briefing before editing\n  \
@@ -92,8 +92,14 @@ enum Commands {
     Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
     Ping,
-    /// Run as MCP stdio server (for Claude Code plugin)
-    Serve,
+    /// Run as MCP stdio server (for Claude/Codex agent integration)
+    Serve {
+        /// Project root directory. Defaults to current working directory.
+        /// Required when the MCP host (e.g. Codex) spawns the server with
+        /// a working directory that differs from the project root.
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+    },
     // ── Internal hook commands (hidden from --help) ─────────────────────
     #[command(hide = true)]
     DocCapture {
@@ -109,7 +115,21 @@ enum Commands {
     #[command(hide = true)]
     LogComplianceMiss { key: String },
     #[command(hide = true)]
+    LogComplianceHit { key: String },
+    #[command(hide = true)]
+    LogCodexShellMiss { key: String },
+    #[command(hide = true)]
+    LogBootstrap { key: String },
+    #[command(hide = true)]
+    LogPromptNudge { key: String },
+    #[command(hide = true)]
     SessionCheckConsulted { key: String },
+    #[command(hide = true)]
+    SessionCheckConsultedRecent {
+        key: String,
+        #[arg(long, default_value_t = mati_core::store::session::CONSULTED_RECENT_TTL_SECS)]
+        ttl_secs: u64,
+    },
     #[command(hide = true)]
     SessionFlush,
     #[command(hide = true)]
@@ -185,16 +205,26 @@ async fn main() -> Result<()> {
             println!("mati ok  {latency_us}µs");
             Ok(())
         }
-        Commands::Serve => {
-            let cwd = std::env::current_dir()?;
-            mati_core::mcp::serve(&cwd).await
+        Commands::Serve { path } => {
+            let root = match path {
+                Some(p) => std::fs::canonicalize(&p)?,
+                None => std::env::current_dir()?,
+            };
+            mati_core::mcp::serve(&root).await
         }
         Commands::Get { key } => cli::hooks::run_get(&key).await,
         Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
         Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,
         Commands::LogComplianceMiss { key } => cli::hooks::run_log_compliance_miss(&key).await,
+        Commands::LogComplianceHit { key } => cli::hooks::run_log_compliance_hit(&key).await,
+        Commands::LogCodexShellMiss { key } => cli::hooks::run_log_codex_shell_miss(&key).await,
+        Commands::LogBootstrap { key } => cli::hooks::run_log_bootstrap(&key).await,
+        Commands::LogPromptNudge { key } => cli::hooks::run_log_prompt_nudge(&key).await,
         Commands::SessionCheckConsulted { key } => {
             cli::hooks::run_session_check_consulted(&key).await
+        }
+        Commands::SessionCheckConsultedRecent { key, ttl_secs } => {
+            cli::hooks::run_session_check_consulted_recent(&key, ttl_secs).await
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,

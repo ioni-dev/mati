@@ -108,7 +108,8 @@ pub async fn apply_gotcha_write(
             let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
             if let Err(e) = store.put_raw(&edge_key, &ts).await {
                 tracing::warn!("gotcha_write: edge add failed for {file_key} → {key}: {e}");
-                crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}")).await;
+                crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}"))
+                    .await;
             }
         }
     }
@@ -118,7 +119,8 @@ pub async fn apply_gotcha_write(
             let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
             if let Err(e) = store.delete(&edge_key).await {
                 tracing::warn!("gotcha_write: edge remove failed for {file_key} → {key}: {e}");
-                crate::store::repair::mark_dirty(store, key, &format!("edge remove failed: {e}")).await;
+                crate::store::repair::mark_dirty(store, key, &format!("edge remove failed: {e}"))
+                    .await;
             }
         }
     }
@@ -158,7 +160,12 @@ pub async fn apply_gotcha_tombstone(
     // 2. Remove gotcha_keys from file records — best-effort
     if let Err(e) = sync_gotcha_file_links(store, key, affected_files, &[]).await {
         tracing::warn!("gotcha_tombstone: file link cleanup failed for {key}: {e}");
-        crate::store::repair::mark_dirty(store, key, &format!("tombstone link cleanup failed: {e}")).await;
+        crate::store::repair::mark_dirty(
+            store,
+            key,
+            &format!("tombstone link cleanup failed: {e}"),
+        )
+        .await;
     }
 
     // 3. Remove graph edges — best-effort
@@ -167,7 +174,12 @@ pub async fn apply_gotcha_tombstone(
         let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
         if let Err(e) = store.delete(&edge_key).await {
             tracing::warn!("gotcha_tombstone: edge remove failed for {file_key} → {key}: {e}");
-            crate::store::repair::mark_dirty(store, key, &format!("tombstone edge remove failed: {e}")).await;
+            crate::store::repair::mark_dirty(
+                store,
+                key,
+                &format!("tombstone edge remove failed: {e}"),
+            )
+            .await;
         }
     }
 
@@ -435,10 +447,8 @@ mod tests {
 
         // Graph edges should exist
         let edge_keys = store.scan_keys("graph:edge:").await.unwrap();
-        let edge_a =
-            Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:test").to_key();
-        let edge_b =
-            Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:test").to_key();
+        let edge_a = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:test").to_key();
+        let edge_b = Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:test").to_key();
         assert!(edge_keys.contains(&edge_a));
         assert!(edge_keys.contains(&edge_b));
 
@@ -454,15 +464,9 @@ mod tests {
         store.put("gotcha:dup", &record).await.unwrap();
 
         let record2 = make_gotcha_record("gotcha:dup", &["src/b.rs"]);
-        let err = apply_gotcha_write(
-            &store,
-            &record2,
-            &[],
-            &["src/b.rs".into()],
-            true,
-        )
-        .await
-        .unwrap_err();
+        let err = apply_gotcha_write(&store, &record2, &[], &["src/b.rs".into()], true)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("already exists"));
 
         store.close().await.unwrap();
@@ -484,15 +488,9 @@ mod tests {
 
         // Initial write targeting src/a.rs
         let record = make_gotcha_record("gotcha:move", &["src/a.rs"]);
-        apply_gotcha_write(
-            &store,
-            &record,
-            &[],
-            &["src/a.rs".into()],
-            true,
-        )
-        .await
-        .unwrap();
+        apply_gotcha_write(&store, &record, &[], &["src/a.rs".into()], true)
+            .await
+            .unwrap();
 
         // Edit: move from src/a.rs to src/b.rs
         let record2 = make_gotcha_record("gotcha:move", &["src/b.rs"]);
@@ -513,10 +511,8 @@ mod tests {
 
         // Edge should move too
         let edge_keys = store.scan_keys("graph:edge:").await.unwrap();
-        let edge_a =
-            Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:move").to_key();
-        let edge_b =
-            Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:move").to_key();
+        let edge_a = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:move").to_key();
+        let edge_b = Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:move").to_key();
         assert!(!edge_keys.contains(&edge_a));
         assert!(edge_keys.contains(&edge_b));
 
@@ -561,10 +557,8 @@ mod tests {
 
         // Graph edges should be gone
         let edge_keys = store.scan_keys("graph:edge:").await.unwrap();
-        let edge_a =
-            Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:del").to_key();
-        let edge_b =
-            Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:del").to_key();
+        let edge_a = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:del").to_key();
+        let edge_b = Edge::new("file:src/b.rs", EdgeKind::HasGotcha, "gotcha:del").to_key();
         assert!(!edge_keys.contains(&edge_a));
         assert!(!edge_keys.contains(&edge_b));
 
@@ -607,14 +601,9 @@ mod tests {
         assert!(!file_gotcha_keys(&a).contains(&"gotcha:mcp-created".to_string()));
 
         // Now call sync_gotcha_file_links (what mem_set now does after the fix)
-        sync_gotcha_file_links(
-            &store,
-            "gotcha:mcp-created",
-            &[],
-            &["src/a.rs".into()],
-        )
-        .await
-        .unwrap();
+        sync_gotcha_file_links(&store, "gotcha:mcp-created", &[], &["src/a.rs".into()])
+            .await
+            .unwrap();
 
         // File should now have the link
         let a2 = store.get("file:src/a.rs").await.unwrap().unwrap();
