@@ -253,16 +253,18 @@ impl MatiServer {
                         // Write session:consulted marker so pre-read/pre-bash hooks know this key
                         // was looked up via MCP and can downgrade deny → allow+context on next access.
                         let _ = crate::store::session::log_hit(store, &params.key).await;
-                        serde_json::to_string_pretty(&record_to_agent_json(&record))
-                            .unwrap_or_else(|e| {
-                                format!("{{\"error\": \"serialization failed: {e}\"}}")
-                            })
+                        serde_json::to_string_pretty(&record_to_agent_json(&record)).unwrap_or_else(
+                            |e| format!("{{\"error\": \"serialization failed: {e}\"}}"),
+                        )
                     }
                     Ok(None) => "null".to_string(),
                     Err(e) => format!("{{\"error\": \"{e}\"}}"),
                 }
             }
-            MatiBackend::Socket { .. } => self.socket_call("mem_get", json!({ "key": params.key })).await,
+            MatiBackend::Socket { .. } => {
+                self.socket_call("mem_get", json!({ "key": params.key }))
+                    .await
+            }
         }
     }
 
@@ -275,10 +277,7 @@ impl MatiServer {
         description = "Search the mati knowledge store. Use mode \"text\" for BM25 full-text search or mode \"graph\" for a 1-hop traversal from a seed key.",
         annotations(read_only_hint = true)
     )]
-    pub(crate) async fn mem_query(
-        &self,
-        Parameters(params): Parameters<MemQueryParams>,
-    ) -> String {
+    pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
         match &self.backend {
             MatiBackend::Direct(graph_arc) => {
                 let mode = params.mode.as_str();
@@ -474,8 +473,11 @@ impl MatiServer {
                 }
             }
             MatiBackend::Socket { .. } => {
-                self.socket_call("mem_bootstrap", json!({ "context_files": params.context_files }))
-                    .await
+                self.socket_call(
+                    "mem_bootstrap",
+                    json!({ "context_files": params.context_files }),
+                )
+                .await
             }
         }
     }
@@ -488,7 +490,11 @@ impl MatiServer {
     #[rmcp::tool(
         name = "mem_set",
         description = "Write, confirm, or delete a knowledge record. Actions: \"write\" (default) creates/updates a record, \"confirm\" activates a gotcha for hook enforcement, \"delete\" tombstones a gotcha.",
-        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
     )]
     pub(crate) async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
         match &self.backend {
@@ -496,14 +502,10 @@ impl MatiServer {
                 // Dispatch on action before the default write path.
                 match params.action.as_str() {
                     "confirm" => {
-                        return self
-                            .mem_set_confirm(graph_arc, &params.key)
-                            .await;
+                        return self.mem_set_confirm(graph_arc, &params.key).await;
                     }
                     "delete" => {
-                        return self
-                            .mem_set_delete(graph_arc, &params.key)
-                            .await;
+                        return self.mem_set_delete(graph_arc, &params.key).await;
                     }
                     "write" | "" => {} // fall through to write path below
                     other => {
@@ -521,244 +523,252 @@ impl MatiServer {
                     .unwrap_or_default()
                     .as_secs();
 
-        // Validate key namespace
-        let valid_prefix = ["file:", "gotcha:", "decision:", "dev_note:"]
-            .iter()
-            .any(|p| params.key.starts_with(p));
-        if !valid_prefix {
-            return serde_json::json!({
-                "error": "key must start with file:, gotcha:, decision:, or dev_note:"
-            })
-            .to_string();
-        }
+                // Validate key namespace
+                let valid_prefix = ["file:", "gotcha:", "decision:", "dev_note:"]
+                    .iter()
+                    .any(|p| params.key.starts_with(p));
+                if !valid_prefix {
+                    return serde_json::json!({
+                        "error": "key must start with file:, gotcha:, decision:, or dev_note:"
+                    })
+                    .to_string();
+                }
 
-        // Parse category
-        let category = match params.category.as_str() {
-            "File" => Category::File,
-            "Gotcha" => Category::Gotcha,
-            "Decision" => Category::Decision,
-            "DevNote" => Category::DevNote,
-            other => {
-                return serde_json::json!({
+                // Parse category
+                let category = match params.category.as_str() {
+                    "File" => Category::File,
+                    "Gotcha" => Category::Gotcha,
+                    "Decision" => Category::Decision,
+                    "DevNote" => Category::DevNote,
+                    other => {
+                        return serde_json::json!({
                     "error": format!("unknown category: {other}. Valid: File, Gotcha, Decision, DevNote")
                 })
                 .to_string();
-            }
-        };
-
-        // Parse priority
-        let priority = match params.priority.as_str() {
-            "Critical" => Priority::Critical,
-            "High" => Priority::High,
-            "Low" => Priority::Low,
-            _ => Priority::Normal,
-        };
-
-        // Fetch existing record to preserve Layer 0 structural data
-        let existing_record = store.get(&params.key).await.ok().flatten();
-
-        let was_confirmed = existing_record
-            .as_ref()
-            .map(|r| r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80)
-            .unwrap_or(false);
-
-        // Capture old affected_files before mutation (for file-link sync)
-        let old_affected_files: Vec<String> = existing_record
-            .as_ref()
-            .filter(|r| r.key.starts_with("gotcha:"))
-            .and_then(|r| r.payload_as::<GotchaRecord>())
-            .map(|g| g.affected_files)
-            .unwrap_or_default();
-
-        let mut record = match existing_record {
-            Some(existing) => existing,
-            _ => Record {
-                key: params.key.clone(),
-                value: String::new(),
-                category: category.clone(),
-                priority: Priority::Normal,
-                tags: vec![],
-                created_at: now,
-                updated_at: now,
-                ref_url: None,
-                staleness: StalenessScore::fresh(),
-                lifecycle: RecordLifecycle::Active,
-                version: RecordVersion {
-                    device_id: uuid::Uuid::new_v4(),
-                    logical_clock: 0,
-                    wall_clock: now,
-                },
-                quality: QualityScore::layer0_default(),
-                access_count: 0,
-                last_accessed: 0,
-                source: RecordSource::StaticAnalysis,
-                confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
-                gap_analysis_score: 0.0,
-                payload: Some(serde_json::json!({})),
-            },
-        };
-
-        // Apply enrichment fields
-        record.value = params.value;
-        record.category = category;
-        record.updated_at = now;
-        record.version.logical_clock += 1;
-        record.version.wall_clock = now;
-        record.priority = priority;
-
-        // Preserve confirmation state: if the existing record was previously confirmed
-        // (source=DeveloperManual or confidence>=0.80), keep source/confidence/tags.
-        // Otherwise set to ClaudeEnrich defaults.
-        if was_confirmed {
-            // Only update tags if the caller explicitly provided non-empty tags.
-            if !params.tags.is_empty() {
-                record.tags = params.tags;
-            }
-        } else {
-            record.source = RecordSource::ClaudeEnrich;
-            record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
-            record.tags = params.tags;
-        }
-
-        // Merge payload: for existing records, preserve structural fields from
-        // Layer 0 (entry_points, imports, etc.) while overlaying enrichment.
-        // Some MCP clients (Codex) send the payload as a JSON-encoded string
-        // rather than a raw object. Parse it if so.
-        let new_payload = match &params.payload {
-            serde_json::Value::String(s) => {
-                serde_json::from_str::<serde_json::Value>(s).unwrap_or(params.payload)
-            }
-            _ => params.payload,
-        };
-        if new_payload.is_object() && !new_payload.as_object().map_or(true, |o| o.is_empty()) {
-            if let Some(existing_payload) = &record.payload {
-                // Merge: new values override, existing keys preserved
-                let mut merged = existing_payload.clone();
-                if let (Some(base), Some(overlay)) =
-                    (merged.as_object_mut(), new_payload.as_object())
-                {
-                    for (k, v) in overlay {
-                        base.insert(k.clone(), v.clone());
                     }
-                    record.payload = Some(serde_json::Value::Object(base.clone()));
+                };
+
+                // Parse priority
+                let priority = match params.priority.as_str() {
+                    "Critical" => Priority::Critical,
+                    "High" => Priority::High,
+                    "Low" => Priority::Low,
+                    _ => Priority::Normal,
+                };
+
+                // Fetch existing record to preserve Layer 0 structural data
+                let existing_record = store.get(&params.key).await.ok().flatten();
+
+                let was_confirmed = existing_record
+                    .as_ref()
+                    .map(|r| {
+                        r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80
+                    })
+                    .unwrap_or(false);
+
+                // Capture old affected_files before mutation (for file-link sync)
+                let old_affected_files: Vec<String> = existing_record
+                    .as_ref()
+                    .filter(|r| r.key.starts_with("gotcha:"))
+                    .and_then(|r| r.payload_as::<GotchaRecord>())
+                    .map(|g| g.affected_files)
+                    .unwrap_or_default();
+
+                let mut record = match existing_record {
+                    Some(existing) => existing,
+                    _ => Record {
+                        key: params.key.clone(),
+                        value: String::new(),
+                        category: category.clone(),
+                        priority: Priority::Normal,
+                        tags: vec![],
+                        created_at: now,
+                        updated_at: now,
+                        ref_url: None,
+                        staleness: StalenessScore::fresh(),
+                        lifecycle: RecordLifecycle::Active,
+                        version: RecordVersion {
+                            device_id: uuid::Uuid::new_v4(),
+                            logical_clock: 0,
+                            wall_clock: now,
+                        },
+                        quality: QualityScore::layer0_default(),
+                        access_count: 0,
+                        last_accessed: 0,
+                        source: RecordSource::StaticAnalysis,
+                        confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+                        gap_analysis_score: 0.0,
+                        payload: Some(serde_json::json!({})),
+                    },
+                };
+
+                // Apply enrichment fields
+                record.value = params.value;
+                record.category = category;
+                record.updated_at = now;
+                record.version.logical_clock += 1;
+                record.version.wall_clock = now;
+                record.priority = priority;
+
+                // Preserve confirmation state: if the existing record was previously confirmed
+                // (source=DeveloperManual or confidence>=0.80), keep source/confidence/tags.
+                // Otherwise set to ClaudeEnrich defaults.
+                if was_confirmed {
+                    // Only update tags if the caller explicitly provided non-empty tags.
+                    if !params.tags.is_empty() {
+                        record.tags = params.tags;
+                    }
                 } else {
-                    record.payload = Some(new_payload);
+                    record.source = RecordSource::ClaudeEnrich;
+                    record.confidence =
+                        ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+                    record.tags = params.tags;
                 }
-            } else {
-                record.payload = Some(new_payload);
-            }
-        }
 
-        // Normalize gotcha payload: severity must be snake_case for GotchaRecord deserialization.
-        // Claude sends "Critical"/"High"/"Normal"/"Low" but serde expects "critical"/"high"/etc.
-        if record.key.starts_with("gotcha:") {
-            if let Some(ref mut payload) = record.payload {
-                if let Some(obj) = payload.as_object_mut() {
-                    if let Some(sev) = obj
-                        .get("severity")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_lowercase())
-                    {
-                        obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                // Merge payload: for existing records, preserve structural fields from
+                // Layer 0 (entry_points, imports, etc.) while overlaying enrichment.
+                // Some MCP clients (Codex) send the payload as a JSON-encoded string
+                // rather than a raw object. Parse it if so.
+                let new_payload = match &params.payload {
+                    serde_json::Value::String(s) => {
+                        serde_json::from_str::<serde_json::Value>(s).unwrap_or(params.payload)
+                    }
+                    _ => params.payload,
+                };
+                if new_payload.is_object() && !new_payload.as_object().is_none_or(|o| o.is_empty())
+                {
+                    if let Some(existing_payload) = &record.payload {
+                        // Merge: new values override, existing keys preserved
+                        let mut merged = existing_payload.clone();
+                        if let (Some(base), Some(overlay)) =
+                            (merged.as_object_mut(), new_payload.as_object())
+                        {
+                            for (k, v) in overlay {
+                                base.insert(k.clone(), v.clone());
+                            }
+                            record.payload = Some(serde_json::Value::Object(base.clone()));
+                        } else {
+                            record.payload = Some(new_payload);
+                        }
+                    } else {
+                        record.payload = Some(new_payload);
                     }
                 }
-            }
-        }
 
-        // Recompute quality. Only reset confidence for non-confirmed records —
-        // confirmed records keep their DeveloperManual confidence (0.80).
-        if !was_confirmed {
-            record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
-        }
-        record.quality = quality::analyze(&record);
+                // Normalize gotcha payload: severity must be snake_case for GotchaRecord deserialization.
+                // Claude sends "Critical"/"High"/"Normal"/"Low" but serde expects "critical"/"high"/etc.
+                if record.key.starts_with("gotcha:") {
+                    if let Some(ref mut payload) = record.payload {
+                        if let Some(obj) = payload.as_object_mut() {
+                            if let Some(sev) = obj
+                                .get("severity")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_lowercase())
+                            {
+                                obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                            }
+                        }
+                    }
+                }
 
-        // Write record
-        let tier_label = format!("{:?}", record.quality.tier);
-        let record_key = record.key.clone();
-        if let Err(e) = store.put(&record.key, &record).await {
-            return serde_json::json!({"error": e.to_string()}).to_string();
-        }
+                // Recompute quality. Only reset confidence for non-confirmed records —
+                // confirmed records keep their DeveloperManual confidence (0.80).
+                if !was_confirmed {
+                    record.confidence =
+                        ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+                }
+                record.quality = quality::analyze(&record);
 
-        // Extract affected_files for edge creation and file-link sync (gotchas only)
-        let affected_files: Vec<String> = if record_key.starts_with("gotcha:") {
-            record
-                .payload
-                .as_ref()
-                .and_then(|p| p.get("affected_files"))
-                .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+                // Write record
+                let tier_label = format!("{:?}", record.quality.tier);
+                let record_key = record.key.clone();
+                if let Err(e) = store.put(&record.key, &record).await {
+                    return serde_json::json!({"error": e.to_string()}).to_string();
+                }
 
-        // Sync file:*.gotcha_keys — the derived index that diff and pre-read hooks use.
-        // This was previously skipped, leaving MCP-created gotchas invisible to
-        // enforcement surfaces even after confirmation.
-        if record_key.starts_with("gotcha:") {
-            if let Err(e) = crate::store::gotcha_ops::sync_gotcha_file_links(
-                store,
-                &record_key,
-                &old_affected_files,
-                &affected_files,
-            )
-            .await
-            {
-                tracing::warn!("mem_set: file link sync failed for {record_key}: {e}");
-                crate::store::repair::mark_dirty(
-                    store,
-                    &record_key,
-                    &format!("mem_set link sync failed: {e}"),
-                )
-                .await;
-            }
-        }
+                // Extract affected_files for edge creation and file-link sync (gotchas only)
+                let affected_files: Vec<String> = if record_key.starts_with("gotcha:") {
+                    record
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("affected_files"))
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
 
-        let old_affected_set: HashSet<&str> =
-            old_affected_files.iter().map(String::as_str).collect();
-        let new_affected_set: HashSet<&str> = affected_files.iter().map(String::as_str).collect();
-
-        drop(graph); // release read lock before taking write lock
-
-        // Keep the in-memory graph in sync with the persisted edge state.
-        // mem_set already updated file links above; here we remove stale
-        // HasGotcha edges for moved gotchas and add edges for newly-affected files.
-        if record_key.starts_with("gotcha:") {
-            let mut graph = graph_arc.write().await;
-
-            for file_path in old_affected_set.difference(&new_affected_set) {
-                let file_key = format!("file:{file_path}");
-                if let Err(e) = graph
-                    .remove_edge(&file_key, &EdgeKind::HasGotcha, &record_key)
+                // Sync file:*.gotcha_keys — the derived index that diff and pre-read hooks use.
+                // This was previously skipped, leaving MCP-created gotchas invisible to
+                // enforcement surfaces even after confirmation.
+                if record_key.starts_with("gotcha:") {
+                    if let Err(e) = crate::store::gotcha_ops::sync_gotcha_file_links(
+                        store,
+                        &record_key,
+                        &old_affected_files,
+                        &affected_files,
+                    )
                     .await
-                {
-                    tracing::warn!(
+                    {
+                        tracing::warn!("mem_set: file link sync failed for {record_key}: {e}");
+                        crate::store::repair::mark_dirty(
+                            store,
+                            &record_key,
+                            &format!("mem_set link sync failed: {e}"),
+                        )
+                        .await;
+                    }
+                }
+
+                let old_affected_set: HashSet<&str> =
+                    old_affected_files.iter().map(String::as_str).collect();
+                let new_affected_set: HashSet<&str> =
+                    affected_files.iter().map(String::as_str).collect();
+
+                drop(graph); // release read lock before taking write lock
+
+                // Keep the in-memory graph in sync with the persisted edge state.
+                // mem_set already updated file links above; here we remove stale
+                // HasGotcha edges for moved gotchas and add edges for newly-affected files.
+                if record_key.starts_with("gotcha:") {
+                    let mut graph = graph_arc.write().await;
+
+                    for file_path in old_affected_set.difference(&new_affected_set) {
+                        let file_key = format!("file:{file_path}");
+                        if let Err(e) = graph
+                            .remove_edge(&file_key, &EdgeKind::HasGotcha, &record_key)
+                            .await
+                        {
+                            tracing::warn!(
                         "mem_set: stale edge removal failed for {file_key} → {record_key}: {e}"
                     );
-                    crate::store::repair::mark_dirty(
-                        graph.store(),
-                        &record_key,
-                        &format!("mem_set edge remove failed: {e}"),
-                    )
-                    .await;
-                }
-            }
+                            crate::store::repair::mark_dirty(
+                                graph.store(),
+                                &record_key,
+                                &format!("mem_set edge remove failed: {e}"),
+                            )
+                            .await;
+                        }
+                    }
 
-            for file_path in new_affected_set.difference(&old_affected_set) {
-                let file_key = format!("file:{file_path}");
-                if let Err(e) = graph
-                    .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
-                    .await
-                {
-                    tracing::warn!("mem_set: edge add failed for {file_key} → {record_key}: {e}");
-                    crate::store::repair::mark_dirty(
-                        graph.store(),
-                        &record_key,
-                        &format!("mem_set edge add failed: {e}"),
-                    )
-                    .await;
+                    for file_path in new_affected_set.difference(&old_affected_set) {
+                        let file_key = format!("file:{file_path}");
+                        if let Err(e) = graph
+                            .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
+                            .await
+                        {
+                            tracing::warn!(
+                                "mem_set: edge add failed for {file_key} → {record_key}: {e}"
+                            );
+                            crate::store::repair::mark_dirty(
+                                graph.store(),
+                                &record_key,
+                                &format!("mem_set edge add failed: {e}"),
+                            )
+                            .await;
+                        }
+                    }
                 }
-            }
-        }
 
                 serde_json::json!({
                     "ok": true,
@@ -831,16 +841,12 @@ impl MatiServer {
                 {
                     obj.insert("severity".to_string(), serde_json::Value::String(sev));
                 }
-                obj.insert(
-                    "confirmed".to_string(),
-                    serde_json::Value::Bool(true),
-                );
+                obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
             }
         }
 
         record.source = RecordSource::DeveloperManual;
-        record.confidence.value =
-            ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+        record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
         record.confidence.confirmation_count += 1;
         record.quality = quality::analyze(&record);
 
@@ -876,9 +882,7 @@ impl MatiServer {
                 if needs_link {
                     if let Some(ref mut payload) = file_record.payload {
                         if let Some(obj) = payload.as_object_mut() {
-                            let arr = obj
-                                .entry("gotcha_keys")
-                                .or_insert(serde_json::json!([]));
+                            let arr = obj.entry("gotcha_keys").or_insert(serde_json::json!([]));
                             if let Some(arr) = arr.as_array_mut() {
                                 arr.push(serde_json::Value::String(key.to_string()));
                             }
@@ -2125,7 +2129,8 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "file:src/main.rs".to_string(),
                 value: "Handles CLI dispatch and binary entry point".to_string(),
                 category: "File".to_string(),
@@ -2231,7 +2236,8 @@ mod tests {
 
         // Enrich — only send purpose and updated gotcha_keys
         let result = server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "file:src/db.rs".to_string(),
                 value: "Manages database connection pooling and query execution".to_string(),
                 category: "File".to_string(),
@@ -2278,7 +2284,8 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "session:12345".to_string(),
                 value: "test".to_string(),
                 category: "File".to_string(),
@@ -2303,7 +2310,8 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "file:test.rs".to_string(),
                 value: "test".to_string(),
                 category: "Unknown".to_string(),
@@ -2351,7 +2359,8 @@ mod tests {
 
         // Update the gotcha's value via mem_set (simulates Claude editing the reason)
         let result = server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "gotcha:confirmed-edit-test".to_string(),
                 value: "Always test first because untested changes cause regressions".to_string(),
                 category: "Gotcha".to_string(),
@@ -2410,7 +2419,8 @@ mod tests {
         let server = MatiServer::new(graph);
 
         server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "gotcha:test-move".to_string(),
                 value: "Always update the paired file because drift breaks the feature".to_string(),
                 category: "Gotcha".to_string(),
@@ -2429,7 +2439,8 @@ mod tests {
             .await;
 
         server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
                 key: "gotcha:test-move".to_string(),
                 value: "Always update the paired file because drift breaks the feature".to_string(),
                 category: "Gotcha".to_string(),

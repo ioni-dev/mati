@@ -92,16 +92,14 @@ pub async fn run(args: InitArgs) -> Result<()> {
                     //   - PID alive → always active (owner is running)
                     //   - PID dead + recent → stale (owner crashed, safe to proceed)
                     //   - No PID (legacy) → active only if recent
-                    let active = if let Some((_ts, pid)) =
-                        crate::cli::daemon::parse_sentinel(&content)
-                    {
-                        crate::cli::daemon::is_pid_alive(pid)
-                    } else if let Ok(ts) = content.trim().parse::<u64>() {
-                        now.saturating_sub(ts)
-                            < crate::cli::daemon::STARTING_STALE_SECS
-                    } else {
-                        false
-                    };
+                    let active =
+                        if let Some((_ts, pid)) = crate::cli::daemon::parse_sentinel(&content) {
+                            crate::cli::daemon::is_pid_alive(pid)
+                        } else if let Ok(ts) = content.trim().parse::<u64>() {
+                            now.saturating_sub(ts) < crate::cli::daemon::STARTING_STALE_SECS
+                        } else {
+                            false
+                        };
                     if active {
                         anyhow::bail!(
                             "a mati daemon is starting and may hold the store lock.\n\
