@@ -63,9 +63,73 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn daily_agg_count(record: Option<Record>) -> u64 {
+    record
+        .and_then(|r| r.payload_as::<mati_core::store::session::DailyAgg>())
+        .map(|agg| agg.count)
+        .unwrap_or(0)
+}
+
+#[derive(Default)]
+struct CodexDailyMetrics {
+    bootstrap_count: u64,
+    shell_hit_count: u64,
+    shell_miss_count: u64,
+    prompt_nudge_count: u64,
+}
+
+impl CodexDailyMetrics {
+    fn has_activity(&self) -> bool {
+        self.bootstrap_count > 0
+            || self.shell_hit_count > 0
+            || self.shell_miss_count > 0
+            || self.prompt_nudge_count > 0
+    }
+}
+
+async fn load_codex_daily_metrics(store: &StoreProxy) -> Result<CodexDailyMetrics> {
+    Ok(CodexDailyMetrics {
+        bootstrap_count: daily_agg_count(
+            store
+                .get(&mati_core::store::session::today_key(
+                    "analytics:bootstrap_",
+                ))
+                .await?,
+        ),
+        shell_hit_count: daily_agg_count(
+            store
+                .get(&mati_core::store::session::today_key(
+                    "compliance:codex_shell_hit_",
+                ))
+                .await?,
+        ),
+        shell_miss_count: daily_agg_count(
+            store
+                .get(&mati_core::store::session::today_key(
+                    "compliance:codex_shell_miss_",
+                ))
+                .await?,
+        ),
+        prompt_nudge_count: daily_agg_count(
+            store
+                .get(&mati_core::store::session::today_key(
+                    "analytics:codex_prompt_nudge_",
+                ))
+                .await?,
+        ),
+    })
+}
+
 pub async fn run(_args: StatusArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = StoreProxy::open(&cwd).await?;
+    let claude_mode = cwd.join(".claude/settings.json").exists();
+    let codex_mode = cwd.join(".codex/config.toml").exists();
+    let codex_metrics = if codex_mode {
+        Some(load_codex_daily_metrics(&store).await?)
+    } else {
+        None
+    };
 
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
@@ -74,7 +138,14 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         if let Some(snap) = cached.payload_as::<StatusSnapshot>() {
             let age = now.saturating_sub(snap.computed_at);
             if snap.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
-                display_cached_status(&snap, age, &cwd);
+                display_cached_status(
+                    &snap,
+                    age,
+                    &cwd,
+                    claude_mode,
+                    codex_mode,
+                    codex_metrics.as_ref(),
+                );
                 store.close().await?;
                 return Ok(());
             }
@@ -114,6 +185,17 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
 
     println!("\n{bold}{blue}◈ mati status{reset} — project: {bold}{white}{project}{reset}\n");
 
+    if claude_mode || codex_mode {
+        println!("  {blue}Platform{reset}");
+        if claude_mode {
+            println!("    Claude  — hard read enforcement");
+        }
+        if codex_mode {
+            println!("    Codex   — hard Bash enforcement, soft native-read enforcement");
+        }
+        println!();
+    }
+
     // ── Integrity warning ────────────────────────────────────────────────
     if let Ok(Some(marker_record)) = store.get(mati_core::store::repair::DIRTY_MARKER_KEY).await {
         if let Some(marker) = marker_record.payload_as::<mati_core::store::repair::DirtyMarker>() {
@@ -128,6 +210,16 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
                 );
             }
         }
+    }
+
+    if let Some(metrics) = codex_metrics.as_ref().filter(|m| m.has_activity()) {
+        println!(
+                "  {blue}Codex Today{reset}  bootstraps {white}{}{reset}  shell ok {white}{}{reset}  shell misses {white}{}{reset}  prompt nudges {white}{}{reset}\n",
+                metrics.bootstrap_count,
+                metrics.shell_hit_count,
+                metrics.shell_miss_count,
+                metrics.prompt_nudge_count,
+            );
     }
 
     // ── Record counts ─────────────────────────────────────────────────────
@@ -285,9 +377,12 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
             r.payload_as::<GotchaRecord>()
                 .map(|g| {
                     g.affected_files.iter().any(|af| {
-                        files
-                            .iter()
-                            .any(|f| f.key == format!("file:{af}") && f.payload_as::<FileRecord>().map(|fr| fr.is_hotspot).unwrap_or(false))
+                        files.iter().any(|f| {
+                            f.key == format!("file:{af}")
+                                && f.payload_as::<FileRecord>()
+                                    .map(|fr| fr.is_hotspot)
+                                    .unwrap_or(false)
+                        })
                     })
                 })
                 .unwrap_or(false)
@@ -392,7 +487,14 @@ async fn write_snapshot_record(store: &StoreProxy, snap: &StatusSnapshot, now: u
 }
 
 /// Render status output from a cached snapshot.
-fn display_cached_status(s: &StatusSnapshot, age: u64, cwd: &std::path::Path) {
+fn display_cached_status(
+    s: &StatusSnapshot,
+    age: u64,
+    cwd: &std::path::Path,
+    claude_mode: bool,
+    codex_mode: bool,
+    codex_metrics: Option<&CodexDailyMetrics>,
+) {
     let use_color = std::io::stdout().is_terminal();
 
     let (blue, green, yellow, gray, white, bold, reset) = if use_color {
@@ -418,6 +520,27 @@ fn display_cached_status(s: &StatusSnapshot, age: u64, cwd: &std::path::Path) {
         "\n{bold}{blue}◈ mati status{reset} — project: {bold}{white}{project}{reset}  {gray}(cached {}s ago){reset}\n",
         age
     );
+
+    if claude_mode || codex_mode {
+        println!("  {blue}Platform{reset}");
+        if claude_mode {
+            println!("    Claude  — hard read enforcement");
+        }
+        if codex_mode {
+            println!("    Codex   — hard Bash enforcement, soft native-read enforcement");
+        }
+        println!();
+    }
+
+    if let Some(metrics) = codex_metrics.filter(|m| m.has_activity()) {
+        println!(
+            "  {blue}Codex Today{reset}  bootstraps {white}{}{reset}  shell ok {white}{}{reset}  shell misses {white}{}{reset}  prompt nudges {white}{}{reset}\n",
+            metrics.bootstrap_count,
+            metrics.shell_hit_count,
+            metrics.shell_miss_count,
+            metrics.prompt_nudge_count,
+        );
+    }
 
     println!(
         "  {blue}Records{reset}     {white}{}{reset} files  {white}{}{reset} gotchas  {white}{}{reset} decisions  {white}{}{reset} notes  {white}{}{reset} deps",

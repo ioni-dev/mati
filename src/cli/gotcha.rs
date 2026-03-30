@@ -392,14 +392,15 @@ async fn run_gotcha_add(
         anyhow::bail!("rule cannot be empty");
     }
 
-    eprint_prompt("Reason (why — what goes wrong otherwise, or Enter to skip): ", use_color);
+    eprint_prompt(
+        "Reason (why — what goes wrong otherwise, or Enter to skip): ",
+        use_color,
+    );
     let reason = read_line(&mut lines)?;
 
     // Remaining fields use defaults unless the user opts in
     eprint_prompt(
-        &format!(
-            "Severity/files/URL? (Enter to accept defaults: normal, {file}) ",
-        ),
+        &format!("Severity/files/URL? (Enter to accept defaults: normal, {file}) ",),
         use_color,
     );
     let extra_input = read_line(&mut lines)?;
@@ -948,7 +949,10 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
                     if let Err(e) = proxy.put(&file_key, &file_record).await {
                         tracing::warn!("confirm_gotcha: file link sync failed for {file_key}: {e}");
                         let _ = proxy
-                            .mark_dirty(key, &format!("confirm link sync failed for {file_key}: {e}"))
+                            .mark_dirty(
+                                key,
+                                &format!("confirm link sync failed for {file_key}: {e}"),
+                            )
                             .await;
                     }
                 }
@@ -957,7 +961,10 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
             Err(e) => {
                 tracing::warn!("confirm_gotcha: file lookup failed for {file_key}: {e}");
                 let _ = proxy
-                    .mark_dirty(key, &format!("confirm file lookup failed for {file_key}: {e}"))
+                    .mark_dirty(
+                        key,
+                        &format!("confirm file lookup failed for {file_key}: {e}"),
+                    )
                     .await;
             }
         }
@@ -1175,21 +1182,32 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
 
         store
-            .put("file:src/main.rs", &make_file_record("file:src/main.rs", vec![]))
+            .put(
+                "file:src/main.rs",
+                &make_file_record("file:src/main.rs", vec![]),
+            )
             .await
             .unwrap();
         store
-            .put("gotcha:test-backfill", &make_gotcha_record("gotcha:test-backfill"))
+            .put(
+                "gotcha:test-backfill",
+                &make_gotcha_record("gotcha:test-backfill"),
+            )
             .await
             .unwrap();
         store.close().await.unwrap();
 
         let proxy = StoreProxy::open(dir.path()).await.unwrap();
-        confirm_gotcha(&proxy, "gotcha:test-backfill").await.unwrap();
+        confirm_gotcha(&proxy, "gotcha:test-backfill")
+            .await
+            .unwrap();
 
         let updated_file = proxy.get("file:src/main.rs").await.unwrap().unwrap();
         let payload = updated_file.payload_as::<FileRecord>().unwrap();
-        assert_eq!(payload.gotcha_keys, vec!["gotcha:test-backfill".to_string()]);
+        assert_eq!(
+            payload.gotcha_keys,
+            vec!["gotcha:test-backfill".to_string()]
+        );
     }
 
     #[tokio::test]
