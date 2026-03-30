@@ -844,10 +844,7 @@ pub fn try_auto_start(project_cwd: &Path) {
             // spawner (this hook process) exits immediately — if we left our
             // own PID in the sentinel, concurrent callers would see a dead PID
             // and reclaim, defeating the thundering-herd prevention.
-            let _ = std::fs::write(
-                &starting_path,
-                format_sentinel(wall_secs(), child_pid),
-            );
+            let _ = std::fs::write(&starting_path, format_sentinel(wall_secs(), child_pid));
             // Detach — do not wait. The child runs independently.
             std::mem::forget(child);
         }

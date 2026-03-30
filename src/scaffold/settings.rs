@@ -177,7 +177,8 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
     // Inject absolute binary path so Claude Code can find it regardless of PATH.
-    mati_settings["mcpServers"]["mati"]["command"] = serde_json::Value::String(super::mati_binary_path());
+    mati_settings["mcpServers"]["mati"]["command"] =
+        serde_json::Value::String(super::mati_binary_path());
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -273,8 +274,8 @@ fn entry_contains_owned_command(entry: &Value, owned_commands: &[String]) -> boo
 /// Uses the absolute binary path so Claude Code can find mati regardless of
 /// the restricted PATH it uses when spawning MCP server subprocesses.
 fn write_mcp_json(path: &Path, project_root: &Path) -> Result<()> {
-    let canonical = std::fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let mati_server = serde_json::json!({
         "command": super::mati_binary_path(),
         "args": ["serve", "--path", canonical.to_string_lossy()]
@@ -605,8 +606,7 @@ mod tests {
             .expect("exec line must follow format: exec \"<path>\" \"$@\"");
 
         // MCP config must point to the same binary
-        let settings =
-            std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
+        let settings = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
         let mcp_command = parsed["mcpServers"]["mati"]["command"]
             .as_str()

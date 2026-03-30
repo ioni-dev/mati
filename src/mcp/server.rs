@@ -229,7 +229,9 @@ async fn open_with_retry(
                     return Err(e).context("failed to open mati store");
                 }
                 if attempt == max_retries {
-                    return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({})).await {
+                    return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({}))
+                        .await
+                    {
                         ProxyDaemonResult::Ok(_) => Ok(ServerOpen::Proxy(mati_root)),
                         other => Err(anyhow::anyhow!(
                             "store locked after retries and no proxy target was reachable: {:?}",
@@ -391,7 +393,13 @@ async fn socket_handle_connection(
     }
 
     let graph_guard = graph.read().await;
-    let resp = socket_dispatch(graph_guard.store(), Some(Arc::clone(&graph)), repo_root, &req).await;
+    let resp = socket_dispatch(
+        graph_guard.store(),
+        Some(Arc::clone(&graph)),
+        repo_root,
+        &req,
+    )
+    .await;
     write_socket_response(&mut writer, &resp).await
 }
 
@@ -810,9 +818,7 @@ async fn socket_dispatch(
                     if needs_link {
                         if let Some(ref mut payload) = file_record.payload {
                             if let Some(obj) = payload.as_object_mut() {
-                                let arr = obj
-                                    .entry("gotcha_keys")
-                                    .or_insert(serde_json::json!([]));
+                                let arr = obj.entry("gotcha_keys").or_insert(serde_json::json!([]));
                                 if let Some(arr) = arr.as_array_mut() {
                                     arr.push(serde_json::Value::String(key.to_string()));
                                 }
