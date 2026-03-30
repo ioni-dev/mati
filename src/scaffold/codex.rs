@@ -276,8 +276,8 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
     // Codex spawns MCP servers with CWD=/. The cwd field tells Codex to set
     // the working directory to the project root so `mati serve` derives the
     // correct store slug from current_dir().
-    let canonical = std::fs::canonicalize(project_root)
-        .unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     doc["mcp_servers"]["mati"]["cwd"] = value(canonical.to_string_lossy().as_ref());
 
     if doc.get("skills").is_none() || !doc["skills"].is_table() {
@@ -416,7 +416,10 @@ mod tests {
 
         // Wrapper must exist and be executable
         let wrapper_path = dir.path().join(".codex/hooks/mati");
-        assert!(wrapper_path.exists(), ".codex/hooks/mati wrapper must exist");
+        assert!(
+            wrapper_path.exists(),
+            ".codex/hooks/mati wrapper must exist"
+        );
 
         let wrapper = std::fs::read_to_string(&wrapper_path).unwrap();
         assert!(wrapper.contains("exec"), "wrapper must use exec");
@@ -483,8 +486,11 @@ mod tests {
 
         // Tamper with the wrapper to simulate a stale binary path
         let wrapper_path = dir.path().join(".codex/hooks/mati");
-        std::fs::write(&wrapper_path, "#!/usr/bin/env bash\nexec \"/old/path/mati\" \"$@\"\n")
-            .unwrap();
+        std::fs::write(
+            &wrapper_path,
+            "#!/usr/bin/env bash\nexec \"/old/path/mati\" \"$@\"\n",
+        )
+        .unwrap();
 
         // Re-install should overwrite
         install_codex(dir.path(), false).unwrap();
