@@ -2117,7 +2117,10 @@ mod tests {
 
     /// 1,200-record batch must be measurably faster than 1,200 sequential puts.
     /// This test guards against the batch accidentally falling back to N fsyncs.
+    ///
+    /// Ignored by default (~60s). Run with: `cargo test --lib put_batch_1200 -- --ignored`
     #[tokio::test]
+    #[ignore]
     async fn put_batch_1200_faster_than_sequential() {
         use std::time::Instant;
 
