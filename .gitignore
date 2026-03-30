@@ -1,4 +1,7 @@
 .noj/
+.claude/
+.codex/
+.mati/
 
 /target/
 .DS_Store
