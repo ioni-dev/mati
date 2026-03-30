@@ -377,10 +377,9 @@ impl StalenessAnalyzer {
         if !updates.is_empty() {
             let batch: Vec<(&str, &Record)> =
                 updates.iter().map(|(k, r)| (k.as_str(), r)).collect();
-            store
-                .put_batch(&batch)
-                .await
-                .with_context(|| format!("staleness batch write failed for {} records", batch.len()))?;
+            store.put_batch(&batch).await.with_context(|| {
+                format!("staleness batch write failed for {} records", batch.len())
+            })?;
         }
 
         Ok(report)
@@ -743,7 +742,11 @@ fn dep_factor(file_record: Option<&FileRecord>, dep_cache: &HashMap<String, Reco
 fn dep_lookup_keys(import: &str) -> Vec<String> {
     let mut keys = Vec::new();
 
-    if let Some(crate_name) = import.split("::").next().filter(|name| *name != import || import.contains("::")) {
+    if let Some(crate_name) = import
+        .split("::")
+        .next()
+        .filter(|name| *name != import || import.contains("::"))
+    {
         push_dep_key(&mut keys, "cargo", crate_name);
         keys.push(format!("dep:{crate_name}"));
     }
@@ -811,7 +814,10 @@ fn go_module_candidates(import: &str) -> Vec<String> {
 }
 
 fn first_path_segment(import: &str) -> Option<&str> {
-    import.split('/').next().filter(|segment| !segment.is_empty())
+    import
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
 }
 
 /// Cascade factor: for file records, check if linked gotchas/decisions are stale.

@@ -212,7 +212,9 @@ fn print_repair_report(report: &RepairReport, use_color: bool) {
     if report.verification_passed {
         println!("  {green}Verification passed.{reset} Indexes are now consistent.");
     } else {
-        println!("  {red}Verification failed.{reset} Some drift may remain — run `mati repair` again.");
+        println!(
+            "  {red}Verification failed.{reset} Some drift may remain — run `mati repair` again."
+        );
     }
 
     if report.dirty_marker_cleared {

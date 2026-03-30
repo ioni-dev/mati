@@ -44,6 +44,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
             return Ok(());
         }
     };
+    let _ = proxy.log_hit(&file_key).await;
 
     let fr = file_rec.payload_as::<FileRecord>();
 

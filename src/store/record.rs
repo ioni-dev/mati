@@ -761,12 +761,16 @@ pub struct GotchaRecord {
     /// Why this rule exists. Causality sentence.
     pub reason: String,
     pub severity: Priority,
+    #[serde(default)]
     pub affected_files: Vec<String>,
+    #[serde(default)]
     pub ref_url: Option<String>,
     /// Timestamp of the session in which this gotcha was first discovered.
+    #[serde(default)]
     pub discovered_session: u64,
     /// Whether a developer has explicitly confirmed this record is accurate.
     /// Layer 0 stubs are always `false` until confirmed via `mati gotcha add`.
+    #[serde(default)]
     pub confirmed: bool,
 }
 

@@ -170,7 +170,10 @@ pub async fn run_daemon_start() -> Result<()> {
     // a second daemon while this one is initializing.
     let mati_root = mati_root_for(&cwd)?;
     let starting_path = mati_root.join("mati.starting");
-    let _ = std::fs::write(&starting_path, wall_secs().to_string());
+    let _ = std::fs::write(
+        &starting_path,
+        format_sentinel(wall_secs(), std::process::id()),
+    );
 
     let repo_root = Arc::new(std::fs::canonicalize(&cwd)?);
     let store = Store::open(&cwd).await?;
@@ -769,9 +772,15 @@ pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
 /// hook falls through to direct `Store::open` for this invocation; the daemon
 /// will be ready for all subsequent hook calls in the same session.
 ///
-/// Guards against double-spawn: if a PID file or socket already exists the
-/// function returns immediately — the daemon is either running or already
-/// starting.
+/// Guards against thundering herd: uses `mati.starting` as an atomic spinlock
+/// via `O_CREAT | O_EXCL`. Only the first concurrent caller creates the file
+/// and spawns a daemon — all others see the file and back off.
+///
+/// After spawn, the sentinel is overwritten with the child daemon's PID so
+/// liveness checks track the actual daemon process, not the short-lived
+/// spawner. If the daemon PID dies (crash), the next caller reclaims
+/// immediately. If `STARTING_STALE_SECS` expires with no PID format (legacy
+/// sentinel), timeout-based reclaim applies.
 pub fn try_auto_start(project_cwd: &Path) {
     let root = match mati_root_for(project_cwd) {
         Ok(r) => r,
@@ -781,30 +790,40 @@ pub fn try_auto_start(project_cwd: &Path) {
         }
     };
 
-    // Already running or a prior auto-start is in progress.
+    // Already running — daemon or MCP server has bound the socket / written PID.
     if root.join("mati.pid").exists() || root.join("mati.sock").exists() {
         return;
     }
 
-    // Cooldown: a recent auto-start attempt wrote mati.starting before calling
-    // Store::open. If the daemon process failed (store error), mati.starting
-    // persists. Retry only after 10 seconds to avoid a spawn loop.
+    // Atomic spinlock: try to create mati.starting with O_CREAT | O_EXCL.
+    // If another caller already created it, we back off. This prevents the
+    // thundering herd where N concurrent hook invocations each spawn a daemon.
     let starting_path = root.join("mati.starting");
-    if let Ok(content) = std::fs::read_to_string(&starting_path) {
-        if let Ok(ts) = content.trim().parse::<u64>() {
-            if wall_secs().saturating_sub(ts) < 10 {
-                tracing::debug!("auto-start: recent attempt in progress or failed (10s cooldown)");
-                return;
+    match try_claim_starting_sentinel(&starting_path) {
+        StartingClaim::Claimed => {
+            // We won the race — spawn the daemon below.
+        }
+        StartingClaim::AlreadyActive => {
+            tracing::debug!("auto-start: another caller is already starting a daemon");
+            return;
+        }
+        StartingClaim::StaleRemoved => {
+            // Owner PID is dead or sentinel expired. Retry the claim.
+            match try_claim_starting_sentinel(&starting_path) {
+                StartingClaim::Claimed => {}
+                _ => {
+                    tracing::debug!("auto-start: lost race after stale removal");
+                    return;
+                }
             }
         }
-        // Sentinel older than 10s — stale, remove and retry.
-        let _ = std::fs::remove_file(&starting_path);
     }
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!(error = %e, "auto-start: could not find current exe");
+            let _ = std::fs::remove_file(&starting_path);
             return;
         }
     };
@@ -818,13 +837,144 @@ pub fn try_auto_start(project_cwd: &Path) {
         .spawn()
     {
         Ok(child) => {
-            tracing::debug!(pid = child.id(), "auto-started mati daemon");
+            let child_pid = child.id();
+            tracing::debug!(pid = child_pid, "auto-started mati daemon");
+            // Overwrite the sentinel with the child's PID so liveness checks
+            // track the daemon process, not the short-lived spawner. The
+            // spawner (this hook process) exits immediately — if we left our
+            // own PID in the sentinel, concurrent callers would see a dead PID
+            // and reclaim, defeating the thundering-herd prevention.
+            let _ = std::fs::write(
+                &starting_path,
+                format_sentinel(wall_secs(), child_pid),
+            );
             // Detach — do not wait. The child runs independently.
             std::mem::forget(child);
         }
         Err(e) => {
             // Non-fatal: hooks fall back to direct Store::open automatically.
+            // Clean up sentinel so the next caller can retry.
+            let _ = std::fs::remove_file(&starting_path);
             tracing::debug!(error = %e, "auto-start: failed to spawn daemon");
+        }
+    }
+}
+
+/// Stale timeout for the starting sentinel. A sentinel older than this with a
+/// dead owner PID is considered abandoned and will be reclaimed.
+pub const STARTING_STALE_SECS: u64 = 30;
+
+#[derive(Debug)]
+enum StartingClaim {
+    /// We created mati.starting — we are the exclusive spawner.
+    Claimed,
+    /// Another caller owns it and is still alive — back off.
+    AlreadyActive,
+    /// Sentinel was stale (owner dead or timeout expired) and we removed it.
+    /// Caller should retry the claim.
+    StaleRemoved,
+}
+
+/// Sentinel file format: `<unix_timestamp> <pid>\n`
+///
+/// The PID allows liveness checks so we don't have to rely solely on a fixed
+/// timeout. If the owner PID is dead, the sentinel is stale regardless of age.
+fn format_sentinel(ts: u64, pid: u32) -> String {
+    format!("{ts} {pid}\n")
+}
+
+pub fn parse_sentinel(content: &str) -> Option<(u64, u32)> {
+    let mut parts = content.trim().split_whitespace();
+    let ts = parts.next()?.parse::<u64>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    Some((ts, pid))
+}
+
+/// Check whether a PID is still alive using `kill(pid, 0)`.
+#[cfg(unix)]
+pub fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) checks existence without sending a signal.
+    // Returns 0 if process exists and we can signal it.
+    // Returns -1 with ESRCH if process does not exist.
+    // Returns -1 with EPERM if process exists but we can't signal it (still alive).
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    // EPERM means the process exists but belongs to another user — still alive.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+pub fn is_pid_alive(_pid: u32) -> bool {
+    // On non-Unix, fall back to the timeout-only approach.
+    true
+}
+
+/// Attempt to atomically create the `mati.starting` sentinel.
+///
+/// Uses `O_CREAT | O_EXCL` (via `create_new`) which fails if the file already
+/// exists — this is the atomic coordination primitive that prevents the
+/// thundering herd.
+///
+/// Staleness is determined by **two** signals (either is sufficient):
+/// 1. Owner PID is dead (immediate reclaim — no waiting)
+/// 2. Sentinel age exceeds `STARTING_STALE_SECS` (catch-all for edge cases)
+///
+/// This handles:
+/// - **Crash during claim:** Owner PID died → next caller reclaims immediately.
+/// - **Slow Store::open:** Owner PID is alive → callers back off even past the
+///   timeout, so a legitimate slow open isn't interrupted.
+/// - **NFS:** `O_EXCL` is unreliable on NFS, but mati stores are always local
+///   (`~/.mati/`). The PID check adds a defense-in-depth layer: even if two
+///   processes both "create" the file, only the one whose PID is in the file
+///   will be recognized as the owner.
+fn try_claim_starting_sentinel(path: &Path) -> StartingClaim {
+    use std::io::Write;
+
+    let now = wall_secs();
+    let my_pid = std::process::id();
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_CREAT | O_EXCL — fails if file exists
+        .open(path)
+    {
+        Ok(mut f) => {
+            let _ = write!(f, "{}", format_sentinel(now, my_pid));
+            StartingClaim::Claimed
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // File exists — check liveness of the owner.
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Some((_ts, pid)) = parse_sentinel(&content) {
+                    if is_pid_alive(pid) {
+                        // Owner is alive — back off unconditionally. Even if
+                        // the sentinel is old, SurrealKV's flock prevents real
+                        // concurrent store access; the worst case is a delayed
+                        // retry after the owner dies or finishes.
+                        return StartingClaim::AlreadyActive;
+                    }
+                    // Owner PID is dead — reclaim immediately.
+                    tracing::debug!(
+                        dead_pid = pid,
+                        "auto-start: reclaiming sentinel from dead owner"
+                    );
+                } else if let Ok(ts) = content.trim().parse::<u64>() {
+                    // Legacy format (timestamp only, no PID). Fall back to
+                    // timeout-only staleness check.
+                    if now.saturating_sub(ts) < STARTING_STALE_SECS {
+                        return StartingClaim::AlreadyActive;
+                    }
+                }
+            }
+            // Stale, dead owner, or unreadable — remove and let caller retry.
+            let _ = std::fs::remove_file(path);
+            StartingClaim::StaleRemoved
+        }
+        Err(_) => {
+            // Permission error or other I/O issue — don't block, just skip.
+            StartingClaim::AlreadyActive
         }
     }
 }
@@ -870,15 +1020,10 @@ pub fn read_pid_file(root: &Path) -> Option<(u32, String)> {
 }
 
 /// Returns `true` if the PID recorded in the PID file is no longer alive.
-/// Uses `kill -0` (no signal sent, just checks process existence).
 /// Returns `true` (assume dead) if the PID file is absent or unreadable.
 pub fn is_pid_dead(root: &Path) -> bool {
     match read_pid_file(root) {
-        Some((pid, _)) => !std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false),
+        Some((pid, _)) => !is_pid_alive(pid),
         None => true,
     }
 }
@@ -1191,5 +1336,131 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = daemon_get(tmp.path(), "file:src/main.rs").await;
         assert!(result.is_none());
+    }
+
+    // ── try_claim_starting_sentinel ──────────────────────────────────────
+
+    #[test]
+    fn starting_sentinel_first_caller_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mati.starting");
+
+        match try_claim_starting_sentinel(&path) {
+            StartingClaim::Claimed => {}
+            other => panic!("first caller should win, got: {other:?}"),
+        }
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn starting_sentinel_second_caller_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mati.starting");
+
+        // First caller claims
+        assert!(matches!(
+            try_claim_starting_sentinel(&path),
+            StartingClaim::Claimed
+        ));
+
+        // Second caller should see AlreadyActive
+        assert!(matches!(
+            try_claim_starting_sentinel(&path),
+            StartingClaim::AlreadyActive
+        ));
+    }
+
+    #[test]
+    fn starting_sentinel_stale_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mati.starting");
+
+        // Write a stale sentinel (>10s old)
+        std::fs::write(&path, "0").unwrap();
+
+        match try_claim_starting_sentinel(&path) {
+            StartingClaim::StaleRemoved => {}
+            other => panic!("stale sentinel should be removed, got: {other:?}"),
+        }
+        // File should be gone after stale removal
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn starting_sentinel_claim_after_stale_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mati.starting");
+
+        // Write a stale sentinel
+        std::fs::write(&path, "0").unwrap();
+
+        // First call removes stale
+        assert!(matches!(
+            try_claim_starting_sentinel(&path),
+            StartingClaim::StaleRemoved
+        ));
+        // Retry claims successfully
+        assert!(matches!(
+            try_claim_starting_sentinel(&path),
+            StartingClaim::Claimed
+        ));
+    }
+
+    #[test]
+    fn starting_sentinel_dead_pid_reclaimed_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mati.starting");
+
+        // Write a recent sentinel with a PID that doesn't exist (PID 1 is init,
+        // use a very large PID that's almost certainly dead).
+        let now = wall_secs();
+        std::fs::write(&path, format_sentinel(now, 4_000_000)).unwrap();
+
+        // Should be reclaimed immediately (dead PID, even though timestamp is fresh)
+        match try_claim_starting_sentinel(&path) {
+            StartingClaim::StaleRemoved => {}
+            other => panic!("dead-PID sentinel should be reclaimed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn starting_sentinel_alive_pid_blocks_even_if_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mati.starting");
+
+        // Write a sentinel with our own PID (definitely alive) but old timestamp
+        let old_ts = wall_secs().saturating_sub(STARTING_STALE_SECS + 100);
+        std::fs::write(&path, format_sentinel(old_ts, std::process::id())).unwrap();
+
+        // Should block — owner PID is alive, so we respect it even past timeout
+        assert!(matches!(
+            try_claim_starting_sentinel(&path),
+            StartingClaim::AlreadyActive
+        ));
+    }
+
+    #[test]
+    fn parse_sentinel_roundtrip() {
+        let s = format_sentinel(1234567890, 42);
+        let (ts, pid) = parse_sentinel(&s).unwrap();
+        assert_eq!(ts, 1234567890);
+        assert_eq!(pid, 42);
+    }
+
+    #[test]
+    fn parse_sentinel_legacy_format_returns_none() {
+        // Legacy format has only a timestamp, no PID
+        assert!(parse_sentinel("1234567890").is_none());
+    }
+
+    #[test]
+    fn is_pid_alive_for_current_process() {
+        assert!(is_pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn is_pid_alive_for_dead_pid() {
+        // PID 4_000_000 is almost certainly not running
+        assert!(!is_pid_alive(4_000_000));
     }
 }

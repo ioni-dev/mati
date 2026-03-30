@@ -10,10 +10,12 @@
 //! a lock error while the MCP server holds the exclusive handle).
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
@@ -21,17 +23,38 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::graph::Graph;
-use crate::store::Store;
+use crate::store::{derive_slug, Store};
 
 use super::tools::MatiServer;
+use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
+
+enum ServerOpen {
+    Direct(Store),
+    Proxy(PathBuf),
+}
+
+#[derive(Debug)]
+pub(crate) enum ProxyDaemonResult {
+    Ok(serde_json::Value),
+    NotRunning,
+    StaleSocket,
+    Unresponsive,
+}
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MatiServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "mati — engineering knowledge that survives turnover. \
-                 Use mem_get to inspect records, mem_query to search, \
-                 mem_bootstrap at session start, and mem_set to save knowledge.",
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_instructions(
+            "mati is a persistent engineering knowledge store for the current \
+                 codebase. Use mem_get for direct record lookup, mem_query for \
+                 search and graph traversal, mem_bootstrap for session context, \
+                 and mem_set for writing knowledge records.",
         )
     }
 }
@@ -44,47 +67,188 @@ impl ServerHandler for MatiServer {
 /// Also binds the daemon Unix socket so hook scripts (`mati ping`, `mati get`)
 /// can reach the store without conflicting with the MCP server's exclusive lock.
 pub async fn serve(repo_root: &Path) -> Result<()> {
-    let store = Store::open_and_rebuild(repo_root)
-        .await
-        .context("failed to open mati store")?;
+    // Codex may spawn multiple instances of the MCP server concurrently.
+    // Only one can acquire the SurrealKV exclusive lock. If the first attempt
+    // fails with a lock error, retry a few times with backoff — the other
+    // instance may be a transient spawn that exits quickly, or it may be the
+    // "winner" that holds the lock for the session lifetime.
+    // Retry window must be long enough to outlast transient daemon processes
+    // spawned by Codex hooks (try_auto_start) during session startup. These
+    // daemons hold the lock for 1-3 seconds before exiting. 8 retries with
+    // exponential backoff (250ms→500ms→1s→2s→4s→4s→4s→4s ≈ 16s total) covers
+    // the worst case.
+    match open_with_retry(repo_root, 8, Duration::from_millis(250)).await? {
+        ServerOpen::Direct(store) => {
+            // Clear session:consulted:* markers from the previous session.
+            // These are written by log_hit and used by pre-read/pre-bash hooks to downgrade
+            // deny → allow+context after a mem_get call. They must be scoped to the current
+            // session — any leftovers from a previous session would permanently bypass deny.
+            if let Ok(keys) = store.scan_keys("session:consulted:").await {
+                for k in &keys {
+                    let _ = store.delete(k).await;
+                }
+                if !keys.is_empty() {
+                    tracing::debug!(
+                        "serve: cleared {} stale session:consulted markers",
+                        keys.len()
+                    );
+                }
+            }
 
-    // Clear session:consulted:* markers from the previous session.
-    // These are written by log_hit and used by pre-read/pre-bash hooks to downgrade
-    // deny → allow+context after a mem_get call. They must be scoped to the current
-    // session — any leftovers from a previous session would permanently bypass deny.
-    if let Ok(keys) = store.scan_keys("session:consulted:").await {
-        for k in &keys {
-            let _ = store.delete(k).await;
+            let graph = Graph::load(store)
+                .await
+                .context("failed to load knowledge graph")?;
+
+            let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+            let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+
+            // Spawn the daemon socket listener so hook scripts (mati ping / mati get)
+            // can route through this process instead of opening the store directly.
+            // Non-fatal: if binding fails, hooks degrade gracefully via mati ping check.
+            let repo_root_arc = Arc::new(repo_root.to_path_buf());
+            tokio::spawn(serve_daemon_socket(Arc::clone(&graph_arc), repo_root_arc));
+
+            let transport = rmcp::transport::io::stdio();
+            let service = server
+                .serve(transport)
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
+
+            service.waiting().await?;
         }
-        if !keys.is_empty() {
-            tracing::debug!(
-                "serve: cleared {} stale session:consulted markers",
-                keys.len()
+        ServerOpen::Proxy(root) => {
+            tracing::info!(
+                "mati serve: store locked by another instance, starting socket-backed MCP proxy"
             );
+            let transport = rmcp::transport::io::stdio();
+            let service = MatiServer::with_socket_root(root)
+                .serve(transport)
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP proxy initialization failed: {e}"))?;
+
+            service.waiting().await?;
         }
     }
-
-    let graph = Graph::load(store)
-        .await
-        .context("failed to load knowledge graph")?;
-
-    let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
-    let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
-
-    // Spawn the daemon socket listener so hook scripts (mati ping / mati get)
-    // can route through this process instead of opening the store directly.
-    // Non-fatal: if binding fails, hooks degrade gracefully via mati ping check.
-    let repo_root_arc = Arc::new(repo_root.to_path_buf());
-    tokio::spawn(serve_daemon_socket(Arc::clone(&graph_arc), repo_root_arc));
-
-    let transport = rmcp::transport::io::stdio();
-    let service = server
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
-
-    service.waiting().await?;
     Ok(())
+}
+
+pub(crate) fn mati_root_for(repo_root: &Path) -> Result<PathBuf> {
+    let slug = derive_slug(repo_root);
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+    Ok(home.join(".mati").join(slug))
+}
+
+pub(crate) async fn proxy_daemon_result(
+    root: &Path,
+    cmd: &str,
+    args: serde_json::Value,
+) -> ProxyDaemonResult {
+    let sock_path = root.join("mati.sock");
+
+    if sock_path.as_os_str().len() > UNIX_SOCK_PATH_MAX {
+        tracing::warn!(
+            path = %sock_path.display(),
+            "mcp proxy: socket path exceeds Unix limit"
+        );
+        return ProxyDaemonResult::NotRunning;
+    }
+
+    if !sock_path.exists() {
+        return ProxyDaemonResult::NotRunning;
+    }
+
+    let stream = match UnixStream::connect(&sock_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
+            if is_refused {
+                let pid_path = root.join("mati.pid");
+                let _ = std::fs::remove_file(&sock_path);
+                let _ = std::fs::remove_file(pid_path);
+                return ProxyDaemonResult::StaleSocket;
+            }
+            return ProxyDaemonResult::NotRunning;
+        }
+    };
+
+    let (reader, mut writer) = stream.into_split();
+    let request = serde_json::json!({ "v": PROTOCOL_VERSION, "cmd": cmd, "args": args });
+    let mut bytes = match serde_json::to_vec(&request) {
+        Ok(b) => b,
+        Err(_) => return ProxyDaemonResult::Unresponsive,
+    };
+    bytes.push(b'\n');
+
+    if writer.write_all(&bytes).await.is_err() {
+        return ProxyDaemonResult::Unresponsive;
+    }
+    if writer.shutdown().await.is_err() {
+        return ProxyDaemonResult::Unresponsive;
+    }
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut line = String::new();
+    match tokio::time::timeout(Duration::from_secs(2), buf_reader.read_line(&mut line)).await {
+        Ok(Ok(n)) if n > 0 => {}
+        _ => return ProxyDaemonResult::Unresponsive,
+    }
+
+    match serde_json::from_str(line.trim()) {
+        Ok(v) => ProxyDaemonResult::Ok(v),
+        Err(_) => ProxyDaemonResult::Unresponsive,
+    }
+}
+
+/// Open the store, handling lock contention from duplicate MCP server spawns.
+///
+/// Codex spawns the same MCP server command twice on startup. Only one instance
+/// can acquire the SurrealKV exclusive flock — the other gets a lock error.
+///
+/// If we crash with exit(1) + stderr, Codex records the failure and shows
+/// "Tools: (none)" even though the first instance is serving correctly.
+///
+/// Fix: on lock contention, retry with backoff. If we still can't get the lock
+/// after all retries, exit silently (exit 0, no stderr) so Codex doesn't
+/// overwrite the successful instance's tool registration with an error state.
+async fn open_with_retry(
+    repo_root: &Path,
+    max_retries: u32,
+    initial_delay: Duration,
+) -> Result<ServerOpen> {
+    let mut delay = initial_delay;
+    let mati_root = mati_root_for(repo_root)?;
+    for attempt in 0..=max_retries {
+        match Store::open_and_rebuild(repo_root).await {
+            Ok(store) => return Ok(ServerOpen::Direct(store)),
+            Err(e) => {
+                let is_lock = e.chain().any(|cause| {
+                    let msg = cause.to_string();
+                    msg.contains("already locked") || msg.contains("WouldBlock")
+                });
+                if !is_lock {
+                    return Err(e).context("failed to open mati store");
+                }
+                if attempt == max_retries {
+                    return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({})).await {
+                        ProxyDaemonResult::Ok(_) => Ok(ServerOpen::Proxy(mati_root)),
+                        other => Err(anyhow::anyhow!(
+                            "store locked after retries and no proxy target was reachable: {:?}",
+                            other
+                        )),
+                    };
+                }
+                tracing::info!(
+                    attempt = attempt + 1,
+                    max_retries,
+                    delay_ms = delay.as_millis() as u64,
+                    "store locked by another process, retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(Duration::from_secs(4));
+            }
+        }
+    }
+    unreachable!()
 }
 
 // ── Daemon socket — hook script bridge ───────────────────────────────────────
@@ -187,17 +351,14 @@ async fn serve_daemon_socket(
                 continue;
             }
         };
-        // Read lock covers one full request/response cycle.
-        // Store methods use interior mutability — a read lock is sufficient.
-        let g = graph.read().await;
-        if let Err(e) = socket_handle_connection(g.store(), &repo_root, stream).await {
+        if let Err(e) = socket_handle_connection(Arc::clone(&graph), &repo_root, stream).await {
             tracing::debug!("daemon socket connection: {e}");
         }
     }
 }
 
 async fn socket_handle_connection(
-    store: &Store,
+    graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     stream: UnixStream,
 ) -> Result<()> {
@@ -229,7 +390,8 @@ async fn socket_handle_connection(
         }
     }
 
-    let resp = socket_dispatch(store, repo_root, &req).await;
+    let graph_guard = graph.read().await;
+    let resp = socket_dispatch(graph_guard.store(), Some(Arc::clone(&graph)), repo_root, &req).await;
     write_socket_response(&mut writer, &resp).await
 }
 
@@ -244,11 +406,72 @@ async fn write_socket_response(
     Ok(())
 }
 
-async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -> SocketResponse {
+async fn socket_dispatch(
+    store: &Store,
+    graph: Option<Arc<tokio::sync::RwLock<Graph>>>,
+    repo_root: &Path,
+    req: &SocketRequest,
+) -> SocketResponse {
     use crate::store::session as sess;
 
     match req.cmd.as_str() {
         "ping" => SocketResponse::ok(serde_json::Value::String("pong".into())),
+
+        "mem_get" => {
+            let Some(graph) = graph.as_ref() else {
+                return SocketResponse::err("mem_get requires graph-backed dispatch");
+            };
+            let params = match serde_json::from_value::<MemGetParams>(req.args.clone()) {
+                Ok(p) => p,
+                Err(e) => return SocketResponse::err(format!("invalid mem_get args: {e}")),
+            };
+            let server = MatiServer::with_graph_arc(Arc::clone(graph));
+            SocketResponse::ok(serde_json::Value::String(
+                server.mem_get(Parameters(params)).await,
+            ))
+        }
+
+        "mem_query" => {
+            let Some(graph) = graph.as_ref() else {
+                return SocketResponse::err("mem_query requires graph-backed dispatch");
+            };
+            let params = match serde_json::from_value::<MemQueryParams>(req.args.clone()) {
+                Ok(p) => p,
+                Err(e) => return SocketResponse::err(format!("invalid mem_query args: {e}")),
+            };
+            let server = MatiServer::with_graph_arc(Arc::clone(graph));
+            SocketResponse::ok(serde_json::Value::String(
+                server.mem_query(Parameters(params)).await,
+            ))
+        }
+
+        "mem_bootstrap" => {
+            let Some(graph) = graph.as_ref() else {
+                return SocketResponse::err("mem_bootstrap requires graph-backed dispatch");
+            };
+            let params = match serde_json::from_value::<MemBootstrapParams>(req.args.clone()) {
+                Ok(p) => p,
+                Err(e) => return SocketResponse::err(format!("invalid mem_bootstrap args: {e}")),
+            };
+            let server = MatiServer::with_graph_arc(Arc::clone(graph));
+            SocketResponse::ok(serde_json::Value::String(
+                server.mem_bootstrap(Parameters(params)).await,
+            ))
+        }
+
+        "mem_set" => {
+            let Some(graph) = graph.as_ref() else {
+                return SocketResponse::err("mem_set requires graph-backed dispatch");
+            };
+            let params = match serde_json::from_value::<MemSetParams>(req.args.clone()) {
+                Ok(p) => p,
+                Err(e) => return SocketResponse::err(format!("invalid mem_set args: {e}")),
+            };
+            let server = MatiServer::with_graph_arc(Arc::clone(graph));
+            return SocketResponse::ok(serde_json::Value::String(
+                server.mem_set(Parameters(params)).await,
+            ));
+        }
 
         "get" => {
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
@@ -312,12 +535,72 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
             SocketResponse::ok(serde_json::Value::Null)
         }
 
+        "log_compliance_hit" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            if let Err(e) = sess::log_compliance_hit(store, key).await {
+                tracing::warn!("daemon socket log_compliance_hit: {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
+        "log_codex_shell_miss" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            if let Err(e) = sess::log_codex_shell_miss(store, key).await {
+                tracing::warn!("daemon socket log_codex_shell_miss: {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
+        "log_bootstrap" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            if let Err(e) = sess::log_bootstrap(store, key).await {
+                tracing::warn!("daemon socket log_bootstrap: {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
+        "log_prompt_nudge" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            if let Err(e) = sess::log_prompt_nudge(store, key).await {
+                tracing::warn!("daemon socket log_prompt_nudge: {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
         "session_check_consulted" => {
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
             match sess::check_consulted(store, key).await {
+                Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
+                Err(e) => SocketResponse::err(format!("store: {e}")),
+            }
+        }
+
+        "session_check_consulted_recent" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            let ttl_secs = req
+                .args
+                .get("ttl_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(900);
+            match sess::check_consulted_recent(store, key, ttl_secs).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -457,6 +740,92 @@ async fn socket_dispatch(store: &Store, repo_root: &Path, req: &SocketRequest) -
             }
         }
 
+        "gotcha_confirm" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+
+            // Read record
+            let mut record = match store.get(key).await {
+                Ok(Some(r)) => r,
+                Ok(None) => return SocketResponse::err(format!("record not found: {key}")),
+                Err(e) => return SocketResponse::err(format!("store get: {e}")),
+            };
+
+            if record.category != crate::store::record::Category::Gotcha {
+                return SocketResponse::err(format!("{key} is not a gotcha record"));
+            }
+
+            // Set confirmed + normalize severity
+            if let Some(ref mut payload) = record.payload {
+                if let Some(obj) = payload.as_object_mut() {
+                    if let Some(sev) = obj
+                        .get("severity")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase())
+                    {
+                        obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                    }
+                    obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+                }
+            }
+
+            record.source = crate::store::record::RecordSource::DeveloperManual;
+            record.confidence.value = crate::store::record::ConfidenceScore::base_for_source(
+                &crate::store::record::RecordSource::DeveloperManual,
+            );
+            record.confidence.confirmation_count += 1;
+            record.quality = crate::health::quality::analyze(&record);
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            record.updated_at = now;
+            record.version.logical_clock += 1;
+            record.version.wall_clock = now;
+
+            // Extract affected_files for file-link sync
+            let affected_files: Vec<String> = record
+                .payload_as::<crate::store::record::GotchaRecord>()
+                .map(|g| g.affected_files)
+                .unwrap_or_default();
+
+            if let Err(e) = store.put(key, &record).await {
+                return SocketResponse::err(format!("store put: {e}"));
+            }
+
+            // Sync file:*.gotcha_keys — best-effort
+            for file_path in &affected_files {
+                let file_key = format!("file:{file_path}");
+                if let Ok(Some(mut file_record)) = store.get(&file_key).await {
+                    let needs_link = file_record
+                        .payload
+                        .as_ref()
+                        .and_then(|p| p.get("gotcha_keys"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| !arr.iter().any(|v| v.as_str() == Some(key)))
+                        .unwrap_or(true);
+                    if needs_link {
+                        if let Some(ref mut payload) = file_record.payload {
+                            if let Some(obj) = payload.as_object_mut() {
+                                let arr = obj
+                                    .entry("gotcha_keys")
+                                    .or_insert(serde_json::json!([]));
+                                if let Some(arr) = arr.as_array_mut() {
+                                    arr.push(serde_json::Value::String(key.to_string()));
+                                }
+                            }
+                        }
+                        let _ = store.put(&file_key, &file_record).await;
+                    }
+                }
+            }
+
+            SocketResponse::ok(serde_json::json!({"confirmed": true, "key": key}))
+        }
+
         other => SocketResponse::err(format!("unknown command: {other}")),
     }
 }
@@ -573,7 +942,7 @@ mod tests {
             version: Some(PROTOCOL_VERSION),
             args,
         };
-        socket_dispatch(store, Path::new("/tmp/mati-test"), &req).await
+        socket_dispatch(store, None, Path::new("/tmp/mati-test"), &req).await
     }
 
     // ── Regression: gotcha_write via socket syncs file links ─────────────

@@ -255,12 +255,7 @@ fn run_pass(
         eprintln!("    mati init...");
         let r = run_once(
             bin,
-            &[
-                "init",
-                "--path",
-                repo_path.to_str().unwrap(),
-                "--no-hooks",
-            ],
+            &["init", "--path", repo_path.to_str().unwrap(), "--no-hooks"],
             repo_path,
         );
         if !r.success {

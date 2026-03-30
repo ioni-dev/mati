@@ -7,6 +7,7 @@ pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # mati pre-read hook — file read interception (M-09-A, M-13-D staleness)
 # Receives tool input JSON on stdin from Claude Code PreToolUse hook.
 set -euo pipefail
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 
 INPUT=$(cat)
 

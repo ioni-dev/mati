@@ -14,10 +14,15 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+use super::codex_post_bash;
+use super::codex_pre_bash;
+use super::codex_session_start;
+use super::codex_stop;
+use super::codex_user_prompt;
 use super::post_compliance;
 use super::post_edit;
-use super::pre_compact;
 use super::pre_bash;
+use super::pre_compact;
 use super::pre_read;
 use super::session_end;
 
@@ -29,6 +34,7 @@ struct HookTestHarness {
     mock_responses: HashMap<String, String>,
     exclude_binaries: Vec<String>,
     mock_ping_exit_code: i32,
+    mock_recent_consulted: bool,
     /// Optional: inject extra logic into the mock mati script (e.g. sleep).
     mock_extra_cases: String,
 }
@@ -74,6 +80,7 @@ impl HookTestHarness {
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
             mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
             mock_extra_cases: String::new(),
         }
     }
@@ -85,6 +92,7 @@ impl HookTestHarness {
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
             mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
             mock_extra_cases: String::new(),
         }
     }
@@ -96,6 +104,67 @@ impl HookTestHarness {
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
             mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_codex_session_start() -> Self {
+        Self {
+            script_content: codex_session_start::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_codex_user_prompt() -> Self {
+        Self {
+            script_content: codex_user_prompt::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_codex_pre_bash() -> Self {
+        Self {
+            script_content: codex_pre_bash::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_codex_post_bash() -> Self {
+        Self {
+            script_content: codex_post_bash::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_codex_stop() -> Self {
+        Self {
+            script_content: codex_stop::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
             mock_extra_cases: String::new(),
         }
     }
@@ -107,6 +176,7 @@ impl HookTestHarness {
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
             mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
             mock_extra_cases: String::new(),
         }
     }
@@ -118,6 +188,7 @@ impl HookTestHarness {
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
             mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
             mock_extra_cases: String::new(),
         }
     }
@@ -129,6 +200,7 @@ impl HookTestHarness {
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
             mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
             mock_extra_cases: String::new(),
         }
     }
@@ -154,6 +226,11 @@ impl HookTestHarness {
         self
     }
 
+    fn with_recent_consulted(mut self, recent: bool) -> Self {
+        self.mock_recent_consulted = recent;
+        self
+    }
+
     /// Build the mock `mati` script and write it to mock_dir.
     fn write_mock_mati(&self) -> PathBuf {
         let log_file = self.mock_dir.path().join("mati_log.txt");
@@ -176,10 +253,16 @@ case "$1" in
 {get_cases}        esac ;;
     session-check-consulted)
         echo "false" ;;
+    session-check-consulted-recent)
+        if [ "${{3:-}}" = "--ttl-secs" ] && [ "${{4:-}}" = "900" ]; then
+            echo "{recent_consulted}"
+        else
+            echo "false"
+        fi ;;
     doc-capture)
         cat >/dev/null
         echo "$@" >> "{log_file}" ;;
-    log-miss|log-hit|log-compliance-miss|edit-hook|session-flush|session-harvest)
+    log-miss|log-hit|log-compliance-miss|log-compliance-hit|log-codex-shell-miss|log-bootstrap|log-prompt-nudge|edit-hook|session-flush|session-harvest)
         echo "$@" >> "{log_file}" ;;
     reparse)
         exit 0 ;;
@@ -188,6 +271,11 @@ case "$1" in
 esac
 "#,
             ping_exit = self.mock_ping_exit_code,
+            recent_consulted = if self.mock_recent_consulted {
+                "true"
+            } else {
+                "false"
+            },
             get_cases = get_cases,
             log_file = log_file.display(),
             extra = self.mock_extra_cases,
@@ -1070,7 +1158,10 @@ fn prebash_unexpected_jq_type_graceful() {
     })
     .to_string();
     let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0, "unexpected jq type should fail open cleanly");
+    assert_eq!(
+        output.exit_code, 0,
+        "unexpected jq type should fail open cleanly"
+    );
     assert_eq!(
         output.decision(),
         "allow",
@@ -1194,7 +1285,7 @@ esac
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Category 3: Post/Lifecycle Hook Contracts (4 tests)
+// Category 3: Post/Lifecycle Hook Contracts (10 tests)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// 3.01 — post-read compliance logs extensionless root-level files.
@@ -1265,5 +1356,123 @@ fn session_end_invokes_session_harvest() {
         harness.wait_for_log_contains("session-harvest"),
         "session-end should invoke session-harvest, log: {}",
         harness.read_log()
+    );
+}
+
+/// 3.05 — Codex session-start nudges mem_bootstrap.
+#[test]
+fn codex_session_start_emits_bootstrap_guidance() {
+    let harness = HookTestHarness::for_codex_session_start();
+    let output = harness.run("{}");
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.contains("mem_bootstrap"),
+        "session-start should instruct Codex to bootstrap memory"
+    );
+}
+
+/// 3.06 — Codex user-prompt hook nudges and logs likely edit intent.
+#[test]
+fn codex_user_prompt_logs_nudge_for_code_edit_intent() {
+    let harness = HookTestHarness::for_codex_user_prompt();
+    let output = harness.run(r#"{"prompt":"Please inspect src/main.rs and fix the bug"}"#);
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.contains("mem_get"),
+        "user-prompt hook should recommend mem_get for risky file work"
+    );
+    assert!(
+        harness.wait_for_log_contains("log-prompt-nudge __codex_prompt__"),
+        "user-prompt hook should log prompt nudges, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.07 — Codex pre-bash blocks strong gotcha shell reads without a receipt.
+#[test]
+fn codex_pre_bash_blocks_shell_read_without_recent_receipt() {
+    let harness = HookTestHarness::for_codex_pre_bash().with_deny_eligible_record(
+        "file:src/main.rs",
+        0.1,
+        "fresh",
+    );
+    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    assert_eq!(output.exit_code, 0);
+    let json = output.json.expect("codex pre-bash should emit JSON");
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"].as_str(),
+        Some("deny")
+    );
+    assert!(
+        json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mem_get"),
+        "block reason should instruct the agent to consult memory first"
+    );
+    assert!(
+        harness.wait_for_log_contains("log-codex-shell-miss file:src/main.rs"),
+        "pre-bash should log shell misses, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.08 — Codex post-bash logs misses and corrective context.
+#[test]
+fn codex_post_bash_logs_shell_miss_and_context() {
+    let harness = HookTestHarness::for_codex_post_bash();
+    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    assert_eq!(output.exit_code, 0);
+    let json = output.json.expect("codex post-bash should emit JSON");
+    assert!(
+        json["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mem_get"),
+        "post-bash miss should remind the agent to consult memory"
+    );
+    assert!(
+        harness.wait_for_log_contains("log-codex-shell-miss file:src/main.rs"),
+        "post-bash should log shell misses, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.09 — Codex pre-bash allows a strong gotcha file after a recent consultation.
+#[test]
+fn codex_pre_bash_allows_with_recent_receipt() {
+    let harness = HookTestHarness::for_codex_pre_bash()
+        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh")
+        .with_recent_consulted(true);
+    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.trim().is_empty(),
+        "recent consultation should suppress deny/advisory output, got: {}",
+        output.stdout
+    );
+    assert!(
+        !harness
+            .read_log()
+            .contains("log-codex-shell-miss file:src/main.rs"),
+        "recent consultation should not log a shell miss, log: {}",
+        harness.read_log()
+    );
+}
+
+/// 3.10 — Codex stop flushes then harvests the session.
+#[test]
+fn codex_stop_flushes_then_harvests() {
+    let harness = HookTestHarness::for_codex_stop();
+    let output = harness.run("{}");
+    assert_eq!(output.exit_code, 0);
+    let log = harness.read_log();
+    assert!(
+        log.contains("session-flush"),
+        "codex stop should flush session state first, log: {log}"
+    );
+    assert!(
+        log.contains("session-harvest"),
+        "codex stop should harvest session state, log: {log}"
     );
 }

@@ -12,8 +12,9 @@ use mati_core::analysis::{
     parse_dependencies, Walker,
 };
 use mati_core::graph::Graph;
-use mati_core::scaffold::{install_hooks, write_claude_md_stub};
+use mati_core::scaffold::codex::CodexInstallResult;
 use mati_core::scaffold::settings::InstallResult;
+use mati_core::scaffold::{install_codex, install_hooks, write_claude_md_stub};
 use mati_core::store::{
     derive_slug, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
     Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
@@ -25,9 +26,17 @@ pub struct InitArgs {
     #[arg(short, long)]
     pub path: Option<PathBuf>,
 
-    /// Skip hook installation into .claude/hooks/
+    /// Skip agent hook/config installation
     #[arg(long)]
     pub no_hooks: bool,
+
+    /// Install or update Codex integration into .codex/
+    #[arg(long)]
+    pub codex: bool,
+
+    /// Install or update Claude integration into .claude/
+    #[arg(long)]
+    pub claude: bool,
 }
 
 pub async fn run(args: InitArgs) -> Result<()> {
@@ -71,7 +80,35 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 );
             }
             DaemonResult::NotRunning | DaemonResult::StaleSocket => {
-                // Safe to proceed — no daemon holds the lock.
+                // No daemon socket — but a daemon may be starting (race window
+                // between spawn and socket bind). Check the mati.starting sentinel.
+                let starting = mati_root.join("mati.starting");
+                if let Ok(content) = std::fs::read_to_string(&starting) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Semantics must match try_claim_starting_sentinel:
+                    //   - PID alive → always active (owner is running)
+                    //   - PID dead + recent → stale (owner crashed, safe to proceed)
+                    //   - No PID (legacy) → active only if recent
+                    let active = if let Some((_ts, pid)) =
+                        crate::cli::daemon::parse_sentinel(&content)
+                    {
+                        crate::cli::daemon::is_pid_alive(pid)
+                    } else if let Ok(ts) = content.trim().parse::<u64>() {
+                        now.saturating_sub(ts)
+                            < crate::cli::daemon::STARTING_STALE_SECS
+                    } else {
+                        false
+                    };
+                    if active {
+                        anyhow::bail!(
+                            "a mati daemon is starting and may hold the store lock.\n\
+                             Wait a few seconds, then re-run:\n\n  mati init\n"
+                        );
+                    }
+                }
             }
         }
     }
@@ -532,7 +569,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
             Err(e) => tracing::warn!("ownership tombstone scan failed (non-fatal): {e}"),
         }
 
-        let new_dep_keys: HashSet<&str> = dep_record_structs.iter().map(|r| r.key.as_str()).collect();
+        let new_dep_keys: HashSet<&str> =
+            dep_record_structs.iter().map(|r| r.key.as_str()).collect();
         match store.scan_prefix("dep:").await {
             Ok(existing) => {
                 for key in stale_dependency_keys(&existing, &new_dep_keys) {
@@ -677,54 +715,109 @@ pub async fn run(args: InitArgs) -> Result<()> {
         println!("  Search index...                (deferred to first MCP server startup)");
     }
 
-    // ── 12. Scaffold: CLAUDE.md stub ─────────────────────────────────────────
-    // Ensure .claude/ exists so scaffold functions can write into it.
-    let claude_dir = root.join(".claude");
-    if !claude_dir.is_dir() {
-        let _ = std::fs::create_dir_all(&claude_dir);
-    }
-    let t = Instant::now();
-    match write_claude_md_stub(&root) {
-        Ok(_) => println!(
-            "  Writing .claude/CLAUDE.md stub...                   {:>3}ms",
-            t.elapsed().as_millis()
-        ),
-        Err(e) => {
-            tracing::warn!("CLAUDE.md stub write failed: {e}");
-            println!("  Writing .claude/CLAUDE.md stub...    skipped — {:#}", e);
-        }
-    }
+    let explicit_platform = args.claude || args.codex;
+    let has_claude_dir = root.join(".claude").is_dir();
+    let has_codex_dir = root.join(".codex").is_dir();
+    let install_claude_integration = !args.no_hooks
+        && if explicit_platform {
+            args.claude
+        } else {
+            has_claude_dir || !has_codex_dir
+        };
+    let install_codex_integration = !args.no_hooks
+        && if explicit_platform {
+            args.codex
+        } else {
+            has_codex_dir
+        };
+    let mut claude_installed = false;
+    let mut codex_installed = false;
 
-    // ── 13. Scaffold: hooks ──────────────────────────────────────────────────
-    if !args.no_hooks {
+    // ── 12. Scaffold: Claude integration ────────────────────────────────────
+    if install_claude_integration {
+        let claude_dir = root.join(".claude");
+        if !claude_dir.is_dir() {
+            let _ = std::fs::create_dir_all(&claude_dir);
+        }
+        let t = Instant::now();
+        match write_claude_md_stub(&root) {
+            Ok(_) => println!(
+                "  Writing .claude/CLAUDE.md stub...                   {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("CLAUDE.md stub write failed: {e}");
+                println!("  Writing .claude/CLAUDE.md stub...    skipped — {:#}", e);
+            }
+        }
+
         let t = Instant::now();
         match install_hooks(&root) {
             Ok(InstallResult::Installed { missing_deps, .. }) => {
+                claude_installed = true;
                 println!(
-                    "  Installing hooks into .claude/...                   {:>3}ms",
+                    "  Installing Claude integration...                    {:>3}ms",
                     t.elapsed().as_millis()
                 );
                 if !missing_deps.is_empty() {
                     eprintln!();
                     eprintln!(
-                        "  WARNING: hook runtime dependencies missing: {}",
+                        "  WARNING: Claude hook runtime dependencies missing: {}",
                         missing_deps.join(", ")
                     );
-                    eprintln!("  Hook enforcement will fail open until they are installed.");
+                    eprintln!("  Claude hook enforcement will fail open until they are installed.");
                     eprintln!();
                 }
             }
             Ok(InstallResult::NoClaude) => println!(
-                "  Installing hooks into .claude/...                   {:>3}ms",
+                "  Installing Claude integration...                    {:>3}ms",
                 t.elapsed().as_millis()
             ),
             Err(e) => {
-                tracing::warn!("hook installation failed: {e}");
-                println!("  Installing hooks into .claude/...    FAILED");
+                tracing::warn!("Claude integration installation failed: {e}");
+                println!("  Installing Claude integration...       FAILED");
                 eprintln!();
-                eprintln!("  WARNING: hook installation failed — {e:#}");
-                eprintln!("  Read interception will not work until hooks are installed.");
-                eprintln!("  Fix the issue above, then re-run: mati init");
+                eprintln!("  WARNING: Claude integration failed — {e:#}");
+                eprintln!("  Claude read interception will not work until this is fixed.");
+                eprintln!("  Fix the issue above, then re-run: mati init --claude");
+                eprintln!();
+            }
+        }
+    }
+
+    // ── 13. Scaffold: Codex integration ─────────────────────────────────────
+    if install_codex_integration {
+        let t = Instant::now();
+        match install_codex(&root, args.codex) {
+            Ok(CodexInstallResult::Installed { missing_deps, .. }) => {
+                codex_installed = true;
+                println!(
+                    "  Installing Codex integration...                     {:>3}ms",
+                    t.elapsed().as_millis()
+                );
+                if !missing_deps.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: Codex hook runtime dependencies missing: {}",
+                        missing_deps.join(", ")
+                    );
+                    eprintln!("  Codex Bash enforcement will fail open until they are installed.");
+                    eprintln!();
+                }
+            }
+            Ok(CodexInstallResult::NoCodex) => println!(
+                "  Installing Codex integration...                     {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("Codex integration installation failed: {e}");
+                println!("  Installing Codex integration...        FAILED");
+                eprintln!();
+                eprintln!("  WARNING: Codex integration failed — {e:#}");
+                eprintln!(
+                    "  Codex MCP/skill/hook support will not be available until this is fixed."
+                );
+                eprintln!("  Fix the issue above, then re-run: mati init --codex");
                 eprintln!();
             }
         }
@@ -781,6 +874,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
         "  Total: {}ms · 0 tokens · 0 Claude calls",
         total_start.elapsed().as_millis()
     );
+    println!();
+    let integration_label = match (claude_installed, codex_installed, args.no_hooks) {
+        (_, _, true) => "MCP-only fallback (agent scaffolds skipped)".to_string(),
+        (true, true, false) => "Claude + Codex".to_string(),
+        (true, false, false) => "Claude".to_string(),
+        (false, true, false) => "Codex".to_string(),
+        (false, false, false) => "MCP-only fallback".to_string(),
+    };
+    println!("  integration:          {integration_label}");
+    if codex_installed {
+        println!("  Codex capability:     hard Bash enforcement, soft native-read enforcement");
+    }
+    if claude_installed {
+        println!("  Claude capability:    hard pre-read enforcement");
+    }
     println!();
 
     // ── Next steps ───────────────────────────────────────────────────────
@@ -1471,9 +1579,7 @@ mod tests {
             make_record_with_category("dep:cargo:old", Category::Dependency),
             make_record_with_category("file:src/main.rs", Category::File),
         ];
-        let new_keys: HashSet<&str> = ["dep:cargo:serde", "dep:npm:react"]
-            .into_iter()
-            .collect();
+        let new_keys: HashSet<&str> = ["dep:cargo:serde", "dep:npm:react"].into_iter().collect();
 
         let stale = stale_dependency_keys(&existing, &new_keys);
 

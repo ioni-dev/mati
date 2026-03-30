@@ -429,7 +429,12 @@ fn fields_from_schema(s: &Schema) -> Result<Fields> {
     })
 }
 
-fn delete_by_key(index: &Index, writer: &IndexWriter, key_field: tantivy::schema::Field, key: &str) -> Result<()> {
+fn delete_by_key(
+    index: &Index,
+    writer: &IndexWriter,
+    key_field: tantivy::schema::Field,
+    key: &str,
+) -> Result<()> {
     let mut tokenizer = index.tokenizer_for_field(key_field)?;
     let mut stream = tokenizer.token_stream(key);
     let mut tokens = Vec::new();
@@ -942,7 +947,10 @@ mod tests {
 
         let r = make_record("gotcha:delete", "delete_me sentinel", &[]);
         s.add_record(&r).unwrap();
-        assert_eq!(s.query_keys("delete_me", 10).unwrap(), vec!["gotcha:delete"]);
+        assert_eq!(
+            s.query_keys("delete_me", 10).unwrap(),
+            vec!["gotcha:delete"]
+        );
 
         s.delete_key("gotcha:delete").unwrap();
         assert!(s.query_keys("delete_me", 10).unwrap().is_empty());
