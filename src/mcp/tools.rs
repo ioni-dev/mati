@@ -1,18 +1,20 @@
 //! MCP tool implementations (M-07, M-11).
 //!
-//! 4 tools:
+//! Public MCP surface:
 //! - `mem_get`       — direct key lookup
 //! - `mem_query`     — BM25 text search or graph traversal
-//! - `mem_bootstrap` — context packet assembly with token budget
-//! - `mem_set`       — write enriched knowledge records (M-11)
+//! - `mem_bootstrap` — session context assembly within a token budget
+//! - `mem_set`       — knowledge record writes
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::tool_router;
+use serde_json::json;
 
 use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
@@ -23,6 +25,7 @@ use crate::store::record::{
     StalenessScore, StalenessTier,
 };
 
+use super::server::{proxy_daemon_result, ProxyDaemonResult};
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 /// Vector B — appended to every mem_bootstrap result (64 tokens, budget 77).
@@ -135,14 +138,20 @@ fn strip_payload(payload: &serde_json::Value, category: &Category) -> serde_json
 /// owns the Store internally.
 #[derive(Clone)]
 pub struct MatiServer {
-    graph: Arc<tokio::sync::RwLock<Graph>>,
+    backend: MatiBackend,
     pub(crate) tool_router: ToolRouter<Self>,
+}
+
+#[derive(Clone)]
+enum MatiBackend {
+    Direct(Arc<tokio::sync::RwLock<Graph>>),
+    Socket { root: PathBuf },
 }
 
 impl MatiServer {
     pub fn new(graph: Graph) -> Self {
         Self {
-            graph: Arc::new(tokio::sync::RwLock::new(graph)),
+            backend: MatiBackend::Direct(Arc::new(tokio::sync::RwLock::new(graph))),
             tool_router: Self::tool_router(),
         }
     }
@@ -151,7 +160,16 @@ impl MatiServer {
     /// (e.g. to also start the daemon socket listener in the same process).
     pub fn with_graph_arc(graph: Arc<tokio::sync::RwLock<Graph>>) -> Self {
         Self {
-            graph,
+            backend: MatiBackend::Direct(graph),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Construct a socket-backed proxy for cases where another mati process
+    /// already owns the store lock.
+    pub fn with_socket_root(root: PathBuf) -> Self {
+        Self {
+            backend: MatiBackend::Socket { root },
             tool_router: Self::tool_router(),
         }
     }
@@ -159,7 +177,46 @@ impl MatiServer {
     /// Expose the inner Arc so the caller can share the graph with other tasks
     /// (e.g. the daemon socket listener spawned alongside `mati serve`).
     pub fn graph_arc(&self) -> Arc<tokio::sync::RwLock<Graph>> {
-        Arc::clone(&self.graph)
+        match &self.backend {
+            MatiBackend::Direct(graph) => Arc::clone(graph),
+            MatiBackend::Socket { .. } => {
+                panic!("graph_arc is unavailable for a socket-backed MatiServer")
+            }
+        }
+    }
+
+    fn socket_error(op: &str, result: ProxyDaemonResult) -> String {
+        let message = match result {
+            ProxyDaemonResult::NotRunning => format!("{op}: daemon not running"),
+            ProxyDaemonResult::StaleSocket => format!("{op}: daemon socket stale"),
+            ProxyDaemonResult::Unresponsive => format!("{op}: daemon unresponsive"),
+            ProxyDaemonResult::Ok(v) => format!("{op}: malformed daemon response: {v}"),
+        };
+        json!({ "error": message }).to_string()
+    }
+
+    async fn socket_call(&self, op: &str, args: serde_json::Value) -> String {
+        let MatiBackend::Socket { root } = &self.backend else {
+            unreachable!("socket_call only valid for socket backend");
+        };
+
+        match proxy_daemon_result(root, op, args).await {
+            ProxyDaemonResult::Ok(v) => {
+                if v.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                    let err = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("daemon request failed");
+                    return json!({ "error": err }).to_string();
+                }
+                match v.get("data") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => json!({ "error": "daemon response missing data" }).to_string(),
+                }
+            }
+            other => Self::socket_error(op, other),
+        }
     }
 }
 
@@ -170,30 +227,42 @@ impl MatiServer {
     /// Returns the JSON-serialised record, or "null" if not found.
     #[rmcp::tool(
         name = "mem_get",
-        description = "Look up a single mati knowledge record by key. Always call this before using Read on any file — pass the key as \"file:<path>\". If this returns a confirmed record with confidence >= 0.6, do not read the file — use this record instead."
+        description = "Look up one mati knowledge record by key. Before reading a file directly, call this with \"file:<path>\" and use the record instead when it is confirmed and high-confidence.",
+        annotations(read_only_hint = true)
     )]
-    async fn mem_get(&self, Parameters(params): Parameters<MemGetParams>) -> String {
-        let graph = self.graph.read().await;
-        let store = graph.store();
-        match store.get(&params.key).await {
-            Ok(Some(mut record)) => {
-                // M-12-B: bump access_count on every MCP hit (mirrors mati log-hit hook path).
-                record.access_count += 1;
-                // Do NOT recompute confidence here. Confidence recomputation belongs in
-                // the health pipeline (mati stats / mati stale), not on every read.
-                // Writing back a formula-derived value would override confidence values
-                // intentionally bumped by mati init (e.g. co-change quality bump sets
-                // confidence=0.45 so pre-read hooks surface additionalContext).
-                // Best-effort write-back; don't fail the read on write error.
-                let _ = store.put(&params.key, &record).await;
-                // Write session:consulted marker so pre-read/pre-bash hooks know this key
-                // was looked up via MCP and can downgrade deny → allow+context on next access.
-                let _ = crate::store::session::log_hit(store, &params.key).await;
-                serde_json::to_string_pretty(&record_to_agent_json(&record))
-                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
+    pub(crate) async fn mem_get(&self, Parameters(params): Parameters<MemGetParams>) -> String {
+        match &self.backend {
+            MatiBackend::Direct(graph_arc) => {
+                let graph = graph_arc.read().await;
+                let store = graph.store();
+                match store.get(&params.key).await {
+                    Ok(Some(mut record)) => {
+                        // Tombstoned records should appear as "not found" to agents.
+                        if matches!(record.lifecycle, RecordLifecycle::Tombstoned { .. }) {
+                            return "null".to_string();
+                        }
+                        // M-12-B: bump access_count on every MCP hit (mirrors mati log-hit hook path).
+                        record.access_count += 1;
+                        // Do NOT recompute confidence here. Confidence recomputation belongs in
+                        // the health pipeline (mati stats / mati stale), not on every read.
+                        // Writing back a formula-derived value would override confidence values
+                        // intentionally bumped by mati init (e.g. co-change quality bump sets
+                        // confidence=0.45 so pre-read hooks surface additionalContext).
+                        // Best-effort write-back; don't fail the read on write error.
+                        let _ = store.put(&params.key, &record).await;
+                        // Write session:consulted marker so pre-read/pre-bash hooks know this key
+                        // was looked up via MCP and can downgrade deny → allow+context on next access.
+                        let _ = crate::store::session::log_hit(store, &params.key).await;
+                        serde_json::to_string_pretty(&record_to_agent_json(&record))
+                            .unwrap_or_else(|e| {
+                                format!("{{\"error\": \"serialization failed: {e}\"}}")
+                            })
+                    }
+                    Ok(None) => "null".to_string(),
+                    Err(e) => format!("{{\"error\": \"{e}\"}}"),
+                }
             }
-            Ok(None) => "null".to_string(),
-            Err(e) => format!("{{\"error\": \"{e}\"}}"),
+            MatiBackend::Socket { .. } => self.socket_call("mem_get", json!({ "key": params.key })).await,
         }
     }
 
@@ -203,17 +272,23 @@ impl MatiServer {
     /// Text mode returns a JSON array. Graph mode returns a grouped JSON object.
     #[rmcp::tool(
         name = "mem_query",
-        description = "Search the mati knowledge store. Modes: \"text\" (default, BM25 full-text search) or \"graph\" (1-hop traversal from seed key, returns JSON object grouped by relationship: gotchas, co_changes, imports, decisions, notes — each group is an array of records with a summary one-liner)."
+        description = "Search the mati knowledge store. Use mode \"text\" for BM25 full-text search or mode \"graph\" for a 1-hop traversal from a seed key.",
+        annotations(read_only_hint = true)
     )]
-    async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
-        let mode = params.mode.as_deref().unwrap_or("text");
-        let limit = params.limit.unwrap_or(20);
+    pub(crate) async fn mem_query(
+        &self,
+        Parameters(params): Parameters<MemQueryParams>,
+    ) -> String {
+        match &self.backend {
+            MatiBackend::Direct(graph_arc) => {
+                let mode = params.mode.as_str();
+                let limit = params.limit;
 
-        match mode {
-            "text" => {
-                let graph = self.graph.read().await;
-                let store = graph.store();
-                match store.search(&params.query, limit).await {
+                match mode {
+                    "text" => {
+                        let graph = graph_arc.read().await;
+                        let store = graph.store();
+                        match store.search(&params.query, limit).await {
                     Ok(mut records) => {
                         records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
                         let stripped: Vec<serde_json::Value> =
@@ -225,9 +300,9 @@ impl MatiServer {
                     Err(e) => format!("{{\"error\": \"{e}\"}}"),
                 }
             }
-            "graph" => {
-                let graph = self.graph.read().await;
-                let store = graph.store();
+                    "graph" => {
+                        let graph = graph_arc.read().await;
+                        let store = graph.store();
 
                 // Per-kind limits ensure gotchas always surface
                 const GOTCHA_LIMIT: usize = 10;
@@ -344,14 +419,23 @@ impl MatiServer {
                 serde_json::to_string_pretty(&result)
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
             }
-            "semantic" => {
-                "{\"error\": \"semantic search requires --features semantic (not enabled)\"}"
-                    .to_string()
+                    "semantic" => {
+                        "{\"error\": \"semantic search requires --features semantic (not enabled)\"}"
+                            .to_string()
+                    }
+                    _ => {
+                        format!(
+                            "{{\"error\": \"unknown mode: {mode}. Valid modes: text, graph, semantic\"}}"
+                        )
+                    }
+                }
             }
-            _ => {
-                format!(
-                    "{{\"error\": \"unknown mode: {mode}. Valid modes: text, graph, semantic\"}}"
+            MatiBackend::Socket { .. } => {
+                self.socket_call(
+                    "mem_query",
+                    json!({ "query": params.query, "mode": params.mode, "limit": params.limit }),
                 )
+                .await
             }
         }
     }
@@ -362,16 +446,37 @@ impl MatiServer {
     /// Returns a markdown injection string for Claude.
     #[rmcp::tool(
         name = "mem_bootstrap",
-        description = "Assemble a context packet for the current coding session. Gathers confirmed gotchas, file records, and architectural decisions relevant to the provided context_files, within a 2,000-token budget. Call this at session start."
+        description = "Assemble a compact context packet for the current coding session from relevant gotchas, file records, and decisions. Call this at session start.",
+        annotations(read_only_hint = true)
     )]
-    async fn mem_bootstrap(&self, Parameters(params): Parameters<MemBootstrapParams>) -> String {
-        let graph = self.graph.read().await;
-        let store = graph.store();
+    pub(crate) async fn mem_bootstrap(
+        &self,
+        Parameters(params): Parameters<MemBootstrapParams>,
+    ) -> String {
+        match &self.backend {
+            MatiBackend::Direct(graph_arc) => {
+                let graph = graph_arc.read().await;
+                let store = graph.store();
 
-        let context_files = params.context_files.unwrap_or_default();
-        match assemble_context_packet(store, &graph, &context_files).await {
-            Ok(packet) => packet.injection_string,
-            Err(e) => format!("[mati] bootstrap error: {e}{VECTOR_B}"),
+                let context_files = params.context_files;
+                let _ = crate::store::session::log_bootstrap(store, "__bootstrap__").await;
+                for file in &context_files {
+                    let file_key = if file.starts_with("file:") {
+                        file.clone()
+                    } else {
+                        format!("file:{file}")
+                    };
+                    let _ = crate::store::session::log_hit(store, &file_key).await;
+                }
+                match assemble_context_packet(store, &graph, &context_files).await {
+                    Ok(packet) => packet.injection_string,
+                    Err(e) => format!("[mati] bootstrap error: {e}{VECTOR_B}"),
+                }
+            }
+            MatiBackend::Socket { .. } => {
+                self.socket_call("mem_bootstrap", json!({ "context_files": params.context_files }))
+                    .await
+            }
         }
     }
 
@@ -382,15 +487,39 @@ impl MatiServer {
     /// to confirm and activate hook enforcement.
     #[rmcp::tool(
         name = "mem_set",
-        description = "Write enriched knowledge to the mati store. \n\nUSE FOR: (1) /mati-enrich file/directory enrichment, (2) inline capture when developer says 'add that as a gotcha' / 'remember this' / 'note that'. \n\nGOTCHA RULES: rule MUST start with imperative verb (Always/Never/Ensure/Do not). reason MUST state causality — what breaks and why. confirmed MUST be false. \n\nFILE RULES: value and purpose MUST start with a verb (Handles/Manages/Validates). Preserve all existing structural fields from mem_get — only update purpose and gotcha_keys. \n\nCONFIRM ROUTING: \n- SINGLE GOTCHA (developer said 'add gotcha' / 'remember this' / 'that's a gotcha'): mem_set then immediately run `mati gotcha confirm <key>` via Bash. Developer is the authority — no review needed. \n- SINGLE FILE ENRICHMENT (/mati-enrich one file): mem_set then `mati gotcha confirm <key>` for each gotcha. Developer is supervising. \n- BATCH ENRICHMENT (/mati-enrich directory or multiple files): mem_set with confirmed=false. Do NOT auto-confirm. End with 'N gotchas written. Run `mati review` to confirm and activate hooks.' \n\nQUALITY GATE: records with quality < 0.2 are suppressed and never injected. Imperative verb + causality reason = quality >= 0.4 (injectable)."
+        description = "Write, confirm, or delete a knowledge record. Actions: \"write\" (default) creates/updates a record, \"confirm\" activates a gotcha for hook enforcement, \"delete\" tombstones a gotcha.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = true)
     )]
-    async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
-        let graph = self.graph.read().await;
-        let store = graph.store();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    pub(crate) async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
+        match &self.backend {
+            MatiBackend::Direct(graph_arc) => {
+                // Dispatch on action before the default write path.
+                match params.action.as_str() {
+                    "confirm" => {
+                        return self
+                            .mem_set_confirm(graph_arc, &params.key)
+                            .await;
+                    }
+                    "delete" => {
+                        return self
+                            .mem_set_delete(graph_arc, &params.key)
+                            .await;
+                    }
+                    "write" | "" => {} // fall through to write path below
+                    other => {
+                        return serde_json::json!({
+                            "error": format!("unknown action: {other}. Valid: write, confirm, delete")
+                        })
+                        .to_string();
+                    }
+                }
+
+                let graph = graph_arc.read().await;
+                let store = graph.store();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
 
         // Validate key namespace
         let valid_prefix = ["file:", "gotcha:", "decision:", "dev_note:"]
@@ -465,7 +594,7 @@ impl MatiServer {
                 source: RecordSource::StaticAnalysis,
                 confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
                 gap_analysis_score: 0.0,
-                payload: None,
+                payload: Some(serde_json::json!({})),
             },
         };
 
@@ -493,7 +622,15 @@ impl MatiServer {
 
         // Merge payload: for existing records, preserve structural fields from
         // Layer 0 (entry_points, imports, etc.) while overlaying enrichment.
-        if let Some(new_payload) = params.payload {
+        // Some MCP clients (Codex) send the payload as a JSON-encoded string
+        // rather than a raw object. Parse it if so.
+        let new_payload = match &params.payload {
+            serde_json::Value::String(s) => {
+                serde_json::from_str::<serde_json::Value>(s).unwrap_or(params.payload)
+            }
+            _ => params.payload,
+        };
+        if new_payload.is_object() && !new_payload.as_object().map_or(true, |o| o.is_empty()) {
             if let Some(existing_payload) = &record.payload {
                 // Merge: new values override, existing keys preserved
                 let mut merged = existing_payload.clone();
@@ -576,7 +713,8 @@ impl MatiServer {
             }
         }
 
-        let old_affected_set: HashSet<&str> = old_affected_files.iter().map(String::as_str).collect();
+        let old_affected_set: HashSet<&str> =
+            old_affected_files.iter().map(String::as_str).collect();
         let new_affected_set: HashSet<&str> = affected_files.iter().map(String::as_str).collect();
 
         drop(graph); // release read lock before taking write lock
@@ -585,7 +723,7 @@ impl MatiServer {
         // mem_set already updated file links above; here we remove stale
         // HasGotcha edges for moved gotchas and add edges for newly-affected files.
         if record_key.starts_with("gotcha:") {
-            let mut graph = self.graph.write().await;
+            let mut graph = graph_arc.write().await;
 
             for file_path in old_affected_set.difference(&new_affected_set) {
                 let file_key = format!("file:{file_path}");
@@ -593,7 +731,9 @@ impl MatiServer {
                     .remove_edge(&file_key, &EdgeKind::HasGotcha, &record_key)
                     .await
                 {
-                    tracing::warn!("mem_set: stale edge removal failed for {file_key} → {record_key}: {e}");
+                    tracing::warn!(
+                        "mem_set: stale edge removal failed for {file_key} → {record_key}: {e}"
+                    );
                     crate::store::repair::mark_dirty(
                         graph.store(),
                         &record_key,
@@ -620,14 +760,177 @@ impl MatiServer {
             }
         }
 
-        serde_json::json!({
+                serde_json::json!({
+                    "ok": true,
+                    "key": record_key,
+                    "confidence": record.confidence.value,
+                    "quality": record.quality.value,
+                    "tier": tier_label,
+                })
+                .to_string()
+            }
+            MatiBackend::Socket { .. } => {
+                let cmd = match params.action.as_str() {
+                    "confirm" => "gotcha_confirm",
+                    "delete" => "gotcha_tombstone",
+                    _ => "mem_set",
+                };
+                self.socket_call(
+                    cmd,
+                    json!({
+                        "key": params.key,
+                        "value": params.value,
+                        "category": params.category,
+                        "payload": params.payload,
+                        "tags": params.tags,
+                        "priority": params.priority,
+                    }),
+                )
+                .await
+            }
+        }
+    }
+}
+
+// ── mem_set action helpers ──────────────────────────────────────────────────
+
+impl MatiServer {
+    /// Confirm a gotcha record — sets confirmed=true, bumps confidence to 0.80,
+    /// syncs file-record gotcha_keys. This is the MCP-native equivalent of
+    /// `mati gotcha confirm`, needed because Codex Bash commands cannot access
+    /// the daemon socket from the sandbox.
+    async fn mem_set_confirm(
+        &self,
+        graph_arc: &Arc<tokio::sync::RwLock<Graph>>,
+        key: &str,
+    ) -> String {
+        let graph = graph_arc.read().await;
+        let store = graph.store();
+
+        if !key.starts_with("gotcha:") {
+            return json!({"error": "confirm action only applies to gotcha: keys"}).to_string();
+        }
+
+        let mut record = match store.get(key).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return json!({"error": format!("record not found: {key}")}).to_string(),
+            Err(e) => return json!({"error": format!("store get: {e}")}).to_string(),
+        };
+
+        if record.category != Category::Gotcha {
+            return json!({"error": format!("{key} is not a gotcha record")}).to_string();
+        }
+
+        // Set confirmed + normalize severity
+        if let Some(ref mut payload) = record.payload {
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(sev) = obj
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase())
+                {
+                    obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                }
+                obj.insert(
+                    "confirmed".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
+
+        record.source = RecordSource::DeveloperManual;
+        record.confidence.value =
+            ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+        record.confidence.confirmation_count += 1;
+        record.quality = quality::analyze(&record);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+
+        // Extract affected_files for file-link sync
+        let affected_files: Vec<String> = record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default();
+
+        if let Err(e) = store.put(key, &record).await {
+            return json!({"error": format!("store put: {e}")}).to_string();
+        }
+
+        // Sync file:*.gotcha_keys — best-effort
+        for file_path in &affected_files {
+            let file_key = format!("file:{file_path}");
+            if let Ok(Some(mut file_record)) = store.get(&file_key).await {
+                let needs_link = file_record
+                    .payload
+                    .as_ref()
+                    .and_then(|p| p.get("gotcha_keys"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| !arr.iter().any(|v| v.as_str() == Some(key)))
+                    .unwrap_or(true);
+                if needs_link {
+                    if let Some(ref mut payload) = file_record.payload {
+                        if let Some(obj) = payload.as_object_mut() {
+                            let arr = obj
+                                .entry("gotcha_keys")
+                                .or_insert(serde_json::json!([]));
+                            if let Some(arr) = arr.as_array_mut() {
+                                arr.push(serde_json::Value::String(key.to_string()));
+                            }
+                        }
+                    }
+                    let _ = store.put(&file_key, &file_record).await;
+                }
+            }
+        }
+
+        // Mint consultation receipt so hooks know this file was reviewed
+        let _ = crate::store::session::log_hit(store, key).await;
+
+        json!({
             "ok": true,
-            "key": record_key,
+            "key": key,
+            "confirmed": true,
             "confidence": record.confidence.value,
             "quality": record.quality.value,
-            "tier": tier_label,
         })
         .to_string()
+    }
+
+    /// Tombstone a gotcha record — marks it as deleted, removes file-record
+    /// links and graph edges. MCP-native equivalent of `mati gotcha delete`.
+    async fn mem_set_delete(
+        &self,
+        graph_arc: &Arc<tokio::sync::RwLock<Graph>>,
+        key: &str,
+    ) -> String {
+        let graph = graph_arc.read().await;
+        let store = graph.store();
+
+        if !key.starts_with("gotcha:") {
+            return json!({"error": "delete action only applies to gotcha: keys"}).to_string();
+        }
+
+        let record = match store.get(key).await {
+            Ok(Some(r)) => r,
+            Ok(None) => return json!({"error": format!("record not found: {key}")}).to_string(),
+            Err(e) => return json!({"error": format!("store get: {e}")}).to_string(),
+        };
+
+        let affected_files: Vec<String> = record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default();
+
+        match crate::store::gotcha_ops::apply_gotcha_tombstone(store, key, &affected_files).await {
+            Ok(()) => json!({"ok": true, "key": key, "tombstoned": true}).to_string(),
+            Err(e) => json!({"error": format!("tombstone failed: {e}")}).to_string(),
+        }
     }
 }
 
@@ -795,9 +1098,7 @@ pub async fn assemble_context_packet(
     //    - always exclude Suppressed (<0.2), caveat Poor (0.2–0.4)
     let critical_gotchas: Vec<Record> = confirmed_gotchas
         .into_iter()
-        .filter(|r| {
-            context_files.is_empty() || context_gotcha_keys.contains(&r.key)
-        })
+        .filter(|r| context_files.is_empty() || context_gotcha_keys.contains(&r.key))
         .filter(|r| r.quality.tier != QualityTier::Suppressed)
         .collect();
 
@@ -1049,7 +1350,7 @@ mod tests {
                 challenge_count: 0,
             },
             gap_analysis_score: 0.0,
-            payload: None,
+            payload: Some(serde_json::json!({})),
         }
     }
 
@@ -1124,8 +1425,8 @@ mod tests {
         let result = server
             .mem_query(Parameters(MemQueryParams {
                 query: "inference".to_string(),
-                mode: Some("text".to_string()),
-                limit: Some(10),
+                mode: "text".to_string(),
+                limit: 10,
             }))
             .await;
         assert!(result.contains("gotcha:async-race"));
@@ -1141,8 +1442,8 @@ mod tests {
         let result = server
             .mem_query(Parameters(MemQueryParams {
                 query: "test".to_string(),
-                mode: Some("invalid".to_string()),
-                limit: None,
+                mode: "invalid".to_string(),
+                limit: 20,
             }))
             .await;
         assert!(result.contains("unknown mode"));
@@ -1158,8 +1459,8 @@ mod tests {
         let result = server
             .mem_query(Parameters(MemQueryParams {
                 query: "test".to_string(),
-                mode: Some("semantic".to_string()),
-                limit: None,
+                mode: "semantic".to_string(),
+                limit: 20,
             }))
             .await;
         assert!(result.contains("--features semantic"));
@@ -1176,7 +1477,7 @@ mod tests {
 
         let result = server
             .mem_bootstrap(Parameters(MemBootstrapParams {
-                context_files: None,
+                context_files: vec![],
             }))
             .await;
         assert!(result.contains("[mati] Before reading any file"));
@@ -1317,7 +1618,10 @@ mod tests {
             .unwrap();
 
         assert!(
-            packet.critical_gotchas.iter().any(|g| g.key == "gotcha:relevant"),
+            packet
+                .critical_gotchas
+                .iter()
+                .any(|g| g.key == "gotcha:relevant"),
             "graph-connected gotcha must remain in context packet"
         );
         assert!(
@@ -1821,14 +2125,14 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "file:src/main.rs".to_string(),
                 value: "Handles CLI dispatch and binary entry point".to_string(),
                 category: "File".to_string(),
-                payload: Some(serde_json::json!({
+                payload: serde_json::json!({
                     "path": "src/main.rs",
                     "purpose": "Handles CLI dispatch and binary entry point"
-                })),
+                }),
                 tags: vec!["entry-point".to_string()],
                 priority: "Normal".to_string(),
             }))
@@ -1840,7 +2144,8 @@ mod tests {
         assert!((parsed["confidence"].as_f64().unwrap() - 0.60).abs() < 0.01);
 
         // Read back and verify
-        let graph = server.graph.read().await;
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
         let record = graph
             .store()
             .get("file:src/main.rs")
@@ -1860,11 +2165,11 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "gotcha:always-use-idempotency-keys".to_string(),
                 value: "Always pass idempotency_key to Stripe charge creation because duplicate charges cause customer refund disputes".to_string(),
                 category: "Gotcha".to_string(),
-                payload: Some(serde_json::json!({
+                payload: serde_json::json!({
                     "rule": "Always pass idempotency_key to Stripe charge creation",
                     "reason": "duplicate charges cause customer refund disputes",
                     "severity": "Critical",
@@ -1872,7 +2177,7 @@ mod tests {
                     "ref_url": null,
                     "discovered_session": 0,
                     "confirmed": false
-                })),
+                }),
                 tags: vec![],
                 priority: "Critical".to_string(),
             }))
@@ -1884,7 +2189,8 @@ mod tests {
         assert!(parsed["quality"].as_f64().unwrap() > 0.2);
 
         // Read back
-        let graph = server.graph.read().await;
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
         let record = graph
             .store()
             .get("gotcha:always-use-idempotency-keys")
@@ -1925,14 +2231,14 @@ mod tests {
 
         // Enrich — only send purpose and updated gotcha_keys
         let result = server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "file:src/db.rs".to_string(),
                 value: "Manages database connection pooling and query execution".to_string(),
                 category: "File".to_string(),
-                payload: Some(serde_json::json!({
+                payload: serde_json::json!({
                     "purpose": "Manages database connection pooling and query execution",
                     "gotcha_keys": ["gotcha:always-close-connections"]
-                })),
+                }),
                 tags: vec![],
                 priority: "Normal".to_string(),
             }))
@@ -1942,7 +2248,8 @@ mod tests {
         assert_eq!(parsed["ok"], true);
 
         // Verify Layer 0 fields preserved via merge
-        let graph = server.graph.read().await;
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
         let record = graph.store().get("file:src/db.rs").await.unwrap().unwrap();
         let payload = record.payload.unwrap();
 
@@ -1971,11 +2278,11 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "session:12345".to_string(),
                 value: "test".to_string(),
                 category: "File".to_string(),
-                payload: None,
+                payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
             }))
@@ -1996,11 +2303,11 @@ mod tests {
         let server = MatiServer::new(graph);
 
         let result = server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "file:test.rs".to_string(),
                 value: "test".to_string(),
                 category: "Unknown".to_string(),
-                payload: None,
+                payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
             }))
@@ -2044,11 +2351,11 @@ mod tests {
 
         // Update the gotcha's value via mem_set (simulates Claude editing the reason)
         let result = server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "gotcha:confirmed-edit-test".to_string(),
                 value: "Always test first because untested changes cause regressions".to_string(),
                 category: "Gotcha".to_string(),
-                payload: Some(serde_json::json!({
+                payload: serde_json::json!({
                     "rule": "Always test first",
                     "reason": "untested changes cause regressions",
                     "severity": "High",
@@ -2056,7 +2363,7 @@ mod tests {
                     "ref_url": null,
                     "discovered_session": 0,
                     "confirmed": true
-                })),
+                }),
                 tags: vec![], // empty — should NOT clear existing tags
                 priority: "High".to_string(),
             }))
@@ -2066,7 +2373,8 @@ mod tests {
         assert_eq!(parsed["ok"], true);
 
         // Verify confirmation state preserved
-        let graph = server.graph.read().await;
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
         let updated = graph
             .store()
             .get("gotcha:confirmed-edit-test")
@@ -2095,24 +2403,18 @@ mod tests {
         // Seed file records for both old and new affected files.
         let old_file = Record::layer0_file_stub("file:src/old.rs", device_id(), 1, now());
         let new_file = Record::layer0_file_stub("file:src/new.rs", device_id(), 1, now());
-        store
-            .put("file:src/old.rs", &old_file)
-            .await
-            .unwrap();
-        store
-            .put("file:src/new.rs", &new_file)
-            .await
-            .unwrap();
+        store.put("file:src/old.rs", &old_file).await.unwrap();
+        store.put("file:src/new.rs", &new_file).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
         let server = MatiServer::new(graph);
 
         server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "gotcha:test-move".to_string(),
                 value: "Always update the paired file because drift breaks the feature".to_string(),
                 category: "Gotcha".to_string(),
-                payload: Some(serde_json::json!({
+                payload: serde_json::json!({
                     "rule": "Always update the paired file",
                     "reason": "drift breaks the feature",
                     "severity": "High",
@@ -2120,18 +2422,18 @@ mod tests {
                     "ref_url": null,
                     "discovered_session": 0,
                     "confirmed": false
-                })),
+                }),
                 tags: vec![],
                 priority: "High".to_string(),
             }))
             .await;
 
         server
-            .mem_set(Parameters(MemSetParams {
+            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
                 key: "gotcha:test-move".to_string(),
                 value: "Always update the paired file because drift breaks the feature".to_string(),
                 category: "Gotcha".to_string(),
-                payload: Some(serde_json::json!({
+                payload: serde_json::json!({
                     "rule": "Always update the paired file",
                     "reason": "drift breaks the feature",
                     "severity": "High",
@@ -2139,13 +2441,14 @@ mod tests {
                     "ref_url": null,
                     "discovered_session": 0,
                     "confirmed": false
-                })),
+                }),
                 tags: vec![],
                 priority: "High".to_string(),
             }))
             .await;
 
-        let graph = server.graph.read().await;
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
 
         let old_file = graph.store().get("file:src/old.rs").await.unwrap().unwrap();
         let new_file = graph.store().get("file:src/new.rs").await.unwrap().unwrap();
@@ -2168,7 +2471,8 @@ mod tests {
             "old file should not keep stale HasGotcha edge"
         );
         assert!(
-            graph.neighbors("file:src/new.rs", &EdgeKind::HasGotcha)
+            graph
+                .neighbors("file:src/new.rs", &EdgeKind::HasGotcha)
                 .contains(&"gotcha:test-move".to_string()),
             "new file should gain HasGotcha edge"
         );
