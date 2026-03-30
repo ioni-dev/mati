@@ -214,11 +214,7 @@ fn mcp_stdio_all_four_tools() {
             .and_then(|v| v.as_bool());
         match name {
             "mem_get" | "mem_query" | "mem_bootstrap" => {
-                assert_eq!(
-                    read_only,
-                    Some(true),
-                    "{name} must have readOnlyHint=true"
-                );
+                assert_eq!(read_only, Some(true), "{name} must have readOnlyHint=true");
             }
             "mem_set" => {
                 assert_eq!(
