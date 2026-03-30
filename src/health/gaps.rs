@@ -363,7 +363,12 @@ fn detect_dependency_unknown(
     // Pre-compute dep names once to avoid repeated strip_prefix in hot loops.
     let dep_names: Vec<(&str, &str)> = deps
         .iter()
-        .map(|d| (d.key.as_str(), crate::analysis::dep_display_name_from_key(&d.key)))
+        .map(|d| {
+            (
+                d.key.as_str(),
+                crate::analysis::dep_display_name_from_key(&d.key),
+            )
+        })
         .collect();
 
     // Build a set of dep keys that have at least one confirmed gotcha referencing them.

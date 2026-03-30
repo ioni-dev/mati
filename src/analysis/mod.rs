@@ -17,8 +17,8 @@ pub mod walker;
 
 pub use claude_md::{import_claude_md, ClaudeMdImport};
 pub use deps::{
-    dep_display_name_from_key, dep_record_key, parse_dep_key, parse_dependencies, DepEntry,
-    DepEcosystem, DepSignals, DepVersion, ManifestKind,
+    dep_display_name_from_key, dep_record_key, parse_dep_key, parse_dependencies, DepEcosystem,
+    DepEntry, DepSignals, DepVersion, ManifestKind,
 };
 pub use edges::{build_edges, Layer0Edges};
 pub use git::{mine_git_history, GitSignals};

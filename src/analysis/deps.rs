@@ -129,8 +129,8 @@ impl DepSignals {
 /// Looks for `Cargo.toml`, `package.json`, `go.mod` in `walked_files`.
 /// Sync, pure I/O. Returns `DepSignals::empty()` on any systemic error (P9).
 ///
-    /// Deduplication: if the same dep identity appears from multiple manifests,
-    /// the entry from the shallowest (fewest path separators) manifest wins.
+/// Deduplication: if the same dep identity appears from multiple manifests,
+/// the entry from the shallowest (fewest path separators) manifest wins.
 pub fn parse_dependencies(repo_path: &Path, walked_files: &[WalkedFile]) -> Result<DepSignals> {
     // Discover manifests, sorted by depth (shallowest first for dedup priority).
     let mut manifests: Vec<(ManifestKind, &str)> = walked_files
@@ -405,11 +405,11 @@ fn parse_package_json(content: &str) -> Vec<DepEntry> {
 
     if let Some(obj) = parsed.get("dependencies").and_then(|v| v.as_object()) {
         for (name, version) in obj {
-        deps.push(DepEntry {
-            ecosystem: DepEcosystem::Npm,
-            name: name.clone(),
-            version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
-            manifest: ManifestKind::PackageJson,
+            deps.push(DepEntry {
+                ecosystem: DepEcosystem::Npm,
+                name: name.clone(),
+                version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
+                manifest: ManifestKind::PackageJson,
                 dev: false,
             });
         }
@@ -417,11 +417,11 @@ fn parse_package_json(content: &str) -> Vec<DepEntry> {
 
     if let Some(obj) = parsed.get("devDependencies").and_then(|v| v.as_object()) {
         for (name, version) in obj {
-        deps.push(DepEntry {
-            ecosystem: DepEcosystem::Npm,
-            name: name.clone(),
-            version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
-            manifest: ManifestKind::PackageJson,
+            deps.push(DepEntry {
+                ecosystem: DepEcosystem::Npm,
+                name: name.clone(),
+                version: DepVersion::Declared(version.as_str().unwrap_or("*").to_string()),
+                manifest: ManifestKind::PackageJson,
                 dev: true,
             });
         }
@@ -933,10 +933,19 @@ react = "1.0"
         let walked = vec![walked_file("Cargo.toml"), walked_file("package.json")];
         let signals = parse_dependencies(dir.path(), &walked).unwrap();
 
-        let react_entries: Vec<&DepEntry> = signals.deps.iter().filter(|d| d.name == "react").collect();
-        assert_eq!(react_entries.len(), 2, "cross-ecosystem names must not collapse");
-        assert!(react_entries.iter().any(|d| d.ecosystem == DepEcosystem::Cargo));
-        assert!(react_entries.iter().any(|d| d.ecosystem == DepEcosystem::Npm));
+        let react_entries: Vec<&DepEntry> =
+            signals.deps.iter().filter(|d| d.name == "react").collect();
+        assert_eq!(
+            react_entries.len(),
+            2,
+            "cross-ecosystem names must not collapse"
+        );
+        assert!(react_entries
+            .iter()
+            .any(|d| d.ecosystem == DepEcosystem::Cargo));
+        assert!(react_entries
+            .iter()
+            .any(|d| d.ecosystem == DepEcosystem::Npm));
     }
 
     #[test]
