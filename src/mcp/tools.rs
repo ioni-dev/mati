@@ -635,8 +635,7 @@ impl MatiServer {
                     }
                     _ => params.payload,
                 };
-                if new_payload.is_object()
-                    && !new_payload.as_object().is_none_or(|o| o.is_empty())
+                if new_payload.is_object() && !new_payload.as_object().is_none_or(|o| o.is_empty())
                 {
                     if let Some(existing_payload) = &record.payload {
                         // Merge: new values override, existing keys preserved
