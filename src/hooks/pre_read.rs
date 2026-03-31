@@ -133,6 +133,9 @@ if [ "$DENY_SIGNAL" = "true" ]; then
     exit 0
   fi
 
+  # Track the denial for compliance analytics (mati stats hit rate).
+  mati log-compliance-miss "file:$REL_PATH" &>/dev/null &
+
   STALE_NOTE=""
   if awk "BEGIN { exit !($STALENESS >= 0.4) }"; then
     STALE_NOTE=" (staleness $(printf '%.2f' "$STALENESS") — verify critical details)"

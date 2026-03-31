@@ -17,8 +17,48 @@ use anyhow::Result;
 
 use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Fire-and-forget: send a command to the daemon socket, drop silently on failure.
+///
+/// Used by all hook analytics/logging commands where data loss is acceptable
+/// under P9 graceful degradation.
+async fn hook_fire_and_forget(cmd: &str, args: serde_json::Value) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+    match daemon_result(&root, cmd, args).await {
+        DaemonResult::Ok(_) => {}
+        _ => tracing::debug!("mati {cmd}: daemon unreachable — dropping event"),
+    }
+    Ok(())
+}
+
+/// Query the daemon for a boolean value, returning `false` on failure.
+///
+/// Used by consultation-receipt checks where the conservative default
+/// (not consulted) causes hooks to deny or advise — correct fail-open.
+async fn hook_query_bool(cmd: &str, args: serde_json::Value) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+    match daemon_result(&root, cmd, args).await {
+        DaemonResult::Ok(resp) => {
+            let value = resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false);
+            println!("{value}");
+        }
+        _ => {
+            tracing::debug!("mati {cmd}: daemon unreachable — false");
+            println!("false");
+        }
+    }
+    Ok(())
+}
+
 // ── M-09-prereq: mati get --json ────────────────────────────────────────────
 
+/// Fetch a record by key. Prints JSON or `"null"`.
+///
+/// This is the only hook command with custom response handling — it extracts
+/// the `data` field from the daemon response and prints it directly.
 pub async fn run_get(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
@@ -33,7 +73,6 @@ pub async fn run_get(key: &str) -> Result<()> {
             println!("{json}");
         }
         _ => {
-            // Fail open: hooks see null → allow the read
             tracing::debug!("mati get: daemon unreachable — fail-open (null)");
             println!("null");
         }
@@ -41,263 +80,90 @@ pub async fn run_get(key: &str) -> Result<()> {
     Ok(())
 }
 
-// ── M-09-G: Internal hook commands ──────────────────────────────────────────
-
-// ── log-miss ─────────────────────────────────────────────────────────────────
+// ── Fire-and-forget hook commands ────────────────────────────────────────────
 
 pub async fn run_log_miss(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(&root, "log_miss", serde_json::json!({ "key": key })).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-miss: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
+    hook_fire_and_forget("log_miss", serde_json::json!({ "key": key })).await
 }
-
-// ── log-hit ──────────────────────────────────────────────────────────────────
 
 pub async fn run_log_hit(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(&root, "log_hit", serde_json::json!({ "key": key })).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-hit: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
+    hook_fire_and_forget("log_hit", serde_json::json!({ "key": key })).await
 }
 
-// ── edit-hook (combined log-hit + reparse) ───────────────────────────────────
+pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
+    hook_fire_and_forget("log_compliance_miss", serde_json::json!({ "key": key })).await
+}
+
+pub async fn run_log_compliance_hit(key: &str) -> Result<()> {
+    hook_fire_and_forget("log_compliance_hit", serde_json::json!({ "key": key })).await
+}
+
+pub async fn run_log_codex_shell_miss(key: &str) -> Result<()> {
+    hook_fire_and_forget("log_codex_shell_miss", serde_json::json!({ "key": key })).await
+}
+
+pub async fn run_log_bootstrap(key: &str) -> Result<()> {
+    hook_fire_and_forget("log_bootstrap", serde_json::json!({ "key": key })).await
+}
+
+pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
+    hook_fire_and_forget("log_prompt_nudge", serde_json::json!({ "key": key })).await
+}
+
+pub async fn run_session_flush() -> Result<()> {
+    hook_fire_and_forget("session_flush", serde_json::json!({})).await
+}
+
+pub async fn run_session_harvest() -> Result<()> {
+    hook_fire_and_forget("session_harvest", serde_json::json!({})).await
+}
 
 /// Combined log-hit + reparse in a single daemon round-trip.
 /// Called by post-edit.sh hook to avoid two separate process spawns.
 pub async fn run_edit_hook(path: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
     // Normalize to repo-relative. post-edit.sh passes absolute paths;
     // store keys always use relative (e.g. "file:src/main.rs").
     let rel = std::path::Path::new(path)
         .strip_prefix(&cwd)
         .map(|r| r.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    let path = rel.as_str();
-
-    match daemon_result(&root, "edit_hook", serde_json::json!({ "path": path })).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati edit-hook: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
+    hook_fire_and_forget("edit_hook", serde_json::json!({ "path": rel })).await
 }
 
-// ── doc-capture (2.3) ────────────────────────────────────────────────────────
-
-/// Read first lines of new file content from stdin, detect a canonical doc
-/// comment, and update the `file:*` record's purpose + confidence.
+/// Read file content from stdin, detect doc comment, update file record.
 pub async fn run_doc_capture(path: &str) -> Result<()> {
     use std::io::Read as _;
     let mut content = String::new();
     std::io::stdin().read_to_string(&mut content)?;
-
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(
-        &root,
+    hook_fire_and_forget(
         "doc_capture",
         serde_json::json!({ "path": path, "content": content }),
     )
     .await
-    {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati doc-capture: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
 }
 
-// ── log-compliance-miss ──────────────────────────────────────────────────────
-
-pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(
-        &root,
-        "log_compliance_miss",
-        serde_json::json!({ "key": key }),
-    )
-    .await
-    {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-compliance-miss: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
-}
-
-pub async fn run_log_compliance_hit(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(
-        &root,
-        "log_compliance_hit",
-        serde_json::json!({ "key": key }),
-    )
-    .await
-    {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-compliance-hit: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
-}
-
-pub async fn run_log_codex_shell_miss(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(
-        &root,
-        "log_codex_shell_miss",
-        serde_json::json!({ "key": key }),
-    )
-    .await
-    {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-codex-shell-miss: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
-}
-
-pub async fn run_log_bootstrap(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(&root, "log_bootstrap", serde_json::json!({ "key": key })).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-bootstrap: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
-}
-
-pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(&root, "log_prompt_nudge", serde_json::json!({ "key": key })).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati log-prompt-nudge: daemon unreachable — dropping event");
-        }
-    }
-    Ok(())
-}
-
-// ── session-check-consulted ──────────────────────────────────────────────────
+// ── Boolean query hook commands ──────────────────────────────────────────────
 
 pub async fn run_session_check_consulted(key: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(
-        &root,
-        "session_check_consulted",
-        serde_json::json!({ "key": key }),
-    )
-    .await
-    {
-        DaemonResult::Ok(resp) => {
-            let consulted = resp.get("data").and_then(|d| d.as_bool()).unwrap_or(false);
-            println!("{consulted}");
-        }
-        _ => {
-            // Fail open: conservative — not consulted
-            tracing::debug!("mati session-check-consulted: daemon unreachable — false");
-            println!("false");
-        }
-    }
-    Ok(())
+    hook_query_bool("session_check_consulted", serde_json::json!({ "key": key })).await
 }
 
 pub async fn run_session_check_consulted_recent(key: &str, ttl_secs: u64) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(
-        &root,
+    hook_query_bool(
         "session_check_consulted_recent",
         serde_json::json!({ "key": key, "ttl_secs": ttl_secs }),
     )
     .await
-    {
-        DaemonResult::Ok(resp) => {
-            let value = resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false);
-            println!("{value}");
-        }
-        _ => {
-            // Fail open: conservative — not consulted recently
-            tracing::debug!("mati session-check-consulted-recent: daemon unreachable — false");
-            println!("false");
-        }
-    }
-    Ok(())
 }
 
-// ── session-flush ────────────────────────────────────────────────────────────
-
-pub async fn run_session_flush() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(&root, "session_flush", serde_json::json!({})).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati session-flush: daemon unreachable — dropping");
-        }
-    }
-    Ok(())
-}
-
-// ── session-harvest ──────────────────────────────────────────────────────────
-
-pub async fn run_session_harvest() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-
-    match daemon_result(&root, "session_harvest", serde_json::json!({})).await {
-        DaemonResult::Ok(_) => {}
-        _ => {
-            tracing::debug!("mati session-harvest: daemon unreachable — dropping");
-        }
-    }
-    Ok(())
-}
-
-// ── Test-only delegates ───────────────────────────────────────────────────────
-// Expose mati_core::store::session functions under the names the test suite
-// expects via `use super::*`.
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use mati_core::store::session::*;
     use mati_core::store::*;
+    use tempfile::TempDir;
 
     fn extract_confirmed(record: &Record) -> bool {
         if record.category != Category::Gotcha {
@@ -308,7 +174,6 @@ mod tests {
             .map(|g| g.confirmed)
             .unwrap_or(false)
     }
-    use tempfile::TempDir;
 
     async fn temp_store() -> (TempDir, Store) {
         let dir = TempDir::new().expect("tempdir");
