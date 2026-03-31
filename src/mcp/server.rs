@@ -644,6 +644,17 @@ async fn socket_dispatch(
             SocketResponse::ok(serde_json::Value::Null)
         }
 
+        "reparse" => {
+            let path = match req.args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return SocketResponse::err("missing args.path"),
+            };
+            if let Err(e) = crate::analysis::reparse::reparse_impl(store, repo_root, path).await {
+                tracing::warn!("daemon socket reparse: {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
         "edit_hook" => {
             let path = match req.args.get("path").and_then(|v| v.as_str()) {
                 Some(p) => p,

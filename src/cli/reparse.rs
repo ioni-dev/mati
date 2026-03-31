@@ -13,20 +13,16 @@ pub async fn run(path: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
 
-    // StoreProxy doesn't expose reparse directly, so we check if we have
-    // direct store access. If routed through socket, use the edit_hook
-    // daemon command which includes reparse.
     if let Some(store) = proxy.direct_store() {
         reparse_impl(store, &cwd, path).await?;
     } else {
-        // Route through daemon socket
+        // Route through the dedicated reparse daemon command (not edit_hook,
+        // which would also call log_hit and mint an unintended receipt).
         use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
         let root = mati_root_for(&cwd)?;
-        match daemon_result(&root, "edit_hook", serde_json::json!({ "path": path })).await {
+        match daemon_result(&root, "reparse", serde_json::json!({ "path": path })).await {
             DaemonResult::Ok(_) => {}
-            _ => {
-                tracing::warn!("mati reparse: daemon unreachable — skipping");
-            }
+            _ => tracing::warn!("mati reparse: daemon unreachable — skipping"),
         }
     }
 

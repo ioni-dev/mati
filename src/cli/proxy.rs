@@ -234,6 +234,9 @@ impl StoreProxy {
     }
 
     /// Delete a record by key.
+    ///
+    /// Will be used by `gotcha.rs` and `review.rs` once those are converted
+    /// from `Store::open` to `StoreProxy`.
     #[allow(dead_code)]
     pub async fn delete(&self, key: &str) -> Result<()> {
         match &self.inner {
@@ -253,7 +256,14 @@ impl StoreProxy {
             ProxyInner::Direct(store) => store.put_batch(records).await,
             ProxyInner::Socket { .. } => {
                 // Socket mode: write records one at a time via put.
-                // Not as efficient as batch, but functional.
+                // Each record is a separate daemon socket round-trip.
+                if records.len() > 100 {
+                    tracing::warn!(
+                        "put_batch: {} records via socket (O(N) round-trips) — \
+                         consider stopping the daemon for bulk imports",
+                        records.len()
+                    );
+                }
                 for &(key, record) in records {
                     self.put(key, record).await?;
                 }
@@ -263,6 +273,8 @@ impl StoreProxy {
     }
 
     /// Confirm a gotcha record via the daemon socket's gotcha_confirm command.
+    ///
+    /// Will be used by `review.rs` once converted from `Store::open` to `StoreProxy`.
     #[allow(dead_code)]
     pub async fn gotcha_confirm(&self, key: &str) -> Result<()> {
         match &self.inner {
@@ -280,6 +292,9 @@ impl StoreProxy {
     }
 
     /// Tombstone a gotcha via the daemon socket's gotcha_tombstone command.
+    ///
+    /// Will be used by `gotcha.rs` and `review.rs` once converted from
+    /// `Store::open` to `StoreProxy`.
     #[allow(dead_code)]
     pub async fn gotcha_tombstone(&self, key: &str, affected_files: &[String]) -> Result<()> {
         match &self.inner {

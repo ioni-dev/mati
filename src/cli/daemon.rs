@@ -166,8 +166,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 pub async fn run_daemon_start() -> Result<()> {
     let cwd = std::env::current_dir()?;
     // Compute mati_root separately so we can write the starting sentinel before
-    // Store::open (which may fail). This prevents try_auto_start from spawning
-    // a second daemon while this one is initializing.
+    // Store::open (which may fail). The sentinel tells `mati init` that a daemon
+    // is starting and the store lock may be held imminently.
     let mati_root = mati_root_for(&cwd)?;
     let starting_path = mati_root.join("mati.starting");
     let _ = std::fs::write(
@@ -200,7 +200,7 @@ pub async fn run_daemon_start() -> Result<()> {
         format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
     )
     .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
-    // PID is written — remove the starting sentinel so try_auto_start won't block.
+    // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
 
     let listener = UnixListener::bind(&sock_path)
