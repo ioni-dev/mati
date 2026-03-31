@@ -122,12 +122,11 @@ while IFS= read -r gkey; do
 done <<< "$GOTCHA_KEYS"
 
 if [ "$DENY_SIGNAL" = "true" ]; then
-  mati log-hit "file:$REL_PATH" &>/dev/null &
-
-  # If already consulted via mem_get this session, downgrade deny → allow+context.
-  # This lets Claude read the file after reviewing gotchas via mem_get.
+  # Check consultation receipt BEFORE minting a new one.
+  # mem_get mints receipts; log-hit must not self-mint before the check.
   ALREADY_CONSULTED=$(mati session-check-consulted "file:$REL_PATH" 2>/dev/null || echo "false")
   if [ "$ALREADY_CONSULTED" = "true" ]; then
+    mati log-hit "file:$REL_PATH" &>/dev/null &
     CONTEXT_BODY="${CONTEXT_LINES:-Gotcha exists for $SAFE_PATH — proceed with awareness}"
     SAFE_CONTEXT=$(printf '%s' "$CONTEXT_BODY" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ' | sed 's/\\n/\\n/g')
     printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","additionalContext":"[mati] Record already consulted. %s"}}\n' "$SAFE_CONTEXT"
