@@ -65,6 +65,18 @@ pub struct ImportArgs {
 // ── run_show ──────────────────────────────────────────────────────────────────
 
 pub async fn run_show(args: ShowArgs) -> Result<()> {
+    // Detect bare namespace prefix (e.g. "gotcha:", "file:", "decision:") and
+    // redirect to `ls` — callers often type `mati show gotcha:` expecting a list.
+    if args.key.ends_with(':') {
+        let category = match args.key.trim_end_matches(':') {
+            "gotcha" | "gotchas" => Some("gotchas".to_string()),
+            "file" | "files" => Some("files".to_string()),
+            "decision" | "decisions" => Some("decisions".to_string()),
+            _ => None,
+        };
+        return run_ls(LsArgs { category, limit: 200 }).await;
+    }
+
     let cwd = std::env::current_dir()?;
     let store = StoreProxy::open(&cwd).await?;
 

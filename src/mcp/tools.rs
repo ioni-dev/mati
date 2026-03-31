@@ -559,10 +559,19 @@ impl MatiServer {
                 // Fetch existing record to preserve Layer 0 structural data
                 let existing_record = store.get(&params.key).await.ok().flatten();
 
+                // A tombstoned record must not bleed its prior confirmation state
+                // into a resurrection — treat it as an unconfirmed write.
+                let is_tombstoned = existing_record
+                    .as_ref()
+                    .map(|r| matches!(r.lifecycle, RecordLifecycle::Tombstoned { .. }))
+                    .unwrap_or(false);
+
                 let was_confirmed = existing_record
                     .as_ref()
                     .map(|r| {
-                        r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80
+                        !is_tombstoned
+                            && (r.source == RecordSource::DeveloperManual
+                                || r.confidence.value >= 0.80)
                     })
                     .unwrap_or(false);
 
@@ -602,7 +611,11 @@ impl MatiServer {
                     },
                 };
 
-                // A write to a tombstoned record revives it.
+                // A write to a tombstoned record revives it; reset
+                // confirmation counters so the new write starts fresh.
+                if is_tombstoned {
+                    record.confidence.confirmation_count = 0;
+                }
                 record.lifecycle = RecordLifecycle::Active;
 
                 // Apply enrichment fields
@@ -647,6 +660,28 @@ impl MatiServer {
                             (merged.as_object_mut(), new_payload.as_object())
                         {
                             for (k, v) in overlay {
+                                // gotcha_keys is a derived index maintained by the
+                                // gotcha confirm/tombstone paths. Overwriting it on
+                                // file-record re-enrichment silently drops edges that
+                                // were added by gotcha confirm. Union-merge instead.
+                                if k == "gotcha_keys" {
+                                    if let (Some(existing_arr), Some(new_arr)) = (
+                                        base.get(k).and_then(|e| e.as_array()).cloned(),
+                                        v.as_array(),
+                                    ) {
+                                        let mut union = existing_arr;
+                                        for item in new_arr {
+                                            if !union.contains(item) {
+                                                union.push(item.clone());
+                                            }
+                                        }
+                                        base.insert(
+                                            k.clone(),
+                                            serde_json::Value::Array(union),
+                                        );
+                                        continue;
+                                    }
+                                }
                                 base.insert(k.clone(), v.clone());
                             }
                             record.payload = Some(serde_json::Value::Object(base.clone()));
