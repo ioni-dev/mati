@@ -53,6 +53,15 @@ impl StoreProxy {
         }
     }
 
+    /// Returns a reference to the direct store if in direct mode, or `None` if
+    /// routed through the daemon socket.
+    pub fn direct_store(&self) -> Option<&Store> {
+        match &self.inner {
+            ProxyInner::Direct(s) => Some(s),
+            ProxyInner::Socket { .. } => None,
+        }
+    }
+
     /// Read the write-sequence counter. This is a plain filesystem read — no lock needed.
     pub fn read_write_seq(&self) -> u64 {
         let root = match &self.inner {
