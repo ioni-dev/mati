@@ -233,6 +233,75 @@ impl StoreProxy {
         }
     }
 
+    /// Delete a record by key.
+    #[allow(dead_code)]
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(store) => store.delete(key).await,
+            ProxyInner::Socket { root } => {
+                match daemon_result(root, "delete", json!({ "key": key })).await {
+                    DaemonResult::Ok(_) => Ok(()),
+                    other => Err(socket_read_error("delete", other)),
+                }
+            }
+        }
+    }
+
+    /// Write a batch of records.
+    pub async fn put_batch(&self, records: &[(&str, &Record)]) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(store) => store.put_batch(records).await,
+            ProxyInner::Socket { .. } => {
+                // Socket mode: write records one at a time via put.
+                // Not as efficient as batch, but functional.
+                for &(key, record) in records {
+                    self.put(key, record).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Confirm a gotcha record via the daemon socket's gotcha_confirm command.
+    #[allow(dead_code)]
+    pub async fn gotcha_confirm(&self, key: &str) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(_) => {
+                // Direct mode: use the confirm_gotcha function
+                super::gotcha::confirm_gotcha(self, key).await
+            }
+            ProxyInner::Socket { root } => {
+                match daemon_result(root, "gotcha_confirm", json!({ "key": key })).await {
+                    DaemonResult::Ok(_) => Ok(()),
+                    other => Err(socket_read_error("gotcha_confirm", other)),
+                }
+            }
+        }
+    }
+
+    /// Tombstone a gotcha via the daemon socket's gotcha_tombstone command.
+    #[allow(dead_code)]
+    pub async fn gotcha_tombstone(&self, key: &str, affected_files: &[String]) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                mati_core::store::gotcha_ops::apply_gotcha_tombstone(store, key, affected_files)
+                    .await
+            }
+            ProxyInner::Socket { root } => {
+                match daemon_result(
+                    root,
+                    "gotcha_tombstone",
+                    json!({ "key": key, "affected_files": affected_files }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(_) => Ok(()),
+                    other => Err(socket_read_error("gotcha_tombstone", other)),
+                }
+            }
+        }
+    }
+
     /// Version history for a single key, newest first.
     ///
     /// Only works in direct mode. In socket mode this errors with a message

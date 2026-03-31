@@ -709,6 +709,17 @@ async fn socket_dispatch(
             }
         }
 
+        "delete" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            match store.delete(key).await {
+                Ok(()) => SocketResponse::ok(serde_json::Value::Null),
+                Err(e) => SocketResponse::err(format!("delete: {e}")),
+            }
+        }
+
         "gotcha_write" => {
             use crate::store::gotcha_ops::apply_gotcha_write;
             use crate::store::Record;
