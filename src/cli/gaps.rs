@@ -11,7 +11,7 @@ use mati_core::graph::{EdgeKind, Graph};
 use mati_core::health::gaps;
 use mati_core::store::{
     Category, ConfidenceScore, KnowledgeGap, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, Store,
+    RecordSource, RecordVersion, StalenessScore,
 };
 
 use super::colors;
@@ -127,16 +127,16 @@ pub async fn run(args: GapsArgs) -> Result<()> {
 
         // Re-open store for cache write (graph took ownership above).
         let cwd2 = std::env::current_dir()?;
-        let store2 = Store::open(&cwd2).await?;
+        let proxy2 = crate::cli::proxy::StoreProxy::open(&cwd2).await?;
         let cache_entry = GapsCacheEntry {
             write_seq: current_seq,
             gaps: all_gaps.clone(),
         };
         if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
             let record = cache_record(cache_key, cache_value);
-            let _ = store2.put(cache_key, &record).await;
+            let _ = proxy2.put(cache_key, &record).await;
         }
-        store2.close().await?;
+        proxy2.close().await?;
 
         let filtered: Vec<_> = all_gaps
             .into_iter()
