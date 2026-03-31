@@ -296,7 +296,6 @@ pub async fn run_session_harvest() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use mati_core::store::session::*;
     use mati_core::store::*;
 
@@ -374,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn promote_gotcha_candidates_confirms_above_threshold() {
         let (_dir, store) = temp_store().await;
-        let mut record = Record {
+        let record = Record {
             key: "gotcha:promote-test".to_string(),
             value: "test".to_string(),
             category: Category::Gotcha,
@@ -421,7 +420,7 @@ mod tests {
         // Create 30 records with staleness in [0.4, 0.7) range
         for i in 0..30 {
             let key = format!("file:test_{i}.rs");
-            let mut record = Record {
+            let record = Record {
                 key: key.clone(),
                 value: format!("test file {i}"),
                 category: Category::File,
