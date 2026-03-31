@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, Priority, QualityScore, QualitySignal, QualityTier,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessTier, Store,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessTier,
 };
 
 use super::colors;
@@ -689,7 +689,7 @@ async fn export_md(store: &StoreProxy) -> Result<String> {
 
 pub async fn run_import(args: ImportArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = super::proxy::StoreProxy::open(&cwd).await?;
 
     let path = &args.file;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -699,7 +699,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
             let content = std::fs::read_to_string(path)?;
             let records: Vec<Record> = serde_json::from_str(&content)?;
             let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
-            store.put_batch(&pairs).await?;
+            proxy.put_batch(&pairs).await?;
             println!("Imported {} records from JSON.", records.len());
         }
         "md" => {
@@ -707,7 +707,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
             let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
             let pairs: Vec<(&str, &Record)> =
                 import.records.iter().map(|r| (r.key.as_str(), r)).collect();
-            store.put_batch(&pairs).await?;
+            proxy.put_batch(&pairs).await?;
             println!("Imported {} records from CLAUDE.md.", import.records.len());
         }
         _ => {
@@ -717,18 +717,19 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
                 let records: Vec<Record> = serde_json::from_str(&content)?;
                 let pairs: Vec<(&str, &Record)> =
                     records.iter().map(|r| (r.key.as_str(), r)).collect();
-                store.put_batch(&pairs).await?;
+                proxy.put_batch(&pairs).await?;
                 println!("Imported {} records from JSON.", records.len());
             } else {
                 let device_id = uuid::Uuid::new_v4();
                 let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
                 let pairs: Vec<(&str, &Record)> =
                     import.records.iter().map(|r| (r.key.as_str(), r)).collect();
-                store.put_batch(&pairs).await?;
+                proxy.put_batch(&pairs).await?;
                 println!("Imported {} records from CLAUDE.md.", import.records.len());
             }
         }
     }
+    proxy.close().await?;
     Ok(())
 }
 
@@ -740,16 +741,14 @@ pub async fn run_history(args: HistoryArgs) -> Result<()> {
     }
 
     let cwd = std::env::current_dir()?;
-    let store = Store::open(&cwd).await?;
+    let proxy = super::proxy::StoreProxy::open(&cwd).await?;
 
-    // Outer/inner pattern: errors from inner are captured, store.close()
-    // is always called regardless.
-    let result = run_history_inner(&store, &args).await;
-    store.close().await?;
+    let result = run_history_inner(&proxy, &args).await;
+    proxy.close().await?;
     result
 }
 
-async fn run_history_inner(store: &Store, args: &HistoryArgs) -> Result<()> {
+async fn run_history_inner(proxy: &super::proxy::StoreProxy, args: &HistoryArgs) -> Result<()> {
     let use_color = std::io::stdout().is_terminal();
 
     match (&args.key, &args.since) {
@@ -757,7 +756,7 @@ async fn run_history_inner(store: &Store, args: &HistoryArgs) -> Result<()> {
         (Some(key), Some(since_str)) => {
             let secs = parse_since_duration(since_str)?;
             let since_ts = now_secs().saturating_sub(secs);
-            let entries = store.history_since(key, since_ts, args.limit)?;
+            let entries = proxy.history_since(key, since_ts, args.limit)?;
             if entries.is_empty() {
                 println!(
                     "No history for '{}' in the last {}.",
@@ -770,7 +769,7 @@ async fn run_history_inner(store: &Store, args: &HistoryArgs) -> Result<()> {
         }
         // mati history <key>
         (Some(key), None) => {
-            let entries = store.history(key, args.limit)?;
+            let entries = proxy.history(key, args.limit)?;
             if entries.is_empty() {
                 println!("No history for '{}'.", key);
                 return Ok(());
@@ -781,7 +780,7 @@ async fn run_history_inner(store: &Store, args: &HistoryArgs) -> Result<()> {
         (None, Some(since_str)) => {
             let secs = parse_since_duration(since_str)?;
             let since_ts = now_secs().saturating_sub(secs);
-            let records = store.records_since(since_ts, args.limit).await?;
+            let records = proxy.records_since(since_ts, args.limit).await?;
             if records.is_empty() {
                 println!("No records changed in the last {}.", duration_label(secs));
                 return Ok(());
