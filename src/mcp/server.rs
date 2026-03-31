@@ -229,6 +229,20 @@ async fn open_with_retry(
                     return Err(e).context("failed to open mati store");
                 }
                 if attempt == max_retries {
+                    // Only enter proxy mode if the lock holder is another MCP
+                    // server (owner: "mcp"). A standalone daemon (owner: "daemon")
+                    // can't handle MCP tool calls (no graph loaded).
+                    let owner = std::fs::read_to_string(mati_root.join("mati.pid"))
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v.get("owner").and_then(|o| o.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    if owner != "mcp" {
+                        return Err(anyhow::anyhow!(
+                            "store locked by a standalone daemon (not an MCP server).\n\
+                             Stop the daemon first: mati daemon stop"
+                        ));
+                    }
                     return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({}))
                         .await
                     {
