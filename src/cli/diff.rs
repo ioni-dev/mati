@@ -25,23 +25,28 @@ use super::colors;
 #[command(
     long_about = "Pre-merge check — cross-reference a git diff against the knowledge store.\n\
                   Surfaces confirmed gotchas for changed files before merge.\n\n\
+                  When RANGE is omitted, diffs the working tree + index against HEAD.\n\n\
                   Examples:\n  \
+                    mati diff\n  \
                     mati diff main\n  \
                     mati diff main..feature-auth\n  \
                     mati diff HEAD~3"
 )]
 pub struct DiffArgs {
-    /// Git ref or range to diff (e.g. "main", "main..feature-auth", "HEAD~3")
-    pub range: String,
+    /// Git ref or range to diff (e.g. "main", "main..feature-auth", "HEAD~3").
+    /// Omit to diff the working tree against HEAD.
+    pub range: Option<String>,
 }
 
 pub async fn run(args: DiffArgs) -> Result<()> {
     let use_color = std::io::stdout().is_terminal();
     let cwd = std::env::current_dir()?;
 
+    let range = args.range.as_deref().unwrap_or("HEAD");
+
     // ── Get changed files from git ────────────────────────────────────────────
     let output = Command::new("git")
-        .args(["diff", "--name-only", &args.range])
+        .args(["diff", "--name-only", range])
         .current_dir(&cwd)
         .output()?;
 
@@ -57,7 +62,7 @@ pub async fn run(args: DiffArgs) -> Result<()> {
         .collect();
 
     if changed.is_empty() {
-        println!("No files changed in '{}'", args.range);
+        println!("No files changed in '{range}'");
         return Ok(());
     }
 
@@ -66,13 +71,12 @@ pub async fn run(args: DiffArgs) -> Result<()> {
     println!();
     if use_color {
         println!(
-            "  {BLUE}Files changed in '{}'{RESET}",
-            args.range,
+            "  {BLUE}Files changed in '{range}'{RESET}",
             BLUE = colors::BLUE,
             RESET = colors::RESET
         );
     } else {
-        println!("  Files changed in '{}'", args.range);
+        println!("  Files changed in '{range}'");
     }
     println!();
 
