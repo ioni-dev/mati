@@ -602,6 +602,9 @@ impl MatiServer {
                     },
                 };
 
+                // A write to a tombstoned record revives it.
+                record.lifecycle = RecordLifecycle::Active;
+
                 // Apply enrichment fields
                 record.value = params.value;
                 record.category = category;
