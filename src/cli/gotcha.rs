@@ -711,6 +711,10 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
         );
     }
 
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        anyhow::bail!("'{key}' is tombstoned — cannot confirm a deleted record");
+    }
+
     if let Some(ref mut payload) = record.payload {
         if let Some(obj) = payload.as_object_mut() {
             if let Some(sev) = obj

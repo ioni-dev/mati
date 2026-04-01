@@ -675,10 +675,7 @@ impl MatiServer {
                                                 union.push(item.clone());
                                             }
                                         }
-                                        base.insert(
-                                            k.clone(),
-                                            serde_json::Value::Array(union),
-                                        );
+                                        base.insert(k.clone(), serde_json::Value::Array(union));
                                         continue;
                                     }
                                 }
@@ -867,6 +864,11 @@ impl MatiServer {
 
         if record.category != Category::Gotcha {
             return json!({"error": format!("{key} is not a gotcha record")}).to_string();
+        }
+
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            return json!({"error": format!("{key} is tombstoned — cannot confirm a deleted record")})
+                .to_string();
         }
 
         // Set confirmed + normalize severity
