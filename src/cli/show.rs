@@ -74,7 +74,11 @@ pub async fn run_show(args: ShowArgs) -> Result<()> {
             "decision" | "decisions" => Some("decisions".to_string()),
             _ => None,
         };
-        return run_ls(LsArgs { category, limit: 200 }).await;
+        return run_ls(LsArgs {
+            category,
+            limit: 200,
+        })
+        .await;
     }
 
     let cwd = std::env::current_dir()?;
