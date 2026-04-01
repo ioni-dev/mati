@@ -77,25 +77,29 @@ pub async fn run(args: GapsArgs) -> Result<()> {
     let use_color = std::io::stdout().is_terminal();
 
     // ── Cache check: reuse when write-seq unchanged ───────────────────────
+    // write_seq == 0 means the file was never written (e.g., socket mode) —
+    // skip cache to avoid serving stale results indefinitely.
     let cache_key = "analytics:gaps_cache";
     let current_seq = proxy.read_write_seq();
-    if let Some(cached) = proxy.get(cache_key).await? {
-        if let Ok(entry) = serde_json::from_str::<GapsCacheEntry>(&cached.value) {
-            let now = now_secs();
-            let age = now.saturating_sub(cached.updated_at);
-            if entry.write_seq == current_seq {
-                let filtered: Vec<_> = entry
-                    .gaps
-                    .into_iter()
-                    .filter(|g| g.risk_score >= args.min_risk)
-                    .take(args.limit)
-                    .collect();
-                display_gaps(&filtered, Some(age), use_color);
-                proxy.close().await?;
-                return Ok(());
+    if current_seq > 0 {
+        if let Some(cached) = proxy.get(cache_key).await? {
+            if let Ok(entry) = serde_json::from_str::<GapsCacheEntry>(&cached.value) {
+                let now = now_secs();
+                let age = now.saturating_sub(cached.updated_at);
+                if entry.write_seq == current_seq {
+                    let filtered: Vec<_> = entry
+                        .gaps
+                        .into_iter()
+                        .filter(|g| g.risk_score >= args.min_risk)
+                        .take(args.limit)
+                        .collect();
+                    display_gaps(&filtered, Some(age), use_color);
+                    proxy.close().await?;
+                    return Ok(());
+                }
             }
         }
-    }
+    } // current_seq > 0
 
     // ── Compute gaps — scan records and load graph for fan-in ─────────────
     let (files, gotchas, decisions, deps) = tokio::try_join!(
@@ -126,17 +130,18 @@ pub async fn run(args: GapsArgs) -> Result<()> {
         let all_gaps = gaps::analyze(&files, &gotchas, &decisions, &deps, &fan_in);
 
         // Re-open store for cache write (graph took ownership above).
-        let cwd2 = std::env::current_dir()?;
-        let proxy2 = crate::cli::proxy::StoreProxy::open(&cwd2).await?;
-        let cache_entry = GapsCacheEntry {
-            write_seq: current_seq,
-            gaps: all_gaps.clone(),
-        };
-        if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
-            let record = cache_record(cache_key, cache_value);
-            let _ = proxy2.put(cache_key, &record).await;
+        // Best-effort: if re-open fails, display gaps anyway — cache is advisory.
+        if let Ok(proxy2) = crate::cli::proxy::StoreProxy::open(&cwd).await {
+            let cache_entry = GapsCacheEntry {
+                write_seq: current_seq,
+                gaps: all_gaps.clone(),
+            };
+            if let Ok(cache_value) = serde_json::to_string(&cache_entry) {
+                let record = cache_record(cache_key, cache_value);
+                let _ = proxy2.put(cache_key, &record).await;
+            }
+            let _ = proxy2.close().await;
         }
-        proxy2.close().await?;
 
         let filtered: Vec<_> = all_gaps
             .into_iter()
