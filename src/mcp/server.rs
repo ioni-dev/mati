@@ -217,6 +217,12 @@ async fn open_with_retry(
 ) -> Result<ServerOpen> {
     let mut delay = initial_delay;
     let mati_root = mati_root_for(repo_root)?;
+
+    // Clean up stale lock holder from a previous session. If the PID in
+    // mati.pid is dead, remove the socket and PID file so we can acquire
+    // the lock directly instead of entering proxy mode against a ghost.
+    cleanup_stale_pid(&mati_root);
+
     for attempt in 0..=max_retries {
         match Store::open_and_rebuild(repo_root).await {
             Ok(store) => return Ok(ServerOpen::Direct(Box::new(store))),
@@ -265,6 +271,68 @@ async fn open_with_retry(
         }
     }
     unreachable!()
+}
+
+/// Remove stale socket and PID files left by a dead MCP server process.
+///
+/// When Claude Code restarts a session, the old `mati serve` process may still
+/// be alive briefly or may have been killed without cleanup. If the PID file
+/// points to a dead process, we remove the socket and PID files so the new
+/// instance can acquire the store lock directly instead of entering proxy mode
+/// against a non-existent target.
+fn cleanup_stale_pid(mati_root: &Path) {
+    let pid_path = mati_root.join("mati.pid");
+    let sock_path = mati_root.join("mati.sock");
+
+    let pid_content = match std::fs::read_to_string(&pid_path) {
+        Ok(s) => s,
+        Err(_) => return, // No PID file — nothing to clean up
+    };
+
+    let pid: u32 = match serde_json::from_str::<serde_json::Value>(&pid_content)
+        .ok()
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        .and_then(|p| u32::try_from(p).ok())
+    {
+        Some(p) => p,
+        None => return, // Malformed PID file — leave it for the retry logic
+    };
+
+    // If the process is still alive, don't touch anything — it may be a
+    // legitimate session or a concurrent spawn that will resolve via retry.
+    if is_pid_alive(pid) {
+        return;
+    }
+
+    tracing::info!(
+        pid,
+        "mati serve: cleaning up stale PID file from dead process"
+    );
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
+
+    // Also remove the SurrealKV lock file if present — the dead process
+    // may have left it behind. SurrealKV uses an exclusive flock which is
+    // released by the OS on process exit, but the LOCK file itself persists.
+    let lock_path = mati_root.join("knowledge.db").join("LOCK");
+    if lock_path.exists() {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
+/// Check whether a PID is still alive using `kill(pid, 0)`.
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn is_pid_alive(_pid: u32) -> bool {
+    true // Conservative: assume alive on non-Unix
 }
 
 // ── Daemon socket — hook script bridge ───────────────────────────────────────

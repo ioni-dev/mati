@@ -128,33 +128,24 @@ impl StoreProxy {
                     .await
                 {
                     DaemonResult::Ok(resp) => {
-                        if resp["ok"] == true {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
                             Ok(())
                         } else {
-                            let error = resp["error"].as_str().unwrap_or("unknown error");
-                            if error.contains("unknown command") {
-                                anyhow::bail!(
-                                    "daemon does not support 'put' — run `mati daemon stop && mati daemon start` to upgrade"
-                                )
-                            } else {
-                                anyhow::bail!("daemon put failed: {}", error)
-                            }
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("daemon put failed: {err}")
                         }
                     }
-                    DaemonResult::NotRunning | DaemonResult::StaleSocket => {
-                        anyhow::bail!("daemon stopped mid-operation; record not written")
-                    }
-                    DaemonResult::Unresponsive => {
-                        anyhow::bail!(
-                            "daemon not responding; record not written — try: mati daemon stop && mati daemon start"
-                        )
-                    }
+                    other => Err(socket_read_error("put", other)),
                 }
             }
         }
     }
 
     /// Mark the gotcha index dirty after a best-effort link/edge sync failure.
+    #[allow(dead_code)]
     ///
     /// Works in both direct and socket modes so callers can preserve the
     /// repair/status observability contract without needing raw store access.
@@ -233,10 +224,7 @@ impl StoreProxy {
         }
     }
 
-    /// Delete a record by key.
-    ///
-    /// Will be used by `gotcha.rs` and `review.rs` once those are converted
-    /// from `Store::open` to `StoreProxy`.
+    /// Delete a record by key (hard delete, not tombstone).
     #[allow(dead_code)]
     pub async fn delete(&self, key: &str) -> Result<()> {
         match &self.inner {
@@ -272,30 +260,69 @@ impl StoreProxy {
         }
     }
 
-    /// Confirm a gotcha record via the daemon socket's gotcha_confirm command.
+    /// Confirm a gotcha record — sets confirmed=true, syncs file links.
     ///
-    /// Will be used by `review.rs` once converted from `Store::open` to `StoreProxy`.
-    #[allow(dead_code)]
+    /// Works in both direct and socket modes. The confirm logic (setting
+    /// confirmed=true, bumping confidence, syncing file-record gotcha_keys)
+    /// runs through `confirm_gotcha` which uses `self.get`/`self.put` — both
+    /// of which route correctly through the proxy.
     pub async fn gotcha_confirm(&self, key: &str) -> Result<()> {
+        super::gotcha::confirm_gotcha(self, key).await
+    }
+
+    /// Write a gotcha record with file-link sync and graph edges.
+    ///
+    /// In direct mode, delegates to `apply_gotcha_write`.
+    /// In socket mode, routes through the `gotcha_write` daemon command.
+    pub async fn gotcha_write(
+        &self,
+        record: &Record,
+        old_files: &[String],
+        new_files: &[String],
+        is_new: bool,
+    ) -> Result<()> {
         match &self.inner {
-            ProxyInner::Direct(_) => {
-                // Direct mode: use the confirm_gotcha function
-                super::gotcha::confirm_gotcha(self, key).await
+            ProxyInner::Direct(store) => {
+                mati_core::store::gotcha_ops::apply_gotcha_write(
+                    store, record, old_files, new_files, is_new,
+                )
+                .await
             }
             ProxyInner::Socket { root } => {
-                match daemon_result(root, "gotcha_confirm", json!({ "key": key })).await {
-                    DaemonResult::Ok(_) => Ok(()),
-                    other => Err(socket_read_error("gotcha_confirm", other)),
+                let record_value = serde_json::to_value(record)?;
+                match daemon_result(
+                    root,
+                    "gotcha_write",
+                    json!({
+                        "record": record_value,
+                        "old_files": old_files,
+                        "new_files": new_files,
+                        "is_new": is_new,
+                    }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            Ok(())
+                        } else {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("daemon gotcha_write failed: {err}")
+                        }
+                    }
+                    other => Err(socket_read_error("gotcha_write", other)),
                 }
             }
         }
     }
 
-    /// Tombstone a gotcha via the daemon socket's gotcha_tombstone command.
+    /// Tombstone a gotcha and remove its graph edges.
     ///
-    /// Will be used by `gotcha.rs` and `review.rs` once converted from
-    /// `Store::open` to `StoreProxy`.
-    #[allow(dead_code)]
+    /// In direct mode, delegates to `apply_gotcha_tombstone`.
+    /// In socket mode, routes through the `gotcha_tombstone` daemon command.
     pub async fn gotcha_tombstone(&self, key: &str, affected_files: &[String]) -> Result<()> {
         match &self.inner {
             ProxyInner::Direct(store) => {
@@ -310,7 +337,17 @@ impl StoreProxy {
                 )
                 .await
                 {
-                    DaemonResult::Ok(_) => Ok(()),
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            Ok(())
+                        } else {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("daemon gotcha_tombstone failed: {err}")
+                        }
+                    }
                     other => Err(socket_read_error("gotcha_tombstone", other)),
                 }
             }
@@ -321,7 +358,6 @@ impl StoreProxy {
     ///
     /// Only works in direct mode. In socket mode this errors with a message
     /// telling the user to stop the daemon first.
-    #[allow(dead_code)]
     pub fn history(&self, key: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
         match &self.inner {
             ProxyInner::Direct(s) => s.history(key, limit),
@@ -339,7 +375,6 @@ impl StoreProxy {
     ///
     /// Only works in direct mode. In socket mode this errors with a message
     /// explaining why and what to do.
-    #[allow(dead_code)]
     pub fn history_since(
         &self,
         key: &str,
@@ -361,7 +396,6 @@ impl StoreProxy {
     /// All records updated since `since_ts` (seconds), newest first.
     ///
     /// Implemented via `scan_prefix` so it works in both direct and socket modes.
-    #[allow(dead_code)]
     pub async fn records_since(&self, since_ts: u64, limit: usize) -> Result<Vec<Record>> {
         let namespaces = &[
             "gotcha:",
@@ -408,6 +442,24 @@ impl StoreProxy {
         match self.inner {
             ProxyInner::Direct(s) => s.close().await,
             ProxyInner::Socket { .. } => Ok(()),
+        }
+    }
+
+    /// Close the proxy, preserving an existing operation error if present.
+    ///
+    /// If the operation succeeded, propagate any close error.
+    /// If the operation failed, best-effort close and return the original error.
+    /// This prevents `proxy.close().await?` from masking the real failure.
+    pub async fn close_with_result<T>(self, result: Result<T>) -> Result<T> {
+        match &result {
+            Ok(_) => {
+                self.close().await?;
+                result
+            }
+            Err(_) => {
+                let _ = self.close().await;
+                result
+            }
         }
     }
 }

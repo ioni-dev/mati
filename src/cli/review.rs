@@ -111,8 +111,8 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let proxy = crate::cli::proxy::StoreProxy::open(&cwd).await?;
-
-    let mut candidates = collect_candidates(&proxy).await?;
+    let candidates_result = collect_candidates(&proxy).await;
+    let mut candidates = proxy.close_with_result(candidates_result).await?;
 
     // Apply --type filter
     if let Some(ref type_filter) = args.r#type {
@@ -730,35 +730,38 @@ async fn edit_candidate(
 
     // Persist edits (still confirmed=false)
     let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
-    let mut record = proxy
-        .get(key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+    let write_result = async {
+        let mut record = proxy
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
 
-    let now = now_secs();
-    let updated = GotchaRecord {
-        rule: rule.clone(),
-        reason: reason.clone(),
-        severity: gotcha.severity.clone(),
-        affected_files: gotcha.affected_files.clone(),
-        ref_url: gotcha.ref_url.clone(),
-        discovered_session: gotcha.discovered_session,
-        confirmed: false,
-    };
+        let now = now_secs();
+        let updated = GotchaRecord {
+            rule: rule.clone(),
+            reason: reason.clone(),
+            severity: gotcha.severity.clone(),
+            affected_files: gotcha.affected_files.clone(),
+            ref_url: gotcha.ref_url.clone(),
+            discovered_session: gotcha.discovered_session,
+            confirmed: false,
+        };
 
-    record.value = if reason.is_empty() {
-        rule
-    } else {
-        format!("{} because {}", updated.rule, updated.reason)
-    };
-    record.payload = serde_json::to_value(&updated).ok();
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-    record.quality = quality::analyze(&record);
+        record.value = if reason.is_empty() {
+            rule
+        } else {
+            format!("{} because {}", updated.rule, updated.reason)
+        };
+        record.payload = serde_json::to_value(&updated).ok();
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+        record.quality = quality::analyze(&record);
 
-    proxy.put(key, &record).await?;
-    proxy.close().await?;
+        proxy.put(key, &record).await
+    }
+    .await;
+    proxy.close_with_result(write_result).await?;
 
     println!("  Edits saved.");
 
@@ -969,27 +972,27 @@ async fn bulk_confirm_candidates(cwd: &Path, keys: &[String], pb: &ProgressBar) 
 /// Confirm a single candidate.
 async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
     let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
-    proxy.gotcha_confirm(key).await?;
-    proxy.close().await?;
-    Ok(())
+    let result = proxy.gotcha_confirm(key).await;
+    proxy.close_with_result(result).await
 }
 
 /// Tombstone a candidate and remove its graph edges.
 async fn delete_candidate(cwd: &Path, key: &str) -> Result<()> {
     let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
 
-    // Fetch affected files before tombstoning
-    let affected_files = proxy
-        .get(key)
-        .await?
-        .and_then(|r| r.payload_as::<GotchaRecord>())
-        .map(|g| g.affected_files)
-        .unwrap_or_default();
+    let result = async {
+        // Fetch affected files before tombstoning
+        let affected_files = proxy
+            .get(key)
+            .await?
+            .and_then(|r| r.payload_as::<GotchaRecord>())
+            .map(|g| g.affected_files)
+            .unwrap_or_default();
 
-    proxy.gotcha_tombstone(key, &affected_files).await?;
-    proxy.close().await?;
-
-    Ok(())
+        proxy.gotcha_tombstone(key, &affected_files).await
+    }
+    .await;
+    proxy.close_with_result(result).await
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
