@@ -143,7 +143,7 @@ impl Search {
     /// [`Search::add_records`] via [`crate::store::Store::put_batch`] — that
     /// path stages the entire batch and commits once.
     pub fn add_record(&self, record: &Record) -> Result<()> {
-        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         delete_by_key(&self.index, &writer, self.fields.key, &record.key)?;
         if is_searchable(record) {
             writer.add_document(record_to_doc(record, &self.fields))?;
@@ -182,7 +182,7 @@ impl Search {
             latest_by_key.insert(record.key.clone(), record);
         }
 
-        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
 
         for key in latest_by_key.keys() {
             delete_by_key(&self.index, &writer, self.fields.key, key)?;
@@ -239,7 +239,7 @@ impl Search {
 
     /// Remove a record from the search index by key and commit immediately.
     pub fn delete_key(&self, key: &str) -> Result<()> {
-        let mut writer = self.writer.lock().expect("search writer lock poisoned");
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         delete_by_key(&self.index, &writer, self.fields.key, key)?;
         writer.commit()?;
         Ok(())

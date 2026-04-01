@@ -47,11 +47,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use mati_core::store::gotcha_ops::{apply_gotcha_tombstone, apply_gotcha_write};
+use mati_core::graph::Graph;
 use mati_core::store::{derive_slug, Store};
 
 // ── CLI subcommand types ──────────────────────────────────────────────────────
@@ -92,49 +91,6 @@ const UNIX_SOCK_PATH_MAX: usize = 104;
 /// idle windows; coarse enough not to burn cycles.
 const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // every 5 min
 
-// ── Protocol types ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct Request {
-    cmd: String,
-    /// Protocol version from client. `None` for legacy clients (treated as compatible).
-    #[serde(default, rename = "v")]
-    version: Option<u32>,
-    #[serde(default)]
-    args: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct Response {
-    ok: bool,
-    /// Always the daemon's version so clients can detect skew.
-    #[serde(rename = "v")]
-    version: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl Response {
-    fn ok(data: serde_json::Value) -> Self {
-        Self {
-            ok: true,
-            version: PROTOCOL_VERSION,
-            data: Some(data),
-            error: None,
-        }
-    }
-    fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            version: PROTOCOL_VERSION,
-            data: None,
-            error: Some(msg.into()),
-        }
-    }
-}
-
 /// Outcome of a [`daemon_result`] call. Each variant carries the information
 /// the caller needs to decide whether to fall back to `Store::open`.
 #[derive(Debug)]
@@ -153,9 +109,6 @@ pub enum DaemonResult {
 }
 
 // ── Connection timeout ───────────────────────────────────────────────────────
-
-/// Max wait for a complete request line per connection.
-const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 // ── Server ───────────────────────────────────────────────────────────────────
 
@@ -178,8 +131,32 @@ pub async fn run_daemon_start() -> Result<()> {
     let repo_root = Arc::new(std::fs::canonicalize(&cwd)?);
     let store = Store::open(&cwd).await?;
 
-    let sock_path = store.root.join("mati.sock");
-    let pid_path = store.root.join("mati.pid");
+    // Clear stale session:consulted:* markers from previous sessions.
+    if let Ok(keys) = store.scan_keys("session:consulted:").await {
+        for k in &keys {
+            let _ = store.delete(k).await;
+        }
+        if !keys.is_empty() {
+            tracing::debug!(
+                "daemon: cleared {} stale session:consulted markers",
+                keys.len()
+            );
+        }
+    }
+
+    // Load the graph so the daemon can handle MCP tool commands (mem_get,
+    // mem_query, mem_bootstrap, mem_set) in addition to hook commands.
+    // Graph::load consumes the Store — access via graph.read().await.store().
+    let graph = Graph::load(store)
+        .await
+        .context("failed to load knowledge graph")?;
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+
+    let (sock_path, pid_path) = {
+        let g = graph.read().await;
+        let root = &g.store().root;
+        (root.join("mati.sock"), root.join("mati.pid"))
+    };
 
     // Unix domain socket paths are limited to 104 bytes on macOS / 108 on Linux.
     // Use the stricter macOS limit as a universal guard.
@@ -256,7 +233,13 @@ pub async fn run_daemon_start() -> Result<()> {
     // serve_loop is NEVER cancelled by tokio. It exits only after handle_connection
     // returns, ensuring all writes are committed before store.close() is called.
     tokio::join!(
-        serve_loop_graceful(&store, &repo_root, &listener, &last_wall, &shutdown),
+        serve_loop_graceful(
+            Arc::clone(&graph),
+            &repo_root,
+            &listener,
+            &last_wall,
+            &shutdown
+        ),
         async {
             // Wait for either a signal or the idle-check notification.
             let ctrl_c = tokio::signal::ctrl_c();
@@ -299,8 +282,14 @@ pub async fn run_daemon_start() -> Result<()> {
     let _ = std::fs::remove_file(&starting_path); // belt-and-suspenders
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
-    if let Err(e) = store.close().await {
-        tracing::warn!("daemon: store close warning on shutdown: {e}");
+    // Unwrap the Arc to close the graph (which closes the store).
+    match Arc::try_unwrap(graph) {
+        Ok(rwlock) => {
+            if let Err(e) = rwlock.into_inner().close().await {
+                tracing::warn!("daemon: store close warning on shutdown: {e}");
+            }
+        }
+        Err(_) => tracing::warn!("daemon: graph Arc still referenced on shutdown"),
     }
     Ok(())
 }
@@ -308,8 +297,12 @@ pub async fn run_daemon_start() -> Result<()> {
 /// Accept and handle connections sequentially. Exits cleanly after the current
 /// connection completes when `shutdown` is notified — never cancels a connection
 /// mid-execution.
+///
+/// Delegates to the shared `socket_handle_connection` from `mcp::server`, which
+/// handles both hook commands (get, log_hit, etc.) and MCP tool commands
+/// (mem_get, mem_query, mem_bootstrap, mem_set).
 async fn serve_loop_graceful(
-    store: &Store,
+    graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     listener: &UnixListener,
     last_wall: &AtomicU64,
@@ -334,325 +327,22 @@ async fn serve_loop_graceful(
         };
         last_wall.store(wall_secs(), Ordering::Relaxed);
         // Runs to completion — NOT cancellable by shutdown.
-        if let Err(e) = handle_connection(store, repo_root, stream).await {
+        if let Err(e) =
+            mati_core::mcp::server::socket_handle_connection(Arc::clone(&graph), repo_root, stream)
+                .await
+        {
             tracing::warn!(error = %e, "daemon: connection error");
         }
     }
 }
 
-/// Read one JSON request, dispatch, write one JSON response.
-async fn handle_connection(store: &Store, repo_root: &Path, stream: UnixStream) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
+// Local dispatch and command handlers removed — the daemon now delegates to
+// `mcp::server::socket_handle_connection` which handles both hook commands
+// and MCP tool commands through the shared `socket_dispatch` function.
 
-    match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line)).await {
-        Ok(Ok(0)) => return Ok(()), // client closed without sending
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => anyhow::bail!("read error: {e}"),
-        Err(_) => anyhow::bail!("read timeout after {}s", READ_TIMEOUT.as_secs()),
-    }
+// (write_response removed — using server::write_socket_response)
 
-    let request: Request = match serde_json::from_str(line.trim()) {
-        Ok(r) => r,
-        Err(e) => {
-            write_response(&mut writer, &Response::err(format!("invalid JSON: {e}"))).await?;
-            return Ok(());
-        }
-    };
-
-    let response = dispatch(store, repo_root, &request).await;
-    write_response(&mut writer, &response).await?;
-    Ok(())
-}
-
-async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &Response,
-) -> Result<()> {
-    let json = serde_json::to_string(response)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-/// Route a request to the appropriate handler.
-async fn dispatch(store: &Store, repo_root: &Path, req: &Request) -> Response {
-    // Version check. Explicit mismatch → error so client falls back rather than
-    // misinterpreting a response from an incompatible daemon.
-    if let Some(v) = req.version {
-        if v != PROTOCOL_VERSION {
-            return Response::err(format!(
-                "protocol version mismatch: client={v} daemon={PROTOCOL_VERSION}; \
-                 run `mati daemon stop && mati daemon start` to upgrade"
-            ));
-        }
-    }
-
-    match req.cmd.as_str() {
-        "get" => cmd_get(store, &req.args).await,
-        "log_hit" => cmd_log_hit(store, &req.args).await,
-        "log_miss" => cmd_log_miss(store, &req.args).await,
-        "log_compliance_miss" => cmd_log_compliance_miss(store, &req.args).await,
-        "session_check_consulted" => cmd_session_check_consulted(store, &req.args).await,
-        "edit_hook" => cmd_edit_hook(store, repo_root, &req.args).await,
-        "session_flush" => cmd_session_flush(store).await,
-        "scan_prefix" => cmd_scan_prefix(store, &req.args).await,
-        "put" => cmd_put(store, &req.args).await,
-        "gotcha_write" => cmd_gotcha_write(store, &req.args).await,
-        "gotcha_tombstone" => cmd_gotcha_tombstone(store, &req.args).await,
-        "ping" => Response::ok(serde_json::Value::String("pong".into())),
-        other => Response::err(format!("unknown command: {other}")),
-    }
-}
-
-// ── Command handlers ─────────────────────────────────────────────────────────
-
-async fn cmd_get(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    match store.get(key).await {
-        Ok(Some(record)) => {
-            // Add top-level `confirmed` field so hook scripts can read `.confirmed`
-            // without knowing the category. Mirrors extract_confirmed in cli/hooks.rs.
-            let confirmed = record
-                .payload_as::<mati_core::store::GotchaRecord>()
-                .map(|g| g.confirmed)
-                .unwrap_or(false);
-            match serde_json::to_value(&record) {
-                Ok(mut val) => {
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert("confirmed".to_string(), serde_json::Value::Bool(confirmed));
-                    }
-                    Response::ok(val)
-                }
-                Err(e) => Response::err(format!("serialize error: {e}")),
-            }
-        }
-        Ok(None) => Response::ok(serde_json::Value::Null),
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-async fn cmd_log_hit(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let now = now_secs();
-
-    let agg_key = today_key("analytics:hit_");
-    if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-        tracing::warn!(error = %e, "daemon: hit aggregation failed");
-    }
-
-    let consulted_key = format!("session:consulted:{key}");
-    if let Err(e) = store
-        .put(
-            &consulted_key,
-            &session_record(&consulted_key, String::new()),
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "daemon: consulted marker failed");
-    }
-
-    if let Ok(Some(mut record)) = store.get(key).await {
-        record.access_count += 1;
-        record.last_accessed = now;
-        if let Err(e) = store.put(key, &record).await {
-            tracing::warn!(error = %e, "daemon: access_count bump failed");
-        }
-    }
-
-    Response::ok(serde_json::Value::String("hit logged".into()))
-}
-
-async fn cmd_log_miss(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let agg_key = today_key("analytics:miss_");
-    if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-        return Response::err(format!("miss aggregation failed: {e}"));
-    }
-    Response::ok(serde_json::Value::String("miss logged".into()))
-}
-
-async fn cmd_log_compliance_miss(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let agg_key = today_key("compliance:miss_");
-    if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-        return Response::err(format!("compliance miss aggregation failed: {e}"));
-    }
-    Response::ok(serde_json::Value::String("compliance miss logged".into()))
-}
-
-async fn cmd_session_check_consulted(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let consulted_key = format!("session:consulted:{key}");
-    match store.get(&consulted_key).await {
-        Ok(Some(_)) => Response::ok(serde_json::Value::Bool(true)),
-        Ok(None) => Response::ok(serde_json::Value::Bool(false)),
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-/// Combined log-hit + reparse. The daemon already has the store open so this
-/// avoids the ~200ms SurrealKV re-open cost that `run_edit_hook` incurs as a
-/// standalone process.
-async fn cmd_edit_hook(store: &Store, repo_root: &Path, args: &serde_json::Value) -> Response {
-    let path = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return Response::err("missing args.path"),
-    };
-    let file_key = format!("file:{path}");
-    let now = now_secs();
-
-    // log-hit (best-effort — mirrors log_hit_impl in hooks.rs)
-    let agg_key = today_key("analytics:hit_");
-    let _ = upsert_daily_agg(store, &agg_key, &file_key).await;
-    let consulted_key = format!("session:consulted:{file_key}");
-    let _ = store
-        .put(
-            &consulted_key,
-            &session_record(&consulted_key, String::new()),
-        )
-        .await;
-    if let Ok(Some(mut record)) = store.get(&file_key).await {
-        record.access_count += 1;
-        record.last_accessed = now;
-        let _ = store.put(&file_key, &record).await;
-    }
-
-    // reparse (best-effort — non-fatal per P9)
-    if let Err(e) = crate::cli::reparse::reparse_impl(store, repo_root, path).await {
-        tracing::warn!(path, error = %e, "daemon edit_hook: reparse failed (non-fatal)");
-    }
-
-    Response::ok(serde_json::Value::Null)
-}
-
-/// Flush consulted-key markers into `session:current`.
-/// Mirrors `session_flush_impl` in hooks.rs. Called at session end before harvest.
-async fn cmd_session_flush(store: &Store) -> Response {
-    let now = now_secs();
-    let consulted_keys = match store.scan_keys("session:consulted:").await {
-        Ok(keys) => keys,
-        Err(e) => return Response::err(format!("scan_keys error: {e}")),
-    };
-    let stripped: Vec<String> = consulted_keys
-        .iter()
-        .map(|k| {
-            k.strip_prefix("session:consulted:")
-                .unwrap_or(k)
-                .to_string()
-        })
-        .collect();
-    let value = match serde_json::to_string(&serde_json::json!({
-        "consulted_keys": stripped,
-        "flushed_at": now,
-    })) {
-        Ok(v) => v,
-        Err(e) => return Response::err(format!("serialize error: {e}")),
-    };
-    match store
-        .put("session:current", &session_record("session:current", value))
-        .await
-    {
-        Ok(()) => Response::ok(serde_json::Value::String("flushed".into())),
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-async fn cmd_scan_prefix(store: &Store, args: &serde_json::Value) -> Response {
-    let prefix = match args.get("prefix").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return Response::err("missing args.prefix"),
-    };
-    match store.scan_prefix(prefix).await {
-        Ok(records) => match serde_json::to_value(&records) {
-            Ok(val) => Response::ok(val),
-            Err(e) => Response::err(format!("serialize error: {e}")),
-        },
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-async fn cmd_put(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let record: Record = match args
-        .get("record")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-    {
-        Some(r) => r,
-        None => return Response::err("put: invalid record"),
-    };
-    match store.put(key, &record).await {
-        Ok(()) => Response::ok(serde_json::Value::Null),
-        Err(e) => Response::err(format!("store put: {e}")),
-    }
-}
-
-/// Write a gotcha record + update affected file records + persist graph edges.
-/// Used by `mati gotcha add/edit` when the daemon holds the store lock.
-async fn cmd_gotcha_write(store: &Store, args: &serde_json::Value) -> Response {
-    let record: Record = match args
-        .get("record")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-    {
-        Some(r) => r,
-        None => return Response::err("missing or invalid args.record"),
-    };
-    let new_files: Vec<String> = args
-        .get("new_files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let old_files: Vec<String> = args
-        .get("old_files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let is_new = args
-        .get("is_new")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    match apply_gotcha_write(store, &record, &old_files, &new_files, is_new).await {
-        Ok(()) => Response::ok(serde_json::Value::String("written".into())),
-        Err(e) => Response::err(format!("{e}")),
-    }
-}
-
-/// Tombstone a gotcha record and remove its HasGotcha graph edges.
-/// Used by `mati gotcha delete` when the daemon holds the store lock.
-async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let affected_files: Vec<String> = args
-        .get("affected_files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    match apply_gotcha_tombstone(store, key, &affected_files).await {
-        Ok(()) => Response::ok(serde_json::Value::String("tombstoned".into())),
-        Err(e) => Response::err(format!("{e}")),
-    }
-}
+// (All dispatch + cmd_* handlers removed — using shared socket_dispatch)
 
 // ── Client ───────────────────────────────────────────────────────────────────
 
@@ -875,96 +565,6 @@ fn wall_secs() -> u64 {
         .as_secs()
 }
 
-fn now_secs() -> u64 {
-    wall_secs()
-}
-
-fn today_key(prefix: &str) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d");
-    format!("{prefix}{now}")
-}
-
-fn new_device_id() -> uuid::Uuid {
-    uuid::Uuid::new_v4()
-}
-
-use mati_core::store::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore,
-};
-
-fn session_record(key: &str, value: String) -> Record {
-    let now = now_secs();
-    Record {
-        key: key.to_string(),
-        value,
-        category: Category::Session,
-        priority: Priority::Normal,
-        tags: vec![],
-        created_at: now,
-        updated_at: now,
-        ref_url: None,
-        staleness: StalenessScore::fresh(),
-        lifecycle: RecordLifecycle::Active,
-        version: RecordVersion {
-            device_id: new_device_id(),
-            logical_clock: 1,
-            wall_clock: now,
-        },
-        quality: QualityScore::layer0_default(),
-        access_count: 0,
-        last_accessed: 0,
-        source: RecordSource::SessionHook,
-        confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
-        gap_analysis_score: 0.0,
-        payload: None,
-    }
-}
-
-fn analytics_record(key: &str, value: String) -> Record {
-    let mut r = session_record(key, value);
-    r.category = Category::Analytics;
-    r
-}
-
-#[derive(Serialize, Deserialize)]
-struct DailyAgg {
-    count: u64,
-    keys: Vec<String>,
-}
-
-const MAX_AGG_KEYS: usize = 100;
-
-async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
-    let now = now_secs();
-    match store.get(agg_key).await? {
-        Some(mut record) => {
-            let mut agg: DailyAgg = serde_json::from_str(&record.value).unwrap_or(DailyAgg {
-                count: 0,
-                keys: vec![],
-            });
-            agg.count += 1;
-            if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
-                agg.keys.push(target_key.to_string());
-            }
-            record.value = serde_json::to_string(&agg)?;
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
-            store.put(agg_key, &record).await?;
-        }
-        None => {
-            let agg = DailyAgg {
-                count: 1,
-                keys: vec![target_key.to_string()],
-            };
-            let record = analytics_record(agg_key, serde_json::to_string(&agg)?);
-            store.put(agg_key, &record).await?;
-        }
-    }
-    Ok(())
-}
-
 // ── Stop ─────────────────────────────────────────────────────────────────────
 
 /// Stop a running daemon by sending SIGTERM to the PID in the PID file.
@@ -1120,42 +720,9 @@ pub async fn run_daemon_status() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn response_ok_serialization() {
-        let resp = Response::ok(serde_json::json!("pong"));
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""ok":true"#));
-        assert!(json.contains(r#""data":"pong""#));
-        assert!(json.contains(r#""v":1"#));
-        assert!(!json.contains("error"));
-    }
-
-    #[test]
-    fn response_err_serialization() {
-        let resp = Response::err("bad request");
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""ok":false"#));
-        assert!(json.contains(r#""error":"bad request""#));
-        assert!(json.contains(r#""v":1"#));
-        assert!(!json.contains("data"));
-    }
-
-    #[test]
-    fn request_with_version() {
-        let json = r#"{"v":1,"cmd":"get","args":{"key":"file:src/main.rs"}}"#;
-        let req: Request = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cmd, "get");
-        assert_eq!(req.version, Some(1));
-        assert_eq!(req.args["key"], "file:src/main.rs");
-    }
-
-    #[test]
-    fn request_without_version_is_backward_compatible() {
-        let json = r#"{"cmd":"ping"}"#;
-        let req: Request = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cmd, "ping");
-        assert_eq!(req.version, None); // legacy client — treated as compatible
-    }
+    // Protocol type serialization tests removed — Request/Response types
+    // now live in mcp::server as SocketRequest/SocketResponse and are
+    // tested there.
 
     #[tokio::test]
     async fn daemon_result_not_running_without_socket() {
