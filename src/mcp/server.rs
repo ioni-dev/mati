@@ -235,18 +235,18 @@ async fn open_with_retry(
                     return Err(e).context("failed to open mati store");
                 }
                 if attempt == max_retries {
-                    // Only enter proxy mode if the lock holder is another MCP
-                    // server (owner: "mcp"). A standalone daemon (owner: "daemon")
-                    // can't handle MCP tool calls (no graph loaded).
+                    // Enter proxy mode if the lock holder is a known mati
+                    // process (owner: "mcp" or "daemon"). Both load the graph
+                    // and handle MCP tool commands via the shared socket dispatch.
                     let owner = std::fs::read_to_string(mati_root.join("mati.pid"))
                         .ok()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                         .and_then(|v| v.get("owner").and_then(|o| o.as_str()).map(String::from))
                         .unwrap_or_default();
-                    if owner != "mcp" {
+                    if owner != "mcp" && owner != "daemon" {
                         return Err(anyhow::anyhow!(
-                            "store locked by a standalone daemon (not an MCP server).\n\
-                             Stop the daemon first: mati daemon stop"
+                            "store locked by an unknown process (owner: {owner}).\n\
+                             Stop it first: mati daemon stop"
                         ));
                     }
                     return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({}))
@@ -347,16 +347,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
-struct SocketRequest {
-    cmd: String,
+pub(crate) struct SocketRequest {
+    pub cmd: String,
     #[serde(default, rename = "v")]
-    version: Option<u32>,
+    pub version: Option<u32>,
     #[serde(default)]
-    args: serde_json::Value,
+    pub args: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
-struct SocketResponse {
+pub(crate) struct SocketResponse {
     ok: bool,
     #[serde(rename = "v")]
     version: u32,
@@ -367,7 +367,7 @@ struct SocketResponse {
 }
 
 impl SocketResponse {
-    fn ok(data: serde_json::Value) -> Self {
+    pub(crate) fn ok(data: serde_json::Value) -> Self {
         Self {
             ok: true,
             version: PROTOCOL_VERSION,
@@ -375,7 +375,7 @@ impl SocketResponse {
             error: None,
         }
     }
-    fn err(msg: impl Into<String>) -> Self {
+    pub(crate) fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             version: PROTOCOL_VERSION,
@@ -441,7 +441,7 @@ async fn serve_daemon_socket(
     }
 }
 
-async fn socket_handle_connection(
+pub async fn socket_handle_connection(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     stream: UnixStream,
@@ -474,18 +474,13 @@ async fn socket_handle_connection(
         }
     }
 
-    let graph_guard = graph.read().await;
-    let resp = socket_dispatch(
-        graph_guard.store(),
-        Some(Arc::clone(&graph)),
-        repo_root,
-        &req,
-    )
-    .await;
+    // Do NOT hold a read lock across dispatch — socket_dispatch may acquire
+    // a write lock for MCP tools like mem_set, which would deadlock.
+    let resp = socket_dispatch(&graph, repo_root, &req).await;
     write_socket_response(&mut writer, &resp).await
 }
 
-async fn write_socket_response(
+pub(crate) async fn write_socket_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     resp: &SocketResponse,
 ) -> Result<()> {
@@ -497,8 +492,7 @@ async fn write_socket_response(
 }
 
 async fn socket_dispatch(
-    store: &Store,
-    graph: Option<Arc<tokio::sync::RwLock<Graph>>>,
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     req: &SocketRequest,
 ) -> SocketResponse {
@@ -507,10 +501,8 @@ async fn socket_dispatch(
     match req.cmd.as_str() {
         "ping" => SocketResponse::ok(serde_json::Value::String("pong".into())),
 
+        // ── MCP tool commands ────────────────────────────────────────────
         "mem_get" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_get requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemGetParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_get args: {e}")),
@@ -522,9 +514,6 @@ async fn socket_dispatch(
         }
 
         "mem_query" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_query requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemQueryParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_query args: {e}")),
@@ -536,9 +525,6 @@ async fn socket_dispatch(
         }
 
         "mem_bootstrap" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_bootstrap requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemBootstrapParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_bootstrap args: {e}")),
@@ -550,9 +536,6 @@ async fn socket_dispatch(
         }
 
         "mem_set" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_set requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemSetParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_set args: {e}")),
@@ -563,11 +546,16 @@ async fn socket_dispatch(
             ));
         }
 
+        // ── Hook commands (store-only) ─────────────────────────────────
+        // Acquire a short-lived read lock for store access. The lock is
+        // released at the end of each arm — no risk of deadlock.
         "get" => {
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
+            let g = graph.read().await;
+            let store = g.store();
             match store.get(key).await {
                 Ok(Some(record)) => {
                     let confirmed = record
@@ -597,7 +585,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_hit(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_hit(g.store(), key).await {
                 tracing::warn!("daemon socket log_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -608,7 +597,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_miss(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_miss(g.store(), key).await {
                 tracing::warn!("daemon socket log_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -619,7 +609,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_compliance_miss(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_compliance_miss(g.store(), key).await {
                 tracing::warn!("daemon socket log_compliance_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -630,7 +621,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_compliance_hit(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_compliance_hit(g.store(), key).await {
                 tracing::warn!("daemon socket log_compliance_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -641,7 +633,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_codex_shell_miss(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_codex_shell_miss(g.store(), key).await {
                 tracing::warn!("daemon socket log_codex_shell_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -652,7 +645,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_bootstrap(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_bootstrap(g.store(), key).await {
                 tracing::warn!("daemon socket log_bootstrap: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -663,7 +657,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_prompt_nudge(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_prompt_nudge(g.store(), key).await {
                 tracing::warn!("daemon socket log_prompt_nudge: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -674,7 +669,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            match sess::check_consulted(store, key).await {
+            let g = graph.read().await;
+            match sess::check_consulted(g.store(), key).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -690,14 +686,16 @@ async fn socket_dispatch(
                 .get("ttl_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(900);
-            match sess::check_consulted_recent(store, key, ttl_secs).await {
+            let g = graph.read().await;
+            match sess::check_consulted_recent(g.store(), key, ttl_secs).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
         }
 
         "session_flush" => {
-            if let Err(e) = sess::session_flush(store).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::session_flush(g.store()).await {
                 tracing::warn!("daemon socket session_flush: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -706,7 +704,8 @@ async fn socket_dispatch(
         "session_harvest" => {
             // Note: uses no-staleness variant because StalenessAnalyzer (git2) is !Send.
             // Git-based staleness analysis runs on the next CLI-path harvest.
-            if let Err(e) = sess::session_harvest_no_staleness(store).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::session_harvest_no_staleness(g.store()).await {
                 tracing::warn!("daemon socket session_harvest: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -717,7 +716,9 @@ async fn socket_dispatch(
                 Some(p) => p,
                 None => return SocketResponse::err("missing args.path"),
             };
-            if let Err(e) = crate::analysis::reparse::reparse_impl(store, repo_root, path).await {
+            let g = graph.read().await;
+            if let Err(e) = crate::analysis::reparse::reparse_impl(g.store(), repo_root, path).await
+            {
                 tracing::warn!("daemon socket reparse: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -729,6 +730,8 @@ async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.path"),
             };
             let file_key = format!("file:{path}");
+            let g = graph.read().await;
+            let store = g.store();
             if let Err(e) = sess::log_hit(store, &file_key).await {
                 tracing::warn!("daemon socket edit_hook: log_hit failed: {e}");
             }
@@ -748,7 +751,8 @@ async fn socket_dispatch(
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if let Err(e) = sess::doc_capture(store, path, content).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::doc_capture(g.store(), path, content).await {
                 tracing::warn!("daemon socket doc_capture: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -759,7 +763,8 @@ async fn socket_dispatch(
                 Some(p) => p,
                 None => return SocketResponse::err("missing args.prefix"),
             };
-            match store.scan_prefix(prefix).await {
+            let g = graph.read().await;
+            match g.store().scan_prefix(prefix).await {
                 Ok(records) => match serde_json::to_value(&records) {
                     Ok(val) => SocketResponse::ok(val),
                     Err(e) => SocketResponse::err(format!("serialize: {e}")),
@@ -782,7 +787,8 @@ async fn socket_dispatch(
                 Some(r) => r,
                 None => return SocketResponse::err("put: invalid record"),
             };
-            match store.put(key, &record).await {
+            let g = graph.read().await;
+            match g.store().put(key, &record).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::Null),
                 Err(e) => SocketResponse::err(format!("store put: {e}")),
             }
@@ -793,7 +799,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            match store.delete(key).await {
+            let g = graph.read().await;
+            match g.store().delete(key).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::Null),
                 Err(e) => SocketResponse::err(format!("delete: {e}")),
             }
@@ -827,7 +834,8 @@ async fn socket_dispatch(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            match apply_gotcha_write(store, &record, &old_files, &new_files, is_new).await {
+            let g = graph.read().await;
+            match apply_gotcha_write(g.store(), &record, &old_files, &new_files, is_new).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::String("written".into())),
                 Err(e) => SocketResponse::err(format!("{e}")),
             }
@@ -840,13 +848,23 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let affected_files: Vec<String> = req
+            // Read affected_files from args if provided, otherwise look up the
+            // record to get them. The MCP proxy sends delete without affected_files.
+            let mut affected_files: Vec<String> = req
                 .args
                 .get("affected_files")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
-            match apply_gotcha_tombstone(store, key, &affected_files).await {
+            let g = graph.read().await;
+            if affected_files.is_empty() {
+                if let Ok(Some(record)) = g.store().get(key).await {
+                    if let Some(gotcha) = record.payload_as::<crate::store::GotchaRecord>() {
+                        affected_files = gotcha.affected_files;
+                    }
+                }
+            }
+            match apply_gotcha_tombstone(g.store(), key, &affected_files).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::String("tombstoned".into())),
                 Err(e) => SocketResponse::err(format!("{e}")),
             }
@@ -859,6 +877,8 @@ async fn socket_dispatch(
             };
 
             // Read record
+            let g = graph.read().await;
+            let store = g.store();
             let mut record = match store.get(key).await {
                 Ok(Some(r)) => r,
                 Ok(None) => return SocketResponse::err(format!("record not found: {key}")),
@@ -867,6 +887,15 @@ async fn socket_dispatch(
 
             if record.category != crate::store::record::Category::Gotcha {
                 return SocketResponse::err(format!("{key} is not a gotcha record"));
+            }
+
+            if !matches!(
+                record.lifecycle,
+                crate::store::record::RecordLifecycle::Active
+            ) {
+                return SocketResponse::err(format!(
+                    "{key} is tombstoned — cannot confirm a deleted record"
+                ));
             }
 
             // Set confirmed + normalize severity
@@ -1046,13 +1075,26 @@ mod tests {
             .unwrap_or_default()
     }
 
-    async fn dispatch(store: &Store, cmd: &str, args: serde_json::Value) -> SocketResponse {
+    /// Test helper: wraps a Store in a Graph + Arc for socket_dispatch.
+    ///
+    /// Consumes the Store (Graph owns it). Returns the Arc and a reference
+    /// to access the store through the graph for assertions.
+    async fn make_test_graph(store: Store) -> Arc<tokio::sync::RwLock<Graph>> {
+        let graph = Graph::load(store).await.expect("failed to load test graph");
+        Arc::new(tokio::sync::RwLock::new(graph))
+    }
+
+    async fn dispatch_with_graph(
+        graph: &Arc<tokio::sync::RwLock<Graph>>,
+        cmd: &str,
+        args: serde_json::Value,
+    ) -> SocketResponse {
         let req = SocketRequest {
             cmd: cmd.to_string(),
             version: Some(PROTOCOL_VERSION),
             args,
         };
-        socket_dispatch(store, None, Path::new("/tmp/mati-test"), &req).await
+        socket_dispatch(graph, Path::new("/tmp/mati-test"), &req).await
     }
 
     // ── Regression: gotcha_write via socket syncs file links ─────────────
@@ -1061,7 +1103,6 @@ mod tests {
     async fn socket_gotcha_write_adds_keys_to_file_records() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         store
             .put("file:src/a.rs", &make_file_record("src/a.rs"))
             .await
@@ -1070,35 +1111,25 @@ mod tests {
             .put("file:src/b.rs", &make_file_record("src/b.rs"))
             .await
             .unwrap();
+        let graph = make_test_graph(store).await;
 
         let record = make_gotcha_record("gotcha:socket-test", &["src/a.rs", "src/b.rs"]);
-        let resp = dispatch(
-            &store,
-            "gotcha_write",
-            serde_json::json!({
-                "record": record,
-                "new_files": ["src/a.rs", "src/b.rs"],
-                "old_files": [],
-                "is_new": true,
-            }),
-        )
-        .await;
-
+        let resp = dispatch_with_graph(&graph, "gotcha_write", serde_json::json!({
+            "record": record, "new_files": ["src/a.rs", "src/b.rs"], "old_files": [], "is_new": true,
+        })).await;
         assert!(resp.ok, "gotcha_write failed: {:?}", resp.error);
 
-        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
-        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
+        let g = graph.read().await;
+        let a = g.store().get("file:src/a.rs").await.unwrap().unwrap();
+        let b = g.store().get("file:src/b.rs").await.unwrap().unwrap();
         assert!(file_gotcha_keys(&a).contains(&"gotcha:socket-test".into()));
         assert!(file_gotcha_keys(&b).contains(&"gotcha:socket-test".into()));
-
-        store.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn socket_gotcha_write_edit_removes_key_from_old_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         store
             .put("file:src/a.rs", &make_file_record("src/a.rs"))
             .await
@@ -1107,58 +1138,36 @@ mod tests {
             .put("file:src/b.rs", &make_file_record("src/b.rs"))
             .await
             .unwrap();
+        let graph = make_test_graph(store).await;
 
-        // Initial write targeting src/a.rs
         let record = make_gotcha_record("gotcha:edit-socket", &["src/a.rs"]);
-        let resp = dispatch(
-            &store,
+        let resp = dispatch_with_graph(
+            &graph,
             "gotcha_write",
             serde_json::json!({
-                "record": record,
-                "new_files": ["src/a.rs"],
-                "old_files": [],
-                "is_new": true,
+                "record": record, "new_files": ["src/a.rs"], "old_files": [], "is_new": true,
             }),
         )
         .await;
         assert!(resp.ok);
 
-        // Edit: move from src/a.rs to src/b.rs
         let record2 = make_gotcha_record("gotcha:edit-socket", &["src/b.rs"]);
-        let resp2 = dispatch(
-            &store,
-            "gotcha_write",
-            serde_json::json!({
-                "record": record2,
-                "new_files": ["src/b.rs"],
-                "old_files": ["src/a.rs"],
-                "is_new": false,
-            }),
-        )
-        .await;
+        let resp2 = dispatch_with_graph(&graph, "gotcha_write", serde_json::json!({
+            "record": record2, "new_files": ["src/b.rs"], "old_files": ["src/a.rs"], "is_new": false,
+        })).await;
         assert!(resp2.ok);
 
-        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
-        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
-        assert!(
-            !file_gotcha_keys(&a).contains(&"gotcha:edit-socket".into()),
-            "old file should not have gotcha key after edit"
-        );
-        assert!(
-            file_gotcha_keys(&b).contains(&"gotcha:edit-socket".into()),
-            "new file should have gotcha key after edit"
-        );
-
-        store.close().await.unwrap();
+        let g = graph.read().await;
+        let a = g.store().get("file:src/a.rs").await.unwrap().unwrap();
+        let b = g.store().get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(!file_gotcha_keys(&a).contains(&"gotcha:edit-socket".into()));
+        assert!(file_gotcha_keys(&b).contains(&"gotcha:edit-socket".into()));
     }
-
-    // ── Regression: gotcha_tombstone via socket cleans file links ─────────
 
     #[tokio::test]
     async fn socket_gotcha_tombstone_removes_keys_from_file_records() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         store
             .put("file:src/a.rs", &make_file_record("src/a.rs"))
             .await
@@ -1167,93 +1176,60 @@ mod tests {
             .put("file:src/b.rs", &make_file_record("src/b.rs"))
             .await
             .unwrap();
+        let graph = make_test_graph(store).await;
 
-        // Write gotcha first
         let record = make_gotcha_record("gotcha:tomb-socket", &["src/a.rs", "src/b.rs"]);
-        let resp = dispatch(
-            &store,
-            "gotcha_write",
-            serde_json::json!({
-                "record": record,
-                "new_files": ["src/a.rs", "src/b.rs"],
-                "old_files": [],
-                "is_new": true,
-            }),
-        )
-        .await;
+        let resp = dispatch_with_graph(&graph, "gotcha_write", serde_json::json!({
+            "record": record, "new_files": ["src/a.rs", "src/b.rs"], "old_files": [], "is_new": true,
+        })).await;
         assert!(resp.ok);
 
-        // Tombstone it
-        let resp2 = dispatch(
-            &store,
+        let resp2 = dispatch_with_graph(
+            &graph,
             "gotcha_tombstone",
             serde_json::json!({
-                "key": "gotcha:tomb-socket",
-                "affected_files": ["src/a.rs", "src/b.rs"],
+                "key": "gotcha:tomb-socket", "affected_files": ["src/a.rs", "src/b.rs"],
             }),
         )
         .await;
         assert!(resp2.ok, "gotcha_tombstone failed: {:?}", resp2.error);
 
-        // Record should be tombstoned
-        let rec = store.get("gotcha:tomb-socket").await.unwrap().unwrap();
+        let g = graph.read().await;
+        let rec = g.store().get("gotcha:tomb-socket").await.unwrap().unwrap();
         assert!(matches!(rec.lifecycle, RecordLifecycle::Tombstoned { .. }));
-
-        // File records should have empty gotcha_keys
-        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
-        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
-        assert!(
-            file_gotcha_keys(&a).is_empty(),
-            "file:src/a.rs should have no gotcha keys after tombstone, got: {:?}",
-            file_gotcha_keys(&a)
-        );
-        assert!(
-            file_gotcha_keys(&b).is_empty(),
-            "file:src/b.rs should have no gotcha keys after tombstone, got: {:?}",
-            file_gotcha_keys(&b)
-        );
-
-        store.close().await.unwrap();
+        let a = g.store().get("file:src/a.rs").await.unwrap().unwrap();
+        let b = g.store().get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(file_gotcha_keys(&a).is_empty());
+        assert!(file_gotcha_keys(&b).is_empty());
     }
-
-    // ── Regression: gotcha_write via socket rejects collisions ────────────
 
     #[tokio::test]
     async fn socket_gotcha_write_rejects_duplicate_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         let record1 = make_gotcha_record("gotcha:dup-socket", &["src/a.rs"]);
         store.put("gotcha:dup-socket", &record1).await.unwrap();
+        let graph = make_test_graph(store).await;
 
         let record2 = make_gotcha_record("gotcha:dup-socket", &["src/b.rs"]);
-        let resp = dispatch(
-            &store,
+        let resp = dispatch_with_graph(
+            &graph,
             "gotcha_write",
             serde_json::json!({
-                "record": record2,
-                "new_files": ["src/b.rs"],
-                "old_files": [],
-                "is_new": true,
+                "record": record2, "new_files": ["src/b.rs"], "old_files": [], "is_new": true,
             }),
         )
         .await;
-
         assert!(!resp.ok, "duplicate key should be rejected");
-        assert!(
-            resp.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("already exists"),
-            "error should mention collision: {:?}",
-            resp.error
-        );
+        assert!(resp
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("already exists"));
 
-        // Original should be untouched
-        let original = store.get("gotcha:dup-socket").await.unwrap().unwrap();
+        let g = graph.read().await;
+        let original = g.store().get("gotcha:dup-socket").await.unwrap().unwrap();
         let payload = original.payload_as::<GotchaRecord>().unwrap();
         assert_eq!(payload.affected_files, vec!["src/a.rs"]);
-
-        store.close().await.unwrap();
     }
 }

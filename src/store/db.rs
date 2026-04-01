@@ -322,11 +322,30 @@ impl Store {
         // Update search index — KV write is primary, search is secondary.
         // We replace by key rather than append, so tantivy stays aligned with
         // the latest KV state without waiting for a full rebuild.
+        //
+        // Wrapped in catch_unwind: a tantivy panic (e.g., corrupted segment)
+        // must never crash the server. The KV write already committed above —
+        // the search index will be rebuilt on next startup via the
+        // SEARCH_SYNC_PENDING crash-fence marker.
         let mut search_synced = false;
         match self.ensure_search() {
             Ok(search) => {
-                search.add_record(record)?;
-                search_synced = true;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    search.add_record(record)
+                })) {
+                    Ok(Ok(())) => {
+                        search_synced = true;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("search index update failed for '{key}': {e}");
+                    }
+                    Err(_panic) => {
+                        tracing::error!(
+                            "search index panicked during put for '{key}' — \
+                             index will be rebuilt on next startup"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("search index unavailable during put: {e}");
@@ -451,12 +470,27 @@ impl Store {
 
         // Update search index — KV write is primary, search is secondary.
         // If tantivy fails to initialize, the KV writes still succeeded.
+        // Wrapped in catch_unwind for the same reason as put().
         let mut search_synced = false;
         match self.ensure_search() {
             Ok(search) => {
                 let search_records: Vec<&Record> = records.iter().map(|(_, r)| *r).collect();
-                let _ = search.add_records(&search_records)?;
-                search_synced = true;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    search.add_records(&search_records)
+                })) {
+                    Ok(Ok(_)) => {
+                        search_synced = true;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("search index update failed in put_batch: {e}");
+                    }
+                    Err(_panic) => {
+                        tracing::error!(
+                            "search index panicked during put_batch — \
+                             index will be rebuilt on next startup"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!("search index unavailable during put_batch: {e}");
@@ -572,7 +606,15 @@ impl Store {
     /// empty `Vec` when `text` is blank or `limit` is 0.
     pub async fn search(&self, text: &str, limit: usize) -> Result<Vec<Record>> {
         let search = self.ensure_search()?;
-        let keys = search.query_keys(text, limit)?;
+        let keys = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            search.query_keys(text, limit)
+        })) {
+            Ok(result) => result?,
+            Err(_panic) => {
+                tracing::error!("search index panicked during query — returning empty results");
+                return Ok(vec![]);
+            }
+        };
         let mut records = Vec::with_capacity(keys.len());
         for key in &keys {
             if let Some(record) = self.get(key).await? {
