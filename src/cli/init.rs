@@ -911,38 +911,56 @@ pub async fn run(args: InitArgs) -> Result<()> {
         "  {bold}Onboarding estimate:{reset}  {white}22 min{reset}  {gray}(0% gotcha coverage — confirm candidates to reduce){reset}"
     );
 
-    // Block 2: Top hotspot files
+    // Block 2: Top hotspot files (filtered to code files for display)
     let hotspot_paths: &[String] = git_signals
         .as_ref()
         .map(|g| g.hotspot_files.as_slice())
         .unwrap_or(&[]);
-    if !hotspot_paths.is_empty() {
+    let code_hotspots: Vec<&String> = hotspot_paths.iter().filter(|p| is_code_file(p)).collect();
+    // Fall back to unfiltered if filtering removes everything
+    let display_hotspots: Vec<&String> = if code_hotspots.is_empty() {
+        hotspot_paths.iter().collect()
+    } else {
+        code_hotspots
+    };
+    if !display_hotspots.is_empty() {
         println!();
         println!(
             "  {bold}Hotspot files{reset}  {gray}(highest risk — most changed in last 90 days){reset}"
         );
-        for path in hotspot_paths.iter().take(5) {
+        for path in display_hotspots.iter().take(5) {
             println!("    {cyan}{path}{reset}");
         }
-        if hotspot_paths.len() > 5 {
-            println!("    {gray}… and {} more{reset}", hotspot_paths.len() - 5);
+        if display_hotspots.len() > 5 {
+            println!("    {gray}… and {} more{reset}", display_hotspots.len() - 5);
         }
     }
 
-    // Block 3: Top co-change pairs
-    if !co_change_pairs.is_empty() {
+    // Block 3: Top co-change pairs (filtered to code-file pairs)
+    let code_pairs: Vec<&(String, String, u32)> = co_change_pairs
+        .iter()
+        .filter(|(a, b, _)| is_code_file(a) && is_code_file(b))
+        .collect();
+    if !code_pairs.is_empty() {
         println!();
         println!(
             "  {bold}Co-change pairs{reset}  {gray}(files that always change together){reset}"
         );
-        for (a, b, count) in co_change_pairs.iter().take(3) {
-            // Show percentage from whichever side has the higher ratio
+        for (a, b, count) in code_pairs.iter().take(3) {
             let (freq_a, freq_b) = git_signals
                 .as_ref()
                 .map(|g| {
                     (
-                        g.change_frequency.get(a).copied().unwrap_or(1).max(1),
-                        g.change_frequency.get(b).copied().unwrap_or(1).max(1),
+                        g.change_frequency
+                            .get(a.as_str())
+                            .copied()
+                            .unwrap_or(1)
+                            .max(1),
+                        g.change_frequency
+                            .get(b.as_str())
+                            .copied()
+                            .unwrap_or(1)
+                            .max(1),
                     )
                 })
                 .unwrap_or((1, 1));
@@ -960,8 +978,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         println!(
             "  {bold}{yellow}Review backlog{reset}  {white}{review_count}{reset} {gray}candidates pending confirmation{reset}"
         );
-        println!("    {gray}Run {white}mati review{gray} to activate hook enforcement{reset}");
-        // On first run, all hotspot files have zero confirmed gotchas
+        println!("    {gray}Run {white}mati review{gray} — confirmed gotchas block file reads until consulted{reset}");
         if hotspot_count > 0 {
             println!(
                 "    {yellow}{hotspot_count} hotspot files have zero confirmed gotchas{reset}"
@@ -970,23 +987,51 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
     println!();
 
-    // Block 5: Personalized next steps
+    // Block 5: Personalized next steps (column-aligned)
     println!("  {bold}{blue}Next steps{reset}");
-    if let Some(top_hotspot) = hotspot_paths.first() {
-        println!(
-            "    {white}mati explain {top_hotspot}{reset}  {gray}← start here (highest-risk file){reset}"
-        );
+    let top_file = display_hotspots.first().map(|s| s.as_str());
+    let explain_cmd = if let Some(path) = top_file {
+        format!("mati explain {path}")
     } else if total_file_count > 0 {
+        "mati explain <file>".to_string()
+    } else {
+        String::new()
+    };
+    let review_cmd = "mati review".to_string();
+    let status_cmd = "mati status".to_string();
+
+    // Compute column width from the longest command + 2 spaces padding
+    let col = explain_cmd
+        .len()
+        .max(review_cmd.len())
+        .max(status_cmd.len())
+        + 2;
+
+    if !explain_cmd.is_empty() {
+        let desc = if top_file.is_some() {
+            "← start here (highest-risk file)"
+        } else {
+            "file briefing — gotchas and decisions before editing"
+        };
         println!(
-            "    {white}mati explain <file>{reset}   {gray}file briefing — gotchas and decisions before editing{reset}"
+            "    {white}{explain_cmd:<col$}{reset}{gray}{desc}{reset}",
+            col = col
         );
     }
     if review_count > 0 {
+        let desc = format!("confirm {review_count} candidates for hook enforcement");
         println!(
-            "    {white}mati review{reset}            {gray}confirm {review_count} candidates for hook enforcement{reset}"
+            "    {white}{review_cmd:<col$}{reset}{gray}{desc}{reset}",
+            col = col
         );
     }
-    println!("    {white}mati status{reset}            {gray}project knowledge dashboard{reset}");
+    {
+        let desc = "project knowledge dashboard";
+        println!(
+            "    {white}{status_cmd:<col$}{reset}{gray}{desc}{reset}",
+            col = col
+        );
+    }
     println!();
 
     Ok(())
@@ -1664,5 +1709,51 @@ mod tests {
         assert_eq!(stale.len(), 2);
         assert!(stale.contains(&"dep:serde".to_string()));
         assert!(stale.contains(&"dep:cargo:old".to_string()));
+    }
+}
+
+// ── Display helpers ─────────────────────────────────────────────────────────
+
+/// Returns `true` if the file path looks like a code file worth showing in
+/// the hotspot/co-change display. Filters out documentation, license, config,
+/// and other non-code files that add noise to the first-run output.
+///
+/// Only affects display — the underlying analysis and records are unchanged.
+fn is_code_file(path: &str) -> bool {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+
+    // Exclude well-known non-code files by exact name
+    const EXCLUDED_NAMES: &[&str] = &[
+        "README.md",
+        "README",
+        "readme.md",
+        "CHANGELOG.md",
+        "CHANGES.md",
+        "HISTORY.md",
+        "LICENSE",
+        "LICENSE.md",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "CONTRIBUTING.md",
+        "CODE_OF_CONDUCT.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CODEX.md",
+        ".gitignore",
+        ".gitattributes",
+    ];
+    if EXCLUDED_NAMES.contains(&basename) {
+        return false;
+    }
+
+    // Require a code-related extension
+    const CODE_EXTENSIONS: &[&str] = &[
+        "rs", "go", "py", "ts", "tsx", "js", "jsx", "java", "kt", "swift", "c", "cpp", "h", "hpp",
+        "cs", "rb", "php", "ex", "exs", "zig", "hs", "ml", "scala", "clj", "toml", "yaml", "yml",
+        "json", "sql", "sh", "bash", "proto",
+    ];
+    match path.rsplit('.').next() {
+        Some(ext) => CODE_EXTENSIONS.contains(&ext),
+        None => false,
     }
 }
