@@ -144,6 +144,13 @@ enum Commands {
         /// Repo-relative file path to re-parse
         path: String,
     },
+    /// Fetch gotcha context for files (used by Codex UserPromptSubmit hook).
+    /// Returns bootstrap markdown for the given context files via daemon socket.
+    #[command(hide = true, name = "prompt-context")]
+    PromptContext {
+        /// File paths to look up gotchas for
+        files: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -232,6 +239,7 @@ async fn main() -> Result<()> {
         Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
+        Commands::PromptContext { files } => cli::hooks::run_prompt_context(&files).await,
     }
 }
 

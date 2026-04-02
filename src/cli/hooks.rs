@@ -157,6 +157,39 @@ pub async fn run_session_check_consulted_recent(key: &str, ttl_secs: u64) -> Res
     .await
 }
 
+// ── Prompt context (Codex UserPromptSubmit) ──────────────────────────────────
+
+/// Fetch bootstrap context for the given files via a single daemon socket call.
+///
+/// Used by the Codex UserPromptSubmit hook. Returns the bootstrap markdown
+/// injection string (gotchas, co-change pairs, file context) for the given
+/// files. Prints empty string on failure (fail-open).
+pub async fn run_prompt_context(files: &[String]) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let root = crate::cli::daemon::mati_root_for(&cwd)?;
+    match crate::cli::daemon::daemon_result(
+        &root,
+        "mem_bootstrap",
+        serde_json::json!({ "context_files": files }),
+    )
+    .await
+    {
+        crate::cli::daemon::DaemonResult::Ok(resp) => {
+            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                if let Some(data) = resp.get("data") {
+                    // data is a JSON string containing the bootstrap markdown
+                    let text = data.as_str().unwrap_or("");
+                    print!("{text}");
+                }
+            }
+        }
+        _ => {
+            // Fail-open: no context injected
+        }
+    }
+    Ok(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
