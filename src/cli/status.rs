@@ -11,6 +11,7 @@ use mati_core::store::{
 };
 
 use super::colors;
+use super::daemon::{daemon_result, mati_root_for, read_pid_file, DaemonResult};
 use super::proxy::StoreProxy;
 
 #[derive(Args)]
@@ -54,6 +55,72 @@ struct StatusSnapshot {
     // Cache metadata
     write_seq: u64,
     computed_at: u64,
+}
+
+/// Daemon health state for display purposes.
+enum DaemonHealth {
+    Running { pid: Option<u32> },
+    Unresponsive { pid: Option<u32> },
+    NotRunning,
+}
+
+/// Check daemon health without opening the store (reuses daemon socket logic).
+async fn check_daemon_health(cwd: &std::path::Path) -> DaemonHealth {
+    let root = match mati_root_for(cwd) {
+        Ok(r) => r,
+        Err(_) => return DaemonHealth::NotRunning,
+    };
+
+    match daemon_result(&root, "ping", serde_json::json!({})).await {
+        DaemonResult::Ok(resp) if resp.get("ok") == Some(&serde_json::Value::Bool(true)) => {
+            let pid = read_pid_file(&root).map(|(pid, _)| pid);
+            DaemonHealth::Running { pid }
+        }
+        DaemonResult::Unresponsive => {
+            let pid = read_pid_file(&root).map(|(pid, _)| pid);
+            DaemonHealth::Unresponsive { pid }
+        }
+        _ => DaemonHealth::NotRunning,
+    }
+}
+
+/// Print the Runtime section showing daemon health.
+fn print_runtime_section(
+    health: &DaemonHealth,
+    red: &str,
+    green: &str,
+    yellow: &str,
+    gray: &str,
+    _white: &str,
+    blue: &str,
+    reset: &str,
+) {
+    println!("  {blue}Runtime{reset}");
+    match health {
+        DaemonHealth::Running { pid } => {
+            let pid_str = pid
+                .map(|p| format!(" (pid {p})"))
+                .unwrap_or_default();
+            println!("    Daemon               {green}running{reset}{pid_str}");
+            println!("    Enforcement          {green}active{reset}");
+        }
+        DaemonHealth::Unresponsive { pid } => {
+            let pid_str = pid
+                .map(|p| format!(" (pid {p})"))
+                .unwrap_or_default();
+            println!("    Daemon               {yellow}unresponsive{reset}{pid_str}");
+            println!(
+                "    Enforcement          {yellow}degraded{reset} {gray}— hooks fail open{reset}"
+            );
+        }
+        DaemonHealth::NotRunning => {
+            println!("    Daemon               {red}not running{reset}");
+            println!(
+                "    Enforcement          {red}degraded{reset} {gray}— hooks fail open without daemon{reset}"
+            );
+        }
+    }
+    println!();
 }
 
 fn now_secs() -> u64 {
@@ -131,6 +198,9 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         None
     };
 
+    // ── Daemon health (real-time, never cached) ──────────────────────────
+    let daemon_health = check_daemon_health(&cwd).await;
+
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
     let current_seq = store.read_write_seq();
@@ -145,6 +215,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
                     claude_mode,
                     codex_mode,
                     codex_metrics.as_ref(),
+                    &daemon_health,
                 );
                 store.close().await?;
                 return Ok(());
@@ -154,8 +225,9 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
 
     let use_color = std::io::stdout().is_terminal();
 
-    let (blue, green, yellow, gray, white, bold, reset) = if use_color {
+    let (red, blue, green, yellow, gray, white, bold, reset) = if use_color {
         (
+            colors::RED,
             colors::BLUE,
             colors::GREEN,
             colors::YELLOW,
@@ -165,7 +237,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
             colors::RESET,
         )
     } else {
-        ("", "", "", "", "", "", "")
+        ("", "", "", "", "", "", "", "")
     };
 
     // ── Scan all namespaces in parallel ───────────────────────────────────
@@ -184,6 +256,11 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         .unwrap_or("unknown");
 
     println!("\n{bold}{blue}◈ mati status{reset} — project: {bold}{white}{project}{reset}\n");
+
+    // ── Runtime (daemon health) ──────────────────────────────────────────
+    if claude_mode || codex_mode {
+        print_runtime_section(&daemon_health, red, green, yellow, gray, white, blue, reset);
+    }
 
     if claude_mode || codex_mode {
         println!("  {blue}Platform{reset}");
@@ -494,11 +571,13 @@ fn display_cached_status(
     claude_mode: bool,
     codex_mode: bool,
     codex_metrics: Option<&CodexDailyMetrics>,
+    daemon_health: &DaemonHealth,
 ) {
     let use_color = std::io::stdout().is_terminal();
 
-    let (blue, green, yellow, gray, white, bold, reset) = if use_color {
+    let (red, blue, green, yellow, gray, white, bold, reset) = if use_color {
         (
+            colors::RED,
             colors::BLUE,
             colors::GREEN,
             colors::YELLOW,
@@ -508,7 +587,7 @@ fn display_cached_status(
             colors::RESET,
         )
     } else {
-        ("", "", "", "", "", "", "")
+        ("", "", "", "", "", "", "", "")
     };
 
     let project = cwd
@@ -520,6 +599,11 @@ fn display_cached_status(
         "\n{bold}{blue}◈ mati status{reset} — project: {bold}{white}{project}{reset}  {gray}(cached {}s ago){reset}\n",
         age
     );
+
+    // ── Runtime (daemon health — always real-time, never cached) ─────────
+    if claude_mode || codex_mode {
+        print_runtime_section(daemon_health, red, green, yellow, gray, white, blue, reset);
+    }
 
     if claude_mode || codex_mode {
         println!("  {blue}Platform{reset}");

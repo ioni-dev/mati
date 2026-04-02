@@ -15,6 +15,8 @@ HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 INPUT=$(cat)
 
 if ! command -v jq >/dev/null 2>&1; then
+  echo "[mati] missing jq — enforcement bypassed" >&2
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") reason=missing_deps" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
   exit 0
 fi
 
@@ -23,6 +25,8 @@ PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // ""' 2>/dev/null || echo "")
 
 # ── Graceful degradation: daemon must be reachable ──────────────────────
 if ! mati ping >/dev/null 2>&1; then
+  echo "[mati] daemon unreachable — enforcement bypassed" >&2
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") file=prompt" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
   exit 0
 fi
 
