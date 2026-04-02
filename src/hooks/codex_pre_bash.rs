@@ -13,19 +13,19 @@ fi
 
 TTL_SECS=900
 
-CMD=$(echo "$INPUT" | jq -r '.tool_input.command // .command // ""' 2>/dev/null || echo "")
+CMD=$(printf '%s\n' "$INPUT" | jq -r '.tool_input.command // .command // ""' 2>/dev/null || echo "")
 [ -z "$CMD" ] && exit 0
 
-if echo "$CMD" | grep -qE '^\s*(cat|less|head|tail|bat)\s+'; then
-  FILE_PATH=$(echo "$CMD" | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)
+if printf '%s\n' "$CMD" | grep -qE '^\s*(cat|less|head|tail|bat)\s+'; then
+  FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)
   if [ -z "$FILE_PATH" ]; then
-    FILE_PATH=$(echo "$CMD" | grep -oE '^\s*(cat|less|head|tail|bat)\s+[^|;&]+' | awk '{for(i=2;i<=NF;i++){if($i !~ /^-/){print $i; exit}}}' || true)
+    FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '^\s*(cat|less|head|tail|bat)\s+[^|;&]+' | awk '{for(i=2;i<=NF;i++){if($i !~ /^-/){print $i; exit}}}' || true)
   fi
-elif echo "$CMD" | grep -qE '^\s*(grep|rg|sed|awk)\s+'; then
-  FILE_PATH=$(echo "$CMD" | grep -oE '"[^"]+"' | tail -1 | tr -d '"' || true)
+elif printf '%s\n' "$CMD" | grep -qE '^\s*(grep|rg|sed|awk)\s+'; then
+  FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '"[^"]+"' | tail -1 | tr -d '"' || true)
   if [ -z "$FILE_PATH" ]; then
-    FILE_PATH=$(echo "$CMD" | grep -oE '^\s*(grep|rg|sed|awk)\s+[^|;&]+' | awk '{last=""; for(i=2;i<=NF;i++){if($i !~ /^-/){last=$i}}; print last}' || true)
-    FILE_PATH=$(echo "$FILE_PATH" | sed "s/^'//;s/'$//" || true)
+    FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '^\s*(grep|rg|sed|awk)\s+[^|;&]+' | awk '{last=""; for(i=2;i<=NF;i++){if($i !~ /^-/){last=$i}}; print last}' || true)
+    FILE_PATH=$(printf '%s\n' "$FILE_PATH" | sed "s/^'//;s/'$//" || true)
   fi
 else
   FILE_PATH=""
@@ -40,7 +40,7 @@ else
   REL_PATH="$FILE_PATH"
 fi
 
-SAFE_PATH=$(echo "$REL_PATH" | sed 's/\\/\\\\/g; s/"/\\"/g')
+SAFE_PATH=$(printf '%s\n' "$REL_PATH" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
 if ! mati ping >/dev/null 2>&1; then
   exit 0
@@ -52,15 +52,19 @@ if [ "$RECORD" = "null" ] || [ -z "$RECORD" ]; then
   exit 0
 fi
 
-if ! echo "$RECORD" | jq -e 'type == "object"' >/dev/null 2>&1; then
+if ! printf '%s\n' "$RECORD" | jq -e 'type == "object"' >/dev/null 2>&1; then
   exit 0
 fi
 
-CONFIDENCE=$(echo "$RECORD" | jq -r '.confidence.value // 0')
-QUALITY=$(echo "$RECORD" | jq -r '.quality.value // 0')
-STALENESS=$(echo "$RECORD" | jq -r '.staleness.value // 0')
-STALENESS_TIER=$(echo "$RECORD" | jq -r '.staleness.tier // "fresh"')
-IS_HOTSPOT=$(echo "$RECORD" | jq -r '.payload.is_hotspot // false')
+CONFIDENCE=$(printf '%s\n' "$RECORD" | jq -r '.confidence.value // 0')
+QUALITY=$(printf '%s\n' "$RECORD" | jq -r '.quality.value // 0')
+STALENESS=$(printf '%s\n' "$RECORD" | jq -r '.staleness.value // 0')
+STALENESS_TIER=$(printf '%s\n' "$RECORD" | jq -r '.staleness.tier // "fresh"')
+IS_HOTSPOT=$(printf '%s\n' "$RECORD" | jq -r '.payload.is_hotspot // false')
+# Sanitize numerics — empty or non-numeric → 0
+case "$CONFIDENCE" in ''|*[!0-9.]*) CONFIDENCE=0 ;; esac
+case "$QUALITY" in ''|*[!0-9.]*) QUALITY=0 ;; esac
+case "$STALENESS" in ''|*[!0-9.]*) STALENESS=0 ;; esac
 
 [ "$STALENESS_TIER" = "tombstone" ] && exit 0
 
@@ -71,17 +75,20 @@ fi
 RECENT=$(mati session-check-consulted-recent "file:$REL_PATH" --ttl-secs "$TTL_SECS" 2>/dev/null || echo "false")
 
 DENY_SIGNAL=false
-GOTCHA_KEYS=$(echo "$RECORD" | jq -r '.payload.gotcha_keys[]? // empty' 2>/dev/null || true)
+GOTCHA_KEYS=$(printf '%s\n' "$RECORD" | jq -r '.payload.gotcha_keys[]? // empty' 2>/dev/null || true)
 while IFS= read -r gkey; do
   [ -z "$gkey" ] && continue
   GREC=$(mati get "$gkey" 2>/dev/null || echo "null")
   [ "$GREC" = "null" ] || [ -z "$GREC" ] && continue
-  if ! echo "$GREC" | jq -e 'type == "object"' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$GREC" | jq -e 'type == "object"' >/dev/null 2>&1; then
     continue
   fi
-  GCONFIRMED=$(echo "$GREC" | jq -r '.payload.confirmed // false')
-  GCONFIDENCE=$(echo "$GREC" | jq -r '.confidence.value // 0')
-  GQUALITY=$(echo "$GREC" | jq -r '.quality.value // 0')
+  GCONFIRMED=$(printf '%s\n' "$GREC" | jq -r '.payload.confirmed // false')
+  GCONFIDENCE=$(printf '%s\n' "$GREC" | jq -r '.confidence.value // 0')
+  GQUALITY=$(printf '%s\n' "$GREC" | jq -r '.quality.value // 0')
+  # Sanitize to numeric — empty or non-numeric → 0 (fail-closed: deny skipped)
+  case "$GCONFIDENCE" in ''|*[!0-9.]*) GCONFIDENCE=0 ;; esac
+  case "$GQUALITY" in ''|*[!0-9.]*) GQUALITY=0 ;; esac
   if [ "$GCONFIRMED" = "true" ] && \
      awk "BEGIN { exit !($GCONFIDENCE >= 0.6) }" && \
      awk "BEGIN { exit !($GQUALITY >= 0.4) }"; then

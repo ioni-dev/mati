@@ -115,6 +115,25 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
 
             service.waiting().await?;
+
+            // MCP client disconnected. Instead of exiting, auto-promote to a
+            // headless daemon so subsequent `mati serve` instances (spawned by
+            // Codex for the next tool call) can enter proxy mode against this
+            // process. The daemon socket is already running in a spawned task.
+            //
+            // On Claude Code this rarely fires (pipe stays open for the full
+            // session). On Codex it fires after every tool call due to the
+            // stdio pipe closure bug (openai/codex#5677).
+            tracing::info!("mati serve: MCP client disconnected — continuing as daemon");
+            wait_for_idle_or_signal().await;
+
+            // Cleanup socket + PID files on exit (same as standalone daemon).
+            {
+                let g = graph_arc.read().await;
+                let root = &g.store().root;
+                let _ = std::fs::remove_file(root.join("mati.sock"));
+                let _ = std::fs::remove_file(root.join("mati.pid"));
+            }
         }
         ServerOpen::Proxy(root) => {
             tracing::info!(
@@ -966,6 +985,80 @@ async fn socket_dispatch(
         }
 
         other => SocketResponse::err(format!("unknown command: {other}")),
+    }
+}
+
+// ── Auto-promotion: MCP server → headless daemon ─────────────────────────────
+
+/// Idle shutdown threshold — wall-clock seconds with no daemon socket requests.
+const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
+
+/// How often to check wall-clock idle time.
+const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // 5 min
+
+/// Block until idle timeout or OS signal (SIGINT/SIGTERM).
+///
+/// Called after the MCP stdio client disconnects. The daemon socket task is
+/// already running in a spawned tokio task — this function just keeps the
+/// runtime alive until there's a reason to shut down.
+async fn wait_for_idle_or_signal() {
+    let wall_secs = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+
+    let start = wall_secs();
+
+    // Idle-check: exits after IDLE_SHUTDOWN_SECS from pipe closure.
+    // The daemon socket handler runs independently in a spawned task —
+    // incoming connections do not reset this timer. 30 minutes is generous
+    // enough for Codex sessions where tool calls arrive seconds apart.
+    let idle_shutdown = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let elapsed = wall_secs().saturating_sub(start);
+            if elapsed >= IDLE_SHUTDOWN_SECS {
+                tracing::info!(
+                    idle_secs = elapsed,
+                    "mati serve: idle shutdown (auto-promoted daemon)"
+                );
+                break;
+            }
+        }
+    };
+
+    // Signal handler: SIGINT or SIGTERM.
+    let signal_shutdown = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {
+                    tracing::info!("mati serve: signal shutdown (SIGINT)");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("mati serve: signal shutdown (SIGTERM)");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+            tracing::info!("mati serve: signal shutdown");
+        }
+    };
+
+    // Wait for whichever comes first — idle timeout or OS signal.
+    tokio::select! {
+        _ = idle_shutdown => {}
+        _ = signal_shutdown => {}
     }
 }
 

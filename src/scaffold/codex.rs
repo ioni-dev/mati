@@ -13,7 +13,8 @@ const HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "bash .codex/hooks/session-start.sh"
+            "command": "bash .codex/hooks/session-start.sh",
+            "statusMessage": "Loading project knowledge..."
           }
         ]
       }
@@ -23,7 +24,8 @@ const HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "bash .codex/hooks/user-prompt-submit.sh"
+            "command": "bash .codex/hooks/user-prompt-submit.sh",
+            "statusMessage": "Checking gotchas..."
           }
         ]
       }
@@ -34,7 +36,8 @@ const HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "bash .codex/hooks/pre-bash.sh"
+            "command": "bash .codex/hooks/pre-bash.sh",
+            "statusMessage": "Checking file knowledge..."
           }
         ]
       }
