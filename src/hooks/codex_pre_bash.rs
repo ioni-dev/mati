@@ -2,6 +2,14 @@
 ///
 /// This is the hard-enforcement path available on Codex today.
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
+# mati Codex pre-bash hook — Bash file-reading command enforcement
+#
+# Enforcement decision matrix:
+#   confirmed + confidence >= 0.6 + quality >= 0.4  ->  DENY read (must call mem_get first)
+#   file record + confidence 0.3-0.6 + quality >= 0.4  ->  ALLOW + attach context hint
+#   no record or below threshold  ->  ALLOW + log gap for detection
+#   agent already consulted (receipt valid within 15min)  ->  ALLOW (context already injected)
+#   mati daemon unreachable  ->  ALLOW (fail-open)
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 

@@ -6,6 +6,13 @@
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # mati pre-read hook — file read interception (M-09-A, M-13-D staleness)
 # Receives tool input JSON on stdin from Claude Code PreToolUse hook.
+#
+# Enforcement decision matrix:
+#   confirmed + confidence >= 0.6 + quality >= 0.4  ->  DENY read (must call mem_get first)
+#   file record + confidence 0.3-0.6 + quality >= 0.4  ->  ALLOW + attach context hint
+#   no record or below threshold  ->  ALLOW + log gap for detection
+#   agent already consulted (receipt valid)  ->  ALLOW (context already injected)
+#   mati daemon unreachable  ->  ALLOW (fail-open)
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 
