@@ -25,13 +25,9 @@ use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input, MultiSelect};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use mati_core::health::quality;
-use mati_core::store::gotcha_ops::{apply_gotcha_tombstone, apply_gotcha_write};
-use mati_core::store::{
-    ConfidenceScore, FileRecord, GotchaRecord, Record, RecordLifecycle, RecordSource, Store,
-};
+use mati_core::store::{FileRecord, GotchaRecord, Record, RecordLifecycle};
 
 use super::colors;
-use super::daemon::{daemon_result, mati_root_for, DaemonResult};
 
 // ── Args ─────────────────────────────────────────────────────────────────────
 
@@ -114,14 +110,9 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     }
 
     let cwd = std::env::current_dir()?;
-    ensure_direct_store_access(&cwd).await?;
-
-    let mut candidates = {
-        let store = Store::open(&cwd).await?;
-        let result = collect_candidates(&store).await?;
-        store.close().await?;
-        result
-    };
+    let proxy = crate::cli::proxy::StoreProxy::open(&cwd).await?;
+    let candidates_result = collect_candidates(&proxy).await;
+    let mut candidates = proxy.close_with_result(candidates_result).await?;
 
     // Apply --type filter
     if let Some(ref type_filter) = args.r#type {
@@ -184,17 +175,6 @@ fn backlog_summary(candidates: &[Record]) -> BacklogSummary {
         total: candidates.len(),
         on_hotspots,
         oldest_days,
-    }
-}
-
-async fn ensure_direct_store_access(cwd: &Path) -> Result<()> {
-    let root = mati_root_for(cwd)?;
-    match daemon_result(&root, "ping", serde_json::json!({})).await {
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => Ok(()),
-        DaemonResult::Ok(_) | DaemonResult::Unresponsive => anyhow::bail!(
-            "mati review requires direct store access, which is unavailable while the daemon is running.\n\
-             Run `mati daemon stop` and retry."
-        ),
     }
 }
 
@@ -749,36 +729,39 @@ async fn edit_candidate(
         .interact_text()?;
 
     // Persist edits (still confirmed=false)
-    let store = Store::open(cwd).await?;
-    let mut record = store
-        .get(key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+    let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
+    let write_result = async {
+        let mut record = proxy
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
 
-    let now = now_secs();
-    let updated = GotchaRecord {
-        rule: rule.clone(),
-        reason: reason.clone(),
-        severity: gotcha.severity.clone(),
-        affected_files: gotcha.affected_files.clone(),
-        ref_url: gotcha.ref_url.clone(),
-        discovered_session: gotcha.discovered_session,
-        confirmed: false,
-    };
+        let now = now_secs();
+        let updated = GotchaRecord {
+            rule: rule.clone(),
+            reason: reason.clone(),
+            severity: gotcha.severity.clone(),
+            affected_files: gotcha.affected_files.clone(),
+            ref_url: gotcha.ref_url.clone(),
+            discovered_session: gotcha.discovered_session,
+            confirmed: false,
+        };
 
-    record.value = if reason.is_empty() {
-        rule
-    } else {
-        format!("{} because {}", updated.rule, updated.reason)
-    };
-    record.payload = serde_json::to_value(&updated).ok();
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-    record.quality = quality::analyze(&record);
+        record.value = if reason.is_empty() {
+            rule
+        } else {
+            format!("{} because {}", updated.rule, updated.reason)
+        };
+        record.payload = serde_json::to_value(&updated).ok();
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+        record.quality = quality::analyze(&record);
 
-    store.put(key, &record).await?;
-    store.close().await?;
+        proxy.put(key, &record).await
+    }
+    .await;
+    proxy.close_with_result(write_result).await?;
 
     println!("  Edits saved.");
 
@@ -906,7 +889,7 @@ impl Select {
 
 /// Scan `gotcha:*` for Active records with `confirmed=false`.
 /// Sorted by priority: hotspot-linked first, then by risk score descending.
-async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
+async fn collect_candidates(store: &crate::cli::proxy::StoreProxy) -> Result<Vec<Record>> {
     let all = store.scan_prefix("gotcha:").await?;
     let mut candidates: Vec<Record> = all
         .into_iter()
@@ -946,7 +929,9 @@ async fn collect_candidates(store: &Store) -> Result<Vec<Record>> {
     Ok(candidates)
 }
 
-async fn collect_hotspot_files(store: &Store) -> std::collections::HashSet<String> {
+async fn collect_hotspot_files(
+    store: &crate::cli::proxy::StoreProxy,
+) -> std::collections::HashSet<String> {
     let mut hotspots = std::collections::HashSet::new();
     if let Ok(files) = store.scan_prefix("file:").await {
         for f in files {
@@ -971,84 +956,43 @@ fn is_hotspot_linked(record: &Record, hotspot_files: &std::collections::HashSet<
 
 /// Bulk-confirm multiple candidates in a single store session.
 async fn bulk_confirm_candidates(cwd: &Path, keys: &[String], pb: &ProgressBar) -> Result<()> {
-    let store = Store::open(cwd).await?;
+    let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
 
     for key in keys {
-        let Some(mut record) = store.get(key).await? else {
-            pb.inc(1);
-            continue;
-        };
-        let Some(mut gotcha) = record.payload_as::<GotchaRecord>() else {
-            pb.inc(1);
-            continue;
-        };
-
-        let now = now_secs();
-        gotcha.confirmed = true;
-        record.payload = serde_json::to_value(&gotcha).ok();
-        record.source = RecordSource::DeveloperManual;
-        record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
-        record.confidence.confirmation_count =
-            record.confidence.confirmation_count.saturating_add(1);
-        record.updated_at = now;
-        record.version.logical_clock += 1;
-        record.version.wall_clock = now;
-
-        let files = gotcha.affected_files.clone();
-        apply_gotcha_write(&store, &record, &[], &files, false).await?;
+        if let Err(e) = proxy.gotcha_confirm(key).await {
+            tracing::warn!("bulk confirm {key}: {e}");
+        }
         pb.inc(1);
     }
 
-    store.close().await?;
+    proxy.close().await?;
     Ok(())
 }
 
 /// Confirm a single candidate.
 async fn confirm_candidate(cwd: &Path, key: &str) -> Result<()> {
-    let store = Store::open(cwd).await?;
-
-    let mut record = store
-        .get(key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
-
-    let mut gotcha: GotchaRecord = record
-        .payload_as()
-        .ok_or_else(|| anyhow::anyhow!("{key} is not a gotcha record"))?;
-
-    let now = now_secs();
-    gotcha.confirmed = true;
-    record.payload = serde_json::to_value(&gotcha).ok();
-    record.source = RecordSource::DeveloperManual;
-    record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
-    record.confidence.confirmation_count = record.confidence.confirmation_count.saturating_add(1);
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-
-    let files = gotcha.affected_files.clone();
-    apply_gotcha_write(&store, &record, &[], &files, false).await?;
-    store.close().await?;
-
-    Ok(())
+    let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
+    let result = proxy.gotcha_confirm(key).await;
+    proxy.close_with_result(result).await
 }
 
 /// Tombstone a candidate and remove its graph edges.
 async fn delete_candidate(cwd: &Path, key: &str) -> Result<()> {
-    let store = Store::open(cwd).await?;
+    let proxy = crate::cli::proxy::StoreProxy::open(cwd).await?;
 
-    // Fetch affected files before tombstoning (apply_gotcha_tombstone needs them)
-    let affected_files = store
-        .get(key)
-        .await?
-        .and_then(|r| r.payload_as::<GotchaRecord>())
-        .map(|g| g.affected_files)
-        .unwrap_or_default();
+    let result = async {
+        // Fetch affected files before tombstoning
+        let affected_files = proxy
+            .get(key)
+            .await?
+            .and_then(|r| r.payload_as::<GotchaRecord>())
+            .map(|g| g.affected_files)
+            .unwrap_or_default();
 
-    apply_gotcha_tombstone(&store, key, &affected_files).await?;
-    store.close().await?;
-
-    Ok(())
+        proxy.gotcha_tombstone(key, &affected_files).await
+    }
+    .await;
+    proxy.close_with_result(result).await
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -1075,8 +1019,8 @@ pub fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use mati_core::store::{
-        Category, ConfidenceScore, Priority, QualityScore, QualityTier, RecordVersion,
-        StalenessScore,
+        Category, ConfidenceScore, Priority, QualityScore, QualityTier, RecordSource,
+        RecordVersion, StalenessScore,
     };
 
     fn make_gotcha(

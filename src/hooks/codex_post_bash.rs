@@ -13,19 +13,19 @@ fi
 
 TTL_SECS=900
 
-CMD=$(echo "$INPUT" | jq -r '.tool_input.command // .command // ""' 2>/dev/null || echo "")
+CMD=$(printf '%s\n' "$INPUT" | jq -r '.tool_input.command // .command // ""' 2>/dev/null || echo "")
 [ -z "$CMD" ] && exit 0
 
-if echo "$CMD" | grep -qE '^\s*(cat|less|head|tail|bat)\s+'; then
-  FILE_PATH=$(echo "$CMD" | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)
+if printf '%s\n' "$CMD" | grep -qE '^\s*(cat|less|head|tail|bat)\s+'; then
+  FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)
   if [ -z "$FILE_PATH" ]; then
-    FILE_PATH=$(echo "$CMD" | grep -oE '^\s*(cat|less|head|tail|bat)\s+[^|;&]+' | awk '{for(i=2;i<=NF;i++){if($i !~ /^-/){print $i; exit}}}' || true)
+    FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '^\s*(cat|less|head|tail|bat)\s+[^|;&]+' | awk '{for(i=2;i<=NF;i++){if($i !~ /^-/){print $i; exit}}}' || true)
   fi
-elif echo "$CMD" | grep -qE '^\s*(grep|rg|sed|awk)\s+'; then
-  FILE_PATH=$(echo "$CMD" | grep -oE '"[^"]+"' | tail -1 | tr -d '"' || true)
+elif printf '%s\n' "$CMD" | grep -qE '^\s*(grep|rg|sed|awk)\s+'; then
+  FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '"[^"]+"' | tail -1 | tr -d '"' || true)
   if [ -z "$FILE_PATH" ]; then
-    FILE_PATH=$(echo "$CMD" | grep -oE '^\s*(grep|rg|sed|awk)\s+[^|;&]+' | awk '{last=""; for(i=2;i<=NF;i++){if($i !~ /^-/){last=$i}}; print last}' || true)
-    FILE_PATH=$(echo "$FILE_PATH" | sed "s/^'//;s/'$//" || true)
+    FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '^\s*(grep|rg|sed|awk)\s+[^|;&]+' | awk '{last=""; for(i=2;i<=NF;i++){if($i !~ /^-/){last=$i}}; print last}' || true)
+    FILE_PATH=$(printf '%s\n' "$FILE_PATH" | sed "s/^'//;s/'$//" || true)
   fi
 else
   FILE_PATH=""
@@ -40,7 +40,7 @@ else
   REL_PATH="$FILE_PATH"
 fi
 
-SAFE_PATH=$(echo "$REL_PATH" | sed 's/\\/\\\\/g; s/"/\\"/g')
+SAFE_PATH=$(printf '%s\n' "$REL_PATH" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
 if ! mati ping >/dev/null 2>&1; then
   exit 0

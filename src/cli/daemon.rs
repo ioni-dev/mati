@@ -47,11 +47,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use mati_core::store::gotcha_ops::{apply_gotcha_tombstone, apply_gotcha_write};
+use mati_core::graph::Graph;
 use mati_core::store::{derive_slug, Store};
 
 // ── CLI subcommand types ──────────────────────────────────────────────────────
@@ -92,49 +91,6 @@ const UNIX_SOCK_PATH_MAX: usize = 104;
 /// idle windows; coarse enough not to burn cycles.
 const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // every 5 min
 
-// ── Protocol types ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct Request {
-    cmd: String,
-    /// Protocol version from client. `None` for legacy clients (treated as compatible).
-    #[serde(default, rename = "v")]
-    version: Option<u32>,
-    #[serde(default)]
-    args: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct Response {
-    ok: bool,
-    /// Always the daemon's version so clients can detect skew.
-    #[serde(rename = "v")]
-    version: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-impl Response {
-    fn ok(data: serde_json::Value) -> Self {
-        Self {
-            ok: true,
-            version: PROTOCOL_VERSION,
-            data: Some(data),
-            error: None,
-        }
-    }
-    fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            version: PROTOCOL_VERSION,
-            data: None,
-            error: Some(msg.into()),
-        }
-    }
-}
-
 /// Outcome of a [`daemon_result`] call. Each variant carries the information
 /// the caller needs to decide whether to fall back to `Store::open`.
 #[derive(Debug)]
@@ -154,9 +110,6 @@ pub enum DaemonResult {
 
 // ── Connection timeout ───────────────────────────────────────────────────────
 
-/// Max wait for a complete request line per connection.
-const READ_TIMEOUT: Duration = Duration::from_secs(3);
-
 // ── Server ───────────────────────────────────────────────────────────────────
 
 /// Start the daemon: open the Store, bind the Unix socket, and serve forever.
@@ -166,8 +119,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 pub async fn run_daemon_start() -> Result<()> {
     let cwd = std::env::current_dir()?;
     // Compute mati_root separately so we can write the starting sentinel before
-    // Store::open (which may fail). This prevents try_auto_start from spawning
-    // a second daemon while this one is initializing.
+    // Store::open (which may fail). The sentinel tells `mati init` that a daemon
+    // is starting and the store lock may be held imminently.
     let mati_root = mati_root_for(&cwd)?;
     let starting_path = mati_root.join("mati.starting");
     let _ = std::fs::write(
@@ -178,8 +131,32 @@ pub async fn run_daemon_start() -> Result<()> {
     let repo_root = Arc::new(std::fs::canonicalize(&cwd)?);
     let store = Store::open(&cwd).await?;
 
-    let sock_path = store.root.join("mati.sock");
-    let pid_path = store.root.join("mati.pid");
+    // Clear stale session:consulted:* markers from previous sessions.
+    if let Ok(keys) = store.scan_keys("session:consulted:").await {
+        for k in &keys {
+            let _ = store.delete(k).await;
+        }
+        if !keys.is_empty() {
+            tracing::debug!(
+                "daemon: cleared {} stale session:consulted markers",
+                keys.len()
+            );
+        }
+    }
+
+    // Load the graph so the daemon can handle MCP tool commands (mem_get,
+    // mem_query, mem_bootstrap, mem_set) in addition to hook commands.
+    // Graph::load consumes the Store — access via graph.read().await.store().
+    let graph = Graph::load(store)
+        .await
+        .context("failed to load knowledge graph")?;
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+
+    let (sock_path, pid_path) = {
+        let g = graph.read().await;
+        let root = &g.store().root;
+        (root.join("mati.sock"), root.join("mati.pid"))
+    };
 
     // Unix domain socket paths are limited to 104 bytes on macOS / 108 on Linux.
     // Use the stricter macOS limit as a universal guard.
@@ -200,7 +177,7 @@ pub async fn run_daemon_start() -> Result<()> {
         format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
     )
     .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
-    // PID is written — remove the starting sentinel so try_auto_start won't block.
+    // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
 
     let listener = UnixListener::bind(&sock_path)
@@ -256,7 +233,13 @@ pub async fn run_daemon_start() -> Result<()> {
     // serve_loop is NEVER cancelled by tokio. It exits only after handle_connection
     // returns, ensuring all writes are committed before store.close() is called.
     tokio::join!(
-        serve_loop_graceful(&store, &repo_root, &listener, &last_wall, &shutdown),
+        serve_loop_graceful(
+            Arc::clone(&graph),
+            &repo_root,
+            &listener,
+            &last_wall,
+            &shutdown
+        ),
         async {
             // Wait for either a signal or the idle-check notification.
             let ctrl_c = tokio::signal::ctrl_c();
@@ -299,8 +282,14 @@ pub async fn run_daemon_start() -> Result<()> {
     let _ = std::fs::remove_file(&starting_path); // belt-and-suspenders
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
-    if let Err(e) = store.close().await {
-        tracing::warn!("daemon: store close warning on shutdown: {e}");
+    // Unwrap the Arc to close the graph (which closes the store).
+    match Arc::try_unwrap(graph) {
+        Ok(rwlock) => {
+            if let Err(e) = rwlock.into_inner().close().await {
+                tracing::warn!("daemon: store close warning on shutdown: {e}");
+            }
+        }
+        Err(_) => tracing::warn!("daemon: graph Arc still referenced on shutdown"),
     }
     Ok(())
 }
@@ -308,8 +297,12 @@ pub async fn run_daemon_start() -> Result<()> {
 /// Accept and handle connections sequentially. Exits cleanly after the current
 /// connection completes when `shutdown` is notified — never cancels a connection
 /// mid-execution.
+///
+/// Delegates to the shared `socket_handle_connection` from `mcp::server`, which
+/// handles both hook commands (get, log_hit, etc.) and MCP tool commands
+/// (mem_get, mem_query, mem_bootstrap, mem_set).
 async fn serve_loop_graceful(
-    store: &Store,
+    graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     listener: &UnixListener,
     last_wall: &AtomicU64,
@@ -334,325 +327,22 @@ async fn serve_loop_graceful(
         };
         last_wall.store(wall_secs(), Ordering::Relaxed);
         // Runs to completion — NOT cancellable by shutdown.
-        if let Err(e) = handle_connection(store, repo_root, stream).await {
+        if let Err(e) =
+            mati_core::mcp::server::socket_handle_connection(Arc::clone(&graph), repo_root, stream)
+                .await
+        {
             tracing::warn!(error = %e, "daemon: connection error");
         }
     }
 }
 
-/// Read one JSON request, dispatch, write one JSON response.
-async fn handle_connection(store: &Store, repo_root: &Path, stream: UnixStream) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut buf_reader = BufReader::new(reader);
-    let mut line = String::new();
+// Local dispatch and command handlers removed — the daemon now delegates to
+// `mcp::server::socket_handle_connection` which handles both hook commands
+// and MCP tool commands through the shared `socket_dispatch` function.
 
-    match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut line)).await {
-        Ok(Ok(0)) => return Ok(()), // client closed without sending
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => anyhow::bail!("read error: {e}"),
-        Err(_) => anyhow::bail!("read timeout after {}s", READ_TIMEOUT.as_secs()),
-    }
+// (write_response removed — using server::write_socket_response)
 
-    let request: Request = match serde_json::from_str(line.trim()) {
-        Ok(r) => r,
-        Err(e) => {
-            write_response(&mut writer, &Response::err(format!("invalid JSON: {e}"))).await?;
-            return Ok(());
-        }
-    };
-
-    let response = dispatch(store, repo_root, &request).await;
-    write_response(&mut writer, &response).await?;
-    Ok(())
-}
-
-async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &Response,
-) -> Result<()> {
-    let json = serde_json::to_string(response)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-/// Route a request to the appropriate handler.
-async fn dispatch(store: &Store, repo_root: &Path, req: &Request) -> Response {
-    // Version check. Explicit mismatch → error so client falls back rather than
-    // misinterpreting a response from an incompatible daemon.
-    if let Some(v) = req.version {
-        if v != PROTOCOL_VERSION {
-            return Response::err(format!(
-                "protocol version mismatch: client={v} daemon={PROTOCOL_VERSION}; \
-                 run `mati daemon stop && mati daemon start` to upgrade"
-            ));
-        }
-    }
-
-    match req.cmd.as_str() {
-        "get" => cmd_get(store, &req.args).await,
-        "log_hit" => cmd_log_hit(store, &req.args).await,
-        "log_miss" => cmd_log_miss(store, &req.args).await,
-        "log_compliance_miss" => cmd_log_compliance_miss(store, &req.args).await,
-        "session_check_consulted" => cmd_session_check_consulted(store, &req.args).await,
-        "edit_hook" => cmd_edit_hook(store, repo_root, &req.args).await,
-        "session_flush" => cmd_session_flush(store).await,
-        "scan_prefix" => cmd_scan_prefix(store, &req.args).await,
-        "put" => cmd_put(store, &req.args).await,
-        "gotcha_write" => cmd_gotcha_write(store, &req.args).await,
-        "gotcha_tombstone" => cmd_gotcha_tombstone(store, &req.args).await,
-        "ping" => Response::ok(serde_json::Value::String("pong".into())),
-        other => Response::err(format!("unknown command: {other}")),
-    }
-}
-
-// ── Command handlers ─────────────────────────────────────────────────────────
-
-async fn cmd_get(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    match store.get(key).await {
-        Ok(Some(record)) => {
-            // Add top-level `confirmed` field so hook scripts can read `.confirmed`
-            // without knowing the category. Mirrors extract_confirmed in cli/hooks.rs.
-            let confirmed = record
-                .payload_as::<mati_core::store::GotchaRecord>()
-                .map(|g| g.confirmed)
-                .unwrap_or(false);
-            match serde_json::to_value(&record) {
-                Ok(mut val) => {
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert("confirmed".to_string(), serde_json::Value::Bool(confirmed));
-                    }
-                    Response::ok(val)
-                }
-                Err(e) => Response::err(format!("serialize error: {e}")),
-            }
-        }
-        Ok(None) => Response::ok(serde_json::Value::Null),
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-async fn cmd_log_hit(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let now = now_secs();
-
-    let agg_key = today_key("analytics:hit_");
-    if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-        tracing::warn!(error = %e, "daemon: hit aggregation failed");
-    }
-
-    let consulted_key = format!("session:consulted:{key}");
-    if let Err(e) = store
-        .put(
-            &consulted_key,
-            &session_record(&consulted_key, String::new()),
-        )
-        .await
-    {
-        tracing::warn!(error = %e, "daemon: consulted marker failed");
-    }
-
-    if let Ok(Some(mut record)) = store.get(key).await {
-        record.access_count += 1;
-        record.last_accessed = now;
-        if let Err(e) = store.put(key, &record).await {
-            tracing::warn!(error = %e, "daemon: access_count bump failed");
-        }
-    }
-
-    Response::ok(serde_json::Value::String("hit logged".into()))
-}
-
-async fn cmd_log_miss(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let agg_key = today_key("analytics:miss_");
-    if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-        return Response::err(format!("miss aggregation failed: {e}"));
-    }
-    Response::ok(serde_json::Value::String("miss logged".into()))
-}
-
-async fn cmd_log_compliance_miss(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let agg_key = today_key("compliance:miss_");
-    if let Err(e) = upsert_daily_agg(store, &agg_key, key).await {
-        return Response::err(format!("compliance miss aggregation failed: {e}"));
-    }
-    Response::ok(serde_json::Value::String("compliance miss logged".into()))
-}
-
-async fn cmd_session_check_consulted(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let consulted_key = format!("session:consulted:{key}");
-    match store.get(&consulted_key).await {
-        Ok(Some(_)) => Response::ok(serde_json::Value::Bool(true)),
-        Ok(None) => Response::ok(serde_json::Value::Bool(false)),
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-/// Combined log-hit + reparse. The daemon already has the store open so this
-/// avoids the ~200ms SurrealKV re-open cost that `run_edit_hook` incurs as a
-/// standalone process.
-async fn cmd_edit_hook(store: &Store, repo_root: &Path, args: &serde_json::Value) -> Response {
-    let path = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return Response::err("missing args.path"),
-    };
-    let file_key = format!("file:{path}");
-    let now = now_secs();
-
-    // log-hit (best-effort — mirrors log_hit_impl in hooks.rs)
-    let agg_key = today_key("analytics:hit_");
-    let _ = upsert_daily_agg(store, &agg_key, &file_key).await;
-    let consulted_key = format!("session:consulted:{file_key}");
-    let _ = store
-        .put(
-            &consulted_key,
-            &session_record(&consulted_key, String::new()),
-        )
-        .await;
-    if let Ok(Some(mut record)) = store.get(&file_key).await {
-        record.access_count += 1;
-        record.last_accessed = now;
-        let _ = store.put(&file_key, &record).await;
-    }
-
-    // reparse (best-effort — non-fatal per P9)
-    if let Err(e) = crate::cli::reparse::reparse_impl(store, repo_root, path).await {
-        tracing::warn!(path, error = %e, "daemon edit_hook: reparse failed (non-fatal)");
-    }
-
-    Response::ok(serde_json::Value::Null)
-}
-
-/// Flush consulted-key markers into `session:current`.
-/// Mirrors `session_flush_impl` in hooks.rs. Called at session end before harvest.
-async fn cmd_session_flush(store: &Store) -> Response {
-    let now = now_secs();
-    let consulted_keys = match store.scan_keys("session:consulted:").await {
-        Ok(keys) => keys,
-        Err(e) => return Response::err(format!("scan_keys error: {e}")),
-    };
-    let stripped: Vec<String> = consulted_keys
-        .iter()
-        .map(|k| {
-            k.strip_prefix("session:consulted:")
-                .unwrap_or(k)
-                .to_string()
-        })
-        .collect();
-    let value = match serde_json::to_string(&serde_json::json!({
-        "consulted_keys": stripped,
-        "flushed_at": now,
-    })) {
-        Ok(v) => v,
-        Err(e) => return Response::err(format!("serialize error: {e}")),
-    };
-    match store
-        .put("session:current", &session_record("session:current", value))
-        .await
-    {
-        Ok(()) => Response::ok(serde_json::Value::String("flushed".into())),
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-async fn cmd_scan_prefix(store: &Store, args: &serde_json::Value) -> Response {
-    let prefix = match args.get("prefix").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return Response::err("missing args.prefix"),
-    };
-    match store.scan_prefix(prefix).await {
-        Ok(records) => match serde_json::to_value(&records) {
-            Ok(val) => Response::ok(val),
-            Err(e) => Response::err(format!("serialize error: {e}")),
-        },
-        Err(e) => Response::err(format!("store error: {e}")),
-    }
-}
-
-async fn cmd_put(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let record: Record = match args
-        .get("record")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-    {
-        Some(r) => r,
-        None => return Response::err("put: invalid record"),
-    };
-    match store.put(key, &record).await {
-        Ok(()) => Response::ok(serde_json::Value::Null),
-        Err(e) => Response::err(format!("store put: {e}")),
-    }
-}
-
-/// Write a gotcha record + update affected file records + persist graph edges.
-/// Used by `mati gotcha add/edit` when the daemon holds the store lock.
-async fn cmd_gotcha_write(store: &Store, args: &serde_json::Value) -> Response {
-    let record: Record = match args
-        .get("record")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-    {
-        Some(r) => r,
-        None => return Response::err("missing or invalid args.record"),
-    };
-    let new_files: Vec<String> = args
-        .get("new_files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let old_files: Vec<String> = args
-        .get("old_files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    let is_new = args
-        .get("is_new")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    match apply_gotcha_write(store, &record, &old_files, &new_files, is_new).await {
-        Ok(()) => Response::ok(serde_json::Value::String("written".into())),
-        Err(e) => Response::err(format!("{e}")),
-    }
-}
-
-/// Tombstone a gotcha record and remove its HasGotcha graph edges.
-/// Used by `mati gotcha delete` when the daemon holds the store lock.
-async fn cmd_gotcha_tombstone(store: &Store, args: &serde_json::Value) -> Response {
-    let key = match args.get("key").and_then(|v| v.as_str()) {
-        Some(k) => k,
-        None => return Response::err("missing args.key"),
-    };
-    let affected_files: Vec<String> = args
-        .get("affected_files")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    match apply_gotcha_tombstone(store, key, &affected_files).await {
-        Ok(()) => Response::ok(serde_json::Value::String("tombstoned".into())),
-        Err(e) => Response::err(format!("{e}")),
-    }
-}
+// (All dispatch + cmd_* handlers removed — using shared socket_dispatch)
 
 // ── Client ───────────────────────────────────────────────────────────────────
 
@@ -772,105 +462,9 @@ pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
 /// hook falls through to direct `Store::open` for this invocation; the daemon
 /// will be ready for all subsequent hook calls in the same session.
 ///
-/// Guards against thundering herd: uses `mati.starting` as an atomic spinlock
-/// via `O_CREAT | O_EXCL`. Only the first concurrent caller creates the file
-/// and spawns a daemon — all others see the file and back off.
-///
-/// After spawn, the sentinel is overwritten with the child daemon's PID so
-/// liveness checks track the actual daemon process, not the short-lived
-/// spawner. If the daemon PID dies (crash), the next caller reclaims
-/// immediately. If `STARTING_STALE_SECS` expires with no PID format (legacy
-/// sentinel), timeout-based reclaim applies.
-pub fn try_auto_start(project_cwd: &Path) {
-    let root = match mati_root_for(project_cwd) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(error = %e, "auto-start: could not derive mati root");
-            return;
-        }
-    };
-
-    // Already running — daemon or MCP server has bound the socket / written PID.
-    if root.join("mati.pid").exists() || root.join("mati.sock").exists() {
-        return;
-    }
-
-    // Atomic spinlock: try to create mati.starting with O_CREAT | O_EXCL.
-    // If another caller already created it, we back off. This prevents the
-    // thundering herd where N concurrent hook invocations each spawn a daemon.
-    let starting_path = root.join("mati.starting");
-    match try_claim_starting_sentinel(&starting_path) {
-        StartingClaim::Claimed => {
-            // We won the race — spawn the daemon below.
-        }
-        StartingClaim::AlreadyActive => {
-            tracing::debug!("auto-start: another caller is already starting a daemon");
-            return;
-        }
-        StartingClaim::StaleRemoved => {
-            // Owner PID is dead or sentinel expired. Retry the claim.
-            match try_claim_starting_sentinel(&starting_path) {
-                StartingClaim::Claimed => {}
-                _ => {
-                    tracing::debug!("auto-start: lost race after stale removal");
-                    return;
-                }
-            }
-        }
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!(error = %e, "auto-start: could not find current exe");
-            let _ = std::fs::remove_file(&starting_path);
-            return;
-        }
-    };
-
-    match std::process::Command::new(&exe)
-        .args(["daemon", "start"])
-        .current_dir(project_cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => {
-            let child_pid = child.id();
-            tracing::debug!(pid = child_pid, "auto-started mati daemon");
-            // Overwrite the sentinel with the child's PID so liveness checks
-            // track the daemon process, not the short-lived spawner. The
-            // spawner (this hook process) exits immediately — if we left our
-            // own PID in the sentinel, concurrent callers would see a dead PID
-            // and reclaim, defeating the thundering-herd prevention.
-            let _ = std::fs::write(&starting_path, format_sentinel(wall_secs(), child_pid));
-            // Detach — do not wait. The child runs independently.
-            std::mem::forget(child);
-        }
-        Err(e) => {
-            // Non-fatal: hooks fall back to direct Store::open automatically.
-            // Clean up sentinel so the next caller can retry.
-            let _ = std::fs::remove_file(&starting_path);
-            tracing::debug!(error = %e, "auto-start: failed to spawn daemon");
-        }
-    }
-}
-
 /// Stale timeout for the starting sentinel. A sentinel older than this with a
-/// dead owner PID is considered abandoned and will be reclaimed.
+/// dead owner PID is considered abandoned.
 pub const STARTING_STALE_SECS: u64 = 30;
-
-#[derive(Debug)]
-enum StartingClaim {
-    /// We created mati.starting — we are the exclusive spawner.
-    Claimed,
-    /// Another caller owns it and is still alive — back off.
-    AlreadyActive,
-    /// Sentinel was stale (owner dead or timeout expired) and we removed it.
-    /// Caller should retry the claim.
-    StaleRemoved,
-}
 
 /// Sentinel file format: `<unix_timestamp> <pid>\n`
 ///
@@ -906,74 +500,6 @@ pub fn is_pid_alive(pid: u32) -> bool {
 pub fn is_pid_alive(_pid: u32) -> bool {
     // On non-Unix, fall back to the timeout-only approach.
     true
-}
-
-/// Attempt to atomically create the `mati.starting` sentinel.
-///
-/// Uses `O_CREAT | O_EXCL` (via `create_new`) which fails if the file already
-/// exists — this is the atomic coordination primitive that prevents the
-/// thundering herd.
-///
-/// Staleness is determined by **two** signals (either is sufficient):
-/// 1. Owner PID is dead (immediate reclaim — no waiting)
-/// 2. Sentinel age exceeds `STARTING_STALE_SECS` (catch-all for edge cases)
-///
-/// This handles:
-/// - **Crash during claim:** Owner PID died → next caller reclaims immediately.
-/// - **Slow Store::open:** Owner PID is alive → callers back off even past the
-///   timeout, so a legitimate slow open isn't interrupted.
-/// - **NFS:** `O_EXCL` is unreliable on NFS, but mati stores are always local
-///   (`~/.mati/`). The PID check adds a defense-in-depth layer: even if two
-///   processes both "create" the file, only the one whose PID is in the file
-///   will be recognized as the owner.
-fn try_claim_starting_sentinel(path: &Path) -> StartingClaim {
-    use std::io::Write;
-
-    let now = wall_secs();
-    let my_pid = std::process::id();
-
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true) // O_CREAT | O_EXCL — fails if file exists
-        .open(path)
-    {
-        Ok(mut f) => {
-            let _ = write!(f, "{}", format_sentinel(now, my_pid));
-            StartingClaim::Claimed
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // File exists — check liveness of the owner.
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Some((_ts, pid)) = parse_sentinel(&content) {
-                    if is_pid_alive(pid) {
-                        // Owner is alive — back off unconditionally. Even if
-                        // the sentinel is old, SurrealKV's flock prevents real
-                        // concurrent store access; the worst case is a delayed
-                        // retry after the owner dies or finishes.
-                        return StartingClaim::AlreadyActive;
-                    }
-                    // Owner PID is dead — reclaim immediately.
-                    tracing::debug!(
-                        dead_pid = pid,
-                        "auto-start: reclaiming sentinel from dead owner"
-                    );
-                } else if let Ok(ts) = content.trim().parse::<u64>() {
-                    // Legacy format (timestamp only, no PID). Fall back to
-                    // timeout-only staleness check.
-                    if now.saturating_sub(ts) < STARTING_STALE_SECS {
-                        return StartingClaim::AlreadyActive;
-                    }
-                }
-            }
-            // Stale, dead owner, or unreadable — remove and let caller retry.
-            let _ = std::fs::remove_file(path);
-            StartingClaim::StaleRemoved
-        }
-        Err(_) => {
-            // Permission error or other I/O issue — don't block, just skip.
-            StartingClaim::AlreadyActive
-        }
-    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1037,96 +563,6 @@ fn wall_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn now_secs() -> u64 {
-    wall_secs()
-}
-
-fn today_key(prefix: &str) -> String {
-    let now = chrono::Utc::now().format("%Y-%m-%d");
-    format!("{prefix}{now}")
-}
-
-fn new_device_id() -> uuid::Uuid {
-    uuid::Uuid::new_v4()
-}
-
-use mati_core::store::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore,
-};
-
-fn session_record(key: &str, value: String) -> Record {
-    let now = now_secs();
-    Record {
-        key: key.to_string(),
-        value,
-        category: Category::Session,
-        priority: Priority::Normal,
-        tags: vec![],
-        created_at: now,
-        updated_at: now,
-        ref_url: None,
-        staleness: StalenessScore::fresh(),
-        lifecycle: RecordLifecycle::Active,
-        version: RecordVersion {
-            device_id: new_device_id(),
-            logical_clock: 1,
-            wall_clock: now,
-        },
-        quality: QualityScore::layer0_default(),
-        access_count: 0,
-        last_accessed: 0,
-        source: RecordSource::SessionHook,
-        confidence: ConfidenceScore::for_new_record(&RecordSource::SessionHook),
-        gap_analysis_score: 0.0,
-        payload: None,
-    }
-}
-
-fn analytics_record(key: &str, value: String) -> Record {
-    let mut r = session_record(key, value);
-    r.category = Category::Analytics;
-    r
-}
-
-#[derive(Serialize, Deserialize)]
-struct DailyAgg {
-    count: u64,
-    keys: Vec<String>,
-}
-
-const MAX_AGG_KEYS: usize = 100;
-
-async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
-    let now = now_secs();
-    match store.get(agg_key).await? {
-        Some(mut record) => {
-            let mut agg: DailyAgg = serde_json::from_str(&record.value).unwrap_or(DailyAgg {
-                count: 0,
-                keys: vec![],
-            });
-            agg.count += 1;
-            if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
-                agg.keys.push(target_key.to_string());
-            }
-            record.value = serde_json::to_string(&agg)?;
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
-            store.put(agg_key, &record).await?;
-        }
-        None => {
-            let agg = DailyAgg {
-                count: 1,
-                keys: vec![target_key.to_string()],
-            };
-            let record = analytics_record(agg_key, serde_json::to_string(&agg)?);
-            store.put(agg_key, &record).await?;
-        }
-    }
-    Ok(())
 }
 
 // ── Stop ─────────────────────────────────────────────────────────────────────
@@ -1284,42 +720,9 @@ pub async fn run_daemon_status() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn response_ok_serialization() {
-        let resp = Response::ok(serde_json::json!("pong"));
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""ok":true"#));
-        assert!(json.contains(r#""data":"pong""#));
-        assert!(json.contains(r#""v":1"#));
-        assert!(!json.contains("error"));
-    }
-
-    #[test]
-    fn response_err_serialization() {
-        let resp = Response::err("bad request");
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""ok":false"#));
-        assert!(json.contains(r#""error":"bad request""#));
-        assert!(json.contains(r#""v":1"#));
-        assert!(!json.contains("data"));
-    }
-
-    #[test]
-    fn request_with_version() {
-        let json = r#"{"v":1,"cmd":"get","args":{"key":"file:src/main.rs"}}"#;
-        let req: Request = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cmd, "get");
-        assert_eq!(req.version, Some(1));
-        assert_eq!(req.args["key"], "file:src/main.rs");
-    }
-
-    #[test]
-    fn request_without_version_is_backward_compatible() {
-        let json = r#"{"cmd":"ping"}"#;
-        let req: Request = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cmd, "ping");
-        assert_eq!(req.version, None); // legacy client — treated as compatible
-    }
+    // Protocol type serialization tests removed — Request/Response types
+    // now live in mcp::server as SocketRequest/SocketResponse and are
+    // tested there.
 
     #[tokio::test]
     async fn daemon_result_not_running_without_socket() {
@@ -1333,107 +736,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = daemon_get(tmp.path(), "file:src/main.rs").await;
         assert!(result.is_none());
-    }
-
-    // ── try_claim_starting_sentinel ──────────────────────────────────────
-
-    #[test]
-    fn starting_sentinel_first_caller_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mati.starting");
-
-        match try_claim_starting_sentinel(&path) {
-            StartingClaim::Claimed => {}
-            other => panic!("first caller should win, got: {other:?}"),
-        }
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn starting_sentinel_second_caller_blocked() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mati.starting");
-
-        // First caller claims
-        assert!(matches!(
-            try_claim_starting_sentinel(&path),
-            StartingClaim::Claimed
-        ));
-
-        // Second caller should see AlreadyActive
-        assert!(matches!(
-            try_claim_starting_sentinel(&path),
-            StartingClaim::AlreadyActive
-        ));
-    }
-
-    #[test]
-    fn starting_sentinel_stale_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mati.starting");
-
-        // Write a stale sentinel (>10s old)
-        std::fs::write(&path, "0").unwrap();
-
-        match try_claim_starting_sentinel(&path) {
-            StartingClaim::StaleRemoved => {}
-            other => panic!("stale sentinel should be removed, got: {other:?}"),
-        }
-        // File should be gone after stale removal
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn starting_sentinel_claim_after_stale_removal() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mati.starting");
-
-        // Write a stale sentinel
-        std::fs::write(&path, "0").unwrap();
-
-        // First call removes stale
-        assert!(matches!(
-            try_claim_starting_sentinel(&path),
-            StartingClaim::StaleRemoved
-        ));
-        // Retry claims successfully
-        assert!(matches!(
-            try_claim_starting_sentinel(&path),
-            StartingClaim::Claimed
-        ));
-    }
-
-    #[test]
-    fn starting_sentinel_dead_pid_reclaimed_immediately() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mati.starting");
-
-        // Write a recent sentinel with a PID that doesn't exist (PID 1 is init,
-        // use a very large PID that's almost certainly dead).
-        let now = wall_secs();
-        std::fs::write(&path, format_sentinel(now, 4_000_000)).unwrap();
-
-        // Should be reclaimed immediately (dead PID, even though timestamp is fresh)
-        match try_claim_starting_sentinel(&path) {
-            StartingClaim::StaleRemoved => {}
-            other => panic!("dead-PID sentinel should be reclaimed, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn starting_sentinel_alive_pid_blocks_even_if_old() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("mati.starting");
-
-        // Write a sentinel with our own PID (definitely alive) but old timestamp
-        let old_ts = wall_secs().saturating_sub(STARTING_STALE_SECS + 100);
-        std::fs::write(&path, format_sentinel(old_ts, std::process::id())).unwrap();
-
-        // Should block — owner PID is alive, so we respect it even past timeout
-        assert!(matches!(
-            try_claim_starting_sentinel(&path),
-            StartingClaim::AlreadyActive
-        ));
     }
 
     #[test]

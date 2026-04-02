@@ -237,25 +237,50 @@ impl MatiServer {
                 let store = graph.store();
                 match store.get(&params.key).await {
                     Ok(Some(mut record)) => {
-                        // Tombstoned records should appear as "not found" to agents.
                         if matches!(record.lifecycle, RecordLifecycle::Tombstoned { .. }) {
                             return "null".to_string();
                         }
-                        // M-12-B: bump access_count on every MCP hit (mirrors mati log-hit hook path).
                         record.access_count += 1;
-                        // Do NOT recompute confidence here. Confidence recomputation belongs in
-                        // the health pipeline (mati stats / mati stale), not on every read.
-                        // Writing back a formula-derived value would override confidence values
-                        // intentionally bumped by mati init (e.g. co-change quality bump sets
-                        // confidence=0.45 so pre-read hooks surface additionalContext).
-                        // Best-effort write-back; don't fail the read on write error.
-                        let _ = store.put(&params.key, &record).await;
-                        // Write session:consulted marker so pre-read/pre-bash hooks know this key
-                        // was looked up via MCP and can downgrade deny → allow+context on next access.
-                        let _ = crate::store::session::log_hit(store, &params.key).await;
-                        serde_json::to_string_pretty(&record_to_agent_json(&record)).unwrap_or_else(
-                            |e| format!("{{\"error\": \"serialization failed: {e}\"}}"),
-                        )
+
+                        // Build the response FIRST — must return before the MCP
+                        // client's response timeout. Codex closes the stdio pipe
+                        // within ~100ms of sending a request if no response arrives.
+                        let response = serde_json::to_string_pretty(&record_to_agent_json(&record))
+                            .unwrap_or_else(|e| {
+                                format!("{{\"error\": \"serialization failed: {e}\"}}")
+                            });
+
+                        // Write ONLY the consultation receipt synchronously — it is
+                        // critical for hook enforcement (deny → mem_get → allow) and
+                        // is fast (~1ms, sessions tree, no tantivy index).
+                        let consulted_key = format!("session:consulted:{}", params.key);
+                        let _ = store
+                            .put(
+                                &consulted_key,
+                                &crate::store::session::session_record(
+                                    &consulted_key,
+                                    String::new(),
+                                ),
+                            )
+                            .await;
+
+                        // Defer the slow writes (access_count to knowledge tree +
+                        // daily hit aggregation) to a background task. These go through
+                        // tantivy indexing (~100-300ms) and would cause Codex to close
+                        // the stdio pipe before the response is sent if done inline.
+                        let key_owned = params.key.clone();
+                        let graph_clone = Arc::clone(graph_arc);
+                        tokio::task::spawn(async move {
+                            let g = graph_clone.read().await;
+                            let s = g.store();
+                            let _ = s.put(&key_owned, &record).await;
+                            let agg_key = crate::store::session::today_key("analytics:hit_");
+                            let _ =
+                                crate::store::session::upsert_daily_agg(s, &agg_key, &key_owned)
+                                    .await;
+                        });
+
+                        response
                     }
                     Ok(None) => "null".to_string(),
                     Err(e) => format!("{{\"error\": \"{e}\"}}"),
@@ -559,10 +584,19 @@ impl MatiServer {
                 // Fetch existing record to preserve Layer 0 structural data
                 let existing_record = store.get(&params.key).await.ok().flatten();
 
+                // A tombstoned record must not bleed its prior confirmation state
+                // into a resurrection — treat it as an unconfirmed write.
+                let is_tombstoned = existing_record
+                    .as_ref()
+                    .map(|r| matches!(r.lifecycle, RecordLifecycle::Tombstoned { .. }))
+                    .unwrap_or(false);
+
                 let was_confirmed = existing_record
                     .as_ref()
                     .map(|r| {
-                        r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80
+                        !is_tombstoned
+                            && (r.source == RecordSource::DeveloperManual
+                                || r.confidence.value >= 0.80)
                     })
                     .unwrap_or(false);
 
@@ -601,6 +635,13 @@ impl MatiServer {
                         payload: Some(serde_json::json!({})),
                     },
                 };
+
+                // A write to a tombstoned record revives it; reset
+                // confirmation counters so the new write starts fresh.
+                if is_tombstoned {
+                    record.confidence.confirmation_count = 0;
+                }
+                record.lifecycle = RecordLifecycle::Active;
 
                 // Apply enrichment fields
                 record.value = params.value;
@@ -644,6 +685,25 @@ impl MatiServer {
                             (merged.as_object_mut(), new_payload.as_object())
                         {
                             for (k, v) in overlay {
+                                // gotcha_keys is a derived index maintained by the
+                                // gotcha confirm/tombstone paths. Overwriting it on
+                                // file-record re-enrichment silently drops edges that
+                                // were added by gotcha confirm. Union-merge instead.
+                                if k == "gotcha_keys" {
+                                    if let (Some(existing_arr), Some(new_arr)) = (
+                                        base.get(k).and_then(|e| e.as_array()).cloned(),
+                                        v.as_array(),
+                                    ) {
+                                        let mut union = existing_arr;
+                                        for item in new_arr {
+                                            if !union.contains(item) {
+                                                union.push(item.clone());
+                                            }
+                                        }
+                                        base.insert(k.clone(), serde_json::Value::Array(union));
+                                        continue;
+                                    }
+                                }
                                 base.insert(k.clone(), v.clone());
                             }
                             record.payload = Some(serde_json::Value::Object(base.clone()));
@@ -829,6 +889,11 @@ impl MatiServer {
 
         if record.category != Category::Gotcha {
             return json!({"error": format!("{key} is not a gotcha record")}).to_string();
+        }
+
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            return json!({"error": format!("{key} is tombstoned — cannot confirm a deleted record")})
+                .to_string();
         }
 
         // Set confirmed + normalize severity
