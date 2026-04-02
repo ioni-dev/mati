@@ -11,7 +11,11 @@ HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 INPUT=$(cat)
 
 # Guard: jq required
-command -v jq &>/dev/null || exit 0
+if ! command -v jq &>/dev/null; then
+  echo "[mati] missing jq — enforcement bypassed" >&2
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") reason=missing_deps" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+  exit 0
+fi
 
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
 [ -z "$FILE_PATH" ] && exit 0

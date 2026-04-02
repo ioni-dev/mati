@@ -105,8 +105,9 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
 
     let use_color = io::stdout().is_terminal();
 
-    let (blue, green, yellow, gray, white, bold, reset) = if use_color {
+    let (red, blue, green, yellow, gray, white, bold, reset) = if use_color {
         (
+            colors::RED,
             colors::BLUE,
             colors::GREEN,
             colors::YELLOW,
@@ -116,7 +117,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
             colors::RESET,
         )
     } else {
-        ("", "", "", "", "", "", "")
+        ("", "", "", "", "", "", "", "")
     };
 
     // ── Scan all namespaces (once — results are reused by gaps + onboarding) ──
@@ -336,6 +337,16 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         println!("    Bypasses               {bp_color}{bypasses_7d}{reset}");
     } else {
         println!("    Bypasses               {gray}\u{2014}{reset}");
+    }
+
+    // Daemon-unreachable events from fail_open.log
+    let fail_open = scan_fail_open_log(now);
+    if fail_open.count_7d > 0 {
+        let ago = format_ago(fail_open.last_ago_secs);
+        println!(
+            "    Daemon unreachable     {red}{}{reset}  {gray}(last: {ago} ago){reset}",
+            fail_open.count_7d
+        );
     }
 
     println!();
@@ -614,8 +625,9 @@ async fn write_snapshot_record_direct(
 fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
     let use_color = io::stdout().is_terminal();
 
-    let (blue, green, yellow, gray, white, bold, reset) = if use_color {
+    let (red, blue, green, yellow, gray, white, bold, reset) = if use_color {
         (
+            colors::RED,
             colors::BLUE,
             colors::GREEN,
             colors::YELLOW,
@@ -625,7 +637,7 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
             colors::RESET,
         )
     } else {
-        ("", "", "", "", "", "", "")
+        ("", "", "", "", "", "", "", "")
     };
 
     let project = cwd
@@ -789,6 +801,20 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
 
+    // Daemon-unreachable events from fail_open.log (always live, not cached)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let fail_open = scan_fail_open_log(now);
+    if fail_open.count_7d > 0 {
+        let ago = format_ago(fail_open.last_ago_secs);
+        println!(
+            "    Daemon unreachable     {red}{}{reset}  {gray}(last: {ago} ago){reset}",
+            fail_open.count_7d
+        );
+    }
+
     println!();
 }
 
@@ -846,6 +872,115 @@ fn format_snapshot_date(ts: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// Result of scanning `~/.mati/fail_open.log` for daemon-unreachable events.
+struct FailOpenStats {
+    /// Number of FAIL_OPEN events in the last 7 days.
+    count_7d: u64,
+    /// Seconds since the most recent event (0 = no events).
+    last_ago_secs: u64,
+}
+
+/// Scan `~/.mati/fail_open.log` for FAIL_OPEN entries in the last 7 days.
+fn scan_fail_open_log(now: u64) -> FailOpenStats {
+    let log_path = match dirs::home_dir() {
+        Some(h) => h.join(".mati").join("fail_open.log"),
+        None => return FailOpenStats { count_7d: 0, last_ago_secs: 0 },
+    };
+
+    let content = match std::fs::read_to_string(&log_path) {
+        Ok(c) => c,
+        Err(_) => return FailOpenStats { count_7d: 0, last_ago_secs: 0 },
+    };
+
+    let cutoff = now.saturating_sub(7 * 86400);
+    let mut count: u64 = 0;
+    let mut latest_ts: u64 = 0;
+
+    for line in content.lines() {
+        if !line.contains("FAIL_OPEN") {
+            continue;
+        }
+        // Parse ISO 8601 timestamp from the start of the line:
+        // "2026-04-02T14:30:00Z FAIL_OPEN hook=..."
+        let ts_str = match line.split_whitespace().next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let ts = parse_iso_timestamp(ts_str);
+        if ts == 0 {
+            continue;
+        }
+        if ts >= cutoff {
+            count += 1;
+        }
+        if ts > latest_ts {
+            latest_ts = ts;
+        }
+    }
+
+    let last_ago = if latest_ts > 0 {
+        now.saturating_sub(latest_ts)
+    } else {
+        0
+    };
+
+    FailOpenStats { count_7d: count, last_ago_secs: last_ago }
+}
+
+/// Minimal ISO 8601 timestamp parser: `YYYY-MM-DDTHH:MM:SSZ` -> Unix seconds.
+fn parse_iso_timestamp(s: &str) -> u64 {
+    // Expected format: 2026-04-02T14:30:00Z (exactly 20 chars)
+    if s.len() < 19 {
+        return 0;
+    }
+    let b = s.as_bytes();
+    let year = parse_u64(&s[0..4]);
+    let month = parse_u64(&s[5..7]);
+    let day = parse_u64(&s[8..10]);
+    let hour = parse_u64(&s[11..13]);
+    let min = parse_u64(&s[14..16]);
+    let sec = parse_u64(&s[17..19]);
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return 0;
+    }
+    // Convert to Unix timestamp (simplified, assumes UTC)
+    let days = civil_to_days(year, month, sec, day);
+    days * 86400 + hour * 3600 + min * 60 + sec
+}
+
+fn parse_u64(s: &str) -> u64 {
+    s.parse::<u64>().unwrap_or(0)
+}
+
+/// Convert civil date to days since epoch (same algorithm as format_snapshot_date inverse).
+fn civil_to_days(y: u64, m: u64, _sec: u64, d: u64) -> u64 {
+    let y = y as i64;
+    let m = m as u64;
+    let (y, m) = if m <= 2 {
+        (y - 1, m + 9)
+    } else {
+        (y, m - 3)
+    };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe as i64 - 719_468) as u64
+}
+
+/// Format seconds-ago as a human-readable delta: "3m", "2h", "1d".
+fn format_ago(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
 }
 
 #[cfg(test)]
