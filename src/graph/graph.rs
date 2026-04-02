@@ -952,7 +952,10 @@ mod tests {
         assert_eq!(g2.edge_count(), 50);
     }
 
+    /// Perf regression guard — flaky on CI runners with variable load.
+    /// Run with: `cargo test --lib add_edges_batch_faster -- --ignored`
     #[tokio::test]
+    #[ignore]
     async fn add_edges_batch_faster_than_sequential() {
         use std::time::Instant;
         let edges: Vec<(String, EdgeKind, String)> = (0..500)

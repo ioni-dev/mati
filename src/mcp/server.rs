@@ -115,6 +115,25 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
 
             service.waiting().await?;
+
+            // MCP client disconnected. Instead of exiting, auto-promote to a
+            // headless daemon so subsequent `mati serve` instances (spawned by
+            // Codex for the next tool call) can enter proxy mode against this
+            // process. The daemon socket is already running in a spawned task.
+            //
+            // On Claude Code this rarely fires (pipe stays open for the full
+            // session). On Codex it fires after every tool call due to the
+            // stdio pipe closure bug (openai/codex#5677).
+            tracing::info!("mati serve: MCP client disconnected — continuing as daemon");
+            wait_for_idle_or_signal().await;
+
+            // Cleanup socket + PID files on exit (same as standalone daemon).
+            {
+                let g = graph_arc.read().await;
+                let root = &g.store().root;
+                let _ = std::fs::remove_file(root.join("mati.sock"));
+                let _ = std::fs::remove_file(root.join("mati.pid"));
+            }
         }
         ServerOpen::Proxy(root) => {
             tracing::info!(
@@ -217,6 +236,12 @@ async fn open_with_retry(
 ) -> Result<ServerOpen> {
     let mut delay = initial_delay;
     let mati_root = mati_root_for(repo_root)?;
+
+    // Clean up stale lock holder from a previous session. If the PID in
+    // mati.pid is dead, remove the socket and PID file so we can acquire
+    // the lock directly instead of entering proxy mode against a ghost.
+    cleanup_stale_pid(&mati_root);
+
     for attempt in 0..=max_retries {
         match Store::open_and_rebuild(repo_root).await {
             Ok(store) => return Ok(ServerOpen::Direct(Box::new(store))),
@@ -229,6 +254,20 @@ async fn open_with_retry(
                     return Err(e).context("failed to open mati store");
                 }
                 if attempt == max_retries {
+                    // Enter proxy mode if the lock holder is a known mati
+                    // process (owner: "mcp" or "daemon"). Both load the graph
+                    // and handle MCP tool commands via the shared socket dispatch.
+                    let owner = std::fs::read_to_string(mati_root.join("mati.pid"))
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v.get("owner").and_then(|o| o.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    if owner != "mcp" && owner != "daemon" {
+                        return Err(anyhow::anyhow!(
+                            "store locked by an unknown process (owner: {owner}).\n\
+                             Stop it first: mati daemon stop"
+                        ));
+                    }
                     return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({}))
                         .await
                     {
@@ -253,6 +292,68 @@ async fn open_with_retry(
     unreachable!()
 }
 
+/// Remove stale socket and PID files left by a dead MCP server process.
+///
+/// When Claude Code restarts a session, the old `mati serve` process may still
+/// be alive briefly or may have been killed without cleanup. If the PID file
+/// points to a dead process, we remove the socket and PID files so the new
+/// instance can acquire the store lock directly instead of entering proxy mode
+/// against a non-existent target.
+fn cleanup_stale_pid(mati_root: &Path) {
+    let pid_path = mati_root.join("mati.pid");
+    let sock_path = mati_root.join("mati.sock");
+
+    let pid_content = match std::fs::read_to_string(&pid_path) {
+        Ok(s) => s,
+        Err(_) => return, // No PID file — nothing to clean up
+    };
+
+    let pid: u32 = match serde_json::from_str::<serde_json::Value>(&pid_content)
+        .ok()
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        .and_then(|p| u32::try_from(p).ok())
+    {
+        Some(p) => p,
+        None => return, // Malformed PID file — leave it for the retry logic
+    };
+
+    // If the process is still alive, don't touch anything — it may be a
+    // legitimate session or a concurrent spawn that will resolve via retry.
+    if is_pid_alive(pid) {
+        return;
+    }
+
+    tracing::info!(
+        pid,
+        "mati serve: cleaning up stale PID file from dead process"
+    );
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
+
+    // Also remove the SurrealKV lock file if present — the dead process
+    // may have left it behind. SurrealKV uses an exclusive flock which is
+    // released by the OS on process exit, but the LOCK file itself persists.
+    let lock_path = mati_root.join("knowledge.db").join("LOCK");
+    if lock_path.exists() {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+}
+
+/// Check whether a PID is still alive using `kill(pid, 0)`.
+#[cfg(unix)]
+fn is_pid_alive(pid: u32) -> bool {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn is_pid_alive(_pid: u32) -> bool {
+    true // Conservative: assume alive on non-Unix
+}
+
 // ── Daemon socket — hook script bridge ───────────────────────────────────────
 
 /// Unix domain socket path length limit (macOS-compatible).
@@ -265,16 +366,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize)]
-struct SocketRequest {
-    cmd: String,
+pub(crate) struct SocketRequest {
+    pub cmd: String,
     #[serde(default, rename = "v")]
-    version: Option<u32>,
+    pub version: Option<u32>,
     #[serde(default)]
-    args: serde_json::Value,
+    pub args: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
-struct SocketResponse {
+pub(crate) struct SocketResponse {
     ok: bool,
     #[serde(rename = "v")]
     version: u32,
@@ -285,7 +386,7 @@ struct SocketResponse {
 }
 
 impl SocketResponse {
-    fn ok(data: serde_json::Value) -> Self {
+    pub(crate) fn ok(data: serde_json::Value) -> Self {
         Self {
             ok: true,
             version: PROTOCOL_VERSION,
@@ -293,7 +394,7 @@ impl SocketResponse {
             error: None,
         }
     }
-    fn err(msg: impl Into<String>) -> Self {
+    pub(crate) fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             version: PROTOCOL_VERSION,
@@ -359,7 +460,7 @@ async fn serve_daemon_socket(
     }
 }
 
-async fn socket_handle_connection(
+pub async fn socket_handle_connection(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     stream: UnixStream,
@@ -392,18 +493,13 @@ async fn socket_handle_connection(
         }
     }
 
-    let graph_guard = graph.read().await;
-    let resp = socket_dispatch(
-        graph_guard.store(),
-        Some(Arc::clone(&graph)),
-        repo_root,
-        &req,
-    )
-    .await;
+    // Do NOT hold a read lock across dispatch — socket_dispatch may acquire
+    // a write lock for MCP tools like mem_set, which would deadlock.
+    let resp = socket_dispatch(&graph, repo_root, &req).await;
     write_socket_response(&mut writer, &resp).await
 }
 
-async fn write_socket_response(
+pub(crate) async fn write_socket_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     resp: &SocketResponse,
 ) -> Result<()> {
@@ -415,8 +511,7 @@ async fn write_socket_response(
 }
 
 async fn socket_dispatch(
-    store: &Store,
-    graph: Option<Arc<tokio::sync::RwLock<Graph>>>,
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     req: &SocketRequest,
 ) -> SocketResponse {
@@ -425,10 +520,8 @@ async fn socket_dispatch(
     match req.cmd.as_str() {
         "ping" => SocketResponse::ok(serde_json::Value::String("pong".into())),
 
+        // ── MCP tool commands ────────────────────────────────────────────
         "mem_get" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_get requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemGetParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_get args: {e}")),
@@ -440,9 +533,6 @@ async fn socket_dispatch(
         }
 
         "mem_query" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_query requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemQueryParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_query args: {e}")),
@@ -454,9 +544,6 @@ async fn socket_dispatch(
         }
 
         "mem_bootstrap" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_bootstrap requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemBootstrapParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_bootstrap args: {e}")),
@@ -468,9 +555,6 @@ async fn socket_dispatch(
         }
 
         "mem_set" => {
-            let Some(graph) = graph.as_ref() else {
-                return SocketResponse::err("mem_set requires graph-backed dispatch");
-            };
             let params = match serde_json::from_value::<MemSetParams>(req.args.clone()) {
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_set args: {e}")),
@@ -481,11 +565,16 @@ async fn socket_dispatch(
             ));
         }
 
+        // ── Hook commands (store-only) ─────────────────────────────────
+        // Acquire a short-lived read lock for store access. The lock is
+        // released at the end of each arm — no risk of deadlock.
         "get" => {
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
+            let g = graph.read().await;
+            let store = g.store();
             match store.get(key).await {
                 Ok(Some(record)) => {
                     let confirmed = record
@@ -515,7 +604,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_hit(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_hit(g.store(), key).await {
                 tracing::warn!("daemon socket log_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -526,7 +616,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_miss(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_miss(g.store(), key).await {
                 tracing::warn!("daemon socket log_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -537,7 +628,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_compliance_miss(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_compliance_miss(g.store(), key).await {
                 tracing::warn!("daemon socket log_compliance_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -548,7 +640,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_compliance_hit(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_compliance_hit(g.store(), key).await {
                 tracing::warn!("daemon socket log_compliance_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -559,7 +652,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_codex_shell_miss(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_codex_shell_miss(g.store(), key).await {
                 tracing::warn!("daemon socket log_codex_shell_miss: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -570,7 +664,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_bootstrap(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_bootstrap(g.store(), key).await {
                 tracing::warn!("daemon socket log_bootstrap: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -581,7 +676,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            if let Err(e) = sess::log_prompt_nudge(store, key).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::log_prompt_nudge(g.store(), key).await {
                 tracing::warn!("daemon socket log_prompt_nudge: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -592,7 +688,8 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            match sess::check_consulted(store, key).await {
+            let g = graph.read().await;
+            match sess::check_consulted(g.store(), key).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -608,14 +705,16 @@ async fn socket_dispatch(
                 .get("ttl_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(900);
-            match sess::check_consulted_recent(store, key, ttl_secs).await {
+            let g = graph.read().await;
+            match sess::check_consulted_recent(g.store(), key, ttl_secs).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
         }
 
         "session_flush" => {
-            if let Err(e) = sess::session_flush(store).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::session_flush(g.store()).await {
                 tracing::warn!("daemon socket session_flush: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -624,8 +723,22 @@ async fn socket_dispatch(
         "session_harvest" => {
             // Note: uses no-staleness variant because StalenessAnalyzer (git2) is !Send.
             // Git-based staleness analysis runs on the next CLI-path harvest.
-            if let Err(e) = sess::session_harvest_no_staleness(store).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::session_harvest_no_staleness(g.store()).await {
                 tracing::warn!("daemon socket session_harvest: {e}");
+            }
+            SocketResponse::ok(serde_json::Value::Null)
+        }
+
+        "reparse" => {
+            let path = match req.args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return SocketResponse::err("missing args.path"),
+            };
+            let g = graph.read().await;
+            if let Err(e) = crate::analysis::reparse::reparse_impl(g.store(), repo_root, path).await
+            {
+                tracing::warn!("daemon socket reparse: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
         }
@@ -636,6 +749,8 @@ async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.path"),
             };
             let file_key = format!("file:{path}");
+            let g = graph.read().await;
+            let store = g.store();
             if let Err(e) = sess::log_hit(store, &file_key).await {
                 tracing::warn!("daemon socket edit_hook: log_hit failed: {e}");
             }
@@ -655,7 +770,8 @@ async fn socket_dispatch(
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if let Err(e) = sess::doc_capture(store, path, content).await {
+            let g = graph.read().await;
+            if let Err(e) = sess::doc_capture(g.store(), path, content).await {
                 tracing::warn!("daemon socket doc_capture: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -666,7 +782,8 @@ async fn socket_dispatch(
                 Some(p) => p,
                 None => return SocketResponse::err("missing args.prefix"),
             };
-            match store.scan_prefix(prefix).await {
+            let g = graph.read().await;
+            match g.store().scan_prefix(prefix).await {
                 Ok(records) => match serde_json::to_value(&records) {
                     Ok(val) => SocketResponse::ok(val),
                     Err(e) => SocketResponse::err(format!("serialize: {e}")),
@@ -689,9 +806,22 @@ async fn socket_dispatch(
                 Some(r) => r,
                 None => return SocketResponse::err("put: invalid record"),
             };
-            match store.put(key, &record).await {
+            let g = graph.read().await;
+            match g.store().put(key, &record).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::Null),
                 Err(e) => SocketResponse::err(format!("store put: {e}")),
+            }
+        }
+
+        "delete" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            let g = graph.read().await;
+            match g.store().delete(key).await {
+                Ok(()) => SocketResponse::ok(serde_json::Value::Null),
+                Err(e) => SocketResponse::err(format!("delete: {e}")),
             }
         }
 
@@ -723,7 +853,8 @@ async fn socket_dispatch(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            match apply_gotcha_write(store, &record, &old_files, &new_files, is_new).await {
+            let g = graph.read().await;
+            match apply_gotcha_write(g.store(), &record, &old_files, &new_files, is_new).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::String("written".into())),
                 Err(e) => SocketResponse::err(format!("{e}")),
             }
@@ -736,13 +867,23 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let affected_files: Vec<String> = req
+            // Read affected_files from args if provided, otherwise look up the
+            // record to get them. The MCP proxy sends delete without affected_files.
+            let mut affected_files: Vec<String> = req
                 .args
                 .get("affected_files")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
 
-            match apply_gotcha_tombstone(store, key, &affected_files).await {
+            let g = graph.read().await;
+            if affected_files.is_empty() {
+                if let Ok(Some(record)) = g.store().get(key).await {
+                    if let Some(gotcha) = record.payload_as::<crate::store::GotchaRecord>() {
+                        affected_files = gotcha.affected_files;
+                    }
+                }
+            }
+            match apply_gotcha_tombstone(g.store(), key, &affected_files).await {
                 Ok(()) => SocketResponse::ok(serde_json::Value::String("tombstoned".into())),
                 Err(e) => SocketResponse::err(format!("{e}")),
             }
@@ -755,6 +896,8 @@ async fn socket_dispatch(
             };
 
             // Read record
+            let g = graph.read().await;
+            let store = g.store();
             let mut record = match store.get(key).await {
                 Ok(Some(r)) => r,
                 Ok(None) => return SocketResponse::err(format!("record not found: {key}")),
@@ -763,6 +906,15 @@ async fn socket_dispatch(
 
             if record.category != crate::store::record::Category::Gotcha {
                 return SocketResponse::err(format!("{key} is not a gotcha record"));
+            }
+
+            if !matches!(
+                record.lifecycle,
+                crate::store::record::RecordLifecycle::Active
+            ) {
+                return SocketResponse::err(format!(
+                    "{key} is tombstoned — cannot confirm a deleted record"
+                ));
             }
 
             // Set confirmed + normalize severity
@@ -833,6 +985,80 @@ async fn socket_dispatch(
         }
 
         other => SocketResponse::err(format!("unknown command: {other}")),
+    }
+}
+
+// ── Auto-promotion: MCP server → headless daemon ─────────────────────────────
+
+/// Idle shutdown threshold — wall-clock seconds with no daemon socket requests.
+const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
+
+/// How often to check wall-clock idle time.
+const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // 5 min
+
+/// Block until idle timeout or OS signal (SIGINT/SIGTERM).
+///
+/// Called after the MCP stdio client disconnects. The daemon socket task is
+/// already running in a spawned tokio task — this function just keeps the
+/// runtime alive until there's a reason to shut down.
+async fn wait_for_idle_or_signal() {
+    let wall_secs = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+
+    let start = wall_secs();
+
+    // Idle-check: exits after IDLE_SHUTDOWN_SECS from pipe closure.
+    // The daemon socket handler runs independently in a spawned task —
+    // incoming connections do not reset this timer. 30 minutes is generous
+    // enough for Codex sessions where tool calls arrive seconds apart.
+    let idle_shutdown = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let elapsed = wall_secs().saturating_sub(start);
+            if elapsed >= IDLE_SHUTDOWN_SECS {
+                tracing::info!(
+                    idle_secs = elapsed,
+                    "mati serve: idle shutdown (auto-promoted daemon)"
+                );
+                break;
+            }
+        }
+    };
+
+    // Signal handler: SIGINT or SIGTERM.
+    let signal_shutdown = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {
+                    tracing::info!("mati serve: signal shutdown (SIGINT)");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("mati serve: signal shutdown (SIGTERM)");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+            tracing::info!("mati serve: signal shutdown");
+        }
+    };
+
+    // Wait for whichever comes first — idle timeout or OS signal.
+    tokio::select! {
+        _ = idle_shutdown => {}
+        _ = signal_shutdown => {}
     }
 }
 
@@ -942,13 +1168,26 @@ mod tests {
             .unwrap_or_default()
     }
 
-    async fn dispatch(store: &Store, cmd: &str, args: serde_json::Value) -> SocketResponse {
+    /// Test helper: wraps a Store in a Graph + Arc for socket_dispatch.
+    ///
+    /// Consumes the Store (Graph owns it). Returns the Arc and a reference
+    /// to access the store through the graph for assertions.
+    async fn make_test_graph(store: Store) -> Arc<tokio::sync::RwLock<Graph>> {
+        let graph = Graph::load(store).await.expect("failed to load test graph");
+        Arc::new(tokio::sync::RwLock::new(graph))
+    }
+
+    async fn dispatch_with_graph(
+        graph: &Arc<tokio::sync::RwLock<Graph>>,
+        cmd: &str,
+        args: serde_json::Value,
+    ) -> SocketResponse {
         let req = SocketRequest {
             cmd: cmd.to_string(),
             version: Some(PROTOCOL_VERSION),
             args,
         };
-        socket_dispatch(store, None, Path::new("/tmp/mati-test"), &req).await
+        socket_dispatch(graph, Path::new("/tmp/mati-test"), &req).await
     }
 
     // ── Regression: gotcha_write via socket syncs file links ─────────────
@@ -957,7 +1196,6 @@ mod tests {
     async fn socket_gotcha_write_adds_keys_to_file_records() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         store
             .put("file:src/a.rs", &make_file_record("src/a.rs"))
             .await
@@ -966,35 +1204,25 @@ mod tests {
             .put("file:src/b.rs", &make_file_record("src/b.rs"))
             .await
             .unwrap();
+        let graph = make_test_graph(store).await;
 
         let record = make_gotcha_record("gotcha:socket-test", &["src/a.rs", "src/b.rs"]);
-        let resp = dispatch(
-            &store,
-            "gotcha_write",
-            serde_json::json!({
-                "record": record,
-                "new_files": ["src/a.rs", "src/b.rs"],
-                "old_files": [],
-                "is_new": true,
-            }),
-        )
-        .await;
-
+        let resp = dispatch_with_graph(&graph, "gotcha_write", serde_json::json!({
+            "record": record, "new_files": ["src/a.rs", "src/b.rs"], "old_files": [], "is_new": true,
+        })).await;
         assert!(resp.ok, "gotcha_write failed: {:?}", resp.error);
 
-        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
-        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
+        let g = graph.read().await;
+        let a = g.store().get("file:src/a.rs").await.unwrap().unwrap();
+        let b = g.store().get("file:src/b.rs").await.unwrap().unwrap();
         assert!(file_gotcha_keys(&a).contains(&"gotcha:socket-test".into()));
         assert!(file_gotcha_keys(&b).contains(&"gotcha:socket-test".into()));
-
-        store.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn socket_gotcha_write_edit_removes_key_from_old_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         store
             .put("file:src/a.rs", &make_file_record("src/a.rs"))
             .await
@@ -1003,58 +1231,36 @@ mod tests {
             .put("file:src/b.rs", &make_file_record("src/b.rs"))
             .await
             .unwrap();
+        let graph = make_test_graph(store).await;
 
-        // Initial write targeting src/a.rs
         let record = make_gotcha_record("gotcha:edit-socket", &["src/a.rs"]);
-        let resp = dispatch(
-            &store,
+        let resp = dispatch_with_graph(
+            &graph,
             "gotcha_write",
             serde_json::json!({
-                "record": record,
-                "new_files": ["src/a.rs"],
-                "old_files": [],
-                "is_new": true,
+                "record": record, "new_files": ["src/a.rs"], "old_files": [], "is_new": true,
             }),
         )
         .await;
         assert!(resp.ok);
 
-        // Edit: move from src/a.rs to src/b.rs
         let record2 = make_gotcha_record("gotcha:edit-socket", &["src/b.rs"]);
-        let resp2 = dispatch(
-            &store,
-            "gotcha_write",
-            serde_json::json!({
-                "record": record2,
-                "new_files": ["src/b.rs"],
-                "old_files": ["src/a.rs"],
-                "is_new": false,
-            }),
-        )
-        .await;
+        let resp2 = dispatch_with_graph(&graph, "gotcha_write", serde_json::json!({
+            "record": record2, "new_files": ["src/b.rs"], "old_files": ["src/a.rs"], "is_new": false,
+        })).await;
         assert!(resp2.ok);
 
-        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
-        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
-        assert!(
-            !file_gotcha_keys(&a).contains(&"gotcha:edit-socket".into()),
-            "old file should not have gotcha key after edit"
-        );
-        assert!(
-            file_gotcha_keys(&b).contains(&"gotcha:edit-socket".into()),
-            "new file should have gotcha key after edit"
-        );
-
-        store.close().await.unwrap();
+        let g = graph.read().await;
+        let a = g.store().get("file:src/a.rs").await.unwrap().unwrap();
+        let b = g.store().get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(!file_gotcha_keys(&a).contains(&"gotcha:edit-socket".into()));
+        assert!(file_gotcha_keys(&b).contains(&"gotcha:edit-socket".into()));
     }
-
-    // ── Regression: gotcha_tombstone via socket cleans file links ─────────
 
     #[tokio::test]
     async fn socket_gotcha_tombstone_removes_keys_from_file_records() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         store
             .put("file:src/a.rs", &make_file_record("src/a.rs"))
             .await
@@ -1063,93 +1269,60 @@ mod tests {
             .put("file:src/b.rs", &make_file_record("src/b.rs"))
             .await
             .unwrap();
+        let graph = make_test_graph(store).await;
 
-        // Write gotcha first
         let record = make_gotcha_record("gotcha:tomb-socket", &["src/a.rs", "src/b.rs"]);
-        let resp = dispatch(
-            &store,
-            "gotcha_write",
-            serde_json::json!({
-                "record": record,
-                "new_files": ["src/a.rs", "src/b.rs"],
-                "old_files": [],
-                "is_new": true,
-            }),
-        )
-        .await;
+        let resp = dispatch_with_graph(&graph, "gotcha_write", serde_json::json!({
+            "record": record, "new_files": ["src/a.rs", "src/b.rs"], "old_files": [], "is_new": true,
+        })).await;
         assert!(resp.ok);
 
-        // Tombstone it
-        let resp2 = dispatch(
-            &store,
+        let resp2 = dispatch_with_graph(
+            &graph,
             "gotcha_tombstone",
             serde_json::json!({
-                "key": "gotcha:tomb-socket",
-                "affected_files": ["src/a.rs", "src/b.rs"],
+                "key": "gotcha:tomb-socket", "affected_files": ["src/a.rs", "src/b.rs"],
             }),
         )
         .await;
         assert!(resp2.ok, "gotcha_tombstone failed: {:?}", resp2.error);
 
-        // Record should be tombstoned
-        let rec = store.get("gotcha:tomb-socket").await.unwrap().unwrap();
+        let g = graph.read().await;
+        let rec = g.store().get("gotcha:tomb-socket").await.unwrap().unwrap();
         assert!(matches!(rec.lifecycle, RecordLifecycle::Tombstoned { .. }));
-
-        // File records should have empty gotcha_keys
-        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
-        let b = store.get("file:src/b.rs").await.unwrap().unwrap();
-        assert!(
-            file_gotcha_keys(&a).is_empty(),
-            "file:src/a.rs should have no gotcha keys after tombstone, got: {:?}",
-            file_gotcha_keys(&a)
-        );
-        assert!(
-            file_gotcha_keys(&b).is_empty(),
-            "file:src/b.rs should have no gotcha keys after tombstone, got: {:?}",
-            file_gotcha_keys(&b)
-        );
-
-        store.close().await.unwrap();
+        let a = g.store().get("file:src/a.rs").await.unwrap().unwrap();
+        let b = g.store().get("file:src/b.rs").await.unwrap().unwrap();
+        assert!(file_gotcha_keys(&a).is_empty());
+        assert!(file_gotcha_keys(&b).is_empty());
     }
-
-    // ── Regression: gotcha_write via socket rejects collisions ────────────
 
     #[tokio::test]
     async fn socket_gotcha_write_rejects_duplicate_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
-
         let record1 = make_gotcha_record("gotcha:dup-socket", &["src/a.rs"]);
         store.put("gotcha:dup-socket", &record1).await.unwrap();
+        let graph = make_test_graph(store).await;
 
         let record2 = make_gotcha_record("gotcha:dup-socket", &["src/b.rs"]);
-        let resp = dispatch(
-            &store,
+        let resp = dispatch_with_graph(
+            &graph,
             "gotcha_write",
             serde_json::json!({
-                "record": record2,
-                "new_files": ["src/b.rs"],
-                "old_files": [],
-                "is_new": true,
+                "record": record2, "new_files": ["src/b.rs"], "old_files": [], "is_new": true,
             }),
         )
         .await;
-
         assert!(!resp.ok, "duplicate key should be rejected");
-        assert!(
-            resp.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("already exists"),
-            "error should mention collision: {:?}",
-            resp.error
-        );
+        assert!(resp
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("already exists"));
 
-        // Original should be untouched
-        let original = store.get("gotcha:dup-socket").await.unwrap().unwrap();
+        let g = graph.read().await;
+        let original = g.store().get("gotcha:dup-socket").await.unwrap().unwrap();
         let payload = original.payload_as::<GotchaRecord>().unwrap();
         assert_eq!(payload.affected_files, vec!["src/a.rs"]);
-
-        store.close().await.unwrap();
     }
 }
