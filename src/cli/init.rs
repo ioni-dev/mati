@@ -889,24 +889,104 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
     println!();
 
-    // ── Next steps ───────────────────────────────────────────────────────
+    // ── Post-init insights ─────────────────────────────────────────────
     let use_color = std::io::stderr().is_terminal();
-    let (blue, gray, white, bold, reset) = if use_color {
+    let (blue, cyan, yellow, gray, white, bold, reset) = if use_color {
         (
             super::colors::BLUE,
+            super::colors::CYAN,
+            super::colors::YELLOW,
             super::colors::GRAY,
             super::colors::WHITE,
             super::colors::BOLD,
             super::colors::RESET,
         )
     } else {
-        ("", "", "", "", "")
+        ("", "", "", "", "", "", "")
     };
 
+    // Block 1: Onboarding time estimate
+    // On first run, gotcha coverage is 0% → base time (22 min).
+    println!(
+        "  {bold}Onboarding estimate:{reset}  {white}22 min{reset}  {gray}(0% gotcha coverage — confirm candidates to reduce){reset}"
+    );
+
+    // Block 2: Top hotspot files
+    let hotspot_paths: &[String] = git_signals
+        .as_ref()
+        .map(|g| g.hotspot_files.as_slice())
+        .unwrap_or(&[]);
+    if !hotspot_paths.is_empty() {
+        println!();
+        println!(
+            "  {bold}Hotspot files{reset}  {gray}(highest risk — most changed in last 90 days){reset}"
+        );
+        for path in hotspot_paths.iter().take(5) {
+            println!("    {cyan}{path}{reset}");
+        }
+        if hotspot_paths.len() > 5 {
+            println!("    {gray}… and {} more{reset}", hotspot_paths.len() - 5);
+        }
+    }
+
+    // Block 3: Top co-change pairs
+    if !co_change_pairs.is_empty() {
+        println!();
+        println!(
+            "  {bold}Co-change pairs{reset}  {gray}(files that always change together){reset}"
+        );
+        for (a, b, count) in co_change_pairs.iter().take(3) {
+            // Show percentage from whichever side has the higher ratio
+            let (freq_a, freq_b) = git_signals
+                .as_ref()
+                .map(|g| {
+                    (
+                        g.change_frequency.get(a).copied().unwrap_or(1).max(1),
+                        g.change_frequency.get(b).copied().unwrap_or(1).max(1),
+                    )
+                })
+                .unwrap_or((1, 1));
+            let pct = ((*count as f64 / freq_a.min(freq_b) as f64) * 100.0)
+                .round()
+                .min(100.0) as u32;
+            println!("    {cyan}{a}{reset}  ↔  {cyan}{b}{reset}  {gray}({pct}%){reset}");
+        }
+    }
+
+    // Block 4: Review backlog
+    let review_count = gotcha_candidates + cochange_count + revert_count + ownership_count;
+    if review_count > 0 {
+        println!();
+        println!(
+            "  {bold}{yellow}Review backlog{reset}  {white}{review_count}{reset} {gray}candidates pending confirmation{reset}"
+        );
+        println!("    {gray}Run {white}mati review{gray} to activate hook enforcement{reset}");
+        // On first run, all hotspot files have zero confirmed gotchas
+        if hotspot_count > 0 {
+            println!(
+                "    {yellow}{hotspot_count} hotspot files have zero confirmed gotchas{reset}"
+            );
+        }
+    }
+    println!();
+
+    // Block 5: Personalized next steps
     println!("  {bold}{blue}Next steps{reset}");
-    println!("    {white}mati explain <file>{reset}   {gray}file briefing — gotchas and decisions before editing{reset}");
-    println!("    {white}mati review{reset}            {gray}confirm auto-detected candidates for hook enforcement{reset}");
-    println!("    {white}mati status{reset}            {gray}project memory dashboard{reset}");
+    if let Some(top_hotspot) = hotspot_paths.first() {
+        println!(
+            "    {white}mati explain {top_hotspot}{reset}  {gray}← start here (highest-risk file){reset}"
+        );
+    } else if total_file_count > 0 {
+        println!(
+            "    {white}mati explain <file>{reset}   {gray}file briefing — gotchas and decisions before editing{reset}"
+        );
+    }
+    if review_count > 0 {
+        println!(
+            "    {white}mati review{reset}            {gray}confirm {review_count} candidates for hook enforcement{reset}"
+        );
+    }
+    println!("    {white}mati status{reset}            {gray}project knowledge dashboard{reset}");
     println!();
 
     Ok(())
