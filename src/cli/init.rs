@@ -757,6 +757,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
                     "  Installing Claude integration...                    {:>3}ms",
                     t.elapsed().as_millis()
                 );
+                {
+                    let g = if std::io::stderr().is_terminal() {
+                        super::colors::GRAY
+                    } else {
+                        ""
+                    };
+                    let r = if std::io::stderr().is_terminal() {
+                        super::colors::RESET
+                    } else {
+                        ""
+                    };
+                    println!("    {g}.claude/settings.json          hook registrations + MCP server config{r}");
+                    println!("    {g}.claude/hooks/                 6 hooks (pre-read, pre-bash, compliance, edit, compact, session-end){r}");
+                    println!("    {g}.claude/CLAUDE.md              knowledge capture + enrichment instructions{r}");
+                }
                 if !missing_deps.is_empty() {
                     eprintln!();
                     eprintln!(
@@ -793,6 +808,23 @@ pub async fn run(args: InitArgs) -> Result<()> {
                     "  Installing Codex integration...                     {:>3}ms",
                     t.elapsed().as_millis()
                 );
+                {
+                    let g = if std::io::stderr().is_terminal() {
+                        super::colors::GRAY
+                    } else {
+                        ""
+                    };
+                    let r = if std::io::stderr().is_terminal() {
+                        super::colors::RESET
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {g}.codex/config.toml             MCP server + hooks feature flag{r}"
+                    );
+                    println!("    {g}.codex/hooks/                  5 hooks (session-start, prompt-submit, pre-bash, post-bash, stop){r}");
+                    println!("    {g}.codex/skills/mati/            skill instructions for agent guidance{r}");
+                }
                 if !missing_deps.is_empty() {
                     eprintln!();
                     eprintln!(
@@ -881,11 +913,40 @@ pub async fn run(args: InitArgs) -> Result<()> {
         (false, false, false) => "MCP-only fallback".to_string(),
     };
     println!("  integration:          {integration_label}");
-    if codex_installed {
-        println!("  Codex capability:     hard Bash enforcement, soft native-read enforcement");
-    }
-    if claude_installed {
-        println!("  Claude capability:    hard pre-read enforcement");
+    if claude_installed || codex_installed {
+        let g = if std::io::stderr().is_terminal() {
+            super::colors::GRAY
+        } else {
+            ""
+        };
+        let w = if std::io::stderr().is_terminal() {
+            super::colors::WHITE
+        } else {
+            ""
+        };
+        let b = if std::io::stderr().is_terminal() {
+            super::colors::BOLD
+        } else {
+            ""
+        };
+        let r = if std::io::stderr().is_terminal() {
+            super::colors::RESET
+        } else {
+            ""
+        };
+        println!();
+        println!("  {b}Enforcement{r}");
+        if claude_installed {
+            println!(
+                "    {w}Claude:{r}  {g}file reads blocked until knowledge consulted (pre-read hook){r}"
+            );
+        }
+        if codex_installed {
+            println!(
+                "    {w}Codex:{r}   {g}Bash reads blocked + gotchas injected on prompt submit{r}"
+            );
+        }
+        println!("    {w}Both:{r}    {g}compliance tracking, edit capture, session analytics{r}");
     }
     println!();
 
