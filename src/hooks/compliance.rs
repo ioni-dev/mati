@@ -419,6 +419,15 @@ esac
     }
 }
 
+// ─── Helper: build Codex 0.118.0 input format ────────────────────────────────
+
+/// Build the JSON input that Codex 0.118.0 sends to PreToolUse hooks.
+/// The `arguments` field is a JSON-encoded string containing the command.
+fn codex_bash_input(cmd: &str) -> String {
+    let inner = serde_json::json!({"cmd": cmd, "shell": "zsh", "workdir": "."});
+    serde_json::json!({"arguments": inner.to_string()}).to_string()
+}
+
 // ─── Helper: build a mock record JSON ────────────────────────────────────────
 
 fn make_record(
@@ -1389,6 +1398,9 @@ fn codex_user_prompt_logs_nudge_for_code_edit_intent() {
 }
 
 /// 3.07 — Codex pre-bash blocks strong gotcha shell reads without a receipt.
+///
+/// Codex 0.118.0 blocking mechanism: exit 2 + stderr message.
+/// Stdout is not used for blocking decisions.
 #[test]
 fn codex_pre_bash_blocks_shell_read_without_recent_receipt() {
     let harness = HookTestHarness::for_codex_pre_bash().with_deny_eligible_record(
@@ -1396,19 +1408,18 @@ fn codex_pre_bash_blocks_shell_read_without_recent_receipt() {
         0.1,
         "fresh",
     );
-    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    let json = output.json.expect("codex pre-bash should emit JSON");
+    // Codex 0.118.0 input format: arguments is a JSON-encoded string
+    let input = codex_bash_input("cat src/main.rs");
+    let output = harness.run(&input);
     assert_eq!(
-        json["hookSpecificOutput"]["permissionDecision"].as_str(),
-        Some("deny")
+        output.exit_code, 2,
+        "codex pre-bash should exit 2 to block, got exit {}; stderr: {}",
+        output.exit_code, output.stderr
     );
     assert!(
-        json["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("mem_get"),
-        "block reason should instruct the agent to consult memory first"
+        output.stderr.contains("mem_get"),
+        "stderr should instruct the agent to consult memory first, got: {}",
+        output.stderr
     );
     assert!(
         harness.wait_for_log_contains("log-codex-shell-miss file:src/main.rs"),
@@ -1444,7 +1455,9 @@ fn codex_pre_bash_allows_with_recent_receipt() {
     let harness = HookTestHarness::for_codex_pre_bash()
         .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh")
         .with_recent_consulted(true);
-    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    // Codex 0.118.0 input format
+    let input = codex_bash_input("cat src/main.rs");
+    let output = harness.run(&input);
     assert_eq!(output.exit_code, 0);
     assert!(
         output.stdout.trim().is_empty(),

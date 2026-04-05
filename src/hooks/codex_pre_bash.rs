@@ -1,33 +1,46 @@
-/// Codex PreToolUse(Bash) hook.
+/// Codex PreToolUse(Bash) hook — hard enforcement via exit 2 + stderr.
 ///
-/// This is the hard-enforcement path available on Codex today.
+/// Confirmed working in Codex 0.118.0: exit 2 blocks the tool call.
+/// stdout is not used for blocking — only stderr + exit code matter.
+///
+/// Enforcement decision matrix:
+///   confirmed + confidence >= 0.6 + quality >= 0.4  ->  DENY (exit 2 + stderr)
+///   agent already consulted (receipt valid within 15min)  ->  ALLOW
+///   no record or below threshold  ->  ALLOW + log gap
+///   mati daemon unreachable  ->  ALLOW (fail-open)
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
-# mati Codex pre-bash hook — Bash file-reading command enforcement
+# mati Codex pre-bash hook — file-reading command enforcement
 #
-# Enforcement decision matrix:
-#   confirmed + confidence >= 0.6 + quality >= 0.4  ->  DENY read (must call mem_get first)
-#   file record + confidence 0.3-0.6 + quality >= 0.4  ->  ALLOW + attach context hint
-#   no record or below threshold  ->  ALLOW + log gap for detection
-#   agent already consulted (receipt valid within 15min)  ->  ALLOW (context already injected)
-#   mati daemon unreachable  ->  ALLOW (fail-open)
+# Blocking mechanism: exit 2 + stderr message (confirmed Codex 0.118.0).
+# Codex does NOT read stdout from PreToolUse hooks for blocking decisions.
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 
 INPUT=$(cat)
 
 if ! command -v jq >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
-  echo "[mati] missing jq or awk — enforcement bypassed" >&2
   { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") reason=missing_deps" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
   exit 0
 fi
 
 TTL_SECS=900
 
-CMD=$(printf '%s\n' "$INPUT" | jq -r '.tool_input.command // .command // ""' 2>/dev/null || echo "")
+# Codex 0.118.0 sends: {"arguments":"{\"cmd\":\"...\",\"shell\":\"zsh\",\"workdir\":\"...\"}"}
+CMD=$(printf '%s\n' "$INPUT" | jq -r '
+  if (.arguments | type) == "string"
+  then (.arguments | fromjson | .cmd // empty)
+  else empty
+  end
+' 2>/dev/null || echo "")
 [ -z "$CMD" ] && exit 0
 
+# Scope to file-reading commands only — never reach mati lookup for pwd, ls, etc.
 if printf '%s\n' "$CMD" | grep -qE '^\s*(cat|less|head|tail|bat)\s+'; then
   FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)
+  if [ -z "$FILE_PATH" ]; then
+    FILE_PATH=$(printf '%s\n' "$CMD" | sed "s/.*'\([^']*\)'.*/\1/" 2>/dev/null || true)
+    [ "$FILE_PATH" = "$CMD" ] && FILE_PATH=""
+  fi
   if [ -z "$FILE_PATH" ]; then
     FILE_PATH=$(printf '%s\n' "$CMD" | grep -oE '^\s*(cat|less|head|tail|bat)\s+[^|;&]+' | awk '{for(i=2;i<=NF;i++){if($i !~ /^-/){print $i; exit}}}' || true)
   fi
@@ -38,7 +51,7 @@ elif printf '%s\n' "$CMD" | grep -qE '^\s*(grep|rg|sed|awk)\s+'; then
     FILE_PATH=$(printf '%s\n' "$FILE_PATH" | sed "s/^'//;s/'$//" || true)
   fi
 else
-  FILE_PATH=""
+  exit 0
 fi
 
 [ -z "$FILE_PATH" ] && exit 0
@@ -52,9 +65,11 @@ fi
 
 SAFE_PATH=$(printf '%s\n' "$REL_PATH" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
-if ! mati ping >/dev/null 2>&1; then
-  echo "[mati] daemon unreachable — enforcement bypassed" >&2
+# Fail open — never block when daemon is unreachable
+if ! mati ping --daemon-only >/dev/null 2>&1; then
+  echo "[mati] WARNING: daemon not running — enforcement bypassed for ${REL_PATH:-unknown file}" >&2
   { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") file=${REL_PATH:-unknown}" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}'
   exit 0
 fi
 
@@ -73,16 +88,12 @@ QUALITY=$(printf '%s\n' "$RECORD" | jq -r '.quality.value // 0')
 STALENESS=$(printf '%s\n' "$RECORD" | jq -r '.staleness.value // 0')
 STALENESS_TIER=$(printf '%s\n' "$RECORD" | jq -r '.staleness.tier // "fresh"')
 IS_HOTSPOT=$(printf '%s\n' "$RECORD" | jq -r '.payload.is_hotspot // false')
-# Sanitize numerics — empty or non-numeric → 0
 case "$CONFIDENCE" in ''|*[!0-9.]*) CONFIDENCE=0 ;; esac
 case "$QUALITY" in ''|*[!0-9.]*) QUALITY=0 ;; esac
 case "$STALENESS" in ''|*[!0-9.]*) STALENESS=0 ;; esac
 
 [ "$STALENESS_TIER" = "tombstone" ] && exit 0
-
-if [ "$STALENESS_TIER" = "liability" ]; then
-  exit 0
-fi
+[ "$STALENESS_TIER" = "liability" ] && exit 0
 
 RECENT=$(mati session-check-consulted-recent "file:$REL_PATH" --ttl-secs "$TTL_SECS" 2>/dev/null || echo "false")
 
@@ -98,7 +109,6 @@ while IFS= read -r gkey; do
   GCONFIRMED=$(printf '%s\n' "$GREC" | jq -r '.payload.confirmed // false')
   GCONFIDENCE=$(printf '%s\n' "$GREC" | jq -r '.confidence.value // 0')
   GQUALITY=$(printf '%s\n' "$GREC" | jq -r '.quality.value // 0')
-  # Sanitize to numeric — empty or non-numeric → 0 (fail-closed: deny skipped)
   case "$GCONFIDENCE" in ''|*[!0-9.]*) GCONFIDENCE=0 ;; esac
   case "$GQUALITY" in ''|*[!0-9.]*) GQUALITY=0 ;; esac
   if [ "$GCONFIRMED" = "true" ] && \
@@ -110,12 +120,8 @@ done <<< "$GOTCHA_KEYS"
 
 if [ "$DENY_SIGNAL" = "true" ] && [ "$RECENT" != "true" ]; then
   mati log-codex-shell-miss "file:$REL_PATH" >/dev/null 2>&1 || true
-  STALE_NOTE=""
-  if awk "BEGIN { exit !($STALENESS >= 0.4) }"; then
-    STALE_NOTE=" Verify critical details because the cached record is stale."
-  fi
-  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[mati] Confirmed gotcha on %s. Call mem_get(\\"file:%s\\") before shell inspection.%s"}}\n' "$SAFE_PATH" "$SAFE_PATH" "$STALE_NOTE"
-  exit 0
+  echo "mati: call mem_get(\"file:$SAFE_PATH\") first" >&2
+  exit 2
 fi
 
 if [ "$RECENT" != "true" ] && \
