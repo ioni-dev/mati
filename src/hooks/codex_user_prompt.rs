@@ -24,8 +24,8 @@ PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // ""' 2>/dev/null || echo "")
 [ -z "$PROMPT" ] && exit 0
 
 # ── Graceful degradation: daemon must be reachable ──────────────────────
-if ! mati ping >/dev/null 2>&1; then
-  echo "[mati] daemon unreachable — enforcement bypassed" >&2
+if ! mati ping --daemon-only >/dev/null 2>&1; then
+  echo "[mati] WARNING: daemon not running — enforcement bypassed" >&2
   { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") file=prompt" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
   exit 0
 fi

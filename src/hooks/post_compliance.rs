@@ -44,8 +44,8 @@ case "$REL_PATH" in
 esac
 
 # Guard: mati must be reachable
-if ! mati ping &>/dev/null; then
-  echo "[mati] daemon unreachable — enforcement bypassed" >&2
+if ! mati ping --daemon-only &>/dev/null; then
+  echo "[mati] WARNING: daemon not running — enforcement bypassed" >&2
   { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") file=${REL_PATH:-unknown}" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
   exit 0
 fi

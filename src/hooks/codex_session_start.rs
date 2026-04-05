@@ -7,9 +7,16 @@ pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 
-if ! mati ping >/dev/null 2>&1; then
-  echo "[mati] daemon unreachable — enforcement bypassed" >&2
-  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") file=session" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+if ! mati ping --daemon-only >/dev/null 2>&1; then
+  # Auto-start the daemon — fails silently if MCP server already holds the lock
+  mati daemon start </dev/null >/dev/null 2>&1 &
+  sleep 0.3
+  if mati ping --daemon-only >/dev/null 2>&1; then
+    echo "[mati] daemon was not running — started automatically. Enforcement active." >&2
+  else
+    echo "[mati] WARNING: daemon not running and auto-start failed — enforcement bypassed this session." >&2
+  fi
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
   exit 0
 fi
 
@@ -27,6 +34,6 @@ fi
 
 mati log-bootstrap "__codex_session__" >/dev/null 2>&1 || true
 
-MSG="[mati] ${GOTCHA_COUNT} confirmed gotchas, ${HOTSPOT_COUNT} hotspot files tracked. Call mem_bootstrap() for full context. Before editing any file, call mem_get(\"file:<path>\") -- gotchas will be injected via UserPromptSubmit hook. Bash file inspection is structurally enforced (denied until consulted)."
+MSG="[mati] ${GOTCHA_COUNT} confirmed gotchas, ${HOTSPOT_COUNT} hotspot files tracked. Call mem_bootstrap() for full context. Before editing any file, call mem_get(\"file:<path>\") -- gotchas will be injected via UserPromptSubmit hook. Bash file inspection is enforced via prompt context (UserPromptSubmit); call mem_get before any file read."
 printf '%s' "$MSG" | jq -Rs '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:.}}'
 "#;
