@@ -958,15 +958,36 @@ impl MatiServer {
             }
         }
 
+        // Propagate confirmation_count to linked file records
+        crate::store::gotcha_ops::propagate_confirmation_to_files(store, &affected_files).await;
+
         // Mint consultation receipt so hooks know this file was reviewed
         let _ = crate::store::session::log_hit(store, key).await;
+
+        let confidence_value = record.confidence.value;
+        let quality_value = record.quality.value;
+
+        // Release the read lock so we can take a write lock for graph edge updates.
+        drop(graph);
+
+        // Ensure HasGotcha edges exist in the in-memory graph for all affected files.
+        // This is idempotent (add_edge is a no-op if the edge already exists) and guards
+        // against gotchas that were written via the CLI path, whose graph edges landed in
+        // the persistent store but were never loaded into the running graph.
+        if !affected_files.is_empty() {
+            let mut g = graph_arc.write().await;
+            for file_path in &affected_files {
+                let file_key = format!("file:{file_path}");
+                let _ = g.add_edge(&file_key, EdgeKind::HasGotcha, key).await;
+            }
+        }
 
         json!({
             "ok": true,
             "key": key,
             "confirmed": true,
-            "confidence": record.confidence.value,
-            "quality": record.quality.value,
+            "confidence": confidence_value,
+            "quality": quality_value,
         })
         .to_string()
     }
@@ -1095,6 +1116,15 @@ pub async fn assemble_context_packet(
             }
 
             if let Some(fr) = record.payload_as::<FileRecord>() {
+                // Supplement graph traversal with the record-level gotcha_keys list.
+                // FileRecord.gotcha_keys is the authoritative persistent source; the
+                // in-memory graph edges are a cache that can lag after CLI gotcha writes
+                // (apply_gotcha_write persists to disk but historically skipped the
+                // in-memory graph update). Including these keys here ensures bootstrap
+                // surfaces confirmed gotchas even when graph edges are stale or missing.
+                for key in &fr.gotcha_keys {
+                    context_gotcha_keys.insert(key.clone());
+                }
                 // Nudge detection: hot file (access_count >= 3) with no gotchas
                 let is_nudge_candidate = record.access_count >= 3 && fr.gotcha_keys.is_empty();
                 file_records.push(fr);
@@ -1703,6 +1733,151 @@ mod tests {
         assert!(
             !packet.injection_string.contains("gotcha:unrelated"),
             "injection string must not mention unrelated gotchas"
+        );
+    }
+
+    /// Regression test for the bootstrap low-confidence file bug.
+    ///
+    /// Scenario: file record has confidence 0.10 (Layer 0 stub from mati init),
+    /// a confirmed gotcha with confidence 0.80 is linked via FileRecord.gotcha_keys,
+    /// but NO HasGotcha graph edge exists (simulating CLI gotcha_write that wrote to
+    /// the store but never updated the in-memory graph).
+    ///
+    /// Bootstrap must still surface the confirmed gotcha by falling back to
+    /// FileRecord.gotcha_keys when graph edges are absent.
+    #[tokio::test]
+    async fn bootstrap_surfaces_confirmed_gotcha_when_graph_edge_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Confirmed gotcha with high confidence/quality
+        let gotcha = make_gotcha_record(
+            "gotcha:never-remove-rate-limit",
+            "Never remove the rate limit check on incoming pipeline events because \
+             removing it caused a cascade failure in staging",
+            true,
+            0.80,
+        );
+        store
+            .put("gotcha:never-remove-rate-limit", &gotcha)
+            .await
+            .unwrap();
+
+        // File record: low-confidence stub (confidence 0.10), but gotcha_keys populated
+        let file_record = {
+            let fr = FileRecord {
+                path: "src/pipeline/prefilter.rs".to_string(),
+                purpose: String::new(), // no purpose — Layer 0 stub
+                entry_points: vec![],
+                imports: vec![],
+                gotcha_keys: vec!["gotcha:never-remove-rate-limit".to_string()],
+                decision_keys: vec![],
+                todos: vec![],
+                unsafe_count: 0,
+                unwrap_count: 0,
+                change_frequency: 18,
+                last_author: Some("dev".to_string()),
+                is_hotspot: true,
+                token_cost_estimate: 0,
+                last_modified_session: now(),
+                content_hash: None,
+                line_count: 0,
+            };
+            let mut r = make_record(
+                "file:src/pipeline/prefilter.rs",
+                "",
+                Category::File,
+                0.10, // low confidence — stub
+            );
+            r.payload = serde_json::to_value(&fr).ok();
+            r
+        };
+        store
+            .put("file:src/pipeline/prefilter.rs", &file_record)
+            .await
+            .unwrap();
+
+        // Intentionally do NOT add a HasGotcha graph edge — simulates the CLI
+        // gotcha_write bug where the persistent store edge was written but the
+        // in-memory graph was never updated.
+        let graph = Graph::load(store).await.unwrap();
+        assert_eq!(
+            graph.neighbors("file:src/pipeline/prefilter.rs", &EdgeKind::HasGotcha),
+            Vec::<String>::new(),
+            "test setup: graph must have no HasGotcha edge"
+        );
+
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/pipeline/prefilter.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet
+                .critical_gotchas
+                .iter()
+                .any(|g| g.key == "gotcha:never-remove-rate-limit"),
+            "bootstrap must surface confirmed gotcha even when graph edge is missing"
+        );
+        assert!(
+            packet
+                .injection_string
+                .contains("gotcha:never-remove-rate-limit"),
+            "injection string must include the gotcha"
+        );
+    }
+
+    /// Negative case: file with confidence 0.10 and NO confirmed gotchas should
+    /// produce minimal bootstrap output — no purpose text, no gotchas, no receipt.
+    #[tokio::test]
+    async fn bootstrap_low_confidence_file_with_no_gotchas_returns_minimal_packet() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let file_record = {
+            let fr = FileRecord {
+                path: "src/empty.rs".to_string(),
+                purpose: String::new(),
+                entry_points: vec![],
+                imports: vec![],
+                gotcha_keys: vec![],
+                decision_keys: vec![],
+                todos: vec![],
+                unsafe_count: 0,
+                unwrap_count: 0,
+                change_frequency: 1,
+                last_author: None,
+                is_hotspot: false,
+                token_cost_estimate: 0,
+                last_modified_session: now(),
+                content_hash: None,
+                line_count: 0,
+            };
+            let mut r = make_record("file:src/empty.rs", "", Category::File, 0.10);
+            r.payload = serde_json::to_value(&fr).ok();
+            r
+        };
+        store
+            .put("file:src/empty.rs", &file_record)
+            .await
+            .unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet =
+            assemble_context_packet(graph.store(), &graph, &["src/empty.rs".to_string()])
+                .await
+                .unwrap();
+
+        assert!(
+            packet.critical_gotchas.is_empty(),
+            "no gotchas should be surfaced for a file with no linked gotchas"
+        );
+        assert!(
+            !packet.injection_string.contains("gotcha:"),
+            "injection string must not mention any gotcha keys"
         );
     }
 
