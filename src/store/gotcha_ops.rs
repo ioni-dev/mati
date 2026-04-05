@@ -220,6 +220,16 @@ async fn update_file_gotcha_key(
 ) -> Result<()> {
     let file_key = format!("file:{file_path}");
     let Some(mut record) = store.get(&file_key).await? else {
+        // File record doesn't exist yet. Mark dirty so `mati repair`
+        // back-fills the link when the file is later indexed by init.
+        if add {
+            crate::store::repair::mark_dirty(
+                store,
+                gotcha_key,
+                &format!("file record missing at link-sync time: {file_key}"),
+            )
+            .await;
+        }
         return Ok(());
     };
 
@@ -289,6 +299,29 @@ fn remove_gotcha_key(record: &mut Record, gotcha_key: &str) -> bool {
     let before = arr.len();
     arr.retain(|v| v.as_str() != Some(gotcha_key));
     arr.len() != before
+}
+
+// ── Confirmation propagation ─────────────────────────────────────────────────
+
+/// Increment `confirmation_count` on all file records linked to a confirmed gotcha.
+///
+/// Best-effort: failures are logged but do not fail the confirmation.
+/// This propagates the signal that a human verified knowledge about this file,
+/// which feeds into the confidence formula via `log2(confirmation_count + 2)`.
+pub async fn propagate_confirmation_to_files(store: &Store, affected_files: &[String]) {
+    for file_path in affected_files {
+        let file_key = format!("file:{file_path}");
+        if let Ok(Some(mut file_record)) = store.get(&file_key).await {
+            file_record.confidence.confirmation_count += 1;
+            let now = now_secs();
+            file_record.updated_at = now;
+            file_record.version.logical_clock += 1;
+            file_record.version.wall_clock = now;
+            if let Err(e) = store.put(&file_key, &file_record).await {
+                tracing::warn!("propagate_confirmation: failed to update {file_key}: {e}");
+            }
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

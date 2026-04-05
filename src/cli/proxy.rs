@@ -270,6 +270,43 @@ impl StoreProxy {
         super::gotcha::confirm_gotcha(self, key).await
     }
 
+    /// Propagate confirmation_count to file records linked to a confirmed gotcha.
+    ///
+    /// In direct mode, delegates to `propagate_confirmation_to_files`.
+    /// In socket mode, uses proxy get/put for each file (N round-trips,
+    /// acceptable for the typical 1-3 affected files per gotcha).
+    pub async fn propagate_confirmation(&self, affected_files: &[String]) {
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                mati_core::store::gotcha_ops::propagate_confirmation_to_files(
+                    store,
+                    affected_files,
+                )
+                .await;
+            }
+            ProxyInner::Socket { .. } => {
+                for file_path in affected_files {
+                    let file_key = format!("file:{file_path}");
+                    if let Ok(Some(mut file_record)) = self.get(&file_key).await {
+                        file_record.confidence.confirmation_count += 1;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        file_record.updated_at = now;
+                        file_record.version.logical_clock += 1;
+                        file_record.version.wall_clock = now;
+                        if let Err(e) = self.put(&file_key, &file_record).await {
+                            tracing::warn!(
+                                "propagate_confirmation: failed to update {file_key}: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Write a gotcha record with file-link sync and graph edges.
     ///
     /// In direct mode, delegates to `apply_gotcha_write`.
@@ -355,27 +392,24 @@ impl StoreProxy {
     }
 
     /// Version history for a single key, newest first.
-    ///
-    /// Only works in direct mode. In socket mode this errors with a message
-    /// telling the user to stop the daemon first.
-    pub fn history(&self, key: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
+    pub async fn history(&self, key: &str, limit: usize) -> Result<Vec<HistoryEntry>> {
         match &self.inner {
             ProxyInner::Direct(s) => s.history(key, limit),
-            ProxyInner::Socket { .. } => anyhow::bail!(
-                "mati history requires direct store access, which is unavailable while the MCP \
-                 server is running.\n\
-                 The MCP server (mati serve) holds the store lock for the duration of your \
-                 Claude Code session.\n\
-                 To use mati history: close your Claude Code session, then re-run the command."
-            ),
+            ProxyInner::Socket { root } => {
+                match daemon_result(root, "history", json!({ "key": key, "limit": limit })).await {
+                    DaemonResult::Ok(v) => {
+                        let data = &v["data"];
+                        Ok(serde_json::from_value(data.clone())
+                            .context("proxy history: failed to deserialize entries")?)
+                    }
+                    other => Err(socket_read_error("history", other)),
+                }
+            }
         }
     }
 
     /// Version history for a single key since `since_ts`, newest first.
-    ///
-    /// Only works in direct mode. In socket mode this errors with a message
-    /// explaining why and what to do.
-    pub fn history_since(
+    pub async fn history_since(
         &self,
         key: &str,
         since_ts: u64,
@@ -383,13 +417,22 @@ impl StoreProxy {
     ) -> Result<Vec<HistoryEntry>> {
         match &self.inner {
             ProxyInner::Direct(s) => s.history_since(key, since_ts, limit),
-            ProxyInner::Socket { .. } => anyhow::bail!(
-                "mati history requires direct store access, which is unavailable while the MCP \
-                 server is running.\n\
-                 The MCP server (mati serve) holds the store lock for the duration of your \
-                 Claude Code session.\n\
-                 To use mati history: close your Claude Code session, then re-run the command."
-            ),
+            ProxyInner::Socket { root } => {
+                match daemon_result(
+                    root,
+                    "history_since",
+                    json!({ "key": key, "since_ts": since_ts, "limit": limit }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(v) => {
+                        let data = &v["data"];
+                        Ok(serde_json::from_value(data.clone())
+                            .context("proxy history_since: failed to deserialize entries")?)
+                    }
+                    other => Err(socket_read_error("history_since", other)),
+                }
+            }
         }
     }
 
