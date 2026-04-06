@@ -24,6 +24,8 @@ use surrealkv::{
     TreeBuilder, VLogChecksumLevel,
 };
 
+use serde::{Deserialize, Serialize};
+
 use super::record::Record;
 use super::Durability;
 use crate::search::Search;
@@ -1008,7 +1010,7 @@ fn prefix_end(prefix: &str) -> String {
 /// Timestamps come from SurrealKV's internal clock (nanoseconds since epoch).
 /// Both seconds and nanoseconds are exposed for callers that need either
 /// precision level.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     /// Timestamp in whole seconds (nanosecond timestamp / 1_000_000_000).
     pub timestamp_secs: u64,

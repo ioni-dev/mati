@@ -48,7 +48,11 @@ pub struct HistoryArgs {
 #[derive(Args)]
 pub struct ExportArgs {
     /// Output format: md or json
-    #[arg(long, default_value = "md")]
+    #[arg(
+        long,
+        default_value = "md",
+        long_help = "Output format:\n  md    Markdown with sections per category (gotchas, decisions, files, notes)\n  json  JSON array of Record objects. Each element contains: key, value, category,\n        confidence, quality, staleness_tier, lifecycle, payload, and version fields."
+    )]
     pub format: String,
 
     /// Output file (defaults to stdout)
@@ -351,8 +355,11 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
         Some("files") => ls_files(&store, use_color, limit).await?,
         Some("gotchas") => ls_gotchas(&store, use_color).await?,
         Some("decisions") => ls_decisions(&store, use_color).await?,
+        Some("notes") | Some("note") | Some("dev_note") | Some("dev_notes") => {
+            ls_notes(&store, use_color).await?
+        }
         Some(other) => {
-            anyhow::bail!("unknown category '{other}'. Valid: files, gotchas, decisions")
+            anyhow::bail!("unknown category '{other}'. Valid: files, gotchas, decisions, notes")
         }
         None => {
             ls_files(&store, use_color, limit).await?;
@@ -360,6 +367,8 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
             ls_gotchas(&store, use_color).await?;
             println!();
             ls_decisions(&store, use_color).await?;
+            println!();
+            ls_notes(&store, use_color).await?;
         }
     }
     Ok(())
@@ -634,6 +643,43 @@ async fn ls_decisions(store: &StoreProxy, _use_color: bool) -> Result<()> {
     Ok(())
 }
 
+async fn ls_notes(store: &StoreProxy, _use_color: bool) -> Result<()> {
+    let mut records = store.scan_prefix("dev_note:").await?;
+    records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+    if records.is_empty() {
+        println!("No note records found.");
+        return Ok(());
+    }
+
+    // Sort by updated_at descending
+    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Key"),
+            Cell::new("Text"),
+            Cell::new("Qual"),
+            Cell::new("Updated"),
+        ]);
+
+    for r in &records {
+        let key_short = r.key.strip_prefix("dev_note:").unwrap_or(&r.key);
+        table.add_row(vec![
+            Cell::new(key_short),
+            Cell::new(truncate(&r.value, 60)),
+            Cell::new(format!("{:.2}", r.quality.value)).fg(score_comfy_color(r.quality.value)),
+            Cell::new(format_date(r.updated_at)),
+        ]);
+    }
+
+    println!("{table}");
+    println!("  {} note records", records.len());
+    Ok(())
+}
+
 // ── run_export (M-08-M) ─────────────────────────────────────────────────────
 
 pub async fn run_export(args: ExportArgs) -> Result<()> {
@@ -772,7 +818,7 @@ async fn run_history_inner(proxy: &super::proxy::StoreProxy, args: &HistoryArgs)
         (Some(key), Some(since_str)) => {
             let secs = parse_since_duration(since_str)?;
             let since_ts = now_secs().saturating_sub(secs);
-            let entries = proxy.history_since(key, since_ts, args.limit)?;
+            let entries = proxy.history_since(key, since_ts, args.limit).await?;
             if entries.is_empty() {
                 println!(
                     "No history for '{}' in the last {}.",
@@ -785,7 +831,7 @@ async fn run_history_inner(proxy: &super::proxy::StoreProxy, args: &HistoryArgs)
         }
         // mati history <key>
         (Some(key), None) => {
-            let entries = proxy.history(key, args.limit)?;
+            let entries = proxy.history(key, args.limit).await?;
             if entries.is_empty() {
                 println!("No history for '{}'.", key);
                 return Ok(());
