@@ -963,7 +963,7 @@ fn preread_mati_binary_not_in_path_allows() {
 
     let essential_bins = [
         "bash", "cat", "echo", "printf", "sed", "grep", "awk", "env", "jq", "bc", "which", "tr",
-        "sort", "cut", "wc", "true", "false",
+        "sort", "cut", "wc", "true", "false", "sleep", "dirname", "basename",
     ];
     let system_dirs = ["/usr/bin", "/bin", "/usr/local/bin"];
 
