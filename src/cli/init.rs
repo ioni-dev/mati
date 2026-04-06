@@ -372,6 +372,45 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
     }
 
+    // ── 8c. Back-fill developer-created gotcha keys ──────────────────────────
+    // Auto-generated gotchas (cochange, revert, ownership) were handled above.
+    // Developer-created gotchas added via `mati gotcha add` before the file
+    // record existed were silently dropped by sync_gotcha_file_links (the file
+    // record didn't exist at confirm time). Re-scan all non-auto gotcha records
+    // and merge their affected_files into the file records being written now.
+    {
+        let all_gotchas = store.scan_prefix("gotcha:").await.unwrap_or_default();
+        let mut path_to_manual_keys: HashMap<String, Vec<String>> = HashMap::new();
+        for rec in &all_gotchas {
+            if !matches!(rec.lifecycle, RecordLifecycle::Active) {
+                continue;
+            }
+            let is_auto = rec.key.starts_with("gotcha:cochange:")
+                || rec.key.starts_with("gotcha:revert:")
+                || rec.key.starts_with("gotcha:ownership:");
+            if is_auto {
+                continue;
+            }
+            if let Some(g) = rec.payload_as::<GotchaRecord>() {
+                for file_path in &g.affected_files {
+                    path_to_manual_keys
+                        .entry(file_path.clone())
+                        .or_default()
+                        .push(rec.key.clone());
+                }
+            }
+        }
+        for fr in file_records.iter_mut() {
+            if let Some(keys) = path_to_manual_keys.get(&fr.path) {
+                for k in keys {
+                    if !fr.gotcha_keys.contains(k) {
+                        fr.gotcha_keys.push(k.clone());
+                    }
+                }
+            }
+        }
+    }
+
     // ── P3: Content hash staleness detection ─────────────────────────────────
     // On incremental runs: compare each changed file's new content_hash against
     // the stored FileRecord. Files whose hash changed get LinesChangedPct; their
