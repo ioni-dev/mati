@@ -261,14 +261,14 @@ fn init_next_steps_guidance() {
 
     // Next steps — the most important product guidance
     assert_contains(&stdout, "Next steps");
-    assert_contains(&stdout, "mati explain <file>");
+    assert_contains(&stdout, "mati explain");
     assert_contains(&stdout, "mati review");
     assert_contains(&stdout, "mati status");
 
-    // Next steps descriptions
-    assert_contains(&stdout, "file briefing");
-    assert_contains(&stdout, "confirm auto-detected candidates");
-    assert_contains(&stdout, "project memory dashboard");
+    // Next steps descriptions (setup_repo always has a hotspot, so explain shows hotspot path)
+    assert_contains(&stdout, "start here");
+    assert_contains(&stdout, "candidates for hook enforcement");
+    assert_contains(&stdout, "project knowledge dashboard");
 }
 
 #[test]
@@ -291,9 +291,9 @@ fn init_codex_reports_platform_capability() {
 
     assert_contains(&stdout, "integration:");
     assert_contains(&stdout, "Codex");
-    assert_contains(&stdout, "Codex capability:");
-    assert_contains(&stdout, "hard Bash enforcement");
-    assert_contains(&stdout, "soft native-read enforcement");
+    assert_contains(&stdout, "Enforcement");
+    assert_contains(&stdout, "Bash reads blocked");
+    assert_contains(&stdout, "gotchas injected on prompt submit");
 }
 
 #[test]
