@@ -32,7 +32,7 @@ const HOOKS_JSON: &str = r#"{
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "exec_command",
         "hooks": [
           {
             "type": "command",
@@ -44,7 +44,7 @@ const HOOKS_JSON: &str = r#"{
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "exec_command",
         "hooks": [
           {
             "type": "command",
@@ -104,9 +104,9 @@ Use `mati` as the codebase memory layer for this repository.
 
 ## Platform semantics
 
-- Codex mode has hard Bash enforcement and soft native-read enforcement.
-- Do not assume `mati` can block native file reads in Codex.
-- If Bash inspection is blocked, call `mem_get("file:<path>")` first.
+- Codex PreToolUse hooks are advisory only — they cannot block exec_command.
+- Enforcement is via UserPromptSubmit context injection (soft enforcement).
+- Always call `mem_get("file:<path>")` before shell-inspecting a file.
 "#;
 
 const SKILL_CONFIG_PATH: &str = ".codex/skills/mati/SKILL.md";
