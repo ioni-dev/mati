@@ -6,6 +6,7 @@ pub mod enrich;
 pub mod explain;
 pub mod gaps;
 pub mod gotcha;
+pub mod hook_decide;
 pub mod hooks;
 pub mod init;
 pub mod proxy;

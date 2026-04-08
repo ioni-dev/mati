@@ -7,6 +7,7 @@ pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # Fires for Read/Glob/Grep only — Bash is covered by the pre-bash PreToolUse hook.
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
+mkdir -p "${HOME}/.mati" 2>/dev/null || true
 
 INPUT=$(cat)
 

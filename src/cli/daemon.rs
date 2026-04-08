@@ -172,6 +172,12 @@ pub async fn run_daemon_start() -> Result<()> {
     // Remove stale socket from a previous unclean shutdown.
     let _ = std::fs::remove_file(&sock_path);
 
+    // Bind socket BEFORE writing PID file. This eliminates the race window
+    // where the PID file exists but the socket isn't ready yet — which causes
+    // `daemon_result` to return `Unresponsive` and `ensure_daemon` to fail open.
+    let listener = UnixListener::bind(&sock_path)
+        .with_context(|| format!("failed to bind Unix socket at {}", sock_path.display()))?;
+
     std::fs::write(
         &pid_path,
         format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
@@ -179,9 +185,6 @@ pub async fn run_daemon_start() -> Result<()> {
     .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
     // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
-
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("failed to bind Unix socket at {}", sock_path.display()))?;
 
     tracing::info!(
         path = %sock_path.display(),

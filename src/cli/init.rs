@@ -46,6 +46,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
     };
     let root = std::fs::canonicalize(&root)?;
 
+    let slug = derive_slug(&root);
+    let project_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!();
+    println!("◈  mati — project: {}  (slug: {})", project_name, slug);
+    println!();
+
+    // ── 0. Scaffold: agent hooks (no store access needed) ───────────────
+    // Install hooks BEFORE any store operations so they succeed even when
+    // the daemon holds the store lock. Hooks only write files to disk.
+    let (claude_installed, codex_installed) = install_scaffold(&root, &args)?;
+
     // Guard: mati init needs exclusive store access. If the daemon is running it
     // holds the SurrealKV lock — attempting Store::open would hang or fail with a
     // cryptic error. Detect this early and give a clear remediation message.
@@ -59,24 +74,37 @@ pub async fn run(args: InitArgs) -> Result<()> {
                     .map(|(_, o)| o)
                     .unwrap_or_else(|| "unknown".to_string());
                 if owner == "mcp" {
+                    if claude_installed || codex_installed {
+                        println!("  Hook scaffold updated successfully.");
+                        println!();
+                    }
                     anyhow::bail!(
                         "mati daemon is running and holds the store lock.\n\
                          The socket is owned by the active MCP server (mati serve).\n\
-                         To run mati init: close your Claude Code session first, then re-run:\n\n  \
+                         Hook scaffold was updated. To run a full re-init, close your\n\
+                         Claude Code / Codex session first, then re-run:\n\n  \
                          mati init\n"
                     );
                 } else {
+                    if claude_installed || codex_installed {
+                        println!("  Hook scaffold updated successfully.");
+                        println!();
+                    }
                     anyhow::bail!(
                         "mati daemon is running and holds the store lock.\n\
-                         Stop it first, then re-run init:\n\n  \
-                         mati daemon stop\n"
+                         Hook scaffold was updated. To run a full re-init, stop the daemon first:\n\n  \
+                         mati daemon stop && mati init\n"
                     );
                 }
             }
             DaemonResult::Unresponsive => {
+                if claude_installed || codex_installed {
+                    println!("  Hook scaffold updated successfully.");
+                    println!();
+                }
                 anyhow::bail!(
                     "mati daemon socket exists but is not responding (may hold the store lock).\n\
-                     Stop it first:\n\n  mati daemon stop\n"
+                     Hook scaffold was updated. Stop the daemon first:\n\n  mati daemon stop\n"
                 );
             }
             DaemonResult::NotRunning | DaemonResult::StaleSocket => {
@@ -101,25 +129,19 @@ pub async fn run(args: InitArgs) -> Result<()> {
                             false
                         };
                     if active {
+                        if claude_installed || codex_installed {
+                            println!("  Hook scaffold updated successfully.");
+                            println!();
+                        }
                         anyhow::bail!(
                             "a mati daemon is starting and may hold the store lock.\n\
-                             Wait a few seconds, then re-run:\n\n  mati init\n"
+                             Hook scaffold was updated. Wait a few seconds, then re-run:\n\n  mati init\n"
                         );
                     }
                 }
             }
         }
     }
-
-    let slug = derive_slug(&root);
-    let project_name = root
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    println!();
-    println!("◈  mati — project: {}  (slug: {})", project_name, slug);
-    println!();
 
     let total_start = Instant::now();
     let device_id = Uuid::new_v4();
@@ -752,147 +774,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         println!("  Search index...                (deferred to first MCP server startup)");
     }
 
-    let explicit_platform = args.claude || args.codex;
-    let has_claude_dir = root.join(".claude").is_dir();
-    let has_codex_dir = root.join(".codex").is_dir();
-    let install_claude_integration = !args.no_hooks
-        && if explicit_platform {
-            args.claude
-        } else {
-            has_claude_dir || !has_codex_dir
-        };
-    let install_codex_integration = !args.no_hooks
-        && if explicit_platform {
-            args.codex
-        } else {
-            has_codex_dir
-        };
-    let mut claude_installed = false;
-    let mut codex_installed = false;
-
-    // ── 12. Scaffold: Claude integration ────────────────────────────────────
-    if install_claude_integration {
-        let claude_dir = root.join(".claude");
-        if !claude_dir.is_dir() {
-            let _ = std::fs::create_dir_all(&claude_dir);
-        }
-        let t = Instant::now();
-        match write_claude_md_stub(&root) {
-            Ok(_) => println!(
-                "  Writing .claude/CLAUDE.md stub...                   {:>3}ms",
-                t.elapsed().as_millis()
-            ),
-            Err(e) => {
-                tracing::warn!("CLAUDE.md stub write failed: {e}");
-                println!("  Writing .claude/CLAUDE.md stub...    skipped — {:#}", e);
-            }
-        }
-
-        let t = Instant::now();
-        match install_hooks(&root) {
-            Ok(InstallResult::Installed { missing_deps, .. }) => {
-                claude_installed = true;
-                println!(
-                    "  Installing Claude integration...                    {:>3}ms",
-                    t.elapsed().as_millis()
-                );
-                {
-                    let g = if std::io::stderr().is_terminal() {
-                        super::colors::GRAY
-                    } else {
-                        ""
-                    };
-                    let r = if std::io::stderr().is_terminal() {
-                        super::colors::RESET
-                    } else {
-                        ""
-                    };
-                    println!("    {g}.claude/settings.json          hook registrations + MCP server config{r}");
-                    println!("    {g}.claude/hooks/                 6 hooks (pre-read, pre-bash, compliance, edit, compact, session-end){r}");
-                    println!("    {g}.claude/CLAUDE.md              knowledge capture + enrichment instructions{r}");
-                }
-                if !missing_deps.is_empty() {
-                    eprintln!();
-                    eprintln!(
-                        "  WARNING: Claude hook runtime dependencies missing: {}",
-                        missing_deps.join(", ")
-                    );
-                    eprintln!("  Claude hook enforcement will fail open until they are installed.");
-                    eprintln!();
-                }
-            }
-            Ok(InstallResult::NoClaude) => println!(
-                "  Installing Claude integration...                    {:>3}ms",
-                t.elapsed().as_millis()
-            ),
-            Err(e) => {
-                tracing::warn!("Claude integration installation failed: {e}");
-                println!("  Installing Claude integration...       FAILED");
-                eprintln!();
-                eprintln!("  WARNING: Claude integration failed — {e:#}");
-                eprintln!("  Claude read interception will not work until this is fixed.");
-                eprintln!("  Fix the issue above, then re-run: mati init --claude");
-                eprintln!();
-            }
-        }
-    }
-
-    // ── 13. Scaffold: Codex integration ─────────────────────────────────────
-    if install_codex_integration {
-        let t = Instant::now();
-        match install_codex(&root, args.codex) {
-            Ok(CodexInstallResult::Installed { missing_deps, .. }) => {
-                codex_installed = true;
-                println!(
-                    "  Installing Codex integration...                     {:>3}ms",
-                    t.elapsed().as_millis()
-                );
-                {
-                    let g = if std::io::stderr().is_terminal() {
-                        super::colors::GRAY
-                    } else {
-                        ""
-                    };
-                    let r = if std::io::stderr().is_terminal() {
-                        super::colors::RESET
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "    {g}.codex/config.toml             MCP server + hooks feature flag{r}"
-                    );
-                    println!("    {g}.codex/hooks/                  5 hooks (session-start, prompt-submit, pre-bash, post-bash, stop){r}");
-                    println!("    {g}.codex/skills/mati/            skill instructions for agent guidance{r}");
-                }
-                if !missing_deps.is_empty() {
-                    eprintln!();
-                    eprintln!(
-                        "  WARNING: Codex hook runtime dependencies missing: {}",
-                        missing_deps.join(", ")
-                    );
-                    eprintln!("  Codex Bash enforcement will fail open until they are installed.");
-                    eprintln!();
-                }
-            }
-            Ok(CodexInstallResult::NoCodex) => println!(
-                "  Installing Codex integration...                     {:>3}ms",
-                t.elapsed().as_millis()
-            ),
-            Err(e) => {
-                tracing::warn!("Codex integration installation failed: {e}");
-                println!("  Installing Codex integration...        FAILED");
-                eprintln!();
-                eprintln!("  WARNING: Codex integration failed — {e:#}");
-                eprintln!(
-                    "  Codex MCP/skill/hook support will not be available until this is fixed."
-                );
-                eprintln!("  Fix the issue above, then re-run: mati init --codex");
-                eprintln!();
-            }
-        }
-    }
-
-    // ── 14. Close ────────────────────────────────────────────────────────────
+    // ── 12. Close ────────────────────────────────────────────────────────────
     graph.close().await?;
 
     // ── Summary ──────────────────────────────────────────────────────────────
@@ -1856,4 +1738,207 @@ fn is_code_file(path: &str) -> bool {
         Some(ext) => CODE_EXTENSIONS.contains(&ext),
         None => false,
     }
+}
+
+// ── Scaffold installation (no store access) ─────────────────────────────────
+
+/// Install agent hooks and scaffold files. Returns (claude_installed, codex_installed).
+///
+/// This function only writes files to disk — it never opens the store or
+/// contacts the daemon. Safe to call even when the daemon holds the lock.
+pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool, bool)> {
+    let explicit_platform = args.claude || args.codex;
+    let has_claude_dir = root.join(".claude").is_dir();
+    let has_codex_dir = root.join(".codex").is_dir();
+    let install_claude_integration = !args.no_hooks
+        && if explicit_platform {
+            args.claude
+        } else {
+            has_claude_dir || !has_codex_dir
+        };
+    let install_codex_integration = !args.no_hooks
+        && if explicit_platform {
+            args.codex
+        } else {
+            has_codex_dir
+        };
+    let mut claude_installed = false;
+    let mut codex_installed = false;
+
+    if install_claude_integration {
+        let claude_dir = root.join(".claude");
+        if !claude_dir.is_dir() {
+            let _ = std::fs::create_dir_all(&claude_dir);
+        }
+        let t = Instant::now();
+        match write_claude_md_stub(root) {
+            Ok(_) => println!(
+                "  Writing .claude/CLAUDE.md stub...                   {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("CLAUDE.md stub write failed: {e}");
+                println!("  Writing .claude/CLAUDE.md stub...    skipped — {:#}", e);
+            }
+        }
+
+        let t = Instant::now();
+        match install_hooks(root) {
+            Ok(InstallResult::Installed { missing_deps, .. }) => {
+                claude_installed = true;
+                println!(
+                    "  Installing Claude integration...                    {:>3}ms",
+                    t.elapsed().as_millis()
+                );
+                {
+                    let g = if std::io::stderr().is_terminal() {
+                        super::colors::GRAY
+                    } else {
+                        ""
+                    };
+                    let r = if std::io::stderr().is_terminal() {
+                        super::colors::RESET
+                    } else {
+                        ""
+                    };
+                    println!("    {g}.claude/settings.json          hook registrations + MCP server config{r}");
+                    println!("    {g}.claude/hooks/                 6 hooks (pre-read, pre-bash, compliance, edit, compact, session-end){r}");
+                    println!("    {g}.claude/CLAUDE.md              knowledge capture + enrichment instructions{r}");
+                }
+                if !missing_deps.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: Claude hook runtime dependencies missing: {}",
+                        missing_deps.join(", ")
+                    );
+                    eprintln!("  Claude hook enforcement will fail open until they are installed.");
+                    eprintln!();
+                }
+            }
+            Ok(InstallResult::NoClaude) => println!(
+                "  Installing Claude integration...                    {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("Claude integration installation failed: {e}");
+                println!("  Installing Claude integration...       FAILED");
+                eprintln!();
+                eprintln!("  WARNING: Claude integration failed — {e:#}");
+                eprintln!("  Claude read interception will not work until this is fixed.");
+                eprintln!("  Fix the issue above, then re-run: mati init --claude");
+                eprintln!();
+            }
+        }
+    }
+
+    if install_codex_integration {
+        let t = Instant::now();
+        match install_codex(root, args.codex) {
+            Ok(CodexInstallResult::Installed { missing_deps, .. }) => {
+                codex_installed = true;
+                println!(
+                    "  Installing Codex integration...                     {:>3}ms",
+                    t.elapsed().as_millis()
+                );
+                {
+                    let g = if std::io::stderr().is_terminal() {
+                        super::colors::GRAY
+                    } else {
+                        ""
+                    };
+                    let r = if std::io::stderr().is_terminal() {
+                        super::colors::RESET
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {g}.codex/config.toml             MCP server + hooks feature flag{r}"
+                    );
+                    println!("    {g}.codex/hooks/                  5 hooks (session-start, prompt-submit, pre-bash, post-bash, stop){r}");
+                    println!("    {g}.codex/skills/mati/            skill instructions for agent guidance{r}");
+                }
+                if !missing_deps.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "  WARNING: Codex hook runtime dependencies missing: {}",
+                        missing_deps.join(", ")
+                    );
+                    eprintln!("  Codex Bash enforcement will fail open until they are installed.");
+                    eprintln!();
+                }
+            }
+            Ok(CodexInstallResult::NoCodex) => println!(
+                "  Installing Codex integration...                     {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("Codex integration installation failed: {e}");
+                println!("  Installing Codex integration...        FAILED");
+                eprintln!();
+                eprintln!("  WARNING: Codex integration failed — {e:#}");
+                eprintln!(
+                    "  Codex MCP/skill/hook support will not be available until this is fixed."
+                );
+                eprintln!("  Fix the issue above, then re-run: mati init --codex");
+                eprintln!();
+            }
+        }
+    }
+
+    Ok((claude_installed, codex_installed))
+}
+
+// ── `mati hooks` subcommand ─────────────────────────────────────────────────
+
+/// Arguments for `mati hooks` — install or update agent hooks without a full re-init.
+#[derive(Args)]
+pub struct HooksArgs {
+    /// Path to repository root (defaults to current directory)
+    #[arg(short, long)]
+    pub path: Option<PathBuf>,
+
+    /// Install or update Codex integration into .codex/
+    #[arg(long)]
+    pub codex: bool,
+
+    /// Install or update Claude integration into .claude/
+    #[arg(long)]
+    pub claude: bool,
+}
+
+/// Install or update agent hooks without touching the store.
+///
+/// Lightweight alternative to `mati init` — writes hook scripts, settings.json,
+/// and SKILL.md from the current binary. Safe to run while the daemon is active.
+pub fn run_hooks(args: HooksArgs) -> Result<()> {
+    let root = match &args.path {
+        Some(p) => p.clone(),
+        None => std::env::current_dir()?,
+    };
+    let root = std::fs::canonicalize(&root)?;
+
+    let init_args = InitArgs {
+        path: Some(root.clone()),
+        no_hooks: false,
+        codex: args.codex,
+        claude: args.claude,
+    };
+
+    let project_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!();
+    println!("◈  mati hooks — project: {}", project_name);
+    println!();
+
+    let (claude_installed, codex_installed) = install_scaffold(&root, &init_args)?;
+
+    if !claude_installed && !codex_installed {
+        println!("  No platform detected. Use --claude or --codex to force installation.");
+    }
+
+    println!();
+    Ok(())
 }

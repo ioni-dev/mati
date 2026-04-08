@@ -600,6 +600,95 @@ async fn socket_dispatch(
             }
         }
 
+        // ── Internal hook-decide bulk command ────────────────────────────
+        // Returns file record + all linked gotcha records + consultation
+        // status in a single round-trip. NOT an MCP tool.
+        "hook_evaluate" => {
+            let file_key = match req.args.get("file_key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.file_key"),
+            };
+            let include_recent = req
+                .args
+                .get("include_recent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let g = graph.read().await;
+            let store = g.store();
+
+            // 1. Fetch file record. Distinguish Ok(None) from Err.
+            let (file_record, store_error) = match store.get(file_key).await {
+                Ok(Some(r)) => (serde_json::to_value(&r).ok(), false),
+                Ok(None) => (None, false),
+                Err(e) => {
+                    tracing::warn!("hook_evaluate: store.get({file_key}) failed: {e}");
+                    (None, true)
+                }
+            };
+
+            // 2. Fetch all linked gotcha records.
+            let mut gotcha_records = serde_json::Map::new();
+            let mut gotcha_error = false;
+            if let Some(ref fr) = file_record {
+                if let Some(keys) = fr
+                    .pointer("/payload/gotcha_keys")
+                    .and_then(|v| v.as_array())
+                {
+                    for gk in keys {
+                        if let Some(key_str) = gk.as_str() {
+                            match store.get(key_str).await {
+                                Ok(Some(grec)) => {
+                                    // Inline confirmed flag (same as "get" handler).
+                                    let confirmed = grec
+                                        .payload_as::<crate::store::GotchaRecord>()
+                                        .map(|g| g.confirmed)
+                                        .unwrap_or(false);
+                                    if let Ok(mut val) = serde_json::to_value(&grec) {
+                                        if let Some(obj) = val.as_object_mut() {
+                                            obj.insert(
+                                                "confirmed".to_string(),
+                                                serde_json::Value::Bool(confirmed),
+                                            );
+                                        }
+                                        gotcha_records
+                                            .insert(key_str.to_string(), val);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!("hook_evaluate: store.get({key_str}) failed: {e}");
+                                    gotcha_error = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Consultation status.
+            let consulted = sess::check_consulted(store, file_key)
+                .await
+                .unwrap_or(false);
+            let consulted_recent = if include_recent {
+                sess::check_consulted_recent(store, file_key, 900)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            SocketResponse::ok(serde_json::json!({
+                "file_key": file_key,
+                "file_record": file_record,
+                "gotcha_records": gotcha_records,
+                "consulted": consulted,
+                "consulted_recent": consulted_recent,
+                "store_error": store_error,
+                "gotcha_error": gotcha_error,
+            }))
+        }
+
         "log_hit" => {
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
@@ -935,6 +1024,9 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
+            if !key.starts_with("gotcha:") {
+                return SocketResponse::err("delete action only applies to gotcha: keys");
+            }
             // Read affected_files from args if provided, otherwise look up the
             // record to get them. The MCP proxy sends delete without affected_files.
             let mut affected_files: Vec<String> = req
