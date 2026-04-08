@@ -31,10 +31,12 @@ pub struct InitArgs {
     pub no_hooks: bool,
 
     /// Install or update Codex integration into .codex/
+    /// (auto-detected if .codex/ exists and no flag is given)
     #[arg(long)]
     pub codex: bool,
 
     /// Install or update Claude integration into .claude/
+    /// (auto-detected if .claude/ exists and no flag is given)
     #[arg(long)]
     pub claude: bool,
 }
@@ -1750,11 +1752,16 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
     let explicit_platform = args.claude || args.codex;
     let has_claude_dir = root.join(".claude").is_dir();
     let has_codex_dir = root.join(".codex").is_dir();
+
+    // Platform selection:
+    //   Flags present       → install exactly what was requested.
+    //   No flags + dirs     → auto-detect from existing .claude/ and .codex/.
+    //   No flags + no dirs  → scan only, guide user to pick a platform.
     let install_claude_integration = !args.no_hooks
         && if explicit_platform {
             args.claude
         } else {
-            has_claude_dir || !has_codex_dir
+            has_claude_dir
         };
     let install_codex_integration = !args.no_hooks
         && if explicit_platform {
@@ -1762,6 +1769,15 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
         } else {
             has_codex_dir
         };
+
+    if !args.no_hooks && !explicit_platform && !has_claude_dir && !has_codex_dir {
+        println!("  No platform detected (.claude/ or .codex/ not found).");
+        println!("  Skipping hook installation. To install, run:");
+        println!();
+        println!("    mati init --claude    # for Claude Code");
+        println!("    mati init --codex     # for Codex");
+        println!();
+    }
     let mut claude_installed = false;
     let mut codex_installed = false;
 
