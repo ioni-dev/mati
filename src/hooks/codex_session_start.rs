@@ -1,30 +1,29 @@
-/// Codex SessionStart hook — project knowledge injection at session start.
+/// Codex SessionStart hook — daemon health check + compact sentinel.
 ///
-/// Injects a compact summary of confirmed gotcha count, hotspot count, and
-/// the enforcement model so the agent starts with awareness of the knowledge
-/// layer from turn one. Also logs the bootstrap event for analytics.
+/// Auto-starts the daemon if needed, logs a bootstrap event for analytics,
+/// and emits a ~5-token sentinel. All workflow instructions live in SKILL.md
+/// (loaded once by the platform) — the hook does not repeat them.
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
+mkdir -p "${HOME}/.mati" 2>/dev/null || true
 
-if ! mati ping >/dev/null 2>&1; then
-  exit 0
-fi
-
-# Count confirmed gotchas and hotspot files for a compact summary
-GOTCHA_COUNT=0
-HOTSPOT_COUNT=0
-
-if command -v jq >/dev/null 2>&1; then
-  GOTCHAS=$(mati get "analytics:knowledge_snapshot" 2>/dev/null || echo "null")
-  if [ "$GOTCHAS" != "null" ] && [ -n "$GOTCHAS" ]; then
-    GOTCHA_COUNT=$(printf '%s\n' "$GOTCHAS" | jq -r '.payload.confirmed_gotchas // 0' 2>/dev/null || echo "0")
-    HOTSPOT_COUNT=$(printf '%s\n' "$GOTCHAS" | jq -r '.payload.hotspot_files // 0' 2>/dev/null || echo "0")
+if ! mati ping --daemon-only >/dev/null 2>&1; then
+  mati daemon start </dev/null >/dev/null 2>&1 &
+  READY=false
+  for _attempt in 1 2 3; do
+    sleep 0.15
+    if mati ping --daemon-only >/dev/null 2>&1; then READY=true; break; fi
+  done
+  if [ "$READY" = "false" ]; then
+    echo "[mati] WARNING: daemon bootstrap failed — PreToolUse hooks will retry independently." >&2
+    { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start result=failed" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+    exit 0
   fi
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start result=ok" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
 fi
 
 mati log-bootstrap "__codex_session__" >/dev/null 2>&1 || true
 
-MSG="[mati] ${GOTCHA_COUNT} confirmed gotchas, ${HOTSPOT_COUNT} hotspot files tracked. Call mem_bootstrap() for full context. Before editing any file, call mem_get(\"file:<path>\") -- gotchas will be injected via UserPromptSubmit hook. Bash file inspection is structurally enforced (denied until consulted)."
-printf '%s' "$MSG" | jq -Rs '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:.}}'
+printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"[mati] active"}}\n'
 "#;

@@ -88,10 +88,17 @@ enum Commands {
     },
 
     // ── Infrastructure ───────────────────────────────────────────────────
+    /// Install or update agent hooks without a full re-init (safe while daemon is running)
+    Hooks(cli::init::HooksArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
-    Ping,
+    Ping {
+        /// Only check the daemon socket — exit 1 if no daemon is running
+        /// (skip direct store fallback). Used by hook scripts.
+        #[arg(long)]
+        daemon_only: bool,
+    },
     /// Run as MCP stdio server (for Claude/Codex agent integration)
     Serve {
         /// Project root directory. Defaults to current working directory.
@@ -101,6 +108,9 @@ enum Commands {
         path: Option<std::path::PathBuf>,
     },
     // ── Internal hook commands (hidden from --help) ─────────────────────
+    /// Enforcement decision engine for hook scripts.
+    #[command(hide = true, name = "hook-decide")]
+    HookDecide(cli::hook_decide::HookDecideArgs),
     #[command(hide = true)]
     DocCapture {
         /// Repo-relative file path
@@ -186,12 +196,13 @@ async fn main() -> Result<()> {
         Commands::Stale(args) => cli::stale::run(args).await,
         Commands::Repair(args) => cli::repair::run(args).await,
         Commands::Check => cli::check::run().await,
+        Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
             cli::daemon::DaemonCommand::Stop => cli::daemon::run_daemon_stop().await,
             cli::daemon::DaemonCommand::Status => cli::daemon::run_daemon_status().await,
         },
-        Commands::Ping => {
+        Commands::Ping { daemon_only } => {
             let cwd = std::env::current_dir()?;
             // Try daemon socket first (avoids store open conflict when mati serve is running).
             let root = cli::daemon::mati_root_for(&cwd)?;
@@ -205,6 +216,12 @@ async fn main() -> Result<()> {
                     anyhow::bail!("mati daemon unresponsive");
                 }
                 cli::daemon::DaemonResult::NotRunning | cli::daemon::DaemonResult::StaleSocket => {
+                    if daemon_only {
+                        // Hook scripts use --daemon-only to check daemon liveness
+                        // without the store fallback. Exit 1 so hooks fail-open
+                        // with a visible warning instead of silently succeeding.
+                        std::process::exit(1);
+                    }
                     // No daemon — fall through to direct store open.
                 }
             }
@@ -220,6 +237,7 @@ async fn main() -> Result<()> {
             };
             mati_core::mcp::serve(&root).await
         }
+        Commands::HookDecide(args) => cli::hook_decide::run(args).await,
         Commands::Get { key } => cli::hooks::run_get(&key).await,
         Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
         Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,

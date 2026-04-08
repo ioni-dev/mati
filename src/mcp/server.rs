@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
 use crate::store::{derive_slug, Store};
 
@@ -599,6 +600,96 @@ async fn socket_dispatch(
             }
         }
 
+        // ── Internal hook-decide bulk command ────────────────────────────
+        // Returns file record + all linked gotcha records + consultation
+        // status in a single round-trip. NOT an MCP tool.
+        "hook_evaluate" => {
+            let file_key = match req.args.get("file_key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.file_key"),
+            };
+            let include_recent = req
+                .args
+                .get("include_recent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let g = graph.read().await;
+            let store = g.store();
+
+            // 1. Fetch file record. Distinguish Ok(None) from Err.
+            let (file_record, store_error) = match store.get(file_key).await {
+                Ok(Some(r)) => (serde_json::to_value(&r).ok(), false),
+                Ok(None) => (None, false),
+                Err(e) => {
+                    tracing::warn!("hook_evaluate: store.get({file_key}) failed: {e}");
+                    (None, true)
+                }
+            };
+
+            // 2. Fetch all linked gotcha records.
+            let mut gotcha_records = serde_json::Map::new();
+            let mut gotcha_error = false;
+            if let Some(ref fr) = file_record {
+                if let Some(keys) = fr
+                    .pointer("/payload/gotcha_keys")
+                    .and_then(|v| v.as_array())
+                {
+                    for gk in keys {
+                        if let Some(key_str) = gk.as_str() {
+                            match store.get(key_str).await {
+                                Ok(Some(grec)) => {
+                                    // Inline confirmed flag (same as "get" handler).
+                                    let confirmed = grec
+                                        .payload_as::<crate::store::GotchaRecord>()
+                                        .map(|g| g.confirmed)
+                                        .unwrap_or(false);
+                                    if let Ok(mut val) = serde_json::to_value(&grec) {
+                                        if let Some(obj) = val.as_object_mut() {
+                                            obj.insert(
+                                                "confirmed".to_string(),
+                                                serde_json::Value::Bool(confirmed),
+                                            );
+                                        }
+                                        gotcha_records.insert(key_str.to_string(), val);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "hook_evaluate: store.get({key_str}) failed: {e}"
+                                    );
+                                    gotcha_error = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Consultation status.
+            let consulted = sess::check_consulted(store, file_key)
+                .await
+                .unwrap_or(false);
+            let consulted_recent = if include_recent {
+                sess::check_consulted_recent(store, file_key, 900)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            SocketResponse::ok(serde_json::json!({
+                "file_key": file_key,
+                "file_record": file_record,
+                "gotcha_records": gotcha_records,
+                "consulted": consulted,
+                "consulted_recent": consulted_recent,
+                "store_error": store_error,
+                "gotcha_error": gotcha_error,
+            }))
+        }
+
         "log_hit" => {
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k,
@@ -825,6 +916,43 @@ async fn socket_dispatch(
             }
         }
 
+        "history" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let g = graph.read().await;
+            match g.store().history(key, limit) {
+                Ok(entries) => match serde_json::to_value(&entries) {
+                    Ok(val) => SocketResponse::ok(val),
+                    Err(e) => SocketResponse::err(format!("serialize: {e}")),
+                },
+                Err(e) => SocketResponse::err(format!("history: {e}")),
+            }
+        }
+
+        "history_since" => {
+            let key = match req.args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return SocketResponse::err("missing args.key"),
+            };
+            let since_ts = req
+                .args
+                .get("since_ts")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let g = graph.read().await;
+            match g.store().history_since(key, since_ts, limit) {
+                Ok(entries) => match serde_json::to_value(&entries) {
+                    Ok(val) => SocketResponse::ok(val),
+                    Err(e) => SocketResponse::err(format!("serialize: {e}")),
+                },
+                Err(e) => SocketResponse::err(format!("history_since: {e}")),
+            }
+        }
+
         "gotcha_write" => {
             use crate::store::gotcha_ops::apply_gotcha_write;
             use crate::store::Record;
@@ -853,11 +981,41 @@ async fn socket_dispatch(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let g = graph.read().await;
-            match apply_gotcha_write(g.store(), &record, &old_files, &new_files, is_new).await {
-                Ok(()) => SocketResponse::ok(serde_json::Value::String("written".into())),
-                Err(e) => SocketResponse::err(format!("{e}")),
+            {
+                let g = graph.read().await;
+                match apply_gotcha_write(g.store(), &record, &old_files, &new_files, is_new).await {
+                    Ok(()) => {}
+                    Err(e) => return SocketResponse::err(format!("{e}")),
+                }
             }
+
+            // Sync the in-memory graph: add HasGotcha edges for newly-affected files,
+            // remove edges for files no longer affected. The persistent store was already
+            // updated by apply_gotcha_write above; this keeps the in-memory adjacency list
+            // in sync so that assemble_context_packet (bootstrap) sees the edges immediately
+            // without requiring a daemon restart.
+            let record_key = record.key.clone();
+            let old_set: std::collections::HashSet<&str> =
+                old_files.iter().map(String::as_str).collect();
+            let new_set: std::collections::HashSet<&str> =
+                new_files.iter().map(String::as_str).collect();
+            {
+                let mut g = graph.write().await;
+                for file_path in new_set.difference(&old_set) {
+                    let file_key = format!("file:{file_path}");
+                    let _ = g
+                        .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
+                        .await;
+                }
+                for file_path in old_set.difference(&new_set) {
+                    let file_key = format!("file:{file_path}");
+                    let _ = g
+                        .remove_edge(&file_key, &EdgeKind::HasGotcha, &record_key)
+                        .await;
+                }
+            }
+
+            SocketResponse::ok(serde_json::Value::String("written".into()))
         }
 
         "gotcha_tombstone" => {
@@ -867,6 +1025,9 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
+            if !key.starts_with("gotcha:") {
+                return SocketResponse::err("delete action only applies to gotcha: keys");
+            }
             // Read affected_files from args if provided, otherwise look up the
             // record to get them. The MCP proxy sends delete without affected_files.
             let mut affected_files: Vec<String> = req
@@ -980,6 +1141,9 @@ async fn socket_dispatch(
                     }
                 }
             }
+
+            // Propagate confirmation_count to linked file records
+            crate::store::gotcha_ops::propagate_confirmation_to_files(store, &affected_files).await;
 
             SocketResponse::ok(serde_json::json!({"confirmed": true, "key": key}))
         }

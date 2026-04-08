@@ -7,11 +7,16 @@ pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # Fires for Read/Glob/Grep only — Bash is covered by the pre-bash PreToolUse hook.
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
+mkdir -p "${HOME}/.mati" 2>/dev/null || true
 
 INPUT=$(cat)
 
 # Guard: jq required
-command -v jq &>/dev/null || exit 0
+if ! command -v jq &>/dev/null; then
+  echo "[mati] missing jq — enforcement bypassed" >&2
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") reason=missing_deps" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+  exit 0
+fi
 
 # Extract file path from tool input (Read/Glob/Grep have file_path or path)
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || echo "")
@@ -40,7 +45,11 @@ case "$REL_PATH" in
 esac
 
 # Guard: mati must be reachable
-mati ping &>/dev/null || exit 0
+if ! mati ping --daemon-only &>/dev/null; then
+  echo "[mati] WARNING: daemon not running — enforcement bypassed" >&2
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") file=${REL_PATH:-unknown}" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+  exit 0
+fi
 
 # Check if this file was consulted via mati before being read
 CONSULTED=$(mati session-check-consulted "file:$REL_PATH" 2>/dev/null || echo "false")
