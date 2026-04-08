@@ -50,9 +50,7 @@ pub async fn run(args: HookDecideArgs) -> Result<()> {
     // 3. Resolve repo root via git2 (no subprocess).
     let cwd = std::env::current_dir()?;
     let repo_root = discover_repo_root(&cwd);
-    let repo_root_str = repo_root
-        .as_ref()
-        .and_then(|p| p.to_str());
+    let repo_root_str = repo_root.as_ref().and_then(|p| p.to_str());
     // Platform limitation: bare relative paths in shell commands (e.g. `cat foo.rs`)
     // resolve against the hook process cwd, which is the repo root when set by
     // Claude Code / Codex. If the platform changes cwd semantics, relative paths
@@ -96,10 +94,7 @@ pub async fn run(args: HookDecideArgs) -> Result<()> {
     )
     .await
     {
-        DaemonResult::Ok(resp) => resp
-            .get("data")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
+        DaemonResult::Ok(resp) => resp.get("data").cloned().unwrap_or(serde_json::Value::Null),
         _ => {
             log_fail_open(&rel_path, "hook_evaluate failed");
             emit_allow(args.variant);
@@ -114,9 +109,7 @@ pub async fn run(args: HookDecideArgs) -> Result<()> {
     fire_events(&mati_root, &adapter.events).await;
 
     // Fail-open telemetry for store/gotcha errors.
-    if let EvalDataCheck::FailOpen(reason) =
-        check_eval_data(args.variant, &rel_path, &eval_data)
-    {
+    if let EvalDataCheck::FailOpen(reason) = check_eval_data(args.variant, &rel_path, &eval_data) {
         log_fail_open(&rel_path, &reason);
     }
 
@@ -148,9 +141,7 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
         }
-        HookVariant::ClaudePreBash
-        | HookVariant::CodexPreBash
-        | HookVariant::CodexPostBash => {
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::CodexPostBash => {
             // Raw command string — classify then extract.
             let cmd = input
                 .pointer("/tool_input/command")
@@ -173,16 +164,14 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
 /// this, repos without a remote URL get different slugs from `hook-decide`
 /// vs `mati init`/`mati daemon`, causing daemon socket discovery to fail.
 fn discover_repo_root(cwd: &Path) -> Option<PathBuf> {
-    git2::Repository::discover(cwd)
-        .ok()
-        .and_then(|repo| {
-            repo.workdir().map(|p| {
-                // Strip trailing separator that git2's workdir() sometimes adds.
-                let s = p.to_string_lossy();
-                let trimmed = s.trim_end_matches('/');
-                PathBuf::from(trimmed)
-            })
+    git2::Repository::discover(cwd).ok().and_then(|repo| {
+        repo.workdir().map(|p| {
+            // Strip trailing separator that git2's workdir() sometimes adds.
+            let s = p.to_string_lossy();
+            let trimmed = s.trim_end_matches('/');
+            PathBuf::from(trimmed)
         })
+    })
 }
 
 // ── Daemon readiness ────────────────────────────────────────────────────────
@@ -331,10 +320,7 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
     )
     .await
     {
-        DaemonResult::Ok(resp) => resp
-            .get("data")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        DaemonResult::Ok(resp) => resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false),
         _ => false,
     };
 
@@ -344,12 +330,7 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
     } else {
         "log_codex_shell_miss"
     };
-    let _ = daemon_result(
-        mati_root,
-        cmd,
-        serde_json::json!({ "key": &file_key }),
-    )
-    .await;
+    let _ = daemon_result(mati_root, cmd, serde_json::json!({ "key": &file_key })).await;
 
     // Post-hook: no output, always exit 0.
     Ok(())
@@ -358,17 +339,13 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
 // ── Fail-open telemetry ─────────────────────────────────────────────────────
 
 fn log_fail_open(rel_path: &str, reason: &str) {
-    eprintln!(
-        "[mati] WARNING: enforcement bypassed for {rel_path} — {reason}"
-    );
+    eprintln!("[mati] WARNING: enforcement bypassed for {rel_path} — {reason}");
     if let Some(home) = dirs::home_dir() {
         let log_dir = home.join(".mati");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join("fail_open.log");
         let now = chrono_lite_utc();
-        let entry = format!(
-            "{now} FAIL_OPEN hook=hook-decide file={rel_path} reason={reason}\n"
-        );
+        let entry = format!("{now} FAIL_OPEN hook=hook-decide file={rel_path} reason={reason}\n");
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -477,11 +454,7 @@ fn extract_gotcha_map(eval_data: &serde_json::Value) -> HashMap<String, serde_js
     eval_data
         .get("gotcha_records")
         .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default()
 }
 
@@ -527,7 +500,10 @@ fn check_eval_data(
     rel_path: &str,
     eval_data: &serde_json::Value,
 ) -> EvalDataCheck {
-    let include_recent = matches!(variant, HookVariant::CodexPreBash | HookVariant::CodexPostBash);
+    let include_recent = matches!(
+        variant,
+        HookVariant::CodexPreBash | HookVariant::CodexPostBash
+    );
     let already_consulted = if include_recent {
         eval_data
             .get("consulted_recent")
@@ -758,7 +734,10 @@ mod tests {
             context: "test".into(),
         };
         let result = platform_events(HookVariant::CodexPreBash, &decision, events);
-        assert!(result.is_empty(), "Codex should not mint receipts for silent outcomes");
+        assert!(
+            result.is_empty(),
+            "Codex should not mint receipts for silent outcomes"
+        );
     }
 
     #[test]
@@ -799,16 +778,18 @@ mod tests {
 
     #[test]
     fn claude_keeps_all_events() {
-        let events = vec![
-            HookEvent::Hit {
-                key: "file:src/main.rs".into(),
-            },
-        ];
+        let events = vec![HookEvent::Hit {
+            key: "file:src/main.rs".into(),
+        }];
         let decision = Decision::Advisory {
             context: "test".into(),
         };
         let result = platform_events(HookVariant::ClaudePreRead, &decision, events);
-        assert_eq!(result.len(), 1, "Claude should keep Hit for advisory outcomes");
+        assert_eq!(
+            result.len(),
+            1,
+            "Claude should keep Hit for advisory outcomes"
+        );
     }
 
     #[test]
@@ -862,11 +843,7 @@ mod tests {
     #[test]
     fn e2e_codex_deny_exit2_stderr_and_shell_blocked_event() {
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(
-            HookVariant::CodexPreBash,
-            "src/main.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 2, "Codex deny must exit 2");
         assert!(
@@ -887,15 +864,11 @@ mod tests {
     #[test]
     fn e2e_claude_deny_json_output_and_blocked_event() {
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(
-            HookVariant::ClaudePreBash,
-            "src/main.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0, "Claude always exits 0");
-        let json: serde_json::Value = serde_json::from_str(&result.stdout)
-            .expect("stdout must be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
         assert_eq!(
             json.pointer("/hookSpecificOutput/permissionDecision")
                 .and_then(|v| v.as_str()),
@@ -932,11 +905,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(
-            HookVariant::CodexPreBash,
-            "src/lib.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/lib.rs", &data);
 
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.is_empty(), "Codex advisory must be silent");
@@ -967,15 +936,11 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(
-            HookVariant::ClaudePreRead,
-            "src/lib.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::ClaudePreRead, "src/lib.rs", &data);
 
         assert_eq!(result.exit_code, 0);
-        let json: serde_json::Value = serde_json::from_str(&result.stdout)
-            .expect("stdout must be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
         assert_eq!(
             json.pointer("/hookSpecificOutput/permissionDecision")
                 .and_then(|v| v.as_str()),
@@ -997,11 +962,7 @@ mod tests {
     fn e2e_codex_consulted_allows_silently() {
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
-        let result = process_eval_response(
-            HookVariant::CodexPreBash,
-            "src/main.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0, "consulted file must not be blocked");
         assert!(result.stdout.is_empty());
@@ -1021,11 +982,7 @@ mod tests {
             "store_error": true,
             "gotcha_error": false
         });
-        let result = process_eval_response(
-            HookVariant::CodexPreBash,
-            "src/main.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0, "store error must fail open");
         assert_eq!(result.decision, Decision::Allow);
@@ -1048,15 +1005,11 @@ mod tests {
             "store_error": false,
             "gotcha_error": true
         });
-        let result = process_eval_response(
-            HookVariant::ClaudePreBash,
-            "src/main.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0, "gotcha error must fail open");
-        let json: serde_json::Value = serde_json::from_str(&result.stdout)
-            .expect("stdout must be valid JSON");
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
         assert_eq!(
             json.pointer("/hookSpecificOutput/permissionDecision")
                 .and_then(|v| v.as_str()),
@@ -1076,11 +1029,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(
-            HookVariant::ClaudePreRead,
-            "src/new.rs",
-            &data,
-        );
+        let result = process_eval_response(HookVariant::ClaudePreRead, "src/new.rs", &data);
 
         assert_eq!(result.exit_code, 0);
         assert!(matches!(result.decision, Decision::NoRecord));

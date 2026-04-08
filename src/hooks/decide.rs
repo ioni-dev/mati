@@ -381,10 +381,7 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
             };
         }
 
-        let safe_path = input
-            .rel_path
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
+        let safe_path = input.rel_path.replace('\\', "\\\\").replace('"', "\\\"");
         let staleness_note = if staleness >= 0.4 {
             format!(" (staleness {staleness:.2} — verify critical details)")
         } else {
@@ -471,12 +468,18 @@ mod tests {
 
     #[test]
     fn classify_cat() {
-        assert_eq!(classify_command("cat src/main.rs"), Some(CommandClass::CatLike));
+        assert_eq!(
+            classify_command("cat src/main.rs"),
+            Some(CommandClass::CatLike)
+        );
     }
 
     #[test]
     fn classify_head_with_flag() {
-        assert_eq!(classify_command("head -n 10 file.rs"), Some(CommandClass::CatLike));
+        assert_eq!(
+            classify_command("head -n 10 file.rs"),
+            Some(CommandClass::CatLike)
+        );
     }
 
     #[test]
@@ -486,37 +489,58 @@ mod tests {
 
     #[test]
     fn classify_less() {
-        assert_eq!(classify_command("less README.md"), Some(CommandClass::CatLike));
+        assert_eq!(
+            classify_command("less README.md"),
+            Some(CommandClass::CatLike)
+        );
     }
 
     #[test]
     fn classify_tail() {
-        assert_eq!(classify_command("tail -f log.txt"), Some(CommandClass::CatLike));
+        assert_eq!(
+            classify_command("tail -f log.txt"),
+            Some(CommandClass::CatLike)
+        );
     }
 
     #[test]
     fn classify_bat() {
-        assert_eq!(classify_command("bat src/lib.rs"), Some(CommandClass::CatLike));
+        assert_eq!(
+            classify_command("bat src/lib.rs"),
+            Some(CommandClass::CatLike)
+        );
     }
 
     #[test]
     fn classify_grep() {
-        assert_eq!(classify_command("grep -rn pattern src/"), Some(CommandClass::GrepLike));
+        assert_eq!(
+            classify_command("grep -rn pattern src/"),
+            Some(CommandClass::GrepLike)
+        );
     }
 
     #[test]
     fn classify_rg() {
-        assert_eq!(classify_command("rg TODO src/"), Some(CommandClass::GrepLike));
+        assert_eq!(
+            classify_command("rg TODO src/"),
+            Some(CommandClass::GrepLike)
+        );
     }
 
     #[test]
     fn classify_sed() {
-        assert_eq!(classify_command("sed -i 's/a/b/' file.rs"), Some(CommandClass::GrepLike));
+        assert_eq!(
+            classify_command("sed -i 's/a/b/' file.rs"),
+            Some(CommandClass::GrepLike)
+        );
     }
 
     #[test]
     fn classify_awk() {
-        assert_eq!(classify_command("awk '{print $1}' file.rs"), Some(CommandClass::GrepLike));
+        assert_eq!(
+            classify_command("awk '{print $1}' file.rs"),
+            Some(CommandClass::GrepLike)
+        );
     }
 
     #[test]
@@ -646,10 +670,7 @@ mod tests {
 
     #[test]
     fn normalize_dotdot() {
-        assert_eq!(
-            normalize_path("src/../src/main.rs", None),
-            "src/main.rs"
-        );
+        assert_eq!(normalize_path("src/../src/main.rs", None), "src/main.rs");
     }
 
     #[test]
@@ -682,10 +703,7 @@ mod tests {
 
     #[test]
     fn normalize_deep_dotdot_escape_returns_unchanged() {
-        assert_eq!(
-            normalize_path("foo/../../bar.rs", None),
-            "foo/../../bar.rs"
-        );
+        assert_eq!(normalize_path("foo/../../bar.rs", None), "foo/../../bar.rs");
     }
 
     #[test]
@@ -759,7 +777,9 @@ mod tests {
             already_consulted: false,
         };
         let result = evaluate(&input);
-        assert!(matches!(&result.decision, Decision::Liability { staleness, .. } if *staleness > 0.8));
+        assert!(
+            matches!(&result.decision, Decision::Liability { staleness, .. } if *staleness > 0.8)
+        );
         assert_eq!(result.events.len(), 1);
         assert!(matches!(&result.events[0], HookEvent::Hit { .. }));
     }
@@ -841,7 +861,10 @@ mod tests {
             already_consulted: true,
         };
         let result = evaluate(&input);
-        assert!(matches!(&result.decision, Decision::AlreadyConsulted { .. }));
+        assert!(matches!(
+            &result.decision,
+            Decision::AlreadyConsulted { .. }
+        ));
         assert!(matches!(&result.events[0], HookEvent::Hit { .. }));
     }
 

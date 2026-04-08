@@ -364,8 +364,12 @@ fn hook_decide_deny_then_allow_after_consultation() {
          stdout: {}\nstderr: {}",
         r.code, r.stdout, r.stderr,
     );
-    let response: serde_json::Value = serde_json::from_str(r.stdout.trim())
-        .unwrap_or_else(|e| panic!("claude-pre-read stdout is not valid JSON: {e}\n{}", r.stdout));
+    let response: serde_json::Value = serde_json::from_str(r.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "claude-pre-read stdout is not valid JSON: {e}\n{}",
+            r.stdout
+        )
+    });
     let permission = response
         .pointer("/hookSpecificOutput/permissionDecision")
         .and_then(|v| v.as_str())

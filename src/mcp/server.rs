@@ -651,13 +651,14 @@ async fn socket_dispatch(
                                                 serde_json::Value::Bool(confirmed),
                                             );
                                         }
-                                        gotcha_records
-                                            .insert(key_str.to_string(), val);
+                                        gotcha_records.insert(key_str.to_string(), val);
                                     }
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
-                                    tracing::warn!("hook_evaluate: store.get({key_str}) failed: {e}");
+                                    tracing::warn!(
+                                        "hook_evaluate: store.get({key_str}) failed: {e}"
+                                    );
                                     gotcha_error = true;
                                 }
                             }
@@ -920,9 +921,7 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let limit = req.args.get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50) as usize;
+            let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let g = graph.read().await;
             match g.store().history(key, limit) {
                 Ok(entries) => match serde_json::to_value(&entries) {
@@ -938,12 +937,12 @@ async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
-            let since_ts = req.args.get("since_ts")
+            let since_ts = req
+                .args
+                .get("since_ts")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let limit = req.args.get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50) as usize;
+            let limit = req.args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
             let g = graph.read().await;
             match g.store().history_since(key, since_ts, limit) {
                 Ok(entries) => match serde_json::to_value(&entries) {
@@ -1004,7 +1003,9 @@ async fn socket_dispatch(
                 let mut g = graph.write().await;
                 for file_path in new_set.difference(&old_set) {
                     let file_key = format!("file:{file_path}");
-                    let _ = g.add_edge(&file_key, EdgeKind::HasGotcha, &record_key).await;
+                    let _ = g
+                        .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
+                        .await;
                 }
                 for file_path in old_set.difference(&new_set) {
                     let file_key = format!("file:{file_path}");

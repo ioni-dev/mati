@@ -600,7 +600,8 @@ impl MatiServer {
                 };
 
                 // Fetch existing record to preserve Layer 0 structural data
-                let existing_record = match resolve_existing_for_write(store.get(&params.key).await) {
+                let existing_record = match resolve_existing_for_write(store.get(&params.key).await)
+                {
                     Ok(record) => record,
                     Err(error_json) => return error_json,
                 };
@@ -1943,16 +1944,12 @@ mod tests {
             r.payload = serde_json::to_value(&fr).ok();
             r
         };
-        store
-            .put("file:src/empty.rs", &file_record)
-            .await
-            .unwrap();
+        store.put("file:src/empty.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let packet =
-            assemble_context_packet(graph.store(), &graph, &["src/empty.rs".to_string()])
-                .await
-                .unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/empty.rs".to_string()])
+            .await
+            .unwrap();
 
         assert!(
             packet.critical_gotchas.is_empty(),
@@ -3028,8 +3025,12 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
 
         // Seed file record
-        let file_record = Record::layer0_file_stub("file:src/graph_limit.rs", device_id(), 1, now());
-        store.put("file:src/graph_limit.rs", &file_record).await.unwrap();
+        let file_record =
+            Record::layer0_file_stub("file:src/graph_limit.rs", device_id(), 1, now());
+        store
+            .put("file:src/graph_limit.rs", &file_record)
+            .await
+            .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
         let server = MatiServer::new(graph);
@@ -3243,12 +3244,14 @@ mod tests {
             let g = server.graph_arc();
             let graph = g.read().await;
             assert!(
-                graph.neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
+                graph
+                    .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
                     .contains(&"gotcha:multi-file-tombstone".to_string()),
                 "file:src/a.rs must have HasGotcha edge before delete"
             );
             assert!(
-                graph.neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
+                graph
+                    .neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
                     .contains(&"gotcha:multi-file-tombstone".to_string()),
                 "file:src/b.rs must have HasGotcha edge before delete"
             );
@@ -3274,12 +3277,14 @@ mod tests {
             let g = server.graph_arc();
             let graph = g.read().await;
             assert!(
-                !graph.neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
+                !graph
+                    .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
                     .contains(&"gotcha:multi-file-tombstone".to_string()),
                 "file:src/a.rs must NOT have HasGotcha edge after delete"
             );
             assert!(
-                !graph.neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
+                !graph
+                    .neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
                     .contains(&"gotcha:multi-file-tombstone".to_string()),
                 "file:src/b.rs must NOT have HasGotcha edge after delete"
             );
@@ -3342,7 +3347,12 @@ mod tests {
         let count_after_first = {
             let g = server.graph_arc();
             let graph = g.read().await;
-            let record = graph.store().get("gotcha:idem-test").await.unwrap().unwrap();
+            let record = graph
+                .store()
+                .get("gotcha:idem-test")
+                .await
+                .unwrap()
+                .unwrap();
             record.confidence.confirmation_count
         };
 
@@ -3365,7 +3375,12 @@ mod tests {
         let count_after_second = {
             let g = server.graph_arc();
             let graph = g.read().await;
-            let record = graph.store().get("gotcha:idem-test").await.unwrap().unwrap();
+            let record = graph
+                .store()
+                .get("gotcha:idem-test")
+                .await
+                .unwrap()
+                .unwrap();
             record.confidence.confirmation_count
         };
 
@@ -3381,9 +3396,7 @@ mod tests {
     /// Previously untestable because it required a real store failure.
     #[test]
     fn test_store_read_error_refuses_write() {
-        let result = resolve_existing_for_write(
-            Err(anyhow::anyhow!("simulated disk I/O timeout")),
-        );
+        let result = resolve_existing_for_write(Err(anyhow::anyhow!("simulated disk I/O timeout")));
         assert!(result.is_err(), "store error must refuse write");
         let err = result.unwrap_err();
         let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();

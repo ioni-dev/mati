@@ -157,7 +157,10 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
 
     if candidates.is_empty() {
         println!("\nNo candidates pending review.");
-        if args.r#type.is_some() || args.file.is_some() || args.min_quality.is_some() || args.hotspot
+        if args.r#type.is_some()
+            || args.file.is_some()
+            || args.min_quality.is_some()
+            || args.hotspot
         {
             println!("  tip: try `mati review` without filters to see all candidates.");
         } else {

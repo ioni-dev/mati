@@ -177,8 +177,7 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
     // Use bare command name — portable across machines.
-    mati_settings["mcpServers"]["mati"]["command"] =
-        serde_json::Value::String("mati".to_owned());
+    mati_settings["mcpServers"]["mati"]["command"] = serde_json::Value::String("mati".to_owned());
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -527,7 +526,11 @@ mod tests {
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
         // No --path arg — mati serve detects project from cwd.
         assert!(
-            parsed["mcpServers"]["mati"]["args"].as_array().unwrap().len() == 1,
+            parsed["mcpServers"]["mati"]["args"]
+                .as_array()
+                .unwrap()
+                .len()
+                == 1,
             "args must only contain 'serve', no --path"
         );
     }
