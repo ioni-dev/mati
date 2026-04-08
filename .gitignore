@@ -2,7 +2,6 @@
 .claude/
 .codex/
 .mati/
-.mcp.json
 
 /target/
 .DS_Store
