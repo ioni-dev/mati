@@ -176,9 +176,9 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
 /// back — preserving all other user settings.
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
-    // Inject absolute binary path so Claude Code can find it regardless of PATH.
+    // Use bare command name — portable across machines.
     mati_settings["mcpServers"]["mati"]["command"] =
-        serde_json::Value::String(super::mati_binary_path());
+        serde_json::Value::String("mati".to_owned());
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -271,14 +271,13 @@ fn entry_contains_owned_command(entry: &Value, owned_commands: &[String]) -> boo
 /// root — this is the primary mechanism; `mcpServers` in `.claude/settings.json`
 /// is kept as a fallback for older Claude Code versions.
 ///
-/// Uses the absolute binary path so Claude Code can find mati regardless of
-/// the restricted PATH it uses when spawning MCP server subprocesses.
-fn write_mcp_json(path: &Path, project_root: &Path) -> Result<()> {
-    let canonical =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+/// Uses the bare `mati` command (PATH-resolved) so the config is portable
+/// across machines. Claude Code sets cwd to the project root when spawning
+/// MCP servers, so `mati serve` detects the project automatically.
+fn write_mcp_json(path: &Path, _project_root: &Path) -> Result<()> {
     let mati_server = serde_json::json!({
-        "command": super::mati_binary_path(),
-        "args": ["serve", "--path", canonical.to_string_lossy()]
+        "command": "mati",
+        "args": ["serve"]
     });
 
     let mut mcp_config = if path.exists() {
@@ -373,10 +372,9 @@ mod tests {
         assert!(parsed["hooks"]["PostToolUse"].is_array());
         assert!(parsed["hooks"]["PreCompact"].is_array());
         assert!(parsed["hooks"]["SessionEnd"].is_array());
-        // MCP server registered.
-        // command is an absolute path to the mati binary (not the bare name).
+        // MCP server registered with portable bare command.
         let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
-        assert!(!cmd.is_empty(), "command should not be empty");
+        assert_eq!(cmd, "mati", "command must be bare 'mati' for portability");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
     }
 
@@ -400,9 +398,8 @@ mod tests {
         assert_eq!(parsed["env"]["DEBUG"], "true");
         // Hooks added.
         assert!(parsed["hooks"]["PreToolUse"].is_array());
-        // MCP server added with absolute path.
-        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
-        assert!(!cmd.is_empty());
+        // MCP server added with portable bare command.
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
     }
 
     #[test]
@@ -422,9 +419,8 @@ mod tests {
 
         // Existing server preserved.
         assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
-        // mati server added alongside with absolute path.
-        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
-        assert!(!cmd.is_empty());
+        // mati server added alongside with portable bare command.
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
     }
 
@@ -527,9 +523,13 @@ mod tests {
 
         let content = std::fs::read_to_string(&mcp_json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
-        assert!(!cmd.is_empty(), "command must not be empty");
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
+        // No --path arg — mati serve detects project from cwd.
+        assert!(
+            parsed["mcpServers"]["mati"]["args"].as_array().unwrap().len() == 1,
+            "args must only contain 'serve', no --path"
+        );
     }
 
     #[test]
@@ -551,8 +551,8 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
+        assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
-        assert_eq!(parsed["mcpServers"]["mati"]["args"][1], "--path");
     }
 
     #[test]
@@ -599,23 +599,23 @@ mod tests {
         let wrapper = std::fs::read_to_string(&wrapper_path).unwrap();
         assert!(wrapper.contains("exec"), "wrapper must use exec");
 
-        // Extract exec target
+        // Wrapper uses absolute path (hooks run in restricted shell without ~/.cargo/bin on PATH).
         let exec_line = wrapper.lines().find(|l| l.contains("exec")).unwrap();
         let exec_target = exec_line
             .strip_prefix("exec \"")
             .and_then(|s| s.strip_suffix("\" \"$@\""))
             .expect("exec line must follow format: exec \"<path>\" \"$@\"");
+        assert!(
+            exec_target.starts_with('/'),
+            "wrapper must use absolute path, got: {exec_target}"
+        );
 
-        // MCP config must point to the same binary
+        // MCP config uses portable bare command (resolved via PATH by Claude Code).
         let settings = std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&settings).unwrap();
-        let mcp_command = parsed["mcpServers"]["mati"]["command"]
-            .as_str()
-            .expect("mcpServers.mati.command must be a string");
-
         assert_eq!(
-            exec_target, mcp_command,
-            "wrapper and MCP config must use the same binary path"
+            parsed["mcpServers"]["mati"]["command"], "mati",
+            "MCP config must use bare 'mati' for portability"
         );
     }
 
