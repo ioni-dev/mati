@@ -302,7 +302,7 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
     {
         doc["mcp_servers"]["mati"] = Item::Table(Table::new());
     }
-    doc["mcp_servers"]["mati"]["command"] = value(super::mati_binary_path());
+    doc["mcp_servers"]["mati"]["command"] = value("mati");
     let mut args = Array::new();
     args.push("serve");
     doc["mcp_servers"]["mati"]["args"] = value(args);
@@ -453,16 +453,19 @@ mod tests {
             .and_then(|s| s.strip_suffix("\" \"$@\""))
             .expect("exec line must follow format: exec \"<path>\" \"$@\"");
 
-        // MCP config must point to the same binary
+        // Wrapper uses absolute path (hooks run in restricted shell).
+        assert!(
+            exec_target.starts_with('/'),
+            "wrapper must use absolute path, got: {exec_target}"
+        );
+
+        // MCP config uses portable bare command.
         let config = std::fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
         let doc = config.parse::<DocumentMut>().unwrap();
-        let mcp_command = doc["mcp_servers"]["mati"]["command"]
-            .as_str()
-            .expect("mcp_servers.mati.command must be a string");
-
         assert_eq!(
-            exec_target, mcp_command,
-            "wrapper and MCP config must use the same binary path"
+            doc["mcp_servers"]["mati"]["command"].as_str().unwrap(),
+            "mati",
+            "MCP config must use bare 'mati' for portability"
         );
 
         // MCP args must include "serve"
