@@ -482,7 +482,8 @@ struct AdapterResult {
     exit_code: i32,
     /// Events to fire (already platform-filtered).
     events: Vec<HookEvent>,
-    /// The semantic decision.
+    /// The semantic decision (used by tests via Debug).
+    #[allow(dead_code)]
     decision: Decision,
 }
 

@@ -384,7 +384,7 @@ esac
 
         let output = Command::new("bash")
             .arg(script_path.to_str().expect("script path not valid UTF-8"))
-            .env("PATH", &path)
+            .env("PATH", path)
             .env("HOME", self.mock_dir.path())
             .current_dir(self.mock_dir.path())
             .stdin(std::process::Stdio::piped())
@@ -523,7 +523,7 @@ exit {code}
 
         let output = Command::new("bash")
             .arg(script_path.to_str().unwrap())
-            .env("PATH", &path)
+            .env("PATH", path)
             .env("HOME", self.mock_dir.path())
             .current_dir(self.mock_dir.path())
             .stdin(std::process::Stdio::piped())
@@ -863,9 +863,9 @@ fn codex_user_prompt_exits_clean_no_injection() {
     );
 }
 
-/// 3.07–3.09 — Codex pre-bash and post-bash enforcement is in Rust.
-/// Wrapper execution is in Category 1 above. Enforcement matrix is covered
-/// by hooks::decide::tests (51 unit tests) + cli::hook_decide::tests (22 tests).
+// 3.07–3.09 — Codex pre-bash and post-bash enforcement is in Rust.
+// Wrapper execution is in Category 1 above. Enforcement matrix is covered
+// by hooks::decide::tests (51 unit tests) + cli::hook_decide::tests (22 tests).
 
 /// 3.10 — Codex stop flushes then harvests the session.
 #[test]

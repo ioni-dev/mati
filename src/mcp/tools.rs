@@ -1223,7 +1223,7 @@ pub async fn assemble_context_packet(
         let all_gotchas = store.scan_prefix("gotcha:").await?;
         all_gotchas
             .into_iter()
-            .filter(|r| is_injectable_gotcha(r))
+            .filter(is_injectable_gotcha)
             .collect()
     } else {
         // Targeted bootstrap: fetch only gotchas linked to context files.
