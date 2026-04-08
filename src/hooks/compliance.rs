@@ -560,7 +560,10 @@ fn preread_wrapper_executes_hook_decide_with_correct_variant() {
     let h = WrapperHarness::new();
     let response = r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#;
     h.write_mock(response, "", 0);
-    let out = h.run(pre_read::SCRIPT, r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
+    let out = h.run(
+        pre_read::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
 
     assert_eq!(out.exit_code, 0, "wrapper must propagate exit 0");
     assert_eq!(out.stdout.trim(), response, "wrapper must relay stdout");
@@ -575,8 +578,15 @@ fn preread_wrapper_executes_hook_decide_with_correct_variant() {
 #[test]
 fn prebash_wrapper_executes_hook_decide_with_correct_variant() {
     let h = WrapperHarness::new();
-    h.write_mock(r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#, "", 0);
-    h.run(pre_bash::SCRIPT, r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    h.write_mock(
+        r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
+        "",
+        0,
+    );
+    h.run(
+        pre_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
 
     let log = h.invocation_log();
     assert!(
@@ -589,7 +599,10 @@ fn prebash_wrapper_executes_hook_decide_with_correct_variant() {
 fn codex_prebash_wrapper_executes_hook_decide_with_correct_variant() {
     let h = WrapperHarness::new();
     h.write_mock("", "", 0);
-    h.run(codex_pre_bash::SCRIPT, r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    h.run(
+        codex_pre_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
 
     let log = h.invocation_log();
     assert!(
@@ -602,7 +615,10 @@ fn codex_prebash_wrapper_executes_hook_decide_with_correct_variant() {
 fn codex_postbash_wrapper_executes_hook_decide_with_correct_variant() {
     let h = WrapperHarness::new();
     h.write_mock("", "", 0);
-    h.run(codex_post_bash::SCRIPT, r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    h.run(
+        codex_post_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
 
     let log = h.invocation_log();
     assert!(
@@ -616,7 +632,11 @@ fn codex_postbash_wrapper_executes_hook_decide_with_correct_variant() {
 #[test]
 fn preread_wrapper_passes_stdin_through() {
     let h = WrapperHarness::new();
-    h.write_mock(r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#, "", 0);
+    h.write_mock(
+        r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
+        "",
+        0,
+    );
     let input = r#"{"tool_input":{"file_path":"src/store/db.rs"}}"#;
     h.run(pre_read::SCRIPT, input);
 
@@ -647,16 +667,25 @@ fn codex_prebash_wrapper_passes_stdin_through() {
 fn preread_wrapper_propagates_nonzero_exit() {
     let h = WrapperHarness::new();
     h.write_mock("", "blocked", 1);
-    let out = h.run(pre_read::SCRIPT, r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
+    let out = h.run(
+        pre_read::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
 
-    assert_eq!(out.exit_code, 1, "wrapper must propagate exit 1 from hook-decide");
+    assert_eq!(
+        out.exit_code, 1,
+        "wrapper must propagate exit 1 from hook-decide"
+    );
 }
 
 #[test]
 fn codex_prebash_wrapper_propagates_exit2_deny() {
     let h = WrapperHarness::new();
     h.write_mock("", "Run mem_get first", 2);
-    let out = h.run(codex_pre_bash::SCRIPT, r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
+    let out = h.run(
+        codex_pre_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
 
     assert_eq!(out.exit_code, 2, "Codex deny exit 2 must survive exec");
     assert!(
@@ -676,7 +705,10 @@ fn preread_wrapper_relays_stderr() {
         "[mati] WARNING: test stderr relay",
         0,
     );
-    let out = h.run(pre_read::SCRIPT, r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
+    let out = h.run(
+        pre_read::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
 
     assert!(
         out.stderr.contains("[mati] WARNING: test stderr relay"),
@@ -842,8 +874,12 @@ fn codex_stop_flushes_then_harvests() {
     let output = harness.run("{}");
     assert_eq!(output.exit_code, 0);
     let log = harness.read_log();
-    let flush_pos = log.find("session-flush").expect("missing session-flush in log");
-    let harvest_pos = log.find("session-harvest").expect("missing session-harvest in log");
+    let flush_pos = log
+        .find("session-flush")
+        .expect("missing session-flush in log");
+    let harvest_pos = log
+        .find("session-harvest")
+        .expect("missing session-harvest in log");
     assert!(
         flush_pos < harvest_pos,
         "flush must precede harvest, log: {log}"

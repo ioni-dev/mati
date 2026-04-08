@@ -886,12 +886,22 @@ struct FailOpenStats {
 fn scan_fail_open_log(now: u64) -> FailOpenStats {
     let log_path = match dirs::home_dir() {
         Some(h) => h.join(".mati").join("fail_open.log"),
-        None => return FailOpenStats { count_7d: 0, last_ago_secs: 0 },
+        None => {
+            return FailOpenStats {
+                count_7d: 0,
+                last_ago_secs: 0,
+            }
+        }
     };
 
     let content = match std::fs::read_to_string(&log_path) {
         Ok(c) => c,
-        Err(_) => return FailOpenStats { count_7d: 0, last_ago_secs: 0 },
+        Err(_) => {
+            return FailOpenStats {
+                count_7d: 0,
+                last_ago_secs: 0,
+            }
+        }
     };
 
     let cutoff = now.saturating_sub(7 * 86400);
@@ -926,7 +936,10 @@ fn scan_fail_open_log(now: u64) -> FailOpenStats {
         0
     };
 
-    FailOpenStats { count_7d: count, last_ago_secs: last_ago }
+    FailOpenStats {
+        count_7d: count,
+        last_ago_secs: last_ago,
+    }
 }
 
 /// Minimal ISO 8601 timestamp parser: `YYYY-MM-DDTHH:MM:SSZ` -> Unix seconds.
@@ -958,11 +971,7 @@ fn parse_u64(s: &str) -> u64 {
 fn civil_to_days(y: u64, m: u64, _sec: u64, d: u64) -> u64 {
     let y = y as i64;
     let m = m as u64;
-    let (y, m) = if m <= 2 {
-        (y - 1, m + 9)
-    } else {
-        (y, m - 3)
-    };
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
     let doy = (153 * m + 2) / 5 + d - 1;

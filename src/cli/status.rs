@@ -98,16 +98,12 @@ fn print_runtime_section(
     println!("  {blue}Runtime{reset}");
     match health {
         DaemonHealth::Running { pid } => {
-            let pid_str = pid
-                .map(|p| format!(" (pid {p})"))
-                .unwrap_or_default();
+            let pid_str = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
             println!("    Daemon               {green}running{reset}{pid_str}");
             println!("    Enforcement          {green}active{reset}");
         }
         DaemonHealth::Unresponsive { pid } => {
-            let pid_str = pid
-                .map(|p| format!(" (pid {p})"))
-                .unwrap_or_default();
+            let pid_str = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
             println!("    Daemon               {yellow}unresponsive{reset}{pid_str}");
             println!(
                 "    Enforcement          {yellow}degraded{reset} {gray}— hooks fail open{reset}"

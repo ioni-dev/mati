@@ -194,9 +194,7 @@ fn merge_hooks_json(path: &Path) -> Result<()> {
         if let Value::Object(ref mut map) = existing {
             merge_hooks(map, &mati_hooks["hooks"]);
         } else {
-            anyhow::bail!(
-                "hooks.json exists but is not a JSON object — cannot merge safely"
-            );
+            anyhow::bail!("hooks.json exists but is not a JSON object — cannot merge safely");
         }
         existing
     } else {
@@ -546,10 +544,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), malformed);
 
         // Replaced hooks.json must be valid JSON with mati's hooks
-        let hooks: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap(),
-        )
-        .expect("hooks.json must be valid JSON after recovery");
+        let hooks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .expect("hooks.json must be valid JSON after recovery");
         assert!(hooks["hooks"]["SessionStart"].is_array());
         assert!(hooks["hooks"]["PreToolUse"].is_array());
     }
