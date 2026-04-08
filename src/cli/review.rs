@@ -49,6 +49,14 @@ pub struct ReviewArgs {
     /// Review only candidates linked to this file
     #[arg(value_name = "FILE")]
     pub file: Option<String>,
+
+    /// Only show candidates with quality >= threshold (e.g. --min-quality 0.4)
+    #[arg(long, value_name = "SCORE")]
+    pub min_quality: Option<f32>,
+
+    /// Only show candidates linked to hotspot files
+    #[arg(long)]
+    pub hotspot: bool,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -112,6 +120,14 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = crate::cli::proxy::StoreProxy::open(&cwd).await?;
     let candidates_result = collect_candidates(&proxy).await;
+
+    // Collect hotspot file set before closing proxy (needed for --hotspot filter)
+    let hotspot_files = if args.hotspot {
+        collect_hotspot_files(&proxy).await
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut candidates = proxy.close_with_result(candidates_result).await?;
 
     // Apply --type filter
@@ -129,10 +145,24 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         });
     }
 
+    // Apply --min-quality filter
+    if let Some(min_q) = args.min_quality {
+        candidates.retain(|r| r.quality.value >= min_q);
+    }
+
+    // Apply --hotspot filter
+    if args.hotspot {
+        candidates.retain(|r| is_hotspot_linked(r, &hotspot_files));
+    }
+
     if candidates.is_empty() {
         println!("\nNo candidates pending review.");
-        if args.r#type.is_some() || args.file.is_some() {
-            println!("Try `mati review` without filters to see all candidates.");
+        if args.r#type.is_some()
+            || args.file.is_some()
+            || args.min_quality.is_some()
+            || args.hotspot
+        {
+            println!("  tip: try `mati review` without filters to see all candidates.");
         } else {
             println!("Run `mati init` to generate candidates from git history.");
             println!("Run `mati gaps` to see what else needs attention.");

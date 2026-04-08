@@ -748,7 +748,13 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
     // doesn't change which files are affected — only ensures links exist.
     proxy
         .gotcha_write(&record, &[], &affected_files, false)
-        .await
+        .await?;
+
+    // Propagate confirmation signal to linked file records — their
+    // confidence.confirmation_count feeds into log2(count + 2).
+    proxy.propagate_confirmation(&affected_files).await;
+
+    Ok(())
 }
 
 async fn run_gotcha_confirm(key: &str) -> Result<()> {

@@ -6,6 +6,7 @@ pub mod codex_pre_bash;
 pub mod codex_session_start;
 pub mod codex_stop;
 pub mod codex_user_prompt;
+pub mod decide;
 pub mod post_compliance;
 pub mod post_edit;
 pub mod pre_bash;

@@ -5,7 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::store::{Priority, QualityScore, QualitySignal, Record};
+use crate::store::{Category, Priority, QualityScore, QualitySignal, Record};
 
 // ── Signal detection constants ───────────────────────────────────────────────
 
@@ -172,7 +172,13 @@ pub fn analyze(record: &Record) -> QualityScore {
         value *= PENALTY_TOO_SHORT;
     }
 
-    if !has_causality && !lower.contains("because") && !lower.contains("reason:") {
+    // NoReason penalty only applies to Gotcha records — file/decision/note
+    // values are purpose statements that naturally lack causality language.
+    if record.category == Category::Gotcha
+        && !has_causality
+        && !lower.contains("because")
+        && !lower.contains("reason:")
+    {
         signals.push(QualitySignal::NoReason);
         value *= PENALTY_NO_REASON;
     }

@@ -43,8 +43,20 @@ Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
 ## /mati-enrich
 
 Run /mati-enrich [path] to enrich a file or directory.
+
+Before enriching each file, call mem_get(\"file:<path>\"). If the record has
+source \"claude_enrich\" or \"developer_manual\" and confidence >= 0.60, skip it —
+already enriched. Only re-enrich if the user explicitly passes the file path.
+
+Per-file flow: mem_get → Read file → extract purpose + gotchas → mem_set file → mem_set each gotcha.
 Single file: mem_set + `mati gotcha confirm <key>` for each gotcha.
-Directory/batch: mem_set only, end with \"Run `mati review` to confirm N gotchas.\"
+Directory/batch: mem_set only (confirmed=false).
+
+When enrichment is complete, print a summary:
+  Enriched: X files (Y skipped — already enriched)
+  Gotcha candidates extracted: Z
+  Run `mati review` to confirm candidates and activate hook enforcement.
+  Run `mati stats` to see updated coverage and onboarding score.
 ";
 
 fn vector_c_stub() -> String {

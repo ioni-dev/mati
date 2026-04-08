@@ -24,8 +24,7 @@ const HOOKS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": "bash .codex/hooks/user-prompt-submit.sh",
-            "statusMessage": "Checking gotchas..."
+            "command": "bash .codex/hooks/user-prompt-submit.sh"
           }
         ]
       }
@@ -104,9 +103,9 @@ Use `mati` as the codebase memory layer for this repository.
 
 ## Platform semantics
 
-- Codex mode has hard Bash enforcement and soft native-read enforcement.
-- Do not assume `mati` can block native file reads in Codex.
-- If Bash inspection is blocked, call `mem_get("file:<path>")` first.
+- Codex PreToolUse hooks block unconsulted file reads via exit 2 + stderr.
+- PostToolUse logs compliance for analytics — no context injection.
+- Always call `mem_get("file:<path>")` before shell-inspecting a file.
 "#;
 
 const SKILL_CONFIG_PATH: &str = ".codex/skills/mati/SKILL.md";
@@ -176,10 +175,26 @@ fn merge_hooks_json(path: &Path) -> Result<()> {
     let mati_hooks: Value = serde_json::from_str(HOOKS_JSON)?;
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
-        let mut existing: Value = serde_json::from_str(&existing_str)
-            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        let mut existing: Value = match serde_json::from_str(&existing_str) {
+            Ok(v) => v,
+            Err(e) => {
+                let bak = path.with_extension("json.bak");
+                match std::fs::write(&bak, &existing_str) {
+                    Ok(()) => tracing::warn!(
+                        "malformed hooks.json, backed up to {} and starting fresh: {e}",
+                        bak.display()
+                    ),
+                    Err(bak_err) => tracing::warn!(
+                        "malformed hooks.json, starting fresh (backup failed: {bak_err}): {e}"
+                    ),
+                }
+                Value::Object(serde_json::Map::new())
+            }
+        };
         if let Value::Object(ref mut map) = existing {
             merge_hooks(map, &mati_hooks["hooks"]);
+        } else {
+            anyhow::bail!("hooks.json exists but is not a JSON object — cannot merge safely");
         }
         existing
     } else {
@@ -250,9 +265,22 @@ fn entry_contains_owned_command(entry: &Value, owned_commands: &[String]) -> boo
 fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Result<()> {
     let mut doc = if path.exists() {
         let existing = std::fs::read_to_string(path)?;
-        existing
-            .parse::<DocumentMut>()
-            .unwrap_or_else(|_| DocumentMut::new())
+        match existing.parse::<DocumentMut>() {
+            Ok(d) => d,
+            Err(e) => {
+                let bak = path.with_extension("toml.bak");
+                match std::fs::write(&bak, &existing) {
+                    Ok(()) => tracing::warn!(
+                        "malformed config.toml, backed up to {} and starting fresh: {e}",
+                        bak.display()
+                    ),
+                    Err(bak_err) => tracing::warn!(
+                        "malformed config.toml, starting fresh (backup failed: {bak_err}): {e}"
+                    ),
+                }
+                DocumentMut::new()
+            }
+        }
     } else {
         DocumentMut::new()
     };
@@ -272,7 +300,7 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
     {
         doc["mcp_servers"]["mati"] = Item::Table(Table::new());
     }
-    doc["mcp_servers"]["mati"]["command"] = value(super::mati_binary_path());
+    doc["mcp_servers"]["mati"]["command"] = value("mati");
     let mut args = Array::new();
     args.push("serve");
     doc["mcp_servers"]["mati"]["args"] = value(args);
@@ -314,20 +342,9 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
 }
 
 fn missing_hook_dependencies() -> Vec<&'static str> {
-    let mut missing = Vec::new();
-    for cmd in ["jq", "awk"] {
-        let ok = std::process::Command::new(cmd)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            missing.push(cmd);
-        }
-    }
-    missing
+    // Codex hooks are thin wrappers that exec `mati hook-decide`.
+    // No jq/awk dependency — all JSON parsing is in Rust.
+    Vec::new()
 }
 
 use super::{make_executable, write_if_changed};
@@ -434,16 +451,19 @@ mod tests {
             .and_then(|s| s.strip_suffix("\" \"$@\""))
             .expect("exec line must follow format: exec \"<path>\" \"$@\"");
 
-        // MCP config must point to the same binary
+        // Wrapper uses absolute path (hooks run in restricted shell).
+        assert!(
+            exec_target.starts_with('/'),
+            "wrapper must use absolute path, got: {exec_target}"
+        );
+
+        // MCP config uses portable bare command.
         let config = std::fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
         let doc = config.parse::<DocumentMut>().unwrap();
-        let mcp_command = doc["mcp_servers"]["mati"]["command"]
-            .as_str()
-            .expect("mcp_servers.mati.command must be a string");
-
         assert_eq!(
-            exec_target, mcp_command,
-            "wrapper and MCP config must use the same binary path"
+            doc["mcp_servers"]["mati"]["command"].as_str().unwrap(),
+            "mati",
+            "MCP config must use bare 'mati' for portability"
         );
 
         // MCP args must include "serve"
@@ -471,14 +491,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         install_codex(dir.path(), true).unwrap();
 
-        for (name, _) in CODEX_HOOK_SCRIPTS {
+        for (name, content_template) in CODEX_HOOK_SCRIPTS {
             let path = dir.path().join(".codex/hooks").join(name);
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|_| panic!("hook script {name} must exist"));
-            assert!(
-                content.contains("HOOKS_DIR=") && content.contains("export PATH="),
-                "hook script {name} must prepend HOOKS_DIR to PATH"
-            );
+            // No-op hooks (e.g. user-prompt-submit) don't need HOOKS_DIR.
+            if content_template.contains("HOOKS_DIR=") {
+                assert!(
+                    content.contains("HOOKS_DIR=") && content.contains("export PATH="),
+                    "hook script {name} must prepend HOOKS_DIR to PATH"
+                );
+            }
         }
     }
 
@@ -501,6 +524,74 @@ mod tests {
         assert!(
             !wrapper.contains("/old/path/mati"),
             "re-init must update the wrapper binary path"
+        );
+    }
+
+    #[test]
+    fn malformed_hooks_json_backed_up_and_replaced() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let malformed = "{not valid json";
+        std::fs::write(codex_dir.join("hooks.json"), malformed).unwrap();
+
+        install_codex(dir.path(), false).unwrap();
+
+        // Original malformed content should be backed up
+        let bak_path = codex_dir.join("hooks.json.bak");
+        assert!(bak_path.exists(), "backup file must exist");
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), malformed);
+
+        // Replaced hooks.json must be valid JSON with mati's hooks
+        let hooks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(codex_dir.join("hooks.json")).unwrap())
+                .expect("hooks.json must be valid JSON after recovery");
+        assert!(hooks["hooks"]["SessionStart"].is_array());
+        assert!(hooks["hooks"]["PreToolUse"].is_array());
+    }
+
+    #[test]
+    fn non_object_hooks_json_causes_error() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        std::fs::write(codex_dir.join("hooks.json"), "[1, 2, 3]").unwrap();
+
+        let err = install_codex(dir.path(), false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a JSON object"),
+            "error must mention 'not a JSON object', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn malformed_config_toml_backed_up_and_replaced() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+
+        let malformed = "[broken toml";
+        std::fs::write(codex_dir.join("config.toml"), malformed).unwrap();
+
+        install_codex(dir.path(), false).unwrap();
+
+        // Original malformed content should be backed up
+        let bak_path = codex_dir.join("config.toml.bak");
+        assert!(bak_path.exists(), "backup file must exist");
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), malformed);
+
+        // Replaced config.toml must be valid TOML with mati's config
+        let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        let doc = config
+            .parse::<DocumentMut>()
+            .expect("config.toml must be valid TOML after recovery");
+        assert_eq!(
+            doc["features"]["codex_hooks"].as_bool(),
+            Some(true),
+            "features.codex_hooks must be true"
         );
     }
 }

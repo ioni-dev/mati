@@ -1,12 +1,22 @@
-/// M-15 Bash Hook Compliance Test Suite — Categories 1 & 2 (33 tests).
+/// M-15 Bash Hook Compliance Test Suite — wrapper execution + lifecycle contracts.
 ///
-/// This module is the core safety certification for mati's trust boundary.
-/// It verifies that the bash hook scripts (pre_read.rs SCRIPT, pre_bash.rs SCRIPT)
-/// produce correct allow/deny decisions for all combinations of confidence,
-/// quality, confirmed status, and staleness tiers.
+/// This module tests two things:
 ///
-/// The test harness writes the bash script to a temp file, creates a mock `mati`
-/// binary, and exercises the hook with controlled stdin JSON + mock responses.
+/// 1. **Wrapper execution** (Category 1) — the thin shell wrappers (`pre_read`,
+///    `pre_bash`, `codex_pre_bash`, `codex_post_bash`) correctly delegate to
+///    `mati hook-decide <variant>` with stdin passthrough and exit-code propagation.
+///
+/// 2. **Lifecycle contracts** (Category 3) — post-compliance, post-edit,
+///    pre-compact, session-end, codex-session-start, codex-user-prompt, and
+///    codex-stop hooks invoke the correct daemon commands in the right order.
+///
+/// Enforcement logic (the allow/deny decision matrix) is tested by:
+/// - `hooks::decide::tests` — pure decision functions (51 unit tests)
+/// - `cli::hook_decide::tests` — adapter pipeline: eval response → decision →
+///   platform events → formatted output (22 tests, including 10 e2e fixtures)
+///
+/// The test harness writes bash scripts to temp files, creates a mock `mati`
+/// binary, and exercises hooks with controlled stdin JSON + mock responses.
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -39,6 +49,8 @@ struct HookTestHarness {
     mock_extra_cases: String,
 }
 
+// Used by Category 3 lifecycle tests.
+#[allow(dead_code)]
 struct HookOutput {
     stdout: String,
     stderr: String,
@@ -46,6 +58,7 @@ struct HookOutput {
     json: Option<serde_json::Value>,
 }
 
+#[allow(dead_code)]
 impl HookOutput {
     fn decision(&self) -> &str {
         self.json
@@ -72,6 +85,9 @@ impl HookOutput {
     }
 }
 
+// Some constructors (for_pre_read, for_pre_bash, etc.) are used by specific
+// Category 1 and Category 3 tests only.
+#[allow(dead_code)]
 impl HookTestHarness {
     fn for_pre_read() -> Self {
         Self {
@@ -368,7 +384,7 @@ esac
 
         let output = Command::new("bash")
             .arg(script_path.to_str().expect("script path not valid UTF-8"))
-            .env("PATH", &path)
+            .env("PATH", path)
             .env("HOME", self.mock_dir.path())
             .current_dir(self.mock_dir.path())
             .stdin(std::process::Stdio::piped())
@@ -408,7 +424,11 @@ esac
     }
 
     fn wait_for_log_contains(&self, needle: &str) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        self.wait_for_log_contains_timeout(needle, std::time::Duration::from_secs(2))
+    }
+
+    fn wait_for_log_contains_timeout(&self, needle: &str, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             if self.read_log().contains(needle) {
                 return true;
@@ -419,869 +439,325 @@ esac
     }
 }
 
-// ─── Helper: build a mock record JSON ────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Category 1: Wrapper Execution Tests
+//
+// Each thin shell wrapper must:
+//   (a) pass stdin through to `mati hook-decide <variant>`,
+//   (b) propagate the exit code,
+//   (c) relay stdout/stderr.
+//
+// Enforcement logic is tested by hooks::decide::tests (51 unit tests) and
+// cli::hook_decide::tests (22 tests including 10 e2e adapter fixtures).
+// ═════════════════════════════════════════════════════════════════════════════
 
-fn make_record(
-    confidence: f64,
-    quality: f64,
-    confirmed: bool,
-    staleness: f64,
-    staleness_tier: &str,
-) -> String {
-    serde_json::json!({
-        "confidence": { "value": confidence },
-        "quality": { "value": quality },
-        "confirmed": confirmed,
-        "staleness": { "value": staleness, "tier": staleness_tier }
-    })
-    .to_string()
+/// Build a mock `mati` that handles `hook-decide <variant>`:
+///   - Logs the variant and stdin to a file for assertion.
+///   - Outputs a canned JSON response on stdout.
+///   - Exits with a configurable code.
+struct WrapperHarness {
+    mock_dir: TempDir,
 }
 
-/// Build a file record JSON that has a linked gotcha key in payload.gotcha_keys.
-/// The deny signal in the hook comes from linked gotcha records, not the file record itself.
-fn make_file_record_with_gotcha(
-    confidence: f64,
-    quality: f64,
-    staleness: f64,
-    staleness_tier: &str,
-    gotcha_key: &str,
-) -> String {
-    serde_json::json!({
-        "confidence": { "value": confidence },
-        "quality": { "value": quality },
-        "staleness": { "value": staleness, "tier": staleness_tier },
-        "value": "Test file purpose",
-        "payload": {
-            "gotcha_keys": [gotcha_key]
+struct WrapperOutput {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+impl WrapperHarness {
+    fn new() -> Self {
+        Self {
+            mock_dir: TempDir::new().expect("failed to create temp dir"),
         }
-    })
-    .to_string()
-}
-
-/// Build a gotcha record JSON for deny testing.
-/// Wire format: confirmed lives under payload.confirmed (matches GotchaRecord serialization).
-fn make_gotcha_record(confidence: f64, quality: f64, confirmed: bool) -> String {
-    serde_json::json!({
-        "confidence": { "value": confidence },
-        "quality": { "value": quality },
-        "value": "Test gotcha: watch out for this",
-        "payload": {
-            "confirmed": confirmed,
-            "rule": "Test gotcha: watch out for this",
-            "reason": "Test reason",
-            "severity": "normal",
-            "affected_files": [],
-            "discovered_session": 0,
-            "ref_url": null
-        }
-    })
-    .to_string()
-}
-
-/// Register a deny-eligible file record + linked gotcha in the harness.
-/// The hook denies when a linked gotcha has confirmed=true + confidence>=0.6 + quality>=0.4.
-impl HookTestHarness {
-    fn with_deny_eligible_record(
-        self,
-        file_key: &str,
-        staleness: f64,
-        staleness_tier: &str,
-    ) -> Self {
-        let gotcha_key = "gotcha:test-deny-signal";
-        let gotcha = make_gotcha_record(0.8, 0.7, true);
-        let file = make_file_record_with_gotcha(0.8, 0.7, staleness, staleness_tier, gotcha_key);
-        self.with_mock_record(file_key, &file)
-            .with_mock_record(gotcha_key, &gotcha)
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Category 1: Hook Decision Matrix (25 tests)
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// 1.01 — PATH excludes jq -> allow (guard fires).
-#[test]
-fn preread_no_jq_allows() {
-    let harness = HookTestHarness::for_pre_read().exclude_binary("jq");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0, "hook should exit 0");
-    assert_eq!(output.decision(), "allow", "missing jq must allow");
-}
-
-/// 1.02 — PATH excludes awk -> allow (guard fires).
-#[test]
-fn preread_no_awk_allows() {
-    let harness = HookTestHarness::for_pre_read().exclude_binary("awk");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0, "hook should exit 0");
-    assert_eq!(output.decision(), "allow", "missing awk must allow");
-}
-
-/// 1.03 — Empty file_path in tool_input -> allow.
-#[test]
-fn preread_empty_file_path_allows() {
-    let harness = HookTestHarness::for_pre_read();
-    let output = harness.run(r#"{"tool_input":{}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow", "empty file_path must allow");
-}
-
-/// 1.04 — mati ping fails -> allow (graceful degradation).
-#[test]
-fn preread_mati_unreachable_allows() {
-    let record = make_record(0.9, 0.9, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read()
-        .with_mock_record("file:src/main.rs", &record)
-        .with_ping_failure();
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow", "unreachable mati must allow");
-}
-
-/// 1.05 — get returns null -> allow + log-miss in background.
-#[test]
-fn preread_no_record_allows_and_logs_miss() {
-    // No mock record registered -> default is "null"
-    let harness = HookTestHarness::for_pre_read();
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow", "no record must allow");
-
-    // Give the background log-miss a moment to write
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let log = harness.read_log();
-    assert!(
-        log.contains("log-miss"),
-        "expected log-miss to be recorded, got: {log}"
-    );
-}
-
-/// 1.06 — Low confidence (0.2), low quality (0.3) -> allow, no context injection.
-#[test]
-fn preread_low_confidence_low_quality_allows_no_injection() {
-    let record = make_record(0.2, 0.3, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow");
-    assert!(
-        output.additional_context().is_empty(),
-        "low conf + low qual should not inject context"
-    );
-    assert!(output.reason().is_empty(), "should not have a deny reason");
-}
-
-/// 1.07 — Low confidence (0.25), high quality (0.8) -> allow, no context.
-#[test]
-fn preread_low_confidence_high_quality_allows_no_injection() {
-    let record = make_record(0.25, 0.8, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow");
-    assert!(
-        output.additional_context().is_empty(),
-        "conf 0.25 < 0.3 threshold, no context should be injected"
-    );
-}
-
-/// 1.08 — Medium confidence (0.45), good quality (0.5) -> allow + additionalContext.
-#[test]
-fn preread_medium_confidence_good_quality_allows_with_context() {
-    let record = make_record(0.45, 0.5, false, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow");
-    let ctx = output.additional_context();
-    assert!(
-        !ctx.is_empty(),
-        "medium conf + good qual should inject additionalContext"
-    );
-    assert!(
-        ctx.contains("0.45"),
-        "context should include the confidence value, got: {ctx}"
-    );
-}
-
-/// 1.09 — Medium confidence (0.5), low quality (0.35) -> allow, no context.
-#[test]
-fn preread_medium_confidence_low_quality_allows_no_injection() {
-    let record = make_record(0.5, 0.35, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow");
-    assert!(
-        output.additional_context().is_empty(),
-        "qual 0.35 < 0.4 threshold, no context should be injected"
-    );
-}
-
-/// 1.10 — High conf, confirmed gotcha linked, good qual, fresh -> DENY.
-/// Deny signal comes from a linked gotcha record (payload.gotcha_keys), not the file record itself.
-#[test]
-fn preread_high_conf_confirmed_good_qual_fresh_denies() {
-    let harness =
-        HookTestHarness::for_pre_read().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "deny",
-        "confirmed gotcha + high conf + good qual must DENY"
-    );
-    assert!(
-        output.reason().contains("mem_get"),
-        "deny reason should reference mem_get, got: {}",
-        output.reason()
-    );
-}
-
-/// 1.11 — Stale (not liability) tier with confirmed gotcha -> still DENY.
-#[test]
-fn preread_high_conf_confirmed_good_qual_stale_still_denies() {
-    let harness =
-        HookTestHarness::for_pre_read().with_deny_eligible_record("file:src/main.rs", 0.6, "stale");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "deny",
-        "stale (not liability) should still deny when confirmed gotcha linked"
-    );
-}
-
-/// 1.12 — High conf + confirmed + good qual + liability -> allow + STALE warning.
-#[test]
-fn preread_high_conf_confirmed_good_qual_liability_downgrades() {
-    let record = make_record(0.8, 0.7, true, 0.9, "liability");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "liability tier must downgrade deny to allow"
-    );
-    let ctx = output.additional_context();
-    assert!(
-        ctx.contains("STALE"),
-        "should include STALE warning, got: {ctx}"
-    );
-    assert!(
-        ctx.contains("liability"),
-        "should mention liability tier, got: {ctx}"
-    );
-}
-
-/// 1.13 — High conf + confirmed + good qual + tombstone -> allow, no context.
-#[test]
-fn preread_high_conf_confirmed_good_qual_tombstone_passthrough() {
-    let record = make_record(0.8, 0.7, true, 1.0, "tombstone");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "tombstone must allow unconditionally"
-    );
-    assert!(
-        output.additional_context().is_empty(),
-        "tombstone should not inject any context"
-    );
-}
-
-/// 1.14 — High conf, unconfirmed -> allow (confirmed=false bypasses deny).
-#[test]
-fn preread_high_conf_unconfirmed_allows() {
-    let record = make_record(0.8, 0.7, false, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    // confirmed=false means the deny branch is skipped.
-    // But conf >= 0.3 + qual >= 0.4 -> allow + additionalContext
-    assert_eq!(output.decision(), "allow");
-    let ctx = output.additional_context();
-    assert!(
-        !ctx.is_empty(),
-        "unconfirmed but medium+ conf should still inject context"
-    );
-}
-
-/// 1.15 — High conf + confirmed but quality < 0.4 -> allow.
-#[test]
-fn preread_high_conf_confirmed_low_quality_allows() {
-    let record = make_record(0.8, 0.35, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "quality < 0.4 must prevent deny even with high conf"
-    );
-    // Quality < 0.4 means neither deny branch nor context branch fires
-    assert!(
-        output.additional_context().is_empty(),
-        "quality < 0.4 should not inject context"
-    );
-}
-
-/// 1.16 — Medium conf (0.45) + liability tier -> allow + STALE_NOTE.
-#[test]
-fn preread_medium_conf_liability_allows_with_stale_note() {
-    let record = make_record(0.45, 0.5, false, 0.9, "liability");
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", &record);
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow");
-    let ctx = output.additional_context();
-    assert!(
-        ctx.contains("WARNING"),
-        "medium conf + liability should include WARNING, got: {ctx}"
-    );
-    assert!(
-        ctx.contains("liability"),
-        "should mention liability, got: {ctx}"
-    );
-}
-
-/// 1.17 — File path containing double quotes -> valid JSON output.
-#[test]
-fn preread_file_path_with_double_quotes_valid_json() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
-    let path_with_quotes = r#"src/main"test.rs"#;
-    let key = format!("file:{path_with_quotes}");
-    let harness = HookTestHarness::for_pre_read().with_mock_record(&key, &record);
-    let input = serde_json::json!({
-        "tool_input": { "file_path": path_with_quotes }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert!(
-        output.json.is_some(),
-        "output must be valid JSON even with quotes in path, stdout: {}",
-        output.stdout
-    );
-}
-
-/// 1.18 — File path containing backslashes -> valid JSON output.
-#[test]
-fn preread_file_path_with_backslashes_valid_json() {
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
-    let path_with_backslash = r"src\main\test.rs";
-    let key = format!("file:{path_with_backslash}");
-    let harness = HookTestHarness::for_pre_read().with_mock_record(&key, &record);
-    let input = serde_json::json!({
-        "tool_input": { "file_path": path_with_backslash }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert!(
-        output.json.is_some(),
-        "output must be valid JSON even with backslashes in path, stdout: {}",
-        output.stdout
-    );
-}
-
-/// 1.19 — File path with spaces -> correct handling.
-#[test]
-fn preread_file_path_with_spaces() {
-    let path_with_spaces = "src/my file/main.rs";
-    let key = format!("file:{path_with_spaces}");
-    let harness = HookTestHarness::for_pre_read().with_deny_eligible_record(&key, 0.1, "fresh");
-    let input = serde_json::json!({
-        "tool_input": { "file_path": path_with_spaces }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert!(
-        output.json.is_some(),
-        "output must be valid JSON with spaces in path, stdout: {}",
-        output.stdout
-    );
-    // High conf + confirmed + good qual -> should deny
-    assert_eq!(output.decision(), "deny");
-}
-
-/// 1.20 — Unicode file path -> correct handling.
-#[test]
-fn preread_file_path_with_unicode() {
-    let record = make_record(0.45, 0.5, false, 0.1, "fresh");
-    let path_unicode = "src/datos/archivo_\u{00f1}.rs";
-    let key = format!("file:{path_unicode}");
-    let harness = HookTestHarness::for_pre_read().with_mock_record(&key, &record);
-    let input = serde_json::json!({
-        "tool_input": { "file_path": path_unicode }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert!(
-        output.json.is_some(),
-        "output must be valid JSON with unicode path, stdout: {}",
-        output.stdout
-    );
-    assert_eq!(output.decision(), "allow");
-}
-
-/// 1.21 — pre-bash: `cat src/main.rs` detected -> deny (if record has confirmed gotcha).
-#[test]
-fn prebash_cat_detected_delegates_to_decision() {
-    let harness =
-        HookTestHarness::for_pre_bash().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
-    let input = serde_json::json!({
-        "tool_input": { "command": "cat src/main.rs" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "deny",
-        "cat with eligible record must deny"
-    );
-    assert!(
-        output.reason().contains("mem_get"),
-        "deny reason should reference mem_get"
-    );
-}
-
-/// 1.22 — pre-bash: `head -n 20 src/main.rs` -> file detected.
-///
-/// The awk parser skips words starting with `-` but treats `20` as a file path
-/// (it doesn't start with `-`). This means `head -n 20 file.rs` detects `20`
-/// as the file, NOT `file.rs`. This is a known limitation of the simple regex
-/// approach (C9 ~2-5% miss rate). We test with `head -20 src/main.rs` (combined
-/// flag) so the first non-flag word is the actual file.
-#[test]
-fn prebash_head_with_flags_detected() {
-    let harness =
-        HookTestHarness::for_pre_bash().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
-    let input = serde_json::json!({
-        "tool_input": { "command": "head -20 src/main.rs" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "deny",
-        "head -20 src/main.rs should detect the file and deny"
-    );
-}
-
-/// 1.23 — pre-bash: `git status` has no file-reading pattern -> allow, no mati call.
-#[test]
-fn prebash_no_file_reading_pattern_allows() {
-    // Even if a record exists, git status should not trigger file detection
-    let record = make_record(0.8, 0.7, true, 0.1, "fresh");
-    let harness = HookTestHarness::for_pre_bash().with_mock_record("file:src/main.rs", &record);
-    let input = serde_json::json!({
-        "tool_input": { "command": "git status" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "non-file-reading command must allow"
-    );
-}
-
-/// 1.24 — pre-bash: `cat src/main.rs | grep foo` -> file detected (piped).
-#[test]
-fn prebash_piped_command_detected() {
-    let harness =
-        HookTestHarness::for_pre_bash().with_deny_eligible_record("file:src/main.rs", 0.1, "fresh");
-    let input = serde_json::json!({
-        "tool_input": { "command": "cat src/main.rs | grep foo" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(
-        output.decision(),
-        "deny",
-        "piped cat command should still detect the file"
-    );
-}
-
-/// 1.25 — pre-bash: empty command -> allow.
-#[test]
-fn prebash_empty_command_allows() {
-    let harness = HookTestHarness::for_pre_bash();
-    let input = serde_json::json!({
-        "tool_input": { "command": "" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow", "empty command must allow");
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Category 2: Failure Modes (8 tests)
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// 2.01 — No mati binary in PATH at all -> allow.
-#[test]
-fn preread_mati_binary_not_in_path_allows() {
-    let harness = HookTestHarness::for_pre_read().exclude_binary("mati");
-
-    // We also need to remove the mock mati from the mock_dir.
-    // The easiest way: don't write it. Override run() behavior by
-    // writing the hook script manually without calling write_mock_mati.
-    let script_path = harness.mock_dir.path().join("hook.sh");
-    std::fs::write(&script_path, &harness.script_content).expect("failed to write hook script");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to chmod hook script");
     }
 
-    // Build a PATH that excludes our mock dir (no mati anywhere)
-    // Use the filtered bin approach but also exclude mati
-    let filtered_dir = harness.mock_dir.path().join("no_mati_bin");
-    std::fs::create_dir_all(&filtered_dir).expect("failed to create no_mati_bin dir");
+    /// Write a mock `mati` binary that records invocation details and replays
+    /// a canned response. `exit_code` controls what the mock returns.
+    fn write_mock(&self, canned_stdout: &str, canned_stderr: &str, exit_code: i32) {
+        let log_path = self.mock_dir.path().join("invocation.log");
+        let escaped_stdout = canned_stdout.replace('\'', "'\\''");
+        let escaped_stderr = canned_stderr.replace('\'', "'\\''");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+# Log the full argument vector.
+echo "ARGS: $*" >> "{log}"
+# Log stdin so tests can verify passthrough.
+STDIN="$(cat)"
+echo "STDIN: $STDIN" >> "{log}"
+# Replay canned response.
+echo -n '{stdout}' >&1
+echo -n '{stderr}' >&2
+exit {code}
+"#,
+            log = log_path.display(),
+            stdout = escaped_stdout,
+            stderr = escaped_stderr,
+            code = exit_code,
+        );
+        let mock_path = self.mock_dir.path().join("mati");
+        std::fs::write(&mock_path, script).expect("write mock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mock_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod mock");
+        }
+    }
 
-    let essential_bins = [
-        "bash", "cat", "echo", "printf", "sed", "grep", "awk", "env", "jq", "bc", "which", "tr",
-        "sort", "cut", "wc", "true", "false",
-    ];
-    let system_dirs = ["/usr/bin", "/bin", "/usr/local/bin"];
+    /// Execute a wrapper script against the mock.
+    fn run(&self, script_content: &str, stdin_json: &str) -> WrapperOutput {
+        let script_path = self.mock_dir.path().join("hook.sh");
+        std::fs::write(&script_path, script_content).expect("write hook script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod hook script");
+        }
 
-    for bin_name in &essential_bins {
-        for dir in &system_dirs {
-            let src = PathBuf::from(dir).join(bin_name);
-            if src.exists() {
-                let dst = filtered_dir.join(bin_name);
-                if !dst.exists() {
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&src, &dst).ok();
+        // Do NOT include mock_dir in PATH — the wrapper's own HOOKS_DIR
+        // setup (`export PATH="$HOOKS_DIR:$PATH"`) must be the only way
+        // the sibling `mati` binary is found.
+        let path = "/usr/bin:/bin:/usr/local/bin";
+
+        let output = Command::new("bash")
+            .arg(script_path.to_str().unwrap())
+            .env("PATH", path)
+            .env("HOME", self.mock_dir.path())
+            .current_dir(self.mock_dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(stdin_json.as_bytes()).expect("write stdin");
                 }
-                break;
-            }
+                child.stdin.take();
+                child.wait_with_output()
+            })
+            .expect("execute hook");
+
+        WrapperOutput {
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
         }
     }
 
-    let path = format!("{}", filtered_dir.display());
-
-    let output_raw = Command::new("bash")
-        .arg(script_path.to_str().expect("script path not valid UTF-8"))
-        .env("PATH", &path)
-        .env("HOME", harness.mock_dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            if let Some(ref mut stdin) = child.stdin {
-                stdin
-                    .write_all(br#"{"tool_input":{"file_path":"src/main.rs"}}"#)
-                    .expect("failed to write stdin");
-            }
-            child.stdin.take();
-            child.wait_with_output()
-        })
-        .expect("failed to execute hook script");
-
-    let stdout = String::from_utf8_lossy(&output_raw.stdout).to_string();
-    let json: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
-
-    assert_eq!(output_raw.status.code().unwrap_or(-1), 0, "should exit 0");
-    let decision = json
-        .as_ref()
-        .and_then(|j| j.pointer("/hookSpecificOutput/permissionDecision"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    assert_eq!(
-        decision, "allow",
-        "no mati in PATH must allow, stdout: {stdout}"
-    );
-}
-
-/// 2.02 — mati get returns invalid JSON (garbage) -> structured allow.
-#[test]
-fn preread_mati_get_returns_invalid_json_allows() {
-    let harness =
-        HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", "NOT_VALID_JSON{{{");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0, "invalid JSON should fail open cleanly");
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "invalid JSON from mati get should produce a structured allow"
-    );
-}
-
-/// 2.03 — mati get returns empty string -> allow + log-miss.
-#[test]
-fn preread_mati_get_returns_empty_string_allows() {
-    let harness = HookTestHarness::for_pre_read().with_mock_record("file:src/main.rs", "");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert_eq!(output.decision(), "allow");
-}
-
-/// 2.04 — Empty stdin -> exits cleanly (code 0).
-#[test]
-fn preread_stdin_empty_exits_cleanly() {
-    let harness = HookTestHarness::for_pre_read();
-    let output = harness.run("");
-    // With empty stdin, jq will either fail or return empty.
-    // set -euo pipefail may cause early exit, but it should still be clean.
-    // The main thing: no hang, and exit code should be 0.
-    assert_eq!(
-        output.exit_code, 0,
-        "empty stdin should exit cleanly, stderr: {}",
-        output.stderr
-    );
-}
-
-/// 2.05 — Non-JSON stdin -> clean exit.
-#[test]
-fn preread_stdin_invalid_json_exits_cleanly() {
-    let harness = HookTestHarness::for_pre_read();
-    let output = harness.run("this is not json at all");
-    // jq should fail on invalid JSON -> the script may exit due to set -e,
-    // or the jq fallback defaults kick in. Either way, no hang.
-    // We accept exit code 0 (if guards catch it) or non-zero (if set -e fires).
-    // If it does produce output, it should be valid JSON
-    if !output.stdout.trim().is_empty() {
-        assert!(
-            output.json.is_some(),
-            "if output is produced, it must be valid JSON, got: {}",
-            output.stdout
-        );
+    /// Read the invocation log written by the mock.
+    fn invocation_log(&self) -> String {
+        let log_path = self.mock_dir.path().join("invocation.log");
+        std::fs::read_to_string(&log_path).unwrap_or_default()
     }
 }
 
-/// 2.06 — Mock mati sleeps 2s on get -> hook still completes (no hang).
-///
-/// This test verifies that the hook does not hang indefinitely when mati is slow.
-/// The bash script does not have an explicit timeout on `mati get`, so this test
-/// confirms the subprocess completes (via the 2s sleep finishing) rather than
-/// testing a timeout mechanism. The test itself has a generous timeout.
+// ── 1.01–1.04: Variant handoff — each wrapper passes the correct variant ────
+
 #[test]
-fn preread_mati_get_slow_does_not_hang() {
-    // Create a custom mock that sleeps 2 seconds before responding to get
-    let harness = HookTestHarness::for_pre_read()
-        .with_extra_mock_case(r#"get) sleep 2; echo 'null' ; exit 0 ;;"#);
-
-    // Override: we need the get case to be the sleep version, not the default.
-    // The simplest approach: use a custom mock that handles get specially.
-    let log_file = harness.mock_dir.path().join("mati_log.txt");
-    let mock_script = format!(
-        r#"#!/usr/bin/env bash
-case "$1" in
-    ping) exit 0 ;;
-    get) sleep 2; echo 'null'; exit 0 ;;
-    log-miss|log-hit|log-compliance-miss)
-        echo "$@" >> "{log}" ;;
-    *) exit 0 ;;
-esac
-"#,
-        log = log_file.display()
+fn preread_wrapper_executes_hook_decide_with_correct_variant() {
+    let h = WrapperHarness::new();
+    let response = r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#;
+    h.write_mock(response, "", 0);
+    let out = h.run(
+        pre_read::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
     );
 
-    let mock_path = harness.mock_dir.path().join("mati");
-    std::fs::write(&mock_path, mock_script).expect("failed to write slow mock mati");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_path, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to chmod mock mati");
-    }
+    assert_eq!(out.exit_code, 0, "wrapper must propagate exit 0");
+    assert_eq!(out.stdout.trim(), response, "wrapper must relay stdout");
 
-    let script_path = harness.write_hook_script();
-    let path = format!(
-        "{}:{}",
-        harness.mock_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    let start = std::time::Instant::now();
-    let output_raw = Command::new("bash")
-        .arg(script_path.to_str().expect("script path not valid UTF-8"))
-        .env("PATH", &path)
-        .env("HOME", harness.mock_dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            if let Some(ref mut stdin) = child.stdin {
-                stdin
-                    .write_all(br#"{"tool_input":{"file_path":"src/main.rs"}}"#)
-                    .expect("failed to write stdin");
-            }
-            child.stdin.take();
-            child.wait_with_output()
-        })
-        .expect("failed to execute hook script");
-    let elapsed = start.elapsed();
-
-    // Should complete (not hang). We allow up to 10s total.
+    let log = h.invocation_log();
     assert!(
-        elapsed.as_secs() < 10,
-        "hook should complete within 10s, took {:?}",
-        elapsed
-    );
-
-    let stdout = String::from_utf8_lossy(&output_raw.stdout).to_string();
-    assert_eq!(output_raw.status.code().unwrap_or(-1), 0);
-
-    let json: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
-    let decision = json
-        .as_ref()
-        .and_then(|j| j.pointer("/hookSpecificOutput/permissionDecision"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    assert_eq!(decision, "allow", "slow mati should still result in allow");
-}
-
-/// 2.07 — pre-bash: mati get returns an array instead of object -> structured allow.
-#[test]
-fn prebash_unexpected_jq_type_graceful() {
-    let harness =
-        HookTestHarness::for_pre_bash().with_mock_record("file:src/main.rs", r#"[1, 2, 3]"#);
-    let input = serde_json::json!({
-        "tool_input": { "command": "cat src/main.rs" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(
-        output.exit_code, 0,
-        "unexpected jq type should fail open cleanly"
-    );
-    assert_eq!(
-        output.decision(),
-        "allow",
-        "unexpected jq type should produce a structured allow"
+        log.contains("ARGS: hook-decide claude-pre-read"),
+        "wrapper must pass variant claude-pre-read, log: {log}"
     );
 }
 
-/// 2.08 — 5 parallel invocations -> all produce valid JSON (no corruption).
 #[test]
-fn preread_concurrent_invocations_no_corruption() {
-    // Deny signal comes from a linked gotcha record, not the file record itself.
-    let gotcha_key = "gotcha:concurrent-test";
-    let gotcha_record = make_gotcha_record(0.8, 0.7, true);
-    let file_record = make_file_record_with_gotcha(0.8, 0.7, 0.1, "fresh", gotcha_key);
-
-    let escaped_file = file_record.replace('\'', "'\\''");
-    let escaped_gotcha = gotcha_record.replace('\'', "'\\''");
-
-    // We need a shared setup for all 5 threads. Create the mock environment once.
-    let shared_dir = TempDir::new().expect("failed to create shared temp dir");
-    let log_file = shared_dir.path().join("mati_log.txt");
-
-    // Write mock mati
-    let mock_script = format!(
-        r#"#!/usr/bin/env bash
-case "$1" in
-    ping) exit 0 ;;
-    get)
-        KEY="$2"
-        case "$KEY" in
-            "file:src/main.rs") echo '{file}' ;;
-            "{gotcha_key}") echo '{gotcha}' ;;
-            *) echo 'null' ;;
-        esac ;;
-    log-miss|log-hit|log-compliance-miss|session-check-consulted)
-        echo "$@" >> "{log}" ;;
-    *) exit 0 ;;
-esac
-"#,
-        file = escaped_file,
-        gotcha_key = gotcha_key,
-        gotcha = escaped_gotcha,
-        log = log_file.display()
+fn prebash_wrapper_executes_hook_decide_with_correct_variant() {
+    let h = WrapperHarness::new();
+    h.write_mock(
+        r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
+        "",
+        0,
+    );
+    h.run(
+        pre_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
     );
 
-    let mock_path = shared_dir.path().join("mati");
-    std::fs::write(&mock_path, mock_script).expect("failed to write mock mati");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&mock_path, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to chmod mock mati");
-    }
+    let log = h.invocation_log();
+    assert!(
+        log.contains("ARGS: hook-decide claude-pre-bash"),
+        "wrapper must pass variant claude-pre-bash, log: {log}"
+    );
+}
 
-    // Write hook script
-    let script_path = shared_dir.path().join("hook.sh");
-    std::fs::write(&script_path, pre_read::SCRIPT).expect("failed to write hook");
+#[test]
+fn codex_prebash_wrapper_executes_hook_decide_with_correct_variant() {
+    let h = WrapperHarness::new();
+    h.write_mock("", "", 0);
+    h.run(
+        codex_pre_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
+
+    let log = h.invocation_log();
+    assert!(
+        log.contains("ARGS: hook-decide codex-pre-bash"),
+        "wrapper must pass variant codex-pre-bash, log: {log}"
+    );
+}
+
+#[test]
+fn codex_postbash_wrapper_executes_hook_decide_with_correct_variant() {
+    let h = WrapperHarness::new();
+    h.write_mock("", "", 0);
+    h.run(
+        codex_post_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
+
+    let log = h.invocation_log();
+    assert!(
+        log.contains("ARGS: hook-decide codex-post-bash"),
+        "wrapper must pass variant codex-post-bash, log: {log}"
+    );
+}
+
+// ── 1.05–1.06: Stdin passthrough — tool_input JSON reaches mock mati ────────
+
+#[test]
+fn preread_wrapper_passes_stdin_through() {
+    let h = WrapperHarness::new();
+    h.write_mock(
+        r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
+        "",
+        0,
+    );
+    let input = r#"{"tool_input":{"file_path":"src/store/db.rs"}}"#;
+    h.run(pre_read::SCRIPT, input);
+
+    let log = h.invocation_log();
+    assert!(
+        log.contains(input),
+        "stdin must reach mock mati intact, log: {log}"
+    );
+}
+
+#[test]
+fn codex_prebash_wrapper_passes_stdin_through() {
+    let h = WrapperHarness::new();
+    h.write_mock("", "", 0);
+    let input = r#"{"tool_input":{"command":"head -20 src/main.rs"}}"#;
+    h.run(codex_pre_bash::SCRIPT, input);
+
+    let log = h.invocation_log();
+    assert!(
+        log.contains(input),
+        "stdin must reach mock mati intact, log: {log}"
+    );
+}
+
+// ── 1.07–1.08: Exit code propagation — non-zero codes survive exec ──────────
+
+#[test]
+fn preread_wrapper_propagates_nonzero_exit() {
+    let h = WrapperHarness::new();
+    h.write_mock("", "blocked", 1);
+    let out = h.run(
+        pre_read::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
+
+    assert_eq!(
+        out.exit_code, 1,
+        "wrapper must propagate exit 1 from hook-decide"
+    );
+}
+
+#[test]
+fn codex_prebash_wrapper_propagates_exit2_deny() {
+    let h = WrapperHarness::new();
+    h.write_mock("", "Run mem_get first", 2);
+    let out = h.run(
+        codex_pre_bash::SCRIPT,
+        r#"{"tool_input":{"command":"cat src/main.rs"}}"#,
+    );
+
+    assert_eq!(out.exit_code, 2, "Codex deny exit 2 must survive exec");
+    assert!(
+        out.stderr.contains("mem_get"),
+        "stderr must relay deny message, got: {}",
+        out.stderr
+    );
+}
+
+// ── 1.09: Stderr relay — wrapper does not swallow stderr ─────────────────────
+
+#[test]
+fn preread_wrapper_relays_stderr() {
+    let h = WrapperHarness::new();
+    h.write_mock(
+        r#"{"hookSpecificOutput":{"permissionDecision":"deny"}}"#,
+        "[mati] WARNING: test stderr relay",
+        0,
+    );
+    let out = h.run(
+        pre_read::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
+
+    assert!(
+        out.stderr.contains("[mati] WARNING: test stderr relay"),
+        "wrapper must relay stderr, got: {}",
+        out.stderr
+    );
+}
+
+// ── 1.10: No mati in PATH — set -e should cause a clean failure ─────────────
+
+#[test]
+fn preread_wrapper_no_mati_in_path_fails_cleanly() {
+    // Don't write any mock — mati is not in PATH.
+    let h = WrapperHarness::new();
+    let script_path = h.mock_dir.path().join("hook.sh");
+    std::fs::write(&script_path, pre_read::SCRIPT).expect("write hook");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to chmod hook");
+            .expect("chmod");
     }
 
-    let path = format!(
-        "{}:{}",
-        shared_dir.path().display(),
-        std::env::var("PATH").unwrap_or_default()
+    // PATH with only system dirs — no mock mati.
+    let output = Command::new("bash")
+        .arg(script_path.to_str().unwrap())
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", h.mock_dir.path())
+        .current_dir(h.mock_dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(b"{}").expect("write stdin");
+            }
+            child.stdin.take();
+            child.wait_with_output()
+        })
+        .expect("execute hook");
+
+    // `command -v mati` guard in the wrapper exits 0 (graceful fail-open)
+    // when mati is not in PATH — the agent must not be blocked by a missing binary.
+    assert_eq!(
+        output.status.code().unwrap_or(-1),
+        0,
+        "missing mati must exit 0 (graceful fail-open)"
     );
-
-    let mut handles = Vec::new();
-    for i in 0..5 {
-        let script = script_path.clone();
-        let env_path = path.clone();
-        let home = shared_dir.path().to_path_buf();
-        handles.push(std::thread::spawn(move || {
-            let output = Command::new("bash")
-                .arg(script.to_str().expect("script path not valid UTF-8"))
-                .env("PATH", &env_path)
-                .env("HOME", &home)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut child| {
-                    if let Some(ref mut stdin) = child.stdin {
-                        stdin
-                            .write_all(br#"{"tool_input":{"file_path":"src/main.rs"}}"#)
-                            .expect("failed to write stdin");
-                    }
-                    child.stdin.take();
-                    child.wait_with_output()
-                })
-                .unwrap_or_else(|e| panic!("thread {i} failed to execute hook: {e}"));
-
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let exit_code = output.status.code().unwrap_or(-1);
-            let json: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
-
-            (i, stdout, exit_code, json)
-        }));
-    }
-
-    for handle in handles {
-        let (i, stdout, exit_code, json) = handle.join().expect("thread panicked");
-        assert_eq!(exit_code, 0, "thread {i} should exit 0");
-        assert!(
-            json.is_some(),
-            "thread {i} must produce valid JSON, got: {stdout}"
-        );
-        let decision = json
-            .as_ref()
-            .and_then(|j| j.pointer("/hookSpecificOutput/permissionDecision"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        assert_eq!(
-            decision, "deny",
-            "thread {i} should deny (high conf + confirmed + good qual)"
-        );
-    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1321,13 +797,15 @@ fn post_edit_invokes_doc_capture_and_edit_hook() {
     .to_string();
     let output = harness.run(&input);
     assert_eq!(output.exit_code, 0);
+    // post-edit fires background processes (`&`) — allow extra time under parallel load.
+    let bg_timeout = std::time::Duration::from_secs(5);
     assert!(
-        harness.wait_for_log_contains("doc-capture src/main.rs"),
+        harness.wait_for_log_contains_timeout("doc-capture src/main.rs", bg_timeout),
         "post-edit should invoke doc-capture, log: {}",
         harness.read_log()
     );
     assert!(
-        harness.wait_for_log_contains("edit-hook src/main.rs"),
+        harness.wait_for_log_contains_timeout("edit-hook src/main.rs", bg_timeout),
         "post-edit should invoke edit-hook, log: {}",
         harness.read_log()
     );
@@ -1359,106 +837,35 @@ fn session_end_invokes_session_harvest() {
     );
 }
 
-/// 3.05 — Codex session-start nudges mem_bootstrap.
+/// 3.05 — Codex session-start emits compact active sentinel (~5 tokens).
 #[test]
-fn codex_session_start_emits_bootstrap_guidance() {
+fn codex_session_start_emits_active_sentinel() {
     let harness = HookTestHarness::for_codex_session_start();
     let output = harness.run("{}");
     assert_eq!(output.exit_code, 0);
     assert!(
-        output.stdout.contains("mem_bootstrap"),
-        "session-start should instruct Codex to bootstrap memory"
+        output.stdout.contains("[mati] active"),
+        "session-start should emit compact sentinel, got: {}",
+        output.stdout
     );
 }
 
-/// 3.06 — Codex user-prompt hook nudges and logs likely edit intent.
+/// 3.06 — Codex user-prompt hook exits cleanly with zero injection.
 #[test]
-fn codex_user_prompt_logs_nudge_for_code_edit_intent() {
+fn codex_user_prompt_exits_clean_no_injection() {
     let harness = HookTestHarness::for_codex_user_prompt();
     let output = harness.run(r#"{"prompt":"Please inspect src/main.rs and fix the bug"}"#);
     assert_eq!(output.exit_code, 0);
     assert!(
-        output.stdout.contains("mem_get"),
-        "user-prompt hook should recommend mem_get for risky file work"
-    );
-    assert!(
-        harness.wait_for_log_contains("log-prompt-nudge __codex_prompt__"),
-        "user-prompt hook should log prompt nudges, log: {}",
-        harness.read_log()
-    );
-}
-
-/// 3.07 — Codex pre-bash blocks strong gotcha shell reads without a receipt.
-#[test]
-fn codex_pre_bash_blocks_shell_read_without_recent_receipt() {
-    let harness = HookTestHarness::for_codex_pre_bash().with_deny_eligible_record(
-        "file:src/main.rs",
-        0.1,
-        "fresh",
-    );
-    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    let json = output.json.expect("codex pre-bash should emit JSON");
-    assert_eq!(
-        json["hookSpecificOutput"]["permissionDecision"].as_str(),
-        Some("deny")
-    );
-    assert!(
-        json["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("mem_get"),
-        "block reason should instruct the agent to consult memory first"
-    );
-    assert!(
-        harness.wait_for_log_contains("log-codex-shell-miss file:src/main.rs"),
-        "pre-bash should log shell misses, log: {}",
-        harness.read_log()
-    );
-}
-
-/// 3.08 — Codex post-bash logs misses and corrective context.
-#[test]
-fn codex_post_bash_logs_shell_miss_and_context() {
-    let harness = HookTestHarness::for_codex_post_bash();
-    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    let json = output.json.expect("codex post-bash should emit JSON");
-    assert!(
-        json["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("mem_get"),
-        "post-bash miss should remind the agent to consult memory"
-    );
-    assert!(
-        harness.wait_for_log_contains("log-codex-shell-miss file:src/main.rs"),
-        "post-bash should log shell misses, log: {}",
-        harness.read_log()
-    );
-}
-
-/// 3.09 — Codex pre-bash allows a strong gotcha file after a recent consultation.
-#[test]
-fn codex_pre_bash_allows_with_recent_receipt() {
-    let harness = HookTestHarness::for_codex_pre_bash()
-        .with_deny_eligible_record("file:src/main.rs", 0.1, "fresh")
-        .with_recent_consulted(true);
-    let output = harness.run(r#"{"tool_input":{"command":"cat src/main.rs"}}"#);
-    assert_eq!(output.exit_code, 0);
-    assert!(
         output.stdout.trim().is_empty(),
-        "recent consultation should suppress deny/advisory output, got: {}",
+        "user-prompt hook must inject zero tokens, got: {}",
         output.stdout
     );
-    assert!(
-        !harness
-            .read_log()
-            .contains("log-codex-shell-miss file:src/main.rs"),
-        "recent consultation should not log a shell miss, log: {}",
-        harness.read_log()
-    );
 }
+
+// 3.07–3.09 — Codex pre-bash and post-bash enforcement is in Rust.
+// Wrapper execution is in Category 1 above. Enforcement matrix is covered
+// by hooks::decide::tests (51 unit tests) + cli::hook_decide::tests (22 tests).
 
 /// 3.10 — Codex stop flushes then harvests the session.
 #[test]
@@ -1467,12 +874,14 @@ fn codex_stop_flushes_then_harvests() {
     let output = harness.run("{}");
     assert_eq!(output.exit_code, 0);
     let log = harness.read_log();
+    let flush_pos = log
+        .find("session-flush")
+        .expect("missing session-flush in log");
+    let harvest_pos = log
+        .find("session-harvest")
+        .expect("missing session-harvest in log");
     assert!(
-        log.contains("session-flush"),
-        "codex stop should flush session state first, log: {log}"
-    );
-    assert!(
-        log.contains("session-harvest"),
-        "codex stop should harvest session state, log: {log}"
+        flush_pos < harvest_pos,
+        "flush must precede harvest, log: {log}"
     );
 }

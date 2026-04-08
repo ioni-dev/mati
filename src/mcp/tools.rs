@@ -225,6 +225,12 @@ impl MatiServer {
     /// Retrieve a single record by its namespaced key.
     ///
     /// Returns the JSON-serialised record, or "null" if not found.
+    ///
+    /// Note: `read_only_hint = true` is set because mem_get does not modify
+    /// knowledge content. However, it does write consultation receipts
+    /// (session:consulted:*) synchronously — these are critical for hook
+    /// enforcement (deny → mem_get → allow cycle) — and defers access_count
+    /// and analytics writes to a background task.
     #[rmcp::tool(
         name = "mem_get",
         description = "Look up one mati knowledge record by key. Before reading a file directly, call this with \"file:<path>\" and use the record instead when it is confirmed and high-confidence.",
@@ -306,7 +312,8 @@ impl MatiServer {
         match &self.backend {
             MatiBackend::Direct(graph_arc) => {
                 let mode = params.mode.as_str();
-                let limit = params.limit;
+                const MAX_QUERY_LIMIT: usize = 50;
+                let limit = params.limit.min(MAX_QUERY_LIMIT);
 
                 match mode {
                     "text" => {
@@ -350,12 +357,13 @@ impl MatiServer {
                 );
 
                 let mut summary_parts = Vec::new();
+                let mut remaining = limit;
 
                 for (kind, group_name, group_limit) in edge_groups {
                     let keys = graph.neighbors(&params.query, kind);
                     let mut group_records = Vec::new();
 
-                    for key in keys.iter().take(*group_limit) {
+                    for key in keys.iter().take((*group_limit).min(remaining)) {
                         if let Ok(Some(record)) = store.get(key).await {
                             if matches!(record.lifecycle, RecordLifecycle::Active) {
                                 let mut entry = serde_json::Map::new();
@@ -392,45 +400,55 @@ impl MatiServer {
                     if !group_records.is_empty() {
                         summary_parts.push(format!("{} {}", group_records.len(), group_name));
                     }
+                    remaining -= group_records.len();
                     result.insert(
                         group_name.to_string(),
                         serde_json::Value::Array(group_records),
                     );
+                    if remaining == 0 {
+                        break;
+                    }
                 }
 
                 // DependencyAffects — add to decisions group
-                let dep_keys = graph.neighbors(&params.query, &EdgeKind::DependencyAffects);
-                for key in dep_keys.iter().take(DECISION_LIMIT) {
-                    if let Ok(Some(record)) = store.get(key).await {
-                        if matches!(record.lifecycle, RecordLifecycle::Active) {
-                            let mut entry = serde_json::Map::new();
-                            entry.insert(
-                                "key".to_string(),
-                                serde_json::Value::String(record.key.clone()),
-                            );
-                            entry.insert(
-                                "relationship".to_string(),
-                                serde_json::Value::String("DependencyAffects".to_string()),
-                            );
-                            entry.insert(
-                                "value".to_string(),
-                                serde_json::Value::String(record.value.clone()),
-                            );
-                            entry.insert(
-                                "confidence".to_string(),
-                                serde_json::json!(record.confidence.value),
-                            );
-                            entry.insert(
-                                "quality".to_string(),
-                                serde_json::json!(record.quality.value),
-                            );
-                            if let Some(decisions) = result.get_mut("decisions") {
-                                if let Some(arr) = decisions.as_array_mut() {
-                                    arr.push(serde_json::Value::Object(entry));
+                if remaining > 0 {
+                    let dep_keys = graph.neighbors(&params.query, &EdgeKind::DependencyAffects);
+                    let mut dep_added = 0usize;
+                    for key in dep_keys.iter().take(DECISION_LIMIT.min(remaining)) {
+                        if let Ok(Some(record)) = store.get(key).await {
+                            if matches!(record.lifecycle, RecordLifecycle::Active) {
+                                let mut entry = serde_json::Map::new();
+                                entry.insert(
+                                    "key".to_string(),
+                                    serde_json::Value::String(record.key.clone()),
+                                );
+                                entry.insert(
+                                    "relationship".to_string(),
+                                    serde_json::Value::String("DependencyAffects".to_string()),
+                                );
+                                entry.insert(
+                                    "value".to_string(),
+                                    serde_json::Value::String(record.value.clone()),
+                                );
+                                entry.insert(
+                                    "confidence".to_string(),
+                                    serde_json::json!(record.confidence.value),
+                                );
+                                entry.insert(
+                                    "quality".to_string(),
+                                    serde_json::json!(record.quality.value),
+                                );
+                                if let Some(decisions) = result.get_mut("decisions") {
+                                    if let Some(arr) = decisions.as_array_mut() {
+                                        arr.push(serde_json::Value::Object(entry));
+                                        dep_added += 1;
+                                    }
                                 }
                             }
                         }
                     }
+                    remaining -= dep_added;
+                    let _ = remaining; // suppress unused warning
                 }
 
                 let summary = if summary_parts.is_empty() {
@@ -517,8 +535,8 @@ impl MatiServer {
         description = "Write, confirm, or delete a knowledge record. Actions: \"write\" (default) creates/updates a record, \"confirm\" activates a gotcha for hook enforcement, \"delete\" tombstones a gotcha.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true
+            destructive_hint = true,
+            idempotent_hint = false
         )
     )]
     pub(crate) async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
@@ -582,7 +600,11 @@ impl MatiServer {
                 };
 
                 // Fetch existing record to preserve Layer 0 structural data
-                let existing_record = store.get(&params.key).await.ok().flatten();
+                let existing_record = match resolve_existing_for_write(store.get(&params.key).await)
+                {
+                    Ok(record) => record,
+                    Err(error_json) => return error_json,
+                };
 
                 // A tombstoned record must not bleed its prior confirmation state
                 // into a resurrection — treat it as an unconfirmed write.
@@ -958,15 +980,36 @@ impl MatiServer {
             }
         }
 
+        // Propagate confirmation_count to linked file records
+        crate::store::gotcha_ops::propagate_confirmation_to_files(store, &affected_files).await;
+
         // Mint consultation receipt so hooks know this file was reviewed
         let _ = crate::store::session::log_hit(store, key).await;
+
+        let confidence_value = record.confidence.value;
+        let quality_value = record.quality.value;
+
+        // Release the read lock so we can take a write lock for graph edge updates.
+        drop(graph);
+
+        // Ensure HasGotcha edges exist in the in-memory graph for all affected files.
+        // This is idempotent (add_edge is a no-op if the edge already exists) and guards
+        // against gotchas that were written via the CLI path, whose graph edges landed in
+        // the persistent store but were never loaded into the running graph.
+        if !affected_files.is_empty() {
+            let mut g = graph_arc.write().await;
+            for file_path in &affected_files {
+                let file_key = format!("file:{file_path}");
+                let _ = g.add_edge(&file_key, EdgeKind::HasGotcha, key).await;
+            }
+        }
 
         json!({
             "ok": true,
             "key": key,
             "confirmed": true,
-            "confidence": record.confidence.value,
-            "quality": record.quality.value,
+            "confidence": confidence_value,
+            "quality": quality_value,
         })
         .to_string()
     }
@@ -978,28 +1021,89 @@ impl MatiServer {
         graph_arc: &Arc<tokio::sync::RwLock<Graph>>,
         key: &str,
     ) -> String {
-        let graph = graph_arc.read().await;
-        let store = graph.store();
+        // Phase 1: read lock — validate and tombstone the record.
+        let affected_files = {
+            let graph = graph_arc.read().await;
+            let store = graph.store();
 
-        if !key.starts_with("gotcha:") {
-            return json!({"error": "delete action only applies to gotcha: keys"}).to_string();
+            if !key.starts_with("gotcha:") {
+                return json!({"error": "delete action only applies to gotcha: keys"}).to_string();
+            }
+
+            let record = match store.get(key).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return json!({"error": format!("record not found: {key}")}).to_string()
+                }
+                Err(e) => return json!({"error": format!("store get: {e}")}).to_string(),
+            };
+
+            let affected: Vec<String> = record
+                .payload_as::<GotchaRecord>()
+                .map(|g| g.affected_files)
+                .unwrap_or_default();
+
+            if let Err(e) =
+                crate::store::gotcha_ops::apply_gotcha_tombstone(store, key, &affected).await
+            {
+                return json!({"error": format!("tombstone failed: {e}")}).to_string();
+            }
+
+            affected
+        }; // read lock dropped here
+
+        // Phase 2: write lock — clean up in-memory graph edges.
+        {
+            let mut graph = graph_arc.write().await;
+            for file_path in &affected_files {
+                let file_key = format!("file:{file_path}");
+                // remove_edge is idempotent — the persisted edge is already gone
+                // from apply_gotcha_tombstone; this cleans up the in-memory cache.
+                if let Err(e) = graph
+                    .remove_edge(&file_key, &EdgeKind::HasGotcha, key)
+                    .await
+                {
+                    tracing::warn!(
+                        "mem_set_delete: in-memory edge cleanup failed for {file_key} → {key}: {e}"
+                    );
+                }
+            }
         }
 
-        let record = match store.get(key).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return json!({"error": format!("record not found: {key}")}).to_string(),
-            Err(e) => return json!({"error": format!("store get: {e}")}).to_string(),
-        };
+        json!({"ok": true, "key": key, "tombstoned": true}).to_string()
+    }
+}
 
-        let affected_files: Vec<String> = record
-            .payload_as::<GotchaRecord>()
-            .map(|g| g.affected_files)
-            .unwrap_or_default();
+/// Returns true if a gotcha record is eligible for injection into a context packet.
+fn is_injectable_gotcha(r: &Record) -> bool {
+    if !matches!(r.lifecycle, RecordLifecycle::Active) {
+        return false;
+    }
+    if r.staleness.tier == StalenessTier::Tombstone {
+        return false;
+    }
+    if let Some(gotcha) = r.payload_as::<GotchaRecord>() {
+        gotcha.confirmed && r.quality.value >= 0.4
+    } else {
+        false
+    }
+}
 
-        match crate::store::gotcha_ops::apply_gotcha_tombstone(store, key, &affected_files).await {
-            Ok(()) => json!({"ok": true, "key": key, "tombstoned": true}).to_string(),
-            Err(e) => json!({"error": format!("tombstone failed: {e}")}).to_string(),
-        }
+/// Resolve the existing record for a mem_set write path.
+///
+/// Returns `Ok(Option<Record>)` on success, or an error JSON string
+/// if the store read failed — callers must abort the write.
+/// Extracted for testability: the `Err` branch was previously untestable
+/// because it required a real store failure.
+fn resolve_existing_for_write(
+    store_result: anyhow::Result<Option<Record>>,
+) -> Result<Option<Record>, String> {
+    match store_result {
+        Ok(record) => Ok(record),
+        Err(e) => Err(serde_json::json!({
+            "error": format!("store read failed \u{2014} refusing to write: {e}")
+        })
+        .to_string()),
     }
 }
 
@@ -1007,7 +1111,9 @@ impl MatiServer {
 ///
 /// Steps:
 /// 1. Fetch `stage:current`
-/// 2. Scan `gotcha:*`, filter confirmed + quality >= 0.4
+/// 2. Collect confirmed gotchas (deferred until after step 3):
+///    - For non-empty `context_files`: fetch only linked gotchas by key
+///    - For empty `context_files` (global bootstrap): scan all `gotcha:*`
 /// 3. For each context_file: get FileRecord, traverse HasGotcha (1-hop),
 ///    traverse Imports→HasGotcha (2-hop), traverse AffectedBy for decisions
 /// 4. Dedup + sort gotchas by confidence × priority_weight
@@ -1022,28 +1128,8 @@ pub async fn assemble_context_packet(
     // 1. Stage
     let stage = store.get("stage:current").await?;
 
-    // 2. Scan all gotchas, filter confirmed + quality >= 0.4, exclude tombstones
-    let all_gotchas = store.scan_prefix("gotcha:").await?;
-    let mut confirmed_gotchas: Vec<Record> = all_gotchas
-        .into_iter()
-        .filter(|r| {
-            // Exclude tombstoned records
-            if !matches!(r.lifecycle, RecordLifecycle::Active) {
-                return false;
-            }
-            // Exclude tombstone-tier staleness
-            if r.staleness.tier == StalenessTier::Tombstone {
-                return false;
-            }
-            // Check confirmed flag from structured payload
-            if let Some(gotcha) = r.payload_as::<GotchaRecord>() {
-                gotcha.confirmed && r.quality.value >= 0.4
-            } else {
-                // No payload or unparseable — exclude
-                false
-            }
-        })
-        .collect();
+    // 2. Gotcha collection — deferred until after context-file traversal
+    //    so we can optimize non-empty context_files to fetch only linked gotchas.
 
     // 3. Context-file traversal
     let mut file_records = Vec::new();
@@ -1095,6 +1181,15 @@ pub async fn assemble_context_packet(
             }
 
             if let Some(fr) = record.payload_as::<FileRecord>() {
+                // Supplement graph traversal with the record-level gotcha_keys list.
+                // FileRecord.gotcha_keys is the authoritative persistent source; the
+                // in-memory graph edges are a cache that can lag after CLI gotcha writes
+                // (apply_gotcha_write persists to disk but historically skipped the
+                // in-memory graph update). Including these keys here ensures bootstrap
+                // surfaces confirmed gotchas even when graph edges are stale or missing.
+                for key in &fr.gotcha_keys {
+                    context_gotcha_keys.insert(key.clone());
+                }
                 // Nudge detection: hot file (access_count >= 3) with no gotchas
                 let is_nudge_candidate = record.access_count >= 3 && fr.gotcha_keys.is_empty();
                 file_records.push(fr);
@@ -1121,6 +1216,27 @@ pub async fn assemble_context_packet(
             decision_keys.insert(key);
         }
     }
+
+    // 2. (deferred) Collect confirmed gotchas — scope depends on context_files.
+    let mut confirmed_gotchas: Vec<Record> = if context_files.is_empty() {
+        // Global bootstrap: scan all gotchas (no context filter).
+        let all_gotchas = store.scan_prefix("gotcha:").await?;
+        all_gotchas
+            .into_iter()
+            .filter(is_injectable_gotcha)
+            .collect()
+    } else {
+        // Targeted bootstrap: fetch only gotchas linked to context files.
+        let mut gotchas = Vec::with_capacity(context_gotcha_keys.len());
+        for key in &context_gotcha_keys {
+            if let Ok(Some(record)) = store.get(key).await {
+                if is_injectable_gotcha(&record) {
+                    gotchas.push(record);
+                }
+            }
+        }
+        gotchas
+    };
 
     // M-13-B: surface stale reviews from last 2 days
     {
@@ -1161,13 +1277,11 @@ pub async fn assemble_context_packet(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // 5. Context filter + quality filter:
-    //    - when context_files are provided, only inject graph-reachable gotchas
-    //    - when context_files are empty, preserve the global bootstrap behavior
-    //    - always exclude Suppressed (<0.2), caveat Poor (0.2–0.4)
+    // 5. Quality filter: exclude Suppressed (<0.2), caveat Poor (0.2–0.4)
+    //    Context scoping is already handled in step 2: targeted fetch for non-empty
+    //    context_files, full scan for global bootstrap.
     let critical_gotchas: Vec<Record> = confirmed_gotchas
         .into_iter()
-        .filter(|r| context_files.is_empty() || context_gotcha_keys.contains(&r.key))
         .filter(|r| r.quality.tier != QualityTier::Suppressed)
         .collect();
 
@@ -1703,6 +1817,147 @@ mod tests {
         assert!(
             !packet.injection_string.contains("gotcha:unrelated"),
             "injection string must not mention unrelated gotchas"
+        );
+    }
+
+    /// Regression test for the bootstrap low-confidence file bug.
+    ///
+    /// Scenario: file record has confidence 0.10 (Layer 0 stub from mati init),
+    /// a confirmed gotcha with confidence 0.80 is linked via FileRecord.gotcha_keys,
+    /// but NO HasGotcha graph edge exists (simulating CLI gotcha_write that wrote to
+    /// the store but never updated the in-memory graph).
+    ///
+    /// Bootstrap must still surface the confirmed gotcha by falling back to
+    /// FileRecord.gotcha_keys when graph edges are absent.
+    #[tokio::test]
+    async fn bootstrap_surfaces_confirmed_gotcha_when_graph_edge_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Confirmed gotcha with high confidence/quality
+        let gotcha = make_gotcha_record(
+            "gotcha:never-remove-rate-limit",
+            "Never remove the rate limit check on incoming pipeline events because \
+             removing it caused a cascade failure in staging",
+            true,
+            0.80,
+        );
+        store
+            .put("gotcha:never-remove-rate-limit", &gotcha)
+            .await
+            .unwrap();
+
+        // File record: low-confidence stub (confidence 0.10), but gotcha_keys populated
+        let file_record = {
+            let fr = FileRecord {
+                path: "src/pipeline/prefilter.rs".to_string(),
+                purpose: String::new(), // no purpose — Layer 0 stub
+                entry_points: vec![],
+                imports: vec![],
+                gotcha_keys: vec!["gotcha:never-remove-rate-limit".to_string()],
+                decision_keys: vec![],
+                todos: vec![],
+                unsafe_count: 0,
+                unwrap_count: 0,
+                change_frequency: 18,
+                last_author: Some("dev".to_string()),
+                is_hotspot: true,
+                token_cost_estimate: 0,
+                last_modified_session: now(),
+                content_hash: None,
+                line_count: 0,
+            };
+            let mut r = make_record(
+                "file:src/pipeline/prefilter.rs",
+                "",
+                Category::File,
+                0.10, // low confidence — stub
+            );
+            r.payload = serde_json::to_value(&fr).ok();
+            r
+        };
+        store
+            .put("file:src/pipeline/prefilter.rs", &file_record)
+            .await
+            .unwrap();
+
+        // Intentionally do NOT add a HasGotcha graph edge — simulates the CLI
+        // gotcha_write bug where the persistent store edge was written but the
+        // in-memory graph was never updated.
+        let graph = Graph::load(store).await.unwrap();
+        assert_eq!(
+            graph.neighbors("file:src/pipeline/prefilter.rs", &EdgeKind::HasGotcha),
+            Vec::<String>::new(),
+            "test setup: graph must have no HasGotcha edge"
+        );
+
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/pipeline/prefilter.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet
+                .critical_gotchas
+                .iter()
+                .any(|g| g.key == "gotcha:never-remove-rate-limit"),
+            "bootstrap must surface confirmed gotcha even when graph edge is missing"
+        );
+        assert!(
+            packet
+                .injection_string
+                .contains("gotcha:never-remove-rate-limit"),
+            "injection string must include the gotcha"
+        );
+    }
+
+    /// Negative case: file with confidence 0.10 and NO confirmed gotchas should
+    /// produce minimal bootstrap output — no purpose text, no gotchas, no receipt.
+    #[tokio::test]
+    async fn bootstrap_low_confidence_file_with_no_gotchas_returns_minimal_packet() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let file_record = {
+            let fr = FileRecord {
+                path: "src/empty.rs".to_string(),
+                purpose: String::new(),
+                entry_points: vec![],
+                imports: vec![],
+                gotcha_keys: vec![],
+                decision_keys: vec![],
+                todos: vec![],
+                unsafe_count: 0,
+                unwrap_count: 0,
+                change_frequency: 1,
+                last_author: None,
+                is_hotspot: false,
+                token_cost_estimate: 0,
+                last_modified_session: now(),
+                content_hash: None,
+                line_count: 0,
+            };
+            let mut r = make_record("file:src/empty.rs", "", Category::File, 0.10);
+            r.payload = serde_json::to_value(&fr).ok();
+            r
+        };
+        store.put("file:src/empty.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &["src/empty.rs".to_string()])
+            .await
+            .unwrap();
+
+        assert!(
+            packet.critical_gotchas.is_empty(),
+            "no gotchas should be surfaced for a file with no linked gotchas"
+        );
+        assert!(
+            !packet.injection_string.contains("gotcha:"),
+            "injection string must not mention any gotcha keys"
         );
     }
 
@@ -2552,5 +2807,631 @@ mod tests {
                 .contains(&"gotcha:test-move".to_string()),
             "new file should gain HasGotcha edge"
         );
+    }
+
+    // ── Regression: query limit clamp ───────────────────────────────────────
+
+    /// Regression test: mem_query must clamp the limit to MAX_QUERY_LIMIT (50)
+    /// even when the caller passes a larger value. Passing limit=100 must not
+    /// error and must return at most 50 results.
+    #[tokio::test]
+    async fn test_query_limit_clamped_to_max() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Insert 60 records — more than MAX_QUERY_LIMIT (50).
+        for i in 0..60 {
+            let record = make_record(
+                &format!("gotcha:clamp-test-{i:03}"),
+                &format!("clamp test rule number {i}"),
+                Category::Gotcha,
+                0.8,
+            );
+            store
+                .put(&format!("gotcha:clamp-test-{i:03}"), &record)
+                .await
+                .unwrap();
+        }
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "clamp test rule".to_string(),
+                mode: "text".to_string(),
+                limit: 100, // exceeds MAX_QUERY_LIMIT (50)
+            }))
+            .await;
+
+        // Must not error
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed.get("error").is_none(),
+            "query with limit > 50 must not error"
+        );
+
+        // Must return at most 50 results (the clamped limit)
+        let results = parsed.as_array().expect("result should be a JSON array");
+        assert!(
+            results.len() <= 50,
+            "result count {} exceeds MAX_QUERY_LIMIT (50)",
+            results.len()
+        );
+    }
+
+    // ── Regression: store-read-error refusal on mem_set write ───────────────
+
+    /// Regression test: mem_set write to a new key must succeed (proving the
+    /// Ok(None) arm of the store read works). The Err(e) arm returns
+    /// {"error": "store read failed — refusing to write: ..."} but cannot be
+    /// triggered without injecting a store fault, which the test harness does
+    /// not support. This test validates the happy path; the error format is
+    /// documented here for grep-ability.
+    #[tokio::test]
+    async fn test_mem_set_write_new_key_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "file:src/brand_new.rs".to_string(),
+                value: "Brand new module for regression test".to_string(),
+                category: "File".to_string(),
+                payload: serde_json::json!({
+                    "path": "src/brand_new.rs",
+                    "purpose": "Brand new module for regression test"
+                }),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["ok"], true,
+            "writing a new key must succeed (Ok(None) arm)"
+        );
+        assert_eq!(parsed["key"], "file:src/brand_new.rs");
+
+        // Verify record persisted
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
+        let record = graph
+            .store()
+            .get("file:src/brand_new.rs")
+            .await
+            .unwrap()
+            .expect("record must exist after write");
+        assert_eq!(record.value, "Brand new module for regression test");
+
+        // Note: the Err(e) path (store read failure) returns:
+        //   {"error": "store read failed — refusing to write: <details>"}
+        // This cannot be exercised without a store-fault injection mechanism.
+        // The guard exists at tools.rs line ~605 to prevent blind overwrites
+        // when the store is in a degraded state.
+    }
+
+    // ── Regression: in-memory graph cleanup after tombstone ─────────────────
+
+    /// Regression test: after deleting a gotcha via mem_set action="delete",
+    /// the in-memory graph must no longer contain HasGotcha edges pointing to
+    /// the deleted gotcha. Previously, only the store was cleaned up but the
+    /// in-memory petgraph retained stale edges until process restart.
+    #[tokio::test]
+    async fn test_tombstone_removes_in_memory_graph_edges() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Seed file record
+        let file_record = Record::layer0_file_stub("file:src/target.rs", device_id(), 1, now());
+        store.put("file:src/target.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Step 1: Write a gotcha linked to the file via affected_files.
+        let write_result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:graph-cleanup-test".to_string(),
+                value: "Never skip validation because it causes silent data corruption".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({
+                    "rule": "Never skip validation",
+                    "reason": "causes silent data corruption",
+                    "severity": "High",
+                    "affected_files": ["src/target.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                }),
+                tags: vec![],
+                priority: "High".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&write_result).unwrap();
+        assert_eq!(parsed["ok"], true, "gotcha write must succeed");
+
+        // Step 2: Verify the in-memory graph has the HasGotcha edge.
+        {
+            let graph_arc = server.graph_arc();
+            let graph = graph_arc.read().await;
+            let neighbors = graph.neighbors("file:src/target.rs", &EdgeKind::HasGotcha);
+            assert!(
+                neighbors.contains(&"gotcha:graph-cleanup-test".to_string()),
+                "HasGotcha edge must exist after write; neighbors: {neighbors:?}"
+            );
+        }
+
+        // Step 3: Delete the gotcha.
+        let delete_result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "delete".to_string(),
+                key: "gotcha:graph-cleanup-test".to_string(),
+                value: String::new(),
+                category: String::new(),
+                payload: serde_json::json!({}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&delete_result).unwrap();
+        assert_eq!(parsed["ok"], true, "gotcha delete must succeed");
+        assert_eq!(parsed["tombstoned"], true);
+
+        // Step 4: Verify the in-memory graph no longer has the HasGotcha edge.
+        {
+            let graph_arc = server.graph_arc();
+            let graph = graph_arc.read().await;
+            let neighbors = graph.neighbors("file:src/target.rs", &EdgeKind::HasGotcha);
+            assert!(
+                !neighbors.contains(&"gotcha:graph-cleanup-test".to_string()),
+                "HasGotcha edge must be removed after delete; neighbors: {neighbors:?}"
+            );
+        }
+
+        // Also verify via graph query mode that the gotcha no longer appears.
+        let graph_query_result = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "file:src/target.rs".to_string(),
+                mode: "graph".to_string(),
+                limit: 20,
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&graph_query_result).unwrap();
+        let gotchas = parsed["gotchas"]
+            .as_array()
+            .expect("gotchas group must be an array");
+        assert!(
+            !gotchas
+                .iter()
+                .any(|g| g["key"] == "gotcha:graph-cleanup-test"),
+            "deleted gotcha must not appear in graph query results"
+        );
+    }
+
+    // ── Regression: graph mode respects global limit ──────────────────────
+
+    /// Graph mode must respect the caller's `limit` as a global cap across all
+    /// edge groups. With limit=3 and records in multiple groups, total results
+    /// must not exceed 3.
+    #[tokio::test]
+    async fn test_graph_mode_respects_global_limit() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Seed file record
+        let file_record =
+            Record::layer0_file_stub("file:src/graph_limit.rs", device_id(), 1, now());
+        store
+            .put("file:src/graph_limit.rs", &file_record)
+            .await
+            .unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Write 5 gotchas linked to the file
+        for i in 0..5 {
+            let result = server
+                .mem_set(Parameters(MemSetParams {
+                    action: "write".to_string(),
+                    key: format!("gotcha:limit-test-{i}"),
+                    value: format!("Limit test gotcha {i}"),
+                    category: "Gotcha".to_string(),
+                    payload: serde_json::json!({
+                        "rule": format!("Limit rule {i}"),
+                        "reason": "testing",
+                        "severity": "Normal",
+                        "affected_files": ["src/graph_limit.rs"],
+                        "ref_url": null,
+                        "discovered_session": 0,
+                        "confirmed": false
+                    }),
+                    tags: vec![],
+                    priority: "Normal".to_string(),
+                }))
+                .await;
+            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(parsed["ok"], true, "gotcha write {i} must succeed");
+        }
+
+        // Query with limit=3 — must get at most 3 total records across all groups.
+        let result = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "file:src/graph_limit.rs".to_string(),
+                mode: "graph".to_string(),
+                limit: 3,
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed.get("error").is_none(), "graph query must not error");
+
+        // Count total records across all groups.
+        let mut total = 0;
+        for group in &["gotchas", "co_changes", "imports", "decisions", "notes"] {
+            if let Some(arr) = parsed[group].as_array() {
+                total += arr.len();
+            }
+        }
+        assert!(
+            total <= 3,
+            "graph mode with limit=3 must return at most 3 total records, got {total}"
+        );
+    }
+
+    /// Graph mode with limit=0 must return zero records in all groups.
+    #[tokio::test]
+    async fn test_graph_mode_limit_zero_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let file_record = Record::layer0_file_stub("file:src/zero.rs", device_id(), 1, now());
+        store.put("file:src/zero.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Write one gotcha so there's something to return if limit is ignored.
+        let _ = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:zero-limit-test".to_string(),
+                value: "Should not appear".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({
+                    "rule": "Zero limit test",
+                    "reason": "testing",
+                    "severity": "Normal",
+                    "affected_files": ["src/zero.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                }),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let result = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "file:src/zero.rs".to_string(),
+                mode: "graph".to_string(),
+                limit: 0,
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        let mut total = 0;
+        for group in &["gotchas", "co_changes", "imports", "decisions", "notes"] {
+            if let Some(arr) = parsed[group].as_array() {
+                total += arr.len();
+            }
+        }
+        assert_eq!(total, 0, "limit=0 must return zero records, got {total}");
+    }
+
+    // ── Regression: mem_set preserves existing data on overwrite ──────────
+
+    /// When overwriting an existing record, mem_set must read and preserve
+    /// Layer 0 structural data from the prior record. This is the exact
+    /// scenario that `.ok().flatten()` would have broken: a store error would
+    /// have made mem_set treat the record as new, losing preservation behavior.
+    #[tokio::test]
+    async fn test_mem_set_overwrite_preserves_existing_data() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Seed a DeveloperManual record with high confidence.
+        let mut original = make_record(
+            "file:src/preserve.rs",
+            "Original purpose from Layer 0",
+            Category::File,
+            0.7,
+        );
+        original.source = RecordSource::DeveloperManual;
+        original.confidence.value = 0.85;
+        original.confidence.confirmation_count = 3;
+        store.put("file:src/preserve.rs", &original).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Overwrite with mem_set — should preserve confirmation state.
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "file:src/preserve.rs".to_string(),
+                value: "Updated purpose from enrichment".to_string(),
+                category: "File".to_string(),
+                payload: serde_json::json!({"path": "src/preserve.rs"}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true, "overwrite must succeed");
+
+        // Verify the record was updated but preserved confirmation state.
+        let graph_arc = server.graph_arc();
+        let graph = graph_arc.read().await;
+        let record = graph
+            .store()
+            .get("file:src/preserve.rs")
+            .await
+            .unwrap()
+            .expect("record must exist");
+        assert_eq!(
+            record.value, "Updated purpose from enrichment",
+            "value must be updated"
+        );
+        // DeveloperManual source + high confidence should be preserved
+        // because the write path detects was_confirmed=true.
+        assert!(
+            record.confidence.value >= 0.80,
+            "confirmed record confidence must be preserved, got {}",
+            record.confidence.value
+        );
+    }
+
+    // ── Regression: tombstone multi-file gotcha cleans all edges ──────────
+
+    /// When a gotcha affects multiple files, tombstone must remove in-memory
+    /// HasGotcha edges from ALL affected files, not just the first.
+    #[tokio::test]
+    async fn test_tombstone_multi_file_removes_all_edges() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Seed two file records
+        let f1 = Record::layer0_file_stub("file:src/a.rs", device_id(), 1, now());
+        let f2 = Record::layer0_file_stub("file:src/b.rs", device_id(), 1, now());
+        store.put("file:src/a.rs", &f1).await.unwrap();
+        store.put("file:src/b.rs", &f2).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Write a gotcha affecting both files
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:multi-file-tombstone".to_string(),
+                value: "Cross-file gotcha".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({
+                    "rule": "Cross-file rule",
+                    "reason": "testing multi-file cleanup",
+                    "severity": "Normal",
+                    "affected_files": ["src/a.rs", "src/b.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                }),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+
+        // Verify both files have the edge
+        {
+            let g = server.graph_arc();
+            let graph = g.read().await;
+            assert!(
+                graph
+                    .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
+                    .contains(&"gotcha:multi-file-tombstone".to_string()),
+                "file:src/a.rs must have HasGotcha edge before delete"
+            );
+            assert!(
+                graph
+                    .neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
+                    .contains(&"gotcha:multi-file-tombstone".to_string()),
+                "file:src/b.rs must have HasGotcha edge before delete"
+            );
+        }
+
+        // Delete the gotcha
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "delete".to_string(),
+                key: "gotcha:multi-file-tombstone".to_string(),
+                value: String::new(),
+                category: String::new(),
+                payload: serde_json::json!({}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true);
+
+        // Verify BOTH files lost the edge
+        {
+            let g = server.graph_arc();
+            let graph = g.read().await;
+            assert!(
+                !graph
+                    .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
+                    .contains(&"gotcha:multi-file-tombstone".to_string()),
+                "file:src/a.rs must NOT have HasGotcha edge after delete"
+            );
+            assert!(
+                !graph
+                    .neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
+                    .contains(&"gotcha:multi-file-tombstone".to_string()),
+                "file:src/b.rs must NOT have HasGotcha edge after delete"
+            );
+        }
+    }
+
+    // ── Regression: confirm is non-idempotent ────────────────────────────
+
+    /// Calling confirm twice must increment confirmation_count each time,
+    /// proving `idempotent_hint = false` is correct for mem_set.
+    #[tokio::test]
+    async fn test_confirm_is_non_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let file_record = Record::layer0_file_stub("file:src/idem.rs", device_id(), 1, now());
+        store.put("file:src/idem.rs", &file_record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // Write an unconfirmed gotcha
+        let _ = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:idem-test".to_string(),
+                value: "Idempotency test rule".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({
+                    "rule": "Idempotency test",
+                    "reason": "testing",
+                    "severity": "Normal",
+                    "affected_files": ["src/idem.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                }),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        // First confirm
+        let r1 = server
+            .mem_set(Parameters(MemSetParams {
+                action: "confirm".to_string(),
+                key: "gotcha:idem-test".to_string(),
+                value: String::new(),
+                category: String::new(),
+                payload: serde_json::json!({}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let p1: serde_json::Value = serde_json::from_str(&r1).unwrap();
+        assert_eq!(p1["ok"], true, "first confirm must succeed");
+        assert_eq!(p1["confirmed"], true);
+
+        // Read confirmation_count after first confirm
+        let count_after_first = {
+            let g = server.graph_arc();
+            let graph = g.read().await;
+            let record = graph
+                .store()
+                .get("gotcha:idem-test")
+                .await
+                .unwrap()
+                .unwrap();
+            record.confidence.confirmation_count
+        };
+
+        // Second confirm
+        let r2 = server
+            .mem_set(Parameters(MemSetParams {
+                action: "confirm".to_string(),
+                key: "gotcha:idem-test".to_string(),
+                value: String::new(),
+                category: String::new(),
+                payload: serde_json::json!({}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let p2: serde_json::Value = serde_json::from_str(&r2).unwrap();
+        assert_eq!(p2["ok"], true, "second confirm must succeed");
+
+        // Read confirmation_count after second confirm
+        let count_after_second = {
+            let g = server.graph_arc();
+            let graph = g.read().await;
+            let record = graph
+                .store()
+                .get("gotcha:idem-test")
+                .await
+                .unwrap()
+                .unwrap();
+            record.confidence.confirmation_count
+        };
+
+        assert!(
+            count_after_second > count_after_first,
+            "confirmation_count must increase on each confirm: first={count_after_first}, second={count_after_second}"
+        );
+    }
+
+    // ── Regression: store-read-error refusal (extracted helper) ───────────
+
+    /// The Err(e) branch must return a structured JSON error and refuse to write.
+    /// Previously untestable because it required a real store failure.
+    #[test]
+    fn test_store_read_error_refuses_write() {
+        let result = resolve_existing_for_write(Err(anyhow::anyhow!("simulated disk I/O timeout")));
+        assert!(result.is_err(), "store error must refuse write");
+        let err = result.unwrap_err();
+        let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("store read failed"),
+            "error must mention store read failure"
+        );
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("simulated disk I/O timeout"),
+            "error must include the underlying cause"
+        );
+    }
+
+    /// Ok(None) must pass through — new record, no existing data to preserve.
+    #[test]
+    fn test_store_read_ok_none_passes_through() {
+        let result = resolve_existing_for_write(Ok(None));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    /// Ok(Some(record)) must pass through — existing record for preservation.
+    #[test]
+    fn test_store_read_ok_some_passes_through() {
+        let record = make_record("file:test.rs", "test", Category::File, 0.5);
+        let result = resolve_existing_for_write(Ok(Some(record.clone())));
+        assert!(result.is_ok());
+        let resolved = result.unwrap();
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().key, "file:test.rs");
     }
 }
