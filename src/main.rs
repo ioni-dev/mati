@@ -88,6 +88,8 @@ enum Commands {
     },
 
     // ── Infrastructure ───────────────────────────────────────────────────
+    /// Install or update agent hooks without a full re-init (safe while daemon is running)
+    Hooks(cli::init::HooksArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Check mati daemon reachability and latency
@@ -106,6 +108,9 @@ enum Commands {
         path: Option<std::path::PathBuf>,
     },
     // ── Internal hook commands (hidden from --help) ─────────────────────
+    /// Enforcement decision engine for hook scripts.
+    #[command(hide = true, name = "hook-decide")]
+    HookDecide(cli::hook_decide::HookDecideArgs),
     #[command(hide = true)]
     DocCapture {
         /// Repo-relative file path
@@ -191,6 +196,7 @@ async fn main() -> Result<()> {
         Commands::Stale(args) => cli::stale::run(args).await,
         Commands::Repair(args) => cli::repair::run(args).await,
         Commands::Check => cli::check::run().await,
+        Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
             cli::daemon::DaemonCommand::Stop => cli::daemon::run_daemon_stop().await,
@@ -231,6 +237,7 @@ async fn main() -> Result<()> {
             };
             mati_core::mcp::serve(&root).await
         }
+        Commands::HookDecide(args) => cli::hook_decide::run(args).await,
         Commands::Get { key } => cli::hooks::run_get(&key).await,
         Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
         Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,

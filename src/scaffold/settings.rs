@@ -505,10 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn pre_hooks_contain_decision_json() {
-        // Verify the real hook scripts contain the permissionDecision protocol.
-        assert!(crate::hooks::pre_read::SCRIPT.contains("permissionDecision"));
-        assert!(crate::hooks::pre_bash::SCRIPT.contains("permissionDecision"));
+    fn pre_hooks_delegate_to_hook_decide() {
+        // Enforcement logic is now in Rust (hooks::decide + cli::hook_decide).
+        // Shell wrappers just exec the correct hook-decide variant.
+        assert!(crate::hooks::pre_read::SCRIPT.contains("exec mati hook-decide claude-pre-read"));
+        assert!(crate::hooks::pre_bash::SCRIPT.contains("exec mati hook-decide claude-pre-bash"));
     }
 
     #[test]

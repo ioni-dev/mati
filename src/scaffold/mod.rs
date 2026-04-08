@@ -37,6 +37,7 @@ pub fn write_mati_wrapper(hooks_dir: &Path) -> Result<()> {
          # mati binary wrapper — written by mati init.\n\
          # Ensures hooks use the same binary as the MCP server.\n\
          # DO NOT EDIT — regenerated on each mati init.\n\
+         [ -x \"{bin}\" ] || exit 0\n\
          exec \"{bin}\" \"$@\"\n"
     );
     let path = hooks_dir.join("mati");
