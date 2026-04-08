@@ -85,6 +85,7 @@ async fn check_daemon_health(cwd: &std::path::Path) -> DaemonHealth {
 }
 
 /// Print the Runtime section showing daemon health.
+#[allow(clippy::too_many_arguments)]
 fn print_runtime_section(
     health: &DaemonHealth,
     red: &str,

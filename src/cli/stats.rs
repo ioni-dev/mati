@@ -970,7 +970,6 @@ fn parse_u64(s: &str) -> u64 {
 /// Convert civil date to days since epoch (same algorithm as format_snapshot_date inverse).
 fn civil_to_days(y: u64, m: u64, _sec: u64, d: u64) -> u64 {
     let y = y as i64;
-    let m = m as u64;
     let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
