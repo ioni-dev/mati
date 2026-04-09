@@ -16,7 +16,7 @@ use mati_core::store::{
     RecordVersion, StalenessScore, Store,
 };
 
-use super::daemon::{daemon_result, mati_root_for, DaemonResult};
+use super::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
 
 #[allow(clippy::large_enum_variant)]
 enum ProxyInner {
@@ -118,15 +118,62 @@ impl StoreProxy {
         }
     }
 
-    /// Write a record. In socket mode, sends via the `put` socket command.
+    /// Write a record. In socket mode, dispatches to the appropriate typed
+    /// v2 command based on key prefix. There is no raw `put` in the v2 protocol.
     pub async fn put(&self, key: &str, record: &Record) -> Result<()> {
         match &self.inner {
             ProxyInner::Direct(s) => s.put(key, record).await,
             ProxyInner::Socket { root } => {
-                let record_value = serde_json::to_value(record)?;
-                match daemon_result(root, "put", json!({ "key": key, "record": record_value }))
-                    .await
-                {
+                use mati_core::mcp::protocol as p;
+
+                let cmd = if key.starts_with("gotcha:") {
+                    let gotcha = record.payload_as::<mati_core::store::GotchaRecord>();
+                    p::Command::GotchaUpsert(p::GotchaDraftInput {
+                        key: key.to_string(),
+                        rule: gotcha.as_ref().map(|g| g.rule.clone()).unwrap_or_default(),
+                        reason: gotcha.as_ref().map(|g| g.reason.clone()).unwrap_or_default(),
+                        severity: p::Severity::Normal,
+                        affected_files: gotcha.map(|g| g.affected_files).unwrap_or_default(),
+                        ref_url: None,
+                        tags: record.tags.clone(),
+                        priority: p::Priority::Normal,
+                    })
+                } else if key.starts_with("file:") {
+                    let path = key.strip_prefix("file:").unwrap_or(key);
+                    p::Command::FileEnrich(p::FileEnrichInput {
+                        path: path.to_string(),
+                        purpose: record.value.clone(),
+                        entry_points: vec![],
+                        decision_keys: vec![],
+                        todos: vec![],
+                        tags: record.tags.clone(),
+                        priority: p::Priority::Normal,
+                    })
+                } else if key.starts_with("decision:") {
+                    let slug = key.strip_prefix("decision:").unwrap_or(key);
+                    let payload = record.payload.as_ref().cloned().unwrap_or(json!({}));
+                    p::Command::DecisionUpsert(p::DecisionUpsertInput {
+                        slug: slug.to_string(),
+                        value: record.value.clone(),
+                        summary: payload.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        rationale: payload.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        tags: record.tags.clone(),
+                        priority: p::Priority::Normal,
+                    })
+                } else if key.starts_with("dev_note:") {
+                    p::Command::DevNoteUpsert(p::DevNoteUpsertInput {
+                        key: Some(key.to_string()),
+                        text: record.value.clone(),
+                    })
+                } else {
+                    // Unknown prefix — create as dev_note.
+                    p::Command::DevNoteUpsert(p::DevNoteUpsertInput {
+                        key: None,
+                        text: record.value.clone(),
+                    })
+                };
+
+                match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {
                         if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
                             Ok(())
@@ -216,23 +263,14 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(store) => mati_core::store::session::log_hit(store, key).await,
             ProxyInner::Socket { root } => {
-                match daemon_result(root, "log_hit", json!({ "key": key })).await {
+                let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
+                    mati_core::mcp::protocol::ConsultationHitInput {
+                        key: key.to_string(),
+                    },
+                );
+                match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(_) => Ok(()),
-                    other => Err(socket_read_error("log_hit", other)),
-                }
-            }
-        }
-    }
-
-    /// Delete a record by key (hard delete, not tombstone).
-    #[allow(dead_code)]
-    pub async fn delete(&self, key: &str) -> Result<()> {
-        match &self.inner {
-            ProxyInner::Direct(store) => store.delete(key).await,
-            ProxyInner::Socket { root } => {
-                match daemon_result(root, "delete", json!({ "key": key })).await {
-                    DaemonResult::Ok(_) => Ok(()),
-                    other => Err(socket_read_error("delete", other)),
+                    other => Err(socket_read_error("consultation_hit", other)),
                 }
             }
         }
@@ -310,7 +348,7 @@ impl StoreProxy {
     /// Write a gotcha record with file-link sync and graph edges.
     ///
     /// In direct mode, delegates to `apply_gotcha_write`.
-    /// In socket mode, routes through the `gotcha_write` daemon command.
+    /// In socket mode, sends a typed `GotchaUpsert` v2 command.
     pub async fn gotcha_write(
         &self,
         record: &Record,
@@ -326,19 +364,29 @@ impl StoreProxy {
                 .await
             }
             ProxyInner::Socket { root } => {
-                let record_value = serde_json::to_value(record)?;
-                match daemon_result(
-                    root,
-                    "gotcha_write",
-                    json!({
-                        "record": record_value,
-                        "old_files": old_files,
-                        "new_files": new_files,
-                        "is_new": is_new,
-                    }),
-                )
-                .await
-                {
+                use mati_core::mcp::protocol as p;
+                let gotcha = record
+                    .payload_as::<mati_core::store::GotchaRecord>()
+                    .unwrap_or(mati_core::store::GotchaRecord {
+                        rule: record.value.clone(),
+                        reason: String::new(),
+                        severity: Priority::Normal,
+                        affected_files: new_files.to_vec(),
+                        ref_url: None,
+                        discovered_session: 0,
+                        confirmed: false,
+                    });
+                let cmd = p::Command::GotchaUpsert(p::GotchaDraftInput {
+                    key: record.key.clone(),
+                    rule: gotcha.rule,
+                    reason: gotcha.reason,
+                    severity: p::Severity::Normal,
+                    affected_files: new_files.to_vec(),
+                    ref_url: gotcha.ref_url,
+                    tags: record.tags.clone(),
+                    priority: p::Priority::Normal,
+                });
+                match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {
                         if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
                             Ok(())
@@ -347,10 +395,10 @@ impl StoreProxy {
                                 .get("error")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown");
-                            anyhow::bail!("daemon gotcha_write failed: {err}")
+                            anyhow::bail!("daemon gotcha_upsert failed: {err}")
                         }
                     }
-                    other => Err(socket_read_error("gotcha_write", other)),
+                    other => Err(socket_read_error("gotcha_upsert", other)),
                 }
             }
         }
@@ -359,7 +407,7 @@ impl StoreProxy {
     /// Tombstone a gotcha and remove its graph edges.
     ///
     /// In direct mode, delegates to `apply_gotcha_tombstone`.
-    /// In socket mode, routes through the `gotcha_tombstone` daemon command.
+    /// In socket mode, sends a typed `GotchaTombstone` v2 command.
     pub async fn gotcha_tombstone(&self, key: &str, affected_files: &[String]) -> Result<()> {
         match &self.inner {
             ProxyInner::Direct(store) => {
@@ -367,13 +415,12 @@ impl StoreProxy {
                     .await
             }
             ProxyInner::Socket { root } => {
-                match daemon_result(
-                    root,
-                    "gotcha_tombstone",
-                    json!({ "key": key, "affected_files": affected_files }),
-                )
-                .await
-                {
+                let cmd = mati_core::mcp::protocol::Command::GotchaTombstone(
+                    mati_core::mcp::protocol::GotchaTombstoneInput {
+                        key: key.to_string(),
+                    },
+                );
+                match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {
                         if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
                             Ok(())

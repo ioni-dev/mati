@@ -46,7 +46,7 @@ pub const MAX_FRAME_SIZE: usize = 65_536;
 ///
 /// Unknown top-level fields are rejected. The `cmd` field is internally tagged
 /// by `type`, and each command's input DTO independently rejects unknown fields.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     /// Protocol version — validated at the wire layer before dispatch.
@@ -143,7 +143,7 @@ pub enum ErrorCode {
 /// or wraps a typed input DTO with `#[serde(deny_unknown_fields)]`.
 ///
 /// There is no public `put` or `delete` command. All mutations are semantic.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Command {
     // ── A. Pure reads ───────────────────────────────────────────────────
@@ -257,13 +257,13 @@ pub enum Command {
 
 // ── A. Pure read inputs ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetInput {
     pub key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookEvaluateInput {
     pub file_key: String,
@@ -271,13 +271,13 @@ pub struct HookEvaluateInput {
     pub include_recent: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanPrefixInput {
     pub prefix: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryInput {
     pub key: String,
@@ -285,7 +285,7 @@ pub struct HistoryInput {
     pub limit: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistorySinceInput {
     pub key: String,
@@ -298,13 +298,13 @@ fn default_history_limit() -> u64 {
     50
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCheckConsultedInput {
     pub key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCheckConsultedRecentInput {
     pub key: String,
@@ -316,7 +316,7 @@ fn default_ttl_secs() -> u64 {
     900
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemQueryInput {
     pub query: String,
@@ -346,13 +346,13 @@ pub enum QueryMode {
 
 // ── B. Read-with-side-effect inputs ─────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemGetInput {
     pub key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemBootstrapInput {
     #[serde(default)]
@@ -366,7 +366,7 @@ pub struct MemBootstrapInput {
 ///
 /// Confirmation is ALWAYS reset to `false` on upsert. Use `GotchaConfirm`
 /// to re-confirm after editing.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GotchaDraftInput {
     /// Gotcha key, must match `gotcha:<slug>`.
@@ -391,13 +391,13 @@ pub struct GotchaDraftInput {
     pub priority: Priority,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GotchaConfirmInput {
     pub key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GotchaTombstoneInput {
     pub key: String,
@@ -410,7 +410,7 @@ pub struct GotchaTombstoneInput {
 /// - `gotcha_keys` (managed by gotcha lifecycle commands)
 /// - `imports` (derived from tree-sitter)
 /// - All structural/internal fields (unsafe_count, unwrap_count, etc.)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileEnrichInput {
     /// File path (maps to `file:<path>`).
@@ -434,13 +434,13 @@ pub struct FileEnrichInput {
     pub priority: Priority,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileReparseInput {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileEditHookInput {
     pub path: String,
@@ -448,13 +448,13 @@ pub struct FileEditHookInput {
 
 /// Path-only doc capture. The daemon reads the file from disk and extracts
 /// the doc comment — no content crosses the wire.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DocCaptureInput {
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionUpsertInput {
     /// Key slug (daemon prepends `decision:`).
@@ -473,7 +473,7 @@ pub struct DecisionUpsertInput {
     pub priority: Priority,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevNoteUpsertInput {
     /// If absent, daemon auto-generates `dev_note:<slug>-<timestamp>`.
@@ -484,7 +484,7 @@ pub struct DevNoteUpsertInput {
     pub text: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLogInput {
     /// The event type (closed enum, 6 variants).
@@ -508,7 +508,7 @@ pub enum SessionEvent {
     PromptNudge,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsultationHitInput {
     pub key: String,
@@ -671,14 +671,17 @@ pub struct AuditEntry {
 
 /// Map a v1-style `(cmd_str, args_json)` pair to a v2 Command JSON object.
 ///
-/// The v2 format uses `{"type":"<cmd_name>", ...fields}` (internally tagged).
-/// This function produces that JSON from flat v1 parameters so that existing
-/// callers (CLI hooks, proxy, MCP socket_call) can speak v2 without rewriting
-/// every call site.
+/// **Pure reads only.** All mutation and side-effecting-read callers have been
+/// migrated to construct typed `protocol::Command` values directly via
+/// `daemon_v2()`. This function is retained only for pure-read commands used
+/// by `daemon_result()` and `proxy_daemon_result()`.
+///
+/// Panics in debug builds if called with a mutation or side-effecting command.
 pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Value {
     use serde_json::json;
 
     match cmd {
+        // Pure reads — the only commands that still use this mapping.
         "ping" => json!({"type": "ping"}),
         "get" => json!({"type": "get", "key": args["key"]}),
         "hook_evaluate" => json!({
@@ -700,117 +703,24 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "key": args["key"],
             "ttl_secs": args.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(900),
         }),
-        "mem_get" => json!({"type": "mem_get", "key": args["key"]}),
         "mem_query" => json!({
             "type": "mem_query",
             "query": args["query"],
             "mode": args.get("mode").and_then(|v| v.as_str()).unwrap_or("text"),
             "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20),
         }),
-        "mem_bootstrap" => json!({
-            "type": "mem_bootstrap",
-            "context_files": args.get("context_files").cloned().unwrap_or(json!([])),
-        }),
-        "mem_set" => {
-            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("write");
-            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            match action {
-                "confirm" => json!({"type": "gotcha_confirm", "key": key}),
-                "delete" => json!({"type": "gotcha_tombstone", "key": key}),
-                _ => v1_mem_set_write_to_v2(key, args),
-            }
-        }
-        "gotcha_confirm" => json!({"type": "gotcha_confirm", "key": args["key"]}),
-        "gotcha_tombstone" => json!({"type": "gotcha_tombstone", "key": args["key"]}),
-        "gotcha_write" => {
-            let record = args.get("record").cloned().unwrap_or(json!({}));
-            let payload = record.get("payload").cloned().unwrap_or(json!({}));
-            let key = record.get("key").and_then(|v| v.as_str()).unwrap_or("");
-            json!({
-                "type": "gotcha_upsert",
-                "key": key,
-                "rule": payload.get("rule").and_then(|v| v.as_str()).unwrap_or(""),
-                "reason": payload.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
-                "severity": payload.get("severity").and_then(|v| v.as_str()).unwrap_or("normal"),
-                "affected_files": payload.get("affected_files").cloned().unwrap_or(json!([])),
-                "ref_url": payload.get("ref_url").cloned().unwrap_or(serde_json::Value::Null),
-                "tags": record.get("tags").cloned().unwrap_or(json!([])),
-                "priority": record.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
-            })
-        }
-        "log_hit" => json!({"type": "consultation_hit", "key": args["key"]}),
-        "log_miss" => json!({"type": "session_log", "event": "miss", "key": args["key"]}),
-        "log_compliance_miss" => json!({"type": "session_log", "event": "compliance_miss", "key": args["key"]}),
-        "log_compliance_hit" => json!({"type": "session_log", "event": "compliance_hit", "key": args["key"]}),
-        "log_codex_shell_miss" => json!({"type": "session_log", "event": "codex_shell_miss", "key": args["key"]}),
-        "log_bootstrap" => json!({"type": "session_log", "event": "bootstrap", "key": args["key"]}),
-        "log_prompt_nudge" => json!({"type": "session_log", "event": "prompt_nudge", "key": args["key"]}),
-        "session_flush" => json!({"type": "session_flush"}),
-        "session_harvest" => json!({"type": "session_harvest"}),
-        "reparse" => json!({"type": "file_reparse", "path": args.get("path").and_then(|v| v.as_str()).unwrap_or("")}),
-        "edit_hook" => json!({"type": "file_edit_hook", "path": args.get("path").and_then(|v| v.as_str()).unwrap_or("")}),
-        "doc_capture" => json!({"type": "doc_capture", "path": args.get("path").and_then(|v| v.as_str()).unwrap_or("")}),
         other => {
+            debug_assert!(
+                false,
+                "v1_to_v2_command called with non-pure-read command '{other}' — \
+                 mutation/side-effecting callers must use daemon_v2() with typed Command"
+            );
+            // Production fallback: construct best-effort JSON so the daemon
+            // can return a structured error rather than a connection failure.
             let mut obj = args.as_object().cloned().unwrap_or_default();
             obj.insert("type".to_string(), serde_json::Value::String(other.to_string()));
             serde_json::Value::Object(obj)
         }
-    }
-}
-
-/// Helper: map v1 mem_set action=write to the correct v2 typed command by key prefix.
-fn v1_mem_set_write_to_v2(key: &str, args: &serde_json::Value) -> serde_json::Value {
-    use serde_json::json;
-    let payload = args.get("payload").cloned().unwrap_or(json!({}));
-
-    if key.starts_with("gotcha:") {
-        json!({
-            "type": "gotcha_upsert",
-            "key": key,
-            "rule": payload.get("rule").and_then(|v| v.as_str()).unwrap_or(""),
-            "reason": payload.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
-            "severity": payload.get("severity").and_then(|v| v.as_str()).unwrap_or("normal"),
-            "affected_files": payload.get("affected_files").cloned().unwrap_or(json!([])),
-            "ref_url": payload.get("ref_url").cloned().unwrap_or(serde_json::Value::Null),
-            "tags": args.get("tags").cloned().unwrap_or(json!([])),
-            "priority": args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
-        })
-    } else if key.starts_with("file:") {
-        let path = key.strip_prefix("file:").unwrap_or(key);
-        json!({
-            "type": "file_enrich",
-            "path": path,
-            "purpose": payload.get("purpose").and_then(|v| v.as_str()).unwrap_or(
-                args.get("value").and_then(|v| v.as_str()).unwrap_or("")
-            ),
-            "entry_points": payload.get("entry_points").cloned().unwrap_or(json!([])),
-            "decision_keys": payload.get("decision_keys").cloned().unwrap_or(json!([])),
-            "todos": payload.get("todos").cloned().unwrap_or(json!([])),
-            "tags": args.get("tags").cloned().unwrap_or(json!([])),
-            "priority": args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
-        })
-    } else if key.starts_with("decision:") {
-        let slug = key.strip_prefix("decision:").unwrap_or(key);
-        json!({
-            "type": "decision_upsert",
-            "slug": slug,
-            "value": args.get("value").and_then(|v| v.as_str()).unwrap_or(""),
-            "summary": payload.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
-            "rationale": payload.get("rationale").and_then(|v| v.as_str()).unwrap_or(""),
-            "tags": args.get("tags").cloned().unwrap_or(json!([])),
-            "priority": args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
-        })
-    } else if key.starts_with("dev_note:") {
-        json!({
-            "type": "dev_note_upsert",
-            "key": key,
-            "text": args.get("value").and_then(|v| v.as_str()).unwrap_or(""),
-        })
-    } else {
-        json!({
-            "type": "dev_note_upsert",
-            "text": args.get("value").and_then(|v| v.as_str()).unwrap_or(""),
-        })
     }
 }
 

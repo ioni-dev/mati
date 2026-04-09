@@ -324,13 +324,19 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
         _ => false,
     };
 
-    // Fire the appropriate compliance event.
-    let cmd = if consulted {
-        "log_compliance_hit"
+    // Fire the appropriate compliance event via typed v2 command.
+    let event = if consulted {
+        mati_core::mcp::protocol::SessionEvent::ComplianceHit
     } else {
-        "log_codex_shell_miss"
+        mati_core::mcp::protocol::SessionEvent::CodexShellMiss
     };
-    let _ = daemon_result(mati_root, cmd, serde_json::json!({ "key": &file_key })).await;
+    let cmd = mati_core::mcp::protocol::Command::SessionLog(
+        mati_core::mcp::protocol::SessionLogInput {
+            event,
+            key: file_key.clone(),
+        },
+    );
+    let _ = super::daemon::daemon_v2(mati_root, cmd).await;
 
     // Post-hook: no output, always exit 0.
     Ok(())
@@ -416,16 +422,35 @@ fn platform_events(
 // ── Event firing ────────────────────────────────────────────────────────────
 
 async fn fire_events(mati_root: &Path, events: &[HookEvent]) {
+    use mati_core::mcp::protocol as p;
     for event in events {
-        let (cmd, key) = match event {
-            HookEvent::Hit { key } => ("log_hit", key.as_str()),
-            HookEvent::Miss { key } => ("log_miss", key.as_str()),
-            HookEvent::BlockedUnconsultedRead { key } => ("log_compliance_miss", key.as_str()),
-            HookEvent::CodexShellBlocked { key } => ("log_codex_shell_miss", key.as_str()),
-            HookEvent::ComplianceHit { key } => ("log_compliance_hit", key.as_str()),
+        let cmd = match event {
+            HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
+                key: key.clone(),
+            }),
+            HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::Miss,
+                key: key.clone(),
+            }),
+            HookEvent::BlockedUnconsultedRead { key } => {
+                p::Command::SessionLog(p::SessionLogInput {
+                    event: p::SessionEvent::ComplianceMiss,
+                    key: key.clone(),
+                })
+            }
+            HookEvent::CodexShellBlocked { key } => {
+                p::Command::SessionLog(p::SessionLogInput {
+                    event: p::SessionEvent::CodexShellMiss,
+                    key: key.clone(),
+                })
+            }
+            HookEvent::ComplianceHit { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::ComplianceHit,
+                key: key.clone(),
+            }),
         };
         // Fire-and-forget — drop silently on failure (P9).
-        let _ = daemon_result(mati_root, cmd, serde_json::json!({ "key": key })).await;
+        let _ = super::daemon::daemon_v2(mati_root, cmd).await;
     }
 }
 

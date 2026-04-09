@@ -16,11 +16,15 @@ pub async fn run(path: &str) -> Result<()> {
     if let Some(store) = proxy.direct_store() {
         reparse_impl(store, &cwd, path).await?;
     } else {
-        // Route through the dedicated reparse daemon command (not edit_hook,
-        // which would also call log_hit and mint an unintended receipt).
-        use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+        // Route through the typed v2 FileReparse command.
+        use crate::cli::daemon::{daemon_v2, mati_root_for, DaemonResult};
         let root = mati_root_for(&cwd)?;
-        match daemon_result(&root, "reparse", serde_json::json!({ "path": path })).await {
+        let cmd = mati_core::mcp::protocol::Command::FileReparse(
+            mati_core::mcp::protocol::FileReparseInput {
+                path: path.to_string(),
+            },
+        );
+        match daemon_v2(&root, cmd).await {
             DaemonResult::Ok(_) => {}
             _ => tracing::warn!("mati reparse: daemon unreachable — skipping"),
         }
