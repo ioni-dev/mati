@@ -710,16 +710,11 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20),
         }),
         other => {
-            debug_assert!(
-                false,
-                "v1_to_v2_command called with non-pure-read command '{other}' — \
-                 mutation/side-effecting callers must use daemon_v2() with typed Command"
+            panic!(
+                "v1_to_v2_command called with unsupported command '{other}' — \
+                 only pure reads are supported; mutation/side-effecting callers \
+                 must use daemon_v2() with typed Command"
             );
-            // Production fallback: construct best-effort JSON so the daemon
-            // can return a structured error rather than a connection failure.
-            let mut obj = args.as_object().cloned().unwrap_or_default();
-            obj.insert("type".to_string(), serde_json::Value::String(other.to_string()));
-            serde_json::Value::Object(obj)
         }
     }
 }
