@@ -191,8 +191,20 @@ pub(crate) async fn proxy_daemon_result(
         }
     };
 
+    // Build v2 request from v1-style (cmd, args) using the same mapping
+    // as cli::daemon::daemon_result.
+    let daemon_session = super::metadata::read_metadata(root)
+        .map(|m| m.session)
+        .unwrap_or_else(uuid::Uuid::nil);
+    let v2_cmd = super::protocol::v1_to_v2_command(cmd, &args);
+    let request = serde_json::json!({
+        "v": super::protocol::PROTOCOL_VERSION,
+        "id": uuid::Uuid::new_v4(),
+        "session": daemon_session,
+        "cmd": v2_cmd,
+    });
+
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({ "v": PROTOCOL_VERSION, "cmd": cmd, "args": args });
     let mut bytes = match serde_json::to_vec(&request) {
         Ok(b) => b,
         Err(_) => return ProxyDaemonResult::Unresponsive,
@@ -213,9 +225,27 @@ pub(crate) async fn proxy_daemon_result(
         _ => return ProxyDaemonResult::Unresponsive,
     }
 
-    match serde_json::from_str(line.trim()) {
-        Ok(v) => ProxyDaemonResult::Ok(v),
-        Err(_) => ProxyDaemonResult::Unresponsive,
+    // Parse v2 Response and convert to v1-compatible envelope for callers.
+    let resp: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return ProxyDaemonResult::Unresponsive,
+    };
+
+    match resp.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => {
+            let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            ProxyDaemonResult::Ok(serde_json::json!({"ok": true, "v": 2, "data": data}))
+        }
+        Some("err") => {
+            let message = resp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            ProxyDaemonResult::Ok(
+                serde_json::json!({"ok": false, "v": 2, "error": message}),
+            )
+        }
+        _ => ProxyDaemonResult::Unresponsive,
     }
 }
 
