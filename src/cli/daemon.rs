@@ -383,7 +383,14 @@ async fn serve_loop_graceful(
 
 // ── Client ───────────────────────────────────────────────────────────────────
 
-/// Send a request to the daemon and return a [`DaemonResult`].
+/// Send a v2 protocol request to the daemon and return a [`DaemonResult`].
+///
+/// Internally constructs a v2 `protocol::Request` from the v1-style `(cmd, args)`
+/// parameters. The daemon session UUID is read from `DaemonMetadata`; a fresh
+/// request UUID is generated per call.
+///
+/// Callers receive `DaemonResult::Ok(json)` where `json` is a v1-compatible
+/// envelope: `{"ok":true,"data":<value>}` or `{"ok":false,"error":"msg"}`.
 ///
 /// Handles three failure modes:
 /// - **No socket** → [`DaemonResult::NotRunning`] — safe to use `Store::open`
@@ -410,7 +417,6 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
             let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
             if is_refused {
                 if is_pid_dead(root) {
-                    // Stale socket — clean up so next direct open works.
                     let _ = std::fs::remove_file(&sock_path);
                     let _ = std::fs::remove_file(root.join("mati.pid"));
                     tracing::debug!("daemon: removed stale socket");
@@ -420,15 +426,31 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
                     return DaemonResult::Unresponsive;
                 }
             }
-            // Any other error (ENOENT race, permission, etc.) — treat as not running.
             tracing::debug!(error = %e, "daemon: connect failed, treating as not running");
             return DaemonResult::NotRunning;
         }
     };
 
+    // Read daemon session UUID from metadata. Use nil if unavailable (the
+    // daemon may reject with SessionMismatch, but that's better than not
+    // connecting at all).
+    let daemon_session = mati_core::mcp::metadata::read_metadata(root)
+        .map(|m| m.session)
+        .unwrap_or_else(uuid::Uuid::nil);
+
+    // Build v2 Command object from v1-style (cmd, args).
+    let v2_cmd = v1_to_v2_command(cmd, &args);
+
+    let request_id = uuid::Uuid::new_v4();
+    let v2_request = serde_json::json!({
+        "v": mati_core::mcp::protocol::PROTOCOL_VERSION,
+        "id": request_id,
+        "session": daemon_session,
+        "cmd": v2_cmd,
+    });
+
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({ "v": PROTOCOL_VERSION, "cmd": cmd, "args": args });
-    let mut bytes = match serde_json::to_vec(&request) {
+    let mut bytes = match serde_json::to_vec(&v2_request) {
         Ok(b) => b,
         Err(_) => return DaemonResult::Unresponsive,
     };
@@ -453,20 +475,40 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
         Err(_) => return DaemonResult::Unresponsive,
     };
 
-    // Protocol version mismatch — client must not interpret this response.
-    // Treat as Unresponsive: daemon is alive (holds the lock) but incompatible.
-    if let Some(v) = resp.get("v").and_then(|v| v.as_u64()) {
-        if v as u32 != PROTOCOL_VERSION {
-            tracing::warn!(
-                daemon_v = v,
-                client_v = PROTOCOL_VERSION,
-                "daemon: protocol version mismatch — restart daemon to upgrade"
-            );
-            return DaemonResult::Unresponsive;
+    // Convert v2 Response to v1-compatible DaemonResult envelope.
+    match resp.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => {
+            let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            DaemonResult::Ok(serde_json::json!({"ok": true, "v": 2, "data": data}))
         }
-    }
+        Some("err") => {
+            let code = resp
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("internal");
+            let message = resp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
 
-    DaemonResult::Ok(resp)
+            // SessionMismatch means daemon restarted — re-read metadata
+            // and callers should retry once.
+            if code == "session_mismatch" {
+                tracing::debug!("daemon: session mismatch — daemon may have restarted");
+            }
+
+            DaemonResult::Ok(
+                serde_json::json!({"ok": false, "v": 2, "error": message, "code": code}),
+            )
+        }
+        _ => DaemonResult::Unresponsive,
+    }
+}
+
+/// Map a v1-style (cmd, args) pair to a v2 Command JSON object.
+/// Delegates to the shared implementation in the library crate.
+pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Value {
+    mati_core::mcp::protocol::v1_to_v2_command(cmd, args)
 }
 
 /// Convenience wrapper: extract the `data` field from a successful `get` response.

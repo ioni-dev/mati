@@ -663,6 +663,157 @@ pub struct AuditEntry {
     pub error_code: Option<ErrorCode>,
 }
 
+// ── V1→V2 command mapping ───────────────────────────────────────────────────
+//
+// Used by the CLI proxy and MCP proxy to convert legacy v1-style (cmd, args)
+// calls into v2 Command JSON. This is a transitional bridge — callers that
+// are updated to construct typed Commands directly do not need this.
+
+/// Map a v1-style `(cmd_str, args_json)` pair to a v2 Command JSON object.
+///
+/// The v2 format uses `{"type":"<cmd_name>", ...fields}` (internally tagged).
+/// This function produces that JSON from flat v1 parameters so that existing
+/// callers (CLI hooks, proxy, MCP socket_call) can speak v2 without rewriting
+/// every call site.
+pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Value {
+    use serde_json::json;
+
+    match cmd {
+        "ping" => json!({"type": "ping"}),
+        "get" => json!({"type": "get", "key": args["key"]}),
+        "hook_evaluate" => json!({
+            "type": "hook_evaluate",
+            "file_key": args["file_key"],
+            "include_recent": args.get("include_recent").and_then(|v| v.as_bool()).unwrap_or(false),
+        }),
+        "scan_prefix" => json!({"type": "scan_prefix", "prefix": args["prefix"]}),
+        "history" => json!({"type": "history", "key": args["key"], "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50)}),
+        "history_since" => json!({
+            "type": "history_since",
+            "key": args["key"],
+            "since_ts": args.get("since_ts").and_then(|v| v.as_u64()).unwrap_or(0),
+            "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50),
+        }),
+        "session_check_consulted" => json!({"type": "session_check_consulted", "key": args["key"]}),
+        "session_check_consulted_recent" => json!({
+            "type": "session_check_consulted_recent",
+            "key": args["key"],
+            "ttl_secs": args.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(900),
+        }),
+        "mem_get" => json!({"type": "mem_get", "key": args["key"]}),
+        "mem_query" => json!({
+            "type": "mem_query",
+            "query": args["query"],
+            "mode": args.get("mode").and_then(|v| v.as_str()).unwrap_or("text"),
+            "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20),
+        }),
+        "mem_bootstrap" => json!({
+            "type": "mem_bootstrap",
+            "context_files": args.get("context_files").cloned().unwrap_or(json!([])),
+        }),
+        "mem_set" => {
+            let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("write");
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            match action {
+                "confirm" => json!({"type": "gotcha_confirm", "key": key}),
+                "delete" => json!({"type": "gotcha_tombstone", "key": key}),
+                _ => v1_mem_set_write_to_v2(key, args),
+            }
+        }
+        "gotcha_confirm" => json!({"type": "gotcha_confirm", "key": args["key"]}),
+        "gotcha_tombstone" => json!({"type": "gotcha_tombstone", "key": args["key"]}),
+        "gotcha_write" => {
+            let record = args.get("record").cloned().unwrap_or(json!({}));
+            let payload = record.get("payload").cloned().unwrap_or(json!({}));
+            let key = record.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            json!({
+                "type": "gotcha_upsert",
+                "key": key,
+                "rule": payload.get("rule").and_then(|v| v.as_str()).unwrap_or(""),
+                "reason": payload.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                "severity": payload.get("severity").and_then(|v| v.as_str()).unwrap_or("normal"),
+                "affected_files": payload.get("affected_files").cloned().unwrap_or(json!([])),
+                "ref_url": payload.get("ref_url").cloned().unwrap_or(serde_json::Value::Null),
+                "tags": record.get("tags").cloned().unwrap_or(json!([])),
+                "priority": record.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
+            })
+        }
+        "log_hit" => json!({"type": "consultation_hit", "key": args["key"]}),
+        "log_miss" => json!({"type": "session_log", "event": "miss", "key": args["key"]}),
+        "log_compliance_miss" => json!({"type": "session_log", "event": "compliance_miss", "key": args["key"]}),
+        "log_compliance_hit" => json!({"type": "session_log", "event": "compliance_hit", "key": args["key"]}),
+        "log_codex_shell_miss" => json!({"type": "session_log", "event": "codex_shell_miss", "key": args["key"]}),
+        "log_bootstrap" => json!({"type": "session_log", "event": "bootstrap", "key": args["key"]}),
+        "log_prompt_nudge" => json!({"type": "session_log", "event": "prompt_nudge", "key": args["key"]}),
+        "session_flush" => json!({"type": "session_flush"}),
+        "session_harvest" => json!({"type": "session_harvest"}),
+        "reparse" => json!({"type": "file_reparse", "path": args.get("path").and_then(|v| v.as_str()).unwrap_or("")}),
+        "edit_hook" => json!({"type": "file_edit_hook", "path": args.get("path").and_then(|v| v.as_str()).unwrap_or("")}),
+        "doc_capture" => json!({"type": "doc_capture", "path": args.get("path").and_then(|v| v.as_str()).unwrap_or("")}),
+        other => {
+            let mut obj = args.as_object().cloned().unwrap_or_default();
+            obj.insert("type".to_string(), serde_json::Value::String(other.to_string()));
+            serde_json::Value::Object(obj)
+        }
+    }
+}
+
+/// Helper: map v1 mem_set action=write to the correct v2 typed command by key prefix.
+fn v1_mem_set_write_to_v2(key: &str, args: &serde_json::Value) -> serde_json::Value {
+    use serde_json::json;
+    let payload = args.get("payload").cloned().unwrap_or(json!({}));
+
+    if key.starts_with("gotcha:") {
+        json!({
+            "type": "gotcha_upsert",
+            "key": key,
+            "rule": payload.get("rule").and_then(|v| v.as_str()).unwrap_or(""),
+            "reason": payload.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+            "severity": payload.get("severity").and_then(|v| v.as_str()).unwrap_or("normal"),
+            "affected_files": payload.get("affected_files").cloned().unwrap_or(json!([])),
+            "ref_url": payload.get("ref_url").cloned().unwrap_or(serde_json::Value::Null),
+            "tags": args.get("tags").cloned().unwrap_or(json!([])),
+            "priority": args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
+        })
+    } else if key.starts_with("file:") {
+        let path = key.strip_prefix("file:").unwrap_or(key);
+        json!({
+            "type": "file_enrich",
+            "path": path,
+            "purpose": payload.get("purpose").and_then(|v| v.as_str()).unwrap_or(
+                args.get("value").and_then(|v| v.as_str()).unwrap_or("")
+            ),
+            "entry_points": payload.get("entry_points").cloned().unwrap_or(json!([])),
+            "decision_keys": payload.get("decision_keys").cloned().unwrap_or(json!([])),
+            "todos": payload.get("todos").cloned().unwrap_or(json!([])),
+            "tags": args.get("tags").cloned().unwrap_or(json!([])),
+            "priority": args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
+        })
+    } else if key.starts_with("decision:") {
+        let slug = key.strip_prefix("decision:").unwrap_or(key);
+        json!({
+            "type": "decision_upsert",
+            "slug": slug,
+            "value": args.get("value").and_then(|v| v.as_str()).unwrap_or(""),
+            "summary": payload.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+            "rationale": payload.get("rationale").and_then(|v| v.as_str()).unwrap_or(""),
+            "tags": args.get("tags").cloned().unwrap_or(json!([])),
+            "priority": args.get("priority").and_then(|v| v.as_str()).unwrap_or("normal").to_lowercase(),
+        })
+    } else if key.starts_with("dev_note:") {
+        json!({
+            "type": "dev_note_upsert",
+            "key": key,
+            "text": args.get("value").and_then(|v| v.as_str()).unwrap_or(""),
+        })
+    } else {
+        json!({
+            "type": "dev_note_upsert",
+            "text": args.get("value").and_then(|v| v.as_str()).unwrap_or(""),
+        })
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
