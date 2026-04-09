@@ -396,13 +396,41 @@ async fn serve_loop_graceful(
 /// - **No socket** → [`DaemonResult::NotRunning`] — safe to use `Store::open`
 /// - **ECONNREFUSED + PID dead** → clean up stale files, [`DaemonResult::StaleSocket`] — safe to use `Store::open`
 /// - **PID alive but not responding** → [`DaemonResult::Unresponsive`] — **unsafe** to use `Store::open`
+/// Send a typed v2 Command to the daemon and return a [`DaemonResult`].
+///
+/// This is the preferred API for internal callers. Constructs a v2
+/// `protocol::Request` directly from a typed `Command` — no legacy
+/// string command names involved.
+pub async fn daemon_v2(
+    root: &Path,
+    cmd: mati_core::mcp::protocol::Command,
+) -> DaemonResult {
+    let v2_cmd = match serde_json::to_value(&cmd) {
+        Ok(v) => v,
+        Err(_) => return DaemonResult::Unresponsive,
+    };
+    send_v2_raw(root, v2_cmd).await
+}
+
+/// Send a v2 request using legacy `(cmd_str, args)` parameters.
+///
+/// Retained for pure-read callers (ping, get, scan_prefix, history, etc.)
+/// that have not yet migrated to typed `daemon_v2`. Mutation and
+/// side-effecting-read callers should use `daemon_v2` directly.
 pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> DaemonResult {
+    let v2_cmd = mati_core::mcp::protocol::v1_to_v2_command(cmd, &args);
+    send_v2_raw(root, v2_cmd).await
+}
+
+/// Low-level: connect to daemon socket, send a pre-built v2 Command JSON,
+/// read and parse the v2 Response.
+async fn send_v2_raw(root: &Path, v2_cmd: serde_json::Value) -> DaemonResult {
     let sock_path = root.join("mati.sock");
 
     if sock_path.as_os_str().len() > UNIX_SOCK_PATH_MAX {
         tracing::warn!(
             path = %sock_path.display(),
-            "daemon_result: socket path exceeds Unix limit — daemon unavailable"
+            "daemon: socket path exceeds Unix limit — daemon unavailable"
         );
         return DaemonResult::NotRunning;
     }
@@ -431,20 +459,13 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
         }
     };
 
-    // Read daemon session UUID from metadata. Use nil if unavailable (the
-    // daemon may reject with SessionMismatch, but that's better than not
-    // connecting at all).
     let daemon_session = mati_core::mcp::metadata::read_metadata(root)
         .map(|m| m.session)
         .unwrap_or_else(uuid::Uuid::nil);
 
-    // Build v2 Command object from v1-style (cmd, args).
-    let v2_cmd = v1_to_v2_command(cmd, &args);
-
-    let request_id = uuid::Uuid::new_v4();
     let v2_request = serde_json::json!({
         "v": mati_core::mcp::protocol::PROTOCOL_VERSION,
-        "id": request_id,
+        "id": uuid::Uuid::new_v4(),
         "session": daemon_session,
         "cmd": v2_cmd,
     });
@@ -475,7 +496,7 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
         Err(_) => return DaemonResult::Unresponsive,
     };
 
-    // Convert v2 Response to v1-compatible DaemonResult envelope.
+    // Convert v2 Response to DaemonResult envelope.
     match resp.get("status").and_then(|s| s.as_str()) {
         Some("ok") => {
             let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
@@ -490,25 +511,15 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
-
-            // SessionMismatch means daemon restarted — re-read metadata
-            // and callers should retry once.
             if code == "session_mismatch" {
                 tracing::debug!("daemon: session mismatch — daemon may have restarted");
             }
-
             DaemonResult::Ok(
                 serde_json::json!({"ok": false, "v": 2, "error": message, "code": code}),
             )
         }
         _ => DaemonResult::Unresponsive,
     }
-}
-
-/// Map a v1-style (cmd, args) pair to a v2 Command JSON object.
-/// Delegates to the shared implementation in the library crate.
-pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Value {
-    mati_core::mcp::protocol::v1_to_v2_command(cmd, args)
 }
 
 /// Convenience wrapper: extract the `data` field from a successful `get` response.
