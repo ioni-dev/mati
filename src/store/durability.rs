@@ -36,8 +36,8 @@ impl Durability {
             || key.starts_with("compliance:")
             || key.starts_with("graph:edge:")
             || key.starts_with("health:") // derived/computed data, fully recomputable
-            || key.starts_with("parse:")
-        // file content hashes — recomputable on re-init
+            || key.starts_with("parse:")  // file content hashes — recomputable on re-init
+            || key.starts_with("audit:session:") // session-side audit — co-located with session mutations
         {
             Self::Eventual
         } else {
@@ -206,6 +206,39 @@ mod tests {
             Durability::for_key("decision:hook_event:design"),
             Durability::Immediate,
             "embedded 'hook_event:' must not trigger Eventual routing"
+        );
+    }
+
+    // ── Audit routing tests ─────────────────────────────────────────────
+
+    #[test]
+    fn audit_session_is_eventual() {
+        // Session-side audit co-locates with session mutations.
+        assert_eq!(
+            Durability::for_key("audit:session:1234567890"),
+            Durability::Eventual,
+            "audit:session:* must route to sessions tree"
+        );
+    }
+
+    #[test]
+    fn audit_knowledge_is_immediate() {
+        // Knowledge-side audit co-locates with knowledge mutations.
+        // "audit:knowledge:*" does NOT match any Eventual prefix → Immediate.
+        assert_eq!(
+            Durability::for_key("audit:knowledge:1234567890"),
+            Durability::Immediate,
+            "audit:knowledge:* must route to knowledge tree"
+        );
+    }
+
+    #[test]
+    fn audit_bare_prefix_is_immediate() {
+        // "audit:" alone doesn't match "audit:session:" → Immediate.
+        assert_eq!(
+            Durability::for_key("audit:something"),
+            Durability::Immediate,
+            "unknown audit prefix must default to Immediate"
         );
     }
 }

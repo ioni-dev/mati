@@ -178,11 +178,27 @@ pub async fn run_daemon_start() -> Result<()> {
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind Unix socket at {}", sock_path.display()))?;
 
-    std::fs::write(
-        &pid_path,
-        format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
-    )
-    .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    // Harden socket permissions after bind.
+    if let Err(e) = mati_core::mcp::metadata::harden_socket(&sock_path) {
+        tracing::warn!("failed to harden socket permissions: {e}");
+    }
+
+    // Publish v2 daemon metadata (with session UUID) atomically.
+    let daemon_meta =
+        mati_core::mcp::metadata::DaemonMetadata::new(mati_core::mcp::metadata::DaemonOwner::Daemon);
+    let daemon_session = daemon_meta.session;
+    if let Err(e) = mati_core::mcp::metadata::publish_metadata(
+        sock_path.parent().unwrap_or(std::path::Path::new(".")),
+        &daemon_meta,
+    ) {
+        // Fall back to legacy PID file.
+        tracing::warn!("failed to publish v2 daemon metadata: {e}");
+        std::fs::write(
+            &pid_path,
+            format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
+        )
+        .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    }
     // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
 
@@ -235,13 +251,18 @@ pub async fn run_daemon_start() -> Result<()> {
     // Run serve_loop and the shutdown-watcher concurrently with join! so that
     // serve_loop is NEVER cancelled by tokio. It exits only after handle_connection
     // returns, ensuring all writes are committed before store.close() is called.
+    // Capture daemon effective UID once — used for every peer credential check.
+    let daemon_euid = mati_core::mcp::metadata::current_euid();
+
     tokio::join!(
         serve_loop_graceful(
             Arc::clone(&graph),
             &repo_root,
             &listener,
             &last_wall,
-            &shutdown
+            &shutdown,
+            daemon_euid,
+            daemon_session,
         ),
         async {
             // Wait for either a signal or the idle-check notification.
@@ -310,6 +331,8 @@ async fn serve_loop_graceful(
     listener: &UnixListener,
     last_wall: &AtomicU64,
     shutdown: &tokio::sync::Notify,
+    daemon_euid: u32,
+    daemon_session: uuid::Uuid,
 ) {
     loop {
         // Race between a new connection and the shutdown signal.
@@ -329,10 +352,21 @@ async fn serve_loop_graceful(
             }
         };
         last_wall.store(wall_secs(), Ordering::Relaxed);
+        // Peer credential check — mismatch or failure drops the connection.
+        let peer = match mati_core::mcp::metadata::check_peer_cred(&stream, daemon_euid) {
+            Some(p) => p,
+            None => continue,
+        };
         // Runs to completion — NOT cancellable by shutdown.
         if let Err(e) =
-            mati_core::mcp::server::socket_handle_connection(Arc::clone(&graph), repo_root, stream)
-                .await
+            mati_core::mcp::server::socket_handle_connection(
+                Arc::clone(&graph),
+                repo_root,
+                stream,
+                peer,
+                daemon_session,
+            )
+            .await
         {
             tracing::warn!(error = %e, "daemon: connection error");
         }

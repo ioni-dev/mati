@@ -377,13 +377,13 @@ pub(crate) struct SocketRequest {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SocketResponse {
-    ok: bool,
+    pub(crate) ok: bool,
     #[serde(rename = "v")]
     version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
+    pub(crate) data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 impl SocketResponse {
@@ -438,14 +438,32 @@ async fn serve_daemon_socket(
             return;
         }
     };
-    let _ = std::fs::write(
-        &pid_path,
-        format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
-    );
+    // Harden socket permissions after bind (before any client can connect).
+    if let Err(e) = super::metadata::harden_socket(&sock_path) {
+        tracing::warn!("failed to harden socket permissions: {e}");
+    }
+    // Publish v2 daemon metadata (with session UUID) atomically.
+    let daemon_meta = super::metadata::DaemonMetadata::new(super::metadata::DaemonOwner::Mcp);
+    let daemon_session = daemon_meta.session;
+    if let Err(e) = super::metadata::publish_metadata(
+        sock_path.parent().unwrap_or(std::path::Path::new(".")),
+        &daemon_meta,
+    ) {
+        tracing::warn!("failed to publish daemon metadata: {e}");
+        // Fall back to legacy PID file so existing clients still work.
+        let _ = std::fs::write(
+            &pid_path,
+            format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
+        );
+    }
     tracing::debug!(
-        "daemon socket ready at {} (MCP-embedded)",
-        sock_path.display()
+        "daemon socket ready at {} (MCP-embedded, session={})",
+        sock_path.display(),
+        daemon_session,
     );
+
+    // Capture daemon effective UID once — used for every peer credential check.
+    let daemon_euid = super::metadata::current_euid();
 
     loop {
         let stream = match listener.accept().await {
@@ -455,7 +473,20 @@ async fn serve_daemon_socket(
                 continue;
             }
         };
-        if let Err(e) = socket_handle_connection(Arc::clone(&graph), &repo_root, stream).await {
+        // Peer credential check — mismatch or failure drops the connection.
+        let peer = match super::metadata::check_peer_cred(&stream, daemon_euid) {
+            Some(p) => p,
+            None => continue,
+        };
+        if let Err(e) = socket_handle_connection(
+            Arc::clone(&graph),
+            &repo_root,
+            stream,
+            peer,
+            daemon_session,
+        )
+        .await
+        {
             tracing::debug!("daemon socket connection: {e}");
         }
     }
@@ -465,6 +496,8 @@ pub async fn socket_handle_connection(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     stream: UnixStream,
+    peer: super::metadata::PeerContext,
+    daemon_session: uuid::Uuid,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut buf = String::new();
@@ -475,29 +508,41 @@ pub async fn socket_handle_connection(
         Err(_) => anyhow::bail!("read timeout"),
     }
 
-    let req: SocketRequest = match serde_json::from_str(buf.trim()) {
+    let trimmed = buf.trim();
+
+    // V2 protocol ONLY — no v1 fallback on the public wire.
+    // The v2 format requires `id` (UUID), `session` (UUID), and `cmd` as
+    // a tagged object with `type`. If decode fails, the request is rejected
+    // with a protocol error — there is no legacy v1 dispatch path.
+    let v2_req = match serde_json::from_str::<super::protocol::Request>(trimmed) {
         Ok(r) => r,
         Err(e) => {
-            let resp = SocketResponse::err(format!("invalid JSON: {e}"));
-            write_socket_response(&mut writer, &resp).await?;
+            // Return a v2-shaped error. Use nil UUID since we can't extract
+            // the request ID from a malformed payload.
+            let resp = super::protocol::Response::err(
+                uuid::Uuid::nil(),
+                super::protocol::ErrorCode::MalformedRequest,
+                format!("invalid v2 request: {e}"),
+            );
+            let json = serde_json::to_string(&resp)?;
+            writer.write_all(json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
             return Ok(());
         }
     };
 
-    if let Some(v) = req.version {
-        if v != PROTOCOL_VERSION {
-            let resp = SocketResponse::err(format!(
-                "protocol version mismatch: client={v} server={PROTOCOL_VERSION}"
-            ));
-            write_socket_response(&mut writer, &resp).await?;
-            return Ok(());
-        }
-    }
-
-    // Do NOT hold a read lock across dispatch — socket_dispatch may acquire
-    // a write lock for MCP tools like mem_set, which would deadlock.
-    let resp = socket_dispatch(&graph, repo_root, &req).await;
-    write_socket_response(&mut writer, &resp).await
+    let ctx = super::dispatch_v2::RequestContext {
+        peer,
+        daemon_session,
+        repo_root: repo_root.to_path_buf(),
+    };
+    let resp = super::dispatch_v2::dispatch_v2(&graph, &ctx, v2_req).await;
+    let json = serde_json::to_string(&resp)?;
+    writer.write_all(json.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 pub(crate) async fn write_socket_response(
@@ -511,7 +556,7 @@ pub(crate) async fn write_socket_response(
     Ok(())
 }
 
-async fn socket_dispatch(
+pub(crate) async fn socket_dispatch(
     graph: &Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     req: &SocketRequest,

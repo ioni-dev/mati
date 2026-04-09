@@ -13,7 +13,7 @@ pub mod record;
 pub mod repair;
 pub mod session;
 
-pub use db::{derive_slug, Store};
+pub use db::{derive_slug, KnowledgeWriteOp, Store};
 pub use durability::Durability;
 pub use record::{
     Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType, GotchaRecord,

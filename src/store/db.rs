@@ -75,6 +75,17 @@ fn is_knowledge_key(key: &str) -> bool {
 /// timestamps, not `Record` structs, and must not be fed to the search index.
 const SESSION_NAMESPACES: &[&str] = &["session:", "analytics:", "hook_event:", "compliance:"];
 
+/// A write operation for a knowledge-tree transaction.
+///
+/// Supports both Record writes (indexed by tantivy) and raw byte writes
+/// (e.g., audit entries) in the same atomic commit.
+pub enum KnowledgeWriteOp<'a> {
+    /// Write a Record (serialized via MessagePack, indexed by tantivy).
+    PutRecord { key: &'a str, record: &'a Record },
+    /// Write raw bytes (not a Record, not indexed by tantivy).
+    PutRaw { key: &'a str, value: &'a [u8] },
+}
+
 /// Persistent knowledge store for a single mati project.
 ///
 /// Wraps two SurrealKV trees:
@@ -681,6 +692,117 @@ impl Store {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // Transactional batch writes (mutation + audit atomic commit)
+    //
+    // SurrealKV supports multi-key atomic transactions within a single tree.
+    // The real constraint is mati's two-tree architecture: no single
+    // transaction can span both the knowledge and sessions trees.
+    // -------------------------------------------------------------------------
+
+    /// Atomically commit multiple writes to the knowledge tree in a single
+    /// transaction.
+    ///
+    /// Supports mixed Record + raw byte writes. All keys MUST route to the
+    /// knowledge tree (`Durability::Immediate`). Panics in debug builds if
+    /// any key routes to sessions.
+    ///
+    /// Handles crash-fence + tantivy sync + write-seq after commit.
+    /// Use this for mutation + audit atomic commit on knowledge-side commands.
+    pub async fn transact_knowledge(&self, ops: &[KnowledgeWriteOp<'_>]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(
+            ops.iter().all(|op| {
+                let k = match op {
+                    KnowledgeWriteOp::PutRecord { key, .. } => key,
+                    KnowledgeWriteOp::PutRaw { key, .. } => key,
+                };
+                Durability::for_key(k) == Durability::Immediate
+            }),
+            "transact_knowledge: all keys must route to knowledge tree"
+        );
+
+        // Collect Records for tantivy sync before committing (we need &Record refs).
+        let mut record_refs: Vec<&Record> = Vec::new();
+
+        let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
+        txn.set_durability(SkvDurability::Immediate);
+        for op in ops {
+            match op {
+                KnowledgeWriteOp::PutRecord { key, record } => {
+                    let bytes = rmps::to_vec_named(record)
+                        .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                    txn.set(key.as_bytes(), bytes)?;
+                    record_refs.push(record);
+                }
+                KnowledgeWriteOp::PutRaw { key, value } => {
+                    txn.set(key.as_bytes(), value.to_vec())?;
+                }
+            }
+        }
+        txn.commit().await?;
+
+        // Crash-fence + tantivy sync (same pattern as put/put_batch).
+        let has_knowledge = ops.iter().any(|op| {
+            let k = match op {
+                KnowledgeWriteOp::PutRecord { key, .. } => key,
+                KnowledgeWriteOp::PutRaw { key, .. } => key,
+            };
+            is_knowledge_key(k)
+        });
+        if has_knowledge {
+            let _ = std::fs::write(self.root.join(SEARCH_SYNC_PENDING), b"");
+        }
+        let mut search_synced = false;
+        if !record_refs.is_empty() {
+            if let Ok(search) = self.ensure_search() {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    search.add_records(&record_refs)
+                })) {
+                    Ok(Ok(_)) => search_synced = true,
+                    Ok(Err(e)) => tracing::warn!("transact_knowledge: tantivy sync failed: {e}"),
+                    Err(_) => tracing::error!("transact_knowledge: tantivy panicked"),
+                }
+            }
+        }
+        if has_knowledge {
+            self.bump_write_seq();
+            if search_synced {
+                let _ = std::fs::remove_file(self.root.join(SEARCH_SYNC_PENDING));
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically commit multiple raw byte writes to the sessions tree in a
+    /// single transaction.
+    ///
+    /// All keys MUST route to the sessions tree (`Durability::Eventual`).
+    /// Panics in debug builds if any key routes to knowledge.
+    ///
+    /// Use this for mutation + audit atomic commit on session-side commands.
+    pub async fn transact_sessions_raw(&self, entries: &[(&str, &[u8])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(
+            entries
+                .iter()
+                .all(|(k, _)| Durability::for_key(k) == Durability::Eventual),
+            "transact_sessions_raw: all keys must route to sessions tree"
+        );
+
+        let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
+        txn.set_durability(SkvDurability::Eventual);
+        for (key, value) in entries {
+            txn.set(key.as_bytes(), value.to_vec())?;
+        }
+        txn.commit().await?;
+        Ok(())
+    }
+
     /// Return all keys whose prefix matches, without deserialising values.
     ///
     /// Cheaper than [`Self::scan_prefix`] when only the key is needed (e.g.
@@ -864,6 +986,14 @@ impl Store {
             Durability::Eventual => &self.sessions,
             Durability::Immediate => &self.knowledge,
         }
+    }
+
+    /// Direct access to the sessions tree for audit reads in tests.
+    ///
+    /// Production code should use the key-routing methods (`get`, `put_raw`,
+    /// `scan_keys`) rather than accessing trees directly.
+    pub fn sessions_tree(&self) -> &Tree {
+        &self.sessions
     }
 }
 

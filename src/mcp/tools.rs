@@ -29,7 +29,7 @@ use super::server::{proxy_daemon_result, ProxyDaemonResult};
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 /// Vector B — appended to every mem_bootstrap result (64 tokens, budget 77).
-const VECTOR_B: &str = "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
+pub(crate) const VECTOR_B: &str = "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
     confidence>=0.6 + confirmed=true \u{2192} use record, skip file read.\n\
     confidence<0.3 \u{2192} read file, consider mem_set to improve.\n\
     \"add gotcha\" \u{2192} mem_set(Gotcha) then mati gotcha confirm <key>.";
@@ -58,7 +58,7 @@ fn priority_weight(priority: &Priority) -> f32 {
 /// Strip a Record to its agent-facing shape. Removes internal metadata
 /// (device_id, clocks, gap_analysis_score, computed_at, sha, counters)
 /// that agents never use. Cuts ~40% of response size.
-fn record_to_agent_json(record: &Record) -> serde_json::Value {
+pub(crate) fn record_to_agent_json(record: &Record) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("key".into(), serde_json::json!(record.key));
     obj.insert("value".into(), serde_json::json!(record.value));
