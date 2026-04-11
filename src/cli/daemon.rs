@@ -74,10 +74,6 @@ pub enum DaemonCommand {
 
 // ── Protocol constants ───────────────────────────────────────────────────────
 
-/// Bump when request/response format changes incompatibly. Clients that send a
-/// different version get an error and must fall back to direct `Store::open`.
-pub const PROTOCOL_VERSION: u32 = 1;
-
 /// Idle shutdown threshold — wall-clock seconds with no requests.
 /// Uses wall time (not monotonic) so sleep/wake contributes correctly.
 const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
@@ -416,6 +412,7 @@ async fn serve_loop_graceful(
 /// - **No socket** → [`DaemonResult::NotRunning`] — safe to use `Store::open`
 /// - **ECONNREFUSED + PID dead** → clean up stale files, [`DaemonResult::StaleSocket`] — safe to use `Store::open`
 /// - **PID alive but not responding** → [`DaemonResult::Unresponsive`] — **unsafe** to use `Store::open`
+///
 /// Send a typed v2 Command to the daemon and return a [`DaemonResult`].
 ///
 /// This is the preferred API for internal callers. Constructs a v2

@@ -19,20 +19,6 @@ use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Fire-and-forget: send a command to the daemon socket, drop silently on failure.
-///
-/// Used by all hook analytics/logging commands where data loss is acceptable
-/// under P9 graceful degradation.
-async fn hook_fire_and_forget(cmd: &str, args: serde_json::Value) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let root = mati_root_for(&cwd)?;
-    match daemon_result(&root, cmd, args).await {
-        DaemonResult::Ok(_) => {}
-        _ => tracing::debug!("mati {cmd}: daemon unreachable — dropping event"),
-    }
-    Ok(())
-}
-
 /// Fire-and-forget with a typed v2 Command. Preferred for mutation/side-effecting calls.
 async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
     let kind = cmd.kind();
