@@ -843,13 +843,6 @@ pub(crate) async fn handle_dev_note_upsert(
                     "key must start with dev_note:".into(),
                 ));
             }
-            // Verify exists for update mode.
-            if store.get(k).await.map_err(|e| {
-                (ErrorCode::StoreError, format!("store read: {e}"))
-            })?.is_none()
-            {
-                return Err((ErrorCode::NotFound, format!("record not found: {k}")));
-            }
             k.clone()
         }
         None => {
