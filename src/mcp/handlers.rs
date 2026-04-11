@@ -484,13 +484,6 @@ pub(crate) async fn handle_file_enrich(
     let now = now_secs();
     let file_key = format!("file:{}", input.path);
 
-    if input.purpose.is_empty() {
-        return Err((
-            ErrorCode::ValidationFailed,
-            "purpose must not be empty".into(),
-        ));
-    }
-
     let mut record = store
         .get(&file_key)
         .await
@@ -501,6 +494,15 @@ pub(crate) async fn handle_file_enrich(
                 format!("file record not found: {file_key} (must be created by init/reparse)"),
             )
         })?;
+
+    // Require purpose on first enrichment, but allow empty on updates
+    // (e.g. propagate_confirmation only bumps confirmation_count).
+    if input.purpose.is_empty() && record.value.is_empty() {
+        return Err((
+            ErrorCode::ValidationFailed,
+            "purpose must not be empty".into(),
+        ));
+    }
 
     if !matches!(record.lifecycle, RecordLifecycle::Active) {
         return Err((
@@ -515,10 +517,12 @@ pub(crate) async fn handle_file_enrich(
 
     if let Some(ref mut payload) = record.payload {
         if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "purpose".to_string(),
-                serde_json::Value::String(input.purpose.clone()),
-            );
+            if !input.purpose.is_empty() {
+                obj.insert(
+                    "purpose".to_string(),
+                    serde_json::Value::String(input.purpose.clone()),
+                );
+            }
             if !input.entry_points.is_empty() {
                 obj.insert("entry_points".to_string(), serde_json::json!(input.entry_points));
             }
@@ -532,7 +536,9 @@ pub(crate) async fn handle_file_enrich(
         }
     }
 
-    record.value = input.purpose.clone();
+    if !input.purpose.is_empty() {
+        record.value = input.purpose.clone();
+    }
     record.updated_at = now;
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
