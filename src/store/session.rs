@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
@@ -118,6 +118,86 @@ pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) ->
     }
 
     Ok(())
+}
+
+/// Compute the daily aggregation upsert WITHOUT persisting.
+///
+/// Returns `(key, serialized_record_bytes)` for staging into a
+/// `transact_sessions_raw` call. The caller commits this alongside
+/// other writes (e.g., audit) in one atomic transaction.
+pub async fn upsert_daily_agg_staged(
+    store: &Store,
+    agg_key: &str,
+    target_key: &str,
+) -> Result<(String, Vec<u8>)> {
+    let now = now_secs();
+
+    let record = match store.get(agg_key).await? {
+        Some(mut record) => {
+            let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
+                count: 0,
+                keys: vec![],
+            });
+            agg.count += 1;
+            if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
+                agg.keys.push(target_key.to_string());
+            }
+            record.payload = serde_json::to_value(&agg).ok();
+            record.updated_at = now;
+            record.version.logical_clock += 1;
+            record.version.wall_clock = now;
+            record
+        }
+        None => {
+            let agg = DailyAgg {
+                count: 1,
+                keys: vec![target_key.to_string()],
+            };
+            let mut record = analytics_record(agg_key, String::new());
+            record.payload = serde_json::to_value(&agg).ok();
+            record
+        }
+    };
+
+    let bytes = rmp_serde::to_vec_named(&record)
+        .with_context(|| format!("failed to serialize agg record for {agg_key}"))?;
+    Ok((agg_key.to_string(), bytes))
+}
+
+/// Compute the consultation receipt record WITHOUT persisting.
+///
+/// Returns `(key, serialized_record_bytes)` for staging.
+pub fn consultation_receipt_staged(key: &str) -> Result<(String, Vec<u8>)> {
+    let consulted_key = format!("session:consulted:{key}");
+    let record = session_record(&consulted_key, String::new());
+    let bytes = rmp_serde::to_vec_named(&record)
+        .with_context(|| format!("failed to serialize consulted receipt for {consulted_key}"))?;
+    Ok((consulted_key, bytes))
+}
+
+/// Compute the session:current flush record WITHOUT persisting.
+///
+/// Returns `(key, serialized_record_bytes)` for staging.
+pub async fn session_flush_staged(store: &Store) -> Result<Option<(String, Vec<u8>)>> {
+    let now = now_secs();
+    let consulted_keys = store.scan_keys("session:consulted:").await?;
+    let stripped: Vec<String> = consulted_keys
+        .iter()
+        .map(|k| {
+            k.strip_prefix("session:consulted:")
+                .unwrap_or(k)
+                .to_string()
+        })
+        .collect();
+
+    let session_data = serde_json::json!({
+        "consulted_keys": stripped,
+        "flushed_at": now,
+    });
+    let mut rec = session_record("session:current", String::new());
+    rec.payload = Some(session_data);
+    let bytes = rmp_serde::to_vec_named(&rec)?;
+    Ok(Some(("session:current".to_string(), bytes)))
 }
 
 // ── log_hit ───────────────────────────────────────────────────────────────────

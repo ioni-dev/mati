@@ -29,7 +29,8 @@ use super::server::{proxy_daemon_result, ProxyDaemonResult};
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 /// Vector B — appended to every mem_bootstrap result (64 tokens, budget 77).
-const VECTOR_B: &str = "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
+pub(crate) const VECTOR_B: &str =
+    "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
     confidence>=0.6 + confirmed=true \u{2192} use record, skip file read.\n\
     confidence<0.3 \u{2192} read file, consider mem_set to improve.\n\
     \"add gotcha\" \u{2192} mem_set(Gotcha) then mati gotcha confirm <key>.";
@@ -58,7 +59,7 @@ fn priority_weight(priority: &Priority) -> f32 {
 /// Strip a Record to its agent-facing shape. Removes internal metadata
 /// (device_id, clocks, gap_analysis_score, computed_at, sha, counters)
 /// that agents never use. Cuts ~40% of response size.
-fn record_to_agent_json(record: &Record) -> serde_json::Value {
+pub(crate) fn record_to_agent_json(record: &Record) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert("key".into(), serde_json::json!(record.key));
     obj.insert("value".into(), serde_json::json!(record.value));
@@ -305,7 +306,7 @@ impl MatiServer {
     /// Text mode returns a JSON array. Graph mode returns a grouped JSON object.
     #[rmcp::tool(
         name = "mem_query",
-        description = "Search the mati knowledge store. Use mode \"text\" for BM25 full-text search or mode \"graph\" for a 1-hop traversal from a seed key.",
+        description = "Search the mati knowledge store. Use mode \"text\" for BM25 full-text search, mode \"tag\" to filter by tag, or mode \"graph\" for a 1-hop traversal from a seed key.",
         annotations(read_only_hint = true)
     )]
     pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
@@ -319,11 +320,25 @@ impl MatiServer {
                     "text" => {
                         let graph = graph_arc.read().await;
                         let store = graph.store();
-                        match store.search(&params.query, limit).await {
-                    Ok(mut records) => {
-                        records.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
-                        let stripped: Vec<serde_json::Value> =
-                            records.iter().map(record_to_agent_json).collect();
+                        match store.search_scored(&params.query, limit).await {
+                    Ok(scored_records) => {
+                        let stripped: Vec<serde_json::Value> = scored_records
+                            .iter()
+                            .filter(|(_, r)| {
+                                matches!(r.lifecycle, RecordLifecycle::Active)
+                                    && !matches!(r.category, Category::Session | Category::Analytics)
+                            })
+                            .map(|(score, r)| {
+                                let mut obj = record_to_agent_json(r);
+                                if let serde_json::Value::Object(ref mut map) = obj {
+                                    map.insert(
+                                        "relevance".into(),
+                                        serde_json::json!((*score * 1000.0).round() / 1000.0),
+                                    );
+                                }
+                                obj
+                            })
+                            .collect();
                         serde_json::to_string_pretty(&stripped).unwrap_or_else(|e| {
                             format!("{{\"error\": \"serialization failed: {e}\"}}")
                         })
@@ -400,14 +415,11 @@ impl MatiServer {
                     if !group_records.is_empty() {
                         summary_parts.push(format!("{} {}", group_records.len(), group_name));
                     }
-                    remaining -= group_records.len();
+                    remaining = remaining.saturating_sub(group_records.len());
                     result.insert(
                         group_name.to_string(),
                         serde_json::Value::Array(group_records),
                     );
-                    if remaining == 0 {
-                        break;
-                    }
                 }
 
                 // DependencyAffects — add to decisions group
@@ -461,13 +473,40 @@ impl MatiServer {
                 serde_json::to_string_pretty(&result)
                     .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
             }
+                    "tag" => {
+                        let graph = graph_arc.read().await;
+                        let store = graph.store();
+                        let query_lower = params.query.to_lowercase();
+                        let mut matched: Vec<serde_json::Value> = Vec::new();
+                        for ns in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
+                            if let Ok(records) = store.scan_prefix(ns).await {
+                                for record in records {
+                                    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+                                        continue;
+                                    }
+                                    if record.tags.iter().any(|t| t.to_lowercase().contains(&query_lower)) {
+                                        matched.push(record_to_agent_json(&record));
+                                        if matched.len() >= limit {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if matched.len() >= limit {
+                                break;
+                            }
+                        }
+                        serde_json::to_string_pretty(&matched).unwrap_or_else(|e| {
+                            format!("{{\"error\": \"serialization failed: {e}\"}}")
+                        })
+                    }
                     "semantic" => {
                         "{\"error\": \"semantic search requires --features semantic (not enabled)\"}"
                             .to_string()
                     }
                     _ => {
                         format!(
-                            "{{\"error\": \"unknown mode: {mode}. Valid modes: text, graph, semantic\"}}"
+                            "{{\"error\": \"unknown mode: {mode}. Valid modes: text, tag, graph, semantic\"}}"
                         )
                     }
                 }
@@ -612,6 +651,92 @@ impl MatiServer {
                     .as_ref()
                     .map(|r| matches!(r.lifecycle, RecordLifecycle::Tombstoned { .. }))
                     .unwrap_or(false);
+
+                // ── Semantic validation ──────────────────────────────────
+                // Key-category consistency: key prefix must match category.
+                // This prevents miscategorized records (e.g., gotcha: key
+                // with Category::File) that would corrupt the knowledge store.
+                let expected_category = match params.key.split(':').next().unwrap_or("") {
+                    "file" => Category::File,
+                    "gotcha" => Category::Gotcha,
+                    "decision" => Category::Decision,
+                    "dev_note" => Category::DevNote,
+                    _ => unreachable!("key prefix already validated"),
+                };
+                if category != expected_category {
+                    return serde_json::json!({
+                        "error": format!(
+                            "key prefix requires category {expected_category:?}, got {category:?}"
+                        )
+                    })
+                    .to_string();
+                }
+
+                // Payload structural validation for new records. Updates to
+                // existing records use merge semantics (existing fields are
+                // preserved), so partial payloads are valid on update.
+                let is_new_record = existing_record.is_none() || is_tombstoned;
+                if is_new_record {
+                    // Normalize for validation (Codex sends JSON-encoded strings).
+                    let check_payload = match &params.payload {
+                        serde_json::Value::String(s) => {
+                            serde_json::from_str::<serde_json::Value>(s)
+                                .unwrap_or_else(|_| params.payload.clone())
+                        }
+                        _ => params.payload.clone(),
+                    };
+                    let obj = check_payload.as_object();
+                    if let Err(msg) = match &category {
+                        Category::Gotcha => {
+                            let valid = obj.is_some_and(|o| {
+                                let rule = o.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+                                let reason = o.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                                !rule.is_empty() && !reason.is_empty()
+                            });
+                            if valid {
+                                Ok(())
+                            } else {
+                                Err("gotcha requires payload with non-empty 'rule' and 'reason'")
+                            }
+                        }
+                        Category::File => {
+                            let has_purpose = !params.value.is_empty()
+                                || obj
+                                    .and_then(|o| o.get("purpose"))
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|s| !s.is_empty());
+                            if has_purpose {
+                                Ok(())
+                            } else {
+                                Err("file record requires non-empty value or payload.purpose")
+                            }
+                        }
+                        Category::Decision => {
+                            let valid = obj.is_some_and(|o| {
+                                let summary =
+                                    o.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                                let rationale =
+                                    o.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+                                !summary.is_empty() && !rationale.is_empty()
+                            });
+                            if valid {
+                                Ok(())
+                            } else {
+                                Err("decision requires payload with non-empty 'summary' and 'rationale'")
+                            }
+                        }
+                        Category::DevNote => {
+                            if params.value.is_empty() {
+                                Err("dev_note requires non-empty value")
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        _ => Ok(()),
+                    } {
+                        return serde_json::json!({"error": msg}).to_string();
+                    }
+                }
 
                 let was_confirmed = existing_record
                     .as_ref()
@@ -1260,11 +1385,29 @@ pub async fn assemble_context_packet(
         }
     }
 
-    // Fetch decision records
+    // Fetch decision records — graph-linked first, fallback to scan
     let mut related_decisions = Vec::new();
     for key in &decision_keys {
         if let Ok(Some(record)) = store.get(key).await {
             related_decisions.push(record);
+        }
+    }
+    // Fallback: when graph traversal found no decisions, scan decision:*
+    // prefix so decisions always surface in bootstrap when they exist.
+    if related_decisions.is_empty() {
+        if let Ok(mut all_decisions) = store.scan_prefix("decision:").await {
+            all_decisions.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+            all_decisions.sort_by(|a, b| {
+                b.confidence
+                    .value
+                    .partial_cmp(&a.confidence.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            const DECISION_FALLBACK_LIMIT: usize = 5;
+            related_decisions = all_decisions
+                .into_iter()
+                .take(DECISION_FALLBACK_LIMIT)
+                .collect();
         }
     }
 
@@ -2646,6 +2789,170 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown category"));
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_key_category_mismatch() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // gotcha: key with File category — must be rejected.
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:should-fail".to_string(),
+                value: "test".to_string(),
+                category: "File".to_string(),
+                payload: serde_json::json!({"purpose": "test"}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("requires category"),
+            "key-category mismatch must be rejected: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_new_gotcha_without_rule_and_reason() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:missing-fields".to_string(),
+                value: "test".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({"severity": "Normal"}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("'rule' and 'reason'"),
+            "new gotcha without rule/reason must be rejected: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_new_decision_without_summary_rationale() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "decision:incomplete".to_string(),
+                value: "test".to_string(),
+                category: "Decision".to_string(),
+                payload: serde_json::json!({}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("'summary' and 'rationale'"),
+            "new decision without summary/rationale must be rejected: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_new_dev_note_with_empty_value() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "dev_note:empty".to_string(),
+                value: "".to_string(),
+                category: "DevNote".to_string(),
+                payload: serde_json::json!({}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("non-empty value"),
+            "new dev_note with empty value must be rejected: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_set_allows_partial_payload_on_update() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        // First write: full payload (new record).
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:partial-update".to_string(),
+                value: "test rule because test reason".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({
+                    "rule": "test rule",
+                    "reason": "test reason",
+                    "severity": "Normal",
+                    "affected_files": [],
+                }),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true, "initial write must succeed");
+
+        // Second write: partial payload (update) — must succeed because
+        // payload validation is skipped for existing records (merge fills fields).
+        let result = server
+            .mem_set(Parameters(MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:partial-update".to_string(),
+                value: "updated rule because updated reason".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({"reason": "updated reason"}),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            }))
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["ok"], true,
+            "partial-payload update must succeed: {result}"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "mati": {
+      "args": [
+        "serve"
+      ],
+      "command": "mati"
+    }
+  }
+}
