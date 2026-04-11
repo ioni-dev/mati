@@ -85,7 +85,7 @@ pub(crate) fn make_audit_with_prefix(
     accepted: bool,
     error_code: Option<ErrorCode>,
     prefix: &str,
-) -> (String, Vec<u8>) {
+) -> Option<(String, Vec<u8>)> {
     let entry = AuditEntry {
         ts: now_secs(),
         peer_uid: ctx.peer.uid,
@@ -97,8 +97,15 @@ pub(crate) fn make_audit_with_prefix(
         accepted,
         error_code,
     };
-    let bytes = rmp_serde::to_vec_named(&entry).unwrap_or_default();
-    (audit_nanos_key(prefix), bytes)
+    match rmp_serde::to_vec_named(&entry) {
+        Ok(bytes) => Some((audit_nanos_key(prefix), bytes)),
+        Err(e) => {
+            tracing::error!(
+                "audit serialization failed — this is a bug, audit entry skipped: {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Convenience: knowledge-tree audit.
@@ -109,7 +116,7 @@ pub(crate) fn make_audit(
     target_key: &str,
     accepted: bool,
     error_code: Option<ErrorCode>,
-) -> (String, Vec<u8>) {
+) -> Option<(String, Vec<u8>)> {
     make_audit_with_prefix(ctx, request_id, command_kind, target_key, accepted, error_code, AUDIT_KNOWLEDGE_PREFIX)
 }
 
@@ -121,7 +128,7 @@ pub(crate) fn make_session_audit(
     target_key: &str,
     accepted: bool,
     error_code: Option<ErrorCode>,
-) -> (String, Vec<u8>) {
+) -> Option<(String, Vec<u8>)> {
     make_audit_with_prefix(ctx, request_id, command_kind, target_key, accepted, error_code, AUDIT_SESSION_PREFIX)
 }
 
@@ -243,8 +250,9 @@ pub(crate) async fn handle_gotcha_upsert(
         compute_file_link_updates(store, key, &old_affected_files, &input.affected_files).await;
 
     // Build atomic write: gotcha record + file-link updates + audit.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "gotcha_upsert", key, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "gotcha_upsert", key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
     ops.push(KnowledgeWriteOp::PutRecord {
         key,
@@ -346,8 +354,9 @@ pub(crate) async fn handle_gotcha_confirm(
         compute_confirmation_propagation(store, &affected_files).await;
 
     // Atomic: gotcha record + file-link updates + confirmation propagation + audit.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "gotcha_confirm", key, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "gotcha_confirm", key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
     ops.push(KnowledgeWriteOp::PutRecord {
         key,
@@ -424,8 +433,9 @@ pub(crate) async fn handle_gotcha_tombstone(
         compute_file_link_updates(store, key, &affected_files, &[]).await;
 
     // Atomic: tombstoned record + file-link cleanup + audit.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "gotcha_tombstone", key, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "gotcha_tombstone", key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
     ops.push(KnowledgeWriteOp::PutRecord {
         key,
@@ -526,8 +536,9 @@ pub(crate) async fn handle_file_enrich(
     let tier_label = format!("{:?}", record.quality.tier);
 
     // Atomic: file record + audit.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "file_enrich", &file_key, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "file_enrich", &file_key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let ops = vec![
         KnowledgeWriteOp::PutRecord {
             key: &file_key,
@@ -571,8 +582,10 @@ pub(crate) async fn handle_file_reparse(
 
     let Some((file_key, record)) = staged else {
         // No write needed (no changes, parse failure, or missing file with no record).
+        // No record change, but audit is still required for provenance.
         let (audit_key, audit_bytes) =
-            make_audit(ctx, request_id, "file_reparse", &input.path, true, None);
+            make_audit(ctx, request_id, "file_reparse", &input.path, true, None)
+                .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
         let ops = vec![KnowledgeWriteOp::PutRaw {
             key: &audit_key,
             value: &audit_bytes,
@@ -584,8 +597,9 @@ pub(crate) async fn handle_file_reparse(
     };
 
     // Atomic: file record + audit in one transaction.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "file_reparse", &input.path, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "file_reparse", &input.path, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let ops = vec![
         KnowledgeWriteOp::PutRecord {
             key: &file_key,
@@ -632,9 +646,9 @@ pub(crate) async fn handle_doc_capture(
 
     if purpose.is_empty() {
         // No doc comment found — no-op, but still audit.
-        let (audit_key, audit_bytes) =
-            make_audit(ctx, request_id, "doc_capture", &input.path, true, None);
-        let _ = store.put_raw(&audit_key, &audit_bytes).await;
+        if let Some((ak, ab)) = make_audit(ctx, request_id, "doc_capture", &input.path, true, None) {
+            let _ = store.put_raw(&ak, &ab).await;
+        }
         return Ok(serde_json::json!({"ok": true}));
     }
 
@@ -642,18 +656,18 @@ pub(crate) async fn handle_doc_capture(
     let mut record = match store.get(&file_key).await {
         Ok(Some(r)) => r,
         _ => {
-            let (audit_key, audit_bytes) =
-                make_audit(ctx, request_id, "doc_capture", &input.path, true, None);
-            let _ = store.put_raw(&audit_key, &audit_bytes).await;
+            if let Some((ak, ab)) = make_audit(ctx, request_id, "doc_capture", &input.path, true, None) {
+                let _ = store.put_raw(&ak, &ab).await;
+            }
             return Ok(serde_json::json!({"ok": true}));
         }
     };
 
     // Only update StaticAnalysis-sourced records.
     if record.source != RecordSource::StaticAnalysis {
-        let (audit_key, audit_bytes) =
-            make_audit(ctx, request_id, "doc_capture", &input.path, true, None);
-        let _ = store.put_raw(&audit_key, &audit_bytes).await;
+        if let Some((ak, ab)) = make_audit(ctx, request_id, "doc_capture", &input.path, true, None) {
+            let _ = store.put_raw(&ak, &ab).await;
+        }
         return Ok(serde_json::json!({"ok": true}));
     }
 
@@ -672,8 +686,9 @@ pub(crate) async fn handle_doc_capture(
     record.version.wall_clock = now;
 
     // Atomic: file record + audit.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "doc_capture", &input.path, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "doc_capture", &input.path, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let ops = vec![
         KnowledgeWriteOp::PutRecord {
             key: &file_key,
@@ -775,8 +790,9 @@ pub(crate) async fn handle_decision_upsert(
     let quality_val = record.quality.value;
     let tier_label = format!("{:?}", record.quality.tier);
 
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "decision_upsert", &key, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "decision_upsert", &key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let ops = vec![
         KnowledgeWriteOp::PutRecord {
             key: &key,
@@ -888,8 +904,9 @@ pub(crate) async fn handle_dev_note_upsert(
     let quality_val = record.quality.value;
     let tier_label = format!("{:?}", record.quality.tier);
 
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "dev_note_upsert", &key, true, None);
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "dev_note_upsert", &key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let ops = vec![
         KnowledgeWriteOp::PutRecord {
             key: &key,
@@ -925,9 +942,9 @@ pub(crate) async fn handle_mem_get(
     ctx: &RequestContext,
     request_id: Uuid,
     input: &protocol::MemGetInput,
-) -> serde_json::Value {
+) -> HandlerResult {
     if input.key.is_empty() {
-        return serde_json::json!({"error": "key must not be empty"});
+        return Err((ErrorCode::ValidationFailed, "key must not be empty".into()));
     }
 
     // 1. Read record (pure read — no lock contention with sessions writes).
@@ -940,7 +957,7 @@ pub(crate) async fn handle_mem_get(
             }
         }
         Ok(None) => None,
-        Err(e) => return serde_json::json!({"error": format!("store read: {e}")}),
+        Err(e) => return Err((ErrorCode::StoreError, format!("store read: {e}"))),
     };
 
     // 2. Build response FIRST (must return before client timeout).
@@ -958,13 +975,20 @@ pub(crate) async fn handle_mem_get(
                 key = %input.key,
                 "mem_get: consultation receipt staging failed: {e}"
             );
-            // Fail-open: return the read result even if receipt fails.
-            return response;
+            // Fail-open: return success but write accepted audit standalone.
+            if let Some((ak, ab)) = make_session_audit(
+                ctx, request_id, "mem_get", &input.key, true, None,
+            ) {
+                let _ = store.transact_sessions_raw(&[(&ak, &ab)]).await;
+            }
+            return Ok(response);
         }
     };
+    // Audit is required alongside the consultation receipt.
     let (audit_key, audit_bytes) = make_session_audit(
         ctx, request_id, "mem_get", &input.key, true, None,
-    );
+    )
+    .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
     let writes: Vec<(&str, &[u8])> = vec![
         (&receipt.0, &receipt.1),
         (&audit_key, &audit_bytes),
@@ -991,7 +1015,7 @@ pub(crate) async fn handle_mem_get(
         });
     }
 
-    response
+    Ok(response)
 }
 
 /// Native MemBootstrap handler.
@@ -1006,12 +1030,17 @@ pub(crate) async fn handle_mem_bootstrap(
     ctx: &RequestContext,
     request_id: Uuid,
     input: &protocol::MemBootstrapInput,
-) -> String {
-    use super::tools::VECTOR_B;
-
+) -> Result<String, (ErrorCode, String)> {
     let context_files = &input.context_files;
 
-    // 1. Stage all sessions-tree writes: bootstrap agg + per-file consultation receipts + audit.
+    // 1. Assemble context packet (pure read computation) — determines outcome.
+    let assembly = super::tools::assemble_context_packet(store, graph_ref, context_files).await;
+    let (accepted, error_code) = match &assembly {
+        Ok(_) => (true, None),
+        Err(_) => (false, Some(ErrorCode::Internal)),
+    };
+
+    // 2. Stage all sessions-tree writes: bootstrap agg + per-file consultation receipts + audit.
     let mut session_writes: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Bootstrap aggregation.
@@ -1042,18 +1071,20 @@ pub(crate) async fn handle_mem_bootstrap(
         }
     }
 
-    // Audit entry (sessions-tree).
-    let (audit_key, audit_bytes) = make_session_audit(
+    // Audit entry — reflects actual assembly outcome.
+    // Audit is required — fail closed if serialization fails.
+    let audit = make_session_audit(
         ctx,
         request_id,
         "mem_bootstrap",
         "",
-        true,
-        None,
-    );
-    session_writes.push((audit_key, audit_bytes));
+        accepted,
+        error_code,
+    )
+    .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
+    session_writes.push(audit);
 
-    // 2. Commit all sessions-tree writes atomically.
+    // 3. Commit all sessions-tree writes atomically.
     let write_refs: Vec<(&str, &[u8])> = session_writes
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_slice()))
@@ -1065,11 +1096,8 @@ pub(crate) async fn handle_mem_bootstrap(
         );
     }
 
-    // 3. Assemble context packet (pure read computation).
-    let result = super::tools::assemble_context_packet(store, graph_ref, context_files).await;
-
-    // 4. Deferred best-effort: access_count bumps on context file records.
-    if !context_files.is_empty() {
+    // 4. Deferred best-effort: access_count bumps on context file records (only on success).
+    if assembly.is_ok() && !context_files.is_empty() {
         let files_owned: Vec<String> = context_files.clone();
         let graph_clone = Arc::clone(graph_arc);
         tokio::task::spawn(async move {
@@ -1090,9 +1118,9 @@ pub(crate) async fn handle_mem_bootstrap(
         });
     }
 
-    match result {
-        Ok(packet) => packet.injection_string,
-        Err(e) => format!("[mati] bootstrap error: {e}{VECTOR_B}"),
+    match assembly {
+        Ok(packet) => Ok(packet.injection_string),
+        Err(e) => Err((ErrorCode::Internal, format!("bootstrap assembly: {e}"))),
     }
 }
 

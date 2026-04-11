@@ -317,6 +317,57 @@ impl Search {
         }
         Ok(keys)
     }
+
+    /// Same as [`query_keys`] but returns `(score, key)` pairs where `score`
+    /// is the raw BM25 relevance score from tantivy. Results are ordered by
+    /// descending score. Used by `mem_query` text mode to surface relevance
+    /// in the agent-facing response.
+    pub fn query_keys_scored(&self, text: &str, limit: usize) -> Result<Vec<(f32, String)>> {
+        if text.trim().is_empty() || limit == 0 {
+            return Ok(vec![]);
+        }
+
+        self.reader.reload()?;
+        let searcher = self.reader.searcher();
+
+        let mut parser = QueryParser::for_index(
+            &self.index,
+            vec![self.fields.key, self.fields.value, self.fields.tags],
+        );
+        parser.set_field_boost(self.fields.key, 2.0);
+
+        let (query, parse_warnings) = parser.parse_query_lenient(text);
+        if !parse_warnings.is_empty() {
+            tracing::warn!(
+                query = text,
+                warnings = ?parse_warnings,
+                "query parse warnings — proceeding with best-effort query"
+            );
+        }
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+
+        let mut results: Vec<(f32, String)> = Vec::with_capacity(top_docs.len());
+        let mut seen = std::collections::HashSet::new();
+        for (score, doc_address) in top_docs {
+            let doc = match searcher.doc::<TantivyDocument>(doc_address) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to retrieve doc — skipping");
+                    continue;
+                }
+            };
+            if let Some(key) = doc.get_first(self.fields.key).and_then(|v| v.as_str()) {
+                let key = key.to_string();
+                if seen.insert(key.clone()) {
+                    results.push((score, key));
+                }
+            } else {
+                tracing::warn!(?doc_address, "indexed doc missing key field — skipping");
+            }
+        }
+        Ok(results)
+    }
 }
 
 // ── Document construction ─────────────────────────────────────────────────────

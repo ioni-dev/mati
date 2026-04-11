@@ -637,6 +637,31 @@ impl Store {
         Ok(records)
     }
 
+    /// Full-text BM25 search returning `(score, Record)` pairs.
+    ///
+    /// Same semantics as [`Self::search`] but preserves the raw BM25
+    /// relevance score from tantivy. Used by `mem_query` text mode to
+    /// include relevance in the agent-facing response.
+    pub async fn search_scored(&self, text: &str, limit: usize) -> Result<Vec<(f32, Record)>> {
+        let search = self.ensure_search()?;
+        let scored_keys = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            search.query_keys_scored(text, limit)
+        })) {
+            Ok(result) => result?,
+            Err(_panic) => {
+                tracing::error!("search index panicked during scored query — returning empty results");
+                return Ok(vec![]);
+            }
+        };
+        let mut results = Vec::with_capacity(scored_keys.len());
+        for (score, key) in &scored_keys {
+            if let Some(record) = self.get(key).await? {
+                results.push((*score, record));
+            }
+        }
+        Ok(results)
+    }
+
     /// Write raw bytes under `key` with automatically routed durability.
     ///
     /// Same durability routing as [`Self::put`] — callers do not need to know
@@ -704,8 +729,8 @@ impl Store {
     /// transaction.
     ///
     /// Supports mixed Record + raw byte writes. All keys MUST route to the
-    /// knowledge tree (`Durability::Immediate`). Panics in debug builds if
-    /// any key routes to sessions.
+    /// knowledge tree (`Durability::Immediate`). Returns an error if any key
+    /// routes to sessions.
     ///
     /// Handles crash-fence + tantivy sync + write-seq after commit.
     /// Use this for mutation + audit atomic commit on knowledge-side commands.
@@ -713,16 +738,17 @@ impl Store {
         if ops.is_empty() {
             return Ok(());
         }
-        debug_assert!(
-            ops.iter().all(|op| {
-                let k = match op {
-                    KnowledgeWriteOp::PutRecord { key, .. } => key,
-                    KnowledgeWriteOp::PutRaw { key, .. } => key,
-                };
-                Durability::for_key(k) == Durability::Immediate
-            }),
-            "transact_knowledge: all keys must route to knowledge tree"
-        );
+        for op in ops {
+            let k = match op {
+                KnowledgeWriteOp::PutRecord { key, .. } => *key,
+                KnowledgeWriteOp::PutRaw { key, .. } => *key,
+            };
+            if Durability::for_key(k) != Durability::Immediate {
+                anyhow::bail!(
+                    "transact_knowledge: key '{k}' routes to sessions tree, not knowledge"
+                );
+            }
+        }
 
         // Collect Records for tantivy sync before committing (we need &Record refs).
         let mut record_refs: Vec<&Record> = Vec::new();
@@ -780,19 +806,20 @@ impl Store {
     /// single transaction.
     ///
     /// All keys MUST route to the sessions tree (`Durability::Eventual`).
-    /// Panics in debug builds if any key routes to knowledge.
+    /// Returns an error if any key routes to knowledge.
     ///
     /// Use this for mutation + audit atomic commit on session-side commands.
     pub async fn transact_sessions_raw(&self, entries: &[(&str, &[u8])]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        debug_assert!(
-            entries
-                .iter()
-                .all(|(k, _)| Durability::for_key(k) == Durability::Eventual),
-            "transact_sessions_raw: all keys must route to sessions tree"
-        );
+        for (k, _) in entries {
+            if Durability::for_key(k) != Durability::Eventual {
+                anyhow::bail!(
+                    "transact_sessions_raw: key '{k}' routes to knowledge tree, not sessions"
+                );
+            }
+        }
 
         let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
         txn.set_durability(SkvDurability::Eventual);
@@ -3208,5 +3235,75 @@ mod tests {
             !msg.contains("another mati process"),
             "non-lock errors must NOT be rewritten to lock errors, got: {msg}"
         );
+    }
+
+    // ── Transaction tree-routing invariant tests ───────────────────────
+
+    #[tokio::test]
+    async fn transact_knowledge_rejects_sessions_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // "session:foo" routes to Eventual (sessions tree).
+        let ops = vec![KnowledgeWriteOp::PutRaw {
+            key: "session:foo",
+            value: b"data",
+        }];
+        let err = store.transact_knowledge(&ops).await.unwrap_err();
+        assert!(
+            err.to_string().contains("routes to sessions tree"),
+            "wrong-tree key must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transact_sessions_raw_rejects_knowledge_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // "gotcha:foo" routes to Immediate (knowledge tree).
+        let entries: Vec<(&str, &[u8])> = vec![("gotcha:foo", b"data")];
+        let err = store.transact_sessions_raw(&entries).await.unwrap_err();
+        assert!(
+            err.to_string().contains("routes to knowledge tree"),
+            "wrong-tree key must be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transact_knowledge_accepts_valid_knowledge_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let ops = vec![
+            KnowledgeWriteOp::PutRaw {
+                key: "gotcha:test",
+                value: b"data1",
+            },
+            KnowledgeWriteOp::PutRaw {
+                key: "audit:knowledge:123",
+                value: b"data2",
+            },
+        ];
+        store
+            .transact_knowledge(&ops)
+            .await
+            .expect("valid knowledge keys must succeed");
+    }
+
+    #[tokio::test]
+    async fn transact_sessions_raw_accepts_valid_session_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let entries: Vec<(&str, &[u8])> = vec![
+            ("session:consulted:file:foo", b"data1"),
+            ("audit:session:123", b"data2"),
+            ("analytics:hit_2026-04-09", b"data3"),
+        ];
+        store
+            .transact_sessions_raw(&entries)
+            .await
+            .expect("valid session keys must succeed");
     }
 }

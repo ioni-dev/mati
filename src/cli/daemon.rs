@@ -122,6 +122,29 @@ pub async fn run_daemon_start() -> Result<()> {
     // Store::open (which may fail). The sentinel tells `mati init` that a daemon
     // is starting and the store lock may be held imminently.
     let mati_root = mati_root_for(&cwd)?;
+
+    // 1. Ensure runtime directory exists with correct permissions (0700).
+    mati_core::mcp::metadata::ensure_runtime_dir(&mati_root)?;
+
+    // 2. Stale-socket cleanup — refuse startup if a live daemon is detected.
+    {
+        use mati_core::mcp::metadata::{self as meta, StaleCheckResult};
+        match meta::check_and_cleanup_stale(&mati_root) {
+            StaleCheckResult::Clean | StaleCheckResult::StaleRemoved => {}
+            StaleCheckResult::LiveDaemon { pid, owner, .. } => {
+                anyhow::bail!(
+                    "another mati {owner} (pid {pid}) is already running.\n\
+                     Stop it with: mati daemon stop"
+                );
+            }
+            StaleCheckResult::OrphanSocket => {
+                // No metadata but socket file exists — unclean shutdown.
+                // Safe to remove: no PID file means no owner.
+                let _ = std::fs::remove_file(meta::socket_path(&mati_root));
+            }
+        }
+    }
+
     let starting_path = mati_root.join("mati.starting");
     let _ = std::fs::write(
         &starting_path,
@@ -168,9 +191,6 @@ pub async fn run_daemon_start() -> Result<()> {
             sock_path.display()
         );
     }
-
-    // Remove stale socket from a previous unclean shutdown.
-    let _ = std::fs::remove_file(&sock_path);
 
     // Bind socket BEFORE writing PID file. This eliminates the race window
     // where the PID file exists but the socket isn't ready yet — which causes
@@ -444,14 +464,21 @@ async fn send_v2_raw(root: &Path, v2_cmd: serde_json::Value) -> DaemonResult {
         Err(e) => {
             let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
             if is_refused {
-                if is_pid_dead(root) {
-                    let _ = std::fs::remove_file(&sock_path);
-                    let _ = std::fs::remove_file(root.join("mati.pid"));
-                    tracing::debug!("daemon: removed stale socket");
-                    return DaemonResult::StaleSocket;
-                } else {
-                    tracing::warn!("daemon: socket refused but PID alive — unresponsive");
-                    return DaemonResult::Unresponsive;
+                use mati_core::mcp::metadata::{self as meta, StaleCheckResult};
+                match meta::check_and_cleanup_stale(root) {
+                    StaleCheckResult::StaleRemoved | StaleCheckResult::Clean => {
+                        tracing::debug!("daemon: removed stale socket");
+                        return DaemonResult::StaleSocket;
+                    }
+                    StaleCheckResult::OrphanSocket => {
+                        let _ = std::fs::remove_file(&sock_path);
+                        tracing::debug!("daemon: removed orphan socket");
+                        return DaemonResult::StaleSocket;
+                    }
+                    StaleCheckResult::LiveDaemon { .. } => {
+                        tracing::warn!("daemon: socket refused but PID alive — unresponsive");
+                        return DaemonResult::Unresponsive;
+                    }
                 }
             }
             tracing::debug!(error = %e, "daemon: connect failed, treating as not running");
@@ -630,15 +657,6 @@ pub fn read_pid_file(root: &Path) -> Option<(u32, String)> {
     }
 
     None
-}
-
-/// Returns `true` if the PID recorded in the PID file is no longer alive.
-/// Returns `true` (assume dead) if the PID file is absent or unreadable.
-pub fn is_pid_dead(root: &Path) -> bool {
-    match read_pid_file(root) {
-        Some((pid, _)) => !is_pid_alive(pid),
-        None => true,
-    }
 }
 
 /// Derive the `~/.mati/<slug>/` path for the current working directory.

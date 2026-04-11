@@ -18,10 +18,11 @@ pub struct MemGetParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MemQueryParams {
     /// Search query string. For text mode: matched against record keys, values, and tags.
+    /// For tag mode: matched against record tags (substring, case-insensitive).
     /// For graph mode: must be a full namespaced record key (e.g. "file:src/main.rs" or "gotcha:my-rule").
     pub query: String,
-    /// Search mode: "text" (default, BM25 full-text) or "graph" (1-hop traversal from a seed key —
-    /// in graph mode the query must be an exact namespaced key, not a keyword).
+    /// Search mode: "text" (default, BM25 full-text), "tag" (filter by tag),
+    /// or "graph" (1-hop traversal from a seed key — query must be an exact namespaced key, not a keyword).
     #[serde(default = "default_mode")]
     pub mode: String,
     /// Maximum number of results to return (default: 20).

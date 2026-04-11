@@ -98,13 +98,26 @@ pub(crate) async fn dispatch_v2(
         return resp;
     }
 
-    // 2. Extract audit metadata before dispatch.
-    let is_mutation = req.cmd.is_mutation();
-    let command_kind = req.cmd.kind().to_string();
-    let target_key = req.cmd.target_key().to_string();
-    let request_id = req.id;
+    // 1b. Session fence — reject requests from stale clients whose cached
+    // daemon metadata predates a daemon restart. The client should re-read
+    // DaemonMetadata and retry once. Nil session on the request is tolerated
+    // only when the daemon itself has a nil session (test / legacy fallback).
+    if req.session != ctx.daemon_session {
+        let resp = Response::err(
+            req.id,
+            ErrorCode::SessionMismatch,
+            format!(
+                "session mismatch: request={} daemon={}; re-read daemon metadata and retry",
+                req.session, ctx.daemon_session
+            ),
+        );
+        if req.cmd.is_mutation() {
+            best_effort_audit(graph, ctx, &req, false, Some(ErrorCode::SessionMismatch)).await;
+        }
+        return resp;
+    }
 
-    // 3. Dispatch based on command classification.
+    // 2. Dispatch based on command classification.
     //
     // All mutations and side-effecting reads have native handlers.
     // Only pure reads (9 commands) use the v1 bridge, which cannot
@@ -191,19 +204,39 @@ async fn dispatch_side_effecting_read(
     match &req.cmd {
         Command::MemGet(input) => {
             let g = graph.read().await;
-            let data = handlers::handle_mem_get(
+            match handlers::handle_mem_get(
                 g.store(), graph, ctx, request_id, input,
             )
-            .await;
-            Response::ok(request_id, data)
+            .await
+            {
+                Ok(data) => Response::ok(request_id, data),
+                Err((code, msg)) => {
+                    // Handler error paths skip audit — write rejection audit
+                    // to sessions tree before returning.
+                    let entry = build_audit_entry(
+                        ctx, request_id, "mem_get", &input.key,
+                        false, Some(code.clone()),
+                    );
+                    write_session_audit(g.store(), &entry).await;
+                    Response::err(request_id, code, msg)
+                }
+            }
         }
         Command::MemBootstrap(input) => {
             let g = graph.read().await;
-            let injection = handlers::handle_mem_bootstrap(
+            match handlers::handle_mem_bootstrap(
                 g.store(), &g, graph, ctx, request_id, input,
             )
-            .await;
-            Response::ok(request_id, serde_json::Value::String(injection))
+            .await
+            {
+                Ok(injection) => {
+                    Response::ok(request_id, serde_json::Value::String(injection))
+                }
+                Err((code, msg)) => {
+                    // Handler already wrote rejection audit to sessions tree.
+                    Response::err(request_id, code, msg)
+                }
+            }
         }
         _ => unreachable!("is_side_effecting_read guard"),
     }
@@ -258,15 +291,16 @@ async fn dispatch_knowledge_mutation(
         Err((code, message)) => {
             // Write rejected-mutation audit (still atomic — rejection means
             // no mutation record, so audit is a standalone knowledge write).
-            let (audit_key, audit_bytes) = handlers::make_audit(
+            if let Some((audit_key, audit_bytes)) = handlers::make_audit(
                 ctx,
                 request_id,
                 req.cmd.kind(),
                 req.cmd.target_key(),
                 false,
                 Some(code.clone()),
-            );
-            let _ = store.put_raw(&audit_key, &audit_bytes).await;
+            ) {
+                let _ = store.put_raw(&audit_key, &audit_bytes).await;
+            }
             Response::err(request_id, code, message)
         }
     }
@@ -290,16 +324,52 @@ async fn dispatch_file_edit_hook(
     let request_id = req.id;
 
     // Substep 1: consultation hit (sessions tree, best-effort).
+    //
+    // Same staged transactional model as ConsultationHit: daily agg +
+    // consultation receipt + audit committed atomically in one
+    // sessions-tree transaction. Cross-tree access_count bump is a
+    // separate best-effort write. The whole substep is non-blocking —
+    // staging or transaction failures are logged, never propagated.
     {
         let g = graph.read().await;
         let store = g.store();
         let file_key = format!("file:{}", input.path);
-        let _ = sess::log_hit(store, &file_key).await;
-        // Session-side audit for the consultation substep.
-        let entry = build_audit_entry(
+
+        // Stage session-tree writes.
+        let agg_key = sess::today_key("analytics:hit_");
+        let staged_agg = sess::upsert_daily_agg_staged(store, &agg_key, &file_key).await;
+        let staged_receipt = sess::consultation_receipt_staged(&file_key);
+        let audit_entry = build_audit_entry(
             ctx, request_id, "file_edit_hook:consultation", &file_key, true, None,
         );
-        write_session_audit(store, &entry).await;
+        let audit_key = audit_nanos_key("audit:session:");
+        let audit_bytes = serialize_audit(&audit_entry);
+
+        // Atomic commit: agg + receipt + audit (all sessions tree).
+        let mut writes: Vec<(&str, &[u8])> = Vec::new();
+        if let Ok(ref agg) = staged_agg {
+            writes.push((&agg.0, &agg.1));
+        }
+        if let Ok(ref receipt) = staged_receipt {
+            writes.push((&receipt.0, &receipt.1));
+        }
+        if let Some(ref ab) = audit_bytes {
+            writes.push((&audit_key, ab));
+        }
+
+        if let Err(e) = store.transact_sessions_raw(&writes).await {
+            tracing::warn!(
+                request_id = %request_id,
+                "file_edit_hook: consultation substep sessions transaction failed: {e}"
+            );
+        }
+
+        // Cross-tree best-effort: access_count bump on knowledge record.
+        if let Ok(Some(mut record)) = store.get(&file_key).await {
+            record.access_count += 1;
+            record.last_accessed = now_secs();
+            let _ = store.put(&file_key, &record).await;
+        }
     }
 
     // Substep 2: reparse (knowledge tree, native handler with audit).
@@ -315,7 +385,7 @@ async fn dispatch_file_edit_hook(
         .await
         {
             Ok(_) => {}
-            Err((code, msg)) => {
+            Err((_code, msg)) => {
                 tracing::warn!("file_edit_hook: reparse substep failed: {msg}");
                 // Non-fatal — post-edit hook must not block the agent.
             }
@@ -369,12 +439,15 @@ async fn dispatch_session_side(
             let audit_entry = build_audit_entry(
                 ctx, request_id, &command_kind, &target_key, true, None,
             );
+            // Audit is required — fail closed if serialization fails.
             let audit_bytes = match serialize_audit(&audit_entry) {
                 Some(b) => b,
                 None => {
-                    // Audit serialization failed — still commit the mutation.
-                    let _ = store.put_raw(&staged_agg.0, &staged_agg.1).await;
-                    return Response::ok(request_id, serde_json::Value::Null);
+                    return Response::err(
+                        request_id,
+                        ErrorCode::Internal,
+                        "audit serialization failed".to_string(),
+                    );
                 }
             };
             let audit_key = audit_nanos_key("audit:session:");
@@ -385,6 +458,12 @@ async fn dispatch_session_side(
                 (&audit_key, &audit_bytes),
             ];
             if let Err(e) = store.transact_sessions_raw(&writes).await {
+                // Transaction failed — accepted audit inside was lost.
+                let entry = build_audit_entry(
+                    ctx, request_id, &command_kind, &target_key,
+                    false, Some(ErrorCode::StoreError),
+                );
+                write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
             }
             Response::ok(request_id, serde_json::Value::Null)
@@ -397,19 +476,39 @@ async fn dispatch_session_side(
             {
                 Ok(s) => s,
                 Err(e) => {
+                    let entry = build_audit_entry(
+                        ctx, request_id, &command_kind, &target_key,
+                        false, Some(ErrorCode::StoreError),
+                    );
+                    write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
             let staged_receipt = match sess::consultation_receipt_staged(&input.key) {
                 Ok(s) => s,
                 Err(e) => {
+                    let entry = build_audit_entry(
+                        ctx, request_id, &command_kind, &target_key,
+                        false, Some(ErrorCode::StoreError),
+                    );
+                    write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
             let audit_entry = build_audit_entry(
                 ctx, request_id, &command_kind, &target_key, true, None,
             );
-            let audit_bytes = serialize_audit(&audit_entry).unwrap_or_default();
+            // Audit is required — fail closed if serialization fails.
+            let audit_bytes = match serialize_audit(&audit_entry) {
+                Some(b) => b,
+                None => {
+                    return Response::err(
+                        request_id,
+                        ErrorCode::Internal,
+                        "audit serialization failed".to_string(),
+                    );
+                }
+            };
             let audit_key = audit_nanos_key("audit:session:");
 
             // One atomic transaction: agg + receipt + audit (all sessions tree).
@@ -419,6 +518,12 @@ async fn dispatch_session_side(
                 (&audit_key, &audit_bytes),
             ];
             if let Err(e) = store.transact_sessions_raw(&writes).await {
+                // Transaction failed — accepted audit inside was lost.
+                let entry = build_audit_entry(
+                    ctx, request_id, &command_kind, &target_key,
+                    false, Some(ErrorCode::StoreError),
+                );
+                write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
             }
 
@@ -446,13 +551,28 @@ async fn dispatch_session_side(
                     return Response::ok(request_id, serde_json::Value::Null);
                 }
                 Err(e) => {
+                    let entry = build_audit_entry(
+                        ctx, request_id, &command_kind, &target_key,
+                        false, Some(ErrorCode::StoreError),
+                    );
+                    write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
             let audit_entry = build_audit_entry(
                 ctx, request_id, &command_kind, &target_key, true, None,
             );
-            let audit_bytes = serialize_audit(&audit_entry).unwrap_or_default();
+            // Audit is required — fail closed if serialization fails.
+            let audit_bytes = match serialize_audit(&audit_entry) {
+                Some(b) => b,
+                None => {
+                    return Response::err(
+                        request_id,
+                        ErrorCode::Internal,
+                        "audit serialization failed".to_string(),
+                    );
+                }
+            };
             let audit_key = audit_nanos_key("audit:session:");
 
             let writes: Vec<(&str, &[u8])> = vec![
@@ -460,6 +580,11 @@ async fn dispatch_session_side(
                 (&audit_key, &audit_bytes),
             ];
             if let Err(e) = store.transact_sessions_raw(&writes).await {
+                let entry = build_audit_entry(
+                    ctx, request_id, &command_kind, &target_key,
+                    false, Some(ErrorCode::StoreError),
+                );
+                write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
             }
             Response::ok(request_id, serde_json::Value::Null)
@@ -508,11 +633,15 @@ async fn dispatch_via_v1(
 
     let (cmd, args) = command_to_v1(&req.cmd);
 
-    // Safety assertion: the v1 bridge must NEVER produce "put" or "delete".
-    debug_assert!(
-        cmd != "put" && cmd != "delete",
-        "v1 bridge must not produce raw put/delete commands: got {cmd}"
-    );
+    // Safety guard: the v1 bridge must NEVER produce "put" or "delete".
+    // Primary guard is unreachable!() in command_to_v1; this is defense-in-depth.
+    if cmd == "put" || cmd == "delete" {
+        return Response::err(
+            req.id,
+            ErrorCode::Internal,
+            format!("v1 bridge produced forbidden mutation command: {cmd}"),
+        );
+    }
 
     let v1_req = SocketRequest {
         cmd,
@@ -726,10 +855,18 @@ mod tests {
         }
     }
 
+    /// Stable session UUID shared by test_ctx and make_request so the
+    /// session fence passes. Tests that need a mismatch construct their
+    /// own Request/RequestContext.
+    fn test_session() -> Uuid {
+        // Deterministic but non-nil so it exercises the real comparison path.
+        Uuid::from_bytes([0xAA; 16])
+    }
+
     fn test_ctx(repo_root: &std::path::Path) -> RequestContext {
         RequestContext {
             peer: test_peer(),
-            daemon_session: Uuid::new_v4(),
+            daemon_session: test_session(),
             repo_root: repo_root.to_path_buf(),
         }
     }
@@ -738,7 +875,7 @@ mod tests {
         Request {
             v: PROTOCOL_VERSION,
             id: Uuid::new_v4(),
-            session: Uuid::new_v4(),
+            session: test_session(),
             cmd,
         }
     }
@@ -865,7 +1002,7 @@ mod tests {
             uid: 12345,
             pid: Some(67890),
         };
-        let daemon_session = Uuid::new_v4();
+        let daemon_session = test_session();
         let ctx = RequestContext {
             peer,
             daemon_session,
@@ -1013,6 +1150,47 @@ mod tests {
     // ── Native MemGet / MemBootstrap tests ──────────────────────────────
 
     #[tokio::test]
+    async fn native_mem_get_empty_key_returns_error_with_rejection_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::MemGet(MemGetInput {
+            key: "".into(),
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+
+        // Must return Response::Err, not Response::Ok with error payload.
+        match resp {
+            Response::Err { code, .. } => {
+                assert_eq!(code, ErrorCode::ValidationFailed);
+            }
+            Response::Ok { data, .. } => {
+                panic!("empty key must return Response::Err, got Ok with: {data}")
+            }
+        }
+
+        // Rejection audit must exist in sessions tree with accepted=false.
+        let g = graph.read().await;
+        let audit_keys = g.store().scan_keys("audit:session:").await.unwrap();
+        assert!(
+            !audit_keys.is_empty(),
+            "empty-key rejection must produce session audit"
+        );
+        let txn = g
+            .store()
+            .sessions_tree()
+            .begin_with_mode(surrealkv::Mode::ReadOnly)
+            .unwrap();
+        let raw = txn.get(audit_keys[0].as_bytes()).unwrap().unwrap();
+        let entry: AuditEntry = rmp_serde::from_slice(&raw).unwrap();
+        assert!(!entry.accepted, "rejection audit must have accepted=false");
+        assert_eq!(entry.error_code, Some(ErrorCode::ValidationFailed));
+    }
+
+    #[tokio::test]
     async fn native_mem_get_returns_null_for_missing_key() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
@@ -1142,5 +1320,111 @@ mod tests {
         // Nothing in knowledge tree.
         let k_audit = g.store().scan_keys("audit:knowledge:").await.unwrap();
         assert!(k_audit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_session_mismatch_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        // Construct a request with a different session UUID.
+        let req = Request {
+            v: PROTOCOL_VERSION,
+            id: Uuid::new_v4(),
+            session: Uuid::new_v4(), // does NOT match test_session()
+            cmd: Command::Ping,
+        };
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+
+        match resp {
+            Response::Err { code, message, .. } => {
+                assert_eq!(code, ErrorCode::SessionMismatch);
+                assert!(
+                    message.contains("re-read daemon metadata"),
+                    "error should guide the client to retry: {message}"
+                );
+            }
+            Response::Ok { .. } => panic!("expected SessionMismatch error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_matching_session_passes_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        // make_request uses test_session() which matches ctx.daemon_session.
+        let req = make_request(Command::Ping);
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+
+        match resp {
+            Response::Ok { data, .. } => {
+                assert_eq!(data, serde_json::json!("pong"));
+            }
+            Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_edit_hook_consultation_substep_writes_receipt_and_audit_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        // Create a dummy file so reparse doesn't need real filesystem.
+        let test_path = dir.path().join("test.rs");
+        std::fs::write(&test_path, "fn main() {}").unwrap();
+
+        let req = make_request(Command::FileEditHook(FileEditHookInput {
+            path: "test.rs".into(),
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+        assert!(matches!(resp, Response::Ok { .. }));
+
+        let g = graph.read().await;
+
+        // Session-side audit must exist (from consultation substep).
+        let audit_keys = g.store().scan_keys("audit:session:").await.unwrap();
+        assert!(
+            !audit_keys.is_empty(),
+            "FileEditHook consultation substep must produce session-side audit"
+        );
+
+        // Consultation receipt must exist (staged + committed atomically with audit).
+        let consulted = g
+            .store()
+            .get("session:consulted:file:test.rs")
+            .await
+            .unwrap();
+        assert!(
+            consulted.is_some(),
+            "FileEditHook consultation substep must write consultation receipt"
+        );
+
+        // Daily hit agg must exist (staged + committed atomically with audit).
+        let hit_keys = g.store().scan_keys("analytics:hit_").await.unwrap();
+        assert!(
+            !hit_keys.is_empty(),
+            "FileEditHook consultation substep must write daily hit agg"
+        );
+
+        // Verify the audit entry is for the consultation substep.
+        let txn = g
+            .store()
+            .sessions_tree()
+            .begin_with_mode(surrealkv::Mode::ReadOnly)
+            .unwrap();
+        let raw = txn.get(audit_keys[0].as_bytes()).unwrap().unwrap();
+        let entry: AuditEntry = rmp_serde::from_slice(&raw).unwrap();
+        assert_eq!(entry.command_kind, "file_edit_hook:consultation");
+        assert!(entry.accepted);
     }
 }

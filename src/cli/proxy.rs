@@ -10,11 +10,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use mati_core::store::db::HistoryEntry;
-use mati_core::store::repair::{DirtyMarker, DIRTY_MARKER_KEY};
-use mati_core::store::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore, Store,
-};
+use mati_core::store::{Record, Store};
 
 use super::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
 
@@ -132,11 +128,17 @@ impl StoreProxy {
                         key: key.to_string(),
                         rule: gotcha.as_ref().map(|g| g.rule.clone()).unwrap_or_default(),
                         reason: gotcha.as_ref().map(|g| g.reason.clone()).unwrap_or_default(),
-                        severity: p::Severity::Normal,
-                        affected_files: gotcha.map(|g| g.affected_files).unwrap_or_default(),
-                        ref_url: None,
+                        severity: gotcha
+                            .as_ref()
+                            .map(|g| g.severity.clone().into())
+                            .unwrap_or_default(),
+                        affected_files: gotcha
+                            .as_ref()
+                            .map(|g| g.affected_files.clone())
+                            .unwrap_or_default(),
+                        ref_url: gotcha.as_ref().and_then(|g| g.ref_url.clone()),
                         tags: record.tags.clone(),
-                        priority: p::Priority::Normal,
+                        priority: record.priority.clone().into(),
                     })
                 } else if key.starts_with("file:") {
                     let path = key.strip_prefix("file:").unwrap_or(key);
@@ -166,11 +168,14 @@ impl StoreProxy {
                         text: record.value.clone(),
                     })
                 } else {
-                    // Unknown prefix — create as dev_note.
-                    p::Command::DevNoteUpsert(p::DevNoteUpsertInput {
-                        key: None,
-                        text: record.value.clone(),
-                    })
+                    // Reject unsupported namespaces — never fabricate a
+                    // DevNote from an unrecognised key prefix. Callers that
+                    // write advisory caches (analytics:*) use `let _ =` and
+                    // will silently skip the write in socket mode.
+                    anyhow::bail!(
+                        "StoreProxy::put: unsupported namespace in socket mode: {key}\n\
+                         Supported: gotcha:*, file:*, decision:*, dev_note:*"
+                    );
                 };
 
                 match daemon_v2(root, cmd).await {
@@ -203,57 +208,16 @@ impl StoreProxy {
                 Ok(())
             }
             ProxyInner::Socket { .. } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                let existing_record = self.get(DIRTY_MARKER_KEY).await?;
-                let mut marker = existing_record
-                    .as_ref()
-                    .and_then(|r| r.payload_as::<DirtyMarker>())
-                    .unwrap_or_else(DirtyMarker::clean);
-                marker.dirty = true;
-                if marker.dirty_since == 0 {
-                    marker.dirty_since = now;
-                }
-                marker.cause = cause.to_string();
-                if !marker.affected_keys.iter().any(|k| k == gotcha_key) {
-                    marker.affected_keys.push(gotcha_key.to_string());
-                }
-
-                let mut record = existing_record.unwrap_or(Record {
-                    key: DIRTY_MARKER_KEY.to_string(),
-                    value: cause.to_string(),
-                    category: Category::Analytics,
-                    priority: Priority::Normal,
-                    tags: vec![],
-                    created_at: now,
-                    updated_at: now,
-                    ref_url: None,
-                    staleness: StalenessScore::fresh(),
-                    lifecycle: RecordLifecycle::Active,
-                    version: RecordVersion {
-                        device_id: uuid::Uuid::new_v4(),
-                        logical_clock: 1,
-                        wall_clock: now,
-                    },
-                    quality: QualityScore::layer0_default(),
-                    access_count: 0,
-                    last_accessed: 0,
-                    source: RecordSource::StaticAnalysis,
-                    confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
-                    gap_analysis_score: 0.0,
-                    payload: None,
-                });
-
-                record.value = cause.to_string();
-                record.updated_at = now;
-                record.version.logical_clock += 1;
-                record.version.wall_clock = now;
-                record.payload = serde_json::to_value(&marker).ok();
-
-                self.put(DIRTY_MARKER_KEY, &record).await
+                // In socket mode the daemon manages gotcha consistency
+                // (write + file-link sync + graph edges) atomically. Client-side
+                // dirty markers are unnecessary — the daemon's own repair path
+                // handles any internal failures. The analytics:* key used by
+                // DIRTY_MARKER_KEY is not a supported socket-mode namespace.
+                tracing::debug!(
+                    "mark_dirty({gotcha_key}): skipped in socket mode — \
+                     daemon manages its own consistency"
+                );
+                Ok(())
             }
         }
     }
@@ -370,7 +334,7 @@ impl StoreProxy {
                     .unwrap_or(mati_core::store::GotchaRecord {
                         rule: record.value.clone(),
                         reason: String::new(),
-                        severity: Priority::Normal,
+                        severity: mati_core::store::Priority::Normal,
                         affected_files: new_files.to_vec(),
                         ref_url: None,
                         discovered_session: 0,
@@ -380,11 +344,11 @@ impl StoreProxy {
                     key: record.key.clone(),
                     rule: gotcha.rule,
                     reason: gotcha.reason,
-                    severity: p::Severity::Normal,
+                    severity: gotcha.severity.into(),
                     affected_files: new_files.to_vec(),
                     ref_url: gotcha.ref_url,
                     tags: record.tags.clone(),
-                    priority: p::Priority::Normal,
+                    priority: record.priority.clone().into(),
                 });
                 match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {
@@ -570,6 +534,7 @@ fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
 mod tests {
     use super::*;
 
+    use mati_core::store::repair::{DirtyMarker, DIRTY_MARKER_KEY};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -620,5 +585,50 @@ mod tests {
         assert!(payload.dirty);
         assert_eq!(payload.cause, "link sync failed");
         assert_eq!(payload.affected_keys, vec!["gotcha:test".to_string()]);
+    }
+
+    /// Socket-mode `put` must reject unsupported namespaces with a clear error
+    /// instead of silently fabricating a DevNoteUpsert.
+    #[tokio::test]
+    async fn socket_put_rejects_unsupported_namespace() {
+        let dir = TempDir::new().unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Socket {
+                root: dir.path().to_path_buf(),
+            },
+        };
+
+        let record = Record::layer0_file_stub("dummy", uuid::Uuid::new_v4(), 1, 0);
+        for ns in &[
+            "analytics:test",
+            "session:123",
+            "dep:rust:serde",
+            "stage:current",
+            "graph:edge:a:b:c",
+        ] {
+            let err = proxy.put(ns, &record).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unsupported namespace"),
+                "expected 'unsupported namespace' error for key '{ns}', got: {msg}"
+            );
+        }
+    }
+
+    /// Socket-mode `mark_dirty` is a no-op (daemon manages its own consistency).
+    #[tokio::test]
+    async fn socket_mark_dirty_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Socket {
+                root: dir.path().to_path_buf(),
+            },
+        };
+
+        // Should succeed without trying to write analytics:* through put().
+        proxy
+            .mark_dirty("gotcha:test", "link sync failed")
+            .await
+            .unwrap();
     }
 }
