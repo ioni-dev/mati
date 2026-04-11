@@ -75,10 +75,7 @@ pub struct Request {
 pub enum Response {
     /// Command succeeded. `data` contains the command-specific result.
     #[serde(rename = "ok")]
-    Ok {
-        id: Uuid,
-        data: serde_json::Value,
-    },
+    Ok { id: Uuid, data: serde_json::Value },
     /// Command failed. `code` is a structured error code for programmatic
     /// handling; `message` is a human-readable description.
     #[serde(rename = "err")]
@@ -153,7 +150,6 @@ pub enum ErrorCode {
 #[serde(tag = "type")]
 pub enum Command {
     // ── A. Pure reads ───────────────────────────────────────────────────
-
     /// Health check. No arguments.
     #[serde(rename = "ping")]
     Ping,
@@ -191,7 +187,6 @@ pub enum Command {
     MemQuery(MemQueryInput),
 
     // ── B. Reads with audited side effects ──────────────────────────────
-
     /// Single record lookup with consultation receipt side effect.
     #[serde(rename = "mem_get")]
     MemGet(MemGetInput),
@@ -201,7 +196,6 @@ pub enum Command {
     MemBootstrap(MemBootstrapInput),
 
     // ── C. Semantic mutations ───────────────────────────────────────────
-
     /// Create or update a gotcha record. Always sets confirmed=false.
     #[serde(rename = "gotcha_upsert")]
     GotchaUpsert(GotchaDraftInput),
@@ -728,7 +722,9 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "include_recent": args.get("include_recent").and_then(|v| v.as_bool()).unwrap_or(false),
         }),
         "scan_prefix" => json!({"type": "scan_prefix", "prefix": args["prefix"]}),
-        "history" => json!({"type": "history", "key": args["key"], "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50)}),
+        "history" => {
+            json!({"type": "history", "key": args["key"], "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50)})
+        }
         "history_since" => json!({
             "type": "history_since",
             "key": args["key"],
@@ -929,7 +925,10 @@ mod tests {
             "cmd": { "type": "get", "key": "file:foo", "smuggled": true }
         });
         let result = serde_json::from_value::<Request>(json);
-        assert!(result.is_err(), "unknown field in command args must be rejected");
+        assert!(
+            result.is_err(),
+            "unknown field in command args must be rejected"
+        );
     }
 
     #[test]
@@ -1047,7 +1046,10 @@ mod tests {
             }
         });
         let result = serde_json::from_value::<Request>(json);
-        assert!(result.is_err(), "invalid severity enum value must be rejected");
+        assert!(
+            result.is_err(),
+            "invalid severity enum value must be rejected"
+        );
     }
 
     #[test]
@@ -1199,9 +1201,7 @@ mod tests {
             ),
             (
                 "scan_prefix",
-                Command::ScanPrefix(ScanPrefixInput {
-                    prefix: "p".into(),
-                }),
+                Command::ScanPrefix(ScanPrefixInput { prefix: "p".into() }),
             ),
             (
                 "history",

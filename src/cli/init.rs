@@ -745,10 +745,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
                                 merged.push(k.clone());
                             }
                         }
-                        obj.insert(
-                            "gotcha_keys".to_string(),
-                            serde_json::json!(merged),
-                        );
+                        obj.insert("gotcha_keys".to_string(), serde_json::json!(merged));
                     }
                 }
                 patched.push((file_key, record));

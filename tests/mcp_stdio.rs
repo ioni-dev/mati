@@ -411,48 +411,93 @@ fn mcp_stdio_gotcha_lifecycle() {
 
     // Write a gotcha
     let write_text = call_tool(
-        &mut stdin, &rx, 10, "mem_set",
+        &mut stdin,
+        &rx,
+        10,
+        "mem_set",
         r#"{"action":"write","key":"gotcha:lifecycle-test","value":"Test rule because test reason","category":"Gotcha","payload":"{\"rule\":\"Test rule\",\"reason\":\"test reason\",\"severity\":\"normal\",\"affected_files\":[],\"confirmed\":false}","tags":["test"],"priority":"Normal"}"#,
     );
-    assert!(write_text.contains("\"ok\""), "write should succeed: {write_text}");
-    assert!(write_text.contains("lifecycle-test"), "write should echo key: {write_text}");
+    assert!(
+        write_text.contains("\"ok\""),
+        "write should succeed: {write_text}"
+    );
+    assert!(
+        write_text.contains("lifecycle-test"),
+        "write should echo key: {write_text}"
+    );
 
     // Read it back
     let get_text = call_tool(
-        &mut stdin, &rx, 11, "mem_get",
+        &mut stdin,
+        &rx,
+        11,
+        "mem_get",
         r#"{"key":"gotcha:lifecycle-test"}"#,
     );
-    assert!(get_text.contains("\"confirmed\": false"), "should be unconfirmed: {get_text}");
-    assert!(get_text.contains("\"claude_enrich\"") || get_text.contains("claude_enrich"), "source should be claude_enrich: {get_text}");
+    assert!(
+        get_text.contains("\"confirmed\": false"),
+        "should be unconfirmed: {get_text}"
+    );
+    assert!(
+        get_text.contains("\"claude_enrich\"") || get_text.contains("claude_enrich"),
+        "source should be claude_enrich: {get_text}"
+    );
 
     // Confirm it
     let confirm_text = call_tool(
-        &mut stdin, &rx, 12, "mem_set",
+        &mut stdin,
+        &rx,
+        12,
+        "mem_set",
         r#"{"action":"confirm","key":"gotcha:lifecycle-test"}"#,
     );
-    assert!(confirm_text.contains("\"confirmed\": true") || confirm_text.contains("\"confirmed\":true"), "confirm should return confirmed=true: {confirm_text}");
+    assert!(
+        confirm_text.contains("\"confirmed\": true") || confirm_text.contains("\"confirmed\":true"),
+        "confirm should return confirmed=true: {confirm_text}"
+    );
 
     // Read back — verify confirmed + DeveloperManual
     let confirmed_text = call_tool(
-        &mut stdin, &rx, 13, "mem_get",
+        &mut stdin,
+        &rx,
+        13,
+        "mem_get",
         r#"{"key":"gotcha:lifecycle-test"}"#,
     );
-    assert!(confirmed_text.contains("\"confirmed\": true"), "should be confirmed: {confirmed_text}");
-    assert!(confirmed_text.contains("developer_manual"), "source should be developer_manual: {confirmed_text}");
+    assert!(
+        confirmed_text.contains("\"confirmed\": true"),
+        "should be confirmed: {confirmed_text}"
+    );
+    assert!(
+        confirmed_text.contains("developer_manual"),
+        "source should be developer_manual: {confirmed_text}"
+    );
 
     // Delete (tombstone)
     let delete_text = call_tool(
-        &mut stdin, &rx, 14, "mem_set",
+        &mut stdin,
+        &rx,
+        14,
+        "mem_set",
         r#"{"action":"delete","key":"gotcha:lifecycle-test"}"#,
     );
-    assert!(delete_text.contains("\"tombstoned\""), "delete should return tombstoned: {delete_text}");
+    assert!(
+        delete_text.contains("\"tombstoned\""),
+        "delete should return tombstoned: {delete_text}"
+    );
 
     // Read back — should be null
     let tombstoned_text = call_tool(
-        &mut stdin, &rx, 15, "mem_get",
+        &mut stdin,
+        &rx,
+        15,
+        "mem_get",
         r#"{"key":"gotcha:lifecycle-test"}"#,
     );
-    assert!(tombstoned_text == "null" || tombstoned_text.contains("null"), "tombstoned record should return null: {tombstoned_text}");
+    assert!(
+        tombstoned_text == "null" || tombstoned_text.contains("null"),
+        "tombstoned record should return null: {tombstoned_text}"
+    );
 }
 
 // ── Test: validation gates ───────────────────────────────────────────────────
@@ -463,45 +508,81 @@ fn mcp_stdio_validation_gates() {
 
     // Invalid key prefix
     let text = call_tool(
-        &mut stdin, &rx, 20, "mem_set",
+        &mut stdin,
+        &rx,
+        20,
+        "mem_set",
         r#"{"action":"write","key":"session:invalid","value":"test","category":"File","payload":"{}"}"#,
     );
-    assert!(text.contains("must start with"), "should reject invalid prefix: {text}");
+    assert!(
+        text.contains("must start with"),
+        "should reject invalid prefix: {text}"
+    );
 
     // Key-category mismatch
     let text = call_tool(
-        &mut stdin, &rx, 21, "mem_set",
+        &mut stdin,
+        &rx,
+        21,
+        "mem_set",
         r#"{"action":"write","key":"gotcha:mismatch","value":"test","category":"File","payload":"{\"purpose\":\"wrong\"}"}"#,
     );
-    assert!(text.contains("requires category"), "should reject mismatch: {text}");
+    assert!(
+        text.contains("requires category"),
+        "should reject mismatch: {text}"
+    );
 
     // Missing gotcha fields
     let text = call_tool(
-        &mut stdin, &rx, 22, "mem_set",
+        &mut stdin,
+        &rx,
+        22,
+        "mem_set",
         r#"{"action":"write","key":"gotcha:no-fields","value":"test","category":"Gotcha","payload":"{\"severity\":\"normal\"}"}"#,
     );
-    assert!(text.contains("rule") && text.contains("reason"), "should reject missing fields: {text}");
+    assert!(
+        text.contains("rule") && text.contains("reason"),
+        "should reject missing fields: {text}"
+    );
 
     // Unknown action
     let text = call_tool(
-        &mut stdin, &rx, 23, "mem_set",
+        &mut stdin,
+        &rx,
+        23,
+        "mem_set",
         r#"{"action":"destroy","key":"gotcha:test"}"#,
     );
-    assert!(text.contains("unknown action"), "should reject unknown action: {text}");
+    assert!(
+        text.contains("unknown action"),
+        "should reject unknown action: {text}"
+    );
 
     // Delete non-gotcha
     let text = call_tool(
-        &mut stdin, &rx, 24, "mem_set",
+        &mut stdin,
+        &rx,
+        24,
+        "mem_set",
         r#"{"action":"delete","key":"file:test.rs"}"#,
     );
-    assert!(text.contains("only applies to gotcha"), "should reject non-gotcha delete: {text}");
+    assert!(
+        text.contains("only applies to gotcha"),
+        "should reject non-gotcha delete: {text}"
+    );
 
     // Confirm non-existent
     let text = call_tool(
-        &mut stdin, &rx, 25, "mem_set",
+        &mut stdin,
+        &rx,
+        25,
+        "mem_set",
         r#"{"action":"confirm","key":"gotcha:does-not-exist"}"#,
     );
-    assert!(text.contains("not found"), "should reject confirm on missing key: {text}");
+    assert!(
+        text.contains("not found"),
+        "should reject confirm on missing key: {text}"
+    );
 }
 
 // ── Test: search modes (text with relevance, tag, graph, semantic gate) ──────
@@ -512,60 +593,108 @@ fn mcp_stdio_search_modes() {
 
     // Write two records with different tags
     call_tool(
-        &mut stdin, &rx, 30, "mem_set",
+        &mut stdin,
+        &rx,
+        30,
+        "mem_set",
         r#"{"action":"write","key":"gotcha:search-a","value":"Alpha rule because alpha reason","category":"Gotcha","payload":"{\"rule\":\"Alpha rule\",\"reason\":\"alpha reason\"}","tags":["alpha","shared"],"priority":"Normal"}"#,
     );
     call_tool(
-        &mut stdin, &rx, 31, "mem_set",
+        &mut stdin,
+        &rx,
+        31,
+        "mem_set",
         r#"{"action":"write","key":"gotcha:search-b","value":"Beta rule because beta reason","category":"Gotcha","payload":"{\"rule\":\"Beta rule\",\"reason\":\"beta reason\"}","tags":["beta","shared"],"priority":"Normal"}"#,
     );
 
     // Text search — should have relevance scores
     let text = call_tool(
-        &mut stdin, &rx, 32, "mem_query",
+        &mut stdin,
+        &rx,
+        32,
+        "mem_query",
         r#"{"query":"alpha","mode":"text","limit":5}"#,
     );
-    assert!(text.contains("relevance"), "text search should include relevance: {text}");
-    assert!(text.contains("search-a"), "text search should find alpha: {text}");
+    assert!(
+        text.contains("relevance"),
+        "text search should include relevance: {text}"
+    );
+    assert!(
+        text.contains("search-a"),
+        "text search should find alpha: {text}"
+    );
 
     // Tag search
     let text = call_tool(
-        &mut stdin, &rx, 33, "mem_query",
+        &mut stdin,
+        &rx,
+        33,
+        "mem_query",
         r#"{"query":"shared","mode":"tag","limit":5}"#,
     );
-    assert!(text.contains("search-a") && text.contains("search-b"), "tag search should find both: {text}");
+    assert!(
+        text.contains("search-a") && text.contains("search-b"),
+        "tag search should find both: {text}"
+    );
 
     // Tag search — no match
     let text = call_tool(
-        &mut stdin, &rx, 34, "mem_query",
+        &mut stdin,
+        &rx,
+        34,
+        "mem_query",
         r#"{"query":"zzz-nonexistent","mode":"tag","limit":5}"#,
     );
     assert!(text == "[]", "no-match tag search should return []: {text}");
 
     // Semantic mode gate
     let text = call_tool(
-        &mut stdin, &rx, 35, "mem_query",
+        &mut stdin,
+        &rx,
+        35,
+        "mem_query",
         r#"{"query":"test","mode":"semantic","limit":5}"#,
     );
-    assert!(text.contains("semantic") && text.contains("not enabled"), "semantic should return feature gate error: {text}");
+    assert!(
+        text.contains("semantic") && text.contains("not enabled"),
+        "semantic should return feature gate error: {text}"
+    );
 
     // Empty query
     let text = call_tool(
-        &mut stdin, &rx, 36, "mem_query",
+        &mut stdin,
+        &rx,
+        36,
+        "mem_query",
         r#"{"query":"","mode":"text","limit":5}"#,
     );
     assert!(text == "[]", "empty query should return []: {text}");
 
     // Limit 0
     let text = call_tool(
-        &mut stdin, &rx, 37, "mem_query",
+        &mut stdin,
+        &rx,
+        37,
+        "mem_query",
         r#"{"query":"rule","mode":"text","limit":0}"#,
     );
     assert!(text == "[]", "limit 0 should return []: {text}");
 
     // Cleanup
-    call_tool(&mut stdin, &rx, 38, "mem_set", r#"{"action":"delete","key":"gotcha:search-a"}"#);
-    call_tool(&mut stdin, &rx, 39, "mem_set", r#"{"action":"delete","key":"gotcha:search-b"}"#);
+    call_tool(
+        &mut stdin,
+        &rx,
+        38,
+        "mem_set",
+        r#"{"action":"delete","key":"gotcha:search-a"}"#,
+    );
+    call_tool(
+        &mut stdin,
+        &rx,
+        39,
+        "mem_set",
+        r#"{"action":"delete","key":"gotcha:search-b"}"#,
+    );
 }
 
 // ── Test: write-then-search consistency ──────────────────────────────────────
@@ -576,23 +705,47 @@ fn mcp_stdio_write_then_search() {
 
     // Write with a unique sentinel
     call_tool(
-        &mut stdin, &rx, 40, "mem_set",
+        &mut stdin,
+        &rx,
+        40,
+        "mem_set",
         r#"{"action":"write","key":"gotcha:sentinel-zqx99","value":"zqx99_unique_sentinel because consistency test","category":"Gotcha","payload":"{\"rule\":\"zqx99_unique_sentinel\",\"reason\":\"consistency test\"}","tags":["sentinel"],"priority":"Normal"}"#,
     );
 
     // Immediately search — should find it
     let text = call_tool(
-        &mut stdin, &rx, 41, "mem_query",
+        &mut stdin,
+        &rx,
+        41,
+        "mem_query",
         r#"{"query":"zqx99_unique_sentinel","mode":"text","limit":5}"#,
     );
-    assert!(text.contains("sentinel-zqx99"), "write-then-search should find the record immediately: {text}");
-    assert!(text.contains("relevance"), "should have relevance score: {text}");
+    assert!(
+        text.contains("sentinel-zqx99"),
+        "write-then-search should find the record immediately: {text}"
+    );
+    assert!(
+        text.contains("relevance"),
+        "should have relevance score: {text}"
+    );
 
     // Delete + verify excluded from search
-    call_tool(&mut stdin, &rx, 42, "mem_set", r#"{"action":"delete","key":"gotcha:sentinel-zqx99"}"#);
+    call_tool(
+        &mut stdin,
+        &rx,
+        42,
+        "mem_set",
+        r#"{"action":"delete","key":"gotcha:sentinel-zqx99"}"#,
+    );
     let text = call_tool(
-        &mut stdin, &rx, 43, "mem_query",
+        &mut stdin,
+        &rx,
+        43,
+        "mem_query",
         r#"{"query":"zqx99_unique_sentinel","mode":"text","limit":5}"#,
     );
-    assert!(!text.contains("sentinel-zqx99"), "tombstoned record should not appear in search: {text}");
+    assert!(
+        !text.contains("sentinel-zqx99"),
+        "tombstoned record should not appear in search: {text}"
+    );
 }

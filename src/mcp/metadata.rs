@@ -102,8 +102,7 @@ pub fn socket_path(root: &Path) -> std::path::PathBuf {
 pub fn ensure_runtime_dir(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("cannot create runtime dir at {}", root.display()))?;
-    set_mode(root, 0o700)
-        .with_context(|| format!("cannot set mode 0700 on {}", root.display()))?;
+    set_mode(root, 0o700).with_context(|| format!("cannot set mode 0700 on {}", root.display()))?;
     Ok(())
 }
 
@@ -141,8 +140,7 @@ pub fn publish_metadata(root: &Path, metadata: &DaemonMetadata) -> Result<()> {
     let tmp_path = root.join(METADATA_TMP_FILENAME);
     let final_path = metadata_path(root);
 
-    let json = serde_json::to_string(metadata)
-        .context("failed to serialize daemon metadata")?;
+    let json = serde_json::to_string(metadata).context("failed to serialize daemon metadata")?;
 
     std::fs::write(&tmp_path, json.as_bytes())
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
@@ -150,8 +148,13 @@ pub fn publish_metadata(root: &Path, metadata: &DaemonMetadata) -> Result<()> {
     // Set permissions BEFORE rename so the file is never visible with wrong mode.
     set_mode(&tmp_path, 0o600)?;
 
-    std::fs::rename(&tmp_path, &final_path)
-        .with_context(|| format!("failed to rename {} → {}", tmp_path.display(), final_path.display()))?;
+    std::fs::rename(&tmp_path, &final_path).with_context(|| {
+        format!(
+            "failed to rename {} → {}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
 
     Ok(())
 }
@@ -186,7 +189,10 @@ pub fn read_metadata(root: &Path) -> Option<DaemonMetadata> {
     // Legacy v1 JSON: {"pid":N,"owner":"daemon"|"mcp"} — no session field.
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
         let pid = val.get("pid").and_then(|v| v.as_u64())? as u32;
-        let owner_str = val.get("owner").and_then(|v| v.as_str()).unwrap_or("daemon");
+        let owner_str = val
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .unwrap_or("daemon");
         let owner = match owner_str {
             "mcp" => DaemonOwner::Mcp,
             _ => DaemonOwner::Daemon,
@@ -262,10 +268,7 @@ pub struct PeerContext {
 ///
 /// This enforces the Unix-socket UID boundary: only processes running as
 /// the same user can talk to the daemon.
-pub fn check_peer_cred(
-    stream: &tokio::net::UnixStream,
-    daemon_euid: u32,
-) -> Option<PeerContext> {
+pub fn check_peer_cred(stream: &tokio::net::UnixStream, daemon_euid: u32) -> Option<PeerContext> {
     match stream.peer_cred() {
         Ok(cred) => {
             let peer_uid = cred.uid();
@@ -419,11 +422,7 @@ mod tests {
     #[test]
     fn read_metadata_legacy_v1_json() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("mati.pid"),
-            r#"{"pid":5678,"owner":"mcp"}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("mati.pid"), r#"{"pid":5678,"owner":"mcp"}"#).unwrap();
 
         let read = read_metadata(dir.path()).unwrap();
         assert_eq!(read.pid, 5678);
@@ -616,7 +615,10 @@ mod tests {
 
         let daemon_euid = current_euid();
         let peer = check_peer_cred(&server_stream, daemon_euid);
-        assert!(peer.is_some(), "same-user connection should pass peer check");
+        assert!(
+            peer.is_some(),
+            "same-user connection should pass peer check"
+        );
 
         let ctx = peer.unwrap();
         assert_eq!(ctx.uid, daemon_euid);
@@ -643,15 +645,15 @@ mod tests {
         // Use a fake daemon_euid that won't match the test process.
         let fake_euid = current_euid().wrapping_add(1);
         let peer = check_peer_cred(&server_stream, fake_euid);
-        assert!(
-            peer.is_none(),
-            "mismatched UID should be rejected"
-        );
+        assert!(peer.is_none(), "mismatched UID should be rejected");
     }
 
     #[test]
     fn peer_context_pid_is_optional() {
-        let ctx = PeerContext { uid: 501, pid: None };
+        let ctx = PeerContext {
+            uid: 501,
+            pid: None,
+        };
         assert!(ctx.pid.is_none());
 
         let ctx2 = PeerContext {

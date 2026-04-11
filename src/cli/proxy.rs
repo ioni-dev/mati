@@ -127,7 +127,10 @@ impl StoreProxy {
                     p::Command::GotchaUpsert(p::GotchaDraftInput {
                         key: key.to_string(),
                         rule: gotcha.as_ref().map(|g| g.rule.clone()).unwrap_or_default(),
-                        reason: gotcha.as_ref().map(|g| g.reason.clone()).unwrap_or_default(),
+                        reason: gotcha
+                            .as_ref()
+                            .map(|g| g.reason.clone())
+                            .unwrap_or_default(),
                         severity: gotcha
                             .as_ref()
                             .map(|g| g.severity.clone().into())
@@ -164,8 +167,16 @@ impl StoreProxy {
                     p::Command::DecisionUpsert(p::DecisionUpsertInput {
                         slug: slug.to_string(),
                         value: record.value.clone(),
-                        summary: payload.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        rationale: payload.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        summary: payload
+                            .get("summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        rationale: payload
+                            .get("rationale")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         tags: record.tags.clone(),
                         priority: p::Priority::Normal,
                     })
