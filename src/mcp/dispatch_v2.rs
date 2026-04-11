@@ -204,18 +204,18 @@ async fn dispatch_side_effecting_read(
     match &req.cmd {
         Command::MemGet(input) => {
             let g = graph.read().await;
-            match handlers::handle_mem_get(
-                g.store(), graph, ctx, request_id, input,
-            )
-            .await
-            {
+            match handlers::handle_mem_get(g.store(), graph, ctx, request_id, input).await {
                 Ok(data) => Response::ok(request_id, data),
                 Err((code, msg)) => {
                     // Handler error paths skip audit — write rejection audit
                     // to sessions tree before returning.
                     let entry = build_audit_entry(
-                        ctx, request_id, "mem_get", &input.key,
-                        false, Some(code.clone()),
+                        ctx,
+                        request_id,
+                        "mem_get",
+                        &input.key,
+                        false,
+                        Some(code.clone()),
                     );
                     write_session_audit(g.store(), &entry).await;
                     Response::err(request_id, code, msg)
@@ -224,14 +224,9 @@ async fn dispatch_side_effecting_read(
         }
         Command::MemBootstrap(input) => {
             let g = graph.read().await;
-            match handlers::handle_mem_bootstrap(
-                g.store(), &g, graph, ctx, request_id, input,
-            )
-            .await
+            match handlers::handle_mem_bootstrap(g.store(), &g, graph, ctx, request_id, input).await
             {
-                Ok(injection) => {
-                    Response::ok(request_id, serde_json::Value::String(injection))
-                }
+                Ok(injection) => Response::ok(request_id, serde_json::Value::String(injection)),
                 Err((code, msg)) => {
                     // Handler already wrote rejection audit to sessions tree.
                     Response::err(request_id, code, msg)
@@ -283,7 +278,9 @@ async fn dispatch_knowledge_mutation(
         Command::DevNoteUpsert(input) => {
             handlers::handle_dev_note_upsert(store, ctx, request_id, input).await
         }
-        _ => unreachable!("is_knowledge_mutation guard ensures only knowledge mutations reach here"),
+        _ => {
+            unreachable!("is_knowledge_mutation guard ensures only knowledge mutations reach here")
+        }
     };
 
     match result {
@@ -340,7 +337,12 @@ async fn dispatch_file_edit_hook(
         let staged_agg = sess::upsert_daily_agg_staged(store, &agg_key, &file_key).await;
         let staged_receipt = sess::consultation_receipt_staged(&file_key);
         let audit_entry = build_audit_entry(
-            ctx, request_id, "file_edit_hook:consultation", &file_key, true, None,
+            ctx,
+            request_id,
+            "file_edit_hook:consultation",
+            &file_key,
+            true,
+            None,
         );
         let audit_key = audit_nanos_key("audit:session:");
         let audit_bytes = serialize_audit(&audit_entry);
@@ -380,7 +382,11 @@ async fn dispatch_file_edit_hook(
             path: input.path.clone(),
         };
         match super::handlers::handle_file_reparse(
-            store, ctx, request_id, &reparse_input, &ctx.repo_root,
+            store,
+            ctx,
+            request_id,
+            &reparse_input,
+            &ctx.repo_root,
         )
         .await
         {
@@ -429,16 +435,19 @@ async fn dispatch_session_side(
                 Ok(s) => s,
                 Err(e) => {
                     let entry = build_audit_entry(
-                        ctx, request_id, &command_kind, &target_key, false,
+                        ctx,
+                        request_id,
+                        &command_kind,
+                        &target_key,
+                        false,
                         Some(ErrorCode::StoreError),
                     );
                     write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
-            let audit_entry = build_audit_entry(
-                ctx, request_id, &command_kind, &target_key, true, None,
-            );
+            let audit_entry =
+                build_audit_entry(ctx, request_id, &command_kind, &target_key, true, None);
             // Audit is required — fail closed if serialization fails.
             let audit_bytes = match serialize_audit(&audit_entry) {
                 Some(b) => b,
@@ -453,15 +462,17 @@ async fn dispatch_session_side(
             let audit_key = audit_nanos_key("audit:session:");
 
             // One atomic transaction: agg mutation + audit.
-            let writes: Vec<(&str, &[u8])> = vec![
-                (&staged_agg.0, &staged_agg.1),
-                (&audit_key, &audit_bytes),
-            ];
+            let writes: Vec<(&str, &[u8])> =
+                vec![(&staged_agg.0, &staged_agg.1), (&audit_key, &audit_bytes)];
             if let Err(e) = store.transact_sessions_raw(&writes).await {
                 // Transaction failed — accepted audit inside was lost.
                 let entry = build_audit_entry(
-                    ctx, request_id, &command_kind, &target_key,
-                    false, Some(ErrorCode::StoreError),
+                    ctx,
+                    request_id,
+                    &command_kind,
+                    &target_key,
+                    false,
+                    Some(ErrorCode::StoreError),
                 );
                 write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
@@ -477,8 +488,12 @@ async fn dispatch_session_side(
                 Ok(s) => s,
                 Err(e) => {
                     let entry = build_audit_entry(
-                        ctx, request_id, &command_kind, &target_key,
-                        false, Some(ErrorCode::StoreError),
+                        ctx,
+                        request_id,
+                        &command_kind,
+                        &target_key,
+                        false,
+                        Some(ErrorCode::StoreError),
                     );
                     write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
@@ -488,16 +503,19 @@ async fn dispatch_session_side(
                 Ok(s) => s,
                 Err(e) => {
                     let entry = build_audit_entry(
-                        ctx, request_id, &command_kind, &target_key,
-                        false, Some(ErrorCode::StoreError),
+                        ctx,
+                        request_id,
+                        &command_kind,
+                        &target_key,
+                        false,
+                        Some(ErrorCode::StoreError),
                     );
                     write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
-            let audit_entry = build_audit_entry(
-                ctx, request_id, &command_kind, &target_key, true, None,
-            );
+            let audit_entry =
+                build_audit_entry(ctx, request_id, &command_kind, &target_key, true, None);
             // Audit is required — fail closed if serialization fails.
             let audit_bytes = match serialize_audit(&audit_entry) {
                 Some(b) => b,
@@ -520,8 +538,12 @@ async fn dispatch_session_side(
             if let Err(e) = store.transact_sessions_raw(&writes).await {
                 // Transaction failed — accepted audit inside was lost.
                 let entry = build_audit_entry(
-                    ctx, request_id, &command_kind, &target_key,
-                    false, Some(ErrorCode::StoreError),
+                    ctx,
+                    request_id,
+                    &command_kind,
+                    &target_key,
+                    false,
+                    Some(ErrorCode::StoreError),
                 );
                 write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
@@ -544,24 +566,26 @@ async fn dispatch_session_side(
                 Ok(Some(s)) => s,
                 Ok(None) => {
                     // No consulted keys — nothing to flush. Still audit.
-                    let audit_entry = build_audit_entry(
-                        ctx, request_id, &command_kind, &target_key, true, None,
-                    );
+                    let audit_entry =
+                        build_audit_entry(ctx, request_id, &command_kind, &target_key, true, None);
                     write_session_audit(store, &audit_entry).await;
                     return Response::ok(request_id, serde_json::Value::Null);
                 }
                 Err(e) => {
                     let entry = build_audit_entry(
-                        ctx, request_id, &command_kind, &target_key,
-                        false, Some(ErrorCode::StoreError),
+                        ctx,
+                        request_id,
+                        &command_kind,
+                        &target_key,
+                        false,
+                        Some(ErrorCode::StoreError),
                     );
                     write_session_audit(store, &entry).await;
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
-            let audit_entry = build_audit_entry(
-                ctx, request_id, &command_kind, &target_key, true, None,
-            );
+            let audit_entry =
+                build_audit_entry(ctx, request_id, &command_kind, &target_key, true, None);
             // Audit is required — fail closed if serialization fails.
             let audit_bytes = match serialize_audit(&audit_entry) {
                 Some(b) => b,
@@ -581,8 +605,12 @@ async fn dispatch_session_side(
             ];
             if let Err(e) = store.transact_sessions_raw(&writes).await {
                 let entry = build_audit_entry(
-                    ctx, request_id, &command_kind, &target_key,
-                    false, Some(ErrorCode::StoreError),
+                    ctx,
+                    request_id,
+                    &command_kind,
+                    &target_key,
+                    false,
+                    Some(ErrorCode::StoreError),
                 );
                 write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
@@ -603,7 +631,12 @@ async fn dispatch_session_side(
             // Harvest itself is multi-step with internal commits — cannot be
             // made atomic end-to-end (cross-tree). Audit records the outcome.
             let entry = build_audit_entry(
-                ctx, request_id, &command_kind, &target_key, accepted, error_code,
+                ctx,
+                request_id,
+                &command_kind,
+                &target_key,
+                accepted,
+                error_code,
             );
             write_session_audit(store, &entry).await;
 
@@ -653,14 +686,9 @@ async fn dispatch_via_v1(
 
     // Convert v1 SocketResponse to v2 Response.
     if v1_resp.ok {
-        Response::ok(
-            req.id,
-            v1_resp.data.unwrap_or(serde_json::Value::Null),
-        )
+        Response::ok(req.id, v1_resp.data.unwrap_or(serde_json::Value::Null))
     } else {
-        let message = v1_resp
-            .error
-            .unwrap_or_else(|| "unknown error".to_string());
+        let message = v1_resp.error.unwrap_or_else(|| "unknown error".to_string());
         let code = classify_v1_error(&message);
         Response::err(req.id, code, message)
     }
@@ -1051,8 +1079,15 @@ mod tests {
                 include_recent: false,
             }),
             Command::ScanPrefix(ScanPrefixInput { prefix: "p".into() }),
-            Command::History(HistoryInput { key: "k".into(), limit: 10 }),
-            Command::HistorySince(HistorySinceInput { key: "k".into(), since_ts: 0, limit: 10 }),
+            Command::History(HistoryInput {
+                key: "k".into(),
+                limit: 10,
+            }),
+            Command::HistorySince(HistorySinceInput {
+                key: "k".into(),
+                since_ts: 0,
+                limit: 10,
+            }),
             Command::SessionCheckConsulted(SessionCheckConsultedInput { key: "k".into() }),
             Command::SessionCheckConsultedRecent(SessionCheckConsultedRecentInput {
                 key: "k".into(),
@@ -1065,13 +1100,31 @@ mod tests {
             }),
         ];
 
-        assert_eq!(pure_read_commands.len(), 9, "must cover all 9 pure read commands");
+        assert_eq!(
+            pure_read_commands.len(),
+            9,
+            "must cover all 9 pure read commands"
+        );
         for cmd in pure_read_commands {
             assert!(!cmd.is_mutation(), "{} must not be a mutation", cmd.kind());
-            assert!(!is_side_effecting_read(&cmd), "{} must not be a side-effecting read", cmd.kind());
+            assert!(
+                !is_side_effecting_read(&cmd),
+                "{} must not be a side-effecting read",
+                cmd.kind()
+            );
             let (v1_cmd, _) = command_to_v1(&cmd);
-            assert_ne!(v1_cmd, "put", "v1 bridge must never produce 'put': got it for {}", cmd.kind());
-            assert_ne!(v1_cmd, "delete", "v1 bridge must never produce 'delete': got it for {}", cmd.kind());
+            assert_ne!(
+                v1_cmd,
+                "put",
+                "v1 bridge must never produce 'put': got it for {}",
+                cmd.kind()
+            );
+            assert_ne!(
+                v1_cmd,
+                "delete",
+                "v1 bridge must never produce 'delete': got it for {}",
+                cmd.kind()
+            );
         }
     }
 
@@ -1082,37 +1135,65 @@ mod tests {
         // through the v1 bridge.
         let all_mutations: Vec<Command> = vec![
             Command::GotchaUpsert(GotchaDraftInput {
-                key: "gotcha:t".into(), rule: "r".into(), reason: "r".into(),
-                severity: Severity::Normal, affected_files: vec![],
-                ref_url: None, tags: vec![], priority: Priority::Normal,
+                key: "gotcha:t".into(),
+                rule: "r".into(),
+                reason: "r".into(),
+                severity: Severity::Normal,
+                affected_files: vec![],
+                ref_url: None,
+                tags: vec![],
+                priority: Priority::Normal,
                 source: None,
             }),
-            Command::GotchaConfirm(GotchaConfirmInput { key: "gotcha:t".into() }),
-            Command::GotchaTombstone(GotchaTombstoneInput { key: "gotcha:t".into() }),
+            Command::GotchaConfirm(GotchaConfirmInput {
+                key: "gotcha:t".into(),
+            }),
+            Command::GotchaTombstone(GotchaTombstoneInput {
+                key: "gotcha:t".into(),
+            }),
             Command::FileEnrich(FileEnrichInput {
-                path: "p".into(), purpose: "p".into(), entry_points: vec![],
-                decision_keys: vec![], todos: vec![], tags: vec![], priority: Priority::Normal,
+                path: "p".into(),
+                purpose: "p".into(),
+                entry_points: vec![],
+                decision_keys: vec![],
+                todos: vec![],
+                tags: vec![],
+                priority: Priority::Normal,
             }),
             Command::FileReparse(FileReparseInput { path: "p".into() }),
             Command::FileEditHook(FileEditHookInput { path: "p".into() }),
             Command::DocCapture(DocCaptureInput { path: "p".into() }),
             Command::DecisionUpsert(DecisionUpsertInput {
-                slug: "s".into(), value: "v".into(), summary: "s".into(),
-                rationale: "r".into(), tags: vec![], priority: Priority::Normal,
+                slug: "s".into(),
+                value: "v".into(),
+                summary: "s".into(),
+                rationale: "r".into(),
+                tags: vec![],
+                priority: Priority::Normal,
             }),
-            Command::DevNoteUpsert(DevNoteUpsertInput { key: None, text: "t".into() }),
-            Command::SessionLog(SessionLogInput { event: SessionEvent::Miss, key: "k".into() }),
+            Command::DevNoteUpsert(DevNoteUpsertInput {
+                key: None,
+                text: "t".into(),
+            }),
+            Command::SessionLog(SessionLogInput {
+                event: SessionEvent::Miss,
+                key: "k".into(),
+            }),
             Command::ConsultationHit(ConsultationHitInput { key: "k".into() }),
             Command::SessionFlush,
             Command::SessionHarvest,
             // Side-effecting reads.
             Command::MemGet(MemGetInput { key: "k".into() }),
-            Command::MemBootstrap(MemBootstrapInput { context_files: vec![] }),
+            Command::MemBootstrap(MemBootstrapInput {
+                context_files: vec![],
+            }),
         ];
         for cmd in &all_mutations {
             assert!(
-                is_knowledge_mutation(cmd) || is_session_side(cmd)
-                    || is_compound(cmd) || is_side_effecting_read(cmd),
+                is_knowledge_mutation(cmd)
+                    || is_session_side(cmd)
+                    || is_compound(cmd)
+                    || is_side_effecting_read(cmd),
                 "{} must be handled natively, not via v1 bridge",
                 cmd.kind()
             );
@@ -1158,9 +1239,7 @@ mod tests {
         let graph = Arc::new(tokio::sync::RwLock::new(graph));
         let ctx = test_ctx(dir.path());
 
-        let req = make_request(Command::MemGet(MemGetInput {
-            key: "".into(),
-        }));
+        let req = make_request(Command::MemGet(MemGetInput { key: "".into() }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
 
         // Must return Response::Err, not Response::Ok with error payload.
@@ -1226,7 +1305,10 @@ mod tests {
         let g = graph.read().await;
         // Audit should be in sessions tree.
         let audit_keys = g.store().scan_keys("audit:session:").await.unwrap();
-        assert!(!audit_keys.is_empty(), "MemGet should produce session-side audit");
+        assert!(
+            !audit_keys.is_empty(),
+            "MemGet should produce session-side audit"
+        );
 
         // Consultation receipt should exist.
         let consulted = g
@@ -1234,11 +1316,17 @@ mod tests {
             .get("session:consulted:file:src/main.rs")
             .await
             .unwrap();
-        assert!(consulted.is_some(), "MemGet should write consultation receipt");
+        assert!(
+            consulted.is_some(),
+            "MemGet should write consultation receipt"
+        );
 
         // No knowledge-side audit.
         let k_audit = g.store().scan_keys("audit:knowledge:").await.unwrap();
-        assert!(k_audit.is_empty(), "MemGet should NOT produce knowledge-side audit");
+        assert!(
+            k_audit.is_empty(),
+            "MemGet should NOT produce knowledge-side audit"
+        );
     }
 
     #[tokio::test]
@@ -1264,7 +1352,10 @@ mod tests {
 
         let g = graph.read().await;
         let audit_keys = g.store().scan_keys("audit:session:").await.unwrap();
-        assert!(!audit_keys.is_empty(), "MemBootstrap should produce session-side audit");
+        assert!(
+            !audit_keys.is_empty(),
+            "MemBootstrap should produce session-side audit"
+        );
     }
 
     #[tokio::test]
@@ -1285,16 +1376,21 @@ mod tests {
             }),
         };
         let resp = dispatch_v2(&graph, &ctx, req).await;
-        assert!(matches!(resp, Response::Err { code: ErrorCode::VersionMismatch, .. }));
+        assert!(matches!(
+            resp,
+            Response::Err {
+                code: ErrorCode::VersionMismatch,
+                ..
+            }
+        ));
 
         // No consultation receipt should exist.
         let g = graph.read().await;
-        let consulted = g
-            .store()
-            .get("session:consulted:file:test")
-            .await
-            .unwrap();
-        assert!(consulted.is_none(), "version mismatch must not write consultation receipt");
+        let consulted = g.store().get("session:consulted:file:test").await.unwrap();
+        assert!(
+            consulted.is_none(),
+            "version mismatch must not write consultation receipt"
+        );
     }
 
     #[tokio::test]
@@ -1315,9 +1411,15 @@ mod tests {
         let g = graph.read().await;
         // Both the compliance agg and audit should be in sessions tree.
         let compliance_keys = g.store().scan_keys("compliance:miss_").await.unwrap();
-        assert!(!compliance_keys.is_empty(), "SessionLog should write compliance agg");
+        assert!(
+            !compliance_keys.is_empty(),
+            "SessionLog should write compliance agg"
+        );
         let audit_keys = g.store().scan_keys("audit:session:").await.unwrap();
-        assert!(!audit_keys.is_empty(), "SessionLog should write session-side audit");
+        assert!(
+            !audit_keys.is_empty(),
+            "SessionLog should write session-side audit"
+        );
         // Nothing in knowledge tree.
         let k_audit = g.store().scan_keys("audit:knowledge:").await.unwrap();
         assert!(k_audit.is_empty());

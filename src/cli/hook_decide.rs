@@ -330,12 +330,11 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
     } else {
         mati_core::mcp::protocol::SessionEvent::CodexShellMiss
     };
-    let cmd = mati_core::mcp::protocol::Command::SessionLog(
-        mati_core::mcp::protocol::SessionLogInput {
+    let cmd =
+        mati_core::mcp::protocol::Command::SessionLog(mati_core::mcp::protocol::SessionLogInput {
             event,
             key: file_key.clone(),
-        },
-    );
+        });
     let _ = super::daemon::daemon_v2(mati_root, cmd).await;
 
     // Post-hook: no output, always exit 0.
@@ -425,9 +424,9 @@ async fn fire_events(mati_root: &Path, events: &[HookEvent]) {
     use mati_core::mcp::protocol as p;
     for event in events {
         let cmd = match event {
-            HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
-                key: key.clone(),
-            }),
+            HookEvent::Hit { key } => {
+                p::Command::ConsultationHit(p::ConsultationHitInput { key: key.clone() })
+            }
             HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::Miss,
                 key: key.clone(),
@@ -438,12 +437,10 @@ async fn fire_events(mati_root: &Path, events: &[HookEvent]) {
                     key: key.clone(),
                 })
             }
-            HookEvent::CodexShellBlocked { key } => {
-                p::Command::SessionLog(p::SessionLogInput {
-                    event: p::SessionEvent::CodexShellMiss,
-                    key: key.clone(),
-                })
-            }
+            HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::CodexShellMiss,
+                key: key.clone(),
+            }),
             HookEvent::ComplianceHit { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::ComplianceHit,
                 key: key.clone(),

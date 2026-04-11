@@ -186,8 +186,7 @@ pub(crate) async fn proxy_daemon_result(
                 // to decide whether to clean up. Never blindly remove.
                 use super::metadata::{self as meta, StaleCheckResult};
                 match meta::check_and_cleanup_stale(root) {
-                    StaleCheckResult::StaleRemoved
-                    | StaleCheckResult::Clean => {
+                    StaleCheckResult::StaleRemoved | StaleCheckResult::Clean => {
                         return ProxyDaemonResult::StaleSocket;
                     }
                     StaleCheckResult::OrphanSocket => {
@@ -255,9 +254,7 @@ pub(crate) async fn proxy_daemon_result(
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
-            ProxyDaemonResult::Ok(
-                serde_json::json!({"ok": false, "v": 2, "error": message}),
-            )
+            ProxyDaemonResult::Ok(serde_json::json!({"ok": false, "v": 2, "error": message}))
         }
         _ => ProxyDaemonResult::Unresponsive,
     }
@@ -496,14 +493,9 @@ async fn serve_daemon_socket(
             Some(p) => p,
             None => continue,
         };
-        if let Err(e) = socket_handle_connection(
-            Arc::clone(&graph),
-            &repo_root,
-            stream,
-            peer,
-            daemon_session,
-        )
-        .await
+        if let Err(e) =
+            socket_handle_connection(Arc::clone(&graph), &repo_root, stream, peer, daemon_session)
+                .await
         {
             tracing::debug!("daemon socket connection: {e}");
         }
@@ -1606,14 +1598,8 @@ mod tests {
             w.shutdown().await.unwrap();
         });
 
-        let handle_result = socket_handle_connection(
-            graph,
-            dir.path(),
-            server,
-            peer,
-            uuid::Uuid::nil(),
-        )
-        .await;
+        let handle_result =
+            socket_handle_connection(graph, dir.path(), server, peer, uuid::Uuid::nil()).await;
         assert!(handle_result.is_ok());
 
         write_handle.await.unwrap();
@@ -1658,7 +1644,10 @@ mod tests {
             "cmd": { "type": "ping" }
         });
         let payload = format!("{}\n", serde_json::to_string(&request).unwrap());
-        assert!(payload.len() < MAX_FRAME_SIZE, "test payload should be small");
+        assert!(
+            payload.len() < MAX_FRAME_SIZE,
+            "test payload should be small"
+        );
 
         let (client_read, client_write) = client.into_split();
 
@@ -1668,14 +1657,8 @@ mod tests {
             w.shutdown().await.unwrap();
         });
 
-        let handle_result = socket_handle_connection(
-            graph,
-            dir.path(),
-            server,
-            peer,
-            uuid::Uuid::nil(),
-        )
-        .await;
+        let handle_result =
+            socket_handle_connection(graph, dir.path(), server, peer, uuid::Uuid::nil()).await;
         assert!(handle_result.is_ok());
 
         write_handle.await.unwrap();

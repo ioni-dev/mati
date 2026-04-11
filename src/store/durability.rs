@@ -37,7 +37,8 @@ impl Durability {
             || key.starts_with("graph:edge:")
             || key.starts_with("health:") // derived/computed data, fully recomputable
             || key.starts_with("parse:")  // file content hashes — recomputable on re-init
-            || key.starts_with("audit:session:") // session-side audit — co-located with session mutations
+            || key.starts_with("audit:session:")
+        // session-side audit — co-located with session mutations
         {
             Self::Eventual
         } else {

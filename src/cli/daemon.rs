@@ -204,8 +204,9 @@ pub async fn run_daemon_start() -> Result<()> {
     }
 
     // Publish v2 daemon metadata (with session UUID) atomically.
-    let daemon_meta =
-        mati_core::mcp::metadata::DaemonMetadata::new(mati_core::mcp::metadata::DaemonOwner::Daemon);
+    let daemon_meta = mati_core::mcp::metadata::DaemonMetadata::new(
+        mati_core::mcp::metadata::DaemonOwner::Daemon,
+    );
     let daemon_session = daemon_meta.session;
     if let Err(e) = mati_core::mcp::metadata::publish_metadata(
         sock_path.parent().unwrap_or(std::path::Path::new(".")),
@@ -378,15 +379,14 @@ async fn serve_loop_graceful(
             None => continue,
         };
         // Runs to completion — NOT cancellable by shutdown.
-        if let Err(e) =
-            mati_core::mcp::server::socket_handle_connection(
-                Arc::clone(&graph),
-                repo_root,
-                stream,
-                peer,
-                daemon_session,
-            )
-            .await
+        if let Err(e) = mati_core::mcp::server::socket_handle_connection(
+            Arc::clone(&graph),
+            repo_root,
+            stream,
+            peer,
+            daemon_session,
+        )
+        .await
         {
             tracing::warn!(error = %e, "daemon: connection error");
         }
@@ -421,10 +421,7 @@ async fn serve_loop_graceful(
 /// This is the preferred API for internal callers. Constructs a v2
 /// `protocol::Request` directly from a typed `Command` — no legacy
 /// string command names involved.
-pub async fn daemon_v2(
-    root: &Path,
-    cmd: mati_core::mcp::protocol::Command,
-) -> DaemonResult {
+pub async fn daemon_v2(root: &Path, cmd: mati_core::mcp::protocol::Command) -> DaemonResult {
     let v2_cmd = match serde_json::to_value(&cmd) {
         Ok(v) => v,
         Err(_) => return DaemonResult::Unresponsive,

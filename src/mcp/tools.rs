@@ -29,7 +29,8 @@ use super::server::{proxy_daemon_result, ProxyDaemonResult};
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 /// Vector B — appended to every mem_bootstrap result (64 tokens, budget 77).
-pub(crate) const VECTOR_B: &str = "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
+pub(crate) const VECTOR_B: &str =
+    "\n\n[mati] Before reading any file: call mem_get(\"file:<path>\").\n\
     confidence>=0.6 + confirmed=true \u{2192} use record, skip file read.\n\
     confidence<0.3 \u{2192} read file, consider mem_set to improve.\n\
     \"add gotcha\" \u{2192} mem_set(Gotcha) then mati gotcha confirm <key>.";
@@ -689,8 +690,7 @@ impl MatiServer {
                         Category::Gotcha => {
                             let valid = obj.is_some_and(|o| {
                                 let rule = o.get("rule").and_then(|v| v.as_str()).unwrap_or("");
-                                let reason =
-                                    o.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                                let reason = o.get("reason").and_then(|v| v.as_str()).unwrap_or("");
                                 !rule.is_empty() && !reason.is_empty()
                             });
                             if valid {

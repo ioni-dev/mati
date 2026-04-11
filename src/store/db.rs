@@ -649,7 +649,9 @@ impl Store {
         })) {
             Ok(result) => result?,
             Err(_panic) => {
-                tracing::error!("search index panicked during scored query — returning empty results");
+                tracing::error!(
+                    "search index panicked during scored query — returning empty results"
+                );
                 return Ok(vec![]);
             }
         };
