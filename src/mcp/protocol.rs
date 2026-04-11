@@ -399,6 +399,10 @@ pub struct GotchaDraftInput {
     /// Record-level priority.
     #[serde(default)]
     pub priority: Priority,
+    /// Record source — when set, the handler uses this instead of defaulting
+    /// to `ClaudeEnrich`. CLI `gotcha add` sends `DeveloperManual` here.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1251,6 +1255,7 @@ mod tests {
                     ref_url: None,
                     tags: vec![],
                     priority: Priority::Normal,
+                    source: None,
                 }),
             ),
             (
@@ -1386,6 +1391,7 @@ mod tests {
                 ref_url: None,
                 tags: vec![],
                 priority: Priority::Normal,
+                source: None,
             })
             .target_key(),
             "gotcha:test"

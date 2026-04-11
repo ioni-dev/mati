@@ -234,8 +234,13 @@ pub(crate) async fn handle_gotcha_upsert(
     record.lifecycle = RecordLifecycle::Active;
     record.priority = map_priority(&input.priority);
     record.tags = input.tags.clone();
-    record.source = RecordSource::ClaudeEnrich;
-    record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+    let source = match input.source.as_deref() {
+        Some("developer_manual") => RecordSource::DeveloperManual,
+        Some("import") => RecordSource::Import,
+        _ => RecordSource::ClaudeEnrich,
+    };
+    record.source = source.clone();
+    record.confidence = ConfidenceScore::for_new_record(&source);
     if is_tombstoned {
         record.confidence.confirmation_count = 0;
     }
