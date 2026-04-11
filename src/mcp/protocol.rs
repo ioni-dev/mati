@@ -6,8 +6,9 @@
 //!
 //! ## Wire format
 //!
-//! Framing: `LengthDelimitedCodec` with max frame size [`MAX_FRAME_SIZE`].
-//! Payload: MessagePack-encoded [`Request`] / [`Response`].
+//! Framing: newline-delimited JSON. One JSON object per line, terminated by `\n`.
+//! Request size is capped at [`MAX_FRAME_SIZE`] bytes (enforced by the server
+//! before full buffering). Oversized requests receive [`ErrorCode::FrameTooLarge`].
 //!
 //! ## Security properties
 //!
@@ -32,10 +33,15 @@ use uuid::Uuid;
 
 /// Protocol version. Bump on incompatible wire format changes.
 /// v1: newline-delimited JSON, flat cmd/args
-/// v2: length-delimited frames, typed Command enum, session UUID required
+/// v2: newline-delimited JSON, typed Command enum, session UUID required,
+///     request size capped at [`MAX_FRAME_SIZE`]
 pub const PROTOCOL_VERSION: u16 = 2;
 
-/// Maximum frame size in bytes for `LengthDelimitedCodec`.
+/// Maximum request size in bytes (including the trailing newline).
+/// Enforced by `socket_handle_connection` via `AsyncReadExt::take` before
+/// any JSON parsing occurs. Oversized requests receive
+/// [`ErrorCode::FrameTooLarge`] without triggering handler side effects.
+///
 /// Chosen to comfortably fit the largest normal request (FileEnrich ~2-4 KiB)
 /// with headroom, while rejecting pathological payloads.
 pub const MAX_FRAME_SIZE: usize = 65_536;
@@ -114,7 +120,7 @@ impl Response {
 pub enum ErrorCode {
     /// Request protocol version does not match daemon's PROTOCOL_VERSION.
     VersionMismatch,
-    /// Frame exceeds MAX_FRAME_SIZE.
+    /// Request exceeds [`MAX_FRAME_SIZE`] bytes. Rejected before JSON parsing.
     FrameTooLarge,
     /// JSON parse error, unknown fields, or type mismatch.
     MalformedRequest,
@@ -340,8 +346,12 @@ fn default_query_limit() -> u32 {
 pub enum QueryMode {
     /// BM25 full-text search over record keys, values, and tags.
     Text,
+    /// Filter records by tag (substring, case-insensitive).
+    Tag,
     /// 1-hop graph traversal from a seed key.
     Graph,
+    /// Semantic search (requires --features semantic).
+    Semantic,
 }
 
 // ── B. Read-with-side-effect inputs ─────────────────────────────────────────
@@ -536,6 +546,30 @@ pub enum Priority {
     #[default]
     Normal,
     Low,
+}
+
+// ── Conversions from store types ────────────────────────────────────────────
+
+impl From<crate::store::Priority> for Severity {
+    fn from(p: crate::store::Priority) -> Self {
+        match p {
+            crate::store::Priority::Low => Severity::Low,
+            crate::store::Priority::Normal => Severity::Normal,
+            crate::store::Priority::High => Severity::High,
+            crate::store::Priority::Critical => Severity::Critical,
+        }
+    }
+}
+
+impl From<crate::store::Priority> for Priority {
+    fn from(p: crate::store::Priority) -> Self {
+        match p {
+            crate::store::Priority::Low => Priority::Low,
+            crate::store::Priority::Normal => Priority::Normal,
+            crate::store::Priority::High => Priority::High,
+            crate::store::Priority::Critical => Priority::Critical,
+        }
+    }
 }
 
 // ── Command helpers ──────────────────────────────────────────────────────────
@@ -1418,5 +1452,25 @@ mod tests {
         assert_eq!(json["accepted"], false);
         assert_eq!(json["error_code"], "not_found");
         assert!(json["peer_pid"].is_null());
+    }
+
+    // ── store::Priority → protocol type conversions ────────────────────
+
+    #[test]
+    fn store_priority_to_protocol_severity_preserves_all_variants() {
+        use crate::store::Priority as SP;
+        assert_eq!(Severity::from(SP::Low), Severity::Low);
+        assert_eq!(Severity::from(SP::Normal), Severity::Normal);
+        assert_eq!(Severity::from(SP::High), Severity::High);
+        assert_eq!(Severity::from(SP::Critical), Severity::Critical);
+    }
+
+    #[test]
+    fn store_priority_to_protocol_priority_preserves_all_variants() {
+        use crate::store::Priority as SP;
+        assert_eq!(Priority::from(SP::Low), Priority::Low);
+        assert_eq!(Priority::from(SP::Normal), Priority::Normal);
+        assert_eq!(Priority::from(SP::High), Priority::High);
+        assert_eq!(Priority::from(SP::Critical), Priority::Critical);
     }
 }
