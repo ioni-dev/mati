@@ -19,16 +19,14 @@ use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Fire-and-forget: send a command to the daemon socket, drop silently on failure.
-///
-/// Used by all hook analytics/logging commands where data loss is acceptable
-/// under P9 graceful degradation.
-async fn hook_fire_and_forget(cmd: &str, args: serde_json::Value) -> Result<()> {
+/// Fire-and-forget with a typed v2 Command. Preferred for mutation/side-effecting calls.
+async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
+    let kind = cmd.kind();
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
-    match daemon_result(&root, cmd, args).await {
+    match super::daemon::daemon_v2(&root, cmd).await {
         DaemonResult::Ok(_) => {}
-        _ => tracing::debug!("mati {cmd}: daemon unreachable — dropping event"),
+        _ => tracing::debug!("mati {kind}: daemon unreachable — dropping event"),
     }
     Ok(())
 }
@@ -83,63 +81,101 @@ pub async fn run_get(key: &str) -> Result<()> {
 // ── Fire-and-forget hook commands ────────────────────────────────────────────
 
 pub async fn run_log_miss(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_miss", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::Miss,
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_log_hit(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_hit", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::ConsultationHit(p::ConsultationHitInput {
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_compliance_miss", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::ComplianceMiss,
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_log_compliance_hit(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_compliance_hit", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::ComplianceHit,
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_log_codex_shell_miss(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_codex_shell_miss", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::CodexShellMiss,
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_log_bootstrap(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_bootstrap", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::Bootstrap,
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
-    hook_fire_and_forget("log_prompt_nudge", serde_json::json!({ "key": key })).await
+    use mati_core::mcp::protocol as p;
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::PromptNudge,
+        key: key.to_string(),
+    }))
+    .await
 }
 
 pub async fn run_session_flush() -> Result<()> {
-    hook_fire_and_forget("session_flush", serde_json::json!({})).await
+    hook_fire_v2(mati_core::mcp::protocol::Command::SessionFlush).await
 }
 
 pub async fn run_session_harvest() -> Result<()> {
-    hook_fire_and_forget("session_harvest", serde_json::json!({})).await
+    hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest).await
 }
 
 /// Combined log-hit + reparse in a single daemon round-trip.
 /// Called by post-edit.sh hook to avoid two separate process spawns.
 pub async fn run_edit_hook(path: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    // Normalize to repo-relative. post-edit.sh passes absolute paths;
-    // store keys always use relative (e.g. "file:src/main.rs").
     let rel = std::path::Path::new(path)
         .strip_prefix(&cwd)
         .map(|r| r.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    hook_fire_and_forget("edit_hook", serde_json::json!({ "path": rel })).await
+    hook_fire_v2(mati_core::mcp::protocol::Command::FileEditHook(
+        mati_core::mcp::protocol::FileEditHookInput { path: rel },
+    ))
+    .await
 }
 
-/// Read file content from stdin, detect doc comment, update file record.
+/// Path-only doc capture. Daemon reads file from disk.
 pub async fn run_doc_capture(path: &str) -> Result<()> {
+    // NOTE: stdin content is no longer piped. The v2 DocCapture command is
+    // path-only — the daemon reads the file from disk.
+    // Drain stdin to avoid broken pipe if the hook script still pipes content.
     use std::io::Read as _;
-    let mut content = String::new();
-    std::io::stdin().read_to_string(&mut content)?;
-    hook_fire_and_forget(
-        "doc_capture",
-        serde_json::json!({ "path": path, "content": content }),
-    )
+    let _ = std::io::stdin().read_to_end(&mut Vec::new());
+    hook_fire_v2(mati_core::mcp::protocol::Command::DocCapture(
+        mati_core::mcp::protocol::DocCaptureInput {
+            path: path.to_string(),
+        },
+    ))
     .await
 }
 
@@ -167,13 +203,12 @@ pub async fn run_session_check_consulted_recent(key: &str, ttl_secs: u64) -> Res
 pub async fn run_prompt_context(files: &[String]) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = crate::cli::daemon::mati_root_for(&cwd)?;
-    match crate::cli::daemon::daemon_result(
-        &root,
-        "mem_bootstrap",
-        serde_json::json!({ "context_files": files }),
-    )
-    .await
-    {
+    let cmd = mati_core::mcp::protocol::Command::MemBootstrap(
+        mati_core::mcp::protocol::MemBootstrapInput {
+            context_files: files.to_vec(),
+        },
+    );
+    match crate::cli::daemon::daemon_v2(&root, cmd).await {
         crate::cli::daemon::DaemonResult::Ok(resp) => {
             if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
                 if let Some(data) = resp.get("data") {

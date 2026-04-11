@@ -3,6 +3,10 @@
 // Keep the surface intentional: each tool should have concise MCP-facing
 // metadata because Codex surfaces this list directly in `/mcp`.
 
+pub mod dispatch_v2;
+pub mod handlers;
+pub mod metadata;
+pub mod protocol;
 pub mod server;
 pub mod tools;
 pub mod types;

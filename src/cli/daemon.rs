@@ -74,10 +74,6 @@ pub enum DaemonCommand {
 
 // ── Protocol constants ───────────────────────────────────────────────────────
 
-/// Bump when request/response format changes incompatibly. Clients that send a
-/// different version get an error and must fall back to direct `Store::open`.
-pub const PROTOCOL_VERSION: u32 = 1;
-
 /// Idle shutdown threshold — wall-clock seconds with no requests.
 /// Uses wall time (not monotonic) so sleep/wake contributes correctly.
 const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
@@ -122,6 +118,29 @@ pub async fn run_daemon_start() -> Result<()> {
     // Store::open (which may fail). The sentinel tells `mati init` that a daemon
     // is starting and the store lock may be held imminently.
     let mati_root = mati_root_for(&cwd)?;
+
+    // 1. Ensure runtime directory exists with correct permissions (0700).
+    mati_core::mcp::metadata::ensure_runtime_dir(&mati_root)?;
+
+    // 2. Stale-socket cleanup — refuse startup if a live daemon is detected.
+    {
+        use mati_core::mcp::metadata::{self as meta, StaleCheckResult};
+        match meta::check_and_cleanup_stale(&mati_root) {
+            StaleCheckResult::Clean | StaleCheckResult::StaleRemoved => {}
+            StaleCheckResult::LiveDaemon { pid, owner, .. } => {
+                anyhow::bail!(
+                    "another mati {owner} (pid {pid}) is already running.\n\
+                     Stop it with: mati daemon stop"
+                );
+            }
+            StaleCheckResult::OrphanSocket => {
+                // No metadata but socket file exists — unclean shutdown.
+                // Safe to remove: no PID file means no owner.
+                let _ = std::fs::remove_file(meta::socket_path(&mati_root));
+            }
+        }
+    }
+
     let starting_path = mati_root.join("mati.starting");
     let _ = std::fs::write(
         &starting_path,
@@ -169,20 +188,34 @@ pub async fn run_daemon_start() -> Result<()> {
         );
     }
 
-    // Remove stale socket from a previous unclean shutdown.
-    let _ = std::fs::remove_file(&sock_path);
-
     // Bind socket BEFORE writing PID file. This eliminates the race window
     // where the PID file exists but the socket isn't ready yet — which causes
     // `daemon_result` to return `Unresponsive` and `ensure_daemon` to fail open.
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("failed to bind Unix socket at {}", sock_path.display()))?;
 
-    std::fs::write(
-        &pid_path,
-        format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
-    )
-    .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    // Harden socket permissions after bind.
+    if let Err(e) = mati_core::mcp::metadata::harden_socket(&sock_path) {
+        tracing::warn!("failed to harden socket permissions: {e}");
+    }
+
+    // Publish v2 daemon metadata (with session UUID) atomically.
+    let daemon_meta = mati_core::mcp::metadata::DaemonMetadata::new(
+        mati_core::mcp::metadata::DaemonOwner::Daemon,
+    );
+    let daemon_session = daemon_meta.session;
+    if let Err(e) = mati_core::mcp::metadata::publish_metadata(
+        sock_path.parent().unwrap_or(std::path::Path::new(".")),
+        &daemon_meta,
+    ) {
+        // Fall back to legacy PID file.
+        tracing::warn!("failed to publish v2 daemon metadata: {e}");
+        std::fs::write(
+            &pid_path,
+            format!(r#"{{"pid":{},"owner":"daemon"}}"#, std::process::id()),
+        )
+        .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    }
     // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
 
@@ -235,13 +268,18 @@ pub async fn run_daemon_start() -> Result<()> {
     // Run serve_loop and the shutdown-watcher concurrently with join! so that
     // serve_loop is NEVER cancelled by tokio. It exits only after handle_connection
     // returns, ensuring all writes are committed before store.close() is called.
+    // Capture daemon effective UID once — used for every peer credential check.
+    let daemon_euid = mati_core::mcp::metadata::current_euid();
+
     tokio::join!(
         serve_loop_graceful(
             Arc::clone(&graph),
             &repo_root,
             &listener,
             &last_wall,
-            &shutdown
+            &shutdown,
+            daemon_euid,
+            daemon_session,
         ),
         async {
             // Wait for either a signal or the idle-check notification.
@@ -310,6 +348,8 @@ async fn serve_loop_graceful(
     listener: &UnixListener,
     last_wall: &AtomicU64,
     shutdown: &tokio::sync::Notify,
+    daemon_euid: u32,
+    daemon_session: uuid::Uuid,
 ) {
     loop {
         // Race between a new connection and the shutdown signal.
@@ -329,10 +369,20 @@ async fn serve_loop_graceful(
             }
         };
         last_wall.store(wall_secs(), Ordering::Relaxed);
+        // Peer credential check — mismatch or failure drops the connection.
+        let peer = match mati_core::mcp::metadata::check_peer_cred(&stream, daemon_euid) {
+            Some(p) => p,
+            None => continue,
+        };
         // Runs to completion — NOT cancellable by shutdown.
-        if let Err(e) =
-            mati_core::mcp::server::socket_handle_connection(Arc::clone(&graph), repo_root, stream)
-                .await
+        if let Err(e) = mati_core::mcp::server::socket_handle_connection(
+            Arc::clone(&graph),
+            repo_root,
+            stream,
+            peer,
+            daemon_session,
+        )
+        .await
         {
             tracing::warn!(error = %e, "daemon: connection error");
         }
@@ -349,19 +399,52 @@ async fn serve_loop_graceful(
 
 // ── Client ───────────────────────────────────────────────────────────────────
 
-/// Send a request to the daemon and return a [`DaemonResult`].
+/// Send a v2 protocol request to the daemon and return a [`DaemonResult`].
+///
+/// Internally constructs a v2 `protocol::Request` from the v1-style `(cmd, args)`
+/// parameters. The daemon session UUID is read from `DaemonMetadata`; a fresh
+/// request UUID is generated per call.
+///
+/// Callers receive `DaemonResult::Ok(json)` where `json` is a v1-compatible
+/// envelope: `{"ok":true,"data":<value>}` or `{"ok":false,"error":"msg"}`.
 ///
 /// Handles three failure modes:
 /// - **No socket** → [`DaemonResult::NotRunning`] — safe to use `Store::open`
 /// - **ECONNREFUSED + PID dead** → clean up stale files, [`DaemonResult::StaleSocket`] — safe to use `Store::open`
 /// - **PID alive but not responding** → [`DaemonResult::Unresponsive`] — **unsafe** to use `Store::open`
+///
+/// Send a typed v2 Command to the daemon and return a [`DaemonResult`].
+///
+/// This is the preferred API for internal callers. Constructs a v2
+/// `protocol::Request` directly from a typed `Command` — no legacy
+/// string command names involved.
+pub async fn daemon_v2(root: &Path, cmd: mati_core::mcp::protocol::Command) -> DaemonResult {
+    let v2_cmd = match serde_json::to_value(&cmd) {
+        Ok(v) => v,
+        Err(_) => return DaemonResult::Unresponsive,
+    };
+    send_v2_raw(root, v2_cmd).await
+}
+
+/// Send a v2 request using legacy `(cmd_str, args)` parameters.
+///
+/// Retained for pure-read callers (ping, get, scan_prefix, history, etc.)
+/// that have not yet migrated to typed `daemon_v2`. Mutation and
+/// side-effecting-read callers should use `daemon_v2` directly.
 pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> DaemonResult {
+    let v2_cmd = mati_core::mcp::protocol::v1_to_v2_command(cmd, &args);
+    send_v2_raw(root, v2_cmd).await
+}
+
+/// Low-level: connect to daemon socket, send a pre-built v2 Command JSON,
+/// read and parse the v2 Response.
+async fn send_v2_raw(root: &Path, v2_cmd: serde_json::Value) -> DaemonResult {
     let sock_path = root.join("mati.sock");
 
     if sock_path.as_os_str().len() > UNIX_SOCK_PATH_MAX {
         tracing::warn!(
             path = %sock_path.display(),
-            "daemon_result: socket path exceeds Unix limit — daemon unavailable"
+            "daemon: socket path exceeds Unix limit — daemon unavailable"
         );
         return DaemonResult::NotRunning;
     }
@@ -375,26 +458,41 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
         Err(e) => {
             let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
             if is_refused {
-                if is_pid_dead(root) {
-                    // Stale socket — clean up so next direct open works.
-                    let _ = std::fs::remove_file(&sock_path);
-                    let _ = std::fs::remove_file(root.join("mati.pid"));
-                    tracing::debug!("daemon: removed stale socket");
-                    return DaemonResult::StaleSocket;
-                } else {
-                    tracing::warn!("daemon: socket refused but PID alive — unresponsive");
-                    return DaemonResult::Unresponsive;
+                use mati_core::mcp::metadata::{self as meta, StaleCheckResult};
+                match meta::check_and_cleanup_stale(root) {
+                    StaleCheckResult::StaleRemoved | StaleCheckResult::Clean => {
+                        tracing::debug!("daemon: removed stale socket");
+                        return DaemonResult::StaleSocket;
+                    }
+                    StaleCheckResult::OrphanSocket => {
+                        let _ = std::fs::remove_file(&sock_path);
+                        tracing::debug!("daemon: removed orphan socket");
+                        return DaemonResult::StaleSocket;
+                    }
+                    StaleCheckResult::LiveDaemon { .. } => {
+                        tracing::warn!("daemon: socket refused but PID alive — unresponsive");
+                        return DaemonResult::Unresponsive;
+                    }
                 }
             }
-            // Any other error (ENOENT race, permission, etc.) — treat as not running.
             tracing::debug!(error = %e, "daemon: connect failed, treating as not running");
             return DaemonResult::NotRunning;
         }
     };
 
+    let daemon_session = mati_core::mcp::metadata::read_metadata(root)
+        .map(|m| m.session)
+        .unwrap_or_else(uuid::Uuid::nil);
+
+    let v2_request = serde_json::json!({
+        "v": mati_core::mcp::protocol::PROTOCOL_VERSION,
+        "id": uuid::Uuid::new_v4(),
+        "session": daemon_session,
+        "cmd": v2_cmd,
+    });
+
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({ "v": PROTOCOL_VERSION, "cmd": cmd, "args": args });
-    let mut bytes = match serde_json::to_vec(&request) {
+    let mut bytes = match serde_json::to_vec(&v2_request) {
         Ok(b) => b,
         Err(_) => return DaemonResult::Unresponsive,
     };
@@ -419,20 +517,30 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
         Err(_) => return DaemonResult::Unresponsive,
     };
 
-    // Protocol version mismatch — client must not interpret this response.
-    // Treat as Unresponsive: daemon is alive (holds the lock) but incompatible.
-    if let Some(v) = resp.get("v").and_then(|v| v.as_u64()) {
-        if v as u32 != PROTOCOL_VERSION {
-            tracing::warn!(
-                daemon_v = v,
-                client_v = PROTOCOL_VERSION,
-                "daemon: protocol version mismatch — restart daemon to upgrade"
-            );
-            return DaemonResult::Unresponsive;
+    // Convert v2 Response to DaemonResult envelope.
+    match resp.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => {
+            let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            DaemonResult::Ok(serde_json::json!({"ok": true, "v": 2, "data": data}))
         }
+        Some("err") => {
+            let code = resp
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("internal");
+            let message = resp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            if code == "session_mismatch" {
+                tracing::debug!("daemon: session mismatch — daemon may have restarted");
+            }
+            DaemonResult::Ok(
+                serde_json::json!({"ok": false, "v": 2, "error": message, "code": code}),
+            )
+        }
+        _ => DaemonResult::Unresponsive,
     }
-
-    DaemonResult::Ok(resp)
 }
 
 /// Convenience wrapper: extract the `data` field from a successful `get` response.
@@ -543,15 +651,6 @@ pub fn read_pid_file(root: &Path) -> Option<(u32, String)> {
     }
 
     None
-}
-
-/// Returns `true` if the PID recorded in the PID file is no longer alive.
-/// Returns `true` (assume dead) if the PID file is absent or unreadable.
-pub fn is_pid_dead(root: &Path) -> bool {
-    match read_pid_file(root) {
-        Some((pid, _)) => !is_pid_alive(pid),
-        None => true,
-    }
 }
 
 /// Derive the `~/.mati/<slug>/` path for the current working directory.

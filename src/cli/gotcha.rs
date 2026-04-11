@@ -743,12 +743,16 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
         .map(|g| g.affected_files)
         .unwrap_or_default();
 
-    // Route through gotcha_write to handle the record write, file-link sync,
-    // AND HasGotcha graph edges in one pass. old_files=[] because confirmation
-    // doesn't change which files are affected — only ensures links exist.
-    proxy
-        .gotcha_write(&record, &[], &affected_files, false)
-        .await?;
+    // In socket mode, use the daemon's native GotchaConfirm handler which
+    // atomically sets DeveloperManual source + 0.80 confidence + file links.
+    // In direct mode, write locally via gotcha_write.
+    if !proxy.is_direct() {
+        proxy.daemon_gotcha_confirm(key).await?;
+    } else {
+        proxy
+            .gotcha_write(&record, &[], &affected_files, false)
+            .await?;
+    }
 
     // Propagate confirmation signal to linked file records — their
     // confidence.confirmation_count feeds into log2(count + 2).

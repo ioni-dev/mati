@@ -182,17 +182,42 @@ pub(crate) async fn proxy_daemon_result(
         Err(e) => {
             let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
             if is_refused {
-                let pid_path = root.join("mati.pid");
-                let _ = std::fs::remove_file(&sock_path);
-                let _ = std::fs::remove_file(pid_path);
-                return ProxyDaemonResult::StaleSocket;
+                // Socket refused — use the metadata + PID liveness protocol
+                // to decide whether to clean up. Never blindly remove.
+                use super::metadata::{self as meta, StaleCheckResult};
+                match meta::check_and_cleanup_stale(root) {
+                    StaleCheckResult::StaleRemoved | StaleCheckResult::Clean => {
+                        return ProxyDaemonResult::StaleSocket;
+                    }
+                    StaleCheckResult::OrphanSocket => {
+                        // No metadata + ECONNREFUSED → stale
+                        let _ = std::fs::remove_file(&sock_path);
+                        return ProxyDaemonResult::StaleSocket;
+                    }
+                    StaleCheckResult::LiveDaemon { .. } => {
+                        // PID alive but socket refused — daemon is starting or broken
+                        return ProxyDaemonResult::Unresponsive;
+                    }
+                }
             }
             return ProxyDaemonResult::NotRunning;
         }
     };
 
+    // Build v2 request from v1-style (cmd, args) using the same mapping
+    // as cli::daemon::daemon_result.
+    let daemon_session = super::metadata::read_metadata(root)
+        .map(|m| m.session)
+        .unwrap_or_else(uuid::Uuid::nil);
+    let v2_cmd = super::protocol::v1_to_v2_command(cmd, &args);
+    let request = serde_json::json!({
+        "v": super::protocol::PROTOCOL_VERSION,
+        "id": uuid::Uuid::new_v4(),
+        "session": daemon_session,
+        "cmd": v2_cmd,
+    });
+
     let (reader, mut writer) = stream.into_split();
-    let request = serde_json::json!({ "v": PROTOCOL_VERSION, "cmd": cmd, "args": args });
     let mut bytes = match serde_json::to_vec(&request) {
         Ok(b) => b,
         Err(_) => return ProxyDaemonResult::Unresponsive,
@@ -213,9 +238,25 @@ pub(crate) async fn proxy_daemon_result(
         _ => return ProxyDaemonResult::Unresponsive,
     }
 
-    match serde_json::from_str(line.trim()) {
-        Ok(v) => ProxyDaemonResult::Ok(v),
-        Err(_) => ProxyDaemonResult::Unresponsive,
+    // Parse v2 Response and convert to v1-compatible envelope for callers.
+    let resp: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return ProxyDaemonResult::Unresponsive,
+    };
+
+    match resp.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => {
+            let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            ProxyDaemonResult::Ok(serde_json::json!({"ok": true, "v": 2, "data": data}))
+        }
+        Some("err") => {
+            let message = resp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error");
+            ProxyDaemonResult::Ok(serde_json::json!({"ok": false, "v": 2, "error": message}))
+        }
+        _ => ProxyDaemonResult::Unresponsive,
     }
 }
 
@@ -238,10 +279,26 @@ async fn open_with_retry(
     let mut delay = initial_delay;
     let mati_root = mati_root_for(repo_root)?;
 
+    // Ensure runtime directory exists with correct permissions.
+    if let Err(e) = super::metadata::ensure_runtime_dir(&mati_root) {
+        tracing::warn!("ensure_runtime_dir failed: {e}");
+    }
+
     // Clean up stale lock holder from a previous session. If the PID in
-    // mati.pid is dead, remove the socket and PID file so we can acquire
+    // metadata is dead, remove the socket and PID file so we can acquire
     // the lock directly instead of entering proxy mode against a ghost.
-    cleanup_stale_pid(&mati_root);
+    {
+        use super::metadata::{self as meta, StaleCheckResult};
+        match meta::check_and_cleanup_stale(&mati_root) {
+            StaleCheckResult::Clean | StaleCheckResult::StaleRemoved => {}
+            StaleCheckResult::LiveDaemon { .. } => {
+                // Live daemon — let the retry loop handle proxy mode.
+            }
+            StaleCheckResult::OrphanSocket => {
+                let _ = std::fs::remove_file(meta::socket_path(&mati_root));
+            }
+        }
+    }
 
     for attempt in 0..=max_retries {
         match Store::open_and_rebuild(repo_root).await {
@@ -293,67 +350,8 @@ async fn open_with_retry(
     unreachable!()
 }
 
-/// Remove stale socket and PID files left by a dead MCP server process.
-///
-/// When Claude Code restarts a session, the old `mati serve` process may still
-/// be alive briefly or may have been killed without cleanup. If the PID file
-/// points to a dead process, we remove the socket and PID files so the new
-/// instance can acquire the store lock directly instead of entering proxy mode
-/// against a non-existent target.
-fn cleanup_stale_pid(mati_root: &Path) {
-    let pid_path = mati_root.join("mati.pid");
-    let sock_path = mati_root.join("mati.sock");
-
-    let pid_content = match std::fs::read_to_string(&pid_path) {
-        Ok(s) => s,
-        Err(_) => return, // No PID file — nothing to clean up
-    };
-
-    let pid: u32 = match serde_json::from_str::<serde_json::Value>(&pid_content)
-        .ok()
-        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
-        .and_then(|p| u32::try_from(p).ok())
-    {
-        Some(p) => p,
-        None => return, // Malformed PID file — leave it for the retry logic
-    };
-
-    // If the process is still alive, don't touch anything — it may be a
-    // legitimate session or a concurrent spawn that will resolve via retry.
-    if is_pid_alive(pid) {
-        return;
-    }
-
-    tracing::info!(
-        pid,
-        "mati serve: cleaning up stale PID file from dead process"
-    );
-    let _ = std::fs::remove_file(&sock_path);
-    let _ = std::fs::remove_file(&pid_path);
-
-    // Also remove the SurrealKV lock file if present — the dead process
-    // may have left it behind. SurrealKV uses an exclusive flock which is
-    // released by the OS on process exit, but the LOCK file itself persists.
-    let lock_path = mati_root.join("knowledge.db").join("LOCK");
-    if lock_path.exists() {
-        let _ = std::fs::remove_file(&lock_path);
-    }
-}
-
-/// Check whether a PID is still alive using `kill(pid, 0)`.
-#[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if ret == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn is_pid_alive(_pid: u32) -> bool {
-    true // Conservative: assume alive on non-Unix
-}
+// cleanup_stale_pid and local is_pid_alive removed — callers now use
+// metadata::check_and_cleanup_stale which centralizes PID liveness checks.
 
 // ── Daemon socket — hook script bridge ───────────────────────────────────────
 
@@ -369,6 +367,7 @@ const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Deserialize)]
 pub(crate) struct SocketRequest {
     pub cmd: String,
+    #[allow(dead_code)] // Wire protocol field — must exist for deserialization
     #[serde(default, rename = "v")]
     pub version: Option<u32>,
     #[serde(default)]
@@ -377,13 +376,13 @@ pub(crate) struct SocketRequest {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SocketResponse {
-    ok: bool,
+    pub(crate) ok: bool,
     #[serde(rename = "v")]
     version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
+    pub(crate) data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 impl SocketResponse {
@@ -427,7 +426,24 @@ async fn serve_daemon_socket(
         return;
     }
 
-    let _ = std::fs::remove_file(&sock_path);
+    // Stale-socket cleanup — only remove if PID is dead or metadata absent.
+    {
+        use super::metadata::{self as meta, StaleCheckResult};
+        let root = sock_path.parent().unwrap_or(std::path::Path::new("."));
+        match meta::check_and_cleanup_stale(root) {
+            StaleCheckResult::Clean | StaleCheckResult::StaleRemoved => {}
+            StaleCheckResult::LiveDaemon { pid, owner, .. } => {
+                tracing::warn!(
+                    "another mati {owner} (pid {pid}) owns the socket — \
+                     skipping embedded daemon socket"
+                );
+                return;
+            }
+            StaleCheckResult::OrphanSocket => {
+                let _ = std::fs::remove_file(&sock_path);
+            }
+        }
+    }
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
@@ -438,14 +454,32 @@ async fn serve_daemon_socket(
             return;
         }
     };
-    let _ = std::fs::write(
-        &pid_path,
-        format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
-    );
+    // Harden socket permissions after bind (before any client can connect).
+    if let Err(e) = super::metadata::harden_socket(&sock_path) {
+        tracing::warn!("failed to harden socket permissions: {e}");
+    }
+    // Publish v2 daemon metadata (with session UUID) atomically.
+    let daemon_meta = super::metadata::DaemonMetadata::new(super::metadata::DaemonOwner::Mcp);
+    let daemon_session = daemon_meta.session;
+    if let Err(e) = super::metadata::publish_metadata(
+        sock_path.parent().unwrap_or(std::path::Path::new(".")),
+        &daemon_meta,
+    ) {
+        tracing::warn!("failed to publish daemon metadata: {e}");
+        // Fall back to legacy PID file so existing clients still work.
+        let _ = std::fs::write(
+            &pid_path,
+            format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
+        );
+    }
     tracing::debug!(
-        "daemon socket ready at {} (MCP-embedded)",
-        sock_path.display()
+        "daemon socket ready at {} (MCP-embedded, session={})",
+        sock_path.display(),
+        daemon_session,
     );
+
+    // Capture daemon effective UID once — used for every peer credential check.
+    let daemon_euid = super::metadata::current_euid();
 
     loop {
         let stream = match listener.accept().await {
@@ -455,7 +489,15 @@ async fn serve_daemon_socket(
                 continue;
             }
         };
-        if let Err(e) = socket_handle_connection(Arc::clone(&graph), &repo_root, stream).await {
+        // Peer credential check — mismatch or failure drops the connection.
+        let peer = match super::metadata::check_peer_cred(&stream, daemon_euid) {
+            Some(p) => p,
+            None => continue,
+        };
+        if let Err(e) =
+            socket_handle_connection(Arc::clone(&graph), &repo_root, stream, peer, daemon_session)
+                .await
+        {
             tracing::debug!("daemon socket connection: {e}");
         }
     }
@@ -465,53 +507,79 @@ pub async fn socket_handle_connection(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     stream: UnixStream,
+    peer: super::metadata::PeerContext,
+    daemon_session: uuid::Uuid,
 ) -> Result<()> {
+    use super::protocol::MAX_FRAME_SIZE;
+    use tokio::io::AsyncReadExt;
+
     let (reader, mut writer) = stream.into_split();
     let mut buf = String::new();
-    match tokio::time::timeout(READ_TIMEOUT, BufReader::new(reader).read_line(&mut buf)).await {
+
+    // Cap the read at MAX_FRAME_SIZE + 1 bytes so the allocation is bounded
+    // before any JSON parsing occurs. If the client sends more data than
+    // MAX_FRAME_SIZE before the newline delimiter, `read_line` will stop at
+    // the take limit and the size check below will reject the request.
+    let limited = reader.take(MAX_FRAME_SIZE as u64 + 1);
+    let mut buf_reader = BufReader::new(limited);
+    match tokio::time::timeout(READ_TIMEOUT, buf_reader.read_line(&mut buf)).await {
         Ok(Ok(0)) => return Ok(()),
         Ok(Ok(_)) => {}
         Ok(Err(e)) => anyhow::bail!("read error: {e}"),
         Err(_) => anyhow::bail!("read timeout"),
     }
 
-    let req: SocketRequest = match serde_json::from_str(buf.trim()) {
+    if buf.len() > MAX_FRAME_SIZE {
+        let resp = super::protocol::Response::err(
+            uuid::Uuid::nil(),
+            super::protocol::ErrorCode::FrameTooLarge,
+            format!("request exceeds {MAX_FRAME_SIZE} byte limit"),
+        );
+        let json = serde_json::to_string(&resp)?;
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    let trimmed = buf.trim();
+
+    // V2 protocol ONLY — no v1 fallback on the public wire.
+    // The v2 format requires `id` (UUID), `session` (UUID), and `cmd` as
+    // a tagged object with `type`. If decode fails, the request is rejected
+    // with a protocol error — there is no legacy v1 dispatch path.
+    let v2_req = match serde_json::from_str::<super::protocol::Request>(trimmed) {
         Ok(r) => r,
         Err(e) => {
-            let resp = SocketResponse::err(format!("invalid JSON: {e}"));
-            write_socket_response(&mut writer, &resp).await?;
+            // Return a v2-shaped error. Use nil UUID since we can't extract
+            // the request ID from a malformed payload.
+            let resp = super::protocol::Response::err(
+                uuid::Uuid::nil(),
+                super::protocol::ErrorCode::MalformedRequest,
+                format!("invalid v2 request: {e}"),
+            );
+            let json = serde_json::to_string(&resp)?;
+            writer.write_all(json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
             return Ok(());
         }
     };
 
-    if let Some(v) = req.version {
-        if v != PROTOCOL_VERSION {
-            let resp = SocketResponse::err(format!(
-                "protocol version mismatch: client={v} server={PROTOCOL_VERSION}"
-            ));
-            write_socket_response(&mut writer, &resp).await?;
-            return Ok(());
-        }
-    }
-
-    // Do NOT hold a read lock across dispatch — socket_dispatch may acquire
-    // a write lock for MCP tools like mem_set, which would deadlock.
-    let resp = socket_dispatch(&graph, repo_root, &req).await;
-    write_socket_response(&mut writer, &resp).await
-}
-
-pub(crate) async fn write_socket_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &SocketResponse,
-) -> Result<()> {
-    let json = serde_json::to_string(resp)?;
+    let ctx = super::dispatch_v2::RequestContext {
+        peer,
+        daemon_session,
+        repo_root: repo_root.to_path_buf(),
+    };
+    let resp = super::dispatch_v2::dispatch_v2(&graph, &ctx, v2_req).await;
+    let json = serde_json::to_string(&resp)?;
     writer.write_all(json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
 }
 
-async fn socket_dispatch(
+pub(crate) async fn socket_dispatch(
     graph: &Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
     req: &SocketRequest,
@@ -1488,5 +1556,109 @@ mod tests {
         let original = g.store().get("gotcha:dup-socket").await.unwrap().unwrap();
         let payload = original.payload_as::<GotchaRecord>().unwrap();
         assert_eq!(payload.affected_files, vec!["src/a.rs"]);
+    }
+
+    // ── Wire-level size enforcement ────────────────────────────────────
+
+    #[tokio::test]
+    async fn oversized_request_returns_frame_too_large_with_response() {
+        use super::super::protocol::MAX_FRAME_SIZE;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = make_test_graph(store).await;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = super::super::metadata::PeerContext {
+            uid: 501,
+            pid: None,
+        };
+
+        // Payload larger than MAX_FRAME_SIZE.
+        let oversized = "x".repeat(MAX_FRAME_SIZE + 100);
+        let payload = format!("{oversized}\n");
+
+        // Split client: write oversized request, then read response.
+        let (client_read, client_write) = client.into_split();
+
+        let write_handle = tokio::spawn(async move {
+            let mut w = client_write;
+            w.write_all(payload.as_bytes()).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+
+        let handle_result =
+            socket_handle_connection(graph, dir.path(), server, peer, uuid::Uuid::nil()).await;
+        assert!(handle_result.is_ok());
+
+        write_handle.await.unwrap();
+
+        // Read the error response from the server.
+        let mut reader = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert_eq!(resp["status"], "err");
+        assert_eq!(resp["code"], "frame_too_large");
+        assert!(
+            resp["message"]
+                .as_str()
+                .unwrap()
+                .contains(&MAX_FRAME_SIZE.to_string()),
+            "error message should mention the size limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_sized_request_is_not_rejected_by_size_check() {
+        use super::super::protocol::MAX_FRAME_SIZE;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = make_test_graph(store).await;
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = super::super::metadata::PeerContext {
+            uid: 501,
+            pid: None,
+        };
+
+        // A valid v2 ping request — well under MAX_FRAME_SIZE.
+        let request = serde_json::json!({
+            "v": 2,
+            "id": uuid::Uuid::new_v4(),
+            "session": uuid::Uuid::nil(),
+            "cmd": { "type": "ping" }
+        });
+        let payload = format!("{}\n", serde_json::to_string(&request).unwrap());
+        assert!(
+            payload.len() < MAX_FRAME_SIZE,
+            "test payload should be small"
+        );
+
+        let (client_read, client_write) = client.into_split();
+
+        let write_handle = tokio::spawn(async move {
+            let mut w = client_write;
+            w.write_all(payload.as_bytes()).await.unwrap();
+            w.shutdown().await.unwrap();
+        });
+
+        let handle_result =
+            socket_handle_connection(graph, dir.path(), server, peer, uuid::Uuid::nil()).await;
+        assert!(handle_result.is_ok());
+
+        write_handle.await.unwrap();
+
+        // Read response — should be a successful pong, not FrameTooLarge.
+        let mut reader = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+
+        assert_eq!(resp["status"], "ok", "ping should succeed, got: {resp}");
     }
 }

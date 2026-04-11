@@ -192,6 +192,145 @@ pub async fn reparse_impl(
     Ok(())
 }
 
+/// Compute the reparse result without persisting. Returns the key and updated
+/// Record to write, or `None` if no write is needed (file missing, parse
+/// failure, or no structural changes).
+///
+/// The caller is responsible for committing the record (and any audit entry)
+/// in a single transaction via `transact_knowledge`.
+///
+/// Staleness cascade to linked gotchas is NOT included — it is a separate
+/// best-effort substep that the caller handles after committing the main write.
+pub async fn reparse_staged(
+    store: &Store,
+    repo_root: &std::path::Path,
+    rel_path: &str,
+) -> Result<Option<(String, Record)>> {
+    let abs_path = repo_root.join(rel_path);
+    let file_key = format!("file:{rel_path}");
+    let now = now_secs();
+
+    // 1. File deleted — update staleness.
+    if !abs_path.exists() {
+        if let Some(mut record) = store.get(&file_key).await? {
+            record.staleness.value = 1.0;
+            record.staleness.tier = StalenessTier::Tombstone;
+            record.staleness.signals.push(StalenessSignal::FileDeleted);
+            record.staleness.computed_at = now;
+            record.updated_at = now;
+            record.version.logical_clock += 1;
+            record.version.wall_clock = now;
+            return Ok(Some((file_key, record)));
+        }
+        return Ok(None);
+    }
+
+    // 2-3. Detect language, parse file.
+    let language = detect_language(&abs_path);
+    let size_bytes = std::fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+    let walked = WalkedFile {
+        abs_path: abs_path.clone(),
+        rel_path: rel_path.to_string(),
+        language,
+        size_bytes,
+        mtime_secs: 0,
+    };
+    let analysis = match parse_file(&walked) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("reparse_staged: parse failed for {rel_path}: {e}");
+            return Ok(None);
+        }
+    };
+
+    // 4. Fetch existing record.
+    let existing = store.get(&file_key).await?;
+
+    // 5. No record → create Layer 0 stub.
+    let Some(mut record) = existing else {
+        let file_record = build_file_record_from_analysis(rel_path, &analysis, &walked, now);
+        let new_record = Record {
+            key: file_key.clone(),
+            value: file_record.purpose.clone(),
+            payload: serde_json::to_value(&file_record).ok(),
+            category: Category::File,
+            priority: crate::store::record::Priority::Normal,
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: now,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        };
+        return Ok(Some((file_key, new_record)));
+    };
+
+    // 6. Deserialize existing payload.
+    let old_fr: FileRecord = match record.payload_as::<FileRecord>() {
+        Some(fr) => fr,
+        None => {
+            let file_record = build_file_record_from_analysis(rel_path, &analysis, &walked, now);
+            record.value = file_record.purpose.clone();
+            record.payload = serde_json::to_value(&file_record).ok();
+            record.updated_at = now;
+            record.version.logical_clock += 1;
+            record.version.wall_clock = now;
+            return Ok(Some((file_key, record)));
+        }
+    };
+
+    // 7. Compute diff — no change means no write.
+    let diff = compute_diff(&old_fr, &analysis);
+    if diff.is_empty() {
+        return Ok(None);
+    }
+
+    // 8. Merge structural fields, preserve enrichment.
+    let merged = FileRecord {
+        path: rel_path.to_string(),
+        purpose: old_fr.purpose,
+        entry_points: public_api_symbols(&analysis),
+        imports: analysis.imports,
+        gotcha_keys: old_fr.gotcha_keys.clone(),
+        decision_keys: old_fr.decision_keys,
+        todos: analysis.todos,
+        unsafe_count: analysis.unsafe_count,
+        unwrap_count: analysis.unwrap_count,
+        change_frequency: old_fr.change_frequency,
+        last_author: old_fr.last_author,
+        is_hotspot: old_fr.is_hotspot,
+        token_cost_estimate: (walked.size_bytes / 4).min(u32::MAX as u64) as u32,
+        last_modified_session: now,
+        content_hash: analysis.content_hash.clone(),
+        line_count: analysis.line_count,
+    };
+
+    record.value = merged.purpose.clone();
+    record.payload = serde_json::to_value(&merged).ok();
+
+    // 9-10. Apply staleness, bump version.
+    let _signals = apply_reparse_staleness(&mut record, &diff);
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    // NOTE: staleness cascade to linked gotchas is NOT done here.
+    // The caller handles it as a best-effort substep after committing.
+
+    Ok(Some((file_key, record)))
+}
+
 /// Build a fresh FileRecord from analysis output (no prior enrichment).
 fn build_file_record_from_analysis(
     rel_path: &str,

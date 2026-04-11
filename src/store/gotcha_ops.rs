@@ -10,9 +10,19 @@
 //!
 //! ## Partial-failure behaviour
 //!
-//! SurrealKV does not support cross-key transactions, so the multi-step
-//! mutations here are not atomic. The ordering is chosen to minimize damage
-//! from a mid-operation failure:
+//! SurrealKV supports multi-key atomic transactions within a single tree.
+//! However, gotcha mutations span both the knowledge tree (gotcha records,
+//! file-record links) and the sessions tree (graph edges). No single
+//! transaction can span both trees — this is mati's two-tree architecture
+//! constraint, not a SurrealKV limitation.
+//!
+//! The v2 protocol handlers in `mcp::handlers` stage knowledge-tree writes
+//! (gotcha record + file-link updates + audit) in a single atomic
+//! `transact_knowledge` call. Graph edge writes remain best-effort.
+//!
+//! The functions below are retained for the CLI direct-store path and as
+//! building blocks. Their ordering is chosen to minimize damage from a
+//! mid-operation failure:
 //!
 //! 1. **Record write first** — the gotcha record is the source of truth. If
 //!    later steps fail, the record exists and a future mutation or manual
