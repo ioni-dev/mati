@@ -30,6 +30,7 @@ use crate::store::record::{
     Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, TombstoneReason,
 };
 use crate::store::Store;
+use crate::graph::edges::{Edge, EdgeKind};
 
 use super::dispatch_v2::RequestContext;
 
@@ -277,6 +278,9 @@ pub(crate) async fn handle_gotcha_upsert(
         (ErrorCode::StoreError, format!("transact failed: {e}"))
     })?;
 
+    // Best-effort: sync HasGotcha graph edges (cross-tree, outside transaction).
+    sync_has_gotcha_edges(store, key, &old_affected_files, &input.affected_files).await;
+
     Ok(serde_json::json!({
         "ok": true,
         "key": key,
@@ -387,6 +391,9 @@ pub(crate) async fn handle_gotcha_confirm(
         (ErrorCode::StoreError, format!("transact failed: {e}"))
     })?;
 
+    // Best-effort: ensure HasGotcha edges exist for all affected files.
+    sync_has_gotcha_edges(store, key, &[], &affected_files).await;
+
     Ok(serde_json::json!({
         "ok": true,
         "key": key,
@@ -459,6 +466,9 @@ pub(crate) async fn handle_gotcha_tombstone(
     store.transact_knowledge(&ops).await.map_err(|e| {
         (ErrorCode::StoreError, format!("transact failed: {e}"))
     })?;
+
+    // Best-effort: remove HasGotcha edges for all affected files.
+    sync_has_gotcha_edges(store, key, &affected_files, &[]).await;
 
     Ok(serde_json::json!({"ok": true, "key": key, "tombstoned": true}))
 }
@@ -1173,6 +1183,46 @@ async fn compute_file_link_updates(
     }
 
     updates
+}
+
+/// Best-effort HasGotcha graph edge sync (cross-tree, outside transaction).
+///
+/// Adds edges for files in `new_files` that aren't in `old_files`, and removes
+/// edges for files in `old_files` that aren't in `new_files`. Failures are
+/// logged but not propagated — `mati repair` reconciles on drift.
+async fn sync_has_gotcha_edges(
+    store: &Store,
+    gotcha_key: &str,
+    old_files: &[String],
+    new_files: &[String],
+) {
+    use std::collections::HashSet;
+
+    let old_set: HashSet<&str> = old_files.iter().map(String::as_str).collect();
+    let new_set: HashSet<&str> = new_files.iter().map(String::as_str).collect();
+    let ts = now_secs().to_le_bytes();
+
+    // Add edges for newly-affected files.
+    for file_path in &new_set {
+        if !old_set.contains(*file_path) {
+            let file_key = format!("file:{file_path}");
+            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, gotcha_key).to_key();
+            if let Err(e) = store.put_raw(&edge_key, &ts).await {
+                tracing::warn!("sync_has_gotcha_edges: add failed {file_key} → {gotcha_key}: {e}");
+            }
+        }
+    }
+
+    // Remove edges for files no longer affected.
+    for file_path in &old_set {
+        if !new_set.contains(*file_path) {
+            let file_key = format!("file:{file_path}");
+            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, gotcha_key).to_key();
+            if let Err(e) = store.delete(&edge_key).await {
+                tracing::warn!("sync_has_gotcha_edges: remove failed {file_key} → {gotcha_key}: {e}");
+            }
+        }
+    }
 }
 
 /// Compute confirmation_count propagation updates for file records.
