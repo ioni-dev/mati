@@ -367,6 +367,7 @@ const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Deserialize)]
 pub(crate) struct SocketRequest {
     pub cmd: String,
+    #[allow(dead_code)] // Wire protocol field — must exist for deserialization
     #[serde(default, rename = "v")]
     pub version: Option<u32>,
     #[serde(default)]
@@ -572,17 +573,6 @@ pub async fn socket_handle_connection(
     };
     let resp = super::dispatch_v2::dispatch_v2(&graph, &ctx, v2_req).await;
     let json = serde_json::to_string(&resp)?;
-    writer.write_all(json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-pub(crate) async fn write_socket_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    resp: &SocketResponse,
-) -> Result<()> {
-    let json = serde_json::to_string(resp)?;
     writer.write_all(json.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;

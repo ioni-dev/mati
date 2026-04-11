@@ -184,13 +184,6 @@ fn is_compound(cmd: &Command) -> bool {
     matches!(cmd, Command::FileEditHook(_))
 }
 
-fn extract_outcome(resp: &Response) -> (bool, Option<ErrorCode>) {
-    match resp {
-        Response::Ok { .. } => (true, None),
-        Response::Err { code, .. } => (false, Some(code.clone())),
-    }
-}
-
 // ── Side-effecting read handlers ────────────────────────────────────────────
 
 async fn dispatch_side_effecting_read(
@@ -809,19 +802,6 @@ fn audit_nanos_key(prefix: &str) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{prefix}{nanos}")
-}
-
-/// Write audit to knowledge tree. Used for knowledge-side mutations.
-/// Currently a separate transaction (bridge limitation); native handlers
-/// will merge mutation+audit into one `transact_knowledge` call.
-async fn write_knowledge_audit(store: &crate::store::Store, entry: &AuditEntry) {
-    let Some(bytes) = serialize_audit(entry) else {
-        return;
-    };
-    let key = audit_nanos_key("audit:knowledge:");
-    if let Err(e) = store.put_raw(&key, &bytes).await {
-        tracing::warn!("audit: knowledge write failed for {key}: {e}");
-    }
 }
 
 /// Write audit to sessions tree. Used for session-side mutations.
