@@ -1085,6 +1085,7 @@ mod tests {
                 key: "gotcha:t".into(), rule: "r".into(), reason: "r".into(),
                 severity: Severity::Normal, affected_files: vec![],
                 ref_url: None, tags: vec![], priority: Priority::Normal,
+                source: None,
             }),
             Command::GotchaConfirm(GotchaConfirmInput { key: "gotcha:t".into() }),
             Command::GotchaTombstone(GotchaTombstoneInput { key: "gotcha:t".into() }),

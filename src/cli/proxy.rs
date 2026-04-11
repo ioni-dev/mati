@@ -139,6 +139,13 @@ impl StoreProxy {
                         ref_url: gotcha.as_ref().and_then(|g| g.ref_url.clone()),
                         tags: record.tags.clone(),
                         priority: record.priority.clone().into(),
+                        source: match &record.source {
+                            mati_core::store::RecordSource::DeveloperManual => {
+                                Some("developer_manual".to_string())
+                            }
+                            mati_core::store::RecordSource::Import => Some("import".to_string()),
+                            _ => None,
+                        },
                     })
                 } else if key.starts_with("file:") {
                     let path = key.strip_prefix("file:").unwrap_or(key);
@@ -340,6 +347,13 @@ impl StoreProxy {
                         discovered_session: 0,
                         confirmed: false,
                     });
+                let source = match &record.source {
+                    mati_core::store::RecordSource::DeveloperManual => {
+                        Some("developer_manual".to_string())
+                    }
+                    mati_core::store::RecordSource::Import => Some("import".to_string()),
+                    _ => None,
+                };
                 let cmd = p::Command::GotchaUpsert(p::GotchaDraftInput {
                     key: record.key.clone(),
                     rule: gotcha.rule,
@@ -349,6 +363,7 @@ impl StoreProxy {
                     ref_url: gotcha.ref_url,
                     tags: record.tags.clone(),
                     priority: record.priority.clone().into(),
+                    source,
                 });
                 match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {
@@ -397,6 +412,38 @@ impl StoreProxy {
                         }
                     }
                     other => Err(socket_read_error("gotcha_tombstone", other)),
+                }
+            }
+        }
+    }
+
+    /// Send a `GotchaConfirm` v2 command to the daemon.
+    ///
+    /// Only used in socket mode. The daemon's native handler atomically sets
+    /// `DeveloperManual` source, 0.80 confidence, and file-link updates.
+    /// In direct mode this is a no-op — the caller handles local writes.
+    pub async fn daemon_gotcha_confirm(&self, key: &str) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(_) => Ok(()),
+            ProxyInner::Socket { root } => {
+                let cmd = mati_core::mcp::protocol::Command::GotchaConfirm(
+                    mati_core::mcp::protocol::GotchaConfirmInput {
+                        key: key.to_string(),
+                    },
+                );
+                match daemon_v2(root, cmd).await {
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            Ok(())
+                        } else {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("daemon gotcha_confirm failed: {err}")
+                        }
+                    }
+                    other => Err(socket_read_error("gotcha_confirm", other)),
                 }
             }
         }
