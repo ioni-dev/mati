@@ -11,6 +11,7 @@ use mati_core::analysis::{
     build_edges, build_file_records, hash_and_parse_parallel, import_claude_md, mine_git_history,
     parse_dependencies, Walker,
 };
+use mati_core::graph::edges::EdgeKind;
 use mati_core::graph::Graph;
 use mati_core::scaffold::codex::CodexInstallResult;
 use mati_core::scaffold::settings::InstallResult;
@@ -295,7 +296,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .as_ref()
         .map(|g| g.co_change_pairs.clone())
         .unwrap_or_default();
-    let layer0_edges = build_edges(&files_to_parse, &analyses, &co_change_pairs);
+    let mut layer0_edges = build_edges(&files_to_parse, &analyses, &co_change_pairs);
     let edge_count = layer0_edges.edges.len();
     println!(
         "  Building graph edges...              {:>4} edges   {:>4}ms",
@@ -671,6 +672,97 @@ pub async fn run(args: InitArgs) -> Result<()> {
         t.elapsed().as_millis(),
     );
 
+    // ── 9a-pre. Patch gotcha_keys on skipped (unchanged) file records ────────
+    // Incremental re-init only has changed files in memory. Skipped files that
+    // are affected by new cochange/revert/ownership gotchas need their
+    // gotcha_keys updated in the store directly.
+    if skipped_count > 0 {
+        let in_memory_paths: HashSet<String> =
+            file_records.iter().map(|fr| fr.path.clone()).collect();
+
+        // Build path -> [gotcha_key] for ALL auto-generated gotchas.
+        // Include both in-memory records AND existing store records (from prior inits).
+        let mut path_to_all_keys: HashMap<String, Vec<String>> = HashMap::new();
+        for rec_vec in [
+            &cochange_record_structs,
+            &revert_record_structs,
+            &ownership_record_structs,
+        ] {
+            for rec in rec_vec.iter() {
+                if let Some(g) = rec.payload_as::<GotchaRecord>() {
+                    for file_path in &g.affected_files {
+                        path_to_all_keys
+                            .entry(file_path.clone())
+                            .or_default()
+                            .push(rec.key.clone());
+                    }
+                }
+            }
+        }
+        // Also scan store for gotchas from prior inits not in current batch.
+        for prefix in &["gotcha:cochange:", "gotcha:revert:", "gotcha:ownership:"] {
+            if let Ok(stored) = store.scan_prefix(prefix).await {
+                for rec in &stored {
+                    if !matches!(rec.lifecycle, RecordLifecycle::Active) {
+                        continue;
+                    }
+                    if let Some(g) = rec.payload_as::<GotchaRecord>() {
+                        for file_path in &g.affected_files {
+                            let keys = path_to_all_keys.entry(file_path.clone()).or_default();
+                            if !keys.contains(&rec.key) {
+                                keys.push(rec.key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // For paths NOT in memory, load from store and patch gotcha_keys.
+        let mut patched: Vec<(String, Record)> = Vec::new();
+        for (path, gotcha_keys) in &path_to_all_keys {
+            if in_memory_paths.contains(path) {
+                continue; // Already handled by in-memory loop above.
+            }
+            let file_key = format!("file:{path}");
+            if let Ok(Some(mut record)) = store.get(&file_key).await {
+                if let Some(ref mut payload) = record.payload {
+                    if let Some(obj) = payload.as_object_mut() {
+                        let existing: Vec<String> = obj
+                            .get("gotcha_keys")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        let mut merged: Vec<String> = existing
+                            .into_iter()
+                            .filter(|k| {
+                                !k.starts_with("gotcha:cochange:")
+                                    && !k.starts_with("gotcha:revert:")
+                                    && !k.starts_with("gotcha:ownership:")
+                            })
+                            .collect();
+                        for k in gotcha_keys {
+                            if !merged.contains(k) {
+                                merged.push(k.clone());
+                            }
+                        }
+                        obj.insert(
+                            "gotcha_keys".to_string(),
+                            serde_json::json!(merged),
+                        );
+                    }
+                }
+                patched.push((file_key, record));
+            }
+        }
+        if !patched.is_empty() {
+            let pairs: Vec<(&str, &Record)> =
+                patched.iter().map(|(k, r)| (k.as_str(), r)).collect();
+            if let Err(e) = store.put_batch_kv_only(&pairs).await {
+                tracing::warn!("init: skipped-file gotcha_keys patch failed: {e}");
+            }
+        }
+    }
+
     // ── 9a. Implicit staleness — co-change partner propagation ───────────────
     // Files that changed ≥10% of their lines may have invalidated knowledge for
     // their co-change partners even though those partners weren't edited. Push
@@ -744,6 +836,36 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
         if let Err(e) = super::stale::seed_stale_cache(&store, &all_records).await {
             tracing::warn!("stale cache seed failed (non-fatal): {e}");
+        }
+    }
+
+    // ── 9c. HasGotcha edges from all auto-generated gotchas ────────────────────
+    // build_edges creates CoChanges + Imports edges but not HasGotcha. Generate
+    // HasGotcha edges from affected_files in every gotcha record so the graph
+    // traversal (mem_query graph mode, mem_bootstrap) sees them without repair.
+    {
+        let all_gotcha_recs = claude_import
+            .records
+            .iter()
+            .filter(|r| r.key.starts_with("gotcha:"))
+            .chain(cochange_record_structs.iter())
+            .chain(revert_record_structs.iter())
+            .chain(ownership_record_structs.iter());
+
+        for rec in all_gotcha_recs {
+            if !matches!(rec.lifecycle, RecordLifecycle::Active) {
+                continue;
+            }
+            let affected = rec
+                .payload_as::<GotchaRecord>()
+                .map(|g| g.affected_files)
+                .unwrap_or_default();
+            for file_path in &affected {
+                let file_key = format!("file:{file_path}");
+                layer0_edges
+                    .edges
+                    .push((file_key, EdgeKind::HasGotcha, rec.key.clone()));
+            }
         }
     }
 
