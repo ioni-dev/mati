@@ -679,7 +679,7 @@ type internalState struct {
         // All grouped imports extracted with quotes stripped
         for import in &["context", "fmt", "github.com/example/dep"] {
             assert!(
-                analysis.imports.contains(&import.to_string()),
+                analysis.imports.iter().any(|i| i.path == *import),
                 "expected import {import:?} in {:?}",
                 analysis.imports
             );
@@ -906,7 +906,7 @@ type Handler struct{}
         // ── net/http must appear in at least one file's imports ────────────────
         let any_net_http = analyses
             .iter()
-            .any(|(_, a)| a.imports.contains(&"net/http".to_string()));
+            .any(|(_, a)| a.imports.iter().any(|i| i.path == "net/http"));
 
         assert!(
             any_net_http,

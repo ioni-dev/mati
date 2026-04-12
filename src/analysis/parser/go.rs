@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, StaticFileAnalysis};
+use super::{extract_todo, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -137,7 +137,9 @@ pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnal
                 if let Ok(path) = node.utf8_text(src) {
                     // Strip surrounding quotes from the interpreted_string_literal
                     let stripped = path.trim_matches('"');
-                    out.imports.push(stripped.to_owned());
+                    let line = node.start_position().row as u32 + 1;
+                    out.imports
+                        .push(ImportStatement::new(stripped, ImportKind::Normal, line));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -270,7 +272,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let src = "package main\n\nimport \"fmt\"\n\nfunc main() {}\n";
         let a = parse(&dir, src);
-        assert!(a.imports.contains(&"fmt".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "fmt"));
     }
 
     #[test]
@@ -287,9 +289,9 @@ import (
 func main() {}
 "#;
         let a = parse(&dir, src);
-        assert!(a.imports.contains(&"fmt".to_owned()));
-        assert!(a.imports.contains(&"os".to_owned()));
-        assert!(a.imports.contains(&"net/http".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "fmt"));
+        assert!(a.imports.iter().any(|i| i.path == "os"));
+        assert!(a.imports.iter().any(|i| i.path == "net/http"));
     }
 
     #[test]
@@ -298,8 +300,8 @@ func main() {}
         let src = "package main\n\nimport \"encoding/json\"\n\nfunc F() {}\n";
         let a = parse(&dir, src);
         // Import should not contain surrounding quotes
-        assert!(a.imports.iter().all(|i| !i.starts_with('"')));
-        assert!(a.imports.contains(&"encoding/json".to_owned()));
+        assert!(a.imports.iter().all(|i| !i.path.starts_with('"')));
+        assert!(a.imports.iter().any(|i| i.path == "encoding/json"));
     }
 
     // ── TODOs ─────────────────────────────────────────────────────────────────

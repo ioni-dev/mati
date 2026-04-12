@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -144,7 +144,11 @@ pub(super) fn parse_java(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                         .trim_start_matches("static ")
                         .trim_end_matches(';')
                         .trim();
-                    out.imports.push(cleaned.to_owned());
+                    out.imports.push(ImportStatement::new(
+                        cleaned.to_owned(),
+                        ImportKind::Normal,
+                        node.start_position().row as u32 + 1,
+                    ));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -269,7 +273,7 @@ mod tests {
     fn import_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "import java.util.List;\npublic class Foo {}");
-        assert!(a.imports.contains(&"java.util.List".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "java.util.List"));
     }
 
     #[test]
@@ -279,7 +283,7 @@ mod tests {
             &dir,
             "import static java.lang.Math.PI;\npublic class Foo {}",
         );
-        assert!(a.imports.contains(&"java.lang.Math.PI".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "java.lang.Math.PI"));
     }
 
     // ── TODOs ────────────────────────────────────────────────────────────────
