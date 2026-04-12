@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -129,7 +129,11 @@ pub(super) fn parse_elixir(file: &WalkedFile, source: &str) -> Result<StaticFile
                         }
                         "import" | "alias" | "use" | "require" => {
                             if let Some(name) = extract_elixir_module_name(call_node, src) {
-                                out.imports.push(name);
+                                out.imports.push(ImportStatement::new(
+                                    name,
+                                    ImportKind::Normal,
+                                    node.start_position().row as u32 + 1,
+                                ));
                             }
                         }
                         "if" | "unless" | "cond" | "case" | "with" | "try" | "receive" => {
@@ -309,28 +313,28 @@ mod tests {
     fn import_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "defmodule Foo do\n  import Enum\nend\n");
-        assert!(a.imports.contains(&"Enum".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "Enum"));
     }
 
     #[test]
     fn alias_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "defmodule Foo do\n  alias MyApp.Utils\nend\n");
-        assert!(a.imports.contains(&"MyApp.Utils".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "MyApp.Utils"));
     }
 
     #[test]
     fn use_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "defmodule Foo do\n  use GenServer\nend\n");
-        assert!(a.imports.contains(&"GenServer".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "GenServer"));
     }
 
     #[test]
     fn require_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "defmodule Foo do\n  require Logger\nend\n");
-        assert!(a.imports.contains(&"Logger".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "Logger"));
     }
 
     #[test]

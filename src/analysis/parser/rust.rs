@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, StaticFileAnalysis};
+use super::{extract_todo, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -153,7 +153,9 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                 }
             } else if idx == ci.import {
                 if let Ok(path) = node.utf8_text(src) {
-                    out.imports.push(path.to_owned());
+                    let line = node.start_position().row as u32 + 1;
+                    let kind = classify_rust_import(path);
+                    out.imports.push(ImportStatement::new(path, kind, line));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -211,6 +213,27 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
     }
 
     Ok(out)
+}
+
+/// Classify a Rust `use` path into an ImportKind at extraction time.
+///
+/// - `crate::`, `self::`, `super::` prefixes → internal (Normal or Wildcard)
+/// - `::*` suffix → Wildcard
+/// - Everything else (std::, external crates) → External
+fn classify_rust_import(path: &str) -> ImportKind {
+    let is_internal = path.starts_with("crate::")
+        || path.starts_with("self::")
+        || path.starts_with("super::");
+
+    if !is_internal {
+        return ImportKind::External;
+    }
+
+    if path.ends_with("::*") {
+        ImportKind::Wildcard
+    } else {
+        ImportKind::Normal
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -326,7 +349,7 @@ mod tests {
     fn use_statement() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "use std::collections::HashMap;");
-        assert!(a.imports.iter().any(|i| i.contains("HashMap")));
+        assert!(a.imports.iter().any(|i| i.path.contains("HashMap")));
     }
 
     #[test]
@@ -334,6 +357,34 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "use std::fmt; use anyhow::Result;");
         assert_eq!(a.imports.len(), 2);
+    }
+
+    #[test]
+    fn import_classification_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use std::collections::HashMap;");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn import_classification_internal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::store::db;");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
+    }
+
+    #[test]
+    fn import_classification_wildcard() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::prelude::*;");
+        assert_eq!(a.imports[0].kind, ImportKind::Wildcard);
+    }
+
+    #[test]
+    fn import_line_number() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "// comment\nuse crate::foo;\n");
+        assert_eq!(a.imports[0].line, 2);
     }
 
     // ── Risk signals ──────────────────────────────────────────────────────────

@@ -153,7 +153,7 @@ pub async fn reparse_impl(
         path: rel_path.to_string(),
         purpose: old_fr.purpose,
         entry_points: public_api_symbols(&analysis),
-        imports: analysis.imports,
+        imports: analysis.imports.iter().map(|i| i.path.clone()).collect(),
         gotcha_keys: old_fr.gotcha_keys.clone(),
         decision_keys: old_fr.decision_keys,
         todos: analysis.todos,
@@ -301,7 +301,7 @@ pub async fn reparse_staged(
         path: rel_path.to_string(),
         purpose: old_fr.purpose,
         entry_points: public_api_symbols(&analysis),
-        imports: analysis.imports,
+        imports: analysis.imports.iter().map(|i| i.path.clone()).collect(),
         gotcha_keys: old_fr.gotcha_keys.clone(),
         decision_keys: old_fr.decision_keys,
         todos: analysis.todos,
@@ -342,7 +342,7 @@ fn build_file_record_from_analysis(
         path: rel_path.to_string(),
         purpose: String::new(),
         entry_points: public_api_symbols(analysis),
-        imports: analysis.imports.clone(),
+        imports: analysis.imports.iter().map(|i| i.path.clone()).collect(),
         gotcha_keys: vec![],
         decision_keys: vec![],
         todos: analysis.todos.clone(),
@@ -374,7 +374,7 @@ pub fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
         .collect();
 
     let old_imports: HashSet<&str> = old.imports.iter().map(|s| s.as_str()).collect();
-    let new_imports: HashSet<&str> = new.imports.iter().map(|s| s.as_str()).collect();
+    let new_imports: HashSet<&str> = new.imports.iter().map(|s| s.path.as_str()).collect();
 
     let imports_added: Vec<String> = new_imports
         .difference(&old_imports)
@@ -409,6 +409,7 @@ pub fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::parser::{ImportKind, ImportStatement};
     use crate::analysis::walker::Language;
     use tempfile::TempDir;
 
@@ -439,7 +440,10 @@ mod tests {
             language: Language::Rust,
             entry_points: vec!["main".into(), "new_fn".into()],
             exported_types: vec![],
-            imports: vec!["std::io".into(), "anyhow".into()],
+            imports: vec![
+                ImportStatement::new("std::io", ImportKind::Normal, 1),
+                ImportStatement::new("anyhow", ImportKind::Normal, 2),
+            ],
             todos: vec![],
             unsafe_count: 0,
             unwrap_count: 0,
@@ -504,7 +508,7 @@ mod tests {
             language: Language::Rust,
             entry_points: vec!["main".into()],
             exported_types: vec![],
-            imports: vec!["std::io".into()],
+            imports: vec![ImportStatement::new("std::io", ImportKind::Normal, 1)],
             todos: vec![],
             unsafe_count: 0,
             unwrap_count: 0,

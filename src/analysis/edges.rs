@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::analysis::parser::import::ImportKind;
 use crate::analysis::parser::StaticFileAnalysis;
 use crate::analysis::walker::{Language, WalkedFile};
 use crate::graph::EdgeKind;
@@ -55,13 +56,15 @@ pub fn build_edges(
 
         let from_key = file_key(&file.rel_path);
 
-        for import_path in &analysis.imports {
-            // Skip imports that are known-external (not intra-repo).
-            if is_external_import(import_path, file.language) {
+        for import_stmt in &analysis.imports {
+            // Skip imports classified as external at parse time.
+            if import_stmt.kind == ImportKind::External {
                 continue;
             }
 
-            if let Some(target_rel) = resolver.resolve(import_path, &file.rel_path, file.language) {
+            if let Some(target_rel) =
+                resolver.resolve(&import_stmt.path, &file.rel_path, file.language)
+            {
                 let to_key = file_key(&target_rel);
                 // No self-edges.
                 if from_key != to_key {
@@ -94,24 +97,6 @@ pub fn build_edges(
 /// Format a repo-relative path as a record key.
 fn file_key(rel_path: &str) -> String {
     format!("file:{rel_path}")
-}
-
-/// Returns true if the import is known to be external (not intra-repo)
-/// and should be skipped without counting as unresolved.
-fn is_external_import(import_path: &str, language: Language) -> bool {
-    match language {
-        // Rust: treat crate-relative and module-relative imports as internal.
-        Language::Rust => {
-            !(import_path.starts_with("crate::")
-                || import_path.starts_with("self::")
-                || import_path.starts_with("super::"))
-        }
-        // TS/JS: bare specifiers (no `.` prefix) are npm packages.
-        Language::TypeScript | Language::JavaScript => !import_path.starts_with('.'),
-        // Python: can't easily distinguish stdlib from local without a venv scan.
-        // Treat all Python imports as potentially resolvable.
-        _ => false,
-    }
 }
 
 // ── Import resolver ─────────────────────────────────────────────────────────
@@ -370,6 +355,7 @@ fn rust_module_segments(importing_file: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::parser::import::ImportStatement;
     use crate::analysis::parser::StaticFileAnalysis;
     use crate::analysis::walker::Language;
 
@@ -383,13 +369,54 @@ mod tests {
         }
     }
 
+    /// Classify an import string the same way the parsers do, for test ergonomics.
+    fn classify_import(path: &str, lang: Language) -> ImportStatement {
+        let kind = match lang {
+            Language::Rust => {
+                if path.ends_with("::*") {
+                    if path.starts_with("crate::")
+                        || path.starts_with("self::")
+                        || path.starts_with("super::")
+                    {
+                        ImportKind::Wildcard
+                    } else {
+                        ImportKind::External
+                    }
+                } else if path.starts_with("crate::")
+                    || path.starts_with("self::")
+                    || path.starts_with("super::")
+                {
+                    ImportKind::Normal
+                } else {
+                    ImportKind::External
+                }
+            }
+            Language::TypeScript | Language::JavaScript => {
+                if path.starts_with('.') {
+                    ImportKind::Relative
+                } else {
+                    ImportKind::External
+                }
+            }
+            Language::Python => {
+                if path.starts_with('.') {
+                    ImportKind::Relative
+                } else {
+                    ImportKind::Normal
+                }
+            }
+            _ => ImportKind::Normal,
+        };
+        ImportStatement::new(path, kind, 0)
+    }
+
     fn analysis(path: &str, lang: Language, imports: &[&str]) -> StaticFileAnalysis {
         StaticFileAnalysis {
             path: path.to_string(),
             language: lang,
             entry_points: vec![],
             exported_types: vec![],
-            imports: imports.iter().map(|s| s.to_string()).collect(),
+            imports: imports.iter().map(|s| classify_import(s, lang)).collect(),
             todos: vec![],
             unsafe_count: 0,
             unwrap_count: 0,

@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, StaticFileAnalysis};
+use super::{extract_todo, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -145,7 +145,13 @@ pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFile
                 }
             } else if idx == ci.import {
                 if let Ok(path) = node.utf8_text(src) {
-                    out.imports.push(path.to_owned());
+                    let line = node.start_position().row as u32 + 1;
+                    let kind = if path.starts_with('.') {
+                        ImportKind::Relative
+                    } else {
+                        ImportKind::Normal
+                    };
+                    out.imports.push(ImportStatement::new(path, kind, line));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -327,7 +333,7 @@ mod tests {
     fn import_statement() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "import os\n");
-        assert!(a.imports.contains(&"os".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "os"));
     }
 
     #[test]
@@ -337,14 +343,14 @@ mod tests {
         assert!(a
             .imports
             .iter()
-            .any(|i| i.contains("os.path") || i.contains("os")));
+            .any(|i| i.path.contains("os.path") || i.path.contains("os")));
     }
 
     #[test]
     fn from_import() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "from os import path\n");
-        assert!(a.imports.contains(&"os".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "os"));
     }
 
     #[test]
@@ -352,6 +358,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "from . import utils\n");
         assert!(!a.imports.is_empty());
+        assert_eq!(a.imports[0].kind, ImportKind::Relative);
+    }
+
+    #[test]
+    fn import_line_number() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "# comment\nimport os\n");
+        assert_eq!(a.imports[0].line, 2);
+    }
+
+    #[test]
+    fn absolute_import_classified_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "import django.conf\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
     }
 
     // ── Branches ──────────────────────────────────────────────────────────────
