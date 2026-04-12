@@ -1042,9 +1042,7 @@ impl MatiServer {
 
             match result {
                 Ok((rec, files)) => {
-                    return self
-                        .finalize_confirm(graph_arc, key, &rec, &files)
-                        .await;
+                    return self.finalize_confirm(graph_arc, key, &rec, &files).await;
                 }
                 Err(e) => {
                     let msg = format!("{e}");
@@ -1097,8 +1095,7 @@ impl MatiServer {
         }
 
         record.source = RecordSource::DeveloperManual;
-        record.confidence.value =
-            ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+        record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
         record.confidence.confirmation_count += 1;
         record.quality = quality::analyze(&record);
 
