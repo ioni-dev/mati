@@ -393,9 +393,9 @@ esac
             .spawn()
             .and_then(|mut child| {
                 if let Some(ref mut stdin) = child.stdin {
-                    stdin
-                        .write_all(stdin_json.as_bytes())
-                        .expect("failed to write to stdin");
+                    // BrokenPipe is expected when the script exits before
+                    // reading stdin (e.g. the no-op user-prompt hook).
+                    let _ = stdin.write_all(stdin_json.as_bytes());
                 }
                 // Drop stdin to send EOF
                 child.stdin.take();

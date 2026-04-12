@@ -1021,26 +1021,63 @@ impl MatiServer {
         graph_arc: &Arc<tokio::sync::RwLock<Graph>>,
         key: &str,
     ) -> String {
-        let graph = graph_arc.read().await;
-        let store = graph.store();
-
         if !key.starts_with("gotcha:") {
             return json!({"error": "confirm action only applies to gotcha: keys"}).to_string();
         }
 
-        let mut record = match store.get(key).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return json!({"error": format!("record not found: {key}")}).to_string(),
-            Err(e) => return json!({"error": format!("store get: {e}")}).to_string(),
-        };
+        // Retry loop: SurrealKV MVCC can return a transient write conflict
+        // when the confirm races with the preceding write on the same key.
+        // Each attempt acquires and releases the read lock to get a fresh snapshot.
+        const MAX_RETRIES: usize = 3;
+        let mut last_err: Option<String> = None;
+
+        for attempt in 0..MAX_RETRIES {
+            // Scope the read lock so it is dropped before finalize_confirm,
+            // which needs a write lock for graph edge updates.
+            let result = {
+                let graph = graph_arc.read().await;
+                let store = graph.store();
+                self.try_confirm_once(store, key).await
+            };
+
+            match result {
+                Ok((rec, files)) => {
+                    return self.finalize_confirm(graph_arc, key, &rec, &files).await;
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if msg.contains("write conflict") && attempt + 1 < MAX_RETRIES {
+                        tracing::debug!(
+                            "confirm {key}: write conflict (attempt {}), retrying",
+                            attempt + 1
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        last_err = Some(msg);
+                        continue;
+                    }
+                    return json!({"error": msg}).to_string();
+                }
+            }
+        }
+        json!({"error": format!("store put: {}", last_err.unwrap_or_default())}).to_string()
+    }
+
+    /// Single attempt at the confirm get-mutate-put cycle.
+    async fn try_confirm_once(
+        &self,
+        store: &crate::store::Store,
+        key: &str,
+    ) -> anyhow::Result<(Record, Vec<String>)> {
+        let mut record = store
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
 
         if record.category != Category::Gotcha {
-            return json!({"error": format!("{key} is not a gotcha record")}).to_string();
+            anyhow::bail!("{key} is not a gotcha record");
         }
-
         if !matches!(record.lifecycle, RecordLifecycle::Active) {
-            return json!({"error": format!("{key} is tombstoned — cannot confirm a deleted record")})
-                .to_string();
+            anyhow::bail!("{key} is tombstoned — cannot confirm a deleted record");
         }
 
         // Set confirmed + normalize severity
@@ -1070,18 +1107,29 @@ impl MatiServer {
         record.version.logical_clock += 1;
         record.version.wall_clock = now;
 
-        // Extract affected_files for file-link sync
         let affected_files: Vec<String> = record
             .payload_as::<GotchaRecord>()
             .map(|g| g.affected_files)
             .unwrap_or_default();
 
-        if let Err(e) = store.put(key, &record).await {
-            return json!({"error": format!("store put: {e}")}).to_string();
-        }
+        store.put(key, &record).await?;
+        Ok((record, affected_files))
+    }
+
+    /// Post-put work: sync file links, graph edges, consultation receipt.
+    async fn finalize_confirm(
+        &self,
+        graph_arc: &Arc<tokio::sync::RwLock<Graph>>,
+        key: &str,
+        record: &Record,
+        affected_files: &[String],
+    ) -> String {
+        // Acquire a fresh read lock for file-link sync.
+        let graph = graph_arc.read().await;
+        let store = graph.store();
 
         // Sync file:*.gotcha_keys — best-effort
-        for file_path in &affected_files {
+        for file_path in affected_files {
             let file_key = format!("file:{file_path}");
             if let Ok(Some(mut file_record)) = store.get(&file_key).await {
                 let needs_link = file_record
@@ -1106,7 +1154,7 @@ impl MatiServer {
         }
 
         // Propagate confirmation_count to linked file records
-        crate::store::gotcha_ops::propagate_confirmation_to_files(store, &affected_files).await;
+        crate::store::gotcha_ops::propagate_confirmation_to_files(store, affected_files).await;
 
         // Mint consultation receipt so hooks know this file was reviewed
         let _ = crate::store::session::log_hit(store, key).await;
@@ -1114,7 +1162,7 @@ impl MatiServer {
         let confidence_value = record.confidence.value;
         let quality_value = record.quality.value;
 
-        // Release the read lock so we can take a write lock for graph edge updates.
+        // Release the read lock before taking a write lock for graph edge updates.
         drop(graph);
 
         // Ensure HasGotcha edges exist in the in-memory graph for all affected files.
@@ -1123,7 +1171,7 @@ impl MatiServer {
         // the persistent store but were never loaded into the running graph.
         if !affected_files.is_empty() {
             let mut g = graph_arc.write().await;
-            for file_path in &affected_files {
+            for file_path in affected_files {
                 let file_key = format!("file:{file_path}");
                 let _ = g.add_edge(&file_key, EdgeKind::HasGotcha, key).await;
             }
