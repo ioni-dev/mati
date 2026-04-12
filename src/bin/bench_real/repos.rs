@@ -152,10 +152,12 @@ pub fn git_lang_counts(repo_root: &Path) -> Vec<(String, usize)> {
             "py" => "Python",
             "go" => "Go",
             "java" => "Java",
-            "kt" | "kts" => "Kotlin",
             "rb" => "Ruby",
             "c" | "h" => "C",
-            "cpp" | "cc" | "cxx" | "hpp" => "C++",
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "C++",
+            "scala" | "sc" => "Scala",
+            "ex" | "exs" => "Elixir",
+            "hs" | "lhs" => "Haskell",
             _ => "other",
         };
         *counts.entry(lang).or_insert(0) += 1;

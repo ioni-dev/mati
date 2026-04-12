@@ -11,9 +11,16 @@
 //! - Disk read skipped for unsupported languages.
 //! - Count-only captures: no text allocated for counting signals.
 
+mod c;
+mod cpp;
+mod elixir;
 mod go;
+mod haskell;
+mod java;
 mod python;
+mod ruby;
 mod rust;
+mod scala;
 mod typescript;
 
 use std::collections::HashMap;
@@ -215,6 +222,13 @@ fn is_parseable_language(language: Language) -> bool {
             | Language::JavaScript
             | Language::Python
             | Language::Go
+            | Language::Java
+            | Language::C
+            | Language::Cpp
+            | Language::Ruby
+            | Language::Scala
+            | Language::Elixir
+            | Language::Haskell
     )
 }
 
@@ -233,6 +247,13 @@ fn parse_file_from_source(file: &WalkedFile, source: &str) -> Result<StaticFileA
         Language::TypeScript | Language::JavaScript => typescript::parse_typescript(file, source),
         Language::Python => python::parse_python(file, source),
         Language::Go => go::parse_go(file, source),
+        Language::Java => java::parse_java(file, source),
+        Language::C => c::parse_c(file, source),
+        Language::Cpp => cpp::parse_cpp(file, source),
+        Language::Ruby => ruby::parse_ruby(file, source),
+        Language::Scala => scala::parse_scala(file, source),
+        Language::Elixir => elixir::parse_elixir(file, source),
+        Language::Haskell => haskell::parse_haskell(file, source),
         _ => Ok(StaticFileAnalysis::empty(file)),
     }
 }
@@ -397,9 +418,9 @@ mod tests {
     #[test]
     fn unsupported_language_skipped_without_disk_read() {
         let f = WalkedFile {
-            abs_path: PathBuf::from("/nonexistent/file.java"),
-            rel_path: "Main.java".to_owned(),
-            language: Language::Java,
+            abs_path: PathBuf::from("/nonexistent/file.txt"),
+            rel_path: "notes.txt".to_owned(),
+            language: Language::Unknown,
             size_bytes: 0,
             mtime_secs: 0,
         };
