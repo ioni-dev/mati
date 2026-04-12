@@ -64,6 +64,12 @@ pub enum Language {
     Python,
     Go,
     Java,
+    C,
+    Cpp,
+    Ruby,
+    Scala,
+    Elixir,
+    Haskell,
     Unknown,
 }
 
@@ -383,6 +389,15 @@ pub fn detect_language(path: &Path) -> Language {
         Some("py" | "pyi") => Language::Python,
         Some("go") => Language::Go,
         Some("java") => Language::Java,
+        Some("c") => Language::C,
+        // .h is ambiguous (C vs C++ vs ObjC). Defaults to C — C++ headers
+        // typically use .hpp/.hxx/.hh. This is a known, accepted heuristic.
+        Some("h") => Language::C,
+        Some("cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh") => Language::Cpp,
+        Some("rb") => Language::Ruby,
+        Some("scala" | "sc") => Language::Scala,
+        Some("ex" | "exs") => Language::Elixir,
+        Some("hs" | "lhs") => Language::Haskell,
         _ => Language::Unknown,
     }
 }
@@ -678,6 +693,48 @@ mod tests {
     #[test]
     fn detect_language_java() {
         assert_eq!(detect_language(Path::new("Main.java")), Language::Java);
+    }
+
+    #[test]
+    fn detect_language_c() {
+        assert_eq!(detect_language(Path::new("main.c")), Language::C);
+        assert_eq!(detect_language(Path::new("header.h")), Language::C);
+    }
+
+    #[test]
+    fn detect_language_cpp() {
+        assert_eq!(detect_language(Path::new("main.cpp")), Language::Cpp);
+        assert_eq!(detect_language(Path::new("util.cc")), Language::Cpp);
+        assert_eq!(detect_language(Path::new("lib.cxx")), Language::Cpp);
+        assert_eq!(detect_language(Path::new("header.hpp")), Language::Cpp);
+        assert_eq!(detect_language(Path::new("tmpl.hxx")), Language::Cpp);
+        assert_eq!(detect_language(Path::new("types.hh")), Language::Cpp);
+    }
+
+    #[test]
+    fn detect_language_ruby() {
+        assert_eq!(detect_language(Path::new("app.rb")), Language::Ruby);
+    }
+
+    #[test]
+    fn detect_language_scala() {
+        assert_eq!(detect_language(Path::new("Main.scala")), Language::Scala);
+        assert_eq!(detect_language(Path::new("script.sc")), Language::Scala);
+    }
+
+    #[test]
+    fn detect_language_elixir() {
+        assert_eq!(detect_language(Path::new("app.ex")), Language::Elixir);
+        assert_eq!(detect_language(Path::new("test.exs")), Language::Elixir);
+    }
+
+    #[test]
+    fn detect_language_haskell() {
+        assert_eq!(detect_language(Path::new("Main.hs")), Language::Haskell);
+        assert_eq!(
+            detect_language(Path::new("Literate.lhs")),
+            Language::Haskell
+        );
     }
 
     #[test]
