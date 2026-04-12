@@ -88,7 +88,8 @@ tree-sitter-java   = "0.23"
 tree-sitter-c      = "0.23"
 tree-sitter-cpp    = "0.23"
 tree-sitter-ruby   = "0.23"
-tree-sitter-kotlin = "0.3"
+# tree-sitter-kotlin: excluded — latest (0.3.8) requires tree-sitter <0.23.
+# Re-add when upstream targets tree-sitter 0.23+.
 tree-sitter-scala  = "0.23"
 tree-sitter-elixir = "0.3"
 tree-sitter-haskell = "0.23"
