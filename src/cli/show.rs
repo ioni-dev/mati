@@ -242,6 +242,29 @@ fn print_record(record: &Record, use_color: bool) {
     }
     println!();
 
+    // ── Blast radius (file records only) ────────────────────────────────────
+
+    if record.category == Category::File {
+        if let Some(fr) = record.payload_as::<FileRecord>() {
+            if let Some(ref br) = fr.blast_radius {
+                let tier_color = match br.tier {
+                    mati_core::analysis::blast_radius::BlastTier::Critical => red,
+                    mati_core::analysis::blast_radius::BlastTier::High => yellow,
+                    _ => gray,
+                };
+                println!("{blue}  blast radius{reset}");
+                println!("    direct         {white}{}{reset}", br.direct);
+                println!("    transitive     {white}{}{reset}", br.transitive);
+                println!("    score          {white}{:.1}{reset}", br.score);
+                println!(
+                    "    tier           {tier_color}{}{reset}",
+                    br.tier.label()
+                );
+                println!();
+            }
+        }
+    }
+
     // ── Metadata ──────────────────────────────────────────────────────────────
 
     let prio_color = pc(&record.priority);

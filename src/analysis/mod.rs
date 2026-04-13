@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use crate::store::record::FileRecord;
 
+pub mod blast_radius;
 pub mod claude_md;
 pub mod deps;
 pub mod edges;

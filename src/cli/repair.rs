@@ -83,7 +83,34 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     }
 
     let report = repair_gotcha_indexes(&store, mode).await?;
-    store.close().await?;
+
+    // Phase: recompute blast radius for all file records.
+    // Requires graph with Imports edges for traversal.
+    if mode == RepairMode::Full {
+        let graph = mati_core::graph::Graph::load(store).await?;
+        let file_records = graph.store().scan_prefix("file:").await.unwrap_or_default();
+        let mut blast_count = 0u32;
+        for record in &file_records {
+            let mut rec = record.clone();
+            if let Some(mut fr) =
+                rec.payload_as::<mati_core::store::record::FileRecord>()
+            {
+                let br = mati_core::analysis::blast_radius::BlastRadius::compute(
+                    &rec.key, &graph,
+                );
+                fr.blast_radius = Some(br);
+                rec.payload = serde_json::to_value(&fr).ok();
+                let _ = graph.store().put(&rec.key, &rec).await;
+                blast_count += 1;
+            }
+        }
+        if !args.json {
+            println!("  Blast radius recomputed for {blast_count} files.");
+        }
+        graph.close().await?;
+    } else {
+        store.close().await?;
+    }
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);

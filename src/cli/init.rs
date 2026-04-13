@@ -884,6 +884,33 @@ pub async fn run(args: InitArgs) -> Result<()> {
         t.elapsed().as_millis()
     );
 
+    // ── 10a. Compute blast radius for all files ──────────────────────────────
+    // Requires: graph loaded with Imports edges (Phase 10).
+    // Patches file records in the store with blast radius scores.
+    {
+        let t = Instant::now();
+        let store_ref = graph.store();
+        let mut blast_count = 0u32;
+        for fr in &file_records {
+            let file_key = format!("file:{}", fr.path);
+            let br =
+                mati_core::analysis::blast_radius::BlastRadius::compute(&file_key, &graph);
+            if let Ok(Some(mut record)) = store_ref.get(&file_key).await {
+                if let Some(mut stored_fr) = record.payload_as::<FileRecord>() {
+                    stored_fr.blast_radius = Some(br);
+                    record.payload = serde_json::to_value(&stored_fr).ok();
+                    let _ = store_ref.put(&file_key, &record).await;
+                    blast_count += 1;
+                }
+            }
+        }
+        println!(
+            "  Blast radius...                {:>4} files   {:>4}ms",
+            blast_count,
+            t.elapsed().as_millis()
+        );
+    }
+
     // ── 11a. Search index — deferred to first MCP server startup ─────────────
     // Cold init: tantivy costs ~400ms to index 27k records. CLI commands scan
     // KV directly and never need full-text search. Only the MCP server (via
