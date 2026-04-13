@@ -1,0 +1,20 @@
+{
+  "description": "Ruby project with require_relative imports",
+  "edges": [
+    {
+      "from": "lib/main.rb",
+      "to": "lib/auth.rb",
+      "comment": "main requires auth"
+    },
+    {
+      "from": "lib/main.rb",
+      "to": "lib/db.rb",
+      "comment": "main requires db"
+    },
+    {
+      "from": "lib/auth.rb",
+      "to": "lib/db.rb",
+      "comment": "auth requires db"
+    }
+  ]
+}

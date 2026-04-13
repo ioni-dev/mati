@@ -1,0 +1,30 @@
+{
+  "description": "C project with quoted includes resolved relative to importing file",
+  "edges": [
+    {
+      "from": "main.c",
+      "to": "auth.h",
+      "comment": "main.c includes auth.h"
+    },
+    {
+      "from": "main.c",
+      "to": "db.h",
+      "comment": "main.c includes db.h"
+    },
+    {
+      "from": "auth.h",
+      "to": "db.h",
+      "comment": "auth.h includes db.h"
+    },
+    {
+      "from": "auth.c",
+      "to": "auth.h",
+      "comment": "auth.c includes auth.h"
+    },
+    {
+      "from": "db.c",
+      "to": "db.h",
+      "comment": "db.c includes db.h"
+    }
+  ]
+}

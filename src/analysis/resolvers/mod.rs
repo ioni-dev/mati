@@ -19,12 +19,21 @@
 //! 2. Implement `LanguageResolver` for your struct
 //! 3. Register in `ResolverRegistry::new()`
 
+pub mod c;
+pub mod cpp;
+pub mod elixir;
+pub mod go;
+pub mod haskell;
+pub mod java;
 pub mod python;
+pub mod ruby;
 pub mod rust;
+pub mod scala;
 pub mod typescript;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::analysis::parser::import::ImportKind;
 use crate::analysis::parser::ImportStatement;
@@ -63,6 +72,7 @@ pub trait LanguageResolver: Send + Sync {
 /// are acceptable at Layer 0 scale — optimize if benchmarks show a hot spot.
 pub struct FileIndex {
     files: HashSet<String>,
+    root: Option<PathBuf>,
 }
 
 impl FileIndex {
@@ -70,7 +80,24 @@ impl FileIndex {
     pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
         Self {
             files: paths.into_iter().collect(),
+            root: None,
         }
+    }
+
+    /// Create a FileIndex with a repo root for file content access.
+    pub fn new_with_root(root: PathBuf, paths: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            files: paths.into_iter().collect(),
+            root: Some(root),
+        }
+    }
+
+    /// Read a file relative to the index root. Returns None if no root is
+    /// configured or the file can't be read. Resolvers that need content
+    /// access (like Go for go.mod) must tolerate None gracefully.
+    pub fn read_file(&self, rel_path: &str) -> Option<String> {
+        let root = self.root.as_ref()?;
+        std::fs::read_to_string(root.join(rel_path)).ok()
     }
 
     /// Check if a repo-relative path exists in the index.
@@ -123,6 +150,14 @@ impl ResolverRegistry {
             Language::JavaScript,
             Box::new(typescript::TypeScriptResolver),
         );
+        resolvers.insert(Language::Go, Box::new(go::GoResolver));
+        resolvers.insert(Language::Java, Box::new(java::JavaResolver));
+        resolvers.insert(Language::C, Box::new(c::CResolver));
+        resolvers.insert(Language::Cpp, Box::new(cpp::CppResolver));
+        resolvers.insert(Language::Ruby, Box::new(ruby::RubyResolver));
+        resolvers.insert(Language::Scala, Box::new(scala::ScalaResolver));
+        resolvers.insert(Language::Elixir, Box::new(elixir::ElixirResolver));
+        resolvers.insert(Language::Haskell, Box::new(haskell::HaskellResolver));
         Self { resolvers }
     }
 

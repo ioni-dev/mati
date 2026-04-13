@@ -1,0 +1,21 @@
+{
+  "description": "Go module with internal cross-package imports via go.mod",
+  "note": "Go resolves to the first non-test .go file in the target package directory. The exact file picked (user.go vs session.go) depends on HashSet iteration order.",
+  "edges": [
+    {
+      "from": "main.go",
+      "to_one_of": ["auth/user.go", "auth/session.go"],
+      "comment": "main imports github.com/example/simple/auth"
+    },
+    {
+      "from": "main.go",
+      "to": "db/client.go",
+      "comment": "main imports github.com/example/simple/db"
+    },
+    {
+      "from": "auth/user.go",
+      "to": "db/client.go",
+      "comment": "auth/user imports github.com/example/simple/db"
+    }
+  ]
+}

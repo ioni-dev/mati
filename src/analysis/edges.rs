@@ -3,17 +3,19 @@
 //! Converts import statements and git co-change pairs into typed edges
 //! ready for [`crate::graph::Graph::add_edges_batch`].
 //!
-//! Import resolution is best-effort: raw import paths (e.g. `crate::utils`)
-//! are resolved against the set of known walked files. Unresolvable imports
-//! (external crates, std lib, ambiguous paths) are silently skipped — Layer 0
-//! favours precision over recall.
+//! Import resolution is best-effort: structured `ImportStatement` values
+//! are resolved via the [`ResolverRegistry`] against the set of known
+//! walked files. External imports (classified at parse time) are skipped.
+//! Unresolvable imports are silently counted — Layer 0 favours precision
+//! over recall.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use crate::analysis::parser::import::ImportKind;
 use crate::analysis::parser::StaticFileAnalysis;
-use crate::analysis::walker::{Language, WalkedFile};
+use crate::analysis::resolvers::{FileIndex, ResolverRegistry};
+use crate::analysis::walker::WalkedFile;
 use crate::graph::EdgeKind;
 
 /// All edges produced by Layer 0 analysis, ready for batch insertion.
@@ -33,6 +35,17 @@ pub fn build_edges(
     analyses: &[StaticFileAnalysis],
     co_change_pairs: &[(String, String, u32)],
 ) -> Layer0Edges {
+    build_edges_with_root(files, analyses, co_change_pairs, None)
+}
+
+/// Build edges with an explicit repo root for resolvers that need file content
+/// access (e.g. Go's go.mod parsing).
+pub fn build_edges_with_root(
+    files: &[WalkedFile],
+    analyses: &[StaticFileAnalysis],
+    co_change_pairs: &[(String, String, u32)],
+    repo_root: Option<&Path>,
+) -> Layer0Edges {
     assert_eq!(
         files.len(),
         analyses.len(),
@@ -41,8 +54,21 @@ pub fn build_edges(
 
     let file_set: HashSet<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
 
-    // Build lookup tables for import resolution.
-    let resolver = ImportResolver::new(files);
+    // Derive the repo root from the first file if not provided explicitly.
+    let derived_root = repo_root.map(|p| p.to_path_buf()).or_else(|| {
+        files.first().and_then(|f| {
+            f.abs_path
+                .to_str()
+                .and_then(|abs| abs.strip_suffix(&f.rel_path))
+                .map(|r| Path::new(r.trim_end_matches('/')).to_path_buf())
+        })
+    });
+
+    let file_index = match derived_root {
+        Some(root) => FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone())),
+        None => FileIndex::new(files.iter().map(|f| f.rel_path.clone())),
+    };
+    let registry = ResolverRegistry::new();
 
     let mut edges: Vec<(String, EdgeKind, String)> = Vec::new();
     let mut unresolved_imports = 0usize;
@@ -63,7 +89,7 @@ pub fn build_edges(
             }
 
             if let Some(target_rel) =
-                resolver.resolve(&import_stmt.path, &file.rel_path, file.language)
+                registry.resolve(import_stmt, &file.rel_path, file.language, &file_index)
             {
                 let to_key = file_key(&target_rel);
                 // No self-edges.
@@ -97,257 +123,6 @@ pub fn build_edges(
 /// Format a repo-relative path as a record key.
 fn file_key(rel_path: &str) -> String {
     format!("file:{rel_path}")
-}
-
-// ── Import resolver ─────────────────────────────────────────────────────────
-
-/// Best-effort resolver that maps raw import paths to repo-relative file paths.
-///
-/// Strategy per language:
-/// - **Rust**: `crate::foo::bar` → try `src/foo/bar.rs`, `src/foo/bar/mod.rs`.
-///   Assumes standard `src/` layout — non-standard crate roots (e.g. `lib/`,
-///   workspace `crates/*/src/`) are not resolved. Acceptable Layer 0 limitation.
-/// - **Python**: `foo.bar` → try `foo/bar.py`, `foo/bar/__init__.py`;
-///   relative imports (`.foo`, `..foo`) resolved from importing file's directory.
-///   Triple-dot and deeper relative imports are not supported.
-/// - **TypeScript/JavaScript**: `./foo` → try with `.ts`, `.tsx`, `.js`, `.jsx`,
-///   `/index.ts`, `/index.js` suffixes; bare specifiers (no `.` prefix) are
-///   filtered by `is_external_import` before reaching the resolver.
-struct ImportResolver {
-    /// Set of all known repo-relative file paths for O(1) existence checks.
-    known_files: HashSet<String>,
-}
-
-impl ImportResolver {
-    fn new(files: &[WalkedFile]) -> Self {
-        let known_files: HashSet<String> = files.iter().map(|f| f.rel_path.clone()).collect();
-        Self { known_files }
-    }
-
-    /// Try to resolve an import path to a known repo-relative file path.
-    fn resolve(
-        &self,
-        import_path: &str,
-        importing_file: &str,
-        language: Language,
-    ) -> Option<String> {
-        match language {
-            Language::Rust => self.resolve_rust(import_path, importing_file),
-            Language::Python => self.resolve_python(import_path, importing_file),
-            Language::TypeScript | Language::JavaScript => {
-                self.resolve_ts_js(import_path, importing_file)
-            }
-            _ => None,
-        }
-    }
-
-    /// Rust: resolve `crate::`, `self::`, and `super::` module paths.
-    ///
-    fn resolve_rust(&self, import_path: &str, importing_file: &str) -> Option<String> {
-        let clean = import_path
-            .split(" as ")
-            .next()
-            .unwrap_or(import_path)
-            .trim()
-            .trim_end_matches("::*");
-        let current_module = rust_module_segments(importing_file)?;
-        let segments = if let Some(path) = clean.strip_prefix("crate::") {
-            parse_rust_segments(path)
-        } else if let Some(path) = clean.strip_prefix("self::") {
-            current_module
-                .iter()
-                .cloned()
-                .chain(parse_rust_segments(path))
-                .collect()
-        } else if clean.starts_with("super::") {
-            let mut remaining = clean;
-            let mut up = 0usize;
-            while let Some(rest) = remaining.strip_prefix("super::") {
-                remaining = rest;
-                up += 1;
-            }
-            if up > current_module.len() {
-                return None;
-            }
-            current_module[..current_module.len() - up]
-                .iter()
-                .cloned()
-                .chain(parse_rust_segments(remaining))
-                .collect()
-        } else {
-            return None;
-        };
-
-        if segments.is_empty() {
-            return None;
-        }
-
-        let fs_path = format!("src/{}", segments.join("/"));
-
-        // Try direct file: src/foo/bar.rs
-        let direct = format!("{fs_path}.rs");
-        if self.known_files.contains(&direct) {
-            return Some(direct);
-        }
-
-        // Try module directory: src/foo/bar/mod.rs
-        let mod_rs = format!("{fs_path}/mod.rs");
-        if self.known_files.contains(&mod_rs) {
-            return Some(mod_rs);
-        }
-
-        None
-    }
-
-    /// Python: `foo.bar` → `foo/bar.py` or `foo/bar/__init__.py`
-    ///
-    /// Relative imports (`.foo`, `..foo`) resolve from the importing file's
-    /// directory. Absolute imports resolve from the repo root.
-    fn resolve_python(&self, import_path: &str, importing_file: &str) -> Option<String> {
-        let (base_dir, module_path) = if let Some(stripped) = import_path.strip_prefix('.') {
-            // Relative import: resolve from importing file's parent.
-            let parent = Path::new(importing_file)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-
-            // Handle `..module` (double-dot = go up one more level)
-            if let Some(double_stripped) = stripped.strip_prefix('.') {
-                let grandparent = Path::new(&parent)
-                    .parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                (grandparent, double_stripped)
-            } else {
-                (parent, stripped)
-            }
-        } else {
-            (String::new(), import_path)
-        };
-
-        // Convert dots to slashes: foo.bar → foo/bar
-        let rel = module_path.replace('.', "/");
-
-        let prefix = if base_dir.is_empty() {
-            rel
-        } else {
-            format!("{base_dir}/{rel}")
-        };
-
-        // Try direct file: foo/bar.py
-        let py_file = format!("{prefix}.py");
-        if self.known_files.contains(&py_file) {
-            return Some(py_file);
-        }
-
-        // Try package: foo/bar/__init__.py
-        let init_file = format!("{prefix}/__init__.py");
-        if self.known_files.contains(&init_file) {
-            return Some(init_file);
-        }
-
-        None
-    }
-
-    /// TypeScript/JavaScript: resolve relative imports.
-    ///
-    /// Bare specifiers are already filtered by `is_external_import` before
-    /// this method is called. Relative paths are tried with standard extensions.
-    fn resolve_ts_js(&self, import_path: &str, importing_file: &str) -> Option<String> {
-        // Strip quotes if present (parser may include them).
-        let clean = import_path.trim_matches(|c| c == '\'' || c == '"');
-
-        let parent = Path::new(importing_file)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // Resolve the relative path.
-        let resolved = if parent.is_empty() {
-            // File is at repo root.
-            clean.strip_prefix("./").unwrap_or(clean).to_string()
-        } else {
-            let stripped = clean.strip_prefix("./").unwrap_or(clean);
-            normalize_path(&format!("{parent}/{stripped}"))
-        };
-
-        // If it already has an extension and exists, return it.
-        if self.known_files.contains(&resolved) {
-            return Some(resolved);
-        }
-
-        // Try standard extensions.
-        for ext in &[".ts", ".tsx", ".js", ".jsx"] {
-            let with_ext = format!("{resolved}{ext}");
-            if self.known_files.contains(&with_ext) {
-                return Some(with_ext);
-            }
-        }
-
-        // Try index file in directory.
-        for ext in &[".ts", ".tsx", ".js", ".jsx"] {
-            let index = format!("{resolved}/index{ext}");
-            if self.known_files.contains(&index) {
-                return Some(index);
-            }
-        }
-
-        None
-    }
-}
-
-/// Normalize `../` segments in a path string.
-fn normalize_path(path: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
-            ".." => {
-                parts.pop();
-            }
-            "." | "" => {}
-            s => parts.push(s),
-        }
-    }
-    parts.join("/")
-}
-
-fn parse_rust_segments(path: &str) -> Vec<String> {
-    path.split("::")
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty() && *segment != "self")
-        .map(|segment| segment.to_string())
-        .collect()
-}
-
-fn rust_module_segments(importing_file: &str) -> Option<Vec<String>> {
-    let rel = importing_file.strip_prefix("src/")?;
-
-    if rel == "lib.rs" || rel == "main.rs" {
-        return Some(Vec::new());
-    }
-
-    if let Some(parent) = rel.strip_suffix("/mod.rs") {
-        return Some(
-            parent
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-                .map(|segment| segment.to_string())
-                .collect(),
-        );
-    }
-
-    let path = Path::new(rel);
-    let stem = path.file_stem()?.to_str()?;
-    let mut segments: Vec<String> = path
-        .parent()
-        .into_iter()
-        .flat_map(|parent| parent.iter())
-        .filter_map(|segment| segment.to_str())
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| segment.to_string())
-        .collect();
-    segments.push(stem.to_string());
-    Some(segments)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -811,14 +586,5 @@ mod tests {
         let result = build_edges(&[], &[], &[]);
         assert_eq!(result.edges.len(), 0);
         assert_eq!(result.unresolved_imports, 0);
-    }
-
-    // ── normalize_path ──────────────────────────────────────────────────────
-
-    #[test]
-    fn normalize_path_resolves_parent_refs() {
-        assert_eq!(normalize_path("src/components/../utils"), "src/utils");
-        assert_eq!(normalize_path("a/b/c/../../d"), "a/d");
-        assert_eq!(normalize_path("./foo/bar"), "foo/bar");
     }
 }

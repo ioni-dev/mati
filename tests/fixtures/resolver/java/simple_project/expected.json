@@ -1,0 +1,20 @@
+{
+  "description": "Java Maven-layout project with cross-package imports",
+  "edges": [
+    {
+      "from": "src/main/java/com/acme/app/Main.java",
+      "to": "src/main/java/com/acme/auth/UserService.java",
+      "comment": "Main imports com.acme.auth.UserService"
+    },
+    {
+      "from": "src/main/java/com/acme/app/Main.java",
+      "to": "src/main/java/com/acme/db/DbClient.java",
+      "comment": "Main imports com.acme.db.DbClient"
+    },
+    {
+      "from": "src/main/java/com/acme/auth/UserService.java",
+      "to": "src/main/java/com/acme/db/DbClient.java",
+      "comment": "UserService imports com.acme.db.DbClient"
+    }
+  ]
+}
