@@ -916,6 +916,32 @@ pub(crate) async fn socket_dispatch(
             if let Err(e) = crate::analysis::reparse::reparse_impl(store, repo_root, path).await {
                 tracing::warn!("daemon socket edit_hook: reparse failed (non-fatal): {e}");
             }
+
+            // Incremental blast radius update: recompute for the modified file,
+            // its direct importers, and the files it imports.
+            {
+                use crate::analysis::blast_radius::BlastRadius;
+                use crate::graph::edges::EdgeKind;
+
+                let mut keys_to_update = vec![file_key.clone()];
+                // Files that import this file (their blast radius may change if
+                // this file's import list changed).
+                keys_to_update.extend(g.neighbors_incoming(&file_key, &EdgeKind::Imports));
+                // Files this file imports (this file now counts as an importer).
+                keys_to_update.extend(g.neighbors(&file_key, &EdgeKind::Imports));
+
+                for key in keys_to_update {
+                    let br = BlastRadius::compute(&key, &g);
+                    if let Ok(Some(mut rec)) = store.get(&key).await {
+                        if let Some(mut fr) = rec.payload_as::<crate::store::record::FileRecord>() {
+                            fr.blast_radius = Some(br);
+                            rec.payload = serde_json::to_value(&fr).ok();
+                            let _ = store.put(&key, &rec).await;
+                        }
+                    }
+                }
+            }
+
             SocketResponse::ok(serde_json::Value::Null)
         }
 
@@ -1359,6 +1385,7 @@ mod tests {
             last_modified_session: 0,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
         };
         Record {
             key: format!("file:{path}"),

@@ -364,6 +364,20 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
         ));
     }
 
+    // Blast radius warning for high-impact files.
+    {
+        let blast_tier = json_str(file_record, "/payload/blast_radius/tier");
+        if blast_tier == "high" || blast_tier == "critical" {
+            let blast_direct = file_record
+                .pointer("/payload/blast_radius/direct")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            context_lines.push(format!(
+                "\u{26a0} Blast radius: {blast_direct} direct importers ({blast_tier}) — modify carefully"
+            ));
+        }
+    }
+
     // ── Deny path ───────────────────────────────────────────────────────
     if deny_signal {
         if input.already_consulted {
@@ -1024,6 +1038,79 @@ mod tests {
             assert!(context.contains("Do not use unwrap here"));
         } else {
             panic!("expected AlreadyConsulted, got {:?}", result.decision);
+        }
+    }
+
+    #[test]
+    fn eval_blast_radius_warning_for_critical_file() {
+        let mut file_record = make_file_record(0.5, 0.5, 0.1, "fresh", &[]);
+        // Inject blast_radius into payload
+        file_record
+            .as_object_mut()
+            .unwrap()
+            .get_mut("payload")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "blast_radius".into(),
+                json!({ "direct": 45, "transitive": 10, "score": 48.0, "tier": "critical" }),
+            );
+
+        let input = EnforcementInput {
+            rel_path: "src/core.rs".into(),
+            file_record: Some(file_record),
+            gotcha_records: HashMap::new(),
+            already_consulted: false,
+        };
+        let result = evaluate(&input);
+        if let Decision::Advisory { context } = &result.decision {
+            assert!(
+                context.contains("Blast radius"),
+                "advisory context must include blast radius warning, got: {context}"
+            );
+            assert!(
+                context.contains("45"),
+                "warning must include direct count"
+            );
+            assert!(
+                context.contains("critical"),
+                "warning must include tier"
+            );
+        } else {
+            panic!("expected Advisory, got {:?}", result.decision);
+        }
+    }
+
+    #[test]
+    fn eval_no_blast_warning_for_low_file() {
+        let mut file_record = make_file_record(0.5, 0.5, 0.1, "fresh", &[]);
+        file_record
+            .as_object_mut()
+            .unwrap()
+            .get_mut("payload")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "blast_radius".into(),
+                json!({ "direct": 2, "transitive": 0, "score": 2.0, "tier": "low" }),
+            );
+
+        let input = EnforcementInput {
+            rel_path: "src/leaf.rs".into(),
+            file_record: Some(file_record),
+            gotcha_records: HashMap::new(),
+            already_consulted: false,
+        };
+        let result = evaluate(&input);
+        if let Decision::Advisory { context } = &result.decision {
+            assert!(
+                !context.contains("Blast radius"),
+                "low blast radius file should NOT have warning, got: {context}"
+            );
+        } else {
+            panic!("expected Advisory, got {:?}", result.decision);
         }
     }
 }

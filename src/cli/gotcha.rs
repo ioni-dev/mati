@@ -838,6 +838,7 @@ mod tests {
             last_modified_session: now,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
         };
         let mut record = Record::layer0_file_stub(key, uuid::Uuid::new_v4(), 1, now);
         record.payload = serde_json::to_value(&file).ok();

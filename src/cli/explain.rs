@@ -91,6 +91,33 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         );
     }
 
+    // Blast radius — show only when populated
+    if let Some(ref br) = fr.as_ref().and_then(|f| f.blast_radius.as_ref()) {
+        use mati_core::analysis::blast_radius::BlastTier;
+        let tier_label = br.tier.label();
+        let tier_color = match br.tier {
+            BlastTier::Critical => colors::RED,
+            BlastTier::High => colors::YELLOW,
+            _ => colors::GRAY,
+        };
+        if use_color {
+            println!(
+                "  {GRAY}blast radius: {direct} direct, {transitive} transitive ({color}{tier}{RESET}{GRAY}){RESET}",
+                GRAY = colors::GRAY,
+                RESET = colors::RESET,
+                color = tier_color,
+                direct = br.direct,
+                transitive = br.transitive,
+                tier = tier_label,
+            );
+        } else {
+            println!(
+                "  blast radius: {} direct, {} transitive ({})",
+                br.direct, br.transitive, tier_label,
+            );
+        }
+    }
+
     // Staleness warning — show only when it matters
     match file_rec.staleness.tier {
         StalenessTier::Stale => {
