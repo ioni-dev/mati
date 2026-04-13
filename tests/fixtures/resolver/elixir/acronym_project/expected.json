@@ -1,0 +1,15 @@
+{
+  "description": "Elixir project with acronym module names to verify camel_to_snake fix",
+  "edges": [
+    {
+      "from": "lib/my_app.ex",
+      "to": "lib/my_app/http_server.ex",
+      "comment": "MyApp aliases MyApp.HTTPServer → lib/my_app/http_server.ex"
+    },
+    {
+      "from": "lib/my_app.ex",
+      "to": "lib/my_app/xml_parser.ex",
+      "comment": "MyApp aliases MyApp.XMLParser → lib/my_app/xml_parser.ex"
+    }
+  ]
+}

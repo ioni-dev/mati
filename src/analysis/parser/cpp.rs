@@ -169,13 +169,18 @@ pub(super) fn parse_cpp(file: &WalkedFile, source: &str) -> Result<StaticFileAna
                 }
             } else if idx == ci.include {
                 if let Ok(path) = node.utf8_text(src) {
+                    let kind = if path.starts_with('<') {
+                        ImportKind::External
+                    } else {
+                        ImportKind::Relative
+                    };
                     let stripped = path
                         .trim_matches('"')
                         .trim_start_matches('<')
                         .trim_end_matches('>');
                     out.imports.push(ImportStatement::new(
                         stripped.to_owned(),
-                        ImportKind::Normal,
+                        kind,
                         node.start_position().row as u32 + 1,
                     ));
                 }

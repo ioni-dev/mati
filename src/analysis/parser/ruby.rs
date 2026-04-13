@@ -183,9 +183,16 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                     .find(|c| c.index == ci.call_name)
                     .map(|c| c.node.start_position().row as u32 + 1)
                     .unwrap_or(1);
+                // require_relative resolves relative to the current file.
+                // require is typically a gem/stdlib — kept as Normal (unresolvable at Layer 0).
+                let kind = if name == "require_relative" {
+                    ImportKind::Relative
+                } else {
+                    ImportKind::Normal
+                };
                 out.imports.push(ImportStatement::new(
                     arg.to_owned(),
-                    ImportKind::Normal,
+                    kind,
                     line,
                 ));
             }
