@@ -252,8 +252,34 @@ impl MatiServer {
                         // Build the response FIRST — must return before the MCP
                         // client's response timeout. Codex closes the stdio pipe
                         // within ~100ms of sending a request if no response arrives.
-                        let response = serde_json::to_string_pretty(&record_to_agent_json(&record))
-                            .unwrap_or_else(|e| {
+                        let mut agent_json = record_to_agent_json(&record);
+
+                        // Inject blast radius warning for high-impact files.
+                        if record.category == Category::File {
+                            if let Some(payload) = &record.payload {
+                                if let Ok(fr) = serde_json::from_value::<
+                                    crate::store::record::FileRecord,
+                                >(payload.clone())
+                                {
+                                    if let Some(ref br) = fr.blast_radius {
+                                        use crate::analysis::blast_radius::BlastTier;
+                                        if matches!(br.tier, BlastTier::High | BlastTier::Critical)
+                                        {
+                                            let warning = format!(
+                                                "HIGH IMPACT FILE: {} files directly depend on this. Modify with extra care.",
+                                                br.direct
+                                            );
+                                            if let Some(obj) = agent_json.as_object_mut() {
+                                                obj.insert("warnings".into(), json!([warning]));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let response =
+                            serde_json::to_string_pretty(&agent_json).unwrap_or_else(|e| {
                                 format!("{{\"error\": \"serialization failed: {e}\"}}")
                             });
 
@@ -1594,6 +1620,47 @@ pub async fn assemble_context_packet(
         }
     }
 
+    // Highest-impact files in context — sorted by blast radius score descending.
+    // Only shown when at least one file has a non-isolated blast radius.
+    {
+        use crate::analysis::blast_radius::BlastTier;
+        let mut impact_files: Vec<(&FileRecord, f32)> = file_records
+            .iter()
+            .filter_map(|fr| {
+                fr.blast_radius.as_ref().and_then(|br| {
+                    if br.tier == BlastTier::Isolated {
+                        None
+                    } else {
+                        Some((fr, br.score))
+                    }
+                })
+            })
+            .collect();
+        impact_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        if !impact_files.is_empty() {
+            let mut impact_section = String::from("## Highest Impact Files\n");
+            for (fr, _score) in impact_files.iter().take(3) {
+                let br = fr.blast_radius.as_ref().unwrap();
+                let line = format!(
+                    "- `{}`: {} direct importers ({})\n",
+                    fr.path,
+                    br.direct,
+                    br.tier.label(),
+                );
+                let tokens = estimate_tokens(&line);
+                if used_tokens + tokens > available_tokens {
+                    break;
+                }
+                impact_section.push_str(&line);
+                used_tokens += tokens;
+            }
+            if impact_section.len() > "## Highest Impact Files\n".len() {
+                sections.push(impact_section);
+            }
+        }
+    }
+
     // M-13-B: Stale Warnings section — BEFORE Decisions
     if !stale_warnings.is_empty() {
         let mut stale_section = String::from("## Stale Warnings\n");
@@ -1777,6 +1844,105 @@ mod tests {
             .await;
         assert!(result.contains("gotcha:test"));
         assert!(result.contains("test value"));
+    }
+
+    #[tokio::test]
+    async fn mem_get_blast_radius_warning_for_critical_file() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/core.rs".to_string(),
+            purpose: "Core module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 100,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: Some(crate::analysis::blast_radius::BlastRadius {
+                direct: 45,
+                transitive: 10,
+                score: 48.0,
+                tier: crate::analysis::blast_radius::BlastTier::Critical,
+            }),
+            propagated_staleness: None,
+        };
+        let mut record = make_record("file:src/core.rs", "Core module", Category::File, 0.5);
+        record.payload = serde_json::to_value(&fr).ok();
+        store.put("file:src/core.rs", &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_get(Parameters(MemGetParams {
+                key: "file:src/core.rs".to_string(),
+            }))
+            .await;
+
+        assert!(
+            result.contains("HIGH IMPACT FILE"),
+            "response must contain blast radius warning for critical file, got: {result}"
+        );
+        assert!(result.contains("45"), "warning must include direct count");
+    }
+
+    #[tokio::test]
+    async fn mem_get_no_blast_warning_for_low_file() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let fr = FileRecord {
+            path: "src/leaf.rs".to_string(),
+            purpose: "Leaf module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 100,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: Some(crate::analysis::blast_radius::BlastRadius {
+                direct: 2,
+                transitive: 0,
+                score: 2.0,
+                tier: crate::analysis::blast_radius::BlastTier::Low,
+            }),
+            propagated_staleness: None,
+        };
+        let mut record = make_record("file:src/leaf.rs", "Leaf module", Category::File, 0.5);
+        record.payload = serde_json::to_value(&fr).ok();
+        store.put("file:src/leaf.rs", &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let server = MatiServer::new(graph);
+
+        let result = server
+            .mem_get(Parameters(MemGetParams {
+                key: "file:src/leaf.rs".to_string(),
+            }))
+            .await;
+
+        assert!(
+            !result.contains("HIGH IMPACT FILE"),
+            "low blast radius file should NOT have warning"
+        );
     }
 
     // ── mem_query tests ──────────────────────────────────────────────────────
@@ -2057,6 +2223,8 @@ mod tests {
                 last_modified_session: now(),
                 content_hash: None,
                 line_count: 0,
+                blast_radius: None,
+                propagated_staleness: None,
             };
             let mut r = make_record(
                 "file:src/pipeline/prefilter.rs",
@@ -2130,6 +2298,8 @@ mod tests {
                 last_modified_session: now(),
                 content_hash: None,
                 line_count: 0,
+                blast_radius: None,
+                propagated_staleness: None,
             };
             let mut r = make_record("file:src/empty.rs", "", Category::File, 0.10);
             r.payload = serde_json::to_value(&fr).ok();
@@ -2176,6 +2346,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record("file:src/hot.rs", &fr.purpose, Category::File, 0.5);
         file_record.payload = serde_json::to_value(&fr).ok();
@@ -2225,6 +2397,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record("file:src/cold.rs", &fr.purpose, Category::File, 0.5);
         file_record.payload = serde_json::to_value(&fr).ok();
@@ -2264,6 +2438,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/covered.rs",
@@ -2376,6 +2552,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",
@@ -2429,6 +2607,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/dead.rs",
@@ -2478,6 +2658,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/dup.rs",
@@ -2555,6 +2737,8 @@ mod tests {
             last_modified_session: now(),
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",
@@ -3788,5 +3972,100 @@ mod tests {
         let resolved = result.unwrap();
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap().key, "file:test.rs");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_highest_impact_section_appears() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Create a critical-blast-radius file record
+        let fr_critical = FileRecord {
+            path: "src/core.rs".to_string(),
+            purpose: "Core module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 100,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: Some(crate::analysis::blast_radius::BlastRadius {
+                direct: 45,
+                transitive: 10,
+                score: 48.0,
+                tier: crate::analysis::blast_radius::BlastTier::Critical,
+            }),
+            propagated_staleness: None,
+        };
+        let mut rec = make_record("file:src/core.rs", "Core module", Category::File, 0.5);
+        rec.payload = serde_json::to_value(&fr_critical).ok();
+        store.put("file:src/core.rs", &rec).await.unwrap();
+
+        // Create a low-blast-radius file record
+        let fr_low = FileRecord {
+            path: "src/leaf.rs".to_string(),
+            purpose: "Leaf module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 100,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: Some(crate::analysis::blast_radius::BlastRadius {
+                direct: 3,
+                transitive: 0,
+                score: 3.0,
+                tier: crate::analysis::blast_radius::BlastTier::Low,
+            }),
+            propagated_staleness: None,
+        };
+        let mut rec2 = make_record("file:src/leaf.rs", "Leaf module", Category::File, 0.5);
+        rec2.payload = serde_json::to_value(&fr_low).ok();
+        store.put("file:src/leaf.rs", &rec2).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(
+            graph.store(),
+            &graph,
+            &["src/core.rs".to_string(), "src/leaf.rs".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            packet.injection_string.contains("Highest Impact"),
+            "bootstrap must include highest impact section, got: {}",
+            packet.injection_string
+        );
+        assert!(
+            packet.injection_string.contains("src/core.rs"),
+            "critical file must appear in impact section"
+        );
+        // core.rs (score 48) should appear before leaf.rs (score 3)
+        let core_pos = packet.injection_string.find("src/core.rs").unwrap();
+        let leaf_pos = packet
+            .injection_string
+            .find("src/leaf.rs")
+            .unwrap_or(usize::MAX);
+        assert!(
+            core_pos < leaf_pos,
+            "core.rs should appear before leaf.rs in impact section"
+        );
     }
 }

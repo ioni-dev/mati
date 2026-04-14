@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, StaticFileAnalysis};
+use super::{extract_todo, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -137,7 +137,13 @@ pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnal
                 if let Ok(path) = node.utf8_text(src) {
                     // Strip surrounding quotes from the interpreted_string_literal
                     let stripped = path.trim_matches('"');
-                    out.imports.push(stripped.to_owned());
+                    let line = node.start_position().row as u32 + 1;
+                    let kind = if is_go_stdlib(stripped) {
+                        ImportKind::External
+                    } else {
+                        ImportKind::Normal
+                    };
+                    out.imports.push(ImportStatement::new(stripped, kind, line));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -183,6 +189,13 @@ pub(super) fn parse_go(file: &WalkedFile, source: &str) -> Result<StaticFileAnal
 /// Returns true if the identifier is exported in Go (first char is uppercase).
 fn is_exported(name: &str) -> bool {
     name.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Go stdlib packages have no dot in their first path segment. External
+/// packages always start with a domain: `github.com`, `gopkg.in`, etc.
+fn is_go_stdlib(import_path: &str) -> bool {
+    let first_segment = import_path.split('/').next().unwrap_or("");
+    !first_segment.contains('.')
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -270,7 +283,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let src = "package main\n\nimport \"fmt\"\n\nfunc main() {}\n";
         let a = parse(&dir, src);
-        assert!(a.imports.contains(&"fmt".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "fmt"));
     }
 
     #[test]
@@ -287,9 +300,9 @@ import (
 func main() {}
 "#;
         let a = parse(&dir, src);
-        assert!(a.imports.contains(&"fmt".to_owned()));
-        assert!(a.imports.contains(&"os".to_owned()));
-        assert!(a.imports.contains(&"net/http".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "fmt"));
+        assert!(a.imports.iter().any(|i| i.path == "os"));
+        assert!(a.imports.iter().any(|i| i.path == "net/http"));
     }
 
     #[test]
@@ -298,8 +311,8 @@ func main() {}
         let src = "package main\n\nimport \"encoding/json\"\n\nfunc F() {}\n";
         let a = parse(&dir, src);
         // Import should not contain surrounding quotes
-        assert!(a.imports.iter().all(|i| !i.starts_with('"')));
-        assert!(a.imports.contains(&"encoding/json".to_owned()));
+        assert!(a.imports.iter().all(|i| !i.path.starts_with('"')));
+        assert!(a.imports.iter().any(|i| i.path == "encoding/json"));
     }
 
     // ── TODOs ─────────────────────────────────────────────────────────────────
@@ -405,5 +418,42 @@ func main() {}
         let src = "package main\nfunc F() {\n    for i := 0; i < 10; i++ {\n    }\n}\n";
         let a = parse(&dir, src);
         assert_eq!(a.branch_count, 1);
+    }
+
+    // ── Stdlib classification tests ──────────────────────────────────────────
+
+    #[test]
+    fn fmt_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "package main\nimport \"fmt\"\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn net_http_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "package main\nimport \"net/http\"\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn encoding_json_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "package main\nimport \"encoding/json\"\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn github_com_is_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "package main\nimport \"github.com/acme/foo\"\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
+    }
+
+    #[test]
+    fn gopkg_in_is_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "package main\nimport \"gopkg.in/yaml.v3\"\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
     }
 }

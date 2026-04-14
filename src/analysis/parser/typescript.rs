@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, StaticFileAnalysis};
+use super::{extract_todo, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -243,7 +243,13 @@ fn parse_ecma(
                 if let Ok(raw) = node.utf8_text(src) {
                     // Strip surrounding quotes: "react" → react
                     let path = raw.trim_matches(|c| c == '"' || c == '\'');
-                    out.imports.push(path.to_owned());
+                    let line = node.start_position().row as u32 + 1;
+                    let kind = if path.starts_with('.') {
+                        ImportKind::Relative
+                    } else {
+                        ImportKind::External
+                    };
+                    out.imports.push(ImportStatement::new(path, kind, line));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -399,7 +405,7 @@ mod tests {
     fn ts_re_export_source_in_imports() {
         let dir = TempDir::new().unwrap();
         let a = parse_ts(&dir, "export { foo } from './module';");
-        assert!(a.imports.contains(&"./module".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "./module"));
     }
 
     // ── Imports ───────────────────────────────────────────────────────────────
@@ -408,14 +414,14 @@ mod tests {
     fn ts_import_strips_quotes() {
         let dir = TempDir::new().unwrap();
         let a = parse_ts(&dir, "import { useState } from 'react';");
-        assert!(a.imports.contains(&"react".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "react"));
     }
 
     #[test]
     fn ts_import_double_quotes() {
         let dir = TempDir::new().unwrap();
         let a = parse_ts(&dir, r#"import express from "express";"#);
-        assert!(a.imports.contains(&"express".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "express"));
     }
 
     #[test]
@@ -423,6 +429,27 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let a = parse_ts(&dir, "import a from 'a';\nimport b from 'b';");
         assert_eq!(a.imports.len(), 2);
+    }
+
+    #[test]
+    fn ts_import_relative_classified() {
+        let dir = TempDir::new().unwrap();
+        let a = parse_ts(&dir, "import { foo } from './utils';");
+        assert_eq!(a.imports[0].kind, ImportKind::Relative);
+    }
+
+    #[test]
+    fn ts_import_external_classified() {
+        let dir = TempDir::new().unwrap();
+        let a = parse_ts(&dir, "import React from 'react';");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn ts_import_line_number() {
+        let dir = TempDir::new().unwrap();
+        let a = parse_ts(&dir, "// header\nimport x from 'x';");
+        assert_eq!(a.imports[0].line, 2);
     }
 
     // ── Risk signals ──────────────────────────────────────────────────────────
@@ -523,7 +550,7 @@ mod tests {
     fn js_import() {
         let dir = TempDir::new().unwrap();
         let a = parse_js(&dir, "import express from 'express';");
-        assert!(a.imports.contains(&"express".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "express"));
     }
 
     // ── Edge cases ────────────────────────────────────────────────────────────

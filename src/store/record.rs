@@ -699,6 +699,15 @@ pub struct FileRecord {
     /// Newline count at last scan (≈ line count). 0 for non-parseable files.
     #[serde(default)]
     pub line_count: u32,
+    /// Blast radius — how many files depend on this one (direct + transitive).
+    /// Computed during `mati init` Phase 10a from Imports edges in the graph.
+    /// `None` for stores created before blast radius was introduced.
+    #[serde(default)]
+    pub blast_radius: Option<crate::analysis::blast_radius::BlastRadius>,
+    /// Staleness inherited from upstream stale sources via Imports edges.
+    /// `None` for stores created before staleness propagation was introduced.
+    #[serde(default)]
+    pub propagated_staleness: Option<crate::analysis::propagation::PropagatedStaleness>,
 }
 
 impl FileRecord {
@@ -738,6 +747,8 @@ impl FileRecord {
             last_modified_session,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         }
     }
 }
@@ -999,6 +1010,8 @@ mod tests {
             last_modified_session: 1_710_520_800,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         }
     }
 
@@ -1049,6 +1062,34 @@ mod tests {
     #[test]
     fn file_record_serde_roundtrip() {
         assert_serde_roundtrip(&sample_file_record());
+    }
+
+    /// Old stores serialized FileRecord without the `blast_radius` field.
+    /// `#[serde(default)]` on the field must make deserialization succeed
+    /// with `blast_radius == None`.
+    #[test]
+    fn file_record_backward_compat_no_blast_radius() {
+        let json = r#"{
+            "path": "src/main.rs",
+            "purpose": "Entry point",
+            "entry_points": ["main"],
+            "imports": [],
+            "gotcha_keys": [],
+            "decision_keys": [],
+            "todos": [],
+            "unsafe_count": 0,
+            "unwrap_count": 0,
+            "change_frequency": 5,
+            "last_author": "dev",
+            "is_hotspot": false,
+            "token_cost_estimate": 100,
+            "last_modified_session": 1710520800
+        }"#;
+        let fr: FileRecord = serde_json::from_str(json).unwrap();
+        assert!(fr.blast_radius.is_none());
+        assert_eq!(fr.path, "src/main.rs");
+        assert_eq!(fr.content_hash, None);
+        assert_eq!(fr.line_count, 0);
     }
 
     #[test]

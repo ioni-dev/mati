@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, StaticFileAnalysis};
+use super::{extract_todo, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -81,6 +81,91 @@ impl PyCaptures {
     }
 }
 
+// ── Python stdlib classification ──────────────────────────────────────────────
+
+/// Top-level modules in the Python standard library. Used to classify bare
+/// `import X` and `from X import Y` as External rather than Normal.
+const PYTHON_STDLIB: &[&str] = &[
+    "__future__",
+    "abc",
+    "argparse",
+    "ast",
+    "asyncio",
+    "base64",
+    "builtins",
+    "collections",
+    "concurrent",
+    "contextlib",
+    "copy",
+    "csv",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "enum",
+    "errno",
+    "functools",
+    "gc",
+    "getopt",
+    "glob",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "importlib",
+    "inspect",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "multiprocessing",
+    "numbers",
+    "operator",
+    "os",
+    "pathlib",
+    "pickle",
+    "platform",
+    "pprint",
+    "queue",
+    "random",
+    "re",
+    "secrets",
+    "shlex",
+    "shutil",
+    "signal",
+    "socket",
+    "sqlite3",
+    "ssl",
+    "stat",
+    "statistics",
+    "string",
+    "struct",
+    "subprocess",
+    "sys",
+    "tarfile",
+    "tempfile",
+    "textwrap",
+    "threading",
+    "time",
+    "traceback",
+    "types",
+    "typing",
+    "unittest",
+    "urllib",
+    "uuid",
+    "warnings",
+    "weakref",
+    "xml",
+    "zipfile",
+];
+
+fn is_python_stdlib(module: &str) -> bool {
+    let first_segment = module.split('.').next().unwrap_or("");
+    PYTHON_STDLIB.contains(&first_segment)
+}
+
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
@@ -145,7 +230,15 @@ pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFile
                 }
             } else if idx == ci.import {
                 if let Ok(path) = node.utf8_text(src) {
-                    out.imports.push(path.to_owned());
+                    let line = node.start_position().row as u32 + 1;
+                    let kind = if path.starts_with('.') {
+                        ImportKind::Relative
+                    } else if is_python_stdlib(path) {
+                        ImportKind::External
+                    } else {
+                        ImportKind::Normal
+                    };
+                    out.imports.push(ImportStatement::new(path, kind, line));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -327,7 +420,7 @@ mod tests {
     fn import_statement() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "import os\n");
-        assert!(a.imports.contains(&"os".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "os"));
     }
 
     #[test]
@@ -337,14 +430,14 @@ mod tests {
         assert!(a
             .imports
             .iter()
-            .any(|i| i.contains("os.path") || i.contains("os")));
+            .any(|i| i.path.contains("os.path") || i.path.contains("os")));
     }
 
     #[test]
     fn from_import() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "from os import path\n");
-        assert!(a.imports.contains(&"os".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "os"));
     }
 
     #[test]
@@ -352,6 +445,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "from . import utils\n");
         assert!(!a.imports.is_empty());
+        assert_eq!(a.imports[0].kind, ImportKind::Relative);
+    }
+
+    #[test]
+    fn import_line_number() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "# comment\nimport os\n");
+        assert_eq!(a.imports[0].line, 2);
+    }
+
+    #[test]
+    fn absolute_import_classified_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "import django.conf\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
     }
 
     // ── Branches ──────────────────────────────────────────────────────────────
@@ -475,5 +583,42 @@ mod tests {
         // String is NOT the first statement → not a module docstring.
         let a = parse(&dir, "x = 1\n\"\"\"Not a module docstring.\"\"\"\n");
         assert!(a.module_doc.is_none());
+    }
+
+    // ── Stdlib classification tests ──────────────────────────────────────────
+
+    #[test]
+    fn import_os_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "import os\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn from_typing_import_optional_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "from typing import Optional\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn import_myapp_is_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "import myapp\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
+    }
+
+    #[test]
+    fn relative_import_still_relative() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "from .utils import helper\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Relative);
+    }
+
+    #[test]
+    fn stdlib_submodule_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "from urllib.parse import urlparse\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
     }
 }

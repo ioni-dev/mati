@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -137,11 +137,22 @@ pub(super) fn parse_c(file: &WalkedFile, source: &str) -> Result<StaticFileAnaly
                 }
             } else if idx == ci.include {
                 if let Ok(path) = node.utf8_text(src) {
+                    // Angle-bracket includes (<stdio.h>) are system/external.
+                    // Quoted includes ("myheader.h") are local/relative.
+                    let kind = if path.starts_with('<') {
+                        ImportKind::External
+                    } else {
+                        ImportKind::Relative
+                    };
                     let stripped = path
                         .trim_matches('"')
                         .trim_start_matches('<')
                         .trim_end_matches('>');
-                    out.imports.push(stripped.to_owned());
+                    out.imports.push(ImportStatement::new(
+                        stripped.to_owned(),
+                        kind,
+                        node.start_position().row as u32 + 1,
+                    ));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -272,14 +283,14 @@ mod tests {
     fn include_angle_brackets() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "#include <stdio.h>\nint main() { return 0; }\n");
-        assert!(a.imports.contains(&"stdio.h".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "stdio.h"));
     }
 
     #[test]
     fn include_quotes() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "#include \"myheader.h\"\nint main() { return 0; }\n");
-        assert!(a.imports.contains(&"myheader.h".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "myheader.h"));
     }
 
     #[test]

@@ -1,0 +1,30 @@
+{
+  "description": "C++ project with quoted includes resolved relative to importing file",
+  "edges": [
+    {
+      "from": "main.cpp",
+      "to": "auth.hpp",
+      "comment": "main.cpp includes auth.hpp"
+    },
+    {
+      "from": "main.cpp",
+      "to": "db.hpp",
+      "comment": "main.cpp includes db.hpp"
+    },
+    {
+      "from": "auth.hpp",
+      "to": "db.hpp",
+      "comment": "auth.hpp includes db.hpp"
+    },
+    {
+      "from": "auth.cpp",
+      "to": "auth.hpp",
+      "comment": "auth.cpp includes auth.hpp"
+    },
+    {
+      "from": "db.cpp",
+      "to": "db.hpp",
+      "comment": "db.cpp includes db.hpp"
+    }
+  ]
+}

@@ -7,12 +7,16 @@ use std::collections::HashSet;
 
 use crate::store::record::FileRecord;
 
+pub mod blast_radius;
 pub mod claude_md;
+pub mod clusters;
 pub mod deps;
 pub mod edges;
 pub mod git;
 pub mod parser;
+pub mod propagation;
 pub mod reparse;
+pub mod resolvers;
 pub mod walker;
 
 pub use claude_md::{import_claude_md, ClaudeMdImport};
@@ -20,7 +24,7 @@ pub use deps::{
     dep_display_name_from_key, dep_record_key, parse_dep_key, parse_dependencies, DepEcosystem,
     DepEntry, DepSignals, DepVersion, ManifestKind,
 };
-pub use edges::{build_edges, Layer0Edges};
+pub use edges::{build_edges, build_edges_with_root, Layer0Edges};
 pub use git::{mine_git_history, GitSignals};
 pub use parser::{hash_and_parse_parallel, parse_file, parse_files_parallel, StaticFileAnalysis};
 pub use walker::{Language, WalkedFile, Walker};
@@ -73,7 +77,7 @@ pub fn build_file_record(
     let mut fr = FileRecord::layer0_stub(
         path,
         public_api,
-        analysis.imports.clone(),
+        analysis.imports.iter().map(|i| i.path.clone()).collect(),
         analysis.todos.clone(),
         analysis.unsafe_count,
         analysis.unwrap_count,
@@ -130,6 +134,7 @@ pub fn build_file_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::parser::{ImportKind, ImportStatement};
     use crate::store::record::TodoComment;
 
     #[test]
@@ -139,7 +144,7 @@ mod tests {
             language: Language::Rust,
             entry_points: vec!["run".to_string()],
             exported_types: vec![],
-            imports: vec!["crate::utils".to_string()],
+            imports: vec![ImportStatement::new("crate::utils", ImportKind::Normal, 1)],
             todos: vec![TodoComment {
                 text: "TODO: tighten docs".to_string(),
                 line: 12,

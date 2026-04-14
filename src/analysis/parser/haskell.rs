@@ -9,7 +9,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -128,7 +128,11 @@ pub(super) fn parse_haskell(file: &WalkedFile, source: &str) -> Result<StaticFil
                 }
             } else if idx == ci.import {
                 if let Ok(text) = node.utf8_text(src) {
-                    out.imports.push(text.to_owned());
+                    out.imports.push(ImportStatement::new(
+                        text.to_owned(),
+                        ImportKind::Normal,
+                        node.start_position().row as u32 + 1,
+                    ));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -276,7 +280,7 @@ mod tests {
             &dir,
             "module Main where\n\nimport Data.List\n\nmain = putStrLn \"hi\"\n",
         );
-        assert!(a.imports.contains(&"Data.List".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "Data.List"));
     }
 
     #[test]

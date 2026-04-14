@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -132,7 +132,11 @@ pub(super) fn parse_scala(file: &WalkedFile, source: &str) -> Result<StaticFileA
                 if let Ok(text) = node.utf8_text(src) {
                     // Strip "import " prefix from full import_declaration text.
                     let cleaned = text.trim_start_matches("import ").trim();
-                    out.imports.push(cleaned.to_owned());
+                    out.imports.push(ImportStatement::new(
+                        cleaned.to_owned(),
+                        ImportKind::Normal,
+                        node.start_position().row as u32 + 1,
+                    ));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -256,7 +260,10 @@ mod tests {
     fn import_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "import scala.collection.mutable\nobject Foo {}\n");
-        assert!(a.imports.contains(&"scala.collection.mutable".to_owned()));
+        assert!(a
+            .imports
+            .iter()
+            .any(|i| i.path == "scala.collection.mutable"));
     }
 
     #[test]
