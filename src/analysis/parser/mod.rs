@@ -16,6 +16,7 @@ mod cpp;
 mod elixir;
 mod go;
 mod haskell;
+pub mod import;
 mod java;
 mod python;
 mod ruby;
@@ -31,6 +32,8 @@ use sha2::{Digest, Sha256};
 
 use crate::analysis::walker::{Language, WalkedFile};
 use crate::store::record::{TodoComment, TodoKind};
+
+pub use import::{ImportKind, ImportStatement};
 
 // ── Output type ───────────────────────────────────────────────────────────────
 
@@ -49,8 +52,8 @@ pub struct StaticFileAnalysis {
     /// Public types (Rust: `pub struct/enum/trait`; TS: exported class/interface/type/enum;
     /// Python: non-`_` top-level classes).
     pub exported_types: Vec<String>,
-    /// Import paths (Rust: use argument; TS/JS: module specifier; Python: dotted module name).
-    pub imports: Vec<String>,
+    /// Structured import statements with classification and source location.
+    pub imports: Vec<ImportStatement>,
     /// TODO / FIXME / HACK / NOTE / DEPRECATED / @ts-ignore / type:ignore comments.
     pub todos: Vec<TodoComment>,
     /// `unsafe {}` blocks (Rust only).

@@ -748,6 +748,8 @@ mod tests {
             last_modified_session: 0,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         Record {
             key: format!("file:{path}"),

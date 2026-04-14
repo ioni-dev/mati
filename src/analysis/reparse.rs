@@ -13,6 +13,10 @@
 //!    change_frequency, last_author, is_hotspot.
 //! 9. Apply staleness + cascade to linked gotchas (M-12-C).
 //! 10. Write back.
+//!
+//! **Not recomputed here:** Co-change cluster index. Clusters depend on
+//! CoChanges edges which only change when `mati init` re-mines git history
+//! after new commits. Incremental file edits do not affect cluster membership.
 
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -153,7 +157,7 @@ pub async fn reparse_impl(
         path: rel_path.to_string(),
         purpose: old_fr.purpose,
         entry_points: public_api_symbols(&analysis),
-        imports: analysis.imports,
+        imports: analysis.imports.iter().map(|i| i.path.clone()).collect(),
         gotcha_keys: old_fr.gotcha_keys.clone(),
         decision_keys: old_fr.decision_keys,
         todos: analysis.todos,
@@ -166,6 +170,8 @@ pub async fn reparse_impl(
         last_modified_session: now,
         content_hash: analysis.content_hash.clone(),
         line_count: analysis.line_count,
+        blast_radius: old_fr.blast_radius,
+        propagated_staleness: old_fr.propagated_staleness,
     };
 
     record.value = merged.purpose.clone();
@@ -301,7 +307,7 @@ pub async fn reparse_staged(
         path: rel_path.to_string(),
         purpose: old_fr.purpose,
         entry_points: public_api_symbols(&analysis),
-        imports: analysis.imports,
+        imports: analysis.imports.iter().map(|i| i.path.clone()).collect(),
         gotcha_keys: old_fr.gotcha_keys.clone(),
         decision_keys: old_fr.decision_keys,
         todos: analysis.todos,
@@ -314,6 +320,8 @@ pub async fn reparse_staged(
         last_modified_session: now,
         content_hash: analysis.content_hash.clone(),
         line_count: analysis.line_count,
+        blast_radius: old_fr.blast_radius,
+        propagated_staleness: old_fr.propagated_staleness,
     };
 
     record.value = merged.purpose.clone();
@@ -342,7 +350,7 @@ fn build_file_record_from_analysis(
         path: rel_path.to_string(),
         purpose: String::new(),
         entry_points: public_api_symbols(analysis),
-        imports: analysis.imports.clone(),
+        imports: analysis.imports.iter().map(|i| i.path.clone()).collect(),
         gotcha_keys: vec![],
         decision_keys: vec![],
         todos: analysis.todos.clone(),
@@ -355,6 +363,8 @@ fn build_file_record_from_analysis(
         last_modified_session: now,
         content_hash: analysis.content_hash.clone(),
         line_count: analysis.line_count,
+        blast_radius: None,
+        propagated_staleness: None,
     }
 }
 
@@ -374,7 +384,7 @@ pub fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
         .collect();
 
     let old_imports: HashSet<&str> = old.imports.iter().map(|s| s.as_str()).collect();
-    let new_imports: HashSet<&str> = new.imports.iter().map(|s| s.as_str()).collect();
+    let new_imports: HashSet<&str> = new.imports.iter().map(|s| s.path.as_str()).collect();
 
     let imports_added: Vec<String> = new_imports
         .difference(&old_imports)
@@ -409,6 +419,7 @@ pub fn compute_diff(old: &FileRecord, new: &StaticFileAnalysis) -> ReparseDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::parser::{ImportKind, ImportStatement};
     use crate::analysis::walker::Language;
     use tempfile::TempDir;
 
@@ -430,6 +441,8 @@ mod tests {
             last_modified_session: 1_000_000,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         }
     }
 
@@ -439,7 +452,10 @@ mod tests {
             language: Language::Rust,
             entry_points: vec!["main".into(), "new_fn".into()],
             exported_types: vec![],
-            imports: vec!["std::io".into(), "anyhow".into()],
+            imports: vec![
+                ImportStatement::new("std::io", ImportKind::Normal, 1),
+                ImportStatement::new("anyhow", ImportKind::Normal, 2),
+            ],
             todos: vec![],
             unsafe_count: 0,
             unwrap_count: 0,
@@ -498,13 +514,15 @@ mod tests {
             last_modified_session: 0,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let new = StaticFileAnalysis {
             path: "src/main.rs".into(),
             language: Language::Rust,
             entry_points: vec!["main".into()],
             exported_types: vec![],
-            imports: vec!["std::io".into()],
+            imports: vec![ImportStatement::new("std::io", ImportKind::Normal, 1)],
             todos: vec![],
             unsafe_count: 0,
             unwrap_count: 0,
@@ -563,6 +581,8 @@ mod tests {
             last_modified_session: 0,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let record = Record {
             key: "file:gone.rs".into(),
@@ -624,6 +644,8 @@ mod tests {
             last_modified_session: 1_000_000,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let record = Record {
             key: "file:lib.rs".into(),
@@ -702,6 +724,8 @@ mod tests {
             last_modified_session: 1_000_000,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         };
         let record = Record {
             key: "file:stable.rs".into(),

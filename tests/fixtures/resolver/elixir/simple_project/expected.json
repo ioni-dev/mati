@@ -1,0 +1,20 @@
+{
+  "description": "Elixir project with alias-based module imports under lib/",
+  "edges": [
+    {
+      "from": "lib/my_app.ex",
+      "to": "lib/my_app/auth/user_service.ex",
+      "comment": "MyApp aliases MyApp.Auth.UserService"
+    },
+    {
+      "from": "lib/my_app.ex",
+      "to": "lib/my_app/db/client.ex",
+      "comment": "MyApp aliases MyApp.Db.Client"
+    },
+    {
+      "from": "lib/my_app/auth/user_service.ex",
+      "to": "lib/my_app/db/client.ex",
+      "comment": "UserService aliases MyApp.Db.Client"
+    }
+  ]
+}

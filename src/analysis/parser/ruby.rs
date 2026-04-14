@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -175,7 +175,23 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
         // Process require/require_relative calls.
         if let (Some(name), Some(arg)) = (match_call_name, match_call_arg) {
             if name == "require" || name == "require_relative" {
-                out.imports.push(arg.to_owned());
+                // Use the call_name node's parent (the call node) for line info.
+                // Fall back to row 0 if we can't determine the line.
+                let line = m
+                    .captures
+                    .iter()
+                    .find(|c| c.index == ci.call_name)
+                    .map(|c| c.node.start_position().row as u32 + 1)
+                    .unwrap_or(1);
+                // require_relative resolves relative to the current file.
+                // require is typically a gem/stdlib — kept as Normal (unresolvable at Layer 0).
+                let kind = if name == "require_relative" {
+                    ImportKind::Relative
+                } else {
+                    ImportKind::Normal
+                };
+                out.imports
+                    .push(ImportStatement::new(arg.to_owned(), kind, line));
             }
         }
     }
@@ -257,14 +273,14 @@ mod tests {
     fn require_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "require 'json'\n");
-        assert!(a.imports.contains(&"json".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "json"));
     }
 
     #[test]
     fn require_relative_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "require_relative 'helpers/utils'\n");
-        assert!(a.imports.contains(&"helpers/utils".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "helpers/utils"));
     }
 
     #[test]

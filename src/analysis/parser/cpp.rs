@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 
-use super::{extract_todo, normalize_doc, StaticFileAnalysis};
+use super::{extract_todo, normalize_doc, ImportKind, ImportStatement, StaticFileAnalysis};
 use crate::analysis::walker::{Language, WalkedFile};
 
 // ── Static handles ────────────────────────────────────────────────────────────
@@ -169,11 +169,20 @@ pub(super) fn parse_cpp(file: &WalkedFile, source: &str) -> Result<StaticFileAna
                 }
             } else if idx == ci.include {
                 if let Ok(path) = node.utf8_text(src) {
+                    let kind = if path.starts_with('<') {
+                        ImportKind::External
+                    } else {
+                        ImportKind::Relative
+                    };
                     let stripped = path
                         .trim_matches('"')
                         .trim_start_matches('<')
                         .trim_end_matches('>');
-                    out.imports.push(stripped.to_owned());
+                    out.imports.push(ImportStatement::new(
+                        stripped.to_owned(),
+                        kind,
+                        node.start_position().row as u32 + 1,
+                    ));
                 }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
@@ -344,7 +353,7 @@ mod tests {
     fn include_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "#include <iostream>\nint main() { return 0; }\n");
-        assert!(a.imports.contains(&"iostream".to_owned()));
+        assert!(a.imports.iter().any(|i| i.path == "iostream"));
     }
 
     #[test]

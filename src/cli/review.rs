@@ -24,6 +24,7 @@ use clap::Args;
 use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input, MultiSelect};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use mati_core::analysis::blast_radius::BlastTier;
 use mati_core::health::quality;
 use mati_core::store::{FileRecord, GotchaRecord, Record, RecordLifecycle};
 
@@ -128,6 +129,22 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
         std::collections::HashSet::new()
     };
 
+    // Build blast score lookup for triage sorting: path → (score, tier).
+    // Must be done before closing proxy.
+    let blast_scores: std::collections::HashMap<String, (f32, BlastTier)> = {
+        let mut scores = std::collections::HashMap::new();
+        if let Ok(file_recs) = proxy.scan_prefix("file:").await {
+            for rec in file_recs {
+                if let Some(fr) = rec.payload_as::<FileRecord>() {
+                    if let Some(ref br) = fr.blast_radius {
+                        scores.insert(fr.path.clone(), (br.score, br.tier));
+                    }
+                }
+            }
+        }
+        scores
+    };
+
     let mut candidates = proxy.close_with_result(candidates_result).await?;
 
     // Apply --type filter
@@ -174,7 +191,7 @@ pub async fn run(args: ReviewArgs) -> Result<()> {
     let summary = backlog_summary(&candidates);
 
     if args.triage {
-        run_triage_mode(candidates, &cwd, &summary).await
+        run_triage_mode(candidates, &cwd, &summary, &blast_scores).await
     } else {
         run_card_mode(candidates, &cwd, &summary).await
     }
@@ -214,14 +231,24 @@ async fn run_triage_mode(
     candidates: Vec<Record>,
     cwd: &Path,
     summary: &BacklogSummary,
+    blast_scores: &std::collections::HashMap<String, (f32, BlastTier)>,
 ) -> Result<()> {
     let theme = ColorfulTheme::default();
 
     println!("\n◈ mati review — triage mode\n");
     print_backlog_summary(summary);
 
-    // Group by type
-    let groups = group_by_type(&candidates);
+    // Group by type, then sort each group by blast radius score descending.
+    let mut groups = group_by_type(&candidates);
+    for group in groups.values_mut() {
+        group.sort_by(|a, b| {
+            let score_a = max_blast_score(a, blast_scores);
+            let score_b = max_blast_score(b, blast_scores);
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
     let group_order = [
         CandidateType::CoChange,
         CandidateType::Ownership,
@@ -298,7 +325,15 @@ async fn run_triage_mode(
             .unwrap();
 
         let group_candidates = groups.get(selected_kind.label()).unwrap();
-        triage_group(group_candidates, selected_kind, cwd, &theme, &mut session).await?;
+        triage_group(
+            group_candidates,
+            selected_kind,
+            cwd,
+            &theme,
+            &mut session,
+            blast_scores,
+        )
+        .await?;
         println!();
     }
 
@@ -312,6 +347,7 @@ async fn triage_group(
     cwd: &Path,
     theme: &ColorfulTheme,
     session: &mut SessionStats,
+    blast_scores: &std::collections::HashMap<String, (f32, BlastTier)>,
 ) -> Result<()> {
     println!(
         "\n  ◈ {} — {} candidate{}\n",
@@ -338,7 +374,10 @@ async fn triage_group(
     match action {
         0 => {
             // MultiSelect — all pre-checked, user can deselect
-            let items: Vec<String> = candidates.iter().map(|r| format_list_item(r)).collect();
+            let items: Vec<String> = candidates
+                .iter()
+                .map(|r| format_list_item_with_blast(r, blast_scores))
+                .collect();
             let defaults = vec![true; items.len()];
 
             println!("\n  Space to deselect · Enter to confirm selection\n");
@@ -730,6 +769,55 @@ pub fn format_list_item(record: &Record) -> String {
     };
 
     format!("{:<12}  {:.2}  {}", kind.label(), risk, desc)
+}
+
+/// Like `format_list_item` but with an optional blast tier tag prefix.
+fn format_list_item_with_blast(
+    record: &Record,
+    blast_scores: &std::collections::HashMap<String, (f32, BlastTier)>,
+) -> String {
+    let base = format_list_item(record);
+    match max_blast_tier(record, blast_scores) {
+        Some(BlastTier::Critical) => format!("[BLAST:critical] {base}"),
+        Some(BlastTier::High) => format!("[BLAST:high] {base}"),
+        _ => base,
+    }
+}
+
+/// Get the maximum blast radius score across a gotcha candidate's affected files.
+/// Returns 0.0 if no affected files have blast radius data.
+fn max_blast_score(
+    record: &Record,
+    blast_scores: &std::collections::HashMap<String, (f32, BlastTier)>,
+) -> f32 {
+    record
+        .payload_as::<GotchaRecord>()
+        .map(|g| {
+            g.affected_files
+                .iter()
+                .filter_map(|path| blast_scores.get(path).map(|(score, _)| *score))
+                .fold(0.0_f32, f32::max)
+        })
+        .unwrap_or(0.0)
+}
+
+/// Get the highest blast tier across a gotcha candidate's affected files.
+fn max_blast_tier(
+    record: &Record,
+    blast_scores: &std::collections::HashMap<String, (f32, BlastTier)>,
+) -> Option<BlastTier> {
+    record.payload_as::<GotchaRecord>().and_then(|g| {
+        g.affected_files
+            .iter()
+            .filter_map(|path| blast_scores.get(path).map(|(_, tier)| *tier))
+            .max_by_key(|tier| match tier {
+                BlastTier::Isolated => 0,
+                BlastTier::Low => 1,
+                BlastTier::Moderate => 2,
+                BlastTier::High => 3,
+                BlastTier::Critical => 4,
+            })
+    })
 }
 
 fn file_name(path: &str) -> &str {

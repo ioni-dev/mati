@@ -66,6 +66,29 @@ pub fn analyze(
         detect_high_fan_in_no_contract(file_records, fan_in, &mut gaps);
     }
 
+    // Apply blast radius multiplier: high-impact undocumented files surface first.
+    {
+        use crate::analysis::blast_radius::BlastTier;
+        let blast_lookup: HashMap<String, BlastTier> = file_records
+            .iter()
+            .filter_map(|r| {
+                r.payload_as::<crate::store::record::FileRecord>()
+                    .and_then(|fr| fr.blast_radius.as_ref().map(|br| (r.key.clone(), br.tier)))
+            })
+            .collect();
+
+        for gap in &mut gaps {
+            let multiplier = match blast_lookup.get(&gap.key).copied() {
+                Some(BlastTier::Critical) => 2.0,
+                Some(BlastTier::High) => 1.5,
+                Some(BlastTier::Moderate) => 1.2,
+                Some(BlastTier::Low) => 1.0,
+                Some(BlastTier::Isolated) | None => 0.8,
+            };
+            gap.risk_score *= multiplier;
+        }
+    }
+
     // Highest risk first.
     gaps.sort_by(|a, b| {
         b.risk_score
@@ -657,6 +680,8 @@ mod tests {
             last_modified_session: 0,
             content_hash: None,
             line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         }
     }
 

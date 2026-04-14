@@ -91,6 +91,83 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         );
     }
 
+    // Blast radius — show only when populated
+    if let Some(br) = fr.as_ref().and_then(|f| f.blast_radius.as_ref()) {
+        use mati_core::analysis::blast_radius::BlastTier;
+        let tier_label = br.tier.label();
+        let tier_color = match br.tier {
+            BlastTier::Critical => colors::RED,
+            BlastTier::High => colors::YELLOW,
+            _ => colors::GRAY,
+        };
+        if use_color {
+            println!(
+                "  {GRAY}blast radius: {direct} direct, {transitive} transitive ({color}{tier}{RESET}{GRAY}){RESET}",
+                GRAY = colors::GRAY,
+                RESET = colors::RESET,
+                color = tier_color,
+                direct = br.direct,
+                transitive = br.transitive,
+                tier = tier_label,
+            );
+        } else {
+            println!(
+                "  blast radius: {} direct, {} transitive ({})",
+                br.direct, br.transitive, tier_label,
+            );
+        }
+    }
+
+    // Co-change cluster — show only when the file belongs to one
+    if let Ok(Some(cluster_rec)) = proxy.get("cluster:index").await {
+        if let Some(ci) = cluster_rec.payload_as::<mati_core::analysis::clusters::ClusterIndex>() {
+            if let Some(c) = ci.cluster_for(&path) {
+                if use_color {
+                    println!(
+                        "  {GRAY}cluster: {label} ({size} files, cohesion {cohesion:.2}){RESET}",
+                        GRAY = colors::GRAY,
+                        RESET = colors::RESET,
+                        label = c.label,
+                        size = c.size,
+                        cohesion = c.cohesion,
+                    );
+                } else {
+                    println!(
+                        "  cluster: {} ({} files, cohesion {:.2})",
+                        c.label, c.size, c.cohesion,
+                    );
+                }
+            }
+        }
+    }
+
+    // Propagated staleness — show when file has inherited staleness
+    if let Some(prop) = fr.as_ref().and_then(|f| f.propagated_staleness.as_ref()) {
+        if prop.value > 0.0 {
+            if let Some(ref source) = prop.primary_source {
+                if use_color {
+                    println!(
+                        "  {YELLOW}propagated staleness{RESET} {GRAY}— {value:.2} from {source} ({count} upstream source{s}){RESET}",
+                        YELLOW = colors::YELLOW,
+                        GRAY = colors::GRAY,
+                        RESET = colors::RESET,
+                        value = prop.value,
+                        count = prop.source_count,
+                        s = if prop.source_count == 1 { "" } else { "s" },
+                    );
+                } else {
+                    println!(
+                        "  propagated staleness — {:.2} from {} ({} upstream source{})",
+                        prop.value,
+                        source,
+                        prop.source_count,
+                        if prop.source_count == 1 { "" } else { "s" },
+                    );
+                }
+            }
+        }
+    }
+
     // Staleness warning — show only when it matters
     match file_rec.staleness.tier {
         StalenessTier::Stale => {

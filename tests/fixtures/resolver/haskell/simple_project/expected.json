@@ -1,0 +1,20 @@
+{
+  "description": "Haskell project with dot-separated module imports under src/",
+  "edges": [
+    {
+      "from": "src/Main.hs",
+      "to": "src/MyApp/Auth/UserService.hs",
+      "comment": "Main imports MyApp.Auth.UserService"
+    },
+    {
+      "from": "src/Main.hs",
+      "to": "src/MyApp/Db/Client.hs",
+      "comment": "Main imports MyApp.Db.Client"
+    },
+    {
+      "from": "src/MyApp/Auth/UserService.hs",
+      "to": "src/MyApp/Db/Client.hs",
+      "comment": "UserService imports MyApp.Db.Client"
+    }
+  ]
+}
