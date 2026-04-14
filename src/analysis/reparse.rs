@@ -171,6 +171,7 @@ pub async fn reparse_impl(
         content_hash: analysis.content_hash.clone(),
         line_count: analysis.line_count,
         blast_radius: old_fr.blast_radius,
+        propagated_staleness: old_fr.propagated_staleness,
     };
 
     record.value = merged.purpose.clone();
@@ -320,6 +321,7 @@ pub async fn reparse_staged(
         content_hash: analysis.content_hash.clone(),
         line_count: analysis.line_count,
         blast_radius: old_fr.blast_radius,
+        propagated_staleness: old_fr.propagated_staleness,
     };
 
     record.value = merged.purpose.clone();
@@ -362,6 +364,7 @@ fn build_file_record_from_analysis(
         content_hash: analysis.content_hash.clone(),
         line_count: analysis.line_count,
         blast_radius: None,
+        propagated_staleness: None,
     }
 }
 
@@ -439,6 +442,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         }
     }
 
@@ -511,6 +515,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let new = StaticFileAnalysis {
             path: "src/main.rs".into(),
@@ -577,6 +582,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let record = Record {
             key: "file:gone.rs".into(),
@@ -639,6 +645,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let record = Record {
             key: "file:lib.rs".into(),
@@ -718,6 +725,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let record = Record {
             key: "file:stable.rs".into(),

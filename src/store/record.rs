@@ -704,6 +704,10 @@ pub struct FileRecord {
     /// `None` for stores created before blast radius was introduced.
     #[serde(default)]
     pub blast_radius: Option<crate::analysis::blast_radius::BlastRadius>,
+    /// Staleness inherited from upstream stale sources via Imports edges.
+    /// `None` for stores created before staleness propagation was introduced.
+    #[serde(default)]
+    pub propagated_staleness: Option<crate::analysis::propagation::PropagatedStaleness>,
 }
 
 impl FileRecord {
@@ -744,6 +748,7 @@ impl FileRecord {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         }
     }
 }
@@ -1006,6 +1011,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         }
     }
 

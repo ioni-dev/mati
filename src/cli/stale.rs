@@ -7,14 +7,26 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement,
 use serde::{Deserialize, Serialize};
 
 use mati_core::store::{
-    Category, ConfidenceScore, Priority, QualityScore, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore, StalenessSignal, StalenessTier, Store,
+    Category, ConfidenceScore, FileRecord, Priority, QualityScore, Record, RecordLifecycle,
+    RecordSource, RecordVersion, StalenessScore, StalenessSignal, StalenessTier, Store,
 };
 
 use super::proxy::StoreProxy;
 
 use super::colors;
 use super::show::{format_date, staleness_color, truncate};
+
+/// Effective staleness: max of local and propagated. For file records,
+/// this accounts for inherited staleness from upstream imports.
+fn effective_staleness(record: &Record) -> f32 {
+    let local = record.staleness.value;
+    let propagated = record
+        .payload_as::<FileRecord>()
+        .and_then(|fr| fr.propagated_staleness)
+        .map(|p| p.value)
+        .unwrap_or(0.0);
+    local.max(propagated)
+}
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
 
@@ -83,9 +95,8 @@ pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
         .cloned()
         .collect();
     stale.sort_by(|a, b| {
-        b.staleness
-            .value
-            .partial_cmp(&a.staleness.value)
+        effective_staleness(b)
+            .partial_cmp(&effective_staleness(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let entry = StaleCache {
@@ -153,9 +164,8 @@ pub async fn run(args: StaleArgs) -> Result<()> {
 
     // Sort by staleness descending
     stale.sort_by(|a, b| {
-        b.staleness
-            .value
-            .partial_cmp(&a.staleness.value)
+        effective_staleness(b)
+            .partial_cmp(&effective_staleness(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -214,8 +224,15 @@ fn display_stale(stale: &[Record], verbose: bool) {
 
         let tier_color = staleness_comfy_color(&r.staleness.tier);
 
+        // Check for propagated staleness [P] marker
+        let has_propagation = r
+            .payload_as::<mati_core::store::FileRecord>()
+            .and_then(|fr| fr.propagated_staleness)
+            .is_some_and(|p| p.value > 0.0);
+        let prop_marker = if has_propagation { " [P]" } else { "" };
+
         table.add_row(vec![
-            Cell::new(truncate(&r.key, 40)).fg(Color::White),
+            Cell::new(format!("{}{prop_marker}", truncate(&r.key, 40))).fg(Color::White),
             Cell::new(format!("{:.2}", r.staleness.value)).fg(tier_color),
             Cell::new(tier_short_label(&r.staleness.tier)).fg(tier_color),
             Cell::new(format!("{age_days}d")).fg(Color::Grey),
@@ -717,5 +734,104 @@ mod tests {
             hint.contains("deleted"),
             "File Tombstone action hint should mention deletion, got: {hint}"
         );
+    }
+
+    #[test]
+    fn sort_by_effective_staleness_propagated_first() {
+        use mati_core::analysis::propagation::PropagatedStaleness;
+
+        // File A: local 0.3, propagated 0.55 → effective 0.55
+        let fr_a = FileRecord {
+            path: "src/a.rs".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: None,
+            propagated_staleness: Some(PropagatedStaleness {
+                value: 0.55,
+                source_count: 1,
+                primary_source: Some("src/upstream.rs".into()),
+            }),
+        };
+        let mut rec_a = Record {
+            key: "file:src/a.rs".into(),
+            value: String::new(),
+            category: Category::File,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
+            ref_url: None,
+            staleness: StalenessScore {
+                value: 0.3,
+                tier: StalenessTier::Aging,
+                signals: vec![],
+                computed_at: 0,
+                last_record_sha: String::new(),
+            },
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: 0,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+            payload: serde_json::to_value(&fr_a).ok(),
+        };
+
+        // File B: local 0.45, no propagation → effective 0.45
+        let fr_b = FileRecord {
+            path: "src/b.rs".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
+        };
+        let mut rec_b = rec_a.clone();
+        rec_b.key = "file:src/b.rs".into();
+        rec_b.staleness.value = 0.45;
+        rec_b.staleness.tier = StalenessTier::Stale;
+        rec_b.payload = serde_json::to_value(&fr_b).ok();
+
+        // Sort: A (effective 0.55) should come before B (effective 0.45)
+        let mut records = vec![rec_b, rec_a]; // B first intentionally
+        records.sort_by(|a, b| {
+            effective_staleness(b)
+                .partial_cmp(&effective_staleness(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        assert_eq!(records[0].key, "file:src/a.rs", "A (effective 0.55) should sort before B (effective 0.45)");
+        assert_eq!(records[1].key, "file:src/b.rs");
     }
 }
