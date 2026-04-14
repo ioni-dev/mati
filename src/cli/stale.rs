@@ -765,7 +765,7 @@ mod tests {
                 primary_source: Some("src/upstream.rs".into()),
             }),
         };
-        let mut rec_a = Record {
+        let rec_a = Record {
             key: "file:src/a.rs".into(),
             value: String::new(),
             category: Category::File,
@@ -824,7 +824,7 @@ mod tests {
         rec_b.payload = serde_json::to_value(&fr_b).ok();
 
         // Sort: A (effective 0.55) should come before B (effective 0.45)
-        let mut records = vec![rec_b, rec_a]; // B first intentionally
+        let mut records = [rec_b, rec_a]; // B first intentionally
         records.sort_by(|a, b| {
             effective_staleness(b)
                 .partial_cmp(&effective_staleness(a))
