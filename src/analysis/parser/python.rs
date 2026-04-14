@@ -81,6 +81,29 @@ impl PyCaptures {
     }
 }
 
+// ── Python stdlib classification ──────────────────────────────────────────────
+
+/// Top-level modules in the Python standard library. Used to classify bare
+/// `import X` and `from X import Y` as External rather than Normal.
+const PYTHON_STDLIB: &[&str] = &[
+    "__future__", "abc", "argparse", "ast", "asyncio", "base64", "builtins",
+    "collections", "concurrent", "contextlib", "copy", "csv", "dataclasses",
+    "datetime", "decimal", "enum", "errno", "functools", "gc", "getopt",
+    "glob", "hashlib", "heapq", "hmac", "html", "http", "importlib",
+    "inspect", "io", "ipaddress", "itertools", "json", "logging", "math",
+    "multiprocessing", "numbers", "operator", "os", "pathlib", "pickle",
+    "platform", "pprint", "queue", "random", "re", "secrets", "shlex",
+    "shutil", "signal", "socket", "sqlite3", "ssl", "stat", "statistics",
+    "string", "struct", "subprocess", "sys", "tarfile", "tempfile",
+    "textwrap", "threading", "time", "traceback", "types", "typing",
+    "unittest", "urllib", "uuid", "warnings", "weakref", "xml", "zipfile",
+];
+
+fn is_python_stdlib(module: &str) -> bool {
+    let first_segment = module.split('.').next().unwrap_or("");
+    PYTHON_STDLIB.contains(&first_segment)
+}
+
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFileAnalysis> {
@@ -148,6 +171,8 @@ pub(super) fn parse_python(file: &WalkedFile, source: &str) -> Result<StaticFile
                     let line = node.start_position().row as u32 + 1;
                     let kind = if path.starts_with('.') {
                         ImportKind::Relative
+                    } else if is_python_stdlib(path) {
+                        ImportKind::External
                     } else {
                         ImportKind::Normal
                     };
@@ -496,5 +521,42 @@ mod tests {
         // String is NOT the first statement → not a module docstring.
         let a = parse(&dir, "x = 1\n\"\"\"Not a module docstring.\"\"\"\n");
         assert!(a.module_doc.is_none());
+    }
+
+    // ── Stdlib classification tests ──────────────────────────────────────────
+
+    #[test]
+    fn import_os_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "import os\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn from_typing_import_optional_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "from typing import Optional\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
+    }
+
+    #[test]
+    fn import_myapp_is_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "import myapp\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
+    }
+
+    #[test]
+    fn relative_import_still_relative() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "from .utils import helper\n");
+        assert_eq!(a.imports[0].kind, ImportKind::Relative);
+    }
+
+    #[test]
+    fn stdlib_submodule_is_external() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "from urllib.parse import urlparse\n");
+        assert_eq!(a.imports[0].kind, ImportKind::External);
     }
 }
