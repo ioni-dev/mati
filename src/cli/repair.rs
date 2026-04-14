@@ -107,6 +107,79 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         if !args.json {
             println!("  Blast radius recomputed for {blast_count} files.");
         }
+
+        // Phase: recompute cluster index from CoChanges edges.
+        // Without git re-mining, raw counts aren't available — use all existing
+        // CoChanges edges (they already passed the 0.70 threshold at init time)
+        // with a synthetic count above MIN_COCHANGE_COUNT so the cluster filter
+        // doesn't drop them.
+        {
+            use mati_core::graph::edges::EdgeKind;
+            let mut seen = std::collections::HashSet::new();
+            let mut pairs: Vec<(String, String, u32)> = Vec::new();
+            // Scan graph edges for CoChanges. Each pair has bidirectional edges;
+            // collect unique pairs by keeping only a < b.
+            for record in &file_records {
+                let key = &record.key;
+                for neighbor in graph.neighbors(key, &EdgeKind::CoChanges) {
+                    let (a, b) = if key < &neighbor {
+                        (key.clone(), neighbor.clone())
+                    } else {
+                        (neighbor.clone(), key.clone())
+                    };
+                    // Strip file: prefix for consistency with co_change_pairs format.
+                    let pa = a.strip_prefix("file:").unwrap_or(&a).to_string();
+                    let pb = b.strip_prefix("file:").unwrap_or(&b).to_string();
+                    if seen.insert((pa.clone(), pb.clone())) {
+                        pairs.push((pa, pb, mati_core::analysis::clusters::MIN_COCHANGE_COUNT));
+                    }
+                }
+            }
+            let total_files = file_records.len();
+            let cluster_index =
+                mati_core::analysis::clusters::ClusterIndex::compute(&pairs, total_files);
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cluster_record = mati_core::store::record::Record {
+                key: "cluster:index".to_string(),
+                value: format!(
+                    "{} clusters, {} clustered files",
+                    cluster_index.total, cluster_index.clustered_files
+                ),
+                payload: serde_json::to_value(&cluster_index).ok(),
+                category: mati_core::store::record::Category::Analytics,
+                priority: mati_core::store::record::Priority::Normal,
+                tags: vec![],
+                created_at: now_ts,
+                updated_at: now_ts,
+                ref_url: None,
+                staleness: mati_core::store::record::StalenessScore::fresh(),
+                lifecycle: mati_core::store::record::RecordLifecycle::Active,
+                version: mati_core::store::record::RecordVersion {
+                    device_id: uuid::Uuid::new_v4(),
+                    logical_clock: 1,
+                    wall_clock: now_ts,
+                },
+                quality: mati_core::store::record::QualityScore::layer0_default(),
+                access_count: 0,
+                last_accessed: 0,
+                source: mati_core::store::record::RecordSource::StaticAnalysis,
+                confidence: mati_core::store::record::ConfidenceScore::for_new_record(
+                    &mati_core::store::record::RecordSource::StaticAnalysis,
+                ),
+                gap_analysis_score: 0.0,
+            };
+            let _ = graph.store().put("cluster:index", &cluster_record).await;
+            if !args.json {
+                println!(
+                    "  Clusters recomputed: {} found.",
+                    cluster_index.total
+                );
+            }
+        }
+
         graph.close().await?;
     } else {
         store.close().await?;

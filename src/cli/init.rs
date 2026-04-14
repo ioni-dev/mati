@@ -911,6 +911,53 @@ pub async fn run(args: InitArgs) -> Result<()> {
         );
     }
 
+    // ── 10b. Compute and persist cluster index ─────────────────────────────
+    // Requires: co_change_pairs from git mining (Phase 8a).
+    // Writes: single "cluster:index" record.
+    {
+        let t = Instant::now();
+        let cluster_index = mati_core::analysis::clusters::ClusterIndex::compute(
+            &co_change_pairs,
+            file_records.len() + skipped_count,
+        );
+        let cluster_count = cluster_index.total;
+        let store_ref = graph.store();
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cluster_record = Record {
+            key: "cluster:index".to_string(),
+            value: format!("{} clusters, {} clustered files", cluster_index.total, cluster_index.clustered_files),
+            payload: serde_json::to_value(&cluster_index).ok(),
+            category: Category::Analytics,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: now_ts,
+            updated_at: now_ts,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: device_id,
+                logical_clock: 1,
+                wall_clock: now_ts,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        };
+        let _ = store_ref.put("cluster:index", &cluster_record).await;
+        println!(
+            "  Clusters...                    {:>4} found   {:>4}ms",
+            cluster_count,
+            t.elapsed().as_millis()
+        );
+    }
+
     // ── 11a. Search index — deferred to first MCP server startup ─────────────
     // Cold init: tantivy costs ~400ms to index 27k records. CLI commands scan
     // KV directly and never need full-text search. Only the MCP server (via

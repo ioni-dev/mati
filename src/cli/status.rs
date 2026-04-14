@@ -198,6 +198,14 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     // ── Daemon health (real-time, never cached) ──────────────────────────
     let daemon_health = check_daemon_health(&cwd).await;
 
+    // ── Load cluster index (shared by cached and live paths) ───────────────
+    let cluster_index: Option<mati_core::analysis::clusters::ClusterIndex> = store
+        .get("cluster:index")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.payload_as::<mati_core::analysis::clusters::ClusterIndex>());
+
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
     let current_seq = store.read_write_seq();
@@ -213,6 +221,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
                     codex_mode,
                     codex_metrics.as_ref(),
                     &daemon_health,
+                    cluster_index.as_ref(),
                 );
                 store.close().await?;
                 return Ok(());
@@ -402,6 +411,38 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         "  {blue}Hotspots{reset}     {white}{hotspot_count}{reset} / {total_files} ({hot_pct}%)"
     );
 
+    // ── Co-change clusters (from preloaded cluster index) ──────────────
+    if let Some(ci) = &cluster_index {
+        if ci.total > 0 {
+            let largest = ci
+                .clusters
+                .first()
+                .map(|c| {
+                    format!(
+                        "{} ({} files, cohesion {:.2})",
+                        c.label, c.size, c.cohesion
+                    )
+                })
+                .unwrap_or_default();
+            let cl_pct = if total_files > 0 {
+                (ci.clustered_files as f32 / total_files as f32 * 100.0) as u32
+            } else {
+                0
+            };
+            println!(
+                "\n  {blue}Clusters{reset}     {white}{}{reset} co-change clusters",
+                ci.total
+            );
+            println!(
+                "    Largest:         {white}{largest}{reset}"
+            );
+            println!(
+                "    Clustered files: {white}{}{reset} / {total_files} ({cl_pct}%)",
+                ci.clustered_files
+            );
+        }
+    }
+
     // ── Trust health ─────────────────────────────────────────────────────
     let stale_count = gotchas
         .iter()
@@ -569,6 +610,7 @@ fn display_cached_status(
     codex_mode: bool,
     codex_metrics: Option<&CodexDailyMetrics>,
     daemon_health: &DaemonHealth,
+    cluster_index: Option<&mati_core::analysis::clusters::ClusterIndex>,
 ) {
     let use_color = std::io::stdout().is_terminal();
 
@@ -664,6 +706,31 @@ fn display_cached_status(
         "  {blue}Hotspots{reset}     {white}{}{reset} / {} ({hot_pct}%)",
         s.hotspot_count, s.files_count,
     );
+
+    // ── Co-change clusters (from preloaded cluster index) ───────────────
+    if let Some(ci) = cluster_index {
+        if ci.total > 0 {
+            let largest = ci
+                .clusters
+                .first()
+                .map(|c| format!("{} ({} files, cohesion {:.2})", c.label, c.size, c.cohesion))
+                .unwrap_or_default();
+            let cl_pct = if s.files_count > 0 {
+                (ci.clustered_files as f32 / s.files_count as f32 * 100.0) as u32
+            } else {
+                0
+            };
+            println!(
+                "\n  {blue}Clusters{reset}     {white}{}{reset} co-change clusters",
+                ci.total
+            );
+            println!("    Largest:         {white}{largest}{reset}");
+            println!(
+                "    Clustered files: {white}{}{reset} / {} ({cl_pct}%)",
+                ci.clustered_files, s.files_count
+            );
+        }
+    }
 
     println!();
 }
