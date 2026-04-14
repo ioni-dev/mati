@@ -39,7 +39,11 @@ impl LanguageResolver for TypeScriptResolver {
 }
 
 /// Core resolution logic, extracted for direct testing.
-fn resolve_ts_js(import_path: &str, importing_file: &str, file_index: &FileIndex) -> Option<String> {
+fn resolve_ts_js(
+    import_path: &str,
+    importing_file: &str,
+    file_index: &FileIndex,
+) -> Option<String> {
     // Strip quotes if present (parser may include them).
     let clean = import_path.trim_matches(|c| c == '\'' || c == '"');
 

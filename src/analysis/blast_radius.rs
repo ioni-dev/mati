@@ -242,7 +242,7 @@ mod tests {
 
         let br_a = BlastRadius::compute("file:a", &g);
         assert_eq!(br_a.direct, 1); // B imports A
-        // B is direct; no transitive beyond that in a 2-node cycle
+                                    // B is direct; no transitive beyond that in a 2-node cycle
         assert_eq!(br_a.tier, BlastTier::Low);
 
         let br_b = BlastRadius::compute("file:b", &g);
@@ -275,8 +275,8 @@ mod tests {
         // Beyond depth 3: e — should NOT be counted
         let br = BlastRadius::compute("file:a", &g);
         assert_eq!(br.direct, 1); // b
-        // traverse_incoming at depth 3 returns b, c, d (3 nodes)
-        // minus direct (b) = 2 transitive
+                                  // traverse_incoming at depth 3 returns b, c, d (3 nodes)
+                                  // minus direct (b) = 2 transitive
         assert_eq!(br.transitive, 2); // c, d — but NOT e
         assert_eq!(br.tier, BlastTier::Low);
 
@@ -365,10 +365,9 @@ mod tests {
         let val: Option<BlastRadius> = serde_json::from_str("null").unwrap();
         assert!(val.is_none());
 
-        let val: BlastRadius = serde_json::from_str(
-            r#"{"direct":0,"transitive":0,"score":0.0,"tier":"isolated"}"#,
-        )
-        .unwrap();
+        let val: BlastRadius =
+            serde_json::from_str(r#"{"direct":0,"transitive":0,"score":0.0,"tier":"isolated"}"#)
+                .unwrap();
         assert_eq!(val.tier, BlastTier::Isolated);
     }
 }

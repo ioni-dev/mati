@@ -256,10 +256,7 @@ fn print_record(record: &Record, use_color: bool) {
                 println!("    direct         {white}{}{reset}", br.direct);
                 println!("    transitive     {white}{}{reset}", br.transitive);
                 println!("    score          {white}{:.1}{reset}", br.score);
-                println!(
-                    "    tier           {tier_color}{}{reset}",
-                    br.tier.label()
-                );
+                println!("    tier           {tier_color}{}{reset}", br.tier.label());
                 println!();
             }
         }

@@ -126,18 +126,13 @@ fn python_fixture_resolves_absolute_import() {
     let file_index = FileIndex::new(files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
-    let main_file = files
-        .iter()
-        .find(|f| f.rel_path == "app/main.py")
-        .unwrap();
+    let main_file = files.iter().find(|f| f.rel_path == "app/main.py").unwrap();
     let analysis = parse_file(main_file).unwrap();
 
     let resolved: Vec<String> = analysis
         .imports
         .iter()
-        .filter_map(|imp| {
-            registry.resolve(imp, &main_file.rel_path, Language::Python, &file_index)
-        })
+        .filter_map(|imp| registry.resolve(imp, &main_file.rel_path, Language::Python, &file_index))
         .collect();
 
     assert!(
@@ -179,10 +174,7 @@ fn python_fixture_resolves_package_init() {
     let registry = ResolverRegistry::new();
 
     // app/utils.py imports `..pkg` which should resolve to pkg/__init__.py
-    let utils_file = files
-        .iter()
-        .find(|f| f.rel_path == "app/utils.py")
-        .unwrap();
+    let utils_file = files.iter().find(|f| f.rel_path == "app/utils.py").unwrap();
     let analysis = parse_file(utils_file).unwrap();
 
     let resolved: Vec<String> = analysis
@@ -207,10 +199,7 @@ fn typescript_fixture_resolves_relative_import() {
     let file_index = FileIndex::new(files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
-    let app_file = files
-        .iter()
-        .find(|f| f.rel_path == "src/app.ts")
-        .unwrap();
+    let app_file = files.iter().find(|f| f.rel_path == "src/app.ts").unwrap();
     let analysis = parse_file(app_file).unwrap();
 
     let resolved: Vec<String> = analysis
@@ -233,10 +222,7 @@ fn typescript_fixture_resolves_index_import() {
     let file_index = FileIndex::new(files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
-    let app_file = files
-        .iter()
-        .find(|f| f.rel_path == "src/app.ts")
-        .unwrap();
+    let app_file = files.iter().find(|f| f.rel_path == "src/app.ts").unwrap();
     let analysis = parse_file(app_file).unwrap();
 
     let resolved: Vec<String> = analysis
@@ -269,7 +255,12 @@ fn typescript_fixture_resolves_parent_dir_import() {
         .imports
         .iter()
         .filter_map(|imp| {
-            registry.resolve(imp, &button_file.rel_path, Language::TypeScript, &file_index)
+            registry.resolve(
+                imp,
+                &button_file.rel_path,
+                Language::TypeScript,
+                &file_index,
+            )
         })
         .collect();
 
@@ -285,17 +276,19 @@ fn typescript_fixture_skips_external_imports() {
     let file_index = FileIndex::new(files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
-    let app_file = files
-        .iter()
-        .find(|f| f.rel_path == "src/app.ts")
-        .unwrap();
+    let app_file = files.iter().find(|f| f.rel_path == "src/app.ts").unwrap();
     let analysis = parse_file(app_file).unwrap();
 
     // 'react' is an external import — should NOT be resolved
     let react_import = analysis.imports.iter().find(|i| i.path == "react").unwrap();
     assert_eq!(react_import.kind, ImportKind::External);
     assert_eq!(
-        registry.resolve(react_import, &app_file.rel_path, Language::TypeScript, &file_index),
+        registry.resolve(
+            react_import,
+            &app_file.rel_path,
+            Language::TypeScript,
+            &file_index
+        ),
         None
     );
 }
@@ -306,8 +299,7 @@ fn typescript_fixture_skips_external_imports() {
 fn go_fixture_resolves_internal_imports() {
     let root = fixture_sub_path("go", "simple_module");
     let files = walk_fixture_sub("go", "simple_module");
-    let file_index =
-        FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone()));
+    let file_index = FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
     // main.go imports auth and db packages
@@ -316,11 +308,15 @@ fn go_fixture_resolves_internal_imports() {
 
     // Should resolve to at least one file in auth/ and one in db/
     assert!(
-        resolved.iter().any(|r| r.starts_with("auth/") && r.ends_with(".go")),
+        resolved
+            .iter()
+            .any(|r| r.starts_with("auth/") && r.ends_with(".go")),
         "main.go should resolve auth import, got: {resolved:?}"
     );
     assert!(
-        resolved.iter().any(|r| r.starts_with("db/") && r.ends_with(".go")),
+        resolved
+            .iter()
+            .any(|r| r.starts_with("db/") && r.ends_with(".go")),
         "main.go should resolve db import, got: {resolved:?}"
     );
 }
@@ -329,15 +325,11 @@ fn go_fixture_resolves_internal_imports() {
 fn go_fixture_cross_package_import() {
     let root = fixture_sub_path("go", "simple_module");
     let files = walk_fixture_sub("go", "simple_module");
-    let file_index =
-        FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone()));
+    let file_index = FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
     // auth/user.go imports db
-    let user_file = files
-        .iter()
-        .find(|f| f.rel_path == "auth/user.go")
-        .unwrap();
+    let user_file = files.iter().find(|f| f.rel_path == "auth/user.go").unwrap();
     let resolved = resolve_all(user_file, Language::Go, &registry, &file_index);
 
     assert!(
@@ -350,8 +342,7 @@ fn go_fixture_cross_package_import() {
 fn go_fixture_skips_stdlib() {
     let root = fixture_sub_path("go", "simple_module");
     let files = walk_fixture_sub("go", "simple_module");
-    let file_index =
-        FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone()));
+    let file_index = FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
     // main.go imports "fmt" which is stdlib — should not resolve
@@ -524,10 +515,7 @@ fn ruby_fixture_resolves_require_relative() {
     let registry = ResolverRegistry::new();
 
     // lib/main.rb requires auth and db
-    let main_file = files
-        .iter()
-        .find(|f| f.rel_path == "lib/main.rb")
-        .unwrap();
+    let main_file = files.iter().find(|f| f.rel_path == "lib/main.rb").unwrap();
     let resolved = resolve_all(main_file, Language::Ruby, &registry, &file_index);
 
     assert!(
@@ -547,10 +535,7 @@ fn ruby_fixture_transitive_require() {
     let registry = ResolverRegistry::new();
 
     // lib/auth.rb requires db
-    let auth_file = files
-        .iter()
-        .find(|f| f.rel_path == "lib/auth.rb")
-        .unwrap();
+    let auth_file = files.iter().find(|f| f.rel_path == "lib/auth.rb").unwrap();
     let resolved = resolve_all(auth_file, Language::Ruby, &registry, &file_index);
 
     assert!(
@@ -673,10 +658,7 @@ fn haskell_fixture_resolves_module_imports() {
     let file_index = FileIndex::new(files.iter().map(|f| f.rel_path.clone()));
     let registry = ResolverRegistry::new();
 
-    let main_file = files
-        .iter()
-        .find(|f| f.rel_path == "src/Main.hs")
-        .unwrap();
+    let main_file = files.iter().find(|f| f.rel_path == "src/Main.hs").unwrap();
     let resolved = resolve_all(main_file, Language::Haskell, &registry, &file_index);
 
     assert!(

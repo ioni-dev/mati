@@ -92,12 +92,8 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         let mut blast_count = 0u32;
         for record in &file_records {
             let mut rec = record.clone();
-            if let Some(mut fr) =
-                rec.payload_as::<mati_core::store::record::FileRecord>()
-            {
-                let br = mati_core::analysis::blast_radius::BlastRadius::compute(
-                    &rec.key, &graph,
-                );
+            if let Some(mut fr) = rec.payload_as::<mati_core::store::record::FileRecord>() {
+                let br = mati_core::analysis::blast_radius::BlastRadius::compute(&rec.key, &graph);
                 fr.blast_radius = Some(br);
                 rec.payload = serde_json::to_value(&fr).ok();
                 let _ = graph.store().put(&rec.key, &rec).await;
@@ -173,10 +169,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
             };
             let _ = graph.store().put("cluster:index", &cluster_record).await;
             if !args.json {
-                println!(
-                    "  Clusters recomputed: {} found.",
-                    cluster_index.total
-                );
+                println!("  Clusters recomputed: {} found.", cluster_index.total);
             }
         }
 

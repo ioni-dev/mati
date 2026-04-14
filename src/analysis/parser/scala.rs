@@ -260,7 +260,10 @@ mod tests {
     fn import_captured() {
         let dir = TempDir::new().unwrap();
         let a = parse(&dir, "import scala.collection.mutable\nobject Foo {}\n");
-        assert!(a.imports.iter().any(|i| i.path == "scala.collection.mutable"));
+        assert!(a
+            .imports
+            .iter()
+            .any(|i| i.path == "scala.collection.mutable"));
     }
 
     #[test]

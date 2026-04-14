@@ -965,10 +965,8 @@ pub(crate) async fn socket_dispatch(
                         neighborhood_recs.push(rec);
                     }
                 }
-                let propagation = crate::analysis::propagation::compute_propagation(
-                    &neighborhood_recs,
-                    &g,
-                );
+                let propagation =
+                    crate::analysis::propagation::compute_propagation(&neighborhood_recs, &g);
                 for (key, prop) in &propagation {
                     if let Ok(Some(mut rec)) = store.get(key).await {
                         if let Some(mut fr) = rec.payload_as::<crate::store::record::FileRecord>() {

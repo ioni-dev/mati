@@ -124,9 +124,18 @@ mod tests {
     #[test]
     fn stdlib_skipped() {
         let file_index = idx(&["src/Main.hs"]);
-        assert_eq!(HaskellResolver.resolve(&import("Data.List"), "src/Main.hs", &file_index), None);
-        assert_eq!(HaskellResolver.resolve(&import("Control.Monad"), "src/Main.hs", &file_index), None);
-        assert_eq!(HaskellResolver.resolve(&import("Prelude"), "src/Main.hs", &file_index), None);
+        assert_eq!(
+            HaskellResolver.resolve(&import("Data.List"), "src/Main.hs", &file_index),
+            None
+        );
+        assert_eq!(
+            HaskellResolver.resolve(&import("Control.Monad"), "src/Main.hs", &file_index),
+            None
+        );
+        assert_eq!(
+            HaskellResolver.resolve(&import("Prelude"), "src/Main.hs", &file_index),
+            None
+        );
     }
 
     #[test]
@@ -153,6 +162,9 @@ mod tests {
     #[test]
     fn nonexistent_returns_none() {
         let file_index = idx(&["src/Main.hs"]);
-        assert_eq!(HaskellResolver.resolve(&import("Missing.Module"), "src/Main.hs", &file_index), None);
+        assert_eq!(
+            HaskellResolver.resolve(&import("Missing.Module"), "src/Main.hs", &file_index),
+            None
+        );
     }
 }

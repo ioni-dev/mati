@@ -108,7 +108,10 @@ impl FileIndex {
     /// Find all files whose path starts with the given prefix.
     /// Returns references to avoid allocation when only checking existence.
     pub fn files_with_prefix(&self, prefix: &str) -> Vec<&String> {
-        self.files.iter().filter(|f| f.starts_with(prefix)).collect()
+        self.files
+            .iter()
+            .filter(|f| f.starts_with(prefix))
+            .collect()
     }
 
     /// Find all files whose stem (filename without extension) matches.

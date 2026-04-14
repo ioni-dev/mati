@@ -257,10 +257,14 @@ impl MatiServer {
                         // Inject blast radius warning for high-impact files.
                         if record.category == Category::File {
                             if let Some(payload) = &record.payload {
-                                if let Some(fr) = serde_json::from_value::<crate::store::record::FileRecord>(payload.clone()).ok() {
+                                if let Ok(fr) = serde_json::from_value::<
+                                    crate::store::record::FileRecord,
+                                >(payload.clone())
+                                {
                                     if let Some(ref br) = fr.blast_radius {
                                         use crate::analysis::blast_radius::BlastTier;
-                                        if matches!(br.tier, BlastTier::High | BlastTier::Critical) {
+                                        if matches!(br.tier, BlastTier::High | BlastTier::Critical)
+                                        {
                                             let warning = format!(
                                                 "HIGH IMPACT FILE: {} files directly depend on this. Modify with extra care.",
                                                 br.direct
@@ -274,8 +278,8 @@ impl MatiServer {
                             }
                         }
 
-                        let response = serde_json::to_string_pretty(&agent_json)
-                            .unwrap_or_else(|e| {
+                        let response =
+                            serde_json::to_string_pretty(&agent_json).unwrap_or_else(|e| {
                                 format!("{{\"error\": \"serialization failed: {e}\"}}")
                             });
 
@@ -1632,9 +1636,7 @@ pub async fn assemble_context_packet(
                 })
             })
             .collect();
-        impact_files.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        impact_files.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         if !impact_files.is_empty() {
             let mut impact_section = String::from("## Highest Impact Files\n");
@@ -1872,7 +1874,7 @@ mod tests {
                 score: 48.0,
                 tier: crate::analysis::blast_radius::BlastTier::Critical,
             }),
-        propagated_staleness: None,
+            propagated_staleness: None,
         };
         let mut record = make_record("file:src/core.rs", "Core module", Category::File, 0.5);
         record.payload = serde_json::to_value(&fr).ok();
@@ -1891,10 +1893,7 @@ mod tests {
             result.contains("HIGH IMPACT FILE"),
             "response must contain blast radius warning for critical file, got: {result}"
         );
-        assert!(
-            result.contains("45"),
-            "warning must include direct count"
-        );
+        assert!(result.contains("45"), "warning must include direct count");
     }
 
     #[tokio::test]
@@ -1925,7 +1924,7 @@ mod tests {
                 score: 2.0,
                 tier: crate::analysis::blast_radius::BlastTier::Low,
             }),
-        propagated_staleness: None,
+            propagated_staleness: None,
         };
         let mut record = make_record("file:src/leaf.rs", "Leaf module", Category::File, 0.5);
         record.payload = serde_json::to_value(&fr).ok();
@@ -4004,7 +4003,7 @@ mod tests {
                 score: 48.0,
                 tier: crate::analysis::blast_radius::BlastTier::Critical,
             }),
-        propagated_staleness: None,
+            propagated_staleness: None,
         };
         let mut rec = make_record("file:src/core.rs", "Core module", Category::File, 0.5);
         rec.payload = serde_json::to_value(&fr_critical).ok();
@@ -4034,7 +4033,7 @@ mod tests {
                 score: 3.0,
                 tier: crate::analysis::blast_radius::BlastTier::Low,
             }),
-        propagated_staleness: None,
+            propagated_staleness: None,
         };
         let mut rec2 = make_record("file:src/leaf.rs", "Leaf module", Category::File, 0.5);
         rec2.payload = serde_json::to_value(&fr_low).ok();
@@ -4060,7 +4059,10 @@ mod tests {
         );
         // core.rs (score 48) should appear before leaf.rs (score 3)
         let core_pos = packet.injection_string.find("src/core.rs").unwrap();
-        let leaf_pos = packet.injection_string.find("src/leaf.rs").unwrap_or(usize::MAX);
+        let leaf_pos = packet
+            .injection_string
+            .find("src/leaf.rs")
+            .unwrap_or(usize::MAX);
         assert!(
             core_pos < leaf_pos,
             "core.rs should appear before leaf.rs in impact section"

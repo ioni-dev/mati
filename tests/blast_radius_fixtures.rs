@@ -6,7 +6,7 @@
 use mati_core::analysis::blast_radius::{BlastRadius, BlastTier};
 use mati_core::analysis::edges::build_edges;
 use mati_core::analysis::parser::parse_file;
-use mati_core::analysis::walker::{Walker, WalkedFile};
+use mati_core::analysis::walker::{WalkedFile, Walker};
 use mati_core::graph::edges::EdgeKind;
 use mati_core::graph::Graph;
 use mati_core::store::Store;
@@ -25,7 +25,12 @@ fn fixture_sub_path(lang: &str, sub: &str) -> std::path::PathBuf {
         .join(sub)
 }
 
-fn walk_and_parse(root: &std::path::Path) -> (Vec<WalkedFile>, Vec<mati_core::analysis::StaticFileAnalysis>) {
+fn walk_and_parse(
+    root: &std::path::Path,
+) -> (
+    Vec<WalkedFile>,
+    Vec<mati_core::analysis::StaticFileAnalysis>,
+) {
     let files = Walker::new(root.to_path_buf()).walk().unwrap();
     let analyses: Vec<_> = files.iter().map(|f| parse_file(f).unwrap()).collect();
     (files, analyses)
@@ -208,4 +213,3 @@ async fn elixir_fixture_blast_radius() {
 async fn haskell_fixture_blast_radius() {
     validate_fixture(&fixture_sub_path("haskell", "simple_project"), "haskell").await;
 }
-

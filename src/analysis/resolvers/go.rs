@@ -63,6 +63,12 @@ impl LanguageResolver for GoResolver {
     }
 }
 
+impl Default for GoResolver {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl GoResolver {
     pub fn new() -> Self {
         Self
@@ -124,11 +130,7 @@ mod tests {
     }
 
     /// Create a go.mod file in a TempDir and return a FileIndex with root set.
-    fn setup_go_project(
-        dir: &TempDir,
-        module_name: &str,
-        files: &[&str],
-    ) -> FileIndex {
+    fn setup_go_project(dir: &TempDir, module_name: &str, files: &[&str]) -> FileIndex {
         let go_mod_content = format!("module {module_name}\n\ngo 1.21\n");
         std::fs::write(dir.path().join("go.mod"), &go_mod_content).unwrap();
 
@@ -225,8 +227,7 @@ mod tests {
             &["cmd/server/main.go", "internal/auth/auth.go"],
         );
 
-        let module = GoResolver
-            .find_module_path("cmd/server/main.go", &file_index);
+        let module = GoResolver.find_module_path("cmd/server/main.go", &file_index);
         assert_eq!(module, Some("github.com/acme/project".into()));
     }
 
@@ -257,11 +258,7 @@ mod tests {
     #[test]
     fn rejects_stdlib_import() {
         let dir = TempDir::new().unwrap();
-        let file_index = setup_go_project(
-            &dir,
-            "github.com/acme/project",
-            &["main.go"],
-        );
+        let file_index = setup_go_project(&dir, "github.com/acme/project", &["main.go"]);
         assert_eq!(
             GoResolver.resolve(&import("net/http"), "main.go", &file_index),
             None,
@@ -272,11 +269,7 @@ mod tests {
     #[test]
     fn rejects_third_party_import() {
         let dir = TempDir::new().unwrap();
-        let file_index = setup_go_project(
-            &dir,
-            "github.com/acme/project",
-            &["main.go"],
-        );
+        let file_index = setup_go_project(&dir, "github.com/acme/project", &["main.go"]);
         assert_eq!(
             GoResolver.resolve(
                 &import("github.com/other/library/pkg"),
@@ -321,7 +314,11 @@ mod tests {
         let file_index = setup_go_project(
             &dir,
             "github.com/acme/project",
-            &["main.go", "internal/auth/handler.go", "internal/db/client.go"],
+            &[
+                "main.go",
+                "internal/auth/handler.go",
+                "internal/db/client.go",
+            ],
         );
 
         let result = GoResolver.resolve(

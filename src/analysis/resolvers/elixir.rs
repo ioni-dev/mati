@@ -37,7 +37,7 @@ fn resolve_elixir(module_path: &str, file_index: &FileIndex) -> Option<String> {
     // Convert MyApp.Router → my_app/router
     let segments: Vec<String> = module_path
         .split('.')
-        .map(|seg| camel_to_snake(seg))
+        .map(camel_to_snake)
         .collect();
     let rel = segments.join("/");
 
@@ -148,10 +148,7 @@ fn camel_to_snake(s: &str) -> String {
             //   or the next char is lowercase (HTTPServer -> http_server)
             if i > 0 {
                 let prev_is_lower = chars[i - 1].is_lowercase();
-                let next_is_lower = chars
-                    .get(i + 1)
-                    .map(|c| c.is_lowercase())
-                    .unwrap_or(false);
+                let next_is_lower = chars.get(i + 1).map(|c| c.is_lowercase()).unwrap_or(false);
                 if prev_is_lower || next_is_lower {
                     result.push('_');
                 }
@@ -315,8 +312,7 @@ mod tests {
     #[test]
     fn local_module_resolves() {
         let file_index = idx(&["lib/my_app/router.ex"]);
-        let result =
-            ElixirResolver.resolve(&import("MyApp.Router"), "lib/my_app.ex", &file_index);
+        let result = ElixirResolver.resolve(&import("MyApp.Router"), "lib/my_app.ex", &file_index);
         assert_eq!(result, Some("lib/my_app/router.ex".into()));
     }
 
@@ -330,22 +326,16 @@ mod tests {
     #[test]
     fn acronym_module_resolves() {
         let file_index = idx(&["lib/my_app/http_server.ex"]);
-        let result = ElixirResolver.resolve(
-            &import("MyApp.HTTPServer"),
-            "lib/my_app.ex",
-            &file_index,
-        );
+        let result =
+            ElixirResolver.resolve(&import("MyApp.HTTPServer"), "lib/my_app.ex", &file_index);
         assert_eq!(result, Some("lib/my_app/http_server.ex".into()));
     }
 
     #[test]
     fn xml_parser_module_resolves() {
         let file_index = idx(&["lib/my_app/xml_parser.ex"]);
-        let result = ElixirResolver.resolve(
-            &import("MyApp.XMLParser"),
-            "lib/my_app.ex",
-            &file_index,
-        );
+        let result =
+            ElixirResolver.resolve(&import("MyApp.XMLParser"), "lib/my_app.ex", &file_index);
         assert_eq!(result, Some("lib/my_app/xml_parser.ex".into()));
     }
 

@@ -417,12 +417,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
             let largest = ci
                 .clusters
                 .first()
-                .map(|c| {
-                    format!(
-                        "{} ({} files, cohesion {:.2})",
-                        c.label, c.size, c.cohesion
-                    )
-                })
+                .map(|c| format!("{} ({} files, cohesion {:.2})", c.label, c.size, c.cohesion))
                 .unwrap_or_default();
             let cl_pct = if total_files > 0 {
                 (ci.clustered_files as f32 / total_files as f32 * 100.0) as u32
@@ -433,9 +428,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
                 "\n  {blue}Clusters{reset}     {white}{}{reset} co-change clusters",
                 ci.total
             );
-            println!(
-                "    Largest:         {white}{largest}{reset}"
-            );
+            println!("    Largest:         {white}{largest}{reset}");
             println!(
                 "    Clustered files: {white}{}{reset} / {total_files} ({cl_pct}%)",
                 ci.clustered_files
@@ -602,6 +595,7 @@ async fn write_snapshot_record(store: &StoreProxy, snap: &StatusSnapshot, now: u
 }
 
 /// Render status output from a cached snapshot.
+#[allow(clippy::too_many_arguments)]
 fn display_cached_status(
     s: &StatusSnapshot,
     age: u64,

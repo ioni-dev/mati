@@ -142,6 +142,9 @@ mod tests {
     #[test]
     fn nonexistent_returns_none() {
         let file_index = idx(&["src/main.cpp"]);
-        assert_eq!(CppResolver.resolve(&import("missing.h"), "src/main.cpp", &file_index), None);
+        assert_eq!(
+            CppResolver.resolve(&import("missing.h"), "src/main.cpp", &file_index),
+            None
+        );
     }
 }

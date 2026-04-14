@@ -93,7 +93,7 @@ pub fn compute_propagation(
                 if d1_set.contains(&d2_importer) {
                     continue;
                 }
-                apply_propagation(&mut result, &d2_importer, d2_bump, source_path);
+                apply_propagation(&mut result, d2_importer, d2_bump, source_path);
             }
         }
     }
