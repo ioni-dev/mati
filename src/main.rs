@@ -56,6 +56,8 @@ enum Commands {
     History(cli::show::HistoryArgs),
     /// Show knowledge gaps ranked by risk
     Gaps(cli::gaps::GapsArgs),
+    /// List co-change clusters discovered from git history
+    Clusters(cli::clusters::ClustersArgs),
     /// Show knowledge health metrics
     Stats(cli::stats::StatsArgs),
     /// Batch-enrich file records using Claude API (Layer 1)
@@ -181,6 +183,7 @@ async fn main() -> Result<()> {
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Stats(args) => cli::stats::run(args).await,
         Commands::Gaps(args) => cli::gaps::run(args).await,
+        Commands::Clusters(args) => cli::clusters::run(args).await,
         Commands::Show(args) => cli::show::run_show(args).await,
         Commands::Ls(args) => cli::show::run_ls(args).await,
         Commands::History(args) => cli::show::run_history(args).await,

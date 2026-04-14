@@ -13,6 +13,10 @@
 //!    change_frequency, last_author, is_hotspot.
 //! 9. Apply staleness + cascade to linked gotchas (M-12-C).
 //! 10. Write back.
+//!
+//! **Not recomputed here:** Co-change cluster index. Clusters depend on
+//! CoChanges edges which only change when `mati init` re-mines git history
+//! after new commits. Incremental file edits do not affect cluster membership.
 
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};

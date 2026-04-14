@@ -118,6 +118,31 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         }
     }
 
+    // Co-change cluster — show only when the file belongs to one
+    if let Ok(Some(cluster_rec)) = proxy.get("cluster:index").await {
+        if let Some(ci) =
+            cluster_rec.payload_as::<mati_core::analysis::clusters::ClusterIndex>()
+        {
+            if let Some(c) = ci.cluster_for(&path) {
+                if use_color {
+                    println!(
+                        "  {GRAY}cluster: {label} ({size} files, cohesion {cohesion:.2}){RESET}",
+                        GRAY = colors::GRAY,
+                        RESET = colors::RESET,
+                        label = c.label,
+                        size = c.size,
+                        cohesion = c.cohesion,
+                    );
+                } else {
+                    println!(
+                        "  cluster: {} ({} files, cohesion {:.2})",
+                        c.label, c.size, c.cohesion,
+                    );
+                }
+            }
+        }
+    }
+
     // Staleness warning — show only when it matters
     match file_rec.staleness.tier {
         StalenessTier::Stale => {
