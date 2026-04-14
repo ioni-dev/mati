@@ -831,7 +831,10 @@ mod tests {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        assert_eq!(records[0].key, "file:src/a.rs", "A (effective 0.55) should sort before B (effective 0.45)");
+        assert_eq!(
+            records[0].key, "file:src/a.rs",
+            "A (effective 0.55) should sort before B (effective 0.45)"
+        );
         assert_eq!(records[1].key, "file:src/b.rs");
     }
 }

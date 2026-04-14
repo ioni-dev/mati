@@ -125,10 +125,7 @@ pub async fn run(args: ClustersArgs) -> Result<()> {
             println!("  {cyan}{member}{reset}");
         }
         if c.members.len() > max_display {
-            println!(
-                "  {gray}(+{} more){reset}",
-                c.members.len() - max_display
-            );
+            println!("  {gray}(+{} more){reset}", c.members.len() - max_display);
         }
         println!();
     }

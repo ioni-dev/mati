@@ -86,8 +86,14 @@ mod tests {
     #[test]
     fn stdlib_skipped() {
         let file_index = idx(&["Main.java"]);
-        assert_eq!(JavaResolver.resolve(&import("java.util.List"), "Main.java", &file_index), None);
-        assert_eq!(JavaResolver.resolve(&import("javax.swing.JFrame"), "Main.java", &file_index), None);
+        assert_eq!(
+            JavaResolver.resolve(&import("java.util.List"), "Main.java", &file_index),
+            None
+        );
+        assert_eq!(
+            JavaResolver.resolve(&import("javax.swing.JFrame"), "Main.java", &file_index),
+            None
+        );
     }
 
     #[test]
@@ -115,6 +121,9 @@ mod tests {
     #[test]
     fn nonexistent_returns_none() {
         let file_index = idx(&["Main.java"]);
-        assert_eq!(JavaResolver.resolve(&import("com.example.Missing"), "Main.java", &file_index), None);
+        assert_eq!(
+            JavaResolver.resolve(&import("com.example.Missing"), "Main.java", &file_index),
+            None
+        );
     }
 }

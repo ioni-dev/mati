@@ -92,7 +92,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     }
 
     // Blast radius — show only when populated
-    if let Some(ref br) = fr.as_ref().and_then(|f| f.blast_radius.as_ref()) {
+    if let Some(br) = fr.as_ref().and_then(|f| f.blast_radius.as_ref()) {
         use mati_core::analysis::blast_radius::BlastTier;
         let tier_label = br.tier.label();
         let tier_color = match br.tier {
@@ -120,9 +120,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
 
     // Co-change cluster — show only when the file belongs to one
     if let Ok(Some(cluster_rec)) = proxy.get("cluster:index").await {
-        if let Some(ci) =
-            cluster_rec.payload_as::<mati_core::analysis::clusters::ClusterIndex>()
-        {
+        if let Some(ci) = cluster_rec.payload_as::<mati_core::analysis::clusters::ClusterIndex>() {
             if let Some(c) = ci.cluster_for(&path) {
                 if use_color {
                     println!(
@@ -144,7 +142,7 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     }
 
     // Propagated staleness — show when file has inherited staleness
-    if let Some(ref prop) = fr.as_ref().and_then(|f| f.propagated_staleness.as_ref()) {
+    if let Some(prop) = fr.as_ref().and_then(|f| f.propagated_staleness.as_ref()) {
         if prop.value > 0.0 {
             if let Some(ref source) = prop.primary_source {
                 if use_color {
@@ -160,7 +158,9 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
                 } else {
                     println!(
                         "  propagated staleness — {:.2} from {} ({} upstream source{})",
-                        prop.value, source, prop.source_count,
+                        prop.value,
+                        source,
+                        prop.source_count,
                         if prop.source_count == 1 { "" } else { "s" },
                     );
                 }

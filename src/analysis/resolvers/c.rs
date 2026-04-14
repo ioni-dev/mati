@@ -122,6 +122,9 @@ mod tests {
     #[test]
     fn nonexistent_returns_none() {
         let file_index = idx(&["src/main.c"]);
-        assert_eq!(CResolver.resolve(&import("missing.h"), "src/main.c", &file_index), None);
+        assert_eq!(
+            CResolver.resolve(&import("missing.h"), "src/main.c", &file_index),
+            None
+        );
     }
 }

@@ -314,10 +314,7 @@ mod tests {
 
     #[test]
     fn two_disjoint_pairs_form_two_clusters() {
-        let p = pairs(&[
-            ("src/a.rs", "src/b.rs", 10),
-            ("src/c.rs", "src/d.rs", 8),
-        ]);
+        let p = pairs(&[("src/a.rs", "src/b.rs", 10), ("src/c.rs", "src/d.rs", 8)]);
         let idx = ClusterIndex::compute(&p, 10);
         assert_eq!(idx.total, 2);
         assert_eq!(idx.clusters[0].size, 2);
@@ -427,10 +424,7 @@ mod tests {
 
     #[test]
     fn cluster_for_returns_correct_cluster() {
-        let p = pairs(&[
-            ("src/a.rs", "src/b.rs", 10),
-            ("src/c.rs", "src/d.rs", 8),
-        ]);
+        let p = pairs(&[("src/a.rs", "src/b.rs", 10), ("src/c.rs", "src/d.rs", 8)]);
         let idx = ClusterIndex::compute(&p, 4);
         let c = idx.cluster_for("src/a.rs").unwrap();
         assert!(c.members.contains(&"src/a.rs".to_string()));

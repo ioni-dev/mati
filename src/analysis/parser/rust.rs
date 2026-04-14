@@ -221,9 +221,8 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
 /// - `::*` suffix → Wildcard
 /// - Everything else (std::, external crates) → External
 fn classify_rust_import(path: &str) -> ImportKind {
-    let is_internal = path.starts_with("crate::")
-        || path.starts_with("self::")
-        || path.starts_with("super::");
+    let is_internal =
+        path.starts_with("crate::") || path.starts_with("self::") || path.starts_with("super::");
 
     if !is_internal {
         return ImportKind::External;

@@ -325,7 +325,15 @@ async fn run_triage_mode(
             .unwrap();
 
         let group_candidates = groups.get(selected_kind.label()).unwrap();
-        triage_group(group_candidates, selected_kind, cwd, &theme, &mut session, blast_scores).await?;
+        triage_group(
+            group_candidates,
+            selected_kind,
+            cwd,
+            &theme,
+            &mut session,
+            blast_scores,
+        )
+        .await?;
         println!();
     }
 
@@ -366,7 +374,10 @@ async fn triage_group(
     match action {
         0 => {
             // MultiSelect — all pre-checked, user can deselect
-            let items: Vec<String> = candidates.iter().map(|r| format_list_item_with_blast(r, blast_scores)).collect();
+            let items: Vec<String> = candidates
+                .iter()
+                .map(|r| format_list_item_with_blast(r, blast_scores))
+                .collect();
             let defaults = vec![true; items.len()];
 
             println!("\n  Space to deselect · Enter to confirm selection\n");

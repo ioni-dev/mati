@@ -893,8 +893,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         let mut blast_count = 0u32;
         for fr in &file_records {
             let file_key = format!("file:{}", fr.path);
-            let br =
-                mati_core::analysis::blast_radius::BlastRadius::compute(&file_key, &graph);
+            let br = mati_core::analysis::blast_radius::BlastRadius::compute(&file_key, &graph);
             if let Ok(Some(mut record)) = store_ref.get(&file_key).await {
                 if let Some(mut stored_fr) = record.payload_as::<FileRecord>() {
                     stored_fr.blast_radius = Some(br);
@@ -928,7 +927,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
             .as_secs();
         let cluster_record = Record {
             key: "cluster:index".to_string(),
-            value: format!("{} clusters, {} clustered files", cluster_index.total, cluster_index.clustered_files),
+            value: format!(
+                "{} clusters, {} clustered files",
+                cluster_index.total, cluster_index.clustered_files
+            ),
             payload: serde_json::to_value(&cluster_index).ok(),
             category: Category::Analytics,
             priority: Priority::Normal,
@@ -939,7 +941,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: device_id,
+                device_id,
                 logical_clock: 1,
                 wall_clock: now_ts,
             },
@@ -965,10 +967,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         let t = Instant::now();
         let store_ref = graph.store();
         let all_file_recs = store_ref.scan_prefix("file:").await.unwrap_or_default();
-        let propagation = mati_core::analysis::propagation::compute_propagation(
-            &all_file_recs,
-            &graph,
-        );
+        let propagation =
+            mati_core::analysis::propagation::compute_propagation(&all_file_recs, &graph);
         let mut prop_count = 0u32;
         for (key, prop) in &propagation {
             if let Ok(Some(mut record)) = store_ref.get(key).await {

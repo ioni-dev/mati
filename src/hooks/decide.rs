@@ -1069,14 +1069,8 @@ mod tests {
                 context.contains("Blast radius"),
                 "advisory context must include blast radius warning, got: {context}"
             );
-            assert!(
-                context.contains("45"),
-                "warning must include direct count"
-            );
-            assert!(
-                context.contains("critical"),
-                "warning must include tier"
-            );
+            assert!(context.contains("45"), "warning must include direct count");
+            assert!(context.contains("critical"), "warning must include tier");
         } else {
             panic!("expected Advisory, got {:?}", result.decision);
         }

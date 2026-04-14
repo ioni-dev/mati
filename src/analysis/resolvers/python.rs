@@ -130,11 +130,7 @@ mod tests {
     fn package_init_resolves() {
         let file_index = idx(&["main.py", "pkg/__init__.py"]);
         let resolver = PythonResolver;
-        let result = resolver.resolve(
-            &import("pkg", ImportKind::Normal),
-            "main.py",
-            &file_index,
-        );
+        let result = resolver.resolve(&import("pkg", ImportKind::Normal), "main.py", &file_index);
         assert_eq!(result, Some("pkg/__init__.py".into()));
     }
 

@@ -191,8 +191,7 @@ mod tests {
     fn self_import_resolves() {
         let file_index = idx(&["src/store/mod.rs", "src/store/helpers.rs"]);
         let resolver = RustResolver;
-        let result =
-            resolver.resolve(&import("self::helpers"), "src/store/mod.rs", &file_index);
+        let result = resolver.resolve(&import("self::helpers"), "src/store/mod.rs", &file_index);
         assert_eq!(result, Some("src/store/helpers.rs".into()));
     }
 
@@ -200,8 +199,7 @@ mod tests {
     fn super_import_resolves() {
         let file_index = idx(&["src/store/db.rs", "src/store/helpers.rs"]);
         let resolver = RustResolver;
-        let result =
-            resolver.resolve(&import("super::helpers"), "src/store/db.rs", &file_index);
+        let result = resolver.resolve(&import("super::helpers"), "src/store/db.rs", &file_index);
         assert_eq!(result, Some("src/store/helpers.rs".into()));
     }
 
@@ -217,8 +215,7 @@ mod tests {
     fn unresolvable_returns_none() {
         let file_index = idx(&["src/lib.rs"]);
         let resolver = RustResolver;
-        let result =
-            resolver.resolve(&import("crate::nonexistent"), "src/lib.rs", &file_index);
+        let result = resolver.resolve(&import("crate::nonexistent"), "src/lib.rs", &file_index);
         assert_eq!(result, None);
     }
 
@@ -246,7 +243,11 @@ mod tests {
     fn crate_import_with_trailing_symbol_resolves_to_file() {
         // crate::store::record::FileRecord → src/store/record.rs
         let file_index = idx(&["src/lib.rs", "src/store/record.rs"]);
-        let result = resolve_rust("crate::store::record::FileRecord", "src/lib.rs", &file_index);
+        let result = resolve_rust(
+            "crate::store::record::FileRecord",
+            "src/lib.rs",
+            &file_index,
+        );
         assert_eq!(result, Some("src/store/record.rs".into()));
     }
 
@@ -254,8 +255,11 @@ mod tests {
     fn crate_import_with_trailing_symbol_resolves_to_mod_rs() {
         // crate::analysis::parser::Language → src/analysis/parser/mod.rs
         let file_index = idx(&["src/lib.rs", "src/analysis/parser/mod.rs"]);
-        let result =
-            resolve_rust("crate::analysis::parser::Language", "src/lib.rs", &file_index);
+        let result = resolve_rust(
+            "crate::analysis::parser::Language",
+            "src/lib.rs",
+            &file_index,
+        );
         assert_eq!(result, Some("src/analysis/parser/mod.rs".into()));
     }
 
@@ -263,8 +267,11 @@ mod tests {
     fn crate_import_deep_symbol_chain_strips_multiple() {
         // crate::error::MatiError::NotFound → src/error.rs (strips 2 segments)
         let file_index = idx(&["src/lib.rs", "src/error.rs"]);
-        let result =
-            resolve_rust("crate::error::MatiError::NotFound", "src/lib.rs", &file_index);
+        let result = resolve_rust(
+            "crate::error::MatiError::NotFound",
+            "src/lib.rs",
+            &file_index,
+        );
         assert_eq!(result, Some("src/error.rs".into()));
     }
 
@@ -285,8 +292,11 @@ mod tests {
     fn super_import_with_trailing_symbol() {
         // super::helpers::format_score from src/cli/review.rs → src/cli/helpers.rs
         let file_index = idx(&["src/cli/review.rs", "src/cli/helpers.rs"]);
-        let result =
-            resolve_rust("super::helpers::format_score", "src/cli/review.rs", &file_index);
+        let result = resolve_rust(
+            "super::helpers::format_score",
+            "src/cli/review.rs",
+            &file_index,
+        );
         assert_eq!(result, Some("src/cli/helpers.rs".into()));
     }
 
@@ -294,8 +304,7 @@ mod tests {
     fn self_import_with_trailing_symbol() {
         // self::types::MyType from src/store/mod.rs → src/store/types.rs
         let file_index = idx(&["src/store/mod.rs", "src/store/types.rs"]);
-        let result =
-            resolve_rust("self::types::MyType", "src/store/mod.rs", &file_index);
+        let result = resolve_rust("self::types::MyType", "src/store/mod.rs", &file_index);
         assert_eq!(result, Some("src/store/types.rs".into()));
     }
 
@@ -326,8 +335,7 @@ mod tests {
     #[test]
     fn nonexistent_path_returns_none() {
         let file_index = idx(&["src/lib.rs"]);
-        let result =
-            resolve_rust("crate::nonexistent::thing", "src/lib.rs", &file_index);
+        let result = resolve_rust("crate::nonexistent::thing", "src/lib.rs", &file_index);
         assert_eq!(result, None);
     }
 
@@ -351,11 +359,7 @@ mod tests {
     fn existing_exact_match_preferred_over_stripped() {
         // crate::store::record where src/store/record.rs exists should NOT strip
         // to src/store.rs even if that also exists
-        let file_index = idx(&[
-            "src/lib.rs",
-            "src/store.rs",
-            "src/store/record.rs",
-        ]);
+        let file_index = idx(&["src/lib.rs", "src/store.rs", "src/store/record.rs"]);
         let result = resolve_rust("crate::store::record", "src/lib.rs", &file_index);
         assert_eq!(result, Some("src/store/record.rs".into()));
     }

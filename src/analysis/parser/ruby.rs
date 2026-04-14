@@ -190,11 +190,8 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                 } else {
                     ImportKind::Normal
                 };
-                out.imports.push(ImportStatement::new(
-                    arg.to_owned(),
-                    kind,
-                    line,
-                ));
+                out.imports
+                    .push(ImportStatement::new(arg.to_owned(), kind, line));
             }
         }
     }

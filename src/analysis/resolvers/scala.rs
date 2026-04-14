@@ -101,7 +101,14 @@ mod tests {
     #[test]
     fn stdlib_skipped() {
         let file_index = idx(&["Main.scala"]);
-        assert_eq!(ScalaResolver.resolve(&import("scala.collection.mutable"), "Main.scala", &file_index), None);
+        assert_eq!(
+            ScalaResolver.resolve(
+                &import("scala.collection.mutable"),
+                "Main.scala",
+                &file_index
+            ),
+            None
+        );
     }
 
     #[test]
@@ -115,7 +122,10 @@ mod tests {
     fn sbt_layout_resolves() {
         let file_index = idx(&["src/main/scala/com/example/Utils.scala", "Main.scala"]);
         let result = ScalaResolver.resolve(&import("com.example.Utils"), "Main.scala", &file_index);
-        assert_eq!(result, Some("src/main/scala/com/example/Utils.scala".into()));
+        assert_eq!(
+            result,
+            Some("src/main/scala/com/example/Utils.scala".into())
+        );
     }
 
     #[test]
@@ -128,6 +138,9 @@ mod tests {
     #[test]
     fn nonexistent_returns_none() {
         let file_index = idx(&["Main.scala"]);
-        assert_eq!(ScalaResolver.resolve(&import("com.example.Missing"), "Main.scala", &file_index), None);
+        assert_eq!(
+            ScalaResolver.resolve(&import("com.example.Missing"), "Main.scala", &file_index),
+            None
+        );
     }
 }
