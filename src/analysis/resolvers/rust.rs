@@ -45,7 +45,21 @@ fn resolve_rust(import_path: &str, importing_file: &str, file_index: &FileIndex)
 
     let current_module = rust_module_segments(importing_file)?;
 
-    let segments = if let Some(path) = clean.strip_prefix("crate::") {
+    // Handle bare keyword paths left after wildcard stripping:
+    // `super::*` → `super`, `self::*` → `self`, `crate::*` → `crate`.
+    let segments = if clean == "crate" {
+        // `use crate::*` — re-export of entire crate root, no single file target.
+        return None;
+    } else if clean == "self" {
+        // `use self::*` — re-export of current module directory.
+        current_module.clone()
+    } else if clean == "super" {
+        // `use super::*` — re-export of parent module.
+        if current_module.is_empty() {
+            return None;
+        }
+        current_module[..current_module.len() - 1].to_vec()
+    } else if let Some(path) = clean.strip_prefix("crate::") {
         parse_rust_segments(path)
     } else if let Some(path) = clean.strip_prefix("self::") {
         current_module
@@ -344,5 +358,34 @@ mod tests {
         ]);
         let result = resolve_rust("crate::store::record", "src/lib.rs", &file_index);
         assert_eq!(result, Some("src/store/record.rs".into()));
+    }
+
+    // ── Wildcard bare-keyword resolution ─────────────────────────────────
+
+    #[test]
+    fn super_wildcard_resolves_to_parent_module() {
+        // use super::* from src/cli/review.rs → resolves to src/cli/mod.rs
+        let file_index = idx(&["src/cli/review.rs", "src/cli/mod.rs"]);
+        let imp = ImportStatement::new("super::*", ImportKind::Wildcard, 1);
+        let result = RustResolver.resolve(&imp, "src/cli/review.rs", &file_index);
+        assert_eq!(result, Some("src/cli/mod.rs".into()));
+    }
+
+    #[test]
+    fn self_wildcard_resolves_to_current_module() {
+        // use self::* from src/store/mod.rs → resolves to src/store/mod.rs itself
+        let file_index = idx(&["src/store/mod.rs", "src/store/db.rs"]);
+        let imp = ImportStatement::new("self::*", ImportKind::Wildcard, 1);
+        let result = RustResolver.resolve(&imp, "src/store/mod.rs", &file_index);
+        assert_eq!(result, Some("src/store/mod.rs".into()));
+    }
+
+    #[test]
+    fn crate_wildcard_returns_none() {
+        // use crate::* → no single file target for crate root
+        let file_index = idx(&["src/lib.rs", "src/main.rs"]);
+        let imp = ImportStatement::new("crate::*", ImportKind::Wildcard, 1);
+        let result = RustResolver.resolve(&imp, "src/lib.rs", &file_index);
+        assert_eq!(result, None);
     }
 }
