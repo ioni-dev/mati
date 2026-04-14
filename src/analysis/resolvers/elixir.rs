@@ -35,10 +35,7 @@ fn resolve_elixir(module_path: &str, file_index: &FileIndex) -> Option<String> {
     }
 
     // Convert MyApp.Router → my_app/router
-    let segments: Vec<String> = module_path
-        .split('.')
-        .map(camel_to_snake)
-        .collect();
+    let segments: Vec<String> = module_path.split('.').map(camel_to_snake).collect();
     let rel = segments.join("/");
 
     // Try under lib/: lib/my_app/router.ex
