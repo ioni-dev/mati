@@ -958,6 +958,37 @@ pub async fn run(args: InitArgs) -> Result<()> {
         );
     }
 
+    // ── 10c. Compute propagated staleness ──────────────────────────────────
+    // Requires: graph loaded with Imports edges (Phase 10), file records
+    // with staleness values written to store (Phase 9).
+    {
+        let t = Instant::now();
+        let store_ref = graph.store();
+        let all_file_recs = store_ref.scan_prefix("file:").await.unwrap_or_default();
+        let propagation = mati_core::analysis::propagation::compute_propagation(
+            &all_file_recs,
+            &graph,
+        );
+        let mut prop_count = 0u32;
+        for (key, prop) in &propagation {
+            if let Ok(Some(mut record)) = store_ref.get(key).await {
+                if let Some(mut fr) = record.payload_as::<FileRecord>() {
+                    fr.propagated_staleness = Some(prop.clone());
+                    record.payload = serde_json::to_value(&fr).ok();
+                    let _ = store_ref.put(key, &record).await;
+                    prop_count += 1;
+                }
+            }
+        }
+        if prop_count > 0 {
+            println!(
+                "  Staleness propagation...       {:>4} files   {:>4}ms",
+                prop_count,
+                t.elapsed().as_millis()
+            );
+        }
+    }
+
     // ── 11a. Search index — deferred to first MCP server startup ─────────────
     // Cold init: tantivy costs ~400ms to index 27k records. CLI commands scan
     // KV directly and never need full-text search. Only the MCP server (via

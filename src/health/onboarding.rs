@@ -208,6 +208,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         }
     }
 

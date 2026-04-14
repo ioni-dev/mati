@@ -10,6 +10,7 @@ use crate::store::record::FileRecord;
 pub mod blast_radius;
 pub mod claude_md;
 pub mod clusters;
+pub mod propagation;
 pub mod deps;
 pub mod edges;
 pub mod git;

@@ -254,6 +254,34 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     let mc_color = if multi_contributor > 0 { green } else { yellow };
     println!("    Confirmed by 2+ devs  {mc_color}{multi_contributor}{reset}");
 
+    // Propagation chains
+    {
+        use std::collections::HashSet;
+        let prop_files: Vec<&FileRecord> = file_data
+            .iter()
+            .filter(|fr| {
+                fr.propagated_staleness
+                    .as_ref()
+                    .is_some_and(|p| p.source_count > 0)
+            })
+            .collect();
+        if !prop_files.is_empty() {
+            let sources: HashSet<&str> = prop_files
+                .iter()
+                .filter_map(|fr| {
+                    fr.propagated_staleness
+                        .as_ref()
+                        .and_then(|p| p.primary_source.as_deref())
+                })
+                .collect();
+            println!(
+                "    Propagation chains    {yellow}{}{reset} files have inherited staleness from {white}{}{reset} source files",
+                prop_files.len(),
+                sources.len(),
+            );
+        }
+    }
+
     println!();
 
     // ════════════════════════════════════════════════════════════════════════════

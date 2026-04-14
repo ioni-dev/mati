@@ -180,6 +180,29 @@ pub async fn run(args: RepairArgs) -> Result<()> {
             }
         }
 
+        // Phase: recompute propagated staleness.
+        {
+            let all_recs = graph.store().scan_prefix("file:").await.unwrap_or_default();
+            let propagation =
+                mati_core::analysis::propagation::compute_propagation(&all_recs, &graph);
+            let mut prop_count = 0u32;
+            for (key, prop) in &propagation {
+                if let Ok(Some(mut record)) = graph.store().get(key).await {
+                    if let Some(mut fr) =
+                        record.payload_as::<mati_core::store::record::FileRecord>()
+                    {
+                        fr.propagated_staleness = Some(prop.clone());
+                        record.payload = serde_json::to_value(&fr).ok();
+                        let _ = graph.store().put(key, &record).await;
+                        prop_count += 1;
+                    }
+                }
+            }
+            if !args.json && prop_count > 0 {
+                println!("  Staleness propagation recomputed for {prop_count} files.");
+            }
+        }
+
         graph.close().await?;
     } else {
         store.close().await?;

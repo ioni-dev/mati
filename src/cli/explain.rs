@@ -143,6 +143,31 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         }
     }
 
+    // Propagated staleness — show when file has inherited staleness
+    if let Some(ref prop) = fr.as_ref().and_then(|f| f.propagated_staleness.as_ref()) {
+        if prop.value > 0.0 {
+            if let Some(ref source) = prop.primary_source {
+                if use_color {
+                    println!(
+                        "  {YELLOW}propagated staleness{RESET} {GRAY}— {value:.2} from {source} ({count} upstream source{s}){RESET}",
+                        YELLOW = colors::YELLOW,
+                        GRAY = colors::GRAY,
+                        RESET = colors::RESET,
+                        value = prop.value,
+                        count = prop.source_count,
+                        s = if prop.source_count == 1 { "" } else { "s" },
+                    );
+                } else {
+                    println!(
+                        "  propagated staleness — {:.2} from {} ({} upstream source{})",
+                        prop.value, source, prop.source_count,
+                        if prop.source_count == 1 { "" } else { "s" },
+                    );
+                }
+            }
+        }
+    }
+
     // Staleness warning — show only when it matters
     match file_rec.staleness.tier {
         StalenessTier::Stale => {

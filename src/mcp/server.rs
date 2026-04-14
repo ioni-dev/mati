@@ -942,6 +942,44 @@ pub(crate) async fn socket_dispatch(
                 }
             }
 
+            // Incremental staleness propagation: recompute for the edited
+            // file's direct importers and their importers (depth 2 only).
+            // Does NOT recompute the full repo — keeps the hook fast.
+            {
+                let mut affected_keys = vec![file_key.clone()];
+                let d1 = g.neighbors_incoming(&file_key, &EdgeKind::Imports);
+                for d1k in &d1 {
+                    affected_keys.push(d1k.clone());
+                    affected_keys.extend(g.neighbors_incoming(d1k, &EdgeKind::Imports));
+                }
+                // Collect records for just the affected neighborhood
+                let mut neighborhood_recs = Vec::new();
+                for key in &affected_keys {
+                    if let Ok(Some(rec)) = store.get(key).await {
+                        neighborhood_recs.push(rec);
+                    }
+                }
+                // Also include the edited file itself as a potential source
+                if let Ok(Some(rec)) = store.get(&file_key).await {
+                    if !neighborhood_recs.iter().any(|r| r.key == file_key) {
+                        neighborhood_recs.push(rec);
+                    }
+                }
+                let propagation = crate::analysis::propagation::compute_propagation(
+                    &neighborhood_recs,
+                    &g,
+                );
+                for (key, prop) in &propagation {
+                    if let Ok(Some(mut rec)) = store.get(key).await {
+                        if let Some(mut fr) = rec.payload_as::<crate::store::record::FileRecord>() {
+                            fr.propagated_staleness = Some(prop.clone());
+                            rec.payload = serde_json::to_value(&fr).ok();
+                            let _ = store.put(key, &rec).await;
+                        }
+                    }
+                }
+            }
+
             SocketResponse::ok(serde_json::Value::Null)
         }
 
@@ -1386,6 +1424,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         Record {
             key: format!("file:{path}"),

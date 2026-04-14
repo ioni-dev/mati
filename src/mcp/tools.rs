@@ -1872,6 +1872,7 @@ mod tests {
                 score: 48.0,
                 tier: crate::analysis::blast_radius::BlastTier::Critical,
             }),
+        propagated_staleness: None,
         };
         let mut record = make_record("file:src/core.rs", "Core module", Category::File, 0.5);
         record.payload = serde_json::to_value(&fr).ok();
@@ -1924,6 +1925,7 @@ mod tests {
                 score: 2.0,
                 tier: crate::analysis::blast_radius::BlastTier::Low,
             }),
+        propagated_staleness: None,
         };
         let mut record = make_record("file:src/leaf.rs", "Leaf module", Category::File, 0.5);
         record.payload = serde_json::to_value(&fr).ok();
@@ -2223,6 +2225,7 @@ mod tests {
                 content_hash: None,
                 line_count: 0,
                 blast_radius: None,
+                propagated_staleness: None,
             };
             let mut r = make_record(
                 "file:src/pipeline/prefilter.rs",
@@ -2297,6 +2300,7 @@ mod tests {
                 content_hash: None,
                 line_count: 0,
                 blast_radius: None,
+                propagated_staleness: None,
             };
             let mut r = make_record("file:src/empty.rs", "", Category::File, 0.10);
             r.payload = serde_json::to_value(&fr).ok();
@@ -2344,6 +2348,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record("file:src/hot.rs", &fr.purpose, Category::File, 0.5);
         file_record.payload = serde_json::to_value(&fr).ok();
@@ -2394,6 +2399,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record("file:src/cold.rs", &fr.purpose, Category::File, 0.5);
         file_record.payload = serde_json::to_value(&fr).ok();
@@ -2434,6 +2440,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/covered.rs",
@@ -2547,6 +2554,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",
@@ -2601,6 +2609,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/dead.rs",
@@ -2651,6 +2660,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/dup.rs",
@@ -2729,6 +2739,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let mut file_record = make_record(
             "file:src/stale.rs",
@@ -3993,6 +4004,7 @@ mod tests {
                 score: 48.0,
                 tier: crate::analysis::blast_radius::BlastTier::Critical,
             }),
+        propagated_staleness: None,
         };
         let mut rec = make_record("file:src/core.rs", "Core module", Category::File, 0.5);
         rec.payload = serde_json::to_value(&fr_critical).ok();
@@ -4022,6 +4034,7 @@ mod tests {
                 score: 3.0,
                 tier: crate::analysis::blast_radius::BlastTier::Low,
             }),
+        propagated_staleness: None,
         };
         let mut rec2 = make_record("file:src/leaf.rs", "Leaf module", Category::File, 0.5);
         rec2.payload = serde_json::to_value(&fr_low).ok();

@@ -1242,6 +1242,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
 
         let cascaded = cascade_staleness_to_gotchas(&store, &file_record)
@@ -1282,6 +1283,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
 
         let cascaded = cascade_staleness_to_gotchas(&store, &file_record)
@@ -1315,6 +1317,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
 
         let cascaded = cascade_staleness_to_gotchas(&store, &file_record)
@@ -1387,6 +1390,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         Record {
             key: key.to_string(),
@@ -1498,6 +1502,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
         let cache = HashMap::new();
         let factor = dep_factor(Some(&fr), &cache);
@@ -1524,6 +1529,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
 
         // Create a dep record for tokio that was updated after the file.
@@ -1600,6 +1606,7 @@ mod tests {
             token_cost_estimate: 0,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
             last_modified_session: 1_000_000,
             content_hash: None,
         };
@@ -1667,6 +1674,7 @@ mod tests {
             token_cost_estimate: 0,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
             last_modified_session: 1_000_000,
             content_hash: None,
         };
@@ -1741,6 +1749,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
 
         let record = make_file_record_full("file:src/main.rs", vec![], vec![], vec![], 0);
@@ -1780,6 +1789,7 @@ mod tests {
             content_hash: None,
             line_count: 0,
             blast_radius: None,
+            propagated_staleness: None,
         };
 
         let record = make_file_record_full(
