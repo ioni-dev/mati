@@ -67,9 +67,7 @@ pub fn resolve_cross_crate(import_path: &str, file_index: &FileIndex) -> Option<
 fn resolve_rust(import_path: &str, importing_file: &str, file_index: &FileIndex) -> Option<String> {
     // Determine the crate root for this file. Falls back to "src/" when
     // crate_roots is empty (e.g. in unit tests with a plain FileIndex).
-    let crate_root = file_index
-        .crate_root_for(importing_file)
-        .unwrap_or("src/");
+    let crate_root = file_index.crate_root_for(importing_file).unwrap_or("src/");
 
     // Strip `as` alias and `::*` wildcard suffix for path resolution.
     let clean = import_path
@@ -447,11 +445,7 @@ mod tests {
             ],
             vec!["crates/foo/src/", "crates/bar/src/"],
         );
-        let result = resolve_rust(
-            "crate::helper",
-            "crates/foo/src/lib.rs",
-            &file_index,
-        );
+        let result = resolve_rust("crate::helper", "crates/foo/src/lib.rs", &file_index);
         assert_eq!(result, Some("crates/foo/src/helper.rs".into()));
     }
 
@@ -467,20 +461,13 @@ mod tests {
         );
         // File in crates/foo trying to resolve crate::util — should NOT find
         // crates/bar/src/util.rs because that's a different crate.
-        let result = resolve_rust(
-            "crate::util",
-            "crates/foo/src/lib.rs",
-            &file_index,
-        );
+        let result = resolve_rust("crate::util", "crates/foo/src/lib.rs", &file_index);
         assert_eq!(result, None);
     }
 
     #[test]
     fn single_crate_project_still_works_with_explicit_root() {
-        let file_index = idx_with_roots(
-            &["src/lib.rs", "src/utils.rs"],
-            vec!["src/"],
-        );
+        let file_index = idx_with_roots(&["src/lib.rs", "src/utils.rs"], vec!["src/"]);
         let result = resolve_rust("crate::utils", "src/lib.rs", &file_index);
         assert_eq!(result, Some("src/utils.rs".into()));
     }
@@ -533,30 +520,22 @@ mod tests {
             ],
             vec!["crates/printer/src/"],
         );
-        let result = resolve_rust(
-            "crate::hyperlink",
-            "crates/printer/src/lib.rs",
-            &file_index,
-        );
+        let result = resolve_rust("crate::hyperlink", "crates/printer/src/lib.rs", &file_index);
         assert_eq!(result, Some("crates/printer/src/hyperlink/mod.rs".into()));
     }
 
     #[test]
     fn fallback_to_src_when_no_crate_roots_set() {
         // Empty crate_roots → falls back to "src/" (backward compat)
-        let file_index = FileIndex::new(
-            ["src/lib.rs", "src/store.rs"].iter().map(|s| s.to_string()),
-        );
+        let file_index =
+            FileIndex::new(["src/lib.rs", "src/store.rs"].iter().map(|s| s.to_string()));
         let result = resolve_rust("crate::store", "src/lib.rs", &file_index);
         assert_eq!(result, Some("src/store.rs".into()));
     }
 
     // ── Cross-crate workspace resolution tests ──────────────────────────
 
-    fn idx_with_members(
-        paths: &[&str],
-        members: &[(&str, &str)],
-    ) -> FileIndex {
+    fn idx_with_members(paths: &[&str], members: &[(&str, &str)]) -> FileIndex {
         let mut fi = FileIndex::new(paths.iter().map(|s| s.to_string()));
         let map: std::collections::HashMap<String, String> = members
             .iter()

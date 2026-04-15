@@ -109,7 +109,7 @@ impl FileIndex {
     /// Roots are sorted longest-first so workspace member paths take
     /// precedence over the repo-root `src/`.
     pub fn set_crate_roots(&mut self, mut roots: Vec<String>) {
-        roots.sort_by(|a, b| b.len().cmp(&a.len()));
+        roots.sort_by_key(|b| std::cmp::Reverse(b.len()));
         self.crate_roots = roots;
     }
 

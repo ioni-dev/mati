@@ -91,7 +91,8 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         let mut file_records = graph.store().scan_prefix("file:").await.unwrap_or_default();
         let mut blast_count = 0u32;
         let all_keys: Vec<String> = file_records.iter().map(|r| r.key.clone()).collect();
-        let blast_map = mati_core::analysis::blast_radius::BlastRadius::compute_all(&graph, &all_keys);
+        let blast_map =
+            mati_core::analysis::blast_radius::BlastRadius::compute_all(&graph, &all_keys);
 
         // In-memory mutation.
         for record in file_records.iter_mut() {
@@ -105,9 +106,8 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         }
 
         // Bulk write.
-        let pairs: Vec<(&str, &mati_core::store::record::Record)> = file_records.iter()
-            .map(|r| (r.key.as_str(), r))
-            .collect();
+        let pairs: Vec<(&str, &mati_core::store::record::Record)> =
+            file_records.iter().map(|r| (r.key.as_str(), r)).collect();
         let _ = graph.store().put_batch_kv_only(&pairs).await;
         if !args.json {
             println!("  Blast radius recomputed for {blast_count} files.");

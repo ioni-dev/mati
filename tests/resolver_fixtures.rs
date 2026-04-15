@@ -124,7 +124,8 @@ fn rust_fixture_resolves_super_import() {
 fn rust_workspace_fixture_resolves_crate_imports() {
     let root = fixture_sub_path("rust", "workspace_project");
     let files = walk_fixture_sub("rust", "workspace_project");
-    let mut file_index = FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()));
+    let mut file_index =
+        FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()));
     let crate_roots = mati_core::analysis::edges::detect_rust_crate_roots(&root, &file_index);
     file_index.set_crate_roots(crate_roots);
     let registry = ResolverRegistry::new();
@@ -145,7 +146,8 @@ fn rust_workspace_fixture_resolves_crate_imports() {
 fn rust_workspace_fixture_bar_resolves_independently() {
     let root = fixture_sub_path("rust", "workspace_project");
     let files = walk_fixture_sub("rust", "workspace_project");
-    let mut file_index = FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()));
+    let mut file_index =
+        FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()));
     let crate_roots = mati_core::analysis::edges::detect_rust_crate_roots(&root, &file_index);
     file_index.set_crate_roots(crate_roots);
     let registry = ResolverRegistry::new();

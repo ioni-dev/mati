@@ -102,12 +102,10 @@ pub fn build_edges_with_root(
             // but for Rust files in a workspace, try cross-crate resolution first.
             if import_stmt.kind == ImportKind::External {
                 if file.language == Language::Rust && file_index.has_workspace_members() {
-                    if let Some(target_rel) =
-                        crate::analysis::resolvers::rust::resolve_cross_crate(
-                            &import_stmt.path,
-                            &file_index,
-                        )
-                    {
+                    if let Some(target_rel) = crate::analysis::resolvers::rust::resolve_cross_crate(
+                        &import_stmt.path,
+                        &file_index,
+                    ) {
                         let to_key = file_key(&target_rel);
                         if from_key != to_key {
                             edges.push((from_key.clone(), EdgeKind::Imports, to_key));
@@ -227,9 +225,7 @@ fn expand_workspace_member(repo_root: &Path, pattern: &str, roots: &mut Vec<Stri
 ///
 /// Returns a map from snake_case crate name (as used in `use` statements)
 /// to the crate root path (e.g. `"crates/regex/src/"`).
-pub fn detect_workspace_members(
-    repo_root: &Path,
-) -> std::collections::HashMap<String, String> {
+pub fn detect_workspace_members(repo_root: &Path) -> std::collections::HashMap<String, String> {
     let mut members = std::collections::HashMap::new();
 
     let cargo_path = repo_root.join("Cargo.toml");
