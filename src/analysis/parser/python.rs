@@ -462,6 +462,24 @@ mod tests {
         assert_eq!(a.imports[0].kind, ImportKind::Normal);
     }
 
+    // ── Brace decomposition: regression guard ─────────────────────────────
+    // Python `from x import (a, b, c)` resolves to module `x` regardless
+    // of which names are imported. The query captures `module_name:` which
+    // is just `x`. Decomposing the parenthesized list adds no file-level
+    // edges — only symbol-level detail out of scope for Layer 0.
+
+    #[test]
+    fn parenthesized_from_import_produces_single_edge() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(
+            &dir,
+            "from myapp.utils import (helper_a, helper_b, helper_c)\n",
+        );
+        assert_eq!(a.imports.len(), 1);
+        assert_eq!(a.imports[0].path, "myapp.utils");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
+    }
+
     // ── Branches ──────────────────────────────────────────────────────────────
 
     #[test]
