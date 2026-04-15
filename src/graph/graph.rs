@@ -238,6 +238,22 @@ impl Graph {
     /// MCP tools need both Store reads and Graph traversal. This accessor
     /// avoids splitting ownership — the Graph owns the Store, and callers
     /// borrow it through this method.
+
+    /// Build a reverse adjacency list for the given edge kind.
+    /// Maps target node key → list of source node keys.
+    /// Used by `BlastRadius::compute_all` to avoid repeated graph lookups.
+    pub fn reverse_adjacency(&self, kind: &EdgeKind) -> HashMap<String, Vec<String>> {
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for edge in self.inner.edge_references() {
+            if edge.weight() == kind {
+                let source = self.inner[edge.source()].clone();
+                let target = self.inner[edge.target()].clone();
+                adj.entry(target).or_default().push(source);
+            }
+        }
+        adj
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }

@@ -15,7 +15,7 @@ use std::path::Path;
 use crate::analysis::parser::import::ImportKind;
 use crate::analysis::parser::StaticFileAnalysis;
 use crate::analysis::resolvers::{FileIndex, ResolverRegistry};
-use crate::analysis::walker::WalkedFile;
+use crate::analysis::walker::{Language, WalkedFile};
 use crate::graph::EdgeKind;
 
 /// All edges produced by Layer 0 analysis, ready for batch insertion.
@@ -64,10 +64,25 @@ pub fn build_edges_with_root(
         })
     });
 
-    let file_index = match derived_root {
-        Some(root) => FileIndex::new_with_root(root, files.iter().map(|f| f.rel_path.clone())),
+    let mut file_index = match derived_root {
+        Some(ref root) => {
+            FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()))
+        }
         None => FileIndex::new(files.iter().map(|f| f.rel_path.clone())),
     };
+
+    // Detect Rust crate roots and workspace members from Cargo.toml.
+    if let Some(ref root) = derived_root {
+        let crate_roots = detect_rust_crate_roots(root, &file_index);
+        if !crate_roots.is_empty() {
+            file_index.set_crate_roots(crate_roots);
+        }
+        let members = detect_workspace_members(root);
+        if !members.is_empty() {
+            file_index.set_workspace_members(members);
+        }
+    }
+
     let registry = ResolverRegistry::new();
 
     let mut edges: Vec<(String, EdgeKind, String)> = Vec::new();
@@ -83,8 +98,22 @@ pub fn build_edges_with_root(
         let from_key = file_key(&file.rel_path);
 
         for import_stmt in &analysis.imports {
-            // Skip imports classified as external at parse time.
+            // Skip imports classified as external at parse time —
+            // but for Rust files in a workspace, try cross-crate resolution first.
             if import_stmt.kind == ImportKind::External {
+                if file.language == Language::Rust && file_index.has_workspace_members() {
+                    if let Some(target_rel) =
+                        crate::analysis::resolvers::rust::resolve_cross_crate(
+                            &import_stmt.path,
+                            &file_index,
+                        )
+                    {
+                        let to_key = file_key(&target_rel);
+                        if from_key != to_key {
+                            edges.push((from_key.clone(), EdgeKind::Imports, to_key));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -117,6 +146,178 @@ pub fn build_edges_with_root(
     Layer0Edges {
         edges,
         unresolved_imports,
+    }
+}
+
+/// Detect Rust crate root prefixes from `Cargo.toml`.
+///
+/// For workspace projects, reads `[workspace].members` and expands globs to
+/// produce roots like `"crates/regex/src/"`. For single-crate projects,
+/// produces `["src/"]` if `src/` contains Rust files.
+pub fn detect_rust_crate_roots(repo_root: &Path, file_index: &FileIndex) -> Vec<String> {
+    let cargo_path = repo_root.join("Cargo.toml");
+    let content = match std::fs::read_to_string(&cargo_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut roots = Vec::new();
+
+    // Check for [workspace] section with members.
+    if let Some(workspace) = doc.get("workspace").and_then(|w| w.as_table()) {
+        if let Some(members) = workspace.get("members").and_then(|m| m.as_array()) {
+            for member in members.iter() {
+                if let Some(pattern) = member.as_str() {
+                    expand_workspace_member(repo_root, pattern, &mut roots);
+                }
+            }
+        }
+    }
+
+    // If workspace members produced roots, also check if the root crate has src/.
+    if !roots.is_empty() {
+        if file_index.contains("src/lib.rs") || file_index.contains("src/main.rs") {
+            roots.push("src/".to_string());
+        }
+        return roots;
+    }
+
+    // Single-crate project: if [package] exists and src/ has Rust files.
+    if doc.get("package").is_some()
+        && (file_index.contains("src/lib.rs") || file_index.contains("src/main.rs"))
+    {
+        roots.push("src/".to_string());
+    }
+
+    roots
+}
+
+/// Expand a workspace member pattern (e.g. `"crates/*"`) into `<member>/src/` roots.
+fn expand_workspace_member(repo_root: &Path, pattern: &str, roots: &mut Vec<String>) {
+    if pattern.contains('*') {
+        // Glob: e.g. "crates/*" — enumerate matching directories.
+        let base_dir = repo_root.join(pattern.split('*').next().unwrap_or(""));
+        if let Ok(entries) = std::fs::read_dir(&base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && path.join("src").is_dir() {
+                    if let Ok(rel) = path.strip_prefix(repo_root) {
+                        let root = format!("{}/src/", rel.to_string_lossy().replace('\\', "/"));
+                        roots.push(root);
+                    }
+                }
+            }
+        }
+    } else {
+        // Literal member: e.g. "crates/foo"
+        let member_dir = repo_root.join(pattern);
+        if member_dir.join("src").is_dir() {
+            let root = format!("{}/src/", pattern.trim_end_matches('/'));
+            roots.push(root);
+        }
+    }
+}
+
+/// Detect workspace member crate names from each member's `Cargo.toml`.
+///
+/// Returns a map from snake_case crate name (as used in `use` statements)
+/// to the crate root path (e.g. `"crates/regex/src/"`).
+pub fn detect_workspace_members(
+    repo_root: &Path,
+) -> std::collections::HashMap<String, String> {
+    let mut members = std::collections::HashMap::new();
+
+    let cargo_path = repo_root.join("Cargo.toml");
+    let content = match std::fs::read_to_string(&cargo_path) {
+        Ok(c) => c,
+        Err(_) => return members,
+    };
+    let doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return members,
+    };
+
+    let workspace = match doc.get("workspace").and_then(|w| w.as_table()) {
+        Some(w) => w,
+        None => return members,
+    };
+    let member_patterns = match workspace.get("members").and_then(|m| m.as_array()) {
+        Some(a) => a,
+        None => return members,
+    };
+
+    // Collect all member directories (expanding globs).
+    let mut member_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for member in member_patterns.iter() {
+        if let Some(pattern) = member.as_str() {
+            collect_member_dirs(repo_root, pattern, &mut member_dirs);
+        }
+    }
+
+    // Also check if the root crate is part of the workspace.
+    if doc.get("package").is_some() {
+        member_dirs.push(repo_root.to_path_buf());
+    }
+
+    // Read each member's Cargo.toml to extract [package].name.
+    for dir in &member_dirs {
+        let member_cargo = dir.join("Cargo.toml");
+        let member_content = match std::fs::read_to_string(&member_cargo) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let member_doc = match member_content.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let name = match member_doc
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Compute the crate root path relative to repo root.
+        let crate_root = if dir == repo_root {
+            "src/".to_string()
+        } else if let Ok(rel) = dir.strip_prefix(repo_root) {
+            format!("{}/src/", rel.to_string_lossy().replace('\\', "/"))
+        } else {
+            continue;
+        };
+
+        // Normalize kebab-case to snake_case (grep-regex → grep_regex).
+        let snake_name = name.replace('-', "_");
+        members.insert(snake_name, crate_root);
+    }
+
+    members
+}
+
+/// Collect member directories from a workspace member pattern, expanding globs.
+fn collect_member_dirs(repo_root: &Path, pattern: &str, dirs: &mut Vec<std::path::PathBuf>) {
+    if pattern.contains('*') {
+        let base_dir = repo_root.join(pattern.split('*').next().unwrap_or(""));
+        if let Ok(entries) = std::fs::read_dir(&base_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+        }
+    } else {
+        let dir = repo_root.join(pattern);
+        if dir.is_dir() {
+            dirs.push(dir);
+        }
     }
 }
 

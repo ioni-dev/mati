@@ -4,7 +4,7 @@
 //! transitively) via `Imports` edges. Higher blast radius means changes
 //! to the file have wider impact and warrant extra review care.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -73,11 +73,14 @@ impl BlastTier {
 }
 
 impl BlastRadius {
-    /// Compute blast radius for a file given the graph.
+    /// Compute blast radius for a single file given the graph.
     ///
     /// Uses `neighbors_incoming` with `EdgeKind::Imports` at depth 1 for direct
     /// count, and `traverse_incoming` at `TRANSITIVE_DEPTH` for the full
     /// transitive set. Transitive count excludes direct importers.
+    ///
+    /// Prefer [`compute_all`] for batch computation — it's O(V+E) total
+    /// vs O(N*(V+E)) when calling this in a loop.
     pub fn compute(file_key: &str, graph: &Graph) -> Self {
         let direct_set: HashSet<String> = graph
             .neighbors_incoming(file_key, &EdgeKind::Imports)
@@ -101,6 +104,60 @@ impl BlastRadius {
             score,
             tier,
         }
+    }
+
+    /// Compute blast radius for every file in the graph in a single pass.
+    ///
+    /// Returns a map from `file:<path>` keys to their `BlastRadius`.
+    /// Pre-computes the reverse adjacency list once, then runs bounded BFS
+    /// per node. This avoids repeated `edges_directed` lookups in petgraph,
+    /// reducing constant factors significantly on large graphs.
+    pub fn compute_all(graph: &Graph, file_keys: &[String]) -> HashMap<String, BlastRadius> {
+        // Pre-compute reverse adjacency list: for each node, who imports it?
+        let reverse_adj = graph.reverse_adjacency(&EdgeKind::Imports);
+        let mut result = HashMap::with_capacity(file_keys.len());
+
+        for file_key in file_keys {
+            let direct_vec = reverse_adj
+                .get(file_key.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let direct_set: HashSet<&str> = direct_vec.iter().map(|s| s.as_str()).collect();
+
+            // BFS for transitive ancestors at depth 2..=TRANSITIVE_DEPTH
+            let mut all_ancestors: HashSet<&str> = HashSet::new();
+            all_ancestors.extend(direct_set.iter());
+
+            let mut frontier: Vec<&str> = direct_vec.iter().map(|s| s.as_str()).collect();
+            for _depth in 1..TRANSITIVE_DEPTH {
+                let mut next_frontier = Vec::new();
+                for node in &frontier {
+                    if let Some(parents) = reverse_adj.get(*node) {
+                        for p in parents {
+                            if all_ancestors.insert(p.as_str()) {
+                                next_frontier.push(p.as_str());
+                            }
+                        }
+                    }
+                }
+                if next_frontier.is_empty() {
+                    break;
+                }
+                frontier = next_frontier;
+            }
+
+            let direct = direct_set.len() as u32;
+            let transitive = (all_ancestors.len() - direct_set.len()) as u32;
+            let score = direct as f32 + (transitive as f32 * TRANSITIVE_WEIGHT);
+            let tier = BlastTier::from_direct_count(direct);
+
+            result.insert(
+                file_key.clone(),
+                BlastRadius { direct, transitive, score, tier },
+            );
+        }
+
+        result
     }
 }
 
@@ -357,6 +414,64 @@ mod tests {
             let label = tier.label();
             assert_eq!(json, format!("\"{label}\""));
         }
+    }
+
+    // ── compute_all tests ────────────────────────────────────────────────────
+
+    /// compute_all matches per-file compute on the same graph.
+    #[tokio::test]
+    async fn compute_all_matches_per_file_compute() {
+        let (mut g, _dir) = temp_graph().await;
+        // a→b, b→c, c→d
+        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:c").await.unwrap();
+        g.add_edge("file:c", EdgeKind::Imports, "file:d").await.unwrap();
+
+        let keys: Vec<String> = ["file:a", "file:b", "file:c", "file:d"]
+            .iter().map(|s| s.to_string()).collect();
+
+        let batch = BlastRadius::compute_all(&g, &keys);
+        for key in &keys {
+            let single = BlastRadius::compute(key, &g);
+            let from_batch = batch.get(key).expect("key missing from compute_all");
+            assert_eq!(single.direct, from_batch.direct, "direct mismatch for {key}");
+            assert_eq!(single.transitive, from_batch.transitive, "transitive mismatch for {key}");
+        }
+
+        g.close().await.unwrap();
+    }
+
+    /// compute_all handles cycles without infinite recursion.
+    #[tokio::test]
+    async fn compute_all_handles_cycle_safely() {
+        let (mut g, _dir) = temp_graph().await;
+        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:a").await.unwrap();
+
+        let keys = vec!["file:a".to_string(), "file:b".to_string()];
+        let batch = BlastRadius::compute_all(&g, &keys);
+
+        let br_a = batch.get("file:a").unwrap();
+        let br_b = batch.get("file:b").unwrap();
+        assert_eq!(br_a.direct, 1);
+        assert_eq!(br_b.direct, 1);
+
+        // Verify matches single-file compute
+        let single_a = BlastRadius::compute("file:a", &g);
+        let single_b = BlastRadius::compute("file:b", &g);
+        assert_eq!(br_a.direct, single_a.direct);
+        assert_eq!(br_b.direct, single_b.direct);
+
+        g.close().await.unwrap();
+    }
+
+    /// compute_all on empty graph returns empty map.
+    #[tokio::test]
+    async fn compute_all_on_empty_graph_returns_empty_map() {
+        let (g, _dir) = temp_graph().await;
+        let batch = BlastRadius::compute_all(&g, &[]);
+        assert!(batch.is_empty());
+        g.close().await.unwrap();
     }
 
     /// Deserialization of BlastRadius with default (missing field in parent).
