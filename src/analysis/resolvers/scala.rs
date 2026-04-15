@@ -173,8 +173,7 @@ mod tests {
             "myproject/src/main/scala/foo/Bar.scala",
             "myproject/src/main/scala/foo/Main.scala",
         ]);
-        file_index
-            .set_scala_source_roots(vec!["myproject/src/main/scala/".to_string()]);
+        file_index.set_scala_source_roots(vec!["myproject/src/main/scala/".to_string()]);
         let result = ScalaResolver.resolve(&import("foo.Bar"), "Main.scala", &file_index);
         assert_eq!(
             result,
@@ -189,9 +188,7 @@ mod tests {
             "zio-json/shared/src/main/scala/zio/json/JsonDecoder.scala",
             "zio-json/shared/src/main/scala/zio/json/JsonEncoder.scala",
         ]);
-        file_index.set_scala_source_roots(vec![
-            "zio-json/shared/src/main/scala/".to_string(),
-        ]);
+        file_index.set_scala_source_roots(vec!["zio-json/shared/src/main/scala/".to_string()]);
         let result = ScalaResolver.resolve(
             &import("zio.json.JsonDecoder"),
             "zio-json/shared/src/main/scala/zio/json/JsonEncoder.scala",

@@ -132,8 +132,11 @@ mod tests {
     #[test]
     fn require_with_lib_prefix_resolves() {
         let file_index = idx(&["lib/sinatra/base.rb", "lib/sinatra.rb"]);
-        let result =
-            RubyResolver.resolve(&import_normal("sinatra/base"), "lib/sinatra.rb", &file_index);
+        let result = RubyResolver.resolve(
+            &import_normal("sinatra/base"),
+            "lib/sinatra.rb",
+            &file_index,
+        );
         assert_eq!(result, Some("lib/sinatra/base.rb".into()));
     }
 
@@ -164,8 +167,11 @@ mod tests {
             "lib/sinatra/main.rb",
             "lib/sinatra/base.rb",
         ]);
-        let result =
-            RubyResolver.resolve(&import_normal("sinatra/main"), "lib/sinatra.rb", &file_index);
+        let result = RubyResolver.resolve(
+            &import_normal("sinatra/main"),
+            "lib/sinatra.rb",
+            &file_index,
+        );
         assert_eq!(result, Some("lib/sinatra/main.rb".into()));
     }
 }
