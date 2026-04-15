@@ -209,24 +209,31 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
     let current_seq = store.read_write_seq();
-    if let Some(cached) = store.get(SNAPSHOT_KEY).await? {
-        if let Some(snap) = cached.payload_as::<StatusSnapshot>() {
-            let age = now.saturating_sub(snap.computed_at);
-            if snap.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
-                display_cached_status(
-                    &snap,
-                    age,
-                    &cwd,
-                    claude_mode,
-                    codex_mode,
-                    codex_metrics.as_ref(),
-                    &daemon_health,
-                    cluster_index.as_ref(),
-                );
-                store.close().await?;
-                return Ok(());
+    match store.get(SNAPSHOT_KEY).await {
+        Ok(Some(cached)) => {
+            if let Some(snap) = cached.payload_as::<StatusSnapshot>() {
+                let age = now.saturating_sub(snap.computed_at);
+                if snap.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
+                    display_cached_status(
+                        &snap,
+                        age,
+                        &cwd,
+                        claude_mode,
+                        codex_mode,
+                        codex_metrics.as_ref(),
+                        &daemon_health,
+                        cluster_index.as_ref(),
+                    );
+                    store.close().await?;
+                    return Ok(());
+                }
             }
         }
+        Err(_) => {
+            // Stale or corrupt cache record (e.g. pre-MessagePack migration).
+            // Fall through to recompute — the new write will overwrite the stale entry.
+        }
+        Ok(None) => {}
     }
 
     let use_color = std::io::stdout().is_terminal();

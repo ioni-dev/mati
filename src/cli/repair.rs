@@ -88,18 +88,27 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     // Requires graph with Imports edges for traversal.
     if mode == RepairMode::Full {
         let graph = mati_core::graph::Graph::load(store).await?;
-        let file_records = graph.store().scan_prefix("file:").await.unwrap_or_default();
+        let mut file_records = graph.store().scan_prefix("file:").await.unwrap_or_default();
         let mut blast_count = 0u32;
-        for record in &file_records {
-            let mut rec = record.clone();
-            if let Some(mut fr) = rec.payload_as::<mati_core::store::record::FileRecord>() {
-                let br = mati_core::analysis::blast_radius::BlastRadius::compute(&rec.key, &graph);
-                fr.blast_radius = Some(br);
-                rec.payload = serde_json::to_value(&fr).ok();
-                let _ = graph.store().put(&rec.key, &rec).await;
-                blast_count += 1;
+        let all_keys: Vec<String> = file_records.iter().map(|r| r.key.clone()).collect();
+        let blast_map =
+            mati_core::analysis::blast_radius::BlastRadius::compute_all(&graph, &all_keys);
+
+        // In-memory mutation.
+        for record in file_records.iter_mut() {
+            if let Some(mut fr) = record.payload_as::<mati_core::store::record::FileRecord>() {
+                if let Some(br) = blast_map.get(&record.key) {
+                    fr.blast_radius = Some(br.clone());
+                    record.payload = serde_json::to_value(&fr).ok();
+                    blast_count += 1;
+                }
             }
         }
+
+        // Bulk write.
+        let pairs: Vec<(&str, &mati_core::store::record::Record)> =
+            file_records.iter().map(|r| (r.key.as_str(), r)).collect();
+        let _ = graph.store().put_batch_kv_only(&pairs).await;
         if !args.json {
             println!("  Blast radius recomputed for {blast_count} files.");
         }

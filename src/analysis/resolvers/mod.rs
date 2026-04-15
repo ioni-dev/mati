@@ -73,6 +73,15 @@ pub trait LanguageResolver: Send + Sync {
 pub struct FileIndex {
     files: HashSet<String>,
     root: Option<PathBuf>,
+    /// Crate root prefixes for Rust workspace resolution (e.g. `"src/"`,
+    /// `"crates/regex/src/"`). Sorted longest-first so workspace member
+    /// paths take precedence over the repo-root `src/`.
+    crate_roots: Vec<String>,
+    /// Map from workspace member crate name (snake_case, as used in `use`
+    /// statements) to its crate root path (e.g. `"crates/regex/src/"`).
+    /// Populated from each member's `[package].name` in Cargo.toml.
+    /// Empty for non-Rust or single-crate projects.
+    workspace_members: HashMap<String, String>,
 }
 
 impl FileIndex {
@@ -81,6 +90,8 @@ impl FileIndex {
         Self {
             files: paths.into_iter().collect(),
             root: None,
+            crate_roots: Vec::new(),
+            workspace_members: HashMap::new(),
         }
     }
 
@@ -89,7 +100,44 @@ impl FileIndex {
         Self {
             files: paths.into_iter().collect(),
             root: Some(root),
+            crate_roots: Vec::new(),
+            workspace_members: HashMap::new(),
         }
+    }
+
+    /// Set Rust crate root prefixes for workspace resolution.
+    /// Roots are sorted longest-first so workspace member paths take
+    /// precedence over the repo-root `src/`.
+    pub fn set_crate_roots(&mut self, mut roots: Vec<String>) {
+        roots.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        self.crate_roots = roots;
+    }
+
+    /// Returns the crate root prefix for the given file, if any.
+    /// For single-crate projects: `Some("src/")`.
+    /// For workspace files at `crates/foo/src/bar.rs`: `Some("crates/foo/src/")`.
+    pub fn crate_root_for(&self, file_path: &str) -> Option<&str> {
+        self.crate_roots
+            .iter()
+            .find(|root| file_path.starts_with(root.as_str()))
+            .map(|s| s.as_str())
+    }
+
+    /// Set workspace member mapping (snake_case crate name → crate root path).
+    pub fn set_workspace_members(&mut self, members: HashMap<String, String>) {
+        self.workspace_members = members;
+    }
+
+    /// Returns the crate root path for a workspace member crate name.
+    /// The first segment of an import path (e.g. `"grep_regex"` in
+    /// `"grep_regex::matcher::Foo"`) is the name to look up.
+    pub fn workspace_member_root(&self, crate_name: &str) -> Option<&str> {
+        self.workspace_members.get(crate_name).map(|s| s.as_str())
+    }
+
+    /// True if workspace member mappings are configured.
+    pub fn has_workspace_members(&self) -> bool {
+        !self.workspace_members.is_empty()
     }
 
     /// Read a file relative to the index root. Returns None if no root is
