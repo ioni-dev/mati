@@ -555,6 +555,32 @@ mod tests {
 
     // ── Edge cases ────────────────────────────────────────────────────────────
 
+    // ── Brace decomposition: regression guard ─────────────────────────────
+    // TS/JS named imports (`import { a, b } from './x'`) always resolve to
+    // the same file regardless of which symbols are imported. Brace
+    // decomposition adds no file-level edges — only symbol-level detail
+    // that is out of scope for Layer 0. One ImportStatement per source
+    // module is correct behavior.
+
+    #[test]
+    fn named_imports_produce_single_file_edge() {
+        let dir = TempDir::new().unwrap();
+        let a = parse_ts(&dir, "import { a, b, c } from './x';");
+        assert_eq!(a.imports.len(), 1);
+        assert_eq!(a.imports[0].path, "./x");
+        assert_eq!(a.imports[0].kind, ImportKind::Relative);
+    }
+
+    #[test]
+    fn js_named_imports_produce_single_file_edge() {
+        let dir = TempDir::new().unwrap();
+        let a = parse_js(&dir, "import { a, b, c } from './x';");
+        assert_eq!(a.imports.len(), 1);
+        assert_eq!(a.imports[0].path, "./x");
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────────────
+
     #[test]
     fn empty_ts_file() {
         let dir = TempDir::new().unwrap();

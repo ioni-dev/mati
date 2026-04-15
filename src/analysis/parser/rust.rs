@@ -152,11 +152,8 @@ pub(super) fn parse_rust(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                     out.exported_types.push(name.to_owned());
                 }
             } else if idx == ci.import {
-                if let Ok(path) = node.utf8_text(src) {
-                    let line = node.start_position().row as u32 + 1;
-                    let kind = classify_rust_import(path);
-                    out.imports.push(ImportStatement::new(path, kind, line));
-                }
+                let line = node.start_position().row as u32 + 1;
+                decompose_use_tree(node, src, "", line, &mut out.imports);
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
                     let row = node.start_position().row;
@@ -232,6 +229,106 @@ fn classify_rust_import(path: &str) -> ImportKind {
         ImportKind::Wildcard
     } else {
         ImportKind::Normal
+    }
+}
+
+/// Recursively decompose a Rust `use` tree AST node into individual import paths.
+///
+/// Walks the tree-sitter node for a `use_declaration` argument. When a
+/// `use_list` (brace group) is found, each child is visited recursively with
+/// the accumulated prefix. Leaf paths (identifiers, scoped identifiers, `self`,
+/// wildcards) emit one `ImportStatement` each.
+///
+/// Examples:
+/// - `crate::store::db` → one import `"crate::store::db"`
+/// - `crate::store::{record, db}` → two imports
+/// - `crate::{a::{b, c}, d}` → three imports (a::b, a::c, d)
+/// - `crate::a::{self, b}` → two imports (a, a::b)
+/// - `crate::a::{b as c}` → one import `"crate::a::b"` (alias dropped)
+fn decompose_use_tree(
+    node: tree_sitter::Node,
+    src: &[u8],
+    prefix: &str,
+    line: u32,
+    out: &mut Vec<ImportStatement>,
+) {
+    match node.kind() {
+        // `use crate::a::{b, c}` — the top-level argument is a `scoped_use_list`
+        // with `path:` field (the prefix) and `list:` field (the brace group).
+        "scoped_use_list" => {
+            let path_prefix = node
+                .child_by_field_name("path")
+                .and_then(|n| n.utf8_text(src).ok())
+                .unwrap_or("");
+            let full_prefix = if prefix.is_empty() {
+                path_prefix.to_owned()
+            } else {
+                format!("{prefix}::{path_prefix}")
+            };
+            if let Some(list) = node.child_by_field_name("list") {
+                decompose_use_tree(list, src, &full_prefix, line, out);
+            }
+        }
+        // The brace group itself: `{b, c}` or `{self, b}`.
+        // Iterate named children — each is a use tree element.
+        "use_list" => {
+            for i in 0..node.named_child_count() {
+                if let Some(child) = node.named_child(i) {
+                    decompose_use_tree(child, src, prefix, line, out);
+                }
+            }
+        }
+        // `b as c` — extract only the original name, drop the alias.
+        "use_as_clause" => {
+            if let Some(name_node) = node.child_by_field_name("path") {
+                // For renamed scoped paths like `a::b as c`, the path field
+                // contains the full original path.
+                if let Ok(name) = name_node.utf8_text(src) {
+                    let full = if prefix.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{prefix}::{name}")
+                    };
+                    let kind = classify_rust_import(&full);
+                    out.push(ImportStatement::new(&full, kind, line));
+                }
+            }
+        }
+        // `self` inside a brace group → emit the prefix itself.
+        "self" => {
+            if !prefix.is_empty() {
+                let kind = classify_rust_import(prefix);
+                out.push(ImportStatement::new(prefix, kind, line));
+            }
+        }
+        // Wildcard: `*` inside a brace group, or `crate::prelude::*` at top level.
+        // The node text contains any embedded path prefix (e.g. `crate::prelude::*`
+        // at top level, `a::*` inside a brace group, or bare `*`).
+        "use_wildcard" => {
+            if let Ok(text) = node.utf8_text(src) {
+                let full = if prefix.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("{prefix}::{text}")
+                };
+                let kind = classify_rust_import(&full);
+                out.push(ImportStatement::new(&full, kind, line));
+            }
+        }
+        // Leaf: an identifier, scoped_identifier, or any other terminal.
+        // This handles simple paths like `crate::store::db` and individual
+        // names inside brace groups like `record`.
+        _ => {
+            if let Ok(text) = node.utf8_text(src) {
+                let full = if prefix.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("{prefix}::{text}")
+                };
+                let kind = classify_rust_import(&full);
+                out.push(ImportStatement::new(&full, kind, line));
+            }
+        }
     }
 }
 
@@ -531,5 +628,77 @@ mod tests {
         let f = make_file(&dir, "src/lib.rs", "pub fn foo() {}");
         let a = parse_rust(&f, "pub fn foo() {}").unwrap();
         assert_eq!(a.path, "src/lib.rs");
+    }
+
+    // ── Brace decomposition ──────────────────────────────────────────────────
+
+    #[test]
+    fn brace_group_produces_multiple_imports() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::store::{record, db};");
+        assert_eq!(a.imports.len(), 2);
+        let paths: Vec<&str> = a.imports.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"crate::store::record"));
+        assert!(paths.contains(&"crate::store::db"));
+        assert!(a.imports.iter().all(|i| i.kind == ImportKind::Normal));
+    }
+
+    #[test]
+    fn nested_brace_group_decomposes_recursively() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::{a::{b, c}, d};");
+        assert_eq!(a.imports.len(), 3);
+        let paths: Vec<&str> = a.imports.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"crate::a::b"));
+        assert!(paths.contains(&"crate::a::c"));
+        assert!(paths.contains(&"crate::d"));
+    }
+
+    #[test]
+    fn wildcard_inside_brace_group() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::a::{b, *};");
+        assert_eq!(a.imports.len(), 2);
+        let paths: Vec<&str> = a.imports.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"crate::a::b"));
+        assert!(paths.contains(&"crate::a::*"));
+        assert!(a.imports.iter().any(|i| i.kind == ImportKind::Wildcard));
+    }
+
+    #[test]
+    fn self_inside_brace_group() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::a::{self, b};");
+        assert_eq!(a.imports.len(), 2);
+        let paths: Vec<&str> = a.imports.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"crate::a"));
+        assert!(paths.contains(&"crate::a::b"));
+    }
+
+    #[test]
+    fn renamed_import_drops_alias() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::a::{b as c};");
+        assert_eq!(a.imports.len(), 1);
+        assert_eq!(a.imports[0].path, "crate::a::b");
+    }
+
+    #[test]
+    fn non_brace_import_still_works() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::store::record;");
+        assert_eq!(a.imports.len(), 1);
+        assert_eq!(a.imports[0].path, "crate::store::record");
+        assert_eq!(a.imports[0].kind, ImportKind::Normal);
+    }
+
+    #[test]
+    fn deep_brace_with_trailing_path() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "use crate::store::{record::FileRecord, db::Store};");
+        assert_eq!(a.imports.len(), 2);
+        let paths: Vec<&str> = a.imports.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"crate::store::record::FileRecord"));
+        assert!(paths.contains(&"crate::store::db::Store"));
     }
 }
