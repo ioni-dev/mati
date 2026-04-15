@@ -238,7 +238,6 @@ impl Graph {
     /// MCP tools need both Store reads and Graph traversal. This accessor
     /// avoids splitting ownership — the Graph owns the Store, and callers
     /// borrow it through this method.
-
     /// Build a reverse adjacency list for the given edge kind.
     /// Maps target node key → list of source node keys.
     /// Used by `BlastRadius::compute_all` to avoid repeated graph lookups.

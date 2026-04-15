@@ -153,7 +153,12 @@ impl BlastRadius {
 
             result.insert(
                 file_key.clone(),
-                BlastRadius { direct, transitive, score, tier },
+                BlastRadius {
+                    direct,
+                    transitive,
+                    score,
+                    tier,
+                },
             );
         }
 
@@ -423,19 +428,33 @@ mod tests {
     async fn compute_all_matches_per_file_compute() {
         let (mut g, _dir) = temp_graph().await;
         // a→b, b→c, c→d
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:b", EdgeKind::Imports, "file:c").await.unwrap();
-        g.add_edge("file:c", EdgeKind::Imports, "file:d").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:c")
+            .await
+            .unwrap();
+        g.add_edge("file:c", EdgeKind::Imports, "file:d")
+            .await
+            .unwrap();
 
         let keys: Vec<String> = ["file:a", "file:b", "file:c", "file:d"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
         let batch = BlastRadius::compute_all(&g, &keys);
         for key in &keys {
             let single = BlastRadius::compute(key, &g);
             let from_batch = batch.get(key).expect("key missing from compute_all");
-            assert_eq!(single.direct, from_batch.direct, "direct mismatch for {key}");
-            assert_eq!(single.transitive, from_batch.transitive, "transitive mismatch for {key}");
+            assert_eq!(
+                single.direct, from_batch.direct,
+                "direct mismatch for {key}"
+            );
+            assert_eq!(
+                single.transitive, from_batch.transitive,
+                "transitive mismatch for {key}"
+            );
         }
 
         g.close().await.unwrap();
@@ -445,8 +464,12 @@ mod tests {
     #[tokio::test]
     async fn compute_all_handles_cycle_safely() {
         let (mut g, _dir) = temp_graph().await;
-        g.add_edge("file:a", EdgeKind::Imports, "file:b").await.unwrap();
-        g.add_edge("file:b", EdgeKind::Imports, "file:a").await.unwrap();
+        g.add_edge("file:a", EdgeKind::Imports, "file:b")
+            .await
+            .unwrap();
+        g.add_edge("file:b", EdgeKind::Imports, "file:a")
+            .await
+            .unwrap();
 
         let keys = vec!["file:a".to_string(), "file:b".to_string()];
         let batch = BlastRadius::compute_all(&g, &keys);

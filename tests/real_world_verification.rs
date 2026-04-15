@@ -34,7 +34,10 @@ fn mati_bin() -> PathBuf {
         return PathBuf::from(p);
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(manifest).join("target").join("debug").join("mati")
+    PathBuf::from(manifest)
+        .join("target")
+        .join("debug")
+        .join("mati")
 }
 
 fn clone_or_reuse(name: &str, url: &str) -> PathBuf {
@@ -241,7 +244,9 @@ fn real_world_ripgrep() {
     if let Some(show_out2) = run_show(&repo, "file:crates/regex/src/lib.rs") {
         let tier2 = parse_blast_tier(&show_out2);
         let direct2 = parse_blast_direct(&show_out2);
-        eprintln!("[real_world_ripgrep] file:crates/regex/src/lib.rs tier={tier2} direct={direct2}");
+        eprintln!(
+            "[real_world_ripgrep] file:crates/regex/src/lib.rs tier={tier2} direct={direct2}"
+        );
     }
 }
 

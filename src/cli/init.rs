@@ -890,8 +890,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
     {
         let store_ref = graph.store();
         let t = Instant::now();
-        let all_keys: Vec<String> = file_records.iter().map(|fr| format!("file:{}", fr.path)).collect();
-        let blast_map = mati_core::analysis::blast_radius::BlastRadius::compute_all(&graph, &all_keys);
+        let all_keys: Vec<String> = file_records
+            .iter()
+            .map(|fr| format!("file:{}", fr.path))
+            .collect();
+        let blast_map =
+            mati_core::analysis::blast_radius::BlastRadius::compute_all(&graph, &all_keys);
 
         // Bulk read all file records in a single scan.
         let mut all_file_recs = store_ref.scan_prefix("file:").await.unwrap_or_default();
@@ -909,9 +913,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
 
         // Bulk write all mutated records in a single batch transaction.
-        let pairs: Vec<(&str, &Record)> = all_file_recs.iter()
-            .map(|r| (r.key.as_str(), r))
-            .collect();
+        let pairs: Vec<(&str, &Record)> =
+            all_file_recs.iter().map(|r| (r.key.as_str(), r)).collect();
         let _ = store_ref.put_batch_kv_only(&pairs).await;
 
         println!(
@@ -995,9 +998,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
         // Bulk write all mutated records.
         if prop_count > 0 {
-            let pairs: Vec<(&str, &Record)> = all_file_recs.iter()
-                .map(|r| (r.key.as_str(), r))
-                .collect();
+            let pairs: Vec<(&str, &Record)> =
+                all_file_recs.iter().map(|r| (r.key.as_str(), r)).collect();
             let _ = store_ref.put_batch_kv_only(&pairs).await;
             println!(
                 "  Staleness propagation...       {:>4} files   {:>4}ms",
