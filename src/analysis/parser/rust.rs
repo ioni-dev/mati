@@ -695,10 +695,7 @@ mod tests {
     #[test]
     fn deep_brace_with_trailing_path() {
         let dir = TempDir::new().unwrap();
-        let a = parse(
-            &dir,
-            "use crate::store::{record::FileRecord, db::Store};",
-        );
+        let a = parse(&dir, "use crate::store::{record::FileRecord, db::Store};");
         assert_eq!(a.imports.len(), 2);
         let paths: Vec<&str> = a.imports.iter().map(|i| i.path.as_str()).collect();
         assert!(paths.contains(&"crate::store::record::FileRecord"));

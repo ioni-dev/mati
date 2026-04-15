@@ -471,7 +471,10 @@ mod tests {
     #[test]
     fn parenthesized_from_import_produces_single_edge() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, "from myapp.utils import (helper_a, helper_b, helper_c)\n");
+        let a = parse(
+            &dir,
+            "from myapp.utils import (helper_a, helper_b, helper_c)\n",
+        );
         assert_eq!(a.imports.len(), 1);
         assert_eq!(a.imports[0].path, "myapp.utils");
         assert_eq!(a.imports[0].kind, ImportKind::Normal);
