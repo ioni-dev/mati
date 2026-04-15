@@ -13,14 +13,22 @@
 //! - Rust:       BurntSushi/ripgrep   (Cargo workspace — known resolver gap)
 //! - Python:     encode/httpx          (single package + tests)
 //! - TypeScript: vitest-dev/vitest     (pnpm monorepo)
+//! - C++:        nlohmann/json         (angle-bracket internal includes)
+//! - Haskell:    haskell/aeson         (Data.Aeson.* stdlib over-classification)
+//! - Scala:      zio/zio-json          (sbt multi-project source roots)
+//! - Ruby:       sinatra/sinatra       (Normal require lib/ fallback)
 //!
 //! ## Measurement baselines (2026-04-14, updated after brace decomposition)
 //!
-//! | Codebase | Edges | Resolution | Hub tier              | Notes                              |
-//! |----------|-------|------------|-----------------------|------------------------------------|
-//! | ripgrep  |   342 | intra+cross| grep_matcher moderate | brace decomposition + cross-crate  |
-//! | httpx    |   124 | ~100%      | __init__.py high      | healthy                            |
-//! | vitest   |  2147 | ~97%       | core.ts critical      | healthy                            |
+//! | Codebase      | Edges | Resolution | Hub tier              | Notes                              |
+//! |---------------|-------|------------|-----------------------|------------------------------------|
+//! | ripgrep       |   342 | intra+cross| grep_matcher moderate | brace decomposition + cross-crate  |
+//! | httpx         |   124 | ~100%      | __init__.py high      | healthy                            |
+//! | vitest        |  2147 | ~97%       | core.ts critical      | healthy                            |
+//! | nlohmann-json |   619 | ~84%       | json.hpp critical     | angle-bracket fix (Phase 2)        |
+//! | aeson         |   223 | ~50%       | Aeson.hs critical     | stdlib allowlist fix (Phase 2)     |
+//! | zio-json      |    21 | ~8%        | —                     | source root fix, wildcard limited  |
+//! | sinatra       |    93 | ~60%       | base.rb high          | lib/ fallback fix (Phase 2)        |
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -378,4 +386,176 @@ fn real_world_vitest() {
             "[real_world_vitest] file:packages/vitest/src/node/types/config.ts tier={tier3} direct={direct3}"
         );
     }
+}
+
+// ── nlohmann-json (C++) ────────────────────────────────────────────────
+//
+// Phase 2 fix: angle-bracket includes resolved as internal when they match
+// a repo file. Baseline before fix: 134 edges. After fix: 619 edges.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_nlohmann_json_resolution() {
+    let repo = clone_or_reuse("nlohmann-json", "https://github.com/nlohmann/json");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 500,
+        "nlohmann-json should index at least 500 files, got {files}"
+    );
+
+    // Baseline 2026-04-15: 619 edges (angle-bracket fix).
+    // Floor set ~5% below: 588 edges minimum.
+    assert!(
+        edges >= 588,
+        "nlohmann-json resolution regressed: expected >= 588 edges (baseline 619), got {edges}"
+    );
+
+    eprintln!("[real_world_nlohmann_json] files={files} edges={edges}");
+
+    // json.hpp is the hub header — should be critical after the fix.
+    let key = "file:include/nlohmann/json.hpp";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — nlohmann-json may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["high", "critical"].contains(&tier.as_str()),
+        "nlohmann json.hpp should be high or critical, got tier={tier}"
+    );
+    assert!(
+        direct >= 100,
+        "nlohmann json.hpp should have >= 100 direct importers (baseline 319), got {direct}"
+    );
+
+    eprintln!("[real_world_nlohmann_json] {key} tier={tier} direct={direct}");
+}
+
+// ── aeson (Haskell) ────────────────────────────────────────────────────
+//
+// Phase 2 fix: stdlib allowlist no longer kills Data.Aeson.* imports.
+// Baseline before fix: 0 edges. After fix: 223 edges.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_aeson_resolution() {
+    let repo = clone_or_reuse("aeson", "https://github.com/haskell/aeson");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 100,
+        "aeson should index at least 100 files, got {files}"
+    );
+
+    // Baseline 2026-04-15: 223 edges (stdlib allowlist fix).
+    // Floor set ~5% below: 211 edges minimum.
+    assert!(
+        edges >= 211,
+        "aeson resolution regressed: expected >= 211 edges (baseline 223), got {edges}"
+    );
+
+    eprintln!("[real_world_aeson] files={files} edges={edges}");
+
+    // Data/Aeson.hs is the hub module — should be critical after the fix.
+    let key = "file:src/Data/Aeson.hs";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — aeson may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["high", "critical"].contains(&tier.as_str()),
+        "aeson Data/Aeson.hs should be high or critical, got tier={tier}"
+    );
+    assert!(
+        direct >= 20,
+        "aeson Data/Aeson.hs should have >= 20 direct importers (baseline 52), got {direct}"
+    );
+
+    eprintln!("[real_world_aeson] {key} tier={tier} direct={direct}");
+}
+
+// ── zio-json (Scala) ───────────────────────────────────────────────────
+//
+// Phase 2 fix: sbt multi-project source root detection.
+// Baseline before fix: 0 edges. After fix: 21 edges.
+// Most imports use wildcard `._` which resolves to the package prefix,
+// not individual files — a known limitation.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_zio_json_resolution() {
+    let repo = clone_or_reuse("zio-json", "https://github.com/zio/zio-json");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 100,
+        "zio-json should index at least 100 files, got {files}"
+    );
+
+    // Baseline 2026-04-15: 21 edges (source root fix).
+    // Floor set ~20% below because the number is small: 16 edges minimum.
+    assert!(
+        edges >= 16,
+        "zio-json resolution regressed: expected >= 16 edges (baseline 21), got {edges}"
+    );
+
+    eprintln!("[real_world_zio_json] files={files} edges={edges}");
+}
+
+// ── sinatra (Ruby) ─────────────────────────────────────────────────────
+//
+// Phase 2 fix: Normal require now tries lib/ prefix.
+// Baseline before fix: 63 edges. After fix: 93 edges.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_sinatra_resolution() {
+    let repo = clone_or_reuse("sinatra", "https://github.com/sinatra/sinatra");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 100,
+        "sinatra should index at least 100 files, got {files}"
+    );
+
+    // Baseline 2026-04-15: 93 edges (lib/ fallback fix).
+    // Floor set ~5% below: 88 edges minimum.
+    assert!(
+        edges >= 88,
+        "sinatra resolution regressed: expected >= 88 edges (baseline 93), got {edges}"
+    );
+
+    eprintln!("[real_world_sinatra] files={files} edges={edges}");
+
+    // lib/sinatra/base.rb is the hub — should be high or above after the fix.
+    let key = "file:lib/sinatra/base.rb";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — sinatra may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["moderate", "high", "critical"].contains(&tier.as_str()),
+        "sinatra base.rb should be moderate or higher, got tier={tier}"
+    );
+    assert!(
+        direct >= 10,
+        "sinatra base.rb should have >= 10 direct importers (baseline 21), got {direct}"
+    );
+
+    eprintln!("[real_world_sinatra] {key} tier={tier} direct={direct}");
 }

@@ -49,6 +49,19 @@ impl LanguageResolver for CResolver {
     }
 }
 
+/// Resolve an angle-bracket include path against the file index.
+///
+/// Called from `build_edges` for C files whose `#include <path>` was
+/// classified as `External` at parse time.  If the path resolves to a
+/// known repo file it is actually internal.
+pub fn resolve_angle_bracket(
+    include_path: &str,
+    importing_file: &str,
+    file_index: &FileIndex,
+) -> Option<String> {
+    resolve_c_include(include_path, importing_file, file_index)
+}
+
 fn resolve_c_include(
     include_path: &str,
     importing_file: &str,
