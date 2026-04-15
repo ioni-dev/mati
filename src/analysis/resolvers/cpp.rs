@@ -49,6 +49,20 @@ impl LanguageResolver for CppResolver {
     }
 }
 
+/// Resolve an angle-bracket include path against the file index.
+///
+/// Called from `build_edges` for C++ files whose `#include <path>` was
+/// classified as `External` at parse time.  If the path resolves to a
+/// known repo file it is actually internal — the edge builder will
+/// create an `Imports` edge instead of skipping.
+pub fn resolve_angle_bracket(
+    include_path: &str,
+    importing_file: &str,
+    file_index: &FileIndex,
+) -> Option<String> {
+    resolve_cpp_include(include_path, importing_file, file_index)
+}
+
 fn resolve_cpp_include(
     include_path: &str,
     importing_file: &str,

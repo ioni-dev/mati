@@ -83,6 +83,12 @@ pub fn build_edges_with_root(
         }
     }
 
+    // Detect Scala source roots from file paths (multi-project sbt layouts).
+    let scala_roots = detect_scala_source_roots(files);
+    if !scala_roots.is_empty() {
+        file_index.set_scala_source_roots(scala_roots);
+    }
+
     let registry = ResolverRegistry::new();
 
     let mut edges: Vec<(String, EdgeKind, String)> = Vec::new();
@@ -106,6 +112,31 @@ pub fn build_edges_with_root(
                         &import_stmt.path,
                         &file_index,
                     ) {
+                        let to_key = file_key(&target_rel);
+                        if from_key != to_key {
+                            edges.push((from_key.clone(), EdgeKind::Imports, to_key));
+                        }
+                    }
+                }
+                // C/C++ angle-bracket includes classified as External may
+                // actually be project-internal (e.g. `#include <nlohmann/json.hpp>`).
+                // Try to resolve them against the file index before skipping.
+                if matches!(file.language, Language::C | Language::Cpp) {
+                    let resolved = match file.language {
+                        Language::Cpp => {
+                            crate::analysis::resolvers::cpp::resolve_angle_bracket(
+                                &import_stmt.path,
+                                &file.rel_path,
+                                &file_index,
+                            )
+                        }
+                        _ => crate::analysis::resolvers::c::resolve_angle_bracket(
+                            &import_stmt.path,
+                            &file.rel_path,
+                            &file_index,
+                        ),
+                    };
+                    if let Some(target_rel) = resolved {
                         let to_key = file_key(&target_rel);
                         if from_key != to_key {
                             edges.push((from_key.clone(), EdgeKind::Imports, to_key));
@@ -315,6 +346,42 @@ fn collect_member_dirs(repo_root: &Path, pattern: &str, dirs: &mut Vec<std::path
             dirs.push(dir);
         }
     }
+}
+
+/// Discover Scala source root prefixes from walked file paths.
+///
+/// Scans for directories matching sbt/Maven conventions:
+/// `**/src/main/scala/`, `**/src/test/scala/`, and Scala-version-specific
+/// variants. Returns each discovered root as a path prefix suitable for
+/// prepending to a dotted-import-derived relative path.
+fn detect_scala_source_roots(files: &[WalkedFile]) -> Vec<String> {
+    const SCALA_PATTERNS: &[&str] = &[
+        "src/main/scala/",
+        "src/test/scala/",
+        "src/main/scala-2.13/",
+        "src/main/scala-2.12/",
+        "src/main/scala-3/",
+        "src/test/scala-2.13/",
+        "src/test/scala-3/",
+    ];
+
+    let mut roots: HashSet<String> = HashSet::new();
+
+    for file in files {
+        if file.language != Language::Scala {
+            continue;
+        }
+        for pattern in SCALA_PATTERNS {
+            if let Some(pos) = file.rel_path.find(pattern) {
+                let root = &file.rel_path[..pos + pattern.len()];
+                roots.insert(root.to_string());
+            }
+        }
+    }
+
+    let mut result: Vec<String> = roots.into_iter().collect();
+    result.sort(); // Deterministic order for tests.
+    result
 }
 
 /// Format a repo-relative path as a record key.
@@ -783,5 +850,97 @@ mod tests {
         let result = build_edges(&[], &[], &[]);
         assert_eq!(result.edges.len(), 0);
         assert_eq!(result.unresolved_imports, 0);
+    }
+
+    // ── C/C++ angle-bracket resolution ─────────────────────────────────
+
+    /// Helper: build a StaticFileAnalysis with explicit ImportStatements.
+    fn analysis_with_imports(
+        path: &str,
+        lang: Language,
+        imports: Vec<ImportStatement>,
+    ) -> StaticFileAnalysis {
+        StaticFileAnalysis {
+            path: path.to_string(),
+            language: lang,
+            entry_points: vec![],
+            exported_types: vec![],
+            imports,
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            panic_count: 0,
+            branch_count: 0,
+            module_doc: None,
+            content_hash: None,
+            line_count: 0,
+        }
+    }
+
+    #[test]
+    fn cpp_angle_bracket_internal_include_resolves() {
+        // #include <nlohmann/json.hpp> from a test file — the header exists
+        // under include/, so the angle-bracket exception should create an edge.
+        let files = vec![
+            walked("tests/test.cpp", Language::Cpp),
+            walked("include/nlohmann/json.hpp", Language::Cpp),
+        ];
+        let analyses = vec![
+            analysis_with_imports(
+                "tests/test.cpp",
+                Language::Cpp,
+                vec![ImportStatement::new(
+                    "nlohmann/json.hpp",
+                    ImportKind::External,
+                    1,
+                )],
+            ),
+            analysis_with_imports("include/nlohmann/json.hpp", Language::Cpp, vec![]),
+        ];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(
+            result.edges.len(),
+            1,
+            "angle-bracket include that resolves to a repo file should produce an edge"
+        );
+        assert_eq!(result.edges[0].2, "file:include/nlohmann/json.hpp");
+    }
+
+    #[test]
+    fn cpp_angle_bracket_external_stays_skipped() {
+        // #include <vector> — no matching file, should produce no edge.
+        let files = vec![walked("src/main.cpp", Language::Cpp)];
+        let analyses = vec![analysis_with_imports(
+            "src/main.cpp",
+            Language::Cpp,
+            vec![ImportStatement::new("vector", ImportKind::External, 1)],
+        )];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 0);
+        // External imports that fail resolution are not counted as unresolved.
+        assert_eq!(result.unresolved_imports, 0);
+    }
+
+    #[test]
+    fn cpp_quoted_include_unchanged() {
+        // #include "helper.h" — Relative kind, resolved through the normal path.
+        let files = vec![
+            walked("src/main.cpp", Language::Cpp),
+            walked("src/helper.h", Language::Cpp),
+        ];
+        let analyses = vec![
+            analysis_with_imports(
+                "src/main.cpp",
+                Language::Cpp,
+                vec![ImportStatement::new("helper.h", ImportKind::Relative, 1)],
+            ),
+            analysis_with_imports("src/helper.h", Language::Cpp, vec![]),
+        ];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].2, "file:src/helper.h");
     }
 }
