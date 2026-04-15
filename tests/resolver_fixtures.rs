@@ -118,6 +118,90 @@ fn rust_fixture_resolves_super_import() {
     );
 }
 
+// ── Rust workspace fixture ──────────────────────────────────────────────────
+
+#[test]
+fn rust_workspace_fixture_resolves_crate_imports() {
+    let root = fixture_sub_path("rust", "workspace_project");
+    let files = walk_fixture_sub("rust", "workspace_project");
+    let mut file_index =
+        FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()));
+    let crate_roots = mati_core::analysis::edges::detect_rust_crate_roots(&root, &file_index);
+    file_index.set_crate_roots(crate_roots);
+    let registry = ResolverRegistry::new();
+
+    // crates/foo/src/lib.rs has `use crate::helper` — should resolve within foo's crate
+    let foo_lib = files
+        .iter()
+        .find(|f| f.rel_path == "crates/foo/src/lib.rs")
+        .unwrap();
+    let resolved = resolve_all(foo_lib, Language::Rust, &registry, &file_index);
+    assert!(
+        resolved.contains(&"crates/foo/src/helper.rs".to_string()),
+        "crate::helper in foo should resolve to crates/foo/src/helper.rs, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn rust_workspace_fixture_bar_resolves_independently() {
+    let root = fixture_sub_path("rust", "workspace_project");
+    let files = walk_fixture_sub("rust", "workspace_project");
+    let mut file_index =
+        FileIndex::new_with_root(root.clone(), files.iter().map(|f| f.rel_path.clone()));
+    let crate_roots = mati_core::analysis::edges::detect_rust_crate_roots(&root, &file_index);
+    file_index.set_crate_roots(crate_roots);
+    let registry = ResolverRegistry::new();
+
+    // crates/bar/src/lib.rs has `use crate::util` — should resolve within bar's crate
+    let bar_lib = files
+        .iter()
+        .find(|f| f.rel_path == "crates/bar/src/lib.rs")
+        .unwrap();
+    let resolved = resolve_all(bar_lib, Language::Rust, &registry, &file_index);
+    assert!(
+        resolved.contains(&"crates/bar/src/util.rs".to_string()),
+        "crate::util in bar should resolve to crates/bar/src/util.rs, got: {resolved:?}"
+    );
+}
+
+#[test]
+fn rust_workspace_fixture_produces_correct_edge_count() {
+    use mati_core::analysis::edges::build_edges_with_root;
+    use mati_core::analysis::parser::parse_file;
+
+    let root = fixture_sub_path("rust", "workspace_project");
+    let files = walk_fixture_sub("rust", "workspace_project");
+    let analyses: Vec<_> = files.iter().map(|f| parse_file(f).unwrap()).collect();
+
+    let result = build_edges_with_root(&files, &analyses, &[], Some(&root));
+
+    // Intra-crate: foo/lib.rs → foo/helper.rs, bar/lib.rs → bar/util.rs = 2 edges
+    // Cross-crate: bar/lib.rs → foo/lib.rs = 1 edge
+    // Total: at least 3 edges
+    assert!(
+        result.edges.len() >= 3,
+        "workspace should produce at least 3 import edges (2 intra + 1 cross), got {}",
+        result.edges.len()
+    );
+
+    // Verify the cross-crate edge specifically
+    let has_cross_crate = result.edges.iter().any(|(from, kind, to)| {
+        from == "file:crates/bar/src/lib.rs"
+            && *kind == mati_core::graph::EdgeKind::Imports
+            && to == "file:crates/foo/src/lib.rs"
+    });
+    assert!(
+        has_cross_crate,
+        "expected cross-crate edge bar/lib.rs → foo/lib.rs, edges: {:?}",
+        result.edges
+    );
+
+    assert_eq!(
+        result.unresolved_imports, 0,
+        "all workspace-internal imports should resolve"
+    );
+}
+
 // ── Python fixtures ─────────────────────────────────────────────────────────
 
 #[test]

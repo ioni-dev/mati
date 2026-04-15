@@ -888,21 +888,35 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // Requires: graph loaded with Imports edges (Phase 10).
     // Patches file records in the store with blast radius scores.
     {
-        let t = Instant::now();
         let store_ref = graph.store();
+        let t = Instant::now();
+        let all_keys: Vec<String> = file_records
+            .iter()
+            .map(|fr| format!("file:{}", fr.path))
+            .collect();
+        let blast_map =
+            mati_core::analysis::blast_radius::BlastRadius::compute_all(&graph, &all_keys);
+
+        // Bulk read all file records in a single scan.
+        let mut all_file_recs = store_ref.scan_prefix("file:").await.unwrap_or_default();
         let mut blast_count = 0u32;
-        for fr in &file_records {
-            let file_key = format!("file:{}", fr.path);
-            let br = mati_core::analysis::blast_radius::BlastRadius::compute(&file_key, &graph);
-            if let Ok(Some(mut record)) = store_ref.get(&file_key).await {
-                if let Some(mut stored_fr) = record.payload_as::<FileRecord>() {
-                    stored_fr.blast_radius = Some(br);
-                    record.payload = serde_json::to_value(&stored_fr).ok();
-                    let _ = store_ref.put(&file_key, &record).await;
+
+        // In-memory mutation: patch each FileRecord with its blast radius.
+        for record in all_file_recs.iter_mut() {
+            if let Some(br) = blast_map.get(&record.key) {
+                if let Some(mut fr) = record.payload_as::<FileRecord>() {
+                    fr.blast_radius = Some(br.clone());
+                    record.payload = serde_json::to_value(&fr).ok();
                     blast_count += 1;
                 }
             }
         }
+
+        // Bulk write all mutated records in a single batch transaction.
+        let pairs: Vec<(&str, &Record)> =
+            all_file_recs.iter().map(|r| (r.key.as_str(), r)).collect();
+        let _ = store_ref.put_batch_kv_only(&pairs).await;
+
         println!(
             "  Blast radius...                {:>4} files   {:>4}ms",
             blast_count,
@@ -966,21 +980,27 @@ pub async fn run(args: InitArgs) -> Result<()> {
     {
         let t = Instant::now();
         let store_ref = graph.store();
-        let all_file_recs = store_ref.scan_prefix("file:").await.unwrap_or_default();
+        let mut all_file_recs = store_ref.scan_prefix("file:").await.unwrap_or_default();
         let propagation =
             mati_core::analysis::propagation::compute_propagation(&all_file_recs, &graph);
         let mut prop_count = 0u32;
-        for (key, prop) in &propagation {
-            if let Ok(Some(mut record)) = store_ref.get(key).await {
+
+        // In-memory mutation: patch propagated staleness onto file records.
+        for record in all_file_recs.iter_mut() {
+            if let Some(prop) = propagation.get(&record.key) {
                 if let Some(mut fr) = record.payload_as::<FileRecord>() {
                     fr.propagated_staleness = Some(prop.clone());
                     record.payload = serde_json::to_value(&fr).ok();
-                    let _ = store_ref.put(key, &record).await;
                     prop_count += 1;
                 }
             }
         }
+
+        // Bulk write all mutated records.
         if prop_count > 0 {
+            let pairs: Vec<(&str, &Record)> =
+                all_file_recs.iter().map(|r| (r.key.as_str(), r)).collect();
+            let _ = store_ref.put_batch_kv_only(&pairs).await;
             println!(
                 "  Staleness propagation...       {:>4} files   {:>4}ms",
                 prop_count,
