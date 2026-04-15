@@ -123,13 +123,11 @@ pub fn build_edges_with_root(
                 // Try to resolve them against the file index before skipping.
                 if matches!(file.language, Language::C | Language::Cpp) {
                     let resolved = match file.language {
-                        Language::Cpp => {
-                            crate::analysis::resolvers::cpp::resolve_angle_bracket(
-                                &import_stmt.path,
-                                &file.rel_path,
-                                &file_index,
-                            )
-                        }
+                        Language::Cpp => crate::analysis::resolvers::cpp::resolve_angle_bracket(
+                            &import_stmt.path,
+                            &file.rel_path,
+                            &file_index,
+                        ),
                         _ => crate::analysis::resolvers::c::resolve_angle_bracket(
                             &import_stmt.path,
                             &file.rel_path,
