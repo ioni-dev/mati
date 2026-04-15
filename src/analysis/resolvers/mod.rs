@@ -82,6 +82,10 @@ pub struct FileIndex {
     /// Populated from each member's `[package].name` in Cargo.toml.
     /// Empty for non-Rust or single-crate projects.
     workspace_members: HashMap<String, String>,
+    /// Scala source root prefixes discovered from file paths during init.
+    /// E.g. `["zio-json/shared/src/main/scala/", "zio-json/jvm/src/test/scala/"]`.
+    /// Used by the Scala resolver to find files in multi-project sbt layouts.
+    scala_source_roots: Vec<String>,
 }
 
 impl FileIndex {
@@ -92,6 +96,7 @@ impl FileIndex {
             root: None,
             crate_roots: Vec::new(),
             workspace_members: HashMap::new(),
+            scala_source_roots: Vec::new(),
         }
     }
 
@@ -102,6 +107,7 @@ impl FileIndex {
             root: Some(root),
             crate_roots: Vec::new(),
             workspace_members: HashMap::new(),
+            scala_source_roots: Vec::new(),
         }
     }
 
@@ -138,6 +144,16 @@ impl FileIndex {
     /// True if workspace member mappings are configured.
     pub fn has_workspace_members(&self) -> bool {
         !self.workspace_members.is_empty()
+    }
+
+    /// Set Scala source root prefixes for multi-project sbt resolution.
+    pub fn set_scala_source_roots(&mut self, roots: Vec<String>) {
+        self.scala_source_roots = roots;
+    }
+
+    /// Returns the discovered Scala source root prefixes.
+    pub fn scala_source_roots(&self) -> &[String] {
+        &self.scala_source_roots
     }
 
     /// Read a file relative to the index root. Returns None if no root is
