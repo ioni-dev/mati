@@ -314,7 +314,10 @@ pub(crate) fn camel_to_snake(s: &str) -> String {
                 // Insert underscore at word boundaries:
                 // - lowercase/digit → uppercase: userN... → user_n...
                 // - uppercase → uppercase+lowercase (acronym end): HTTP_S... → http_s...
-                if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_is_lower) {
+                if prev.is_lowercase()
+                    || prev.is_ascii_digit()
+                    || (prev.is_uppercase() && next_is_lower)
+                {
                     result.push('_');
                 }
             }
@@ -396,7 +399,10 @@ mod tests {
     fn camel_to_snake_multi_word() {
         assert_eq!(camel_to_snake("UserNotification"), "user_notification");
         assert_eq!(camel_to_snake("MyApp"), "my_app");
-        assert_eq!(camel_to_snake("ApplicationController"), "application_controller");
+        assert_eq!(
+            camel_to_snake("ApplicationController"),
+            "application_controller"
+        );
     }
 
     #[test]
