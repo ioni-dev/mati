@@ -65,6 +65,16 @@ pub enum ImportKind {
     /// External / third-party import that should be skipped by the resolver.
     /// (e.g. Rust non-crate imports, TS/JS bare specifiers, C angle-bracket system headers)
     External,
+
+    /// Class inheritance: `class Foo < Bar` produces an Inherits import for Bar.
+    /// Used by Ruby/Rails for autoload-implicit dependencies resolved via Zeitwerk
+    /// path conventions.
+    Inherits,
+
+    /// Module inclusion: `include Foo`, `extend Foo`, `prepend Foo` all produce
+    /// an Includes import. Used by Ruby/Rails for concerns and shared modules,
+    /// resolved via Zeitwerk path conventions.
+    Includes,
 }
 
 impl ImportStatement {
