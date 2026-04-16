@@ -29,6 +29,14 @@ const RUBY_QUERY_SRC: &str = r#"
 
   (call method: (identifier) @call_name arguments: (argument_list (string (string_content) @call_arg)))
 
+  ;; Class inheritance: class Foo < Bar
+  (class superclass: (superclass (constant) @superclass))
+  (class superclass: (superclass (scope_resolution) @superclass))
+
+  ;; include/extend/prepend with constant arguments
+  (call method: (identifier) @mixin_call arguments: (argument_list (constant) @mixin_arg))
+  (call method: (identifier) @mixin_call arguments: (argument_list (scope_resolution) @mixin_arg))
+
   (if) @branch
   (unless) @branch
   (while) @branch
@@ -67,6 +75,9 @@ struct RubyCaptures {
     type_name: u32,
     call_name: u32,
     call_arg: u32,
+    superclass: u32,
+    mixin_call: u32,
+    mixin_arg: u32,
     branch: u32,
     comment: u32,
 }
@@ -83,10 +94,34 @@ impl RubyCaptures {
             type_name: idx("type_name"),
             call_name: idx("call_name"),
             call_arg: idx("call_arg"),
+            superclass: idx("superclass"),
+            mixin_call: idx("mixin_call"),
+            mixin_arg: idx("mixin_arg"),
             branch: idx("branch"),
             comment: idx("comment"),
         }
     }
+}
+
+// ── Built-in constants (never project-defined) ──────────────────────────────
+
+/// Ruby built-in classes/modules that should never produce Inherits or Includes
+/// imports — they are part of the language runtime, not project files.
+const RUBY_BUILTINS: &[&str] = &[
+    "Object",
+    "BasicObject",
+    "Kernel",
+    "Class",
+    "Module",
+    "Comparable",
+    "Enumerable",
+    "Struct",
+];
+
+/// Extract the top-level (leftmost) constant from a possibly namespaced name.
+/// `"Foo::Bar::Baz"` → `"Foo"`, `"Foo"` → `"Foo"`.
+fn top_level_name(name: &str) -> &str {
+    name.split("::").next().unwrap_or(name)
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -130,6 +165,10 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
         let mut match_call_name: Option<&str> = None;
         let mut match_call_arg: Option<&str> = None;
 
+        // For include/extend/prepend detection.
+        let mut match_mixin_call: Option<&str> = None;
+        let mut match_mixin_args: Vec<(&str, u32)> = Vec::new();
+
         for capture in m.captures {
             let idx = capture.index;
             let node = capture.node;
@@ -150,6 +189,26 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                 match_call_name = node.utf8_text(src).ok();
             } else if idx == ci.call_arg {
                 match_call_arg = node.utf8_text(src).ok();
+            } else if idx == ci.superclass {
+                // Class inheritance: class Foo < Bar
+                if let Ok(name) = node.utf8_text(src) {
+                    let line = node.start_position().row as u32 + 1;
+                    let base = top_level_name(name);
+                    if !RUBY_BUILTINS.contains(&base) {
+                        out.imports.push(ImportStatement::new(
+                            name.to_owned(),
+                            ImportKind::Inherits,
+                            line,
+                        ));
+                    }
+                }
+            } else if idx == ci.mixin_call {
+                match_mixin_call = node.utf8_text(src).ok();
+            } else if idx == ci.mixin_arg {
+                if let Ok(name) = node.utf8_text(src) {
+                    let line = node.start_position().row as u32 + 1;
+                    match_mixin_args.push((name, line));
+                }
             } else if idx == ci.comment {
                 if let Ok(text) = node.utf8_text(src) {
                     let row = node.start_position().row;
@@ -172,26 +231,39 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
             }
         }
 
-        // Process require/require_relative calls.
+        // Process require/require_relative/require_dependency calls.
         if let (Some(name), Some(arg)) = (match_call_name, match_call_arg) {
-            if name == "require" || name == "require_relative" {
-                // Use the call_name node's parent (the call node) for line info.
-                // Fall back to row 0 if we can't determine the line.
+            if name == "require" || name == "require_relative" || name == "require_dependency" {
                 let line = m
                     .captures
                     .iter()
                     .find(|c| c.index == ci.call_name)
                     .map(|c| c.node.start_position().row as u32 + 1)
                     .unwrap_or(1);
-                // require_relative resolves relative to the current file.
-                // require is typically a gem/stdlib — kept as Normal (unresolvable at Layer 0).
                 let kind = if name == "require_relative" {
                     ImportKind::Relative
                 } else {
+                    // Both require and require_dependency resolve against lib/ and autoload roots.
                     ImportKind::Normal
                 };
                 out.imports
                     .push(ImportStatement::new(arg.to_owned(), kind, line));
+            }
+        }
+
+        // Process include/extend/prepend calls with constant arguments.
+        if let Some(method) = match_mixin_call {
+            if method == "include" || method == "extend" || method == "prepend" {
+                for (arg, line) in match_mixin_args {
+                    let base = top_level_name(arg);
+                    if !RUBY_BUILTINS.contains(&base) {
+                        out.imports.push(ImportStatement::new(
+                            arg.to_owned(),
+                            ImportKind::Includes,
+                            line,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -346,5 +418,133 @@ mod tests {
         assert_eq!(a.unsafe_count, 0);
         assert_eq!(a.unwrap_count, 0);
         assert_eq!(a.panic_count, 0);
+    }
+
+    // ── Inheritance (Inherits) ────────────────────────────────────────────
+
+    #[test]
+    fn class_with_superclass_emits_inherits() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo < Bar\nend\n");
+        let inherits: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Inherits)
+            .collect();
+        assert_eq!(inherits.len(), 1);
+        assert_eq!(inherits[0].path, "Bar");
+    }
+
+    #[test]
+    fn class_without_superclass_no_inherits() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo\nend\n");
+        let inherits: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Inherits)
+            .collect();
+        assert!(inherits.is_empty());
+    }
+
+    #[test]
+    fn class_with_namespaced_superclass() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo < MyApp::Bar\nend\n");
+        let inherits: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Inherits)
+            .collect();
+        assert_eq!(inherits.len(), 1);
+        assert_eq!(inherits[0].path, "MyApp::Bar");
+    }
+
+    #[test]
+    fn builtin_superclass_skipped() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo < Object\nend\nclass Bar < Struct\nend\n");
+        let inherits: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Inherits)
+            .collect();
+        assert!(inherits.is_empty());
+    }
+
+    // ── Module inclusion (Includes) ───────────────────────────────────────
+
+    #[test]
+    fn single_include_emits_includes() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo\n  include Bar\nend\n");
+        let includes: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Includes)
+            .collect();
+        assert_eq!(includes.len(), 1);
+        assert_eq!(includes[0].path, "Bar");
+    }
+
+    #[test]
+    fn multiple_includes_emit_separately() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo\n  include Bar, Baz, Qux\nend\n");
+        let includes: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Includes)
+            .collect();
+        assert_eq!(includes.len(), 3, "expected 3 includes, got {:?}", includes);
+        let paths: Vec<&str> = includes.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"Bar"));
+        assert!(paths.contains(&"Baz"));
+        assert!(paths.contains(&"Qux"));
+    }
+
+    #[test]
+    fn extend_and_prepend_also_emit_includes() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "class Foo\n  extend Bar\n  prepend Baz\nend\n");
+        let includes: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Includes)
+            .collect();
+        assert_eq!(includes.len(), 2);
+        let paths: Vec<&str> = includes.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"Bar"));
+        assert!(paths.contains(&"Baz"));
+    }
+
+    #[test]
+    fn builtin_module_include_skipped() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(
+            &dir,
+            "class Foo\n  include Comparable\n  include Enumerable\nend\n",
+        );
+        let includes: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Includes)
+            .collect();
+        assert!(includes.is_empty());
+    }
+
+    // ── require_dependency (P3) ───────────────────────────────────────────
+
+    #[test]
+    fn require_dependency_extracted_as_normal() {
+        let dir = TempDir::new().unwrap();
+        let a = parse(&dir, "require_dependency 'app/services/foo'\n");
+        let normals: Vec<_> = a
+            .imports
+            .iter()
+            .filter(|i| i.kind == ImportKind::Normal)
+            .collect();
+        assert_eq!(normals.len(), 1);
+        assert_eq!(normals[0].path, "app/services/foo");
     }
 }

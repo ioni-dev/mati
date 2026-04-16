@@ -4,7 +4,7 @@
 //! Module names matching known Elixir/Erlang stdlib or common framework
 //! prefixes are skipped (Phoenix, Ecto, Plug, etc.).
 
-use super::{FileIndex, LanguageResolver};
+use super::{camel_to_snake, FileIndex, LanguageResolver};
 use crate::analysis::parser::ImportStatement;
 use crate::analysis::walker::Language;
 
@@ -127,35 +127,6 @@ fn is_elixir_stdlib(module: &str) -> bool {
             | "Tuple"
             | "URI"
     )
-}
-
-/// Convert a CamelCase module segment to snake_case.
-/// HTTPServer -> http_server
-/// MyModule -> my_module
-/// HTTP -> http
-/// XMLParser -> xml_parser
-fn camel_to_snake(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 4);
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        if c.is_uppercase() {
-            // Insert underscore before uppercase letter if:
-            // - it's not the first character, AND
-            // - either the previous char is lowercase (MyModule -> my_module)
-            //   or the next char is lowercase (HTTPServer -> http_server)
-            if i > 0 {
-                let prev_is_lower = chars[i - 1].is_lowercase();
-                let next_is_lower = chars.get(i + 1).map(|c| c.is_lowercase()).unwrap_or(false);
-                if prev_is_lower || next_is_lower {
-                    result.push('_');
-                }
-            }
-            result.push(c.to_ascii_lowercase());
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 #[cfg(test)]

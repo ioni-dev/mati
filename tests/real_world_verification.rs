@@ -18,7 +18,7 @@
 //! - Scala:      zio/zio-json          (sbt multi-project source roots)
 //! - Ruby:       sinatra/sinatra       (Normal require lib/ fallback)
 //!
-//! ## Measurement baselines (2026-04-14, updated after brace decomposition)
+//! ## Measurement baselines (2026-04-15, updated after Rails autoload support)
 //!
 //! | Codebase      | Edges | Resolution | Hub tier              | Notes                              |
 //! |---------------|-------|------------|-----------------------|------------------------------------|
@@ -28,7 +28,9 @@
 //! | nlohmann-json |   619 | ~84%       | json.hpp critical     | angle-bracket fix (Phase 2)        |
 //! | aeson         |   223 | ~50%       | Aeson.hs critical     | stdlib allowlist fix (Phase 2)     |
 //! | zio-json      |    21 | ~8%        | —                     | source root fix, wildcard limited  |
-//! | sinatra       |    93 | ~60%       | base.rb high          | lib/ fallback fix (Phase 2)        |
+//! | sinatra       |   145 | ~60%       | base.rb high          | lib/ fallback fix (Phase 2)        |
+//! | discourse     |  2622 | struct     | AppController critical| Rails autoload (Inherits/Includes) |
+//! | solidus       |  1090 | struct     | core.rb moderate      | monorepo autoload + lib/ roots     |
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -532,11 +534,11 @@ fn real_world_sinatra_resolution() {
         "sinatra should index at least 100 files, got {files}"
     );
 
-    // Baseline 2026-04-15: 93 edges (lib/ fallback fix).
-    // Floor set ~5% below: 88 edges minimum.
+    // Baseline 2026-04-15: 145 edges (lib/ fallback + Inherits/Includes).
+    // Floor set ~10% below: 130 edges minimum.
     assert!(
-        edges >= 88,
-        "sinatra resolution regressed: expected >= 88 edges (baseline 93), got {edges}"
+        edges >= 130,
+        "sinatra resolution regressed: expected >= 130 edges (baseline 145), got {edges}"
     );
 
     eprintln!("[real_world_sinatra] files={files} edges={edges}");
@@ -558,4 +560,102 @@ fn real_world_sinatra_resolution() {
     );
 
     eprintln!("[real_world_sinatra] {key} tier={tier} direct={direct}");
+}
+
+// ── discourse (Ruby/Rails) ────────────────────────────────────────────
+//
+// Rails autoload fix: Inherits + Includes + Zeitwerk path resolution.
+// Baseline before fix: 1207 edges, ApplicationController isolated.
+// After fix: 2622 edges, ApplicationController critical (102 direct).
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_discourse_application_controller_is_hub() {
+    let repo = clone_or_reuse("discourse", "https://github.com/discourse/discourse");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 10000,
+        "discourse should index at least 10000 files, got {files}"
+    );
+
+    // Baseline 2026-04-15: 2622 edges (Inherits + Includes + Zeitwerk).
+    // Floor set ~15% below: 2200 edges minimum.
+    assert!(
+        edges >= 2200,
+        "discourse resolution regressed: expected >= 2200 edges (baseline 2622), got {edges}"
+    );
+
+    eprintln!("[real_world_discourse] files={files} edges={edges}");
+
+    // ApplicationController is the most-inherited controller in any Rails app.
+    // Baseline: 102 direct importers, critical tier.
+    let key = "file:app/controllers/application_controller.rb";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — discourse may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["moderate", "high", "critical"].contains(&tier.as_str()),
+        "discourse ApplicationController should be moderate or higher, got tier={tier}"
+    );
+    assert!(
+        direct >= 50,
+        "discourse ApplicationController should have >= 50 direct importers (baseline 102), got {direct}"
+    );
+
+    eprintln!("[real_world_discourse] {key} tier={tier} direct={direct}");
+}
+
+// ── solidus (Ruby/Rails monorepo) ─────────────────────────────────────
+//
+// Rails autoload fix + monorepo lib/ root discovery.
+// Baseline before fix: 30 edges, all hub files isolated.
+// After fix: 1090 edges, core.rb moderate (7 direct).
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_solidus_core_is_hub() {
+    let repo = clone_or_reuse("solidus", "https://github.com/solidusio/solidus");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 2000,
+        "solidus should index at least 2000 files, got {files}"
+    );
+
+    // Baseline 2026-04-15: 1090 edges (autoload roots + monorepo lib/).
+    // Floor set ~15% below: 900 edges minimum.
+    assert!(
+        edges >= 900,
+        "solidus resolution regressed: expected >= 900 edges (baseline 1090), got {edges}"
+    );
+
+    eprintln!("[real_world_solidus] files={files} edges={edges}");
+
+    // Spree::Core is the central entry point for the core engine.
+    // Baseline: 7 direct importers, moderate tier.
+    let key = "file:core/lib/spree/core.rb";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — solidus may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["low", "moderate", "high", "critical"].contains(&tier.as_str()),
+        "solidus core.rb should be low or higher, got tier={tier}"
+    );
+    assert!(
+        direct >= 3,
+        "solidus core.rb should have >= 3 direct importers (baseline 7), got {direct}"
+    );
+
+    eprintln!("[real_world_solidus] {key} tier={tier} direct={direct}");
 }
