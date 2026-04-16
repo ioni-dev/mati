@@ -310,7 +310,7 @@ pub(crate) fn camel_to_snake(s: &str) -> String {
         if c.is_uppercase() {
             if i > 0 {
                 let prev = chars[i - 1];
-                let next_is_lower = chars.get(i + 1).map_or(false, |c| c.is_lowercase());
+                let next_is_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
                 // Insert underscore at word boundaries:
                 // - lowercase/digit → uppercase: userN... → user_n...
                 // - uppercase → uppercase+lowercase (acronym end): HTTP_S... → http_s...

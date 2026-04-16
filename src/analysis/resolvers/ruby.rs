@@ -130,7 +130,7 @@ fn resolve_normal(
 /// any autoload root. Also checks the nested-folder variant
 /// `<root>/foo/bar/baz/baz.rb` (less common but valid).
 fn resolve_zeitwerk(constant: &str, file_index: &FileIndex) -> Option<String> {
-    let parts: Vec<String> = constant.split("::").map(|p| camel_to_snake(p)).collect();
+    let parts: Vec<String> = constant.split("::").map(camel_to_snake).collect();
     let path_suffix = parts.join("/");
 
     // Search autoload roots first (app/models/, app/controllers/, etc.),
