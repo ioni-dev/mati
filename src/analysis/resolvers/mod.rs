@@ -86,6 +86,13 @@ pub struct FileIndex {
     /// E.g. `["zio-json/shared/src/main/scala/", "zio-json/jvm/src/test/scala/"]`.
     /// Used by the Scala resolver to find files in multi-project sbt layouts.
     scala_source_roots: Vec<String>,
+    /// Ruby/Rails Zeitwerk autoload root directories discovered from file paths.
+    /// E.g. `["app/models/", "app/controllers/", "core/app/models/"]`.
+    /// Used by the Ruby resolver to map constant names to file paths.
+    ruby_autoload_roots: Vec<String>,
+    /// Ruby lib/ root directories for `require` resolution in monorepo layouts.
+    /// E.g. `["lib/", "core/lib/", "api/lib/"]`.
+    ruby_lib_roots: Vec<String>,
 }
 
 impl FileIndex {
@@ -97,6 +104,8 @@ impl FileIndex {
             crate_roots: Vec::new(),
             workspace_members: HashMap::new(),
             scala_source_roots: Vec::new(),
+            ruby_autoload_roots: Vec::new(),
+            ruby_lib_roots: Vec::new(),
         }
     }
 
@@ -108,6 +117,8 @@ impl FileIndex {
             crate_roots: Vec::new(),
             workspace_members: HashMap::new(),
             scala_source_roots: Vec::new(),
+            ruby_autoload_roots: Vec::new(),
+            ruby_lib_roots: Vec::new(),
         }
     }
 
@@ -154,6 +165,26 @@ impl FileIndex {
     /// Returns the discovered Scala source root prefixes.
     pub fn scala_source_roots(&self) -> &[String] {
         &self.scala_source_roots
+    }
+
+    /// Set Ruby/Rails Zeitwerk autoload root directories.
+    pub fn set_ruby_autoload_roots(&mut self, roots: Vec<String>) {
+        self.ruby_autoload_roots = roots;
+    }
+
+    /// Returns the discovered Ruby autoload root directories.
+    pub fn ruby_autoload_roots(&self) -> &[String] {
+        &self.ruby_autoload_roots
+    }
+
+    /// Set Ruby lib/ root directories for monorepo require resolution.
+    pub fn set_ruby_lib_roots(&mut self, roots: Vec<String>) {
+        self.ruby_lib_roots = roots;
+    }
+
+    /// Returns the discovered Ruby lib/ root directories.
+    pub fn ruby_lib_roots(&self) -> &[String] {
+        &self.ruby_lib_roots
     }
 
     /// Read a file relative to the index root. Returns None if no root is
@@ -257,6 +288,45 @@ impl Default for ResolverRegistry {
     }
 }
 
+// ── Shared helpers ─────────────────────────────────────────────────────────
+
+/// Convert a PascalCase / CamelCase string to snake_case.
+///
+/// Handles acronyms and digit boundaries correctly:
+/// - `UserNotification` → `user_notification`
+/// - `HTTPServer` → `http_server`
+/// - `JSONParser` → `json_parser`
+/// - `API` → `api`
+/// - `FooID` → `foo_id`
+/// - `V2Parser` → `v2_parser`
+/// - `XMLParserV2` → `xml_parser_v2`
+///
+/// Used by the Ruby and Elixir resolvers for Zeitwerk / Mix path conventions.
+pub(crate) fn camel_to_snake(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    let chars: Vec<char> = s.chars().collect();
+
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                let prev = chars[i - 1];
+                let next_is_lower = chars.get(i + 1).map_or(false, |c| c.is_lowercase());
+                // Insert underscore at word boundaries:
+                // - lowercase/digit → uppercase: userN... → user_n...
+                // - uppercase → uppercase+lowercase (acronym end): HTTP_S... → http_s...
+                if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_is_lower) {
+                    result.push('_');
+                }
+            }
+            result.push(c.to_ascii_lowercase());
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -312,5 +382,57 @@ mod tests {
             registry.resolve(&import, "main.go", Language::Go, &idx),
             None
         );
+    }
+
+    // ── camel_to_snake ─────────────────────────────────────────────────────
+
+    #[test]
+    fn camel_to_snake_simple_word() {
+        assert_eq!(camel_to_snake("User"), "user");
+        assert_eq!(camel_to_snake("Router"), "router");
+    }
+
+    #[test]
+    fn camel_to_snake_multi_word() {
+        assert_eq!(camel_to_snake("UserNotification"), "user_notification");
+        assert_eq!(camel_to_snake("MyApp"), "my_app");
+        assert_eq!(camel_to_snake("ApplicationController"), "application_controller");
+    }
+
+    #[test]
+    fn camel_to_snake_acronyms() {
+        assert_eq!(camel_to_snake("HTTPServer"), "http_server");
+        assert_eq!(camel_to_snake("JSONParser"), "json_parser");
+        assert_eq!(camel_to_snake("XMLParser"), "xml_parser");
+        assert_eq!(camel_to_snake("API"), "api");
+        assert_eq!(camel_to_snake("HTTP"), "http");
+    }
+
+    #[test]
+    fn camel_to_snake_trailing_acronym() {
+        assert_eq!(camel_to_snake("FooID"), "foo_id");
+        assert_eq!(camel_to_snake("UserAPI"), "user_api");
+    }
+
+    #[test]
+    fn camel_to_snake_digit_boundaries() {
+        assert_eq!(camel_to_snake("V2Parser"), "v2_parser");
+        assert_eq!(camel_to_snake("XMLParserV2"), "xml_parser_v2");
+    }
+
+    #[test]
+    fn camel_to_snake_already_lowercase() {
+        assert_eq!(camel_to_snake("already_snake"), "already_snake");
+    }
+
+    #[test]
+    fn camel_to_snake_empty() {
+        assert_eq!(camel_to_snake(""), "");
+    }
+
+    #[test]
+    fn camel_to_snake_single_char() {
+        assert_eq!(camel_to_snake("A"), "a");
+        assert_eq!(camel_to_snake("x"), "x");
     }
 }

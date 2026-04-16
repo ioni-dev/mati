@@ -89,6 +89,15 @@ pub fn build_edges_with_root(
         file_index.set_scala_source_roots(scala_roots);
     }
 
+    // Detect Ruby/Rails autoload roots and monorepo lib/ roots.
+    let (ruby_autoload, ruby_lib) = detect_ruby_roots(files);
+    if !ruby_autoload.is_empty() {
+        file_index.set_ruby_autoload_roots(ruby_autoload);
+    }
+    if !ruby_lib.is_empty() {
+        file_index.set_ruby_lib_roots(ruby_lib);
+    }
+
     let registry = ResolverRegistry::new();
 
     let mut edges: Vec<(String, EdgeKind, String)> = Vec::new();
@@ -380,6 +389,75 @@ fn detect_scala_source_roots(files: &[WalkedFile]) -> Vec<String> {
     let mut result: Vec<String> = roots.into_iter().collect();
     result.sort(); // Deterministic order for tests.
     result
+}
+
+/// Discover Ruby/Rails autoload roots and lib/ roots from walked file paths.
+///
+/// Scans Ruby files for paths matching Rails conventions:
+/// - `**/app/<subdir>/` directories → Zeitwerk autoload roots
+/// - `**/lib/` directories → lib roots for `require` resolution
+///
+/// Returns `(autoload_roots, lib_roots)`. Both sorted for deterministic output.
+fn detect_ruby_roots(files: &[WalkedFile]) -> (Vec<String>, Vec<String>) {
+    let mut autoload: HashSet<String> = HashSet::new();
+    let mut lib: HashSet<String> = HashSet::new();
+
+    for file in files {
+        if file.language != Language::Ruby {
+            continue;
+        }
+        let path = &file.rel_path;
+
+        // Detect app/<subdir>/ autoload roots.
+        // E.g. "core/app/models/spree/order.rb" → "core/app/models/"
+        // E.g. "app/models/concerns/searchable.rb" → "app/models/concerns/"
+        //
+        // Strategy: find the "app/" segment, extract the prefix before it and
+        // the first subdir after it. Register both `<prefix>app/<subdir>/` and,
+        // if the file also descends into `concerns/`, `<prefix>app/<subdir>/concerns/`.
+        if let Some(app_idx) = find_segment(path, "app/") {
+            let after_app = &path[app_idx + 4..]; // skip "app/"
+            if let Some(slash) = after_app.find('/') {
+                let prefix = &path[..app_idx];
+                let subdir = &after_app[..slash];
+                let root = format!("{prefix}app/{subdir}/");
+
+                // Check for concerns/ before inserting to avoid extra allocation.
+                let rest = &after_app[slash + 1..];
+                if rest.starts_with("concerns/") {
+                    autoload.insert(format!("{root}concerns/"));
+                }
+
+                autoload.insert(root);
+            }
+        }
+
+        // Detect lib/ roots (monorepo-aware).
+        // E.g. "core/lib/spree/core.rb" → "core/lib/"
+        // E.g. "lib/discourse.rb" → "lib/"
+        if let Some(lib_idx) = find_segment(path, "lib/") {
+            let prefix = &path[..lib_idx];
+            lib.insert(format!("{prefix}lib/"));
+        }
+    }
+
+    let mut autoload_vec: Vec<String> = autoload.into_iter().collect();
+    autoload_vec.sort();
+    let mut lib_vec: Vec<String> = lib.into_iter().collect();
+    lib_vec.sort();
+    (autoload_vec, lib_vec)
+}
+
+/// Find a directory segment in a path, returning its byte offset.
+///
+/// Matches at position 0 (path starts with segment) or after a `/`.
+/// E.g. `find_segment("core/app/models/foo.rb", "app/")` → `Some(5)`.
+fn find_segment(path: &str, segment: &str) -> Option<usize> {
+    if path.starts_with(segment) {
+        return Some(0);
+    }
+    let needle = format!("/{segment}");
+    path.find(&needle).map(|pos| pos + 1)
 }
 
 /// Format a repo-relative path as a record key.
