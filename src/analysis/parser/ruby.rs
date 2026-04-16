@@ -195,8 +195,11 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                     let line = node.start_position().row as u32 + 1;
                     let base = top_level_name(name);
                     if !RUBY_BUILTINS.contains(&base) {
-                        out.imports
-                            .push(ImportStatement::new(name.to_owned(), ImportKind::Inherits, line));
+                        out.imports.push(ImportStatement::new(
+                            name.to_owned(),
+                            ImportKind::Inherits,
+                            line,
+                        ));
                     }
                 }
             } else if idx == ci.mixin_call {
@@ -254,8 +257,11 @@ pub(super) fn parse_ruby(file: &WalkedFile, source: &str) -> Result<StaticFileAn
                 for (arg, line) in match_mixin_args {
                     let base = top_level_name(arg);
                     if !RUBY_BUILTINS.contains(&base) {
-                        out.imports
-                            .push(ImportStatement::new(arg.to_owned(), ImportKind::Includes, line));
+                        out.imports.push(ImportStatement::new(
+                            arg.to_owned(),
+                            ImportKind::Includes,
+                            line,
+                        ));
                     }
                 }
             }
@@ -500,10 +506,7 @@ mod tests {
     #[test]
     fn extend_and_prepend_also_emit_includes() {
         let dir = TempDir::new().unwrap();
-        let a = parse(
-            &dir,
-            "class Foo\n  extend Bar\n  prepend Baz\nend\n",
-        );
+        let a = parse(&dir, "class Foo\n  extend Bar\n  prepend Baz\nend\n");
         let includes: Vec<_> = a
             .imports
             .iter()
@@ -518,7 +521,10 @@ mod tests {
     #[test]
     fn builtin_module_include_skipped() {
         let dir = TempDir::new().unwrap();
-        let a = parse(&dir, "class Foo\n  include Comparable\n  include Enumerable\nend\n");
+        let a = parse(
+            &dir,
+            "class Foo\n  include Comparable\n  include Enumerable\nend\n",
+        );
         let includes: Vec<_> = a
             .imports
             .iter()

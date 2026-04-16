@@ -170,7 +170,6 @@ fn resolve_zeitwerk(constant: &str, file_index: &FileIndex) -> Option<String> {
     None
 }
 
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -182,11 +181,7 @@ mod tests {
         FileIndex::new(paths.iter().map(|s| s.to_string()))
     }
 
-    fn idx_with_roots(
-        paths: &[&str],
-        autoload_roots: &[&str],
-        lib_roots: &[&str],
-    ) -> FileIndex {
+    fn idx_with_roots(paths: &[&str], autoload_roots: &[&str], lib_roots: &[&str]) -> FileIndex {
         let mut fi = FileIndex::new(paths.iter().map(|s| s.to_string()));
         fi.set_ruby_autoload_roots(autoload_roots.iter().map(|s| s.to_string()).collect());
         fi.set_ruby_lib_roots(lib_roots.iter().map(|s| s.to_string()).collect());
@@ -291,15 +286,15 @@ mod tests {
     #[test]
     fn simple_class_inheritance_resolves_to_app_models() {
         let fi = idx_with_roots(
-            &[
-                "app/models/user.rb",
-                "app/models/application_record.rb",
-            ],
+            &["app/models/user.rb", "app/models/application_record.rb"],
             &["app/models/"],
             &[],
         );
-        let result =
-            RubyResolver.resolve(&import_inherits("ApplicationRecord"), "app/models/user.rb", &fi);
+        let result = RubyResolver.resolve(
+            &import_inherits("ApplicationRecord"),
+            "app/models/user.rb",
+            &fi,
+        );
         assert_eq!(result, Some("app/models/application_record.rb".into()));
     }
 
@@ -327,10 +322,7 @@ mod tests {
     #[test]
     fn concern_inclusion_resolves_via_concerns_dir() {
         let fi = idx_with_roots(
-            &[
-                "app/models/post.rb",
-                "app/models/concerns/searchable.rb",
-            ],
+            &["app/models/post.rb", "app/models/concerns/searchable.rb"],
             &["app/models/", "app/models/concerns/"],
             &[],
         );
@@ -342,15 +334,11 @@ mod tests {
     #[test]
     fn namespaced_constant_resolves_via_nested_path() {
         let fi = idx_with_roots(
-            &[
-                "app/models/my_app/bar.rb",
-                "app/models/foo.rb",
-            ],
+            &["app/models/my_app/bar.rb", "app/models/foo.rb"],
             &["app/models/"],
             &[],
         );
-        let result =
-            RubyResolver.resolve(&import_inherits("MyApp::Bar"), "app/models/foo.rb", &fi);
+        let result = RubyResolver.resolve(&import_inherits("MyApp::Bar"), "app/models/foo.rb", &fi);
         assert_eq!(result, Some("app/models/my_app/bar.rb".into()));
     }
 
@@ -379,34 +367,19 @@ mod tests {
     #[test]
     fn monorepo_lib_require_resolves() {
         let fi = idx_with_roots(
-            &[
-                "core/lib/spree/core.rb",
-                "api/lib/spree/api.rb",
-            ],
+            &["core/lib/spree/core.rb", "api/lib/spree/api.rb"],
             &[],
             &["core/lib/", "api/lib/"],
         );
-        let result = RubyResolver.resolve(
-            &import_normal("spree/core"),
-            "core/lib/spree.rb",
-            &fi,
-        );
+        let result = RubyResolver.resolve(&import_normal("spree/core"), "core/lib/spree.rb", &fi);
         assert_eq!(result, Some("core/lib/spree/core.rb".into()));
     }
 
     #[test]
     fn repo_root_lib_still_works() {
         // Regression guard: sinatra-style require still resolves via lib/
-        let fi = idx_with_roots(
-            &["lib/sinatra/base.rb", "lib/sinatra.rb"],
-            &[],
-            &["lib/"],
-        );
-        let result = RubyResolver.resolve(
-            &import_normal("sinatra/base"),
-            "lib/sinatra.rb",
-            &fi,
-        );
+        let fi = idx_with_roots(&["lib/sinatra/base.rb", "lib/sinatra.rb"], &[], &["lib/"]);
+        let result = RubyResolver.resolve(&import_normal("sinatra/base"), "lib/sinatra.rb", &fi);
         assert_eq!(result, Some("lib/sinatra/base.rb".into()));
     }
 
@@ -414,11 +387,7 @@ mod tests {
 
     #[test]
     fn require_dependency_resolves_via_autoload_roots() {
-        let fi = idx_with_roots(
-            &["app/services/foo.rb"],
-            &["app/services/"],
-            &[],
-        );
+        let fi = idx_with_roots(&["app/services/foo.rb"], &["app/services/"], &[]);
         let result = RubyResolver.resolve(
             &import_normal("foo"),
             "app/controllers/bar_controller.rb",
