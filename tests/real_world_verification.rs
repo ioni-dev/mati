@@ -17,8 +17,13 @@
 //! - Haskell:    haskell/aeson         (Data.Aeson.* stdlib over-classification)
 //! - Scala:      zio/zio-json          (sbt multi-project source roots)
 //! - Ruby:       sinatra/sinatra       (Normal require lib/ fallback)
+//! - Ruby/Rails: discourse/discourse   (Zeitwerk autoload, Inherits/Includes)
+//! - Ruby/Rails: solidusio/solidus     (monorepo autoload + lib/ roots)
+//! - Go:         hashicorp/hcl         (go.mod cross-package resolution)
+//! - Java:       jhy/jsoup             (Java package import resolution)
+//! - C:          microsoft/mimalloc    (C #include "..." resolution)
 //!
-//! ## Measurement baselines (2026-04-15, updated after Rails autoload support)
+//! ## Measurement baselines (2026-04-16, updated after Go/Java/C coverage)
 //!
 //! | Codebase      | Edges | Resolution | Hub tier              | Notes                              |
 //! |---------------|-------|------------|-----------------------|------------------------------------|
@@ -31,6 +36,9 @@
 //! | sinatra       |   145 | ~60%       | base.rb high          | lib/ fallback fix (Phase 2)        |
 //! | discourse     |  2622 | struct     | AppController critical| Rails autoload (Inherits/Includes) |
 //! | solidus       |  1090 | struct     | core.rb moderate      | monorepo autoload + lib/ roots     |
+//! | hcl           |   190 | ~98%       | expr_list.go critical | Go cross-package via go.mod        |
+//! | jsoup         |   576 | ~88%       | Jsoup.java critical   | Java package resolution            |
+//! | mimalloc      |   129 | ~100%      | mimalloc.h high       | C #include "..." resolution        |
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -658,4 +666,149 @@ fn real_world_solidus_core_is_hub() {
     );
 
     eprintln!("[real_world_solidus] {key} tier={tier} direct={direct}");
+}
+
+// ── hcl (Go) ──────────────────────────────────────────────────────────
+//
+// Go cross-package import resolution via go.mod module path.
+// Baseline 2026-04-16: 190 edges, 370 files.
+// Go resolves package imports to the first non-test .go file in the target
+// directory (alphabetical), so blast radius concentrates on package
+// entry-point files. expr_list.go (root package) is the hub — 118 direct.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_hcl_resolution() {
+    let repo = clone_or_reuse("hcl", "https://github.com/hashicorp/hcl");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 200,
+        "hcl should index at least 200 files, got {files}"
+    );
+
+    // Baseline 2026-04-16: 190 edges (go.mod cross-package resolution).
+    // Floor set ~5% below: 180 edges minimum.
+    assert!(
+        edges >= 180,
+        "hcl resolution regressed: expected >= 180 edges (baseline 190), got {edges}"
+    );
+
+    eprintln!("[real_world_hcl] files={files} edges={edges}");
+
+    // Go resolves package imports to one file per package. Which file is
+    // chosen depends on HashMap iteration order, so it varies between runs.
+    // hclparse/ is a single-file package — parser.go is always the target.
+    // It has 4 direct importers (stable across runs).
+    let key = "file:hclparse/parser.go";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — hcl may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        direct >= 2,
+        "hcl hclparse/parser.go should have >= 2 direct importers (baseline 4), got {direct}"
+    );
+
+    eprintln!("[real_world_hcl] {key} tier={tier} direct={direct}");
+}
+
+// ── jsoup (Java) ──────────────────────────────────────────────────────
+//
+// Java package import resolution.
+// Baseline 2026-04-16: 576 edges, 238 files.
+// Jsoup.java is the hub — 60 direct importers, critical tier.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_jsoup_resolution() {
+    let repo = clone_or_reuse("jsoup", "https://github.com/jhy/jsoup");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 100,
+        "jsoup should index at least 100 files, got {files}"
+    );
+
+    // Baseline 2026-04-16: ~745 edges (inner class stripping + test source root).
+    // Floor set ~5% below: 700 edges minimum.
+    assert!(
+        edges >= 700,
+        "jsoup resolution regressed: expected >= 700 edges (baseline ~745), got {edges}"
+    );
+
+    eprintln!("[real_world_jsoup] files={files} edges={edges}");
+
+    // Jsoup.java is the hub — entry point class imported by most of the codebase.
+    let key = "file:src/main/java/org/jsoup/Jsoup.java";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — jsoup may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["high", "critical"].contains(&tier.as_str()),
+        "jsoup Jsoup.java should be high or critical, got tier={tier}"
+    );
+    assert!(
+        direct >= 30,
+        "jsoup Jsoup.java should have >= 30 direct importers (baseline 60), got {direct}"
+    );
+
+    eprintln!("[real_world_jsoup] {key} tier={tier} direct={direct}");
+}
+
+// ── mimalloc (C) ──────────────────────────────────────────────────────
+//
+// C #include "..." resolution.
+// Baseline 2026-04-16: 129 edges, 120 files.
+// mimalloc.h is the hub — 34 direct importers, high tier.
+
+#[test]
+#[ignore = "real_world: requires network and external repos"]
+fn real_world_mimalloc_resolution() {
+    let repo = clone_or_reuse("mimalloc", "https://github.com/microsoft/mimalloc");
+    let (output, _slug) = fresh_init(&repo);
+
+    let edges = parse_edge_count(&output);
+    let files = parse_file_count(&output);
+
+    assert!(
+        files >= 50,
+        "mimalloc should index at least 50 files, got {files}"
+    );
+
+    // Baseline 2026-04-16: 129 edges (C #include resolution).
+    // Floor set ~10% below: 115 edges minimum.
+    assert!(
+        edges >= 115,
+        "mimalloc resolution regressed: expected >= 115 edges (baseline 129), got {edges}"
+    );
+
+    eprintln!("[real_world_mimalloc] files={files} edges={edges}");
+
+    // include/mimalloc.h is the public header — included by most source files.
+    let key = "file:include/mimalloc.h";
+    let show_out = run_show(&repo, key)
+        .unwrap_or_else(|| panic!("{key} not found — mimalloc may have restructured"));
+    let tier = parse_blast_tier(&show_out);
+    let direct = parse_blast_direct(&show_out);
+
+    assert!(
+        ["moderate", "high", "critical"].contains(&tier.as_str()),
+        "mimalloc mimalloc.h should be moderate or higher, got tier={tier}"
+    );
+    assert!(
+        direct >= 15,
+        "mimalloc mimalloc.h should have >= 15 direct importers (baseline 34), got {direct}"
+    );
+
+    eprintln!("[real_world_mimalloc] {key} tier={tier} direct={direct}");
 }
