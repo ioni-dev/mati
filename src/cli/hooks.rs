@@ -209,13 +209,13 @@ pub async fn run_prompt_context(files: &[String]) -> Result<()> {
         },
     );
     match crate::cli::daemon::daemon_v2(&root, cmd).await {
-        crate::cli::daemon::DaemonResult::Ok(resp) => {
-            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                if let Some(data) = resp.get("data") {
-                    // data is a JSON string containing the bootstrap markdown
-                    let text = data.as_str().unwrap_or("");
-                    print!("{text}");
-                }
+        crate::cli::daemon::DaemonResult::Ok(resp)
+            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) =>
+        {
+            if let Some(data) = resp.get("data") {
+                // data is a JSON string containing the bootstrap markdown
+                let text = data.as_str().unwrap_or("");
+                print!("{text}");
             }
         }
         _ => {
