@@ -1226,7 +1226,7 @@ fn history_impl(txn: &Transaction, key: &str, opts: &HistoryOptions) -> Result<V
 
     // Newest first — SurrealKV history iterator order is not guaranteed to be
     // reverse-chronological, so sort explicitly.
-    entries.sort_by(|a, b| b.timestamp_ns.cmp(&a.timestamp_ns));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ns));
     Ok(entries)
 }
 
