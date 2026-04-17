@@ -168,6 +168,6 @@ pub fn git_lang_counts(repo_root: &Path) -> Vec<(String, usize)> {
         .filter(|(_, n)| *n > 0)
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|e| std::cmp::Reverse(e.1));
     v
 }
