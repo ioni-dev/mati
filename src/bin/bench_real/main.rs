@@ -451,11 +451,7 @@ fn compute_accuracy(
         .iter()
         .filter(|k| run_once(bin, &["get", k], repo_path).success)
         .count();
-    let get_hit_rate_pct = if test_n > 0 {
-        (hits * 100 / test_n) as u32
-    } else {
-        0
-    };
+    let get_hit_rate_pct = (hits * 100).checked_div(test_n).unwrap_or(0) as u32;
     eprintln!(
         "    get hit rate: {}/{}  ({}%)",
         hits, test_n, get_hit_rate_pct

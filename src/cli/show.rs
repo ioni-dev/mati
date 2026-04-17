@@ -630,7 +630,7 @@ async fn ls_decisions(store: &StoreProxy, _use_color: bool) -> Result<()> {
     }
 
     // Sort by updated_at descending
-    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    records.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
 
     let mut table = Table::new();
     table
@@ -672,7 +672,7 @@ async fn ls_notes(store: &StoreProxy, _use_color: bool) -> Result<()> {
     }
 
     // Sort by updated_at descending
-    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    records.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
 
     let mut table = Table::new();
     table
