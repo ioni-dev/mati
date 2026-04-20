@@ -9,9 +9,9 @@ use tempfile::TempDir;
 
 use mati_core::store::db::Store;
 use mati_core::store::enforcement::{
-    canonicalize_file_key, scan_enforcement_events, EnforcementEventType,
-    EnforcementEventWriter, EnforcementMode, GapCause, GapCertainty, MissedEventCount,
-    SeqAllocator, SubjectKind, SCHEMA_VERSION,
+    canonicalize_file_key, scan_enforcement_events, EnforcementEventType, EnforcementEventWriter,
+    EnforcementMode, GapCause, GapCertainty, MissedEventCount, SeqAllocator, SubjectKind,
+    SCHEMA_VERSION,
 };
 
 async fn temp_store() -> (TempDir, Store) {
@@ -172,7 +172,11 @@ async fn export_snapshot_consistency() {
     let snapshot = scan_enforcement_events(&store, 1, 50)
         .await
         .expect("snapshot scan");
-    assert_eq!(snapshot.len(), 50, "snapshot must contain exactly 50 events");
+    assert_eq!(
+        snapshot.len(),
+        50,
+        "snapshot must contain exactly 50 events"
+    );
 
     // Write 10 more events (seq 51-60)
     for i in 50..60 {
@@ -299,7 +303,12 @@ async fn gap_detection_on_recovery() {
 
     // Emit a RecordingGap event
     let gap_event = writer2
-        .detect_and_record_gap(&store, 1700000000000, 1700000060000, GapCause::DaemonUnreachable)
+        .detect_and_record_gap(
+            &store,
+            1700000000000,
+            1700000060000,
+            GapCause::DaemonUnreachable,
+        )
         .await
         .expect("record gap");
 
@@ -368,9 +377,7 @@ async fn strict_mode_blocks_on_write_failure() {
     assert_eq!(event.schema_version, SCHEMA_VERSION);
 
     // Verify the event was actually persisted
-    let loaded = scan_enforcement_events(&store, 1, 1)
-        .await
-        .expect("scan");
+    let loaded = scan_enforcement_events(&store, 1, 1).await.expect("scan");
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].event_hash, event.event_hash);
 
@@ -586,9 +593,7 @@ async fn gotcha_crud_records_control_changed_events() {
         .expect("delete gotcha");
 
     // Read all enforcement events
-    let events = scan_enforcement_events(&store, 1, 100)
-        .await
-        .expect("scan");
+    let events = scan_enforcement_events(&store, 1, 100).await.expect("scan");
 
     // Should have at least 3 control_changed events (created, updated, deleted)
     let control_events: Vec<_> = events
@@ -714,9 +719,7 @@ async fn retention_prunes_old_events_and_records_prune_event() {
     }
 
     // Verify: old events are gone, new events remain
-    let remaining = scan_enforcement_events(&store, 1, 100)
-        .await
-        .expect("scan");
+    let remaining = scan_enforcement_events(&store, 1, 100).await.expect("scan");
 
     // Should have 3 recent events + 1 RetentionPruned event = 4
     assert_eq!(
@@ -749,9 +752,7 @@ async fn retention_prunes_old_events_and_records_prune_event() {
 
 #[tokio::test]
 async fn strict_mode_enforcement_config_records_change_event() {
-    use mati_core::store::enforcement::{
-        get_enforcement_mode, record_event, set_enforcement_mode,
-    };
+    use mati_core::store::enforcement::{get_enforcement_mode, record_event, set_enforcement_mode};
 
     let (_dir, store) = temp_store().await;
 
@@ -776,9 +777,7 @@ async fn strict_mode_enforcement_config_records_change_event() {
     assert_eq!(old, EnforcementMode::Strict);
 
     // Verify EnforcementConfigChanged events were recorded
-    let events = scan_enforcement_events(&store, 1, 100)
-        .await
-        .expect("scan");
+    let events = scan_enforcement_events(&store, 1, 100).await.expect("scan");
 
     let config_events: Vec<_> = events
         .iter()
@@ -853,7 +852,10 @@ async fn config_enforcement_mode_round_trips() {
     let (_dir, store) = temp_store().await;
 
     // Default is advisory
-    assert_eq!(get_enforcement_mode(&store).await, EnforcementMode::Advisory);
+    assert_eq!(
+        get_enforcement_mode(&store).await,
+        EnforcementMode::Advisory
+    );
 
     // Set to strict and read back
     set_enforcement_mode(&store, EnforcementMode::Strict)
@@ -892,9 +894,7 @@ async fn config_set_enforcement_mode_records_event() {
         .await
         .expect("set strict");
 
-    let events = scan_enforcement_events(&store, 1, 100)
-        .await
-        .expect("scan");
+    let events = scan_enforcement_events(&store, 1, 100).await.expect("scan");
 
     let config_events: Vec<_> = events
         .iter()
@@ -925,9 +925,7 @@ async fn config_set_enforcement_mode_records_event() {
         .await
         .expect("set strict again");
 
-    let events2 = scan_enforcement_events(&store, 1, 100)
-        .await
-        .expect("scan");
+    let events2 = scan_enforcement_events(&store, 1, 100).await.expect("scan");
     let config_events2: Vec<_> = events2
         .iter()
         .filter(|e| {

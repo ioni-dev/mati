@@ -407,7 +407,10 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
                     counts.allowed_after_receipt
                 );
                 let bp_c = if counts.bypasses > 0 { red } else { green };
-                println!("    Bypasses               {bp_c}{}{reset}", counts.bypasses);
+                println!(
+                    "    Bypasses               {bp_c}{}{reset}",
+                    counts.bypasses
+                );
                 let gap_c = if counts.gaps > 0 { yellow } else { green };
                 println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
                 println!(
