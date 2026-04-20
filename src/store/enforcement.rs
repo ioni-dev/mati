@@ -261,8 +261,8 @@ impl EnforcementEvent {
             decision_basis_hash: self.decision_basis_hash.as_deref(),
         };
 
-        let json = serde_json::to_string(&canonical)
-            .expect("canonical serialization must not fail");
+        let json =
+            serde_json::to_string(&canonical).expect("canonical serialization must not fail");
 
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
@@ -301,9 +301,7 @@ impl SeqAllocator {
     /// NOT allocated and the caller gets an error.
     pub async fn next(&mut self, store: &Store) -> Result<u64> {
         self.current += 1;
-        store
-            .put_raw(SEQ_KEY, &self.current.to_be_bytes())
-            .await?;
+        store.put_raw(SEQ_KEY, &self.current.to_be_bytes()).await?;
         Ok(self.current)
     }
 
@@ -330,9 +328,7 @@ pub async fn get_or_create_installation_id(store: &Store) -> Result<String> {
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
-    store
-        .put_raw(INSTALLATION_ID_KEY, id.as_bytes())
-        .await?;
+    store.put_raw(INSTALLATION_ID_KEY, id.as_bytes()).await?;
     Ok(id)
 }
 
@@ -394,8 +390,8 @@ pub fn canonicalize_file_key(path: &str, repo_root: &Path) -> String {
     let resolved = std::fs::canonicalize(&normalized).unwrap_or(normalized);
 
     // Step 5: Strip repo root to get repo-relative path
-    let repo_root_canonical = std::fs::canonicalize(repo_root)
-        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let repo_root_canonical =
+        std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let relative = resolved
         .strip_prefix(&repo_root_canonical)
         .unwrap_or(&resolved);
@@ -666,7 +662,10 @@ pub async fn scan_enforcement_events(
     let mut events = Vec::new();
 
     for key in &keys {
-        let seq = match key.strip_prefix(EVENT_PREFIX).and_then(|s| s.parse::<u64>().ok()) {
+        let seq = match key
+            .strip_prefix(EVENT_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             Some(s) => s,
             None => continue,
         };
@@ -714,10 +713,7 @@ pub async fn get_enforcement_mode(store: &Store) -> EnforcementMode {
 
 /// Persist the enforcement mode to the store. Returns the previous mode.
 /// Records an EnforcementConfigChanged event when the mode actually changes.
-pub async fn set_enforcement_mode(
-    store: &Store,
-    mode: EnforcementMode,
-) -> Result<EnforcementMode> {
+pub async fn set_enforcement_mode(store: &Store, mode: EnforcementMode) -> Result<EnforcementMode> {
     let old = get_enforcement_mode(store).await;
     let value = match mode {
         EnforcementMode::Advisory => "advisory",
@@ -875,8 +871,10 @@ pub async fn enforce_retention(store: &Store) -> Result<PruneResult> {
     let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
 
     let all_events = scan_enforcement_events(store, 0, u64::MAX).await?;
-    let old_events: Vec<&EnforcementEvent> =
-        all_events.iter().filter(|e| e.recorded_at_ms < cutoff_ms).collect();
+    let old_events: Vec<&EnforcementEvent> = all_events
+        .iter()
+        .filter(|e| e.recorded_at_ms < cutoff_ms)
+        .collect();
 
     if old_events.is_empty() {
         return Ok(PruneResult::NothingToPrune);
@@ -949,19 +947,16 @@ pub async fn detect_startup_gap(store: &Store, gap_threshold_ms: u64) -> Result<
 // ─────────────────────────────────────────────
 
 /// Scan enforcement events within a time window.
-pub async fn scan_events_since(
-    store: &Store,
-    since_ms: u64,
-) -> Result<Vec<EnforcementEvent>> {
+pub async fn scan_events_since(store: &Store, since_ms: u64) -> Result<Vec<EnforcementEvent>> {
     let all = scan_enforcement_events(store, 0, u64::MAX).await?;
-    Ok(all.into_iter().filter(|e| e.recorded_at_ms >= since_ms).collect())
+    Ok(all
+        .into_iter()
+        .filter(|e| e.recorded_at_ms >= since_ms)
+        .collect())
 }
 
 /// Count enforcement events by type within a time window.
-pub async fn count_events_by_type(
-    store: &Store,
-    since_ms: u64,
-) -> Result<EnforcementEventCounts> {
+pub async fn count_events_by_type(store: &Store, since_ms: u64) -> Result<EnforcementEventCounts> {
     let events = scan_events_since(store, since_ms).await?;
     let mut counts = EnforcementEventCounts {
         total: events.len() as u64,
@@ -1079,7 +1074,10 @@ mod tests {
         event.event_hash = "something_completely_different".to_string();
         let hash2 = event.compute_hash();
 
-        assert_eq!(hash1, hash2, "event_hash field must be excluded from canonical form");
+        assert_eq!(
+            hash1, hash2,
+            "event_hash field must be excluded from canonical form"
+        );
     }
 
     #[test]

@@ -115,9 +115,9 @@ async fn run_set(proxy: &StoreProxy, key: &str, value: &str) -> Result<()> {
             }
         }
         "enforcement.retention" => {
-            let days: u64 = value
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid retention value: {value} (expected integer days)"))?;
+            let days: u64 = value.parse().map_err(|_| {
+                anyhow::anyhow!("invalid retention value: {value} (expected integer days)")
+            })?;
             if days == 0 {
                 anyhow::bail!("retention must be at least 1 day");
             }
