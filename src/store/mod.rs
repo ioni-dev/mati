@@ -8,6 +8,7 @@
 
 pub mod db;
 pub mod durability;
+pub mod enforcement;
 pub mod gotcha_ops;
 pub mod record;
 pub mod repair;

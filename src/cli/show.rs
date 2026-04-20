@@ -43,6 +43,18 @@ pub struct HistoryArgs {
     /// Maximum entries to display
     #[arg(long, default_value = "50")]
     pub limit: usize,
+
+    /// Show enforcement events instead of record history
+    #[arg(long)]
+    pub enforcement: bool,
+
+    /// Filter enforcement events by type (deny, allow_receipt, receipt_minted, bypass, control_changed, config_changed, gap)
+    #[arg(long, requires = "enforcement")]
+    pub r#type: Option<String>,
+
+    /// Filter enforcement events by subject file path
+    #[arg(long, requires = "enforcement")]
+    pub file: Option<String>,
 }
 
 #[derive(Args)]
@@ -825,9 +837,117 @@ pub async fn run_history(args: HistoryArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = super::proxy::StoreProxy::open(&cwd).await?;
 
-    let result = run_history_inner(&proxy, &args).await;
+    let result = if args.enforcement {
+        run_enforcement_history(&proxy, &args).await
+    } else {
+        run_history_inner(&proxy, &args).await
+    };
     proxy.close().await?;
     result
+}
+
+async fn run_enforcement_history(
+    proxy: &super::proxy::StoreProxy,
+    args: &HistoryArgs,
+) -> Result<()> {
+    let store = match proxy.direct_store() {
+        Some(s) => s,
+        None => {
+            anyhow::bail!(
+                "enforcement history requires direct store access.\n\
+                 Stop the daemon first: mati daemon stop"
+            );
+        }
+    };
+
+    let since_ms = match &args.since {
+        Some(since_str) => {
+            let secs = parse_since_duration(since_str)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            now.saturating_sub(secs * 1000)
+        }
+        None => 0,
+    };
+
+    let events = mati_core::store::enforcement::scan_events_since(store, since_ms).await?;
+
+    // Apply filters
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|e| {
+            if let Some(ref type_filter) = args.r#type {
+                let label = mati_core::store::enforcement::event_type_label(&e.event_type);
+                if !label.contains(type_filter.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(ref file_filter) = args.file {
+                if !e.subject_key.contains(file_filter.as_str()) {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(args.limit)
+        .collect();
+
+    if events.is_empty() {
+        let window = args
+            .since
+            .as_deref()
+            .map(|s| format!(" in the last {s}"))
+            .unwrap_or_default();
+        println!("No enforcement events{window}.");
+        return Ok(());
+    }
+
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let (red, green, yellow, cyan, reset) = if use_color {
+        ("\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[36m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "")
+    };
+
+    println!(
+        "{:>6}  {:19}  {:16}  {:30}  {:6}",
+        "SEQ", "TIMESTAMP", "TYPE", "SUBJECT", "REASON"
+    );
+    println!("{}", "-".repeat(90));
+
+    for event in &events {
+        let ts = chrono::DateTime::from_timestamp_millis(event.recorded_at_ms as i64)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "?".to_string());
+
+        let type_label = mati_core::store::enforcement::event_type_label(&event.event_type);
+        let color = match &event.event_type {
+            mati_core::store::enforcement::EnforcementEventType::Deny => red,
+            mati_core::store::enforcement::EnforcementEventType::AllowAfterReceipt => green,
+            mati_core::store::enforcement::EnforcementEventType::RecordingGap { .. } => yellow,
+            _ => cyan,
+        };
+
+        println!(
+            "{:>6}  {ts}  {color}{type_label:<16}{reset}  {}  {}",
+            event.seq_no,
+            truncate_str(&event.subject_key, 30),
+            &event.decision_reason_code,
+        );
+    }
+
+    println!("\n{} event(s) shown.", events.len());
+    Ok(())
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        format!("{s:<width$}", width = max)
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
 }
 
 async fn run_history_inner(proxy: &super::proxy::StoreProxy, args: &HistoryArgs) -> Result<()> {

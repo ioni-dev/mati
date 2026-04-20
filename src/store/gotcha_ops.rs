@@ -50,6 +50,9 @@ use anyhow::Result;
 
 use crate::graph::edges::{Edge, EdgeKind};
 use crate::store::db::Store;
+use crate::store::enforcement::{
+    record_event, ControlChangeKind, EnforcementEventType, SubjectKind,
+};
 use crate::store::record::{Record, RecordLifecycle, TombstoneReason};
 
 fn now_secs() -> u64 {
@@ -100,6 +103,31 @@ pub async fn apply_gotcha_write(
 
     // 2. Persist the gotcha record — fail hard
     store.put(key, record).await?;
+
+    // 2b. Record enforcement event — best-effort (advisory mode logged, strict propagated)
+    let change_kind = if is_new {
+        ControlChangeKind::Created
+    } else {
+        ControlChangeKind::Updated
+    };
+    if let Err(e) = record_event(
+        store,
+        EnforcementEventType::ControlChanged { change_kind },
+        SubjectKind::Control,
+        key.to_string(),
+        "developer".to_string(),
+        None,
+        if is_new {
+            "control_created".to_string()
+        } else {
+            "control_updated".to_string()
+        },
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_write: enforcement event recording failed for {key}: {e}");
+    }
 
     // 3. Sync file-record gotcha_keys — best-effort
     if let Err(e) = sync_gotcha_file_links(store, key, old_files, new_files).await {
@@ -165,6 +193,24 @@ pub async fn apply_gotcha_tombstone(
             store.put(key, &record).await?;
         }
         None => anyhow::bail!("record not found: {key}"),
+    }
+
+    // 1b. Record enforcement event for deletion — best-effort
+    if let Err(e) = record_event(
+        store,
+        EnforcementEventType::ControlChanged {
+            change_kind: ControlChangeKind::Deleted,
+        },
+        SubjectKind::Control,
+        key.to_string(),
+        "developer".to_string(),
+        None,
+        "control_deleted".to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_tombstone: enforcement event recording failed for {key}: {e}");
     }
 
     // 2. Remove gotcha_keys from file records — best-effort

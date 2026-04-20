@@ -788,9 +788,22 @@ pub(crate) async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.key"),
             };
             let g = graph.read().await;
-            if let Err(e) = sess::log_compliance_miss(g.store(), key).await {
+            let store = g.store();
+            if let Err(e) = sess::log_compliance_miss(store, key).await {
                 tracing::warn!("daemon socket log_compliance_miss: {e}");
             }
+            // Record Deny enforcement event — best-effort
+            let _ = crate::store::enforcement::record_event(
+                store,
+                crate::store::enforcement::EnforcementEventType::Deny,
+                crate::store::enforcement::SubjectKind::File,
+                key.to_string(),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await;
             SocketResponse::ok(serde_json::Value::Null)
         }
 
@@ -800,9 +813,22 @@ pub(crate) async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.key"),
             };
             let g = graph.read().await;
-            if let Err(e) = sess::log_compliance_hit(g.store(), key).await {
+            let store = g.store();
+            if let Err(e) = sess::log_compliance_hit(store, key).await {
                 tracing::warn!("daemon socket log_compliance_hit: {e}");
             }
+            // Record AllowAfterReceipt enforcement event — best-effort
+            let _ = crate::store::enforcement::record_event(
+                store,
+                crate::store::enforcement::EnforcementEventType::AllowAfterReceipt,
+                crate::store::enforcement::SubjectKind::File,
+                key.to_string(),
+                "claude".to_string(),
+                None,
+                "receipt_valid".to_string(),
+                None,
+            )
+            .await;
             SocketResponse::ok(serde_json::Value::Null)
         }
 

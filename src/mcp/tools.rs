@@ -298,9 +298,10 @@ impl MatiServer {
                             .await;
 
                         // Defer the slow writes (access_count to knowledge tree +
-                        // daily hit aggregation) to a background task. These go through
-                        // tantivy indexing (~100-300ms) and would cause Codex to close
-                        // the stdio pipe before the response is sent if done inline.
+                        // daily hit aggregation + enforcement event) to a background
+                        // task. These go through tantivy indexing (~100-300ms) and would
+                        // cause Codex to close the stdio pipe before the response is
+                        // sent if done inline.
                         let key_owned = params.key.clone();
                         let graph_clone = Arc::clone(graph_arc);
                         tokio::task::spawn(async move {
@@ -311,6 +312,18 @@ impl MatiServer {
                             let _ =
                                 crate::store::session::upsert_daily_agg(s, &agg_key, &key_owned)
                                     .await;
+                            // Record ReceiptMinted enforcement event — best-effort
+                            let _ = crate::store::enforcement::record_event(
+                                s,
+                                crate::store::enforcement::EnforcementEventType::ReceiptMinted,
+                                crate::store::enforcement::SubjectKind::File,
+                                key_owned.clone(),
+                                "claude".to_string(),
+                                None,
+                                "consultation_requested".to_string(),
+                                None,
+                            )
+                            .await;
                         });
 
                         response
@@ -1139,6 +1152,25 @@ impl MatiServer {
             .unwrap_or_default();
 
         store.put(key, &record).await?;
+
+        // Record ControlChanged::Confirmed enforcement event — best-effort
+        if let Err(e) = crate::store::enforcement::record_event(
+            store,
+            crate::store::enforcement::EnforcementEventType::ControlChanged {
+                change_kind: crate::store::enforcement::ControlChangeKind::Confirmed,
+            },
+            crate::store::enforcement::SubjectKind::Control,
+            key.to_string(),
+            "developer".to_string(),
+            None,
+            "control_confirmed".to_string(),
+            None,
+        )
+        .await
+        {
+            tracing::warn!("confirm: enforcement event recording failed for {key}: {e}");
+        }
+
         Ok((record, affected_files))
     }
 
