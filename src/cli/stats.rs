@@ -380,6 +380,52 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     println!();
 
     // ════════════════════════════════════════════════════════════════════════════
+    // 4b. Enforcement events (last 30 days)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    if let Some(direct_store) = store.direct_store() {
+        let thirty_days_ms = {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            now_ms.saturating_sub(30 * 86_400_000)
+        };
+        match mati_core::store::enforcement::count_events_by_type(direct_store, thirty_days_ms)
+            .await
+        {
+            Ok(counts) if counts.total > 0 => {
+                println!("  {bold}{blue}Enforcement (30d){reset}");
+                println!("    Total events           {white}{}{reset}", counts.total);
+                let deny_color = if counts.denials > 0 { red } else { green };
+                println!(
+                    "    Denials                {deny_color}{}{reset}",
+                    counts.denials
+                );
+                println!(
+                    "    Allowed after receipt  {green}{}{reset}",
+                    counts.allowed_after_receipt
+                );
+                let bp_c = if counts.bypasses > 0 { red } else { green };
+                println!("    Bypasses               {bp_c}{}{reset}", counts.bypasses);
+                let gap_c = if counts.gaps > 0 { yellow } else { green };
+                println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
+                println!(
+                    "    Controls changed       {white}{}{reset}",
+                    counts.controls_changed
+                );
+                println!();
+            }
+            Ok(_) => {
+                // No enforcement events yet — skip the section silently
+            }
+            Err(e) => {
+                tracing::debug!("enforcement event count failed: {e}");
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
     // 5. Write health snapshot (M-10-H)
     // ════════════════════════════════════════════════════════════════════════════
 
