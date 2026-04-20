@@ -664,6 +664,19 @@ impl Store {
         Ok(results)
     }
 
+    /// Read raw bytes by key. Returns `None` if the key does not exist.
+    ///
+    /// Counterpart to [`Self::put_raw`]. Used for structural metadata,
+    /// enforcement events, and other non-Record values stored as raw bytes.
+    pub async fn get_raw_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let tree = self.tree_for(key);
+        let txn = tree.begin_with_mode(Mode::ReadOnly)?;
+        match txn.get(key.as_bytes())? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(bytes.to_vec())),
+        }
+    }
+
     /// Write raw bytes under `key` with automatically routed durability.
     ///
     /// Same durability routing as [`Self::put`] — callers do not need to know

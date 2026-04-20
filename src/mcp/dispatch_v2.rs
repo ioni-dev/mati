@@ -470,6 +470,38 @@ async fn dispatch_session_side(
                 write_session_audit(store, &entry).await;
                 return Response::err(request_id, ErrorCode::StoreError, e.to_string());
             }
+
+            // Best-effort enforcement event recording (post-transaction).
+            match input.event {
+                protocol::SessionEvent::ComplianceMiss => {
+                    let _ = crate::store::enforcement::record_event(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "gotcha_above_threshold".to_string(),
+                        None,
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::ComplianceHit => {
+                    let _ = crate::store::enforcement::record_event(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::AllowAfterReceipt,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "receipt_valid".to_string(),
+                        None,
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+
             Response::ok(request_id, serde_json::Value::Null)
         }
 
@@ -549,6 +581,19 @@ async fn dispatch_session_side(
                 target_record.last_accessed = now_secs();
                 let _ = store.put(&input.key, &target_record).await;
             }
+
+            // Best-effort enforcement event: ReceiptMinted
+            let _ = crate::store::enforcement::record_event(
+                store,
+                crate::store::enforcement::EnforcementEventType::ReceiptMinted,
+                crate::store::enforcement::SubjectKind::File,
+                input.key.clone(),
+                "claude".to_string(),
+                None,
+                "consultation_requested".to_string(),
+                None,
+            )
+            .await;
 
             Response::ok(request_id, serde_json::Value::Null)
         }

@@ -72,6 +72,10 @@ enum Commands {
     /// Import from CLAUDE.md or JSON
     Import(cli::show::ImportArgs),
 
+    // ── Configuration ─────────────────────────────────────────────────────
+    /// Get or set enforcement configuration (mode, retention)
+    Config(cli::config::ConfigArgs),
+
     // ── Maintenance ──────────────────────────────────────────────────────
     /// [Maintenance] Confirm auto-detected candidates for hook enforcement
     Review(cli::review::ReviewArgs),
@@ -179,6 +183,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init(args) => cli::init::run(args).await,
+        Commands::Config(args) => cli::config::run(args).await,
         Commands::Enrich(args) => cli::enrich::run(args).await,
         Commands::Status(args) => cli::status::run(args).await,
         Commands::Stats(args) => cli::stats::run(args).await,
