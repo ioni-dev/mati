@@ -415,7 +415,7 @@ async fn dispatch_session_side(
             let agg_prefix = match input.event {
                 protocol::SessionEvent::Miss => "analytics:miss_",
                 protocol::SessionEvent::ComplianceMiss => "compliance:miss_",
-                protocol::SessionEvent::ComplianceHit => "compliance:codex_shell_hit_",
+                protocol::SessionEvent::ComplianceHit => "compliance:allow_after_receipt_",
                 protocol::SessionEvent::CodexShellMiss => "compliance:codex_shell_miss_",
                 protocol::SessionEvent::Bootstrap => "analytics:bootstrap_",
                 protocol::SessionEvent::PromptNudge => "analytics:codex_prompt_nudge_",
