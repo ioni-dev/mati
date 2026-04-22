@@ -490,6 +490,12 @@ pub struct DevNoteUpsertInput {
     pub key: Option<String>,
     /// Freeform note text.
     pub text: String,
+    /// Optional tags.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Record-level priority.
+    #[serde(default)]
+    pub priority: Priority,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1310,6 +1316,8 @@ mod tests {
                 Command::DevNoteUpsert(DevNoteUpsertInput {
                     key: None,
                     text: "t".into(),
+                    tags: vec![],
+                    priority: Priority::Normal,
                 }),
             ),
             (
@@ -1413,6 +1421,8 @@ mod tests {
             Command::DevNoteUpsert(DevNoteUpsertInput {
                 key: None,
                 text: "t".into(),
+                tags: vec![],
+                priority: Priority::Normal,
             })
             .target_key(),
             ""
