@@ -744,14 +744,15 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
         .unwrap_or_default();
 
     // In socket mode, use the daemon's native GotchaConfirm handler which
-    // atomically sets DeveloperManual source + 0.80 confidence + file links.
-    // In direct mode, write locally via gotcha_write.
+    // atomically sets DeveloperManual source + 0.80 confidence + file links
+    // and records a `ControlChanged::Confirmed` enforcement event.
+    // In direct mode, write via `gotcha_confirm_direct` so the audit stream
+    // sees `Confirmed` instead of the generic `Updated` that `gotcha_write`
+    // would record.
     if !proxy.is_direct() {
         proxy.daemon_gotcha_confirm(key).await?;
     } else {
-        proxy
-            .gotcha_write(&record, &[], &affected_files, false)
-            .await?;
+        proxy.gotcha_confirm_direct(&record, &affected_files).await?;
     }
 
     // Propagate confirmation signal to linked file records — their

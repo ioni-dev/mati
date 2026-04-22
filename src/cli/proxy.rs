@@ -292,9 +292,16 @@ impl StoreProxy {
 
     /// Propagate confirmation_count to file records linked to a confirmed gotcha.
     ///
-    /// In direct mode, delegates to `propagate_confirmation_to_files`.
-    /// In socket mode, uses proxy get/put for each file (N round-trips,
-    /// acceptable for the typical 1-3 affected files per gotcha).
+    /// In direct mode, delegates to `propagate_confirmation_to_files` which
+    /// writes via `store.put` without going through `FileEnrich`.
+    ///
+    /// In socket mode, this is a no-op: the daemon's `handle_gotcha_confirm`
+    /// stages `compute_confirmation_propagation` inside the same
+    /// `transact_knowledge` call that writes the confirmed gotcha, so
+    /// propagation is already atomic and complete by the time the client
+    /// returns. A redundant round-trip here would route through `FileEnrich`,
+    /// which rejects Layer 0 stubs (empty purpose) and would also reset
+    /// `confirmation_count` to its for-new-record default.
     pub async fn propagate_confirmation(&self, affected_files: &[String]) {
         match &self.inner {
             ProxyInner::Direct(store) => {
@@ -305,24 +312,7 @@ impl StoreProxy {
                 .await;
             }
             ProxyInner::Socket { .. } => {
-                for file_path in affected_files {
-                    let file_key = format!("file:{file_path}");
-                    if let Ok(Some(mut file_record)) = self.get(&file_key).await {
-                        file_record.confidence.confirmation_count += 1;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        file_record.updated_at = now;
-                        file_record.version.logical_clock += 1;
-                        file_record.version.wall_clock = now;
-                        if let Err(e) = self.put(&file_key, &file_record).await {
-                            tracing::warn!(
-                                "propagate_confirmation: failed to update {file_key}: {e}"
-                            );
-                        }
-                    }
-                }
+                // Daemon path already propagated atomically — nothing to do.
             }
         }
     }
@@ -425,6 +415,26 @@ impl StoreProxy {
                     other => Err(socket_read_error("gotcha_tombstone", other)),
                 }
             }
+        }
+    }
+
+    /// Persist a confirmed gotcha record with file-link sync in direct mode.
+    ///
+    /// Records a `ControlChanged::Confirmed` enforcement event — used instead
+    /// of `gotcha_write` so confirmations show up as `Confirmed` in the audit
+    /// stream instead of generic `Updated`. No-op in socket mode; socket mode
+    /// uses [`daemon_gotcha_confirm`] which the daemon handler audits.
+    pub async fn gotcha_confirm_direct(
+        &self,
+        record: &Record,
+        affected_files: &[String],
+    ) -> Result<()> {
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                mati_core::store::gotcha_ops::apply_gotcha_confirm(store, record, affected_files)
+                    .await
+            }
+            ProxyInner::Socket { .. } => Ok(()),
         }
     }
 

@@ -523,7 +523,10 @@ async fn full_enforcement_lifecycle_records_all_events() {
 
 #[tokio::test]
 async fn gotcha_crud_records_control_changed_events() {
-    use mati_core::store::gotcha_ops::{apply_gotcha_tombstone, apply_gotcha_write};
+    use mati_core::store::enforcement::ControlChangeKind;
+    use mati_core::store::gotcha_ops::{
+        apply_gotcha_confirm, apply_gotcha_tombstone, apply_gotcha_write,
+    };
     use mati_core::store::record::{
         Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordLifecycle,
         RecordSource, RecordVersion, StalenessScore,
@@ -574,8 +577,14 @@ async fn gotcha_crud_records_control_changed_events() {
         .await
         .expect("create gotcha");
 
-    // 2. Update the gotcha → ControlChanged::Updated
-    let mut record2 = make_gotcha("gotcha:test-crud", false);
+    // 2. Confirm the gotcha → ControlChanged::Confirmed
+    let confirmed_record = make_gotcha("gotcha:test-crud", true);
+    apply_gotcha_confirm(&store, &confirmed_record, &["src/test.rs".into()])
+        .await
+        .expect("confirm gotcha");
+
+    // 3. Update the gotcha → ControlChanged::Updated
+    let mut record2 = make_gotcha("gotcha:test-crud", true);
     record2.value = "updated rule".into();
     apply_gotcha_write(
         &store,
@@ -587,7 +596,7 @@ async fn gotcha_crud_records_control_changed_events() {
     .await
     .expect("update gotcha");
 
-    // 3. Delete the gotcha → ControlChanged::Deleted
+    // 4. Delete the gotcha → ControlChanged::Deleted
     apply_gotcha_tombstone(&store, "gotcha:test-crud", &["src/test.rs".into()])
         .await
         .expect("delete gotcha");
@@ -595,35 +604,88 @@ async fn gotcha_crud_records_control_changed_events() {
     // Read all enforcement events
     let events = scan_enforcement_events(&store, 1, 100).await.expect("scan");
 
-    // Should have at least 3 control_changed events (created, updated, deleted)
+    // Filter ControlChanged events — seq_no is monotonic so this preserves order.
     let control_events: Vec<_> = events
         .iter()
         .filter(|e| matches!(e.event_type, EnforcementEventType::ControlChanged { .. }))
         .collect();
 
-    assert!(
-        control_events.len() >= 3,
-        "expected at least 3 ControlChanged events, got {}",
-        control_events.len()
+    assert_eq!(
+        control_events.len(),
+        4,
+        "expected exactly 4 ControlChanged events (Created, Confirmed, Updated, Deleted), got {}: {:?}",
+        control_events.len(),
+        control_events
+            .iter()
+            .map(|e| &e.event_type)
+            .collect::<Vec<_>>()
     );
 
-    // Verify the change kinds in order
-    let kinds: Vec<_> = control_events
+    // Verify the change kinds fired in the exact CRUD order.
+    let kinds: Vec<ControlChangeKind> = control_events
         .iter()
         .map(|e| match &e.event_type {
             EnforcementEventType::ControlChanged { change_kind } => *change_kind,
             _ => unreachable!(),
         })
         .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ControlChangeKind::Created,
+            ControlChangeKind::Confirmed,
+            ControlChangeKind::Updated,
+            ControlChangeKind::Deleted,
+        ],
+        "ControlChanged events must fire in CRUD order"
+    );
 
-    assert!(kinds.contains(&mati_core::store::enforcement::ControlChangeKind::Created));
-    assert!(kinds.contains(&mati_core::store::enforcement::ControlChangeKind::Updated));
-    assert!(kinds.contains(&mati_core::store::enforcement::ControlChangeKind::Deleted));
+    // Reason codes match the kinds.
+    let reason_codes: Vec<&str> = control_events
+        .iter()
+        .map(|e| e.decision_reason_code.as_str())
+        .collect();
+    assert_eq!(
+        reason_codes,
+        vec![
+            "control_created",
+            "control_confirmed",
+            "control_updated",
+            "control_deleted",
+        ],
+    );
 
-    // All events reference the correct subject
+    // All events reference the correct subject and agent.
     for e in &control_events {
         assert_eq!(e.subject_key, "gotcha:test-crud");
         assert_eq!(e.subject_kind, SubjectKind::Control);
+        assert_eq!(e.agent_type, "developer");
+    }
+
+    // Hash chain intact — seq_no is strictly increasing and prev_hash chains
+    // forward across ALL events in the store, not just the ControlChanged
+    // subset (other event types may interleave, but for this isolated test
+    // only ControlChanged events are recorded).
+    for window in control_events.windows(2) {
+        assert!(
+            window[1].seq_no > window[0].seq_no,
+            "seq_no must be strictly increasing: {} → {}",
+            window[0].seq_no,
+            window[1].seq_no
+        );
+        assert_eq!(
+            window[1].prev_hash, window[0].event_hash,
+            "prev_hash must chain from previous event_hash"
+        );
+    }
+
+    // Each event's computed hash must equal its stored event_hash.
+    for e in &control_events {
+        assert_eq!(
+            e.event_hash,
+            e.compute_hash(),
+            "stored event_hash must match canonical re-computation"
+        );
     }
 }
 

@@ -245,9 +245,11 @@ pub async fn log_compliance_miss(store: &Store, key: &str) -> Result<()> {
     upsert_daily_agg(store, &agg_key, key).await
 }
 
-/// Record a Codex shell compliance hit: Bash file inspection after consultation.
+/// Record a compliance hit: file access allowed because a valid consultation
+/// receipt existed. Platform-neutral — incremented for both Claude pre-read
+/// `AlreadyConsulted` allow and Codex post-bash confirmed consultation.
 pub async fn log_compliance_hit(store: &Store, key: &str) -> Result<()> {
-    let agg_key = today_key("compliance:codex_shell_hit_");
+    let agg_key = today_key("compliance:allow_after_receipt_");
     upsert_daily_agg(store, &agg_key, key).await
 }
 

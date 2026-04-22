@@ -1301,6 +1301,21 @@ pub(crate) async fn socket_dispatch(
             // Propagate confirmation_count to linked file records
             crate::store::gotcha_ops::propagate_confirmation_to_files(store, &affected_files).await;
 
+            // Record ControlChanged::Confirmed enforcement event — best-effort.
+            let _ = crate::store::enforcement::record_event(
+                store,
+                crate::store::enforcement::EnforcementEventType::ControlChanged {
+                    change_kind: crate::store::enforcement::ControlChangeKind::Confirmed,
+                },
+                crate::store::enforcement::SubjectKind::Control,
+                key.to_string(),
+                "developer".to_string(),
+                None,
+                "control_confirmed".to_string(),
+                None,
+            )
+            .await;
+
             SocketResponse::ok(serde_json::json!({"confirmed": true, "key": key}))
         }
 
