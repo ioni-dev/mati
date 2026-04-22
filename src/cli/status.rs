@@ -137,17 +137,13 @@ fn daily_agg_count(record: Option<Record>) -> u64 {
 #[derive(Default)]
 struct CodexDailyMetrics {
     bootstrap_count: u64,
-    shell_hit_count: u64,
     shell_miss_count: u64,
     prompt_nudge_count: u64,
 }
 
 impl CodexDailyMetrics {
     fn has_activity(&self) -> bool {
-        self.bootstrap_count > 0
-            || self.shell_hit_count > 0
-            || self.shell_miss_count > 0
-            || self.prompt_nudge_count > 0
+        self.bootstrap_count > 0 || self.shell_miss_count > 0 || self.prompt_nudge_count > 0
     }
 }
 
@@ -157,13 +153,6 @@ async fn load_codex_daily_metrics(store: &StoreProxy) -> Result<CodexDailyMetric
             store
                 .get(&mati_core::store::session::today_key(
                     "analytics:bootstrap_",
-                ))
-                .await?,
-        ),
-        shell_hit_count: daily_agg_count(
-            store
-                .get(&mati_core::store::session::today_key(
-                    "compliance:codex_shell_hit_",
                 ))
                 .await?,
         ),
@@ -184,6 +173,20 @@ async fn load_codex_daily_metrics(store: &StoreProxy) -> Result<CodexDailyMetric
     })
 }
 
+/// Count of `AllowAfterReceipt` enforcement events today.
+///
+/// Platform-neutral: bumped when any agent (Claude pre-read, Codex post-bash)
+/// reads a file after presenting a valid consultation receipt.
+async fn load_allow_after_receipt_count(store: &StoreProxy) -> Result<u64> {
+    Ok(daily_agg_count(
+        store
+            .get(&mati_core::store::session::today_key(
+                "compliance:allow_after_receipt_",
+            ))
+            .await?,
+    ))
+}
+
 pub async fn run(_args: StatusArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = StoreProxy::open(&cwd).await?;
@@ -193,6 +196,12 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         Some(load_codex_daily_metrics(&store).await?)
     } else {
         None
+    };
+    // Platform-neutral: load whenever any agent is active.
+    let allow_after_receipt_count = if claude_mode || codex_mode {
+        load_allow_after_receipt_count(&store).await?
+    } else {
+        0
     };
 
     // ── Daemon health (real-time, never cached) ──────────────────────────
@@ -221,6 +230,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
                         claude_mode,
                         codex_mode,
                         codex_metrics.as_ref(),
+                        allow_after_receipt_count,
                         &daemon_health,
                         cluster_index.as_ref(),
                     );
@@ -302,14 +312,20 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         }
     }
 
+    if allow_after_receipt_count > 0 {
+        println!(
+            "  {blue}Compliance Today{reset}  allow after receipt {white}{}{reset}\n",
+            allow_after_receipt_count,
+        );
+    }
+
     if let Some(metrics) = codex_metrics.as_ref().filter(|m| m.has_activity()) {
         println!(
-                "  {blue}Codex Today{reset}  bootstraps {white}{}{reset}  shell ok {white}{}{reset}  shell misses {white}{}{reset}  prompt nudges {white}{}{reset}\n",
-                metrics.bootstrap_count,
-                metrics.shell_hit_count,
-                metrics.shell_miss_count,
-                metrics.prompt_nudge_count,
-            );
+            "  {blue}Codex Today{reset}  bootstraps {white}{}{reset}  shell misses {white}{}{reset}  prompt nudges {white}{}{reset}\n",
+            metrics.bootstrap_count,
+            metrics.shell_miss_count,
+            metrics.prompt_nudge_count,
+        );
     }
 
     // ── Record counts ─────────────────────────────────────────────────────
@@ -610,6 +626,7 @@ fn display_cached_status(
     claude_mode: bool,
     codex_mode: bool,
     codex_metrics: Option<&CodexDailyMetrics>,
+    allow_after_receipt_count: u64,
     daemon_health: &DaemonHealth,
     cluster_index: Option<&mati_core::analysis::clusters::ClusterIndex>,
 ) {
@@ -656,11 +673,17 @@ fn display_cached_status(
         println!();
     }
 
+    if allow_after_receipt_count > 0 {
+        println!(
+            "  {blue}Compliance Today{reset}  allow after receipt {white}{}{reset}\n",
+            allow_after_receipt_count,
+        );
+    }
+
     if let Some(metrics) = codex_metrics.filter(|m| m.has_activity()) {
         println!(
-            "  {blue}Codex Today{reset}  bootstraps {white}{}{reset}  shell ok {white}{}{reset}  shell misses {white}{}{reset}  prompt nudges {white}{}{reset}\n",
+            "  {blue}Codex Today{reset}  bootstraps {white}{}{reset}  shell misses {white}{}{reset}  prompt nudges {white}{}{reset}\n",
             metrics.bootstrap_count,
-            metrics.shell_hit_count,
             metrics.shell_miss_count,
             metrics.prompt_nudge_count,
         );

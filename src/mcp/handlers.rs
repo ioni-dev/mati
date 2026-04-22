@@ -297,6 +297,32 @@ pub(crate) async fn handle_gotcha_upsert(
     // Best-effort: sync HasGotcha graph edges (cross-tree, outside transaction).
     sync_has_gotcha_edges(store, key, &old_affected_files, &input.affected_files).await;
 
+    // Best-effort: record ControlChanged enforcement event.
+    let change_kind = if is_new {
+        crate::store::enforcement::ControlChangeKind::Created
+    } else {
+        crate::store::enforcement::ControlChangeKind::Updated
+    };
+    let reason_code = if is_new {
+        "control_created"
+    } else {
+        "control_updated"
+    };
+    if let Err(e) = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ControlChanged { change_kind },
+        crate::store::enforcement::SubjectKind::Control,
+        key.clone(),
+        "developer".to_string(),
+        None,
+        reason_code.to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_upsert: enforcement event recording failed for {key}: {e}");
+    }
+
     Ok(serde_json::json!({
         "ok": true,
         "key": key,
@@ -410,6 +436,24 @@ pub(crate) async fn handle_gotcha_confirm(
     // Best-effort: ensure HasGotcha edges exist for all affected files.
     sync_has_gotcha_edges(store, key, &[], &affected_files).await;
 
+    // Best-effort: record ControlChanged::Confirmed enforcement event.
+    if let Err(e) = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ControlChanged {
+            change_kind: crate::store::enforcement::ControlChangeKind::Confirmed,
+        },
+        crate::store::enforcement::SubjectKind::Control,
+        key.clone(),
+        "developer".to_string(),
+        None,
+        "control_confirmed".to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_confirm: enforcement event recording failed for {key}: {e}");
+    }
+
     Ok(serde_json::json!({
         "ok": true,
         "key": key,
@@ -485,6 +529,24 @@ pub(crate) async fn handle_gotcha_tombstone(
 
     // Best-effort: remove HasGotcha edges for all affected files.
     sync_has_gotcha_edges(store, key, &affected_files, &[]).await;
+
+    // Best-effort: record ControlChanged::Deleted enforcement event.
+    if let Err(e) = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ControlChanged {
+            change_kind: crate::store::enforcement::ControlChangeKind::Deleted,
+        },
+        crate::store::enforcement::SubjectKind::Control,
+        key.clone(),
+        "developer".to_string(),
+        None,
+        "control_deleted".to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_tombstone: enforcement event recording failed for {key}: {e}");
+    }
 
     Ok(serde_json::json!({"ok": true, "key": key, "tombstoned": true}))
 }

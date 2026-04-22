@@ -376,7 +376,8 @@ fn chrono_lite_utc() -> String {
 ///
 /// Codex pre-bash:
 ///   - Deny → CodexShellBlocked (not generic BlockedUnconsultedRead)
-///   - Advisory/Liability/AlreadyConsulted are silent → suppress Hit (no receipt)
+///   - Advisory/Liability are silent → suppress Hit (no receipt)
+///   - AlreadyConsulted → suppress ComplianceHit (codex-post-bash records it)
 ///   - NoRecord → Miss (keep)
 ///
 /// Claude pre-read/pre-bash: keep all events as-is.
@@ -397,12 +398,18 @@ fn platform_events(
                     // Suppress Hit for outcomes where Codex receives no context.
                     // Minting a consultation receipt without delivering context
                     // would incorrectly downgrade future deny decisions.
+                    // `evaluate()` emits Hit only for Advisory and Liability;
+                    // AlreadyConsulted emits ComplianceHit (handled below).
                     match decision {
-                        Decision::AlreadyConsulted { .. }
-                        | Decision::Advisory { .. }
-                        | Decision::Liability { .. } => None,
+                        Decision::Advisory { .. } | Decision::Liability { .. } => None,
                         _ => Some(e),
                     }
+                }
+                HookEvent::ComplianceHit { .. } => {
+                    // codex-post-bash owns ComplianceHit/AllowAfterReceipt
+                    // for shell commands — suppress from pre-bash to avoid
+                    // double-recording the enforcement event.
+                    None
                 }
                 _ => Some(e),
             })
@@ -778,7 +785,9 @@ mod tests {
 
     #[test]
     fn codex_already_consulted_suppresses_hit() {
-        let events = vec![HookEvent::Hit {
+        // Codex AlreadyConsulted emits ComplianceHit (post-Bug 1). Codex
+        // pre-bash still suppresses it so codex-post-bash owns it.
+        let events = vec![HookEvent::ComplianceHit {
             key: "file:src/main.rs".into(),
         }];
         let decision = Decision::AlreadyConsulted {
@@ -990,8 +999,36 @@ mod tests {
         assert_eq!(result.exit_code, 0, "consulted file must not be blocked");
         assert!(result.stdout.is_empty());
         assert!(result.stderr.is_empty());
-        // AlreadyConsulted is silent for Codex → Hit suppressed.
+        // AlreadyConsulted is silent for Codex pre-bash — ComplianceHit is
+        // suppressed so codex-post-bash is the sole emitter of AllowAfterReceipt
+        // for shell commands.
         assert!(result.events.is_empty());
+    }
+
+    #[test]
+    fn e2e_claude_consulted_records_allow_after_receipt() {
+        // Bug 1 regression guard: when Claude pre-read allows a consulted
+        // read, the adapter must emit ComplianceHit so the daemon records
+        // an AllowAfterReceipt enforcement event.
+        let mut data = deny_eligible_eval_data();
+        data["consulted"] = json!(true);
+        let result = process_eval_response(HookVariant::ClaudePreRead, "src/main.rs", &data);
+
+        assert_eq!(result.exit_code, 0, "Claude always exits 0");
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
+        assert_eq!(
+            json.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|v| v.as_str()),
+            Some("allow")
+        );
+        assert!(matches!(result.decision, Decision::AlreadyConsulted { .. }));
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(&result.events[0], HookEvent::ComplianceHit { key } if key == "file:src/main.rs"),
+            "AlreadyConsulted must emit ComplianceHit so AllowAfterReceipt is recorded, got: {:?}",
+            result.events
+        );
     }
 
     #[test]

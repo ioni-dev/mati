@@ -389,9 +389,12 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
             } else {
                 context_lines.join("\n")
             };
+            // AllowAfterReceipt enforcement event: the read is being allowed
+            // because a valid consultation receipt exists. ComplianceHit
+            // (SessionLog v2) triggers the AllowAfterReceipt record.
             return EnforcementResult {
                 decision: Decision::AlreadyConsulted { context },
-                events: vec![HookEvent::Hit { key: file_key }],
+                events: vec![HookEvent::ComplianceHit { key: file_key }],
             };
         }
 
@@ -879,7 +882,9 @@ mod tests {
             &result.decision,
             Decision::AlreadyConsulted { .. }
         ));
-        assert!(matches!(&result.events[0], HookEvent::Hit { .. }));
+        // AlreadyConsulted emits ComplianceHit so the v2 SessionLog dispatch
+        // records an AllowAfterReceipt enforcement event (not a fresh receipt).
+        assert!(matches!(&result.events[0], HookEvent::ComplianceHit { .. }));
     }
 
     #[test]
