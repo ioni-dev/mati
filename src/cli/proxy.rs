@@ -184,6 +184,8 @@ impl StoreProxy {
                     p::Command::DevNoteUpsert(p::DevNoteUpsertInput {
                         key: Some(key.to_string()),
                         text: record.value.clone(),
+                        tags: record.tags.clone(),
+                        priority: record.priority.clone().into(),
                     })
                 } else {
                     // Reject unsupported namespaces — never fabricate a

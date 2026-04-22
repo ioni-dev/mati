@@ -470,9 +470,14 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
         write_seq: current_seq,
     };
 
-    write_snapshot_record(&store, &snapshot, now).await?;
-
-    println!("  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}");
+    // analytics:* is an advisory cache; the socket proxy intentionally rejects
+    // writes to this namespace (documented in proxy.rs). A successful write in
+    // direct mode speeds up the next `mati stats`; a rejection in socket mode
+    // must not fail the command.
+    match write_snapshot_record(&store, &snapshot, now).await {
+        Ok(()) => println!("  {gray}Snapshot written: {SNAPSHOT_KEY}{reset}"),
+        Err(e) => tracing::debug!("stats: snapshot write skipped: {e}"),
+    }
 
     // ── Review backlog ────────────────────────────────────────────────
     let unconfirmed: Vec<&mati_core::store::Record> = gotchas

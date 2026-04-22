@@ -219,19 +219,20 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read-only check via StoreProxy — works while daemon/MCP holds the lock.
+/// Read-only drift check. Requires direct store access because graph edges
+/// are not guaranteed to be fully persisted while the daemon holds the store —
+/// in-memory edges can produce false-positive drift reports through the proxy.
 async fn run_check(cwd: &std::path::Path, json: bool, use_color: bool) -> Result<()> {
     let proxy = StoreProxy::open(cwd).await?;
 
     let result = async {
-        // In direct mode, use the optimized check_gotcha_indexes.
-        // In socket mode, replicate the check using proxy scans.
-        if let Some(store) = proxy.direct_store() {
-            return check_gotcha_indexes(store).await;
+        match proxy.direct_store() {
+            Some(store) => check_gotcha_indexes(store).await,
+            None => anyhow::bail!(
+                "mati repair --check requires direct store access, which is unavailable while the daemon is running.\n\
+                 Run `mati daemon stop` and retry."
+            ),
         }
-
-        // Socket mode: scan all data through the proxy and diff locally.
-        check_via_proxy(&proxy).await
     }
     .await;
 
@@ -247,142 +248,6 @@ async fn run_check(cwd: &std::path::Path, json: bool, use_color: bool) -> Result
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// Replicate check_gotcha_indexes logic using proxy scans (socket mode).
-async fn check_via_proxy(proxy: &StoreProxy) -> Result<RepairReport> {
-    use mati_core::graph::edges::{Edge, EdgeKind};
-    use mati_core::store::{GotchaRecord, RecordLifecycle};
-    use std::collections::{BTreeSet, HashMap};
-
-    // Phase 1: derive desired state from canonical gotcha records
-    let gotchas = proxy.scan_prefix("gotcha:").await?;
-    let scanned_gotchas = gotchas.len();
-
-    let mut desired_file_links: HashMap<String, BTreeSet<String>> = HashMap::new();
-    let mut desired_edges: BTreeSet<(String, String)> = BTreeSet::new();
-
-    for record in &gotchas {
-        if !matches!(record.lifecycle, RecordLifecycle::Active) {
-            continue;
-        }
-        let Some(gotcha) = record.payload_as::<GotchaRecord>() else {
-            continue;
-        };
-        for file_path in &gotcha.affected_files {
-            desired_file_links
-                .entry(file_path.clone())
-                .or_default()
-                .insert(record.key.clone());
-            desired_edges.insert((file_path.clone(), record.key.clone()));
-        }
-    }
-
-    // Phase 2: read actual file links
-    let files = proxy.scan_prefix("file:").await?;
-    let scanned_files = files.len();
-    let mut actual_file_links: HashMap<String, Vec<String>> = HashMap::new();
-
-    for record in &files {
-        let path = record
-            .key
-            .strip_prefix("file:")
-            .unwrap_or(&record.key)
-            .to_string();
-        let keys: Vec<String> = record
-            .payload
-            .as_ref()
-            .and_then(|p| p.get("gotcha_keys"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !keys.is_empty() {
-            actual_file_links.insert(path, keys);
-        }
-    }
-
-    // Phase 3: read actual edges from graph:edge: records
-    let edge_records = proxy.scan_prefix("graph:edge:").await?;
-    let mut actual_edges: BTreeSet<(String, String)> = BTreeSet::new();
-
-    for record in &edge_records {
-        if let Some(edge) = Edge::from_key(&record.key) {
-            if edge.kind == EdgeKind::HasGotcha {
-                let file_path = edge
-                    .from
-                    .strip_prefix("file:")
-                    .unwrap_or(&edge.from)
-                    .to_string();
-                actual_edges.insert((file_path, edge.to));
-            }
-        }
-    }
-
-    // Phase 4: diff
-    use mati_core::store::repair::DriftEntry;
-
-    let mut missing_file_links = Vec::new();
-    let mut stale_file_links = Vec::new();
-
-    for (file_path, desired_keys) in &desired_file_links {
-        let actual_keys: BTreeSet<String> = actual_file_links
-            .get(file_path)
-            .map(|v| v.iter().cloned().collect())
-            .unwrap_or_default();
-        for key in desired_keys {
-            if !actual_keys.contains(key) {
-                missing_file_links.push(DriftEntry {
-                    file_path: file_path.clone(),
-                    gotcha_key: key.clone(),
-                });
-            }
-        }
-    }
-    for (file_path, actual_keys) in &actual_file_links {
-        let desired_keys = desired_file_links
-            .get(file_path)
-            .cloned()
-            .unwrap_or_default();
-        for key in actual_keys {
-            if !desired_keys.contains(key) {
-                stale_file_links.push(DriftEntry {
-                    file_path: file_path.clone(),
-                    gotcha_key: key.clone(),
-                });
-            }
-        }
-    }
-
-    let missing_edges: Vec<DriftEntry> = desired_edges
-        .difference(&actual_edges)
-        .map(|(f, g)| DriftEntry {
-            file_path: f.clone(),
-            gotcha_key: g.clone(),
-        })
-        .collect();
-    let stale_edges: Vec<DriftEntry> = actual_edges
-        .difference(&desired_edges)
-        .map(|(f, g)| DriftEntry {
-            file_path: f.clone(),
-            gotcha_key: g.clone(),
-        })
-        .collect();
-
-    Ok(RepairReport {
-        scanned_gotchas,
-        scanned_files,
-        missing_file_links,
-        stale_file_links,
-        missing_edges,
-        stale_edges,
-        repaired_count: 0,
-        verification_passed: true,
-        dirty_marker_cleared: false,
-    })
 }
 
 fn print_check_report(report: &RepairReport, use_color: bool) {
