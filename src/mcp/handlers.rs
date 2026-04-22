@@ -1010,6 +1010,10 @@ pub(crate) async fn handle_dev_note_upsert(
     record.value = input.text.clone();
     record.category = Category::DevNote;
     record.lifecycle = RecordLifecycle::Active;
+    record.priority = map_priority(&input.priority);
+    if !input.tags.is_empty() {
+        record.tags = input.tags.clone();
+    }
     record.quality = quality::analyze(&record);
 
     let quality_val = record.quality.value;

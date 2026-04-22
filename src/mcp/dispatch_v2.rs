@@ -1199,6 +1199,8 @@ mod tests {
             Command::DevNoteUpsert(DevNoteUpsertInput {
                 key: None,
                 text: "t".into(),
+                tags: vec![],
+                priority: Priority::Normal,
             }),
             Command::SessionLog(SessionLogInput {
                 event: SessionEvent::Miss,

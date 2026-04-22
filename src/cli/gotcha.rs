@@ -752,7 +752,9 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
     if !proxy.is_direct() {
         proxy.daemon_gotcha_confirm(key).await?;
     } else {
-        proxy.gotcha_confirm_direct(&record, &affected_files).await?;
+        proxy
+            .gotcha_confirm_direct(&record, &affected_files)
+            .await?;
     }
 
     // Propagate confirmation signal to linked file records — their
