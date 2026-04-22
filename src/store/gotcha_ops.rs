@@ -242,6 +242,63 @@ pub async fn apply_gotcha_tombstone(
     Ok(())
 }
 
+/// Persist a confirmed gotcha record and record a `ControlChanged::Confirmed`
+/// enforcement event.
+///
+/// Mirrors the non-collision path of [`apply_gotcha_write`] (record write,
+/// file-link sync, graph edges) but emits `Confirmed` instead of `Updated`
+/// so the enforcement audit distinguishes user confirmation from edits.
+/// Used by the CLI `mati gotcha confirm` direct-mode path and by the legacy
+/// socket `gotcha_confirm` command.
+pub async fn apply_gotcha_confirm(
+    store: &Store,
+    record: &Record,
+    affected_files: &[String],
+) -> Result<()> {
+    let key = &record.key;
+
+    // Persist the confirmed record — fail hard.
+    store.put(key, record).await?;
+
+    // Record Confirmed enforcement event — best-effort.
+    if let Err(e) = record_event(
+        store,
+        EnforcementEventType::ControlChanged {
+            change_kind: ControlChangeKind::Confirmed,
+        },
+        SubjectKind::Control,
+        key.to_string(),
+        "developer".to_string(),
+        None,
+        "control_confirmed".to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_confirm: enforcement event recording failed for {key}: {e}");
+    }
+
+    // Sync file-record gotcha_keys — best-effort. Confirm is purely additive:
+    // all affected_files should have the link; none are removed.
+    if let Err(e) = sync_gotcha_file_links(store, key, &[], affected_files).await {
+        tracing::warn!("gotcha_confirm: file link sync failed for {key}: {e}");
+        crate::store::repair::mark_dirty(store, key, &format!("link sync failed: {e}")).await;
+    }
+
+    // Graph edges — best-effort.
+    let ts = now_secs().to_le_bytes();
+    for file_path in affected_files {
+        let file_key = format!("file:{file_path}");
+        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
+        if let Err(e) = store.put_raw(&edge_key, &ts).await {
+            tracing::warn!("gotcha_confirm: edge add failed for {file_key} → {key}: {e}");
+            crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}")).await;
+        }
+    }
+
+    Ok(())
+}
+
 // ── File-record link sync ────────────────────────────────────────────────────
 
 /// Synchronize `gotcha_keys` in file records with the current affected-file set.
