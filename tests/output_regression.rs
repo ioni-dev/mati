@@ -409,20 +409,27 @@ fn diff_output_structure() {
     let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["diff", "HEAD~1"]);
     assert!(ok, "mati diff should succeed");
 
-    // Header shows the range
-    assert_contains(&stdout, "Files changed in");
-    assert_contains(&stdout, "HEAD~1");
-
-    // Summary line has the right vocabulary
+    // Header per README: "PRE-MERGE CHECK — N files changed"
+    assert_contains(&stdout, "PRE-MERGE CHECK");
     assert_contains(&stdout, "changed");
 
-    // Status symbols vocabulary (at least one of these per file)
+    // Status vocabulary (at least one of these per file)
     let has_symbol = stdout.contains("documented")
-        || stdout.contains("no records yet")
-        || stdout.contains("confirmed gotcha");
+        || stdout.contains("no file record")
+        || stdout.contains("gotcha");
     assert!(
         has_symbol,
         "diff output should classify files\n--- stdout ---\n{stdout}"
+    );
+
+    // Severity column appears for every file
+    let has_severity = stdout.contains("CRITICAL")
+        || stdout.contains("HIGH")
+        || stdout.contains("NORMAL")
+        || stdout.contains("UNKNOWN");
+    assert!(
+        has_severity,
+        "diff output should show a severity marker per file\n--- stdout ---\n{stdout}"
     );
 }
 
@@ -453,8 +460,9 @@ fn diff_summary_line_format() {
     let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["diff", "HEAD~1"]);
     assert!(ok);
 
-    // Summary line must include all three counters
-    assert_contains(&stdout, "with gotchas");
+    // Summary line must include all three counters per README
+    assert_contains(&stdout, "Summary:");
+    assert_contains(&stdout, "warned");
     assert_contains(&stdout, "documented");
     assert_contains(&stdout, "unknown");
 }
