@@ -91,30 +91,43 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
         );
     }
 
-    // Blast radius — show only when populated
-    if let Some(br) = fr.as_ref().and_then(|f| f.blast_radius.as_ref()) {
-        use mati_core::analysis::blast_radius::BlastTier;
-        let tier_label = br.tier.label();
-        let tier_color = match br.tier {
-            BlastTier::Critical => colors::RED,
-            BlastTier::High => colors::YELLOW,
-            _ => colors::GRAY,
-        };
-        if use_color {
-            println!(
-                "  {GRAY}blast radius: {direct} direct, {transitive} transitive ({color}{tier}{RESET}{GRAY}){RESET}",
-                GRAY = colors::GRAY,
-                RESET = colors::RESET,
-                color = tier_color,
-                direct = br.direct,
-                transitive = br.transitive,
-                tier = tier_label,
-            );
-        } else {
-            println!(
-                "  blast radius: {} direct, {} transitive ({})",
-                br.direct, br.transitive, tier_label,
-            );
+    // Blast radius — always shown
+    match fr.as_ref().and_then(|f| f.blast_radius.as_ref()) {
+        Some(br) => {
+            use mati_core::analysis::blast_radius::BlastTier;
+            let tier_label = br.tier.label();
+            let tier_color = match br.tier {
+                BlastTier::Critical => colors::RED,
+                BlastTier::High => colors::YELLOW,
+                _ => colors::GRAY,
+            };
+            if use_color {
+                println!(
+                    "  {GRAY}blast radius: {direct} direct, {transitive} transitive ({color}{tier}{RESET}{GRAY}){RESET}",
+                    GRAY = colors::GRAY,
+                    RESET = colors::RESET,
+                    color = tier_color,
+                    direct = br.direct,
+                    transitive = br.transitive,
+                    tier = tier_label,
+                );
+            } else {
+                println!(
+                    "  blast radius: {} direct, {} transitive ({})",
+                    br.direct, br.transitive, tier_label,
+                );
+            }
+        }
+        None => {
+            if use_color {
+                println!(
+                    "  {GRAY}blast radius: not computed (run mati repair){RESET}",
+                    GRAY = colors::GRAY,
+                    RESET = colors::RESET,
+                );
+            } else {
+                println!("  blast radius: not computed (run mati repair)");
+            }
         }
     }
 
@@ -267,9 +280,13 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     // ── Co-changes ────────────────────────────────────────────────────────────
     let cochange_prefix = format!("gotcha:cochange:{path}|");
     let cochange_gotchas = proxy.scan_prefix(&cochange_prefix).await?;
-    if !cochange_gotchas.is_empty() {
-        println!();
-        print_section_header("Co-changes with", colors::BLUE, use_color);
+    println!();
+    print_section_header("Co-change partners", colors::BLUE, use_color);
+    if cochange_gotchas.is_empty() {
+        let gray = if use_color { colors::GRAY } else { "" };
+        let reset = if use_color { colors::RESET } else { "" };
+        println!("  {gray}none{reset}");
+    } else {
         for cg in &cochange_gotchas {
             // Key format: gotcha:cochange:{source}|{target}
             if let Some(target) = cg.key.strip_prefix(&cochange_prefix) {
