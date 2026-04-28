@@ -186,6 +186,10 @@ pub enum Command {
     #[serde(rename = "mem_query")]
     MemQuery(MemQueryInput),
 
+    /// Scan enforcement events stored as raw JSON in the knowledge tree.
+    #[serde(rename = "scan_enforcement_events")]
+    ScanEnforcementEvents(ScanEnforcementEventsInput),
+
     // ── B. Reads with audited side effects ──────────────────────────────
     /// Single record lookup with consultation receipt side effect.
     #[serde(rename = "mem_get")]
@@ -275,6 +279,19 @@ pub struct HookEvaluateInput {
 #[serde(deny_unknown_fields)]
 pub struct ScanPrefixInput {
     pub prefix: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanEnforcementEventsInput {
+    #[serde(default)]
+    pub since_seq: u64,
+    #[serde(default = "default_until_seq")]
+    pub until_seq: u64,
+}
+
+fn default_until_seq() -> u64 {
+    u64::MAX
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -592,6 +609,7 @@ impl Command {
             Self::SessionCheckConsulted(_) => "session_check_consulted",
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
             Self::MemQuery(_) => "mem_query",
+            Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
             Self::MemGet(_) => "mem_get",
             Self::MemBootstrap(_) => "mem_bootstrap",
             Self::GotchaUpsert(_) => "gotcha_upsert",
@@ -634,7 +652,11 @@ impl Command {
             Self::DevNoteUpsert(i) => i.key.as_deref().unwrap_or(""),
             Self::SessionLog(i) => &i.key,
             Self::ConsultationHit(i) => &i.key,
-            Self::Ping | Self::MemBootstrap(_) | Self::SessionFlush | Self::SessionHarvest => "",
+            Self::Ping
+            | Self::MemBootstrap(_)
+            | Self::ScanEnforcementEvents(_)
+            | Self::SessionFlush
+            | Self::SessionHarvest => "",
         }
     }
 
@@ -748,6 +770,11 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "query": args["query"],
             "mode": args.get("mode").and_then(|v| v.as_str()).unwrap_or("text"),
             "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20),
+        }),
+        "scan_enforcement_events" => json!({
+            "type": "scan_enforcement_events",
+            "since_seq": args.get("since_seq").and_then(|v| v.as_u64()).unwrap_or(0),
+            "until_seq": args.get("until_seq").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
         }),
         other => {
             panic!(

@@ -114,6 +114,42 @@ impl StoreProxy {
         }
     }
 
+    /// Read enforcement events. Routes through the daemon when running so the
+    /// CLI does not require exclusive store access.
+    pub async fn scan_enforcement_events(
+        &self,
+        since_seq: u64,
+        until_seq: u64,
+    ) -> Result<Vec<mati_core::store::enforcement::EnforcementEvent>> {
+        match &self.inner {
+            ProxyInner::Direct(s) => {
+                mati_core::store::enforcement::scan_enforcement_events(s, since_seq, until_seq)
+                    .await
+            }
+            ProxyInner::Socket { root } => {
+                match daemon_result(
+                    root,
+                    "scan_enforcement_events",
+                    json!({ "since_seq": since_seq, "until_seq": until_seq }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(v) => {
+                        let data = &v["data"];
+                        if data.is_null() {
+                            Ok(vec![])
+                        } else {
+                            Ok(serde_json::from_value(data.clone()).context(
+                                "proxy scan_enforcement_events: failed to deserialize events",
+                            )?)
+                        }
+                    }
+                    other => Err(socket_read_error("scan_enforcement_events", other)),
+                }
+            }
+        }
+    }
+
     /// Write a record. In socket mode, dispatches to the appropriate typed
     /// v2 command based on key prefix. There is no raw `put` in the v2 protocol.
     pub async fn put(&self, key: &str, record: &Record) -> Result<()> {
