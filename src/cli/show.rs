@@ -850,16 +850,6 @@ async fn run_enforcement_history(
     proxy: &super::proxy::StoreProxy,
     args: &HistoryArgs,
 ) -> Result<()> {
-    let store = match proxy.direct_store() {
-        Some(s) => s,
-        None => {
-            anyhow::bail!(
-                "enforcement history requires direct store access.\n\
-                 Stop the daemon first: mati daemon stop"
-            );
-        }
-    };
-
     let since_ms = match &args.since {
         Some(since_str) => {
             let secs = parse_since_duration(since_str)?;
@@ -872,7 +862,13 @@ async fn run_enforcement_history(
         None => 0,
     };
 
-    let events = mati_core::store::enforcement::scan_events_since(store, since_ms).await?;
+    // Pull all events via the proxy (routes through the daemon socket if it's
+    // running, otherwise opens the store directly), then filter by since_ms.
+    let all_events = proxy.scan_enforcement_events(0, u64::MAX).await?;
+    let events: Vec<_> = all_events
+        .into_iter()
+        .filter(|e| e.recorded_at_ms >= since_ms)
+        .collect();
 
     // Apply filters
     let events: Vec<_> = events

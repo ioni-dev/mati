@@ -779,6 +779,10 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             "mem_query".into(),
             json!({ "query": i.query, "mode": format!("{:?}", i.mode).to_lowercase(), "limit": i.limit }),
         ),
+        Command::ScanEnforcementEvents(i) => (
+            "scan_enforcement_events".into(),
+            json!({ "since_seq": i.since_seq, "until_seq": i.until_seq }),
+        ),
 
         // B. Reads with side effects — handled natively, not via v1 bridge.
         Command::MemGet(_) | Command::MemBootstrap(_) => {
