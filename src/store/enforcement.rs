@@ -881,8 +881,8 @@ pub async fn enforce_retention(store: &Store) -> Result<PruneResult> {
     }
 
     let count = old_events.len() as u64;
-    let oldest_seq = old_events.first().unwrap().seq_no;
-    let newest_seq = old_events.last().unwrap().seq_no;
+    let oldest_seq = old_events.first().expect("checked non-empty above").seq_no;
+    let newest_seq = old_events.last().expect("checked non-empty above").seq_no;
 
     // Delete the old events
     for event in &old_events {
@@ -929,7 +929,7 @@ pub async fn detect_startup_gap(store: &Store, gap_threshold_ms: u64) -> Result<
     if events.is_empty() {
         return Ok(());
     }
-    let last = events.last().unwrap();
+    let last = events.last().expect("checked non-empty above");
     let current = now_ms();
     let age = current.saturating_sub(last.recorded_at_ms);
 

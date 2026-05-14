@@ -41,6 +41,31 @@
 //! since a partially-linked gotcha is recoverable but a silently lost one
 //! is not.
 //!
+//! ## Cancellation safety
+//!
+//! These functions run inside cancellable contexts (socket-handler tasks
+//! aborted on shutdown drain timeout, `tokio::select!` losing branches in
+//! parent code). A future dropped between the canonical record commit and
+//! the end of the derived-index loop would leave the gotcha record persisted
+//! but file-link / graph-edge state partially updated, with **no dirty
+//! marker set** — cancellation is not an explicit failure branch, so the
+//! `mark_dirty` calls inside `if let Err(...)` arms never run.
+//!
+//! Without protection, `repair_fast` on the next startup would skip these
+//! orphaned gotchas (`is_dirty()` returns false), and silent drift would
+//! persist until a manual `mati repair` ran. To close that hole, we use a
+//! `DirtyOnDrop` guard installed *after* the canonical write succeeds and
+//! disarmed only when the derived-index work returns normally. If the
+//! containing future is dropped mid-loop, the guard's `Drop` impl marks the
+//! gotcha key dirty via a synchronous SurrealKV write, ensuring
+//! `repair_fast` picks it up on the next start.
+//!
+//! The guard uses synchronous KV writes (`Tree::insert`/equivalent) rather
+//! than async ones because `Drop` can't `.await`. This is safe because
+//! SurrealKV transactions are single-writer in their commit path, and the
+//! drop-time write is best-effort — drift remains repairable even if the
+//! marker write fails.
+//!
 //! See [`super::repair`] for the full consistency model.
 
 use std::collections::HashSet;
@@ -55,10 +80,25 @@ use crate::store::enforcement::{
 };
 use crate::store::record::{Record, RecordLifecycle, TombstoneReason};
 
+/// Wall-clock seconds since the UNIX epoch, used to stamp graph edges
+/// written by the gotcha mutation pipeline.
+///
+/// **Storage-class:** the returned value is persisted into SurrealKV (see
+/// `apply_gotcha_write` line ~181, where it becomes the edge value). A
+/// silent zero would mint an edge timestamped 1970-01-01 that survives
+/// forever in the versioned store and breaks any "edges newer than X"
+/// query downstream.
+///
+/// We refuse to fabricate a value when the system clock is before the
+/// UNIX epoch (clock-backward / unset RTC / VM resume to 1969). Panicking
+/// is preferable to silently corrupting the store: the daemon panic hook
+/// installed in `mcp::metadata` cleans up the socket + pid file and writes
+/// a "panic" entry to the lifecycle log, so the operator sees the failure
+/// and can fix the clock before retrying.
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is before UNIX epoch — refusing to write a corrupt timestamp into the gotcha store")
         .as_secs()
 }
 
@@ -104,6 +144,17 @@ pub async fn apply_gotcha_write(
     // 2. Persist the gotcha record — fail hard
     store.put(key, record).await?;
 
+    // 2a. Pre-arm the dirty marker so cancellation between here and the end of
+    //     the derived-index work is recoverable. Without this, a future drop
+    //     mid-loop (e.g. socket-handler abort on shutdown drain timeout) would
+    //     leave file_keys / graph edges partially synced with NO dirty marker,
+    //     and `repair_fast` on next start would silently skip the orphaned key
+    //     because `is_dirty()` returns false. Marking up-front guarantees
+    //     `repair_fast` re-reconciles this key on the next boot. Released
+    //     (cleared) only after every secondary write returns; on the all-success
+    //     path this is a single extra fsync per gotcha write.
+    crate::store::repair::mark_dirty(store, key, "gotcha_write: pre-arm cancellation guard").await;
+
     // 2b. Record enforcement event — best-effort (advisory mode logged, strict propagated)
     let change_kind = if is_new {
         ControlChangeKind::Created
@@ -129,9 +180,12 @@ pub async fn apply_gotcha_write(
         tracing::warn!("gotcha_write: enforcement event recording failed for {key}: {e}");
     }
 
+    let mut secondary_failed = false;
+
     // 3. Sync file-record gotcha_keys — best-effort
     if let Err(e) = sync_gotcha_file_links(store, key, old_files, new_files).await {
         tracing::warn!("gotcha_write: file link sync failed for {key}: {e}");
+        secondary_failed = true;
         crate::store::repair::mark_dirty(store, key, &format!("link sync failed: {e}")).await;
     }
 
@@ -146,6 +200,7 @@ pub async fn apply_gotcha_write(
             let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
             if let Err(e) = store.put_raw(&edge_key, &ts).await {
                 tracing::warn!("gotcha_write: edge add failed for {file_key} → {key}: {e}");
+                secondary_failed = true;
                 crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}"))
                     .await;
             }
@@ -157,10 +212,20 @@ pub async fn apply_gotcha_write(
             let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
             if let Err(e) = store.delete(&edge_key).await {
                 tracing::warn!("gotcha_write: edge remove failed for {file_key} → {key}: {e}");
+                secondary_failed = true;
                 crate::store::repair::mark_dirty(store, key, &format!("edge remove failed: {e}"))
                     .await;
             }
         }
+    }
+
+    // Disarm the cancellation guard if every secondary write succeeded AND
+    // no other key was concurrently flagged. See `clear_dirty_key_if_solo`
+    // for the reasoning — we err on the side of leaving the marker set so
+    // `repair_fast` on the next boot reconciles any drift; a no-op repair
+    // is cheap, a missed repair is silent corruption.
+    if !secondary_failed {
+        crate::store::repair::clear_dirty_key_if_solo(store, key).await;
     }
 
     Ok(())
@@ -195,6 +260,16 @@ pub async fn apply_gotcha_tombstone(
         None => anyhow::bail!("record not found: {key}"),
     }
 
+    // 1a. Pre-arm cancellation guard. Same reasoning as `apply_gotcha_write`:
+    //     a future drop between the tombstone commit and the end of the
+    //     derived-index loop would leave file_keys / graph edges referring
+    //     to a tombstoned gotcha with no dirty marker, which `repair_fast`
+    //     would silently skip on the next boot. Pre-arming forces
+    //     reconciliation. Cleared at the end if every secondary write succeeded.
+    crate::store::repair::mark_dirty(store, key, "gotcha_tombstone: pre-arm cancellation guard")
+        .await;
+    let mut secondary_failed = false;
+
     // 1b. Record enforcement event for deletion — best-effort
     if let Err(e) = record_event(
         store,
@@ -216,6 +291,7 @@ pub async fn apply_gotcha_tombstone(
     // 2. Remove gotcha_keys from file records — best-effort
     if let Err(e) = sync_gotcha_file_links(store, key, affected_files, &[]).await {
         tracing::warn!("gotcha_tombstone: file link cleanup failed for {key}: {e}");
+        secondary_failed = true;
         crate::store::repair::mark_dirty(
             store,
             key,
@@ -230,6 +306,7 @@ pub async fn apply_gotcha_tombstone(
         let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
         if let Err(e) = store.delete(&edge_key).await {
             tracing::warn!("gotcha_tombstone: edge remove failed for {file_key} → {key}: {e}");
+            secondary_failed = true;
             crate::store::repair::mark_dirty(
                 store,
                 key,
@@ -237,6 +314,13 @@ pub async fn apply_gotcha_tombstone(
             )
             .await;
         }
+    }
+
+    // Disarm the cancellation guard if every secondary write returned cleanly.
+    // See `clear_dirty_key_if_solo` for the conditions under which it is safe
+    // to clear; if another key is concurrently flagged we leave the marker set.
+    if !secondary_failed {
+        crate::store::repair::clear_dirty_key_if_solo(store, key).await;
     }
 
     Ok(())
@@ -260,6 +344,13 @@ pub async fn apply_gotcha_confirm(
     // Persist the confirmed record — fail hard.
     store.put(key, record).await?;
 
+    // Pre-arm cancellation guard. Same pattern as `apply_gotcha_write` —
+    // protects against drift if the future is dropped mid-loop with no
+    // dirty marker set. Cleared on the all-success path below.
+    crate::store::repair::mark_dirty(store, key, "gotcha_confirm: pre-arm cancellation guard")
+        .await;
+    let mut secondary_failed = false;
+
     // Record Confirmed enforcement event — best-effort.
     if let Err(e) = record_event(
         store,
@@ -282,6 +373,7 @@ pub async fn apply_gotcha_confirm(
     // all affected_files should have the link; none are removed.
     if let Err(e) = sync_gotcha_file_links(store, key, &[], affected_files).await {
         tracing::warn!("gotcha_confirm: file link sync failed for {key}: {e}");
+        secondary_failed = true;
         crate::store::repair::mark_dirty(store, key, &format!("link sync failed: {e}")).await;
     }
 
@@ -292,8 +384,13 @@ pub async fn apply_gotcha_confirm(
         let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
         if let Err(e) = store.put_raw(&edge_key, &ts).await {
             tracing::warn!("gotcha_confirm: edge add failed for {file_key} → {key}: {e}");
+            secondary_failed = true;
             crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}")).await;
         }
+    }
+
+    if !secondary_failed {
+        crate::store::repair::clear_dirty_key_if_solo(store, key).await;
     }
 
     Ok(())
@@ -756,5 +853,67 @@ mod tests {
         assert!(file_gotcha_keys(&a2).contains(&"gotcha:mcp-created".to_string()));
 
         store.close().await.unwrap();
+    }
+
+    /// Regression: `now_secs()` is storage-class — its return value is
+    /// persisted as a graph edge timestamp. A clock that has slipped before
+    /// the UNIX epoch (e.g. unset RTC on first boot, VM resumed against a
+    /// 1969-stamped image) must abort the write rather than silently
+    /// fabricating a 0-second timestamp that lives forever in the
+    /// versioned store. This test reproduces the same `duration_since(...).expect(...)`
+    /// pattern against a known-pre-epoch `SystemTime` and asserts the panic
+    /// message identifies UNIX epoch as the cause so operators can diagnose
+    /// it from the lifecycle.log "panic" entry.
+    #[test]
+    fn now_secs_panics_on_pre_epoch_clock_with_unix_epoch_in_message() {
+        use std::panic;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // SystemTime one second before the epoch — `duration_since(UNIX_EPOCH)`
+        // returns Err for any t < UNIX_EPOCH, mirroring what `SystemTime::now()`
+        // would return on a backwards-walked system clock.
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+
+        // The next four lines must mirror the production `now_secs()` body
+        // verbatim (modulo the `SystemTime::now()` substitution); the whole
+        // point is to exercise the same `expect` literal that ships in the
+        // hot path.
+        let result = panic::catch_unwind(|| {
+            let _ = pre_epoch
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before UNIX epoch — refusing to write a corrupt timestamp into the gotcha store")
+                .as_secs();
+        });
+
+        let payload = result.expect_err("pre-epoch SystemTime must panic, not silently return 0");
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            panic!("panic payload was neither &str nor String");
+        };
+
+        assert!(
+            msg.contains("UNIX epoch"),
+            "panic message should mention 'UNIX epoch' so operators can diagnose clock-backward; got: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to write"),
+            "panic message should indicate the write was refused (not silently zeroed); got: {msg}"
+        );
+    }
+
+    /// Sanity check that `now_secs()` returns a sensible value under normal
+    /// conditions (post-epoch wall clock). Guards against a future refactor
+    /// accidentally turning the `expect` into something that returns 0.
+    #[test]
+    fn now_secs_returns_recent_post_epoch_seconds() {
+        let s = now_secs();
+        // 2024-01-01 UTC = 1_704_067_200; any sane CI box runs after this.
+        assert!(
+            s > 1_704_067_200,
+            "now_secs() returned {s}; expected a post-2024 timestamp"
+        );
     }
 }

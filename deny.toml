@@ -1,0 +1,80 @@
+# cargo-deny configuration — supply-chain hygiene for the OSS mati crate.
+#
+# Per CLAUDE.md "What this repo must NEVER include": customer license-key
+# validation lives in mati-cloud, not here. So this config intentionally
+# does NOT enforce a dependency-license allowlist — that's mati-cloud's
+# responsibility on the final binary, against whatever commercial license
+# policy applies there.
+#
+# What this config DOES enforce in CI:
+#
+#   - advisories: subsumes cargo-audit (RUSTSEC vulnerability check), plus
+#                 surfaces yanked and unmaintained advisories.
+#   - bans:       warns on duplicate versions and wildcard deps.
+#   - sources:    only crates.io. No git deps, no alternate registries.
+#
+# To run locally:
+#
+#   cargo install cargo-deny
+#   cargo deny check bans advisories sources
+#
+# Explicitly listing the checks skips the `licenses` check, which is
+# intentional per the policy above.
+
+[graph]
+# Match the workspace-wide --locked default in CI.
+all-features = true
+
+[advisories]
+version = 2
+# RUSTSEC database location follows the cargo-audit default; do not
+# override unless mirroring is needed.
+#
+# Yanked crates: warn-not-fail in v0.1. Bump to "deny" before 1.0 release.
+yanked = "warn"
+# Per-advisory exceptions are documented in DECISIONS.md ADR-007. Keep
+# in sync — if you ignore one here, link the ADR entry.
+#
+# Listed exceptions:
+#   RUSTSEC-2024-0436 — `paste` unmaintained. Transitive via the
+#   candle / gemm / tokenizers stack (semantic feature). Crate is
+#   feature-frozen and continues to compile; no actively-maintained
+#   replacement the upstream chain has migrated to yet.
+#   RUSTSEC-2025-0119 — `number_prefix` unmaintained. Transitive via
+#   indicatif (progress bars). Stable behavior, no replacement target.
+#
+# Both are silenced rather than fixed because the upstream chains have
+# not migrated. Re-evaluate when upstream moves off them. CI's advisory
+# DB may surface different IDs than a local install depending on its
+# snapshot age, so we ignore both proactively.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive (candle stack) and feature-frozen; no upstream migration target yet" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix is transitive (indicatif) and stable; no replacement target" },
+]
+
+[bans]
+# Warn on duplicate versions of the same crate — flags supply-chain bloat
+# without forcing constant lockfile churn during v0.1 iteration.
+multiple-versions = "warn"
+# Warn on wildcard `*` version specifiers — allowed for v0.1 prototyping
+# but flagged for review.
+wildcards = "warn"
+# No specific bans yet. Future entries follow shape:
+#   { name = "openssl", reason = "use rustls per ADR-XXX" }
+deny = []
+# crates that are expected to appear multiple times — kept empty so the
+# warning fires if something new starts duplicating.
+skip = []
+
+[sources]
+# Reject anything outside crates.io. Guards against typosquatting and
+# supply-chain compromise via forked git deps.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# NOTE: [licenses] section deliberately omitted.
+# See header — license enforcement for the open-core consumer lives in
+# mati-cloud, not here. `cargo deny check` is invoked in CI with an
+# explicit check list that excludes licenses.

@@ -102,7 +102,11 @@ pub async fn run_show(args: ShowArgs) -> Result<()> {
 
     let record = match store.get(&args.key).await? {
         Some(r) => r,
-        None => anyhow::bail!("no record found for key '{}'", args.key),
+        None => anyhow::bail!(
+            "no record found for key '{}'.\n\
+             Run `mati ls` to see available records, or check key spelling.",
+            args.key
+        ),
     };
 
     let use_color = std::io::stdout().is_terminal();
@@ -850,16 +854,6 @@ async fn run_enforcement_history(
     proxy: &super::proxy::StoreProxy,
     args: &HistoryArgs,
 ) -> Result<()> {
-    let store = match proxy.direct_store() {
-        Some(s) => s,
-        None => {
-            anyhow::bail!(
-                "enforcement history requires direct store access.\n\
-                 Stop the daemon first: mati daemon stop"
-            );
-        }
-    };
-
     let since_ms = match &args.since {
         Some(since_str) => {
             let secs = parse_since_duration(since_str)?;
@@ -872,10 +866,16 @@ async fn run_enforcement_history(
         None => 0,
     };
 
-    let events = mati_core::store::enforcement::scan_events_since(store, since_ms).await?;
+    // Pull all events via the proxy (routes through the daemon socket if it's
+    // running, otherwise opens the store directly), then filter by since_ms.
+    let all_events = proxy.scan_enforcement_events(0, u64::MAX).await?;
+    let events: Vec<_> = all_events
+        .into_iter()
+        .filter(|e| e.recorded_at_ms >= since_ms)
+        .collect();
 
     // Apply filters
-    let events: Vec<_> = events
+    let filtered: Vec<_> = events
         .into_iter()
         .filter(|e| {
             if let Some(ref type_filter) = args.r#type {
@@ -891,8 +891,19 @@ async fn run_enforcement_history(
             }
             true
         })
-        .take(args.limit)
         .collect();
+
+    // `--limit N` shows the LAST N events (most recent), still rendered in
+    // ascending chronological order. This matches `git log -N` and `tail -n N`
+    // semantics — the user wants "what just happened?", not "what happened
+    // first ever?". With thousands of accumulated enforcement events, a head-
+    // limit is unusable: the first 50 events are months old and never reflect
+    // recent activity. Bug surfaced in pass 31 — every smoke test pre-pass-31
+    // failed Phase 5 history checks because `--limit 10` returned events from
+    // weeks ago.
+    let total = filtered.len();
+    let skip = total.saturating_sub(args.limit);
+    let events: Vec<_> = filtered.into_iter().skip(skip).collect();
 
     if events.is_empty() {
         let window = args
@@ -1650,5 +1661,72 @@ mod tests {
         let result = truncate(s, 4);
         // 1 char + "..." = 4 chars
         assert_eq!(result, "\u{1F600}...");
+    }
+
+    // ── enforcement history --limit tail semantics (pass 31) ─────────────────
+
+    /// Pass 31 regression: `mati history --enforcement --limit N` MUST show
+    /// the LAST N events (most recent), not the FIRST N (oldest). Pre-pass-31
+    /// the function used `.take(N)` on the ascending-ordered list, returning
+    /// events from weeks ago no matter how many were in the store. Smoke
+    /// tests failed Phase 5 history checks because `--limit 10` returned seq
+    /// 1-10 (months old), and the smoke's freshly-emitted `allow_receipt`
+    /// event lived at e.g. seq 1268 — invisible.
+    ///
+    /// We test the slice math directly: `total.saturating_sub(limit)` is
+    /// what makes the tail behavior work. A simple unit on this expression
+    /// pins the semantics without spinning up a daemon.
+    #[test]
+    fn enforcement_limit_returns_tail_not_head() {
+        // Simulate 1268 events (matching the real-world repro size).
+        let total = 1268usize;
+        let limit = 10usize;
+
+        // The new tail-semantics computation:
+        let skip = total.saturating_sub(limit);
+        let kept_indices: Vec<usize> = (0..total).skip(skip).collect();
+
+        assert_eq!(kept_indices.len(), 10, "exactly `limit` events kept");
+        assert_eq!(
+            kept_indices.first(),
+            Some(&1258),
+            "first kept event must be at index `total - limit`, not 0 (head)"
+        );
+        assert_eq!(
+            kept_indices.last(),
+            Some(&1267),
+            "last kept event must be the most recent (index total-1)"
+        );
+        assert!(
+            !kept_indices.contains(&0),
+            "head events must NOT appear when total > limit (this was the pre-pass-31 bug)"
+        );
+    }
+
+    /// Edge case: when total <= limit, return everything (no skip).
+    /// `saturating_sub` is what makes this safe — `total.saturating_sub(limit)`
+    /// returns 0 when `limit >= total`, so `.skip(0)` keeps the whole list.
+    #[test]
+    fn enforcement_limit_smaller_than_total_returns_all() {
+        let total = 5usize;
+        let limit = 100usize;
+        let skip = total.saturating_sub(limit);
+        let kept: Vec<usize> = (0..total).skip(skip).collect();
+        assert_eq!(
+            kept,
+            vec![0, 1, 2, 3, 4],
+            "all events kept when limit >= total"
+        );
+    }
+
+    /// Edge case: limit=0 returns empty (no events). Matches existing semantics.
+    #[test]
+    fn enforcement_limit_zero_returns_empty() {
+        let total = 50usize;
+        let limit = 0usize;
+        let skip = total.saturating_sub(limit);
+        // skip == 50, so .skip(50).collect() on 0..50 returns empty.
+        let kept: Vec<usize> = (0..total).skip(skip).collect();
+        assert!(kept.is_empty(), "limit=0 returns empty");
     }
 }

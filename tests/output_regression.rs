@@ -409,20 +409,27 @@ fn diff_output_structure() {
     let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["diff", "HEAD~1"]);
     assert!(ok, "mati diff should succeed");
 
-    // Header shows the range
-    assert_contains(&stdout, "Files changed in");
-    assert_contains(&stdout, "HEAD~1");
-
-    // Summary line has the right vocabulary
+    // Header per README: "PRE-MERGE CHECK — N files changed"
+    assert_contains(&stdout, "PRE-MERGE CHECK");
     assert_contains(&stdout, "changed");
 
-    // Status symbols vocabulary (at least one of these per file)
+    // Status vocabulary (at least one of these per file)
     let has_symbol = stdout.contains("documented")
-        || stdout.contains("no records yet")
-        || stdout.contains("confirmed gotcha");
+        || stdout.contains("no file record")
+        || stdout.contains("gotcha");
     assert!(
         has_symbol,
         "diff output should classify files\n--- stdout ---\n{stdout}"
+    );
+
+    // Severity column appears for every file
+    let has_severity = stdout.contains("CRITICAL")
+        || stdout.contains("HIGH")
+        || stdout.contains("NORMAL")
+        || stdout.contains("UNKNOWN");
+    assert!(
+        has_severity,
+        "diff output should show a severity marker per file\n--- stdout ---\n{stdout}"
     );
 }
 
@@ -453,8 +460,9 @@ fn diff_summary_line_format() {
     let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["diff", "HEAD~1"]);
     assert!(ok);
 
-    // Summary line must include all three counters
-    assert_contains(&stdout, "with gotchas");
+    // Summary line must include all three counters per README
+    assert_contains(&stdout, "Summary:");
+    assert_contains(&stdout, "warned");
     assert_contains(&stdout, "documented");
     assert_contains(&stdout, "unknown");
 }
@@ -649,4 +657,103 @@ fn diff_help_describes_premerge() {
 
     // Range argument with examples
     assert_contains(&stdout, "main");
+}
+
+// ── 11. History --enforcement: formatted timeline output ───────────────────
+
+/// Empty enforcement log produces a clear "no events" message — never the
+/// raw `gotcha_above_threshold` repetition or `ERROR/WARN: None found.` shape
+/// from earlier internal builds.
+#[test]
+fn history_enforcement_empty_state_is_explicit() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    init_repo(&bin, repo_dir.path(), home_dir.path());
+
+    let (stdout, _stderr, ok) = run(
+        &bin,
+        repo_dir.path(),
+        home_dir.path(),
+        &["history", "--enforcement", "--limit", "10"],
+    );
+    assert!(ok, "mati history --enforcement should succeed on empty log");
+
+    let clean = strip_ansi(&stdout);
+    assert!(
+        clean.contains("No enforcement events"),
+        "empty enforcement log must use the explicit 'No enforcement events' \
+         message, never the legacy 'None found' / 'No errors or warnings' wording.\n\
+         --- stdout ---\n{clean}"
+    );
+    assert!(
+        !clean.contains("None found"),
+        "legacy 'None found' wording leaked back in:\n{clean}"
+    );
+    assert!(
+        !clean.contains("No errors or warnings"),
+        "legacy summary wording leaked back in:\n{clean}"
+    );
+}
+
+/// `--type config_changed` filters events by the documented label, even on
+/// an empty log. Guards against the legacy fallback that ignored the filter
+/// and dumped every gotcha-above-threshold event verbatim.
+#[test]
+fn history_enforcement_type_filter_accepts_documented_labels() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    init_repo(&bin, repo_dir.path(), home_dir.path());
+
+    for label in &[
+        "deny",
+        "allow_receipt",
+        "control_changed",
+        "config_changed",
+        "gap",
+    ] {
+        let (stdout, stderr, ok) = run(
+            &bin,
+            repo_dir.path(),
+            home_dir.path(),
+            &["history", "--enforcement", "--type", label, "--limit", "5"],
+        );
+        assert!(
+            ok,
+            "history --enforcement --type {label} should succeed\n\
+             stdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+/// `--enforcement` help advertises the documented event-type vocabulary and
+/// the file-filter so users can find the typed filters from the CLI.
+#[test]
+fn history_enforcement_help_lists_event_types() {
+    let bin = mati_bin();
+    let (stdout, _stderr, ok) = run(
+        &bin,
+        Path::new("."),
+        Path::new("/tmp"),
+        &["history", "--help"],
+    );
+    assert!(ok);
+    let clean = strip_ansi(&stdout);
+
+    // The flag itself
+    assert!(
+        clean.contains("--enforcement"),
+        "history --help should advertise --enforcement:\n{clean}"
+    );
+
+    // Type filter and at least the labels referenced in the smoke test
+    assert!(
+        clean.contains("--type"),
+        "history --help should advertise --type:\n{clean}"
+    );
+    for label in &["control_changed", "config_changed"] {
+        assert!(
+            clean.contains(label),
+            "history --help should mention type label {label}:\n{clean}"
+        );
+    }
 }

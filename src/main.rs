@@ -1,3 +1,9 @@
+// `.unwrap()` discards context — production paths should propagate via `?`
+// or document the invariant with `.expect("reason")`. See src/lib.rs for
+// the project-wide rationale. Gated on `not(test)` so inline test
+// modules can continue using `.unwrap()` freely.
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 use std::io::{self, BufRead, IsTerminal, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,17 +83,19 @@ enum Commands {
     Config(cli::config::ConfigArgs),
 
     // ── Maintenance ──────────────────────────────────────────────────────
-    /// [Maintenance] Confirm auto-detected candidates for hook enforcement
+    /// \[Maintenance\] Confirm auto-detected candidates for hook enforcement
     Review(cli::review::ReviewArgs),
-    /// [Maintenance] List stale records with action hints
+    /// \[Maintenance\] List stale records with action hints
     Stale(cli::stale::StaleArgs),
-    /// [Maintenance] Reconcile gotcha indexes from canonical records
+    /// \[Maintenance\] Reconcile gotcha indexes from canonical records
     Repair(cli::repair::RepairArgs),
-    /// [Maintenance] Verify hook enforcement pipeline
+    /// \[Maintenance\] Verify hook enforcement pipeline
     Check,
-    /// [Maintenance] List records by quality tier
+    /// \[Maintenance\] Diagnostic health report — daemon, integrity, lifecycle
+    Doctor(cli::doctor::DoctorArgs),
+    /// \[Maintenance\] List records by quality tier
     QualityCheck,
-    /// [Maintenance] Re-open a record for improvement
+    /// \[Maintenance\] Re-open a record for improvement
     Improve {
         /// Record key to improve (e.g., "gotcha:inference-async")
         key: String,
@@ -98,6 +106,8 @@ enum Commands {
     Hooks(cli::init::HooksArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
+    /// Generate user-level service unit (launchd/systemd) to keep the daemon alive
+    Supervisor(cli::supervisor::SupervisorArgs),
     /// Check mati daemon reachability and latency
     Ping {
         /// Only check the daemon socket — exit 1 if no daemon is running
@@ -169,8 +179,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -181,6 +190,69 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Build the tokio runtime explicitly so we can call `on_thread_start`.
+    // On macOS, mati inherits QOS_CLASS_USER_INTERACTIVE from Claude Code
+    // (a GUI process), which puts tokio workers at Mach priority ~46. logd's
+    // firehose drain threads run at QOS_CLASS_UTILITY (~priority 20); our
+    // workers at 46 preempt them under load, causing the firehose.drain-mem
+    // and firehose.io-wl queue timeouts that trigger kernel panics. Dropping
+    // to USER_INITIATED eliminates the starvation while keeping mati
+    // responsive enough for hook latency requirements.
+    // Lower the main thread's QoS before starting the runtime. In
+    // new_multi_thread, block_on polls the root future on the calling
+    // (main) thread; heavy async work runs on worker threads, but the
+    // main thread still wakes on completion events at the inherited
+    // priority.
+    lower_worker_thread_qos();
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(lower_worker_thread_qos)
+        .build()?
+        .block_on(async_main(cli))
+}
+
+/// Lower a thread's QoS class on macOS from the inherited USER_INTERACTIVE
+/// (priority ~46, from Claude Code's GUI process) to USER_INITIATED so
+/// logd's drain threads (which run at DEFAULT/UTILITY) are not starved.
+///
+/// USER_INITIATED rather than UTILITY: mati hook handlers are on the 3000ms
+/// Claude Code hook timeout critical path — UTILITY risks slow responses
+/// under system load. USER_INITIATED is still well below USER_INTERACTIVE.
+///
+/// IPC turnstile boosting: macOS temporarily raises a thread's priority via
+/// Mach turnstiles when a USER_INTERACTIVE client (Claude Code) is waiting
+/// for a reply. The boost is released when the reply is sent, so idle
+/// workers return to USER_INITIATED. This is intentional: mati is fast
+/// during active requests and well-behaved when idle.
+///
+/// spawn_blocking coverage: tokio worker threads are launched internally
+/// via `runtime::spawn_blocking`, so `on_thread_start` fires for ALL
+/// tokio-managed threads including the blocking pool. Any future use of
+/// `spawn_blocking` in mati code is automatically covered.
+///
+/// Linux: no equivalent QoS elevation occurs when spawned from Claude Code
+/// on Linux (no GUI QoS inheritance), so no adjustment is needed there.
+fn lower_worker_thread_qos() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(
+                qos_class: libc::c_uint,
+                relative_priority: libc::c_int,
+            ) -> libc::c_int;
+        }
+        // Verified against MacOSX15.4.sdk/usr/include/sys/qos.h.
+        // Stable ABI since macOS 10.10; same value on ARM64 and x86_64.
+        const QOS_CLASS_USER_INITIATED: libc::c_uint = 0x19;
+        let ret = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) };
+        // Can only fail with EINVAL (impossible: valid class + priority=0)
+        // or EPERM (impossible: tokio never calls pthread_setschedparam).
+        debug_assert_eq!(ret, 0, "pthread_set_qos_class_self_np failed: errno={ret}");
+    }
+}
+
+async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init(args) => cli::init::run(args).await,
         Commands::Config(args) => cli::config::run(args).await,
@@ -204,12 +276,14 @@ async fn main() -> Result<()> {
         Commands::Stale(args) => cli::stale::run(args).await,
         Commands::Repair(args) => cli::repair::run(args).await,
         Commands::Check => cli::check::run().await,
+        Commands::Doctor(args) => cli::doctor::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
-            cli::daemon::DaemonCommand::Stop => cli::daemon::run_daemon_stop().await,
+            cli::daemon::DaemonCommand::Stop(args) => cli::daemon::run_daemon_stop(args).await,
             cli::daemon::DaemonCommand::Status => cli::daemon::run_daemon_status().await,
         },
+        Commands::Supervisor(args) => cli::supervisor::run(args).await,
         Commands::Ping { daemon_only } => {
             let cwd = std::env::current_dir()?;
             // Try daemon socket first (avoids store open conflict when mati serve is running).
@@ -230,7 +304,18 @@ async fn main() -> Result<()> {
                         // with a visible warning instead of silently succeeding.
                         std::process::exit(1);
                     }
-                    // No daemon — fall through to direct store open.
+                    // No daemon — fall through to direct store open IF a store
+                    // exists. `Store::open` is "create-or-open"; without this
+                    // guard, running `mati ping` in a directory that has no
+                    // mati state would scaffold an empty `~/.mati/<slug>/`
+                    // tree as a side effect of probing health. ping is
+                    // diagnostic; diagnostic tools must not create state.
+                    if !root.join("knowledge.db").exists() {
+                        anyhow::bail!(
+                            "no daemon running and no mati store initialized for this directory.\n\
+                             Run `mati init` to set up, or `mati daemon start` to bring up a daemon."
+                        );
+                    }
                 }
             }
             let store = Store::open(&cwd).await?;
@@ -505,5 +590,50 @@ fn read_line(lines: &mut io::Lines<io::StdinLock<'_>>) -> Result<String> {
         Some(Ok(line)) => Ok(line.trim().to_string()),
         Some(Err(e)) => Err(e.into()),
         None => Ok(String::new()),
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod qos_tests {
+    // Only test in this module is macOS-only; the import is gated to match
+    // so Linux builds don't warn `unused_imports`.
+    #[cfg(target_os = "macos")]
+    use super::lower_worker_thread_qos;
+
+    /// Verify that on_thread_start actually changes the QoS class of tokio
+    /// worker threads. Uses qos_class_self() (same header as the setter) to
+    /// read back the class after the hook fires.
+    ///
+    /// spawn() ensures we run on a worker thread, not the test driver thread.
+    /// Note: #[tokio::test] uses new_current_thread(); we need new_multi_thread
+    /// to exercise on_thread_start.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn worker_thread_qos_is_user_initiated() {
+        extern "C" {
+            fn qos_class_self() -> libc::c_uint;
+        }
+        const QOS_CLASS_USER_INITIATED: libc::c_uint = 0x19;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .on_thread_start(lower_worker_thread_qos)
+            .build()
+            .unwrap();
+
+        // spawn() must be called inside the async block, not as an argument
+        // to block_on — the runtime context is not yet active at call-site.
+        let actual = rt.block_on(async {
+            tokio::task::spawn(async move { unsafe { qos_class_self() } })
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(
+            actual, QOS_CLASS_USER_INITIATED,
+            "worker thread QoS should be USER_INITIATED (0x19), got {actual:#x}"
+        );
     }
 }
