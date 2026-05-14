@@ -63,6 +63,11 @@ jobs:
     # most users run it on macOS — APFS fsync semantics, BSD socket nuances,
     # and the `logd` watchdog have caused real failures invisible to a
     # Linux-only matrix.
+    #
+    # SKIPPED ON PULL REQUESTS: this job takes >15min on cold cache and
+    # blocks PR feedback. It still runs on every push to main so coverage
+    # is preserved after merge. To re-enable for PRs, remove the `if:` line.
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +94,11 @@ jobs:
     # crash recovery, concurrent socket dispatch, and the panic-hook
     # pre-opened-fd path. They're slow and depend on a writable `~/`,
     # so they don't run by default — but they do gate merges.
+    #
+    # SKIPPED ON PULL REQUESTS: subprocess tests are >15min on cold cache.
+    # Runs on push to main only. To re-enable for PRs, remove the `if:` line.
     name: Ignored integration tests (${{ matrix.os }})
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +124,12 @@ jobs:
     # only gate that they *compile*, so an SLO-relevant bench can't bit-rot
     # silently between feature changes. Real bench runs happen locally
     # against ADR-010 SLOs.
+    #
+    # SKIPPED ON PULL REQUESTS: criterion's release build is >10min on
+    # cold cache. Runs on push to main only. To re-enable for PRs, remove
+    # the `if:` line.
     name: Benches compile
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
