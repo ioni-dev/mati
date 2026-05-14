@@ -1,13 +1,26 @@
 //! MCP stdio server entry point (M-07).
 //!
-//! `serve()` is the only public function. It opens the store, loads the graph,
-//! constructs `MatiServer`, and runs the rmcp stdio transport until the client
-//! disconnects.
+//! `serve()` is the entry point. It opens the store, loads the graph,
+//! constructs `MatiServer`, and runs the rmcp stdio transport. After the
+//! client disconnects, the process auto-promotes to a headless daemon and
+//! waits for an idle timeout or signal before shutting down (a panic hook
+//! is installed at startup; lifecycle events are recorded throughout;
+//! a boot-time auto-drain bounded by `AUTO_DRAIN_TIMEOUT` runs the dirty
+//! gotcha-index repair).
 //!
 //! Also binds the Unix daemon socket (`~/.mati/<slug>/mati.sock`) so that hook
 //! scripts using `mati get`/`mati ping` can route through the daemon protocol
 //! instead of trying to open the SurrealKV store directly (which would fail with
-//! a lock error while the MCP server holds the exclusive handle).
+//! a lock error while the MCP server holds the exclusive handle). The socket
+//! task is supervised: a watcher signals graceful shutdown if it dies, and
+//! a `SHUTDOWN_DRAIN_TIMEOUT` ceiling falls back to `abort_handle` so a
+//! wedged handler can never block exit.
+//!
+//! Public surface: `serve`, `socket_handle_connection`, `Shutdown` (+
+//! methods), and the policy constants `AUTO_DRAIN_TIMEOUT`,
+//! `MAX_CONCURRENT_CONNECTIONS`, `IDLE_SHUTDOWN_SECS`,
+//! `IDLE_CHECK_INTERVAL_SECS`, `UNIX_SOCK_PATH_MAX` — all shared with
+//! `cli::daemon` so both daemon paths use identical operational policy.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -63,10 +76,23 @@ impl ServerHandler for MatiServer {
 /// Start the MCP stdio server for the project rooted at `repo_root`.
 ///
 /// Opens the store (with search index rebuild if needed), loads the graph,
-/// and serves tools over stdin/stdout until the client disconnects.
+/// and serves tools over stdin/stdout until the client disconnects. After
+/// disconnect, auto-promotes to a headless daemon and waits for an idle
+/// timeout (`IDLE_SHUTDOWN_SECS`), an OS signal (SIGINT/SIGTERM), or the
+/// supervised socket task ending unexpectedly. On shutdown, drains
+/// in-flight socket handlers (bounded by `SHUTDOWN_DRAIN_TIMEOUT`,
+/// `abort_handle` fallback), flushes the WAL, and unlinks sock + pid.
+///
+/// On lock contention from another instance of the same MCP server, this
+/// retries with backoff and falls back to socket-backed proxy mode if
+/// the lock-holder is a known mati daemon.
 ///
 /// Also binds the daemon Unix socket so hook scripts (`mati ping`, `mati get`)
 /// can reach the store without conflicting with the MCP server's exclusive lock.
+/// A panic hook is installed before serving begins so a panic in any
+/// thread unlinks sock + pid and records a `panic` lifecycle event.
+/// Lifecycle events (`serve_start`, `serve_failed`, `auto_repair*`,
+/// `serve_shutdown`) are appended throughout for `mati doctor`.
 pub async fn serve(repo_root: &Path) -> Result<()> {
     // Codex may spawn multiple instances of the MCP server concurrently.
     // Only one can acquire the SurrealKV exclusive lock. If the first attempt
@@ -80,6 +106,25 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
     // the worst case.
     match open_with_retry(repo_root, 8, Duration::from_millis(250)).await? {
         ServerOpen::Direct(store) => {
+            // Capture the runtime root before `store` moves into `Graph::load`.
+            // The panic hook uses it to clean up sock/pid files on abnormal exit;
+            // the explicit shutdown path below uses it without re-locking the graph.
+            let mati_root_buf = store.root.clone();
+            super::metadata::install_panic_hook(mati_root_buf.clone());
+            // Initialize the global metrics handle before any dispatch can run.
+            // No-op if already initialized (e.g. on a second `serve` call within
+            // a test process — the OnceLock survives across calls).
+            super::metrics::init();
+            super::metadata::record_lifecycle_event(
+                &mati_root_buf,
+                "serve_start",
+                &format!(
+                    "pid={} owner=mcp qos={}",
+                    std::process::id(),
+                    super::metadata::current_qos_class_str(),
+                ),
+            );
+
             // Clear session:consulted:* markers from the previous session.
             // These are written by log_hit and used by pre-read/pre-bash hooks to downgrade
             // deny → allow+context after a mem_get call. They must be scoped to the current
@@ -98,55 +143,261 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
 
             let graph = Graph::load(*store)
                 .await
-                .context("failed to load knowledge graph")?;
+                .context("failed to load knowledge graph")
+                .inspect_err(|e| {
+                    super::metadata::record_lifecycle_event(
+                        &mati_root_buf,
+                        "serve_failed",
+                        &format!("graph load: {e:#}"),
+                    )
+                })?;
+
+            // Auto-drain dirty-marker queue from a previous unclean shutdown.
+            // Cheap precheck (`is_dirty`) avoids the work on healthy startup.
+            // Failures are logged but do not block serving — repair is also
+            // available manually via `mati repair`.
+            //
+            // Bounded by AUTO_DRAIN_TIMEOUT so a pathological dirty queue
+            // (many keys, slow disk under pressure) can't block daemon
+            // startup indefinitely. On timeout, log it and proceed —
+            // serving with stale derived state is better than not serving.
+            if crate::store::repair::is_dirty(graph.store()).await {
+                let drain_fut = crate::store::repair::repair_gotcha_indexes(
+                    graph.store(),
+                    crate::store::repair::RepairMode::Fast,
+                );
+                match tokio::time::timeout(AUTO_DRAIN_TIMEOUT, drain_fut).await {
+                    Ok(Ok(report)) => {
+                        tracing::info!(
+                            "serve: auto-drained dirty gotcha index (drift_remaining={})",
+                            report.total_drift()
+                        );
+                        super::metadata::record_lifecycle_event(
+                            &mati_root_buf,
+                            "auto_repair",
+                            &format!("drift_remaining={}", report.total_drift()),
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("serve: auto-drain failed: {e}");
+                        super::metadata::record_lifecycle_event(
+                            &mati_root_buf,
+                            "auto_repair_failed",
+                            &format!("{e}"),
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "serve: auto-drain timed out after {AUTO_DRAIN_TIMEOUT:?} — \
+                             serving with stale derived state; run `mati repair` manually"
+                        );
+                        super::metadata::record_lifecycle_event(
+                            &mati_root_buf,
+                            "auto_repair_timeout",
+                            &format!("timeout={AUTO_DRAIN_TIMEOUT:?}"),
+                        );
+                    }
+                }
+            }
 
             let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
             let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
 
             // Spawn the daemon socket listener so hook scripts (mati ping / mati get)
             // can route through this process instead of opening the store directly.
-            // Non-fatal: if binding fails, hooks degrade gracefully via mati ping check.
+            //
+            // The socket task is supervised: a watcher task awaits its
+            // `JoinHandle` and signals `socket_death_rx` if the task ends
+            // (panic, error, or unexpected clean exit). The main shutdown
+            // path treats socket-task death as a shutdown trigger so a panic
+            // there brings the daemon down cleanly instead of silently
+            // disabling hooks. `Shutdown` is the graceful drain signal;
+            // `abort_handle` is the hard backstop on drain timeout.
             let repo_root_arc = Arc::new(repo_root.to_path_buf());
-            tokio::spawn(serve_daemon_socket(Arc::clone(&graph_arc), repo_root_arc));
+            let socket_shutdown = Arc::new(Shutdown::new());
+            let socket_inner = tokio::spawn(serve_daemon_socket(
+                Arc::clone(&graph_arc),
+                repo_root_arc,
+                Arc::clone(&socket_shutdown),
+            ));
+            let socket_abort = socket_inner.abort_handle();
+            let (socket_death_tx, mut socket_death_rx) =
+                tokio::sync::oneshot::channel::<&'static str>();
+            tokio::spawn(async move {
+                let reason: &'static str = match socket_inner.await {
+                    Ok(()) => {
+                        tracing::debug!("daemon socket task exited cleanly");
+                        "socket_clean_exit"
+                    }
+                    Err(e) if e.is_cancelled() => "socket_cancelled",
+                    Err(e) if e.is_panic() => {
+                        tracing::error!("daemon socket task panicked: {e:?}");
+                        "socket_panic"
+                    }
+                    Err(e) => {
+                        tracing::warn!("daemon socket task ended: {e:?}");
+                        "socket_error"
+                    }
+                };
+                let _ = socket_death_tx.send(reason);
+            });
+
+            // Install the OS-signal listener BEFORE entering rmcp's
+            // `service.waiting()` blocking await. Pre-fix, SIGTERM was only
+            // observed after the MCP client disconnected — meaning a SIGTERM
+            // delivered during a live MCP session caused a hard exit with no
+            // socket drain, no flush, no socket unlink, no lifecycle event,
+            // and no chance for `mati daemon stop` to confirm the kill via
+            // file removal. The signal listener now runs in parallel with
+            // the rmcp transport, and either the client disconnect OR the
+            // signal triggers the same drain/flush/unlink path.
+            let signal_shutdown = Arc::new(Shutdown::new());
+            spawn_signal_listener(Arc::clone(&signal_shutdown));
 
             let transport = rmcp::transport::io::stdio();
             let service = server
                 .serve(transport)
                 .await
-                .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("MCP server initialization failed: {e}"))
+                .inspect_err(|e| {
+                    super::metadata::record_lifecycle_event(
+                        &mati_root_buf,
+                        "serve_failed",
+                        &format!("mcp init: {e:#}"),
+                    )
+                })?;
 
-            service.waiting().await?;
+            // Race the rmcp transport against signals + supervised socket-task
+            // death. The first that fires wins; the others are dropped.
+            let shutdown_reason: &'static str = tokio::select! {
+                waiting_result = service.waiting() => {
+                    if let Err(e) = waiting_result {
+                        super::metadata::record_lifecycle_event(
+                            &mati_root_buf,
+                            "serve_failed",
+                            &format!("mcp waiting: {e}"),
+                        );
+                    }
+                    "client_disconnect"
+                }
+                _ = signal_shutdown.wait() => "signal_shutdown",
+                Ok(reason) = &mut socket_death_rx => reason,
+            };
 
-            // MCP client disconnected. Instead of exiting, auto-promote to a
-            // headless daemon so subsequent `mati serve` instances (spawned by
-            // Codex for the next tool call) can enter proxy mode against this
-            // process. The daemon socket is already running in a spawned task.
+            // MCP client disconnected (or signal fired). Instead of exiting
+            // mid-flight, follow the same drain → flush → unlink path so
+            // sibling `mati serve` invocations (spawned by Codex for the next
+            // tool call) can enter proxy mode against any subsequent daemon.
             //
-            // On Claude Code this rarely fires (pipe stays open for the full
-            // session). On Codex it fires after every tool call due to the
-            // stdio pipe closure bug (openai/codex#5677).
-            tracing::info!("mati serve: MCP client disconnected — continuing as daemon");
-            wait_for_idle_or_signal().await;
+            // On Claude Code, "client_disconnect" rarely fires (pipe stays
+            // open). On Codex it fires after every tool call due to the
+            // stdio pipe closure bug (openai/codex#5677). On supervised
+            // hosts, "signal_shutdown" fires whenever launchd / systemd
+            // delivers SIGTERM.
+            tracing::info!(reason = shutdown_reason, "mati serve: shutting down");
 
-            // Cleanup socket + PID files on exit (same as standalone daemon).
-            {
-                let g = graph_arc.read().await;
-                let root = &g.store().root;
-                let _ = std::fs::remove_file(root.join("mati.sock"));
-                let _ = std::fs::remove_file(root.join("mati.pid"));
+            // Post-disconnect idle window — a Codex pipe-closure shouldn't
+            // immediately tear down state when the operator might fire
+            // another tool call seconds later. We re-enter the original
+            // idle-or-signal wait BUT only when shutdown was triggered by
+            // a clean client disconnect, not by an explicit signal.
+            let shutdown_reason: &'static str = if shutdown_reason == "client_disconnect" {
+                tokio::select! {
+                    _ = wait_for_idle_or_signal() => "idle_or_signal",
+                    _ = signal_shutdown.wait() => "signal_shutdown",
+                    Ok(reason) = &mut socket_death_rx => reason,
+                }
+            } else {
+                shutdown_reason
+            };
+
+            // Graceful shutdown: signal the socket task to stop accepting and
+            // drain in-flight handlers, then wait up to SHUTDOWN_DRAIN_TIMEOUT
+            // for completion. Falls back to abort_handle on timeout so a wedged
+            // handler can never block shutdown indefinitely.
+            socket_shutdown.signal();
+            let drain = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+                // If the death watcher already fired (socket panic / error
+                // path), this future returns RecvError immediately. Otherwise
+                // it resolves when serve_daemon_socket completes its drain
+                // and the watcher reports `socket_clean_exit`.
+                let _ = (&mut socket_death_rx).await;
+            })
+            .await;
+            if drain.is_err() {
+                tracing::warn!(
+                    "daemon socket drain timed out after {SHUTDOWN_DRAIN_TIMEOUT:?} — aborting"
+                );
+                socket_abort.abort();
             }
+
+            // Reclaim exclusive ownership of the Store so we can run the full
+            // close (flushes both WAL trees + releases the kernel flock).
+            // Mirrors the identical pattern in `cli::daemon` — without it,
+            // SurrealKV's `Tree::Drop` only fire-and-forget-spawns `core.close()`,
+            // which the runtime may not finish before process exit, losing
+            // committed-but-buffered Eventual-durability writes.
+            //
+            // `Arc::try_unwrap` fails briefly if aborted socket handlers are
+            // still completing their current await point after the drain timeout.
+            // The fallback `flush_for_shutdown` covers that window — it ensures
+            // durability without consuming the Arc.
+            match Arc::try_unwrap(graph_arc) {
+                Ok(rwlock) => {
+                    if let Err(e) = rwlock.into_inner().close().await {
+                        tracing::warn!("mcp serve: store close warning on shutdown: {e}");
+                    }
+                }
+                Err(graph_arc) => {
+                    tracing::warn!(
+                        "mcp serve: graph Arc still referenced on shutdown — flushing without close"
+                    );
+                    let g = graph_arc.read().await;
+                    g.store().flush_for_shutdown().await;
+                }
+            }
+
+            // Cleanup socket + PID files on exit. Use the captured root rather
+            // than re-locking the graph so cleanup is independent of any
+            // in-flight socket handler still holding the read lock.
+            let _ = std::fs::remove_file(mati_root_buf.join("mati.sock"));
+            let _ = std::fs::remove_file(mati_root_buf.join("mati.pid"));
+            super::metadata::record_lifecycle_event(
+                &mati_root_buf,
+                "serve_shutdown",
+                shutdown_reason,
+            );
         }
         ServerOpen::Proxy(root) => {
+            super::metadata::record_lifecycle_event(
+                &root,
+                "serve_start",
+                &format!("pid={} owner=proxy", std::process::id()),
+            );
             tracing::info!(
                 "mati serve: store locked by another instance, starting socket-backed MCP proxy"
             );
             let transport = rmcp::transport::io::stdio();
-            let service = MatiServer::with_socket_root(root)
+            let service = MatiServer::with_socket_root(root.clone())
                 .serve(transport)
                 .await
-                .map_err(|e| anyhow::anyhow!("MCP proxy initialization failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("MCP proxy initialization failed: {e}"))
+                .inspect_err(|e| {
+                    super::metadata::record_lifecycle_event(
+                        &root,
+                        "serve_failed",
+                        &format!("proxy init: {e:#}"),
+                    )
+                })?;
 
-            service.waiting().await?;
+            service.waiting().await.inspect_err(|e| {
+                super::metadata::record_lifecycle_event(
+                    &root,
+                    "serve_failed",
+                    &format!("proxy waiting: {e}"),
+                )
+            })?;
+            super::metadata::record_lifecycle_event(&root, "serve_shutdown", "proxy_clean");
         }
     }
     Ok(())
@@ -163,6 +414,142 @@ pub(crate) async fn proxy_daemon_result(
     cmd: &str,
     args: serde_json::Value,
 ) -> ProxyDaemonResult {
+    // Daemon-restart resilience: when `mati daemon stop` followed by
+    // `mati daemon start` happens during an active MCP-stdio session, the
+    // first call after the restart can fail in three ways:
+    //   1. Socket file transiently absent (NotRunning)
+    //   2. Connection refused before the new daemon's accept loop is up
+    //      (StaleSocket / Unresponsive depending on metadata state)
+    //   3. Connection succeeds but the request carries a stale session UUID
+    //      (cached by the rmcp tool dispatcher) → daemon returns
+    //      "session_mismatch" via the v2 fence in `dispatch_v2`.
+    //
+    // Without retry, every subsequent MCP tool call returns a structured
+    // error to Claude/Codex — a P9 violation in spirit since the agent's
+    // entire MCP session becomes unusable until restart.
+    //
+    // The retry is bounded: at most one re-connect after a brief delay,
+    // re-reading daemon metadata so the new session UUID is picked up.
+    // We do NOT retry indefinitely — a hard-down daemon must surface an
+    // error eventually so the caller can fall back.
+    let result = proxy_daemon_result_no_spawn(root, cmd, &args).await;
+
+    // Pass-33: if both retries failed because the daemon is gone (not
+    // because of a session mismatch or a transient stall), auto-spawn a
+    // fresh daemon and try one final time. Phase 3's `mati daemon stop`
+    // cycles for repair/init left the daemon unrun, breaking every MCP
+    // tool call until manual restart — this closes that hole.
+    //
+    // Only NotRunning/StaleSocket are eligible: Unresponsive means
+    // ensure_daemon has its own SIGTERM-and-cleanup recovery path that
+    // would conflict with our retry, and Ok / session-mismatch don't
+    // need a spawn.
+    if matches!(
+        &result,
+        ProxyDaemonResult::NotRunning | ProxyDaemonResult::StaleSocket
+    ) && super::daemon_lifecycle::ensure_daemon(root).await
+    {
+        match proxy_daemon_result_once(root, cmd, &args).await {
+            AttemptOutcome::Final(r) | AttemptOutcome::Retryable(r) => return r,
+        }
+    }
+
+    result
+}
+
+/// Inner: the original two-attempt retry without auto-spawn. Extracted so
+/// `daemon_lifecycle::ensure_daemon`'s probe can call this without
+/// triggering its own auto-spawn (which would loop indefinitely).
+pub(crate) async fn proxy_daemon_result_no_spawn(
+    root: &Path,
+    cmd: &str,
+    args: &serde_json::Value,
+) -> ProxyDaemonResult {
+    match proxy_daemon_result_once(root, cmd, args).await {
+        AttemptOutcome::Final(result) => result,
+        AttemptOutcome::Retryable(_) => {
+            // Brief settle — give the new daemon time to bind socket and
+            // publish metadata. 100ms is generous; daemon startup is ~50ms.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            match proxy_daemon_result_once(root, cmd, args).await {
+                AttemptOutcome::Final(result) | AttemptOutcome::Retryable(result) => result,
+            }
+        }
+    }
+}
+
+/// Outcome of a single `proxy_daemon_result` attempt.
+///
+/// `Retryable` carries the result the caller would have returned if no
+/// retry were attempted — used as the fallback if the second attempt also
+/// fails. This keeps the original error shape stable for callers that
+/// distinguish StaleSocket vs Unresponsive vs structured session_mismatch.
+enum AttemptOutcome {
+    Final(ProxyDaemonResult),
+    Retryable(ProxyDaemonResult),
+}
+
+async fn proxy_daemon_result_once(
+    root: &Path,
+    cmd: &str,
+    args: &serde_json::Value,
+) -> AttemptOutcome {
+    // Build v2 request from v1-style (cmd, args) using the same mapping
+    // as cli::daemon::daemon_result. Pure-reads only — mutating callers
+    // must use [`proxy_daemon_v2`] with a typed Command (see pass-29).
+    let v2_cmd = super::protocol::v1_to_v2_command(cmd, args);
+    proxy_daemon_send_v2(root, v2_cmd).await
+}
+
+/// Send a typed v2 [`super::protocol::Command`] to the daemon socket.
+///
+/// Mirrors [`proxy_daemon_result`] for callers (currently the MCP Socket-
+/// backend `mem_set` path) that have moved to typed commands and would
+/// otherwise have to round-trip through the legacy v1 mapper, which has
+/// no entries for mutating commands and panics on them.
+///
+/// Bounded auto-reconnect mirrors `proxy_daemon_result` so a daemon
+/// restart during an active session is recovered transparently.
+pub(crate) async fn proxy_daemon_v2(
+    root: &Path,
+    cmd: super::protocol::Command,
+) -> ProxyDaemonResult {
+    // Serialize once — every retry uses the same wire bytes.
+    let v2_cmd = match serde_json::to_value(&cmd) {
+        Ok(v) => v,
+        Err(_) => return ProxyDaemonResult::Unresponsive,
+    };
+
+    let result = match proxy_daemon_send_v2(root, v2_cmd.clone()).await {
+        AttemptOutcome::Final(result) => result,
+        AttemptOutcome::Retryable(_) => {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            match proxy_daemon_send_v2(root, v2_cmd.clone()).await {
+                AttemptOutcome::Final(result) | AttemptOutcome::Retryable(result) => result,
+            }
+        }
+    };
+
+    // Pass-33: parallel auto-spawn for the typed-Command path. Same
+    // policy as `proxy_daemon_result`: if the two retries failed because
+    // the daemon is gone, ensure_daemon spawns one and we try once more.
+    if matches!(
+        &result,
+        ProxyDaemonResult::NotRunning | ProxyDaemonResult::StaleSocket
+    ) && super::daemon_lifecycle::ensure_daemon(root).await
+    {
+        match proxy_daemon_send_v2(root, v2_cmd).await {
+            AttemptOutcome::Final(r) | AttemptOutcome::Retryable(r) => return r,
+        }
+    }
+
+    result
+}
+
+/// Inner socket transaction: connect, send a pre-built v2 command JSON,
+/// read the response. Shared between v1-style and typed-Command callers
+/// so the connect/refused/session-mismatch policy stays identical.
+async fn proxy_daemon_send_v2(root: &Path, v2_cmd: serde_json::Value) -> AttemptOutcome {
     let sock_path = root.join("mati.sock");
 
     if sock_path.as_os_str().len() > UNIX_SOCK_PATH_MAX {
@@ -170,11 +557,13 @@ pub(crate) async fn proxy_daemon_result(
             path = %sock_path.display(),
             "mcp proxy: socket path exceeds Unix limit"
         );
-        return ProxyDaemonResult::NotRunning;
+        // Path-length violation is not transient — never retry.
+        return AttemptOutcome::Final(ProxyDaemonResult::NotRunning);
     }
 
     if !sock_path.exists() {
-        return ProxyDaemonResult::NotRunning;
+        // Socket missing — daemon may be mid-restart. Retry once.
+        return AttemptOutcome::Retryable(ProxyDaemonResult::NotRunning);
     }
 
     let stream = match UnixStream::connect(&sock_path).await {
@@ -187,29 +576,28 @@ pub(crate) async fn proxy_daemon_result(
                 use super::metadata::{self as meta, StaleCheckResult};
                 match meta::check_and_cleanup_stale(root) {
                     StaleCheckResult::StaleRemoved | StaleCheckResult::Clean => {
-                        return ProxyDaemonResult::StaleSocket;
+                        return AttemptOutcome::Retryable(ProxyDaemonResult::StaleSocket);
                     }
                     StaleCheckResult::OrphanSocket => {
                         // No metadata + ECONNREFUSED → stale
                         let _ = std::fs::remove_file(&sock_path);
-                        return ProxyDaemonResult::StaleSocket;
+                        return AttemptOutcome::Retryable(ProxyDaemonResult::StaleSocket);
                     }
                     StaleCheckResult::LiveDaemon { .. } => {
                         // PID alive but socket refused — daemon is starting or broken
-                        return ProxyDaemonResult::Unresponsive;
+                        return AttemptOutcome::Retryable(ProxyDaemonResult::Unresponsive);
                     }
                 }
             }
-            return ProxyDaemonResult::NotRunning;
+            return AttemptOutcome::Retryable(ProxyDaemonResult::NotRunning);
         }
     };
 
-    // Build v2 request from v1-style (cmd, args) using the same mapping
-    // as cli::daemon::daemon_result.
+    // Read daemon metadata fresh per attempt so a session UUID rotated by
+    // a daemon restart between attempt 1 and attempt 2 is picked up.
     let daemon_session = super::metadata::read_metadata(root)
         .map(|m| m.session)
         .unwrap_or_else(uuid::Uuid::nil);
-    let v2_cmd = super::protocol::v1_to_v2_command(cmd, &args);
     let request = serde_json::json!({
         "v": super::protocol::PROTOCOL_VERSION,
         "id": uuid::Uuid::new_v4(),
@@ -220,43 +608,63 @@ pub(crate) async fn proxy_daemon_result(
     let (reader, mut writer) = stream.into_split();
     let mut bytes = match serde_json::to_vec(&request) {
         Ok(b) => b,
-        Err(_) => return ProxyDaemonResult::Unresponsive,
+        Err(_) => return AttemptOutcome::Final(ProxyDaemonResult::Unresponsive),
     };
     bytes.push(b'\n');
 
     if writer.write_all(&bytes).await.is_err() {
-        return ProxyDaemonResult::Unresponsive;
+        return AttemptOutcome::Retryable(ProxyDaemonResult::Unresponsive);
     }
     if writer.shutdown().await.is_err() {
-        return ProxyDaemonResult::Unresponsive;
+        return AttemptOutcome::Retryable(ProxyDaemonResult::Unresponsive);
     }
 
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     match tokio::time::timeout(Duration::from_secs(2), buf_reader.read_line(&mut line)).await {
         Ok(Ok(n)) if n > 0 => {}
-        _ => return ProxyDaemonResult::Unresponsive,
+        _ => return AttemptOutcome::Retryable(ProxyDaemonResult::Unresponsive),
     }
 
     // Parse v2 Response and convert to v1-compatible envelope for callers.
     let resp: serde_json::Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
-        Err(_) => return ProxyDaemonResult::Unresponsive,
+        Err(_) => return AttemptOutcome::Final(ProxyDaemonResult::Unresponsive),
     };
 
     match resp.get("status").and_then(|s| s.as_str()) {
         Some("ok") => {
             let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
-            ProxyDaemonResult::Ok(serde_json::json!({"ok": true, "v": 2, "data": data}))
+            AttemptOutcome::Final(ProxyDaemonResult::Ok(
+                serde_json::json!({"ok": true, "v": 2, "data": data}),
+            ))
         }
         Some("err") => {
+            let code = resp
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("internal");
             let message = resp
                 .get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error");
-            ProxyDaemonResult::Ok(serde_json::json!({"ok": false, "v": 2, "error": message}))
+            let envelope = serde_json::json!({
+                "ok": false, "v": 2, "error": message, "code": code
+            });
+            // Session mismatch is the canonical "daemon restarted, your
+            // cached session is stale" signal — see dispatch_v2.rs's fence
+            // and the symmetric handling in cli::daemon::send_v2_raw. The
+            // retry will re-read metadata and pick up the new session UUID.
+            if code == "session_mismatch" {
+                tracing::debug!(
+                    "mcp proxy: session mismatch — daemon may have restarted, will retry"
+                );
+                AttemptOutcome::Retryable(ProxyDaemonResult::Ok(envelope))
+            } else {
+                AttemptOutcome::Final(ProxyDaemonResult::Ok(envelope))
+            }
         }
-        _ => ProxyDaemonResult::Unresponsive,
+        _ => AttemptOutcome::Retryable(ProxyDaemonResult::Unresponsive),
     }
 }
 
@@ -279,10 +687,10 @@ async fn open_with_retry(
     let mut delay = initial_delay;
     let mati_root = mati_root_for(repo_root)?;
 
-    // Ensure runtime directory exists with correct permissions.
-    if let Err(e) = super::metadata::ensure_runtime_dir(&mati_root) {
-        tracing::warn!("ensure_runtime_dir failed: {e}");
-    }
+    // Ensure runtime directory exists with correct permissions AND is not
+    // a symlink. Hard-fail here: silencing this would let a pre-staged
+    // hostile symlink at `~/.mati/<slug>` hijack every subsequent write.
+    super::metadata::ensure_runtime_dir(&mati_root).context("runtime directory check failed")?;
 
     // Clean up stale lock holder from a previous session. If the PID in
     // metadata is dead, remove the socket and PID file so we can acquire
@@ -326,14 +734,30 @@ async fn open_with_retry(
                              Stop it first: mati daemon stop"
                         ));
                     }
-                    return match proxy_daemon_result(&mati_root, "ping", serde_json::json!({}))
-                        .await
-                    {
-                        ProxyDaemonResult::Ok(_) => Ok(ServerOpen::Proxy(mati_root)),
-                        other => Err(anyhow::anyhow!(
-                            "store locked after retries and no proxy target was reachable: {:?}",
-                            other
-                        )),
+                    // proxy_daemon_result auto-recovers NotRunning/StaleSocket via
+                    // ensure_daemon internally, but intentionally skips Unresponsive
+                    // to avoid SIGTERM+respawn on every per-tool-call retry path.
+                    // open_with_retry is a one-time startup check, so calling
+                    // ensure_daemon for Unresponsive here is safe and completes the
+                    // recovery matrix: all three failure modes now self-heal.
+                    let ping = proxy_daemon_result(&mati_root, "ping", serde_json::json!({})).await;
+                    let reachable = match ping {
+                        ProxyDaemonResult::Ok(_) => true,
+                        ProxyDaemonResult::Unresponsive => {
+                            // 300ms wait + re-probe + SIGTERM stale PID + fresh spawn
+                            // + readiness poll — full Unresponsive recovery path.
+                            super::daemon_lifecycle::ensure_daemon(&mati_root).await
+                        }
+                        // NotRunning/StaleSocket: proxy_daemon_result already exhausted
+                        // ensure_daemon internally — no double-spawn.
+                        _ => false,
+                    };
+                    return if reachable {
+                        Ok(ServerOpen::Proxy(mati_root))
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "store locked after retries and no proxy target was reachable"
+                        ))
                     };
                 }
                 tracing::info!(
@@ -356,10 +780,86 @@ async fn open_with_retry(
 // ── Daemon socket — hook script bridge ───────────────────────────────────────
 
 /// Unix domain socket path length limit (macOS-compatible).
-const UNIX_SOCK_PATH_MAX: usize = 104;
+///
+/// Public so the parallel daemon path in `cli::daemon` shares the same
+/// value — preventing one path's bound from drifting from the other's.
+pub const UNIX_SOCK_PATH_MAX: usize = 104;
 
 /// Max wait for a complete request line per connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum number of daemon-socket connections handled concurrently.
+///
+/// A flood beyond this limit blocks at `accept` (TCP backlog absorbs the
+/// surplus); this gives natural backpressure rather than unbounded memory
+/// use. 64 is generous for a per-user daemon — typical hook traffic is
+/// O(1) concurrent. Public so `cli::daemon` shares the same bound.
+pub const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// Maximum time to wait for in-flight handlers to drain after `Shutdown`
+/// is signaled before falling back to `abort_handle.abort()`.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum time the boot-time auto-drain (dirty-marker queue) can run
+/// before we give up and proceed to serve. Prevents a pathological dirty
+/// queue from blocking daemon startup. The dirty marker stays set; the
+/// user can run `mati repair` manually.
+///
+/// Public so `cli::daemon::run_daemon_start` can share the same ceiling.
+pub const AUTO_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Race-free shutdown signal for daemon-socket loops.
+///
+/// `signal()` is idempotent and `wait()` resolves immediately if the signal
+/// has already fired. The `enable()` pattern on `Notify::notified()`
+/// registers the future before the flag check, so a `signal()` race between
+/// flag-set and notify-fire cannot strand a waiter.
+///
+/// Shared with `cli::daemon` so both the embedded MCP-server socket loop
+/// and the headless `mati daemon start` loop use identical shutdown
+/// semantics.
+#[derive(Default)]
+pub struct Shutdown {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Shutdown {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Idempotent — safe to call multiple times. Wakes every active waiter.
+    pub fn signal(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_set(&self) -> bool {
+        // SeqCst (matching the store): defense-in-depth correctness on
+        // weakly-ordered architectures (ARM/POWER). Without it, the load
+        // would rely on Notify's internal mutex acquire to synchronize
+        // with `signal()`'s store — which is the pattern in our `wait()`
+        // body and works in practice, but depends on Notify's
+        // implementation detail. Explicit SC pairing is cheap (one
+        // memory barrier at most) and removes the implicit dependency.
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Future resolves once `signal()` has been called. Safe to call
+    /// repeatedly; safe to race with concurrent `signal()`.
+    pub async fn wait(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Register the receiver BEFORE the flag check so a `signal()` that
+        // fires between check and notify cannot be missed.
+        notified.as_mut().enable();
+        if self.is_set() {
+            return;
+        }
+        notified.await;
+    }
+}
 
 /// Daemon protocol version (must match `cli::daemon::PROTOCOL_VERSION`).
 const PROTOCOL_VERSION: u32 = 1;
@@ -405,11 +905,31 @@ impl SocketResponse {
 }
 
 /// Bind the daemon Unix socket and serve hook requests using the already-open
-/// graph/store. Runs until cancelled (MCP server exits). Non-fatal — logs and
-/// continues on accept/connection errors.
+/// graph/store.
+///
+/// Concurrent connections: handlers are spawned into a `JoinSet` with a
+/// `Semaphore`-bounded permit so up to `MAX_CONCURRENT_CONNECTIONS` requests
+/// run in parallel. Reads on the underlying `RwLock<Graph>` parallelize
+/// naturally; writes serialize at the lock layer. Beyond the limit, the
+/// accept loop pauses (the OS socket backlog absorbs the surplus) — this
+/// gives bounded memory usage under flood.
+///
+/// Panic propagation: if any in-flight handler panics, the accept loop
+/// breaks out and stops accepting new connections. The panic hook
+/// (installed at startup) has already unlinked sock + pid by the time we
+/// observe it via `JoinSet::try_join_next`, so the daemon is unreachable
+/// to new clients — terminating the loop matches that reality and lets
+/// the supervised socket-death watcher signal shutdown to the caller.
+///
+/// Shutdown: `shutdown.signal()` causes the accept loop to exit and the
+/// remaining in-flight handlers to be drained (awaited) before this function
+/// returns. Caller is responsible for the timeout + `abort_handle` fallback.
+///
+/// Non-fatal — logs and continues on accept/connection errors.
 async fn serve_daemon_socket(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: Arc<std::path::PathBuf>,
+    shutdown: Arc<Shutdown>,
 ) {
     let sock_path = {
         let g = graph.read().await;
@@ -444,6 +964,33 @@ async fn serve_daemon_socket(
             }
         }
     }
+    // Publish v2 daemon metadata BEFORE binding the socket so there is never
+    // a window in which `mati.sock` exists with no `mati.pid`. That window
+    // would let a sibling mati invocation classify our socket as
+    // `OrphanSocket` and unlink it. Order: publish → bind → harden.
+    //
+    // If bind fails, we roll back the metadata so we don't masquerade as a
+    // live daemon to siblings (their PID-liveness check would be true while
+    // we're still alive but unable to serve).
+    let parent_root = sock_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let daemon_meta = super::metadata::DaemonMetadata::new(super::metadata::DaemonOwner::Mcp);
+    let daemon_session = daemon_meta.session;
+    let metadata_published = match super::metadata::publish_metadata(&parent_root, &daemon_meta) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("failed to publish daemon metadata: {e}");
+            // Fall back to legacy PID file so existing clients still work.
+            let _ = std::fs::write(
+                &pid_path,
+                format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
+            );
+            false
+        }
+    };
+
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
@@ -451,26 +998,18 @@ async fn serve_daemon_socket(
                 "mati serve: failed to bind daemon socket at {}: {e}",
                 sock_path.display()
             );
+            // Roll back metadata so siblings don't see us as a live daemon.
+            if metadata_published {
+                let _ = std::fs::remove_file(super::metadata::metadata_path(&parent_root));
+            } else {
+                let _ = std::fs::remove_file(&pid_path);
+            }
             return;
         }
     };
     // Harden socket permissions after bind (before any client can connect).
     if let Err(e) = super::metadata::harden_socket(&sock_path) {
         tracing::warn!("failed to harden socket permissions: {e}");
-    }
-    // Publish v2 daemon metadata (with session UUID) atomically.
-    let daemon_meta = super::metadata::DaemonMetadata::new(super::metadata::DaemonOwner::Mcp);
-    let daemon_session = daemon_meta.session;
-    if let Err(e) = super::metadata::publish_metadata(
-        sock_path.parent().unwrap_or(std::path::Path::new(".")),
-        &daemon_meta,
-    ) {
-        tracing::warn!("failed to publish daemon metadata: {e}");
-        // Fall back to legacy PID file so existing clients still work.
-        let _ = std::fs::write(
-            &pid_path,
-            format!(r#"{{"pid":{},"owner":"mcp"}}"#, std::process::id()),
-        );
     }
     tracing::debug!(
         "daemon socket ready at {} (MCP-embedded, session={})",
@@ -481,26 +1020,87 @@ async fn serve_daemon_socket(
     // Capture daemon effective UID once — used for every peer credential check.
     let daemon_euid = super::metadata::current_euid();
 
-    loop {
-        let stream = match listener.accept().await {
-            Ok((s, _)) => s,
-            Err(e) => {
-                tracing::warn!("daemon socket accept: {e}");
-                continue;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+    'accept: loop {
+        // Reap completed handlers opportunistically (non-blocking) so the
+        // JoinSet doesn't grow unboundedly during long-running daemons.
+        // Treat handler panics as terminal: tokio's spawn boundary catches
+        // panics into `JoinError`; without this check we'd silently keep
+        // running while the panic hook had already unlinked sock+pid,
+        // leaving the daemon unreachable to new clients but otherwise
+        // alive. Pre-refactor (serial inline await) the panic propagated
+        // to the watcher; this restores that property.
+        while let Some(res) = in_flight.try_join_next() {
+            if let Err(e) = res {
+                if e.is_panic() {
+                    tracing::error!("daemon socket handler panicked: {e:?}");
+                    break 'accept;
+                }
+                // Cancellation is expected during shutdown drain; ignore.
             }
+        }
+
+        // Acquire a concurrency permit. Pauses here when MAX is in flight,
+        // which is the bounded-memory backpressure point. Shutdown pre-empts.
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown.wait() => break 'accept,
+            res = Arc::clone(&semaphore).acquire_owned() => match res {
+                Ok(p) => p,
+                Err(_) => break 'accept, // semaphore closed (we never close it; defensive)
+            },
         };
+
+        // Accept the next connection. Shutdown pre-empts.
+        let stream = tokio::select! {
+            biased;
+            _ = shutdown.wait() => break 'accept,
+            res = listener.accept() => match res {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    tracing::warn!("daemon socket accept: {e}");
+                    drop(permit);
+                    continue 'accept;
+                }
+            },
+        };
+
         // Peer credential check — mismatch or failure drops the connection.
         let peer = match super::metadata::check_peer_cred(&stream, daemon_euid) {
             Some(p) => p,
-            None => continue,
+            None => {
+                drop(permit);
+                continue;
+            }
         };
-        if let Err(e) =
-            socket_handle_connection(Arc::clone(&graph), &repo_root, stream, peer, daemon_session)
-                .await
-        {
-            tracing::debug!("daemon socket connection: {e}");
-        }
+
+        // Spawn the handler. Permit is held inside the task and released on
+        // task completion (clean exit, error, or panic — tokio drops the
+        // permit either way via JoinSet).
+        let graph_clone = Arc::clone(&graph);
+        let repo_root_clone = Arc::clone(&repo_root);
+        let session = daemon_session;
+        in_flight.spawn(async move {
+            let _permit = permit;
+            if let Err(e) =
+                socket_handle_connection(graph_clone, &repo_root_clone, stream, peer, session).await
+            {
+                tracing::debug!("daemon socket connection: {e}");
+            }
+        });
     }
+
+    // Drain in-flight handlers. The accept loop has exited, so no new tasks
+    // are spawned. Each in-flight task has its own READ_TIMEOUT bound, so
+    // drain is bounded by READ_TIMEOUT × MAX_CONCURRENT in the pathological
+    // case (and typically completes in milliseconds).
+    let drained = in_flight.len();
+    if drained > 0 {
+        tracing::debug!("daemon socket: draining {drained} in-flight handler(s)");
+    }
+    while in_flight.join_next().await.is_some() {}
 }
 
 pub async fn socket_handle_connection(
@@ -588,6 +1188,18 @@ pub(crate) async fn socket_dispatch(
 
     match req.cmd.as_str() {
         "ping" => SocketResponse::ok(serde_json::Value::String("pong".into())),
+
+        // Live daemon metrics snapshot — per-command counters, error rates,
+        // and p50/p95/p99 latencies. Pure read, no side effects, no audit.
+        // Returns `null` if the global metrics handle was never initialized
+        // (which only happens in tests that bypass `serve`).
+        "metrics" => match super::metrics::snapshot() {
+            Some(snap) => match serde_json::to_value(&snap) {
+                Ok(v) => SocketResponse::ok(v),
+                Err(e) => SocketResponse::err(format!("metrics serialize: {e}")),
+            },
+            None => SocketResponse::ok(serde_json::Value::Null),
+        },
 
         // ── MCP tool commands ────────────────────────────────────────────
         "mem_get" => {
@@ -1039,6 +1651,33 @@ pub(crate) async fn socket_dispatch(
             }
         }
 
+        "scan_enforcement_events" => {
+            let since_seq = req
+                .args
+                .get("since_seq")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let until_seq = req
+                .args
+                .get("until_seq")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX);
+            let g = graph.read().await;
+            match crate::store::enforcement::scan_enforcement_events(
+                g.store(),
+                since_seq,
+                until_seq,
+            )
+            .await
+            {
+                Ok(events) => match serde_json::to_value(&events) {
+                    Ok(val) => SocketResponse::ok(val),
+                    Err(e) => SocketResponse::err(format!("serialize: {e}")),
+                },
+                Err(e) => SocketResponse::err(format!("store: {e}")),
+            }
+        }
+
         "put" => {
             use crate::store::Record;
             let key = match req.args.get("key").and_then(|v| v.as_str()) {
@@ -1326,16 +1965,90 @@ pub(crate) async fn socket_dispatch(
 // ── Auto-promotion: MCP server → headless daemon ─────────────────────────────
 
 /// Idle shutdown threshold — wall-clock seconds with no daemon socket requests.
-const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
+///
+/// Shared with `cli::daemon` so both daemon paths use the same idle policy.
+pub const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
 
-/// How often to check wall-clock idle time.
-const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // 5 min
+/// How often to check wall-clock idle time. Shared with `cli::daemon`.
+pub const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // 5 min
 
-/// Block until idle timeout or OS signal (SIGINT/SIGTERM).
+/// Spawn a background task that signals `shutdown` on SIGINT or SIGTERM.
+///
+/// Installed at the top of `serve()` so signals delivered during a live MCP
+/// session (i.e. while `service.waiting()` is awaiting stdin) trigger the
+/// same drain → flush → unlink path as a clean client disconnect. Without
+/// this, a SIGTERM during a session caused a hard exit that left sock + pid
+/// on disk and stranded the SurrealKV WAL.
+///
+/// The task is fire-and-forget — it owns the signal subscriptions and exits
+/// after the first signal fires (idempotent: `Shutdown::signal()` is safe
+/// to call multiple times).
+fn spawn_signal_listener(shutdown: Arc<Shutdown>) {
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "signal listener: failed to install SIGTERM handler");
+                    let _ = ctrl_c.await;
+                    tracing::info!("mati serve: signal shutdown (SIGINT)");
+                    shutdown.signal();
+                    return;
+                }
+            };
+            // SIGHUP default action is termination, which bypasses graceful shutdown.
+            // A daemon may receive SIGHUP if its session leader disconnects (e.g., the
+            // user starts `mati daemon start` in a terminal without `nohup` and then
+            // closes that terminal before a supervisor takes over). Treat as SIGTERM.
+            // If registration fails, log a warning and continue — SIGTERM + SIGINT
+            // coverage is more important than SIGHUP coverage.
+            let mut sighup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "signal listener: failed to install SIGHUP handler — \
+                         SIGHUP will use OS default (terminate without cleanup)"
+                    );
+                    tokio::select! {
+                        _ = ctrl_c => tracing::info!("mati serve: signal shutdown (SIGINT)"),
+                        _ = sigterm.recv() => tracing::info!("mati serve: signal shutdown (SIGTERM)"),
+                    }
+                    shutdown.signal();
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("mati serve: signal shutdown (SIGINT)"),
+                _ = sigterm.recv() => tracing::info!("mati serve: signal shutdown (SIGTERM)"),
+                _ = sighup.recv() => tracing::info!("mati serve: signal shutdown (SIGHUP)"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+            tracing::info!("mati serve: signal shutdown");
+        }
+        shutdown.signal();
+    });
+}
+
+/// Block until the idle timeout elapses (wall-clock based).
 ///
 /// Called after the MCP stdio client disconnects. The daemon socket task is
 /// already running in a spawned tokio task — this function just keeps the
 /// runtime alive until there's a reason to shut down.
+///
+/// Signal handling is done by the OUTER select in `serve()` via the shared
+/// `signal_shutdown` arc — do NOT register a second signal handler here.
+/// Duplicate SIGTERM subscriptions add unnecessary signal handler overhead
+/// and can race with the outer handler on macOS.
 async fn wait_for_idle_or_signal() {
     let wall_secs = || {
         std::time::SystemTime::now()
@@ -1350,54 +2063,192 @@ async fn wait_for_idle_or_signal() {
     // The daemon socket handler runs independently in a spawned task —
     // incoming connections do not reset this timer. 30 minutes is generous
     // enough for Codex sessions where tool calls arrive seconds apart.
-    let idle_shutdown = async {
-        let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let elapsed = wall_secs().saturating_sub(start);
-            if elapsed >= IDLE_SHUTDOWN_SECS {
-                tracing::info!(
-                    idle_secs = elapsed,
-                    "mati serve: idle shutdown (auto-promoted daemon)"
-                );
-                break;
-            }
+    let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let elapsed = wall_secs().saturating_sub(start);
+        if elapsed >= IDLE_SHUTDOWN_SECS {
+            tracing::info!(
+                idle_secs = elapsed,
+                "mati serve: idle shutdown (auto-promoted daemon)"
+            );
+            break;
         }
-    };
-
-    // Signal handler: SIGINT or SIGTERM.
-    let signal_shutdown = async {
-        let ctrl_c = tokio::signal::ctrl_c();
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("failed to register SIGTERM handler");
-            tokio::select! {
-                _ = ctrl_c => {
-                    tracing::info!("mati serve: signal shutdown (SIGINT)");
-                }
-                _ = sigterm.recv() => {
-                    tracing::info!("mati serve: signal shutdown (SIGTERM)");
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = ctrl_c.await;
-            tracing::info!("mati serve: signal shutdown");
-        }
-    };
-
-    // Wait for whichever comes first — idle timeout or OS signal.
-    tokio::select! {
-        _ = idle_shutdown => {}
-        _ = signal_shutdown => {}
     }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_signal_before_wait_returns_immediately() {
+        // Pre-signal: subsequent wait must NOT block. Tests the flag-check
+        // arm of `wait()` before the notified.await.
+        let s = Shutdown::new();
+        s.signal();
+        // Should return well under timeout — generous bound to avoid CI flake.
+        tokio::time::timeout(Duration::from_millis(100), s.wait())
+            .await
+            .expect("wait must return immediately when already signaled");
+        assert!(s.is_set());
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_then_signal_wakes_waiter() {
+        let s = Arc::new(Shutdown::new());
+        let s_clone = Arc::clone(&s);
+        let waiter = tokio::spawn(async move { s_clone.wait().await });
+
+        // Give the waiter a moment to register on `notified()`.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!s.is_set());
+
+        s.signal();
+
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter must wake within timeout")
+            .expect("waiter task should not panic");
+        assert!(s.is_set());
+    }
+
+    #[tokio::test]
+    async fn shutdown_multiple_concurrent_waiters_all_wake() {
+        // The notify_waiters() in signal() must wake every active waiter.
+        let s = Arc::new(Shutdown::new());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let s = Arc::clone(&s);
+            handles.push(tokio::spawn(async move { s.wait().await }));
+        }
+        // Let waiters register.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        s.signal();
+
+        for h in handles {
+            tokio::time::timeout(Duration::from_millis(200), h)
+                .await
+                .expect("each waiter must wake within timeout")
+                .expect("waiter task should not panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_is_idempotent() {
+        // Second signal must be a no-op. Subsequent waits still return.
+        let s = Shutdown::new();
+        s.signal();
+        s.signal();
+        s.signal();
+        tokio::time::timeout(Duration::from_millis(100), s.wait())
+            .await
+            .expect("wait must still return on idempotent re-signal");
+    }
+
+    /// Contract test: the bounded-drain pattern in `serve_loop_graceful`
+    /// (and the caller-side hammer for `serve_daemon_socket`) relies on
+    /// `JoinSet::abort_all()` actually causing in-flight tasks to wake
+    /// with a cancellation error, so a subsequent `join_next` loop
+    /// completes. If tokio ever changes this — e.g., requires polling
+    /// each task explicitly — our drain-timeout fallback silently
+    /// regresses to "wait forever after abort_all".
+    #[tokio::test]
+    async fn joinset_abort_all_makes_drain_finite() {
+        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Spawn a task that would otherwise run for a long time.
+        set.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        // First drain attempt: time out (task is mid-sleep).
+        let primary = tokio::time::timeout(Duration::from_millis(100), async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            primary.is_err(),
+            "primary drain should time out while task is still sleeping"
+        );
+
+        // Now abort and drain again — must complete promptly.
+        set.abort_all();
+        let secondary = tokio::time::timeout(Duration::from_millis(500), async {
+            while set.join_next().await.is_some() {}
+        })
+        .await;
+        assert!(
+            secondary.is_ok(),
+            "drain after abort_all must complete quickly"
+        );
+        assert!(set.is_empty(), "JoinSet should be empty after drain");
+    }
+
+    /// Contract test: the panic-detection logic in `serve_daemon_socket`
+    /// (and `cli::daemon::serve_loop_graceful`) relies on tokio's `JoinSet`
+    /// reporting panicked tasks via `try_join_next() -> Some(Err(e))` with
+    /// `e.is_panic() == true`. If tokio ever changes that, our handler-
+    /// panic-is-terminal property silently regresses. Lock it down here.
+    #[tokio::test]
+    async fn joinset_panics_are_observable_via_try_join_next() {
+        let mut set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        set.spawn(async {
+            panic!("simulated handler panic");
+        });
+
+        // Wait until the panicked task has been catch_unwind'd at the
+        // tokio spawn boundary and parked on the JoinSet's completion queue.
+        // Poll try_join_next briefly; assert we see the panic.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(res) = set.try_join_next() {
+                let err = res.expect_err("panicked task should yield Err");
+                assert!(
+                    err.is_panic(),
+                    "JoinError must report is_panic for panicking task; got: {err:?}"
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("try_join_next never reported the panic within 500ms");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Race contract — exercises the enable() pattern. A waiter that is
+    /// JUST being constructed (between the `notified()` call and the flag
+    /// check) must NOT miss a `signal()` that fires concurrently.
+    ///
+    /// Probabilistic: runs many trials and asserts every one wakes.
+    #[tokio::test]
+    async fn shutdown_no_lost_signal_under_race() {
+        for trial in 0..50 {
+            let s = Arc::new(Shutdown::new());
+            let s_waiter = Arc::clone(&s);
+            let s_signaler = Arc::clone(&s);
+
+            let waiter = tokio::spawn(async move { s_waiter.wait().await });
+
+            // Yield briefly so the waiter has a chance to start `wait()`.
+            tokio::task::yield_now().await;
+
+            // Signal at the moment the waiter is racing to register.
+            s_signaler.signal();
+
+            tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .unwrap_or_else(|_| panic!("trial {trial}: waiter stranded by lost signal"))
+                .expect("waiter task should not panic");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1765,5 +2616,293 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
 
         assert_eq!(resp["status"], "ok", "ping should succeed, got: {resp}");
+    }
+
+    // ── Daemon-restart resilience ──────────────────────────────────────
+    //
+    // Regression for the smoke-test failure: after a daemon stop+start,
+    // the MCP-stdio bridge sees `session_mismatch` (or transient
+    // `Unresponsive`) on the first call because its cached daemon session
+    // UUID predates the restart. Without retry, every subsequent
+    // mem_get/mem_query/mem_bootstrap/mem_set returns a structured error
+    // that effectively wedges the agent's MCP session.
+    //
+    // The fix in `proxy_daemon_result` is one bounded auto-reconnect: the
+    // helper re-reads daemon metadata fresh (picking up the new session
+    // UUID) and re-issues the request. This test asserts the reconnect
+    // succeeds end-to-end and DOES NOT propagate the session_mismatch
+    // error envelope to the caller.
+
+    /// Spawn a tiny daemon-substitute that binds the given socket and
+    /// answers each connection with the supplied JSON response (one line),
+    /// then closes the connection. Returns the JoinHandle so the test can
+    /// await it.
+    async fn spawn_canned_responder(
+        sock_path: std::path::PathBuf,
+        responses: Vec<serde_json::Value>,
+    ) -> tokio::task::JoinHandle<()> {
+        // Bind in this task synchronously so the caller can issue
+        // requests immediately without a sleep race.
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind responder socket");
+        tokio::spawn(async move {
+            for resp in responses {
+                let (stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let (reader, mut writer) = stream.into_split();
+                // Drain the request line so the peer's `shutdown()` returns Ok.
+                let mut buf_reader = tokio::io::BufReader::new(reader);
+                let mut line = String::new();
+                let _ = tokio::io::AsyncBufReadExt::read_line(&mut buf_reader, &mut line).await;
+                let mut bytes = serde_json::to_vec(&resp).unwrap();
+                bytes.push(b'\n');
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await;
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_call_after_daemon_restart_does_not_kill_transport() {
+        // Scenario: the proxy's first attempt hits a daemon whose session
+        // UUID does not match (simulating a daemon restart between two
+        // tool calls). The fix retries once, re-reads metadata, and the
+        // second attempt succeeds.
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let sock_path = root.join("mati.sock");
+
+        // Initial daemon session "before restart". The proxy will read
+        // this UUID, but our canned responder pretends not to recognize
+        // it (returning session_mismatch). After the retry delay, we
+        // rotate metadata to a new UUID — exactly what `mati daemon stop`
+        // + `mati daemon start` would do in production.
+        let session_before = uuid::Uuid::new_v4();
+        let session_after = uuid::Uuid::new_v4();
+
+        let meta_before = super::super::metadata::DaemonMetadata {
+            pid: std::process::id(),
+            session: session_before,
+            owner: super::super::metadata::DaemonOwner::Daemon,
+        };
+        super::super::metadata::publish_metadata(&root, &meta_before).unwrap();
+
+        // Stage two responses on the same socket: the first is a
+        // SessionMismatch err (pre-restart daemon view), the second is a
+        // successful pong (post-restart daemon view).
+        let responder_handle = spawn_canned_responder(
+            sock_path.clone(),
+            vec![
+                serde_json::json!({
+                    "v": 2,
+                    "id": uuid::Uuid::new_v4(),
+                    "status": "err",
+                    "code": "session_mismatch",
+                    "message": "session mismatch: re-read daemon metadata and retry",
+                }),
+                serde_json::json!({
+                    "v": 2,
+                    "id": uuid::Uuid::new_v4(),
+                    "status": "ok",
+                    "data": "pong",
+                }),
+            ],
+        )
+        .await;
+
+        // Concurrent metadata rotation — fires during the retry delay.
+        // Mirrors what a real daemon restart does: writes fresh metadata.
+        let root_for_rotate = root.clone();
+        let rotate_handle = tokio::spawn(async move {
+            // Sleep just less than the proxy's 100ms retry settle so the
+            // metadata rewrite is committed before the second attempt.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let meta_after = super::super::metadata::DaemonMetadata {
+                pid: std::process::id(),
+                session: session_after,
+                owner: super::super::metadata::DaemonOwner::Daemon,
+            };
+            super::super::metadata::publish_metadata(&root_for_rotate, &meta_after).unwrap();
+        });
+
+        // Wrap in a tokio timeout: if the retry path is missing, the
+        // proxy returns the first attempt's envelope without ever
+        // dialing the second responder, which would leave the test
+        // hanging on the spare canned response. The timeout converts
+        // that latent hang into a deterministic failure with a clear
+        // error message.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::proxy_daemon_result(&root, "ping", serde_json::json!({})),
+        )
+        .await
+        .expect("proxy_daemon_result should resolve within 5s — retry path appears wedged");
+
+        rotate_handle.await.unwrap();
+        // Drop the responder task — the second canned response may go
+        // unconsumed in failure modes. Aborting prevents the test from
+        // hanging on `responder_handle.await` in failure mode.
+        responder_handle.abort();
+
+        // The proxy must transparently recover: caller sees Ok, not the
+        // session_mismatch error envelope from the first attempt.
+        match result {
+            super::ProxyDaemonResult::Ok(v) => {
+                let ok = v.get("ok") == Some(&serde_json::Value::Bool(true));
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+                assert!(
+                    ok,
+                    "second attempt should succeed after metadata rotation, \
+                     but caller saw the first attempt's session_mismatch envelope: \
+                     ok={ok} code={code:?} v={v}"
+                );
+            }
+            other => panic!(
+                "expected Ok(true) after auto-reconnect, got {other:?}; \
+                 the daemon-restart retry path is not engaging"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_call_session_mismatch_no_retry_target_returns_envelope() {
+        // Negative-side guard: if the second attempt also fails with the
+        // same error (e.g. the daemon was not actually restarted), the
+        // proxy still returns the structured error envelope to the
+        // caller — it does NOT panic, hang, or close the rmcp transport.
+        // This preserves the per-call structured-error discipline that
+        // keeps Claude's MCP session alive.
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let sock_path = root.join("mati.sock");
+
+        let session = uuid::Uuid::new_v4();
+        let meta = super::super::metadata::DaemonMetadata {
+            pid: std::process::id(),
+            session,
+            owner: super::super::metadata::DaemonOwner::Daemon,
+        };
+        super::super::metadata::publish_metadata(&root, &meta).unwrap();
+
+        // Both attempts get a session_mismatch — emulates a daemon that
+        // truly cannot be reconciled (wedged in a state the proxy can't
+        // recover from).
+        let responder_handle = spawn_canned_responder(
+            sock_path.clone(),
+            vec![
+                serde_json::json!({
+                    "v": 2,
+                    "id": uuid::Uuid::new_v4(),
+                    "status": "err",
+                    "code": "session_mismatch",
+                    "message": "session mismatch (1)",
+                }),
+                serde_json::json!({
+                    "v": 2,
+                    "id": uuid::Uuid::new_v4(),
+                    "status": "err",
+                    "code": "session_mismatch",
+                    "message": "session mismatch (2)",
+                }),
+            ],
+        )
+        .await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::proxy_daemon_result(&root, "ping", serde_json::json!({})),
+        )
+        .await
+        .expect("proxy_daemon_result must resolve within 5s");
+        responder_handle.abort();
+
+        // The caller MUST get a structured Ok envelope with ok:false +
+        // the session_mismatch code, never a panic or transport-killing
+        // surprise. socket_call (in tools.rs) renders this to a JSON
+        // error string — which is exactly the contract the rmcp loop
+        // expects: a String response, not a Result::Err.
+        match result {
+            super::ProxyDaemonResult::Ok(v) => {
+                assert_eq!(v.get("ok"), Some(&serde_json::Value::Bool(false)));
+                assert_eq!(
+                    v.get("code").and_then(|c| c.as_str()),
+                    Some("session_mismatch")
+                );
+            }
+            other => panic!("expected structured Ok envelope, got {other:?}"),
+        }
+    }
+
+    // ── Pass-29 regression: proxy_daemon_result handles side-effecting reads ──
+    //
+    // Pre-fix: every Socket-backed `mem_get` and `mem_bootstrap` MCP call
+    // panicked the rmcp task at `v1_to_v2_command` (no match arm), which
+    // surfaced to the client as `Transport closed` and wedged Phases 6–17
+    // of the smoke. The translation layer is the load-bearing artifact
+    // — pass 27's mock-UnixListener test bypassed it entirely, so the
+    // bug shipped.
+    //
+    // These tests drive `proxy_daemon_result` with the exact strings
+    // tools.rs sends today. Without the new arms in v1_to_v2_command,
+    // both panic. With the fix, both return a clean `NotRunning` because
+    // the socket doesn't exist — proving the translation succeeded
+    // before the connect attempt.
+
+    #[tokio::test]
+    async fn proxy_daemon_result_handles_mem_get_translation_no_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No socket file present — the call must reach the
+        // sock_path.exists() guard, which it cannot do if v1_to_v2_command
+        // panics first.
+        let result = super::proxy_daemon_result(
+            dir.path(),
+            "mem_get",
+            serde_json::json!({ "key": "file:src/main.rs" }),
+        )
+        .await;
+        assert!(
+            matches!(result, super::ProxyDaemonResult::NotRunning),
+            "mem_get without daemon must return NotRunning, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_daemon_result_handles_mem_bootstrap_translation_no_panic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let result = super::proxy_daemon_result(
+            dir.path(),
+            "mem_bootstrap",
+            serde_json::json!({ "context_files": ["src/lib.rs"] }),
+        )
+        .await;
+        assert!(
+            matches!(result, super::ProxyDaemonResult::NotRunning),
+            "mem_bootstrap without daemon must return NotRunning, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_daemon_v2_typed_path_handles_mem_set_mutations_no_panic() {
+        // The Socket-backend mem_set now takes the typed path. With no
+        // daemon present, the typed-Command serialize→connect path must
+        // surface as a clean NotRunning, never a panic. This is the
+        // load-bearing fence: any future caller that accidentally routes
+        // gotcha_upsert through the v1 mapper would fail
+        // v1_to_v2_command_no_mutations_silently_accepted in protocol.rs;
+        // here we make sure the typed path itself is wired end-to-end.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cmd = super::super::protocol::Command::GotchaConfirm(
+            super::super::protocol::GotchaConfirmInput {
+                key: "gotcha:test".into(),
+            },
+        );
+        let result = super::proxy_daemon_v2(dir.path(), cmd).await;
+        assert!(
+            matches!(result, super::ProxyDaemonResult::NotRunning),
+            "typed proxy_daemon_v2 must return NotRunning when daemon is absent, got {result:?}"
+        );
     }
 }

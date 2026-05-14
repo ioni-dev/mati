@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Fail rustdoc on broken intra-doc links, private items linked from
+  # public APIs, etc. Surfaces breakage that `cargo check` doesn't catch.
+  RUSTDOCFLAGS: -D warnings
 
 jobs:
   check:
@@ -27,14 +30,49 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
+
+      # Verify the binary builds without default features so the `semantic`
+      # feature gate (candle / usearch) cannot rot silently.
+      - name: cargo check --no-default-features
+        run: cargo check --locked --no-default-features --all-targets
+
+      # rustdoc with -D warnings (set via RUSTDOCFLAGS at the workflow level)
+      # catches broken intra-doc links and other doc-only regressions.
+      - name: cargo doc
+        run: cargo doc --locked --no-deps --all-features
+
+  # MSRV CI gate intentionally NOT enforced.
+  #
+  # ADR-008 documents MSRV at 1.82 as project intent. However, transitive
+  # deps in the Rust ecosystem (notably clap_lex 1.1.0+) ship Cargo.toml
+  # manifests using syntax newer than the 1.82 Cargo can parse, so a
+  # `runs-on: rust-toolchain@1.82.0` check fails on manifest parsing
+  # before reaching mati's own source. The MSRV declaration in Cargo.toml
+  # remains advisory documentation; enforcement would require either
+  # (a) pinning specific transitive versions (brittle) or (b) bumping
+  # MSRV and updating ADR-008.
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    # Run the default-included test suite on both Linux and macOS.
+    # macOS coverage exists because mati ships as a Claude Code plugin and
+    # most users run it on macOS — APFS fsync semantics, BSD socket nuances,
+    # and the `logd` watchdog have caused real failures invisible to a
+    # Linux-only matrix.
+    #
+    # SKIPPED ON PULL REQUESTS: this job takes >15min on cold cache and
+    # blocks PR feedback. It still runs on every push to main so coverage
+    # is preserved after merge. To re-enable for PRs, remove the `if:` line.
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,4 +81,193 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
+
+      # `cargo test --all-targets` does NOT include doc tests — they need
+      # an explicit `--doc` invocation. Without this, rustdoc examples
+      # rot silently between feature changes.
+      - name: cargo test --doc
+        run: cargo test --locked --doc
+
+  ignored-tests:
+    # The `#[ignore]`d integration tests cover subprocess lifecycle,
+    # crash recovery, concurrent socket dispatch, and the panic-hook
+    # pre-opened-fd path. They're slow and depend on a writable `~/`,
+    # so they don't run by default — but they do gate merges.
+    #
+    # SKIPPED ON PULL REQUESTS: subprocess tests are >15min on cold cache.
+    # Runs on push to main only. To re-enable for PRs, remove the `if:` line.
+    name: Ignored integration tests (${{ matrix.os }})
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -- --ignored
+        # `--test-threads=1` keeps the subprocess tests from racing each
+        # other on `~/.mati/<slug>/` lifecycle logs and per-project sockets.
+        # `stress_700000_edges_linux_kernel_scale` runs here too but is fine
+        # at thread=1.
+        run: cargo test --locked --all-targets -- --ignored --test-threads=1
+
+  benches:
+    # Benches are not run for wall-time (criterion regressions need a
+    # baseline + stable hardware that GH Actions does not provide). We
+    # only gate that they *compile*, so an SLO-relevant bench can't bit-rot
+    # silently between feature changes. Real bench runs happen locally
+    # against ADR-010 SLOs.
+    #
+    # SKIPPED ON PULL REQUESTS: criterion's release build is >10min on
+    # cold cache. Runs on push to main only. To re-enable for PRs, remove
+    # the `if:` line.
+    name: Benches compile
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo bench --no-run
+        run: cargo bench --locked --no-run
+
+  feature-matrix:
+    name: Feature matrix (cargo hack)
+    runs-on: ubuntu-latest
+    # `cargo check --all-targets` exercises one feature combination at a time.
+    # `cargo hack --feature-powerset` exercises every combination, which
+    # catches refactors inside `#[cfg(feature = "semantic")]` blocks that
+    # compile fine under `--all-features` but break under default features.
+    # mati-cloud may enable different combinations than the OSS binary, so
+    # this catches integration breaks before the downstream consumer sees
+    # them.
+    #
+    # Currently mati has one optional feature (`semantic`), so the powerset
+    # is two combinations. Cheap and informative.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: cargo hack check --feature-powerset
+        # NOTE: `--no-dev-deps` was tried here but conflicts with `--locked`
+        # — cargo-hack rewrites Cargo.toml in-place, which causes cargo
+        # to demand a Cargo.lock regeneration that `--locked` forbids.
+        # The current powerset is just two combos (`[]` and `[semantic]`),
+        # so the overhead of including dev-deps is negligible.
+        run: cargo hack check --locked --feature-powerset
+
+  semver:
+    name: Public API semver check
+    runs-on: ubuntu-latest
+    # DISABLED pre-publish: cargo-semver-checks needs a meaningful baseline
+    # to compare against. Pre-1.0 the project is allowed to make breaking
+    # changes within 0.x.y; pre-publish there is no crates.io baseline and
+    # no git tag to compare to. Per-PR comparison against `origin/main`
+    # produces noise (PRs that legitimately break pre-1.0 API would fail)
+    # without a corresponding consumer that pins to versions.
+    #
+    # Re-enable when:
+    #   - The crate is published to crates.io (set `version-tag-prefix: v`
+    #     and remove `baseline-rev`), OR
+    #   - A `v0.1.0` git tag exists (change `baseline-rev: origin/main` to
+    #     `baseline-rev: v0.1.0`).
+    #
+    # Remove the `if: false` below to re-enable.
+    if: false
+    # `mati_core` is consumed by the enterprise binary (mati-cloud) as a
+    # Cargo crate. An accidental breaking change to the public API surface
+    # without a major-version bump forces downstream rework. This job
+    # compares the PR's `mati_core` API against the `main` branch and fails
+    # if it finds a violation.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # cargo-semver-checks needs the baseline ref's history to compare
+          # against, not just the current commit.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo semver-checks (vs main)
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          # Cargo *package* name (not the [lib] name). The lib `mati_core`
+          # lives inside the `mati` package; the action looks up packages
+          # by their `[package].name` field.
+          package: mati
+          # `origin/main` rather than `main`: on PR runs GitHub Actions
+          # checks out the PR head, so the bare name `main` is not a
+          # local ref. `fetch-depth: 0` populates `origin/main` but does
+          # not create a local `main` branch, so `git rev-parse main^{tree}`
+          # would fail. The remote-tracking ref resolves cleanly.
+          baseline-rev: origin/main
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    # Fail fast on RUSTSEC vulnerabilities (default cargo-audit behavior:
+    # exit non-zero on Vulnerability entries, warnings allowed). Five
+    # accepted unmaintained/unsound advisories are documented in
+    # DECISIONS.md; new entries should be triaged before silencing here.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    # Broader supply-chain gate than `cargo audit` alone. Runs three of
+    # cargo-deny's four checks against `deny.toml`:
+    #
+    #   bans       — duplicate versions + wildcard version specifiers
+    #   advisories — same RUSTSEC vulnerability stream as cargo-audit,
+    #                plus optional yanked-crate detection (subsumes audit
+    #                job; kept separate for ADR-007 traceability)
+    #   sources    — only crates.io, no git deps, no unknown registries
+    #
+    # The fourth check (licenses) is INTENTIONALLY SKIPPED. Customer
+    # license-key validation belongs in mati-cloud per CLAUDE.md "What
+    # this repo must NEVER include". Dependency license scanning for the
+    # commercial consumer is mati-cloud's responsibility on its final
+    # binary, not ours upstream.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check (bans + advisories + sources)
+        run: cargo deny check bans advisories sources

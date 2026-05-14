@@ -312,7 +312,9 @@ async fn run_triage_mode(
             break;
         }
 
-        // Find which kind was selected
+        // Find which kind was selected. dialoguer's selection index is
+        // bounded by the same filtered set used to build the visible menu,
+        // so both lookups are structurally guaranteed.
         let selected_kind = group_order
             .iter()
             .filter(|k| {
@@ -322,9 +324,13 @@ async fn run_triage_mode(
                     .unwrap_or(false)
             })
             .nth(sel - 1)
-            .unwrap();
+            .expect(
+                "dialoguer sel is bounded by the same filtered group set used to build the menu",
+            );
 
-        let group_candidates = groups.get(selected_kind.label()).unwrap();
+        let group_candidates = groups
+            .get(selected_kind.label())
+            .expect("selected_kind came from the filter that requires this group to exist");
         triage_group(
             group_candidates,
             selected_kind,
@@ -401,7 +407,7 @@ async fn triage_group(
             let pb = ProgressBar::new(keys_to_confirm.len() as u64);
             pb.set_style(
                 ProgressStyle::with_template("  [{bar:40.green}] {pos}/{len} confirmed")
-                    .unwrap()
+                    .expect("static template literal — only fails on programmer error in the format string")
                     .progress_chars("█░░"),
             );
 

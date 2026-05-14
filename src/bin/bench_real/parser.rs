@@ -462,7 +462,7 @@ pub fn parse_ls_count(stdout: &str) -> usize {
     extract_file_keys(stdout).len()
 }
 
-/// Extract "file:<path>" keys from `mati ls files` output.
+/// Extract `file:<path>` keys from `mati ls files` output.
 ///
 /// Handles two output formats:
 /// - Hot path (cache hit): comfy_table with `┆` (U+2506) column separators.

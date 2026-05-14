@@ -1391,7 +1391,13 @@ mod tests {
     /// The Linux kernel has ~70,000 source + header files. At 10 EdgeKind
     /// variants each this represents the absolute ceiling of what mati will
     /// ever index. If this passes, mati handles any real-world repo.
+    ///
+    /// Ignored by default — running alongside the rest of the test suite
+    /// saturates APFS fsync + logd firehose on macOS (kernel watchdog
+    /// panic). Run explicitly:
+    ///   cargo test stress_700000 -- --ignored --test-threads=1 --nocapture
     #[tokio::test]
+    #[ignore = "linux-scale stress: run with `cargo test stress_700000 -- --ignored --test-threads=1`"]
     async fn stress_700000_edges_linux_kernel_scale() {
         use std::time::Instant;
 

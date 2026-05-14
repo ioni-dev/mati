@@ -701,7 +701,10 @@ fn parse_severity(input: &str) -> Priority {
 pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> {
     let mut record = match proxy.get(key).await? {
         Some(r) => r,
-        None => anyhow::bail!("no record found for '{key}'"),
+        None => anyhow::bail!(
+            "no record found for '{key}'.\n\
+             Run `mati gotcha list` to see existing gotcha keys."
+        ),
     };
 
     if record.category != Category::Gotcha {
