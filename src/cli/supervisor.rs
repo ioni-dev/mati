@@ -303,6 +303,11 @@ WantedBy=default.target
     }
 }
 
+/// Escape a string for embedding in a launchd plist. macOS-only because
+/// the systemd unit format does not require XML escaping — keeping this
+/// `#[cfg(target_os = "macos")]` avoids a `dead_code` warning on Linux CI
+/// where `render_launchd` is not compiled.
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -390,6 +395,7 @@ mod tests {
         assert!(hint.contains("mati-abcd1234.service"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn xml_escape_handles_special_chars() {
         assert_eq!(xml_escape("a&b"), "a&amp;b");

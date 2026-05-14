@@ -34,7 +34,16 @@ version = 2
 yanked = "warn"
 # Per-advisory exceptions are documented in DECISIONS.md ADR-007. Keep
 # in sync — if you ignore one here, link the ADR entry.
-ignore = []
+#
+# Listed exceptions:
+#   RUSTSEC-2024-0436 — `paste` unmaintained. Transitive (pulled in via
+#   one of the candle/usearch/tantivy stacks). The crate is feature-frozen
+#   and continues to compile; there is no actively-maintained replacement
+#   the upstream chain has migrated to yet. Re-evaluate when upstream
+#   moves off it.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive and feature-frozen; no upstream migration target yet" },
+]
 
 [bans]
 # Warn on duplicate versions of the same crate — flags supply-chain bloat
