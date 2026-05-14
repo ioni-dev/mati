@@ -597,6 +597,9 @@ fn read_line(lines: &mut io::Lines<io::StdinLock<'_>>) -> Result<String> {
 
 #[cfg(test)]
 mod qos_tests {
+    // Only test in this module is macOS-only; the import is gated to match
+    // so Linux builds don't warn `unused_imports`.
+    #[cfg(target_os = "macos")]
     use super::lower_worker_thread_qos;
 
     /// Verify that on_thread_start actually changes the QoS class of tokio
