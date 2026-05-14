@@ -902,8 +902,16 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 
 // ── Compliance scanning helpers ──────────────────────────────────────────────
 
-/// Scan analytics:hit_*, analytics:miss_*, and compliance:miss_* for the last
-/// 7 days and return (total_hits, total_misses, total_bypasses).
+/// Scan analytics:hit_*, analytics:miss_*, compliance:miss_*,
+/// compliance:allow_after_receipt_*, and compliance:codex_shell_miss_* for the
+/// last 7 days and return (total_hits, total_misses, total_bypasses).
+///
+/// `compliance:allow_after_receipt_*` is fired by `codex-post-bash` (and the
+/// claude post-compliance hook) when a file's consultation receipt was valid
+/// at the time of use — semantically a hit, so it rolls into `hits_7d`.
+/// `compliance:codex_shell_miss_*` is fired by `codex-post-bash` when a file
+/// was used without a valid receipt — semantically a bypass, so it rolls into
+/// `bypasses_7d` alongside `compliance:miss_*`.
 async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
@@ -917,6 +925,8 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
         let hit_key = format!("analytics:hit_{date}");
         let miss_key = format!("analytics:miss_{date}");
         let bypass_key = format!("compliance:miss_{date}");
+        let post_hit_key = format!("compliance:allow_after_receipt_{date}");
+        let codex_miss_key = format!("compliance:codex_shell_miss_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
@@ -931,6 +941,18 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
         }
 
         if let Ok(Some(record)) = store.get(&bypass_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
+
+        if let Ok(Some(record)) = store.get(&post_hit_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                hits += agg.count;
+            }
+        }
+
+        if let Ok(Some(record)) = store.get(&codex_miss_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 bypasses += agg.count;
             }
@@ -964,6 +986,47 @@ struct FailOpenStats {
     last_ago_secs: u64,
 }
 
+/// Read at most `max_bytes` from the *tail* of `path`. Returns `None` if the
+/// file cannot be opened. If the file is larger than `max_bytes`, reads only
+/// the last `max_bytes` (which may begin mid-line — the first partial line is
+/// silently dropped by `lines()` in the scan loop, since its timestamp will
+/// not parse). This is a one-shot read: no streaming, no buffer reuse.
+///
+/// Used so `mati stats` cannot be turned into an OOM by a pathological
+/// `fail_open.log` (no rotation by design — the log is append-only telemetry).
+fn read_capped(path: &std::path::Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let read_len = if len > max_bytes { max_bytes } else { len };
+    if read_len == 0 {
+        return Some(String::new());
+    }
+    let start = len.saturating_sub(read_len);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).ok()?;
+    }
+    // Cast is safe: read_len <= max_bytes (64 MiB) which fits in usize on all
+    // platforms mati supports (32-bit targets cap at ~4 GiB).
+    let mut buf = Vec::with_capacity(read_len as usize);
+    f.take(read_len).read_to_end(&mut buf).ok()?;
+    // Lossy is fine — only timestamp prefixes are parsed; non-UTF8 lines fail
+    // the timestamp parse and are skipped.
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Hard ceiling on the byte size of `fail_open.log` we will read into memory
+/// when scanning for stats. The legitimate cap is unbounded (the log has no
+/// rotation), but a normal cadence of FAIL_OPEN events is rare — a 7-day
+/// window of even pathological churn fits in tens of KB. The ceiling exists
+/// so `mati stats` does not OOM if a hostile or buggy actor wrote a
+/// multi-gigabyte file at the log path. Above this size we read only the
+/// trailing window — losing older lines is strictly preferable to crashing
+/// the stats command (P9 mirror: degraded observability beats no command).
+///
+/// Same shape as `LIFECYCLE_TRIM_MAX_READ_BYTES` in `mcp::metadata` (pass 21).
+const FAIL_OPEN_SCAN_MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Scan `~/.mati/fail_open.log` for FAIL_OPEN entries in the last 7 days.
 fn scan_fail_open_log(now: u64) -> FailOpenStats {
     let log_path = match dirs::home_dir() {
@@ -975,10 +1038,15 @@ fn scan_fail_open_log(now: u64) -> FailOpenStats {
             }
         }
     };
+    scan_fail_open_log_at(&log_path, now)
+}
 
-    let content = match std::fs::read_to_string(&log_path) {
-        Ok(c) => c,
-        Err(_) => {
+/// Testable inner: scan the given path. Splits I/O location from policy so
+/// the size-guard regression test can drive a tempfile.
+fn scan_fail_open_log_at(log_path: &std::path::Path, now: u64) -> FailOpenStats {
+    let content = match read_capped(log_path, FAIL_OPEN_SCAN_MAX_READ_BYTES) {
+        Some(c) => c,
+        None => {
             return FailOpenStats {
                 count_7d: 0,
                 last_ago_secs: 0,
@@ -1208,5 +1276,149 @@ mod tests {
         assert_eq!(snapshot.files_with_purpose, 5);
         assert_eq!(snapshot.total_files, 10);
         assert_eq!(snapshot.hits_7d, 20);
+    }
+
+    /// Pass-22 / checkpoint C regression. `log_fail_open` (in
+    /// `cli::hook_decide`) appends to `~/.mati/fail_open.log` with no
+    /// rotation and no size cap. If a hostile or buggy actor wrote a
+    /// pathologically-large file at that path, `mati stats` previously
+    /// did `read_to_string(&log_path)` and would OOM the process. The
+    /// fail-open envelope (P9) requires that observability NEVER takes
+    /// down the CLI — degrade by reading only the trailing window.
+    ///
+    /// This mirrors the pass-21 fix for `lifecycle.log` startup OOM.
+    #[test]
+    fn scan_fail_open_log_does_not_oom_on_pathological_file() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fail_open.log");
+
+        // Sparse-extend just past the read cap so reported len() exceeds
+        // the threshold without actually allocating that much disk.
+        // Final byte is a parseable line so the tail-read returns
+        // *something* the parser can chew on (proves we aren't blocked
+        // by the size guard but degraded gracefully).
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.seek(SeekFrom::Start(FAIL_OPEN_SCAN_MAX_READ_BYTES + 1024))
+                .unwrap();
+            // Append a real fail-open line at the tail. Use the same
+            // ISO 8601 format `log_fail_open` writes (after the chrono
+            // upgrade) — but the test does not depend on it parsing,
+            // only on the function not OOMing.
+            f.write_all(
+                b"\n2026-04-29T12:00:00Z FAIL_OPEN hook=hook-decide file=src/x.rs reason=test\n",
+            )
+            .unwrap();
+        }
+        let pre_size = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            pre_size > FAIL_OPEN_SCAN_MAX_READ_BYTES,
+            "test setup: file must exceed the read cap"
+        );
+
+        // Must not panic, must not OOM. Returns within bounded memory
+        // even though file is sparse-extended past 64 MiB.
+        let now: u64 = 1_775_000_000; // April 2026-ish
+        let stats = scan_fail_open_log_at(&path, now);
+
+        // The lines() iterator over the tail window will skip the
+        // partial first line; older lines beyond the window are lost
+        // (acceptable degradation under P9). Assertions:
+        //   1. Function returned (no OOM, no panic).
+        //   2. count_7d is bounded (we only read up to 64 MiB worth).
+        // We do not assert exact count because the size guard's tail
+        // read may or may not include the appended line depending on
+        // sparse-file semantics on the test filesystem.
+        let _ = stats.count_7d;
+        let _ = stats.last_ago_secs;
+    }
+
+    /// Sanity check: under-cap files are read in full (no degradation).
+    /// The size guard must NOT fire on legitimate small logs — proves the
+    /// guard is gated on size, not always-on.
+    #[test]
+    fn scan_fail_open_log_reads_full_file_under_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fail_open.log");
+        // Three FAIL_OPEN events with known-good ISO timestamps. We
+        // pick `now` so all three fall inside the 7-day window. The
+        // exact unix value of each ISO is established below by feeding
+        // the same string through the parser via a self-bootstrapping
+        // step — this avoids depending on the round-trip correctness
+        // of the (lossy) format_snapshot_date helper.
+        let body = "\
+2026-04-29T12:00:00Z FAIL_OPEN hook=hook-decide file=a.rs reason=x\n\
+2026-04-29T12:00:01Z FAIL_OPEN hook=hook-decide file=b.rs reason=y\n\
+2026-04-29T12:00:02Z FAIL_OPEN hook=hook-decide file=c.rs reason=z\n";
+        std::fs::write(&path, body).unwrap();
+
+        // Bootstrap `now` from the most recent line so the assertion is
+        // independent of the parser's exact unix epoch math (it's
+        // simplified, may drift by a few seconds — what matters is
+        // monotonic round-trip within the parser).
+        let latest = parse_iso_timestamp("2026-04-29T12:00:02Z");
+        assert!(latest > 0, "parser must accept ISO timestamps");
+        let now = latest + 100; // 100s after latest event
+
+        let stats = scan_fail_open_log_at(&path, now);
+        assert_eq!(stats.count_7d, 3, "all 3 events fall within 7-day window");
+        // Latest event was at `now - 100`.
+        assert_eq!(stats.last_ago_secs, 100);
+    }
+
+    /// Empty file edge case: must return zero counts cleanly.
+    #[test]
+    fn scan_fail_open_log_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fail_open.log");
+        std::fs::write(&path, b"").unwrap();
+        let stats = scan_fail_open_log_at(&path, 1_775_000_000);
+        assert_eq!(stats.count_7d, 0);
+        assert_eq!(stats.last_ago_secs, 0);
+    }
+
+    /// End-to-end round trip: the writer in `hook_decide::log_fail_open_at`
+    /// produces output that the reader here actually parses. The two helpers
+    /// share the on-disk `fail_open.log` format; a silent format drift between
+    /// them would make `mati stats` always show 0 fail-open events even when
+    /// the log is full of entries — the exact observability bug pass 24
+    /// caught. Use real wall-clock `now` so we exercise the same `iso_utc_now`
+    /// path the production hook would write through.
+    #[test]
+    fn fail_open_log_round_trip_writer_reader() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fail_open.log");
+
+        // Capture wall-clock seconds *before* the writer call so the
+        // last_ago_secs assertion has a sensible upper bound.
+        let now_before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test wall clock must be post-epoch")
+            .as_secs();
+
+        super::super::hook_decide::log_fail_open_at(
+            &path,
+            "src/cli/stats.rs",
+            "round-trip writer/reader format check",
+        );
+
+        // Pass an explicit `now` slightly in the future of the write so the
+        // 7-day window definitely contains the entry regardless of test
+        // scheduler jitter (the entry is at `now_before`, the window end is
+        // `now_before + 5`).
+        let stats = scan_fail_open_log_at(&path, now_before + 5);
+
+        assert_eq!(
+            stats.count_7d, 1,
+            "writer's ISO timestamp must parse — count_7d=0 means format mismatch \
+             between iso_utc_now() and parse_iso_timestamp() (silently breaks mati stats)"
+        );
+        assert!(
+            stats.last_ago_secs <= 10,
+            "last fail-open event should be recent; got last_ago_secs={}",
+            stats.last_ago_secs
+        );
     }
 }

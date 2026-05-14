@@ -649,6 +649,64 @@ fn set_gotcha_keys(record: &mut Record, keys: Vec<String>) {
     }
 }
 
+/// Remove a single gotcha key from the dirty marker if it is the only key
+/// currently flagged.
+///
+/// Used by [`super::gotcha_ops`] as the "disarm" half of its cancellation
+/// guard: after a successful all-secondary-writes path, the caller pre-armed
+/// `mark_dirty(key)` upfront and now wants to release it. If another caller
+/// has flagged a different key concurrently (or a previous failure left a
+/// key behind), we leave the marker alone — `repair_fast` on the next boot
+/// will reconcile both. This is best-effort and never blocks the caller.
+pub async fn clear_dirty_key_if_solo(store: &Store, gotcha_key: &str) {
+    let Some(mut marker) = read_dirty_marker(store).await else {
+        return;
+    };
+    if !marker.dirty {
+        return;
+    }
+    // Only clear if our key is the *only* dirty one. If other keys are
+    // present, leaving the marker intact is the safe choice — repair will
+    // reconcile our successfully-written derived state as a no-op.
+    let only_ours = marker.affected_keys.len() == 1 && marker.affected_keys[0] == gotcha_key;
+    if !only_ours {
+        return;
+    }
+
+    let now = now_secs();
+    marker.dirty = false;
+    marker.affected_keys.clear();
+    marker.last_repaired_at = now;
+
+    let record = Record {
+        key: DIRTY_MARKER_KEY.to_string(),
+        value: String::new(),
+        payload: serde_json::to_value(&marker).ok(),
+        category: Category::Analytics,
+        priority: Priority::Normal,
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: crate::store::record::QualityScore::layer0_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::StaticAnalysis,
+        confidence: crate::store::record::ConfidenceScore::for_new_record(
+            &RecordSource::StaticAnalysis,
+        ),
+        gap_analysis_score: 0.0,
+    };
+    let _ = store.put(DIRTY_MARKER_KEY, &record).await;
+}
+
 async fn clear_dirty_marker(store: &Store, now: u64) {
     if let Some(mut marker) = read_dirty_marker(store).await {
         marker.dirty = false;
@@ -1111,5 +1169,95 @@ mod tests {
         );
 
         store.close().await.unwrap();
+    }
+
+    /// Fault-injection test for the `mati serve` boot-time auto-drain.
+    ///
+    /// Simulates an unclean shutdown that left real drift AND a dirty marker.
+    /// On reopen, the same `is_dirty + repair_gotcha_indexes(Fast)` sequence
+    /// that `mcp::server::serve()` runs must clear both. Locks down the
+    /// contract for the boot-time recovery added alongside the panic hook
+    /// and explicit shutdown flush.
+    #[tokio::test]
+    async fn auto_drain_on_reopen_clears_dirty_marker_and_drift() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Session 1: introduce drift (gotcha now targets [B,C], but file A still
+        // references it from before, file C has not yet been linked, plus a
+        // stale edge to A). Mark dirty as if a partial-write recorded the
+        // failure. Close to simulate the daemon process exiting.
+        {
+            let store = Store::open(dir.path()).await.unwrap();
+            store
+                .put("file:src/a.rs", &make_file("src/a.rs", &["gotcha:moved"]))
+                .await
+                .unwrap();
+            store
+                .put("file:src/b.rs", &make_file("src/b.rs", &["gotcha:moved"]))
+                .await
+                .unwrap();
+            store
+                .put("file:src/c.rs", &make_file("src/c.rs", &[]))
+                .await
+                .unwrap();
+            store
+                .put(
+                    "gotcha:moved",
+                    &make_gotcha("gotcha:moved", &["src/b.rs", "src/c.rs"]),
+                )
+                .await
+                .unwrap();
+            let stale_edge = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:moved");
+            store
+                .put_raw(&stale_edge.to_key(), &now_secs().to_le_bytes())
+                .await
+                .unwrap();
+            mark_dirty(&store, "gotcha:moved", "simulated partial-write").await;
+
+            // Sanity: pre-shutdown state really is broken.
+            let pre = check_gotcha_indexes(&store).await.unwrap();
+            assert!(pre.has_drift(), "drift must exist before shutdown");
+            assert!(is_dirty(&store).await, "marker must be set before shutdown");
+
+            store.close().await.unwrap();
+        }
+
+        // Session 2: reopen and run the exact sequence `serve()` runs at
+        // startup. The dirty marker must survive the reopen (it's persisted
+        // in the knowledge tree), and the Fast drain must clear both the
+        // marker and the drift.
+        {
+            let store = Store::open(dir.path()).await.unwrap();
+            assert!(
+                is_dirty(&store).await,
+                "dirty marker should survive reopen across sessions"
+            );
+
+            let report = repair_gotcha_indexes(&store, RepairMode::Fast)
+                .await
+                .unwrap();
+            assert!(report.repaired_count > 0, "Fast drain must apply repairs");
+            assert!(
+                report.dirty_marker_cleared,
+                "Fast drain must clear the dirty marker on success"
+            );
+
+            assert!(
+                !is_dirty(&store).await,
+                "auto-drain should leave no dirty marker behind"
+            );
+
+            let post = check_gotcha_indexes(&store).await.unwrap();
+            assert!(
+                !post.has_drift(),
+                "no drift after auto-drain: missing_file={}, stale_file={}, missing_edge={}, stale_edge={}",
+                post.missing_file_links.len(),
+                post.stale_file_links.len(),
+                post.missing_edges.len(),
+                post.stale_edges.len(),
+            );
+
+            store.close().await.unwrap();
+        }
     }
 }

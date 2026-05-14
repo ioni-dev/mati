@@ -29,6 +29,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::store::AgentKind;
+
 // ── Protocol constants ──────────────────────────────────────────────────────
 
 /// Protocol version. Bump on incompatible wire format changes.
@@ -63,6 +65,12 @@ pub struct Request {
     /// audit/provenance, NOT an authentication token. Peer identity is
     /// established via Unix peer credentials (`peer_cred()`).
     pub session: Uuid,
+    /// Client-declared agent identity for attribution (ADR-018).
+    /// Optional and additive: pre-multi-agent clients omit this field;
+    /// the daemon stamps `Unknown` server-side when absent. NOT verified —
+    /// same-UID processes are trusted (THREAT_MODEL.md §3.I).
+    #[serde(default)]
+    pub agent: Option<AgentKind>,
     /// The command to execute.
     pub cmd: Command,
 }
@@ -154,6 +162,11 @@ pub enum Command {
     #[serde(rename = "ping")]
     Ping,
 
+    /// Snapshot of live daemon metrics — per-command counters and latency
+    /// percentiles. Pure read, no audit, no side effects.
+    #[serde(rename = "metrics")]
+    Metrics,
+
     /// Single record lookup by key.
     #[serde(rename = "get")]
     Get(GetInput),
@@ -189,6 +202,11 @@ pub enum Command {
     /// Scan enforcement events stored as raw JSON in the knowledge tree.
     #[serde(rename = "scan_enforcement_events")]
     ScanEnforcementEvents(ScanEnforcementEventsInput),
+
+    /// Read a runtime configuration value (e.g. enforcement.mode).
+    /// Pure read — no audit, no side effects.
+    #[serde(rename = "config_get")]
+    ConfigGet(ConfigGetInput),
 
     // ── B. Reads with audited side effects ──────────────────────────────
     /// Single record lookup with consultation receipt side effect.
@@ -236,6 +254,11 @@ pub enum Command {
     /// Create or update a dev note.
     #[serde(rename = "dev_note_upsert")]
     DevNoteUpsert(DevNoteUpsertInput),
+
+    /// Write a runtime configuration value. Records an
+    /// `EnforcementConfigChanged` event when the value actually changes.
+    #[serde(rename = "config_set")]
+    ConfigSet(ConfigSetInput),
 
     /// Append a session analytics event (6 homogeneous event types).
     #[serde(rename = "session_log")]
@@ -545,6 +568,23 @@ pub struct ConsultationHitInput {
     pub key: String,
 }
 
+/// Input for `Command::ConfigGet`. `key` is the dotted config name
+/// (e.g. `enforcement.mode`, `enforcement.retention`).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigGetInput {
+    pub key: String,
+}
+
+/// Input for `Command::ConfigSet`. Values are always sent as strings on the
+/// wire and parsed/validated by the dispatcher.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSetInput {
+    pub key: String,
+    pub value: String,
+}
+
 // ── Shared enums ────────────────────────────────────────────────────────────
 
 /// Severity level for gotcha records. Closed enum.
@@ -601,6 +641,7 @@ impl Command {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Ping => "ping",
+            Self::Metrics => "metrics",
             Self::Get(_) => "get",
             Self::HookEvaluate(_) => "hook_evaluate",
             Self::ScanPrefix(_) => "scan_prefix",
@@ -610,6 +651,8 @@ impl Command {
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
             Self::MemQuery(_) => "mem_query",
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
+            Self::ConfigGet(_) => "config_get",
+            Self::ConfigSet(_) => "config_set",
             Self::MemGet(_) => "mem_get",
             Self::MemBootstrap(_) => "mem_bootstrap",
             Self::GotchaUpsert(_) => "gotcha_upsert",
@@ -652,7 +695,10 @@ impl Command {
             Self::DevNoteUpsert(i) => i.key.as_deref().unwrap_or(""),
             Self::SessionLog(i) => &i.key,
             Self::ConsultationHit(i) => &i.key,
+            Self::ConfigGet(i) => &i.key,
+            Self::ConfigSet(i) => &i.key,
             Self::Ping
+            | Self::Metrics
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
             | Self::SessionFlush
@@ -684,6 +730,7 @@ impl Command {
             | Self::DevNoteUpsert(_)
             | Self::SessionLog(_)
             | Self::ConsultationHit(_)
+            | Self::ConfigSet(_)
             | Self::SessionFlush
             | Self::SessionHarvest
         )
@@ -743,6 +790,7 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
     match cmd {
         // Pure reads — the only commands that still use this mapping.
         "ping" => json!({"type": "ping"}),
+        "metrics" => json!({"type": "metrics"}),
         "get" => json!({"type": "get", "key": args["key"]}),
         "hook_evaluate" => json!({
             "type": "hook_evaluate",
@@ -775,6 +823,18 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "type": "scan_enforcement_events",
             "since_seq": args.get("since_seq").and_then(|v| v.as_u64()).unwrap_or(0),
             "until_seq": args.get("until_seq").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+        }),
+        // Side-effecting reads — pure read shape on the wire, sessions-tree
+        // side effects (consultation receipt, audit) live entirely on the
+        // daemon side. Routing these through the typed Command enum is
+        // strictly preferable, but the MCP Socket-backend tools.rs paths
+        // call into this mapper today; without these arms every mem_get /
+        // mem_bootstrap call against a Socket-mode `mati serve` panics the
+        // rmcp task and surfaces as `Transport closed` to the client.
+        "mem_get" => json!({"type": "mem_get", "key": args["key"]}),
+        "mem_bootstrap" => json!({
+            "type": "mem_bootstrap",
+            "context_files": args.get("context_files").cloned().unwrap_or_else(|| serde_json::json!([])),
         }),
         other => {
             panic!(
@@ -1224,6 +1284,7 @@ mod tests {
         // Build one instance of each variant and verify kind() matches serde rename.
         let cases: Vec<(&str, Command)> = vec![
             ("ping", Command::Ping),
+            ("metrics", Command::Metrics),
             ("get", Command::Get(GetInput { key: "k".into() })),
             (
                 "hook_evaluate",
@@ -1362,7 +1423,7 @@ mod tests {
             ("session_harvest", Command::SessionHarvest),
         ];
 
-        assert_eq!(cases.len(), 24, "must cover all 24 command variants");
+        assert_eq!(cases.len(), 25, "must cover all 25 command variants");
         for (expected_kind, cmd) in &cases {
             assert_eq!(
                 cmd.kind(),
@@ -1377,6 +1438,7 @@ mod tests {
     fn command_is_mutation_classification() {
         // Pure reads — must NOT be mutations
         assert!(!Command::Ping.is_mutation());
+        assert!(!Command::Metrics.is_mutation());
         assert!(!Command::Get(GetInput { key: "k".into() }).is_mutation());
         assert!(!Command::MemQuery(MemQueryInput {
             query: "q".into(),
@@ -1515,5 +1577,171 @@ mod tests {
         assert_eq!(Priority::from(SP::Normal), Priority::Normal);
         assert_eq!(Priority::from(SP::High), Priority::High);
         assert_eq!(Priority::from(SP::Critical), Priority::Critical);
+    }
+
+    // ── v1_to_v2_command translation tests (pass-29 regression) ─────────
+    //
+    // Pass 28 shipped a panic-on-default mapper that crashed every Socket-
+    // backed `mem_get` and `mem_bootstrap` call (rmcp task panic →
+    // "Transport closed"). The test below locks the mapper to the same
+    // wire shape the daemon's typed DTOs (`MemGetInput`, `MemBootstrapInput`)
+    // expect — both have `deny_unknown_fields`, so the test doubles as a
+    // contract check between the proxy layer and `dispatch_v2`.
+
+    #[test]
+    fn v1_to_v2_command_handles_mem_get() {
+        let mapped = v1_to_v2_command("mem_get", &serde_json::json!({ "key": "file:src/main.rs" }));
+        assert_eq!(
+            mapped,
+            serde_json::json!({ "type": "mem_get", "key": "file:src/main.rs" })
+        );
+
+        // Round-trip into a typed Command — proves the wire shape decodes
+        // through `MemGetInput::deny_unknown_fields`.
+        let cmd: Command = serde_json::from_value(mapped).expect("mem_get must decode as Command");
+        match cmd {
+            Command::MemGet(input) => assert_eq!(input.key, "file:src/main.rs"),
+            other => panic!("expected Command::MemGet, got {:?}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn v1_to_v2_command_handles_mem_bootstrap() {
+        // Args present.
+        let mapped = v1_to_v2_command(
+            "mem_bootstrap",
+            &serde_json::json!({ "context_files": ["src/lib.rs", "src/main.rs"] }),
+        );
+        let cmd: Command =
+            serde_json::from_value(mapped).expect("mem_bootstrap must decode as Command");
+        match cmd {
+            Command::MemBootstrap(input) => {
+                assert_eq!(input.context_files, vec!["src/lib.rs", "src/main.rs"]);
+            }
+            other => panic!("expected Command::MemBootstrap, got {:?}", other.kind()),
+        }
+
+        // Args missing — must default to an empty list, not panic.
+        let mapped_empty = v1_to_v2_command("mem_bootstrap", &serde_json::json!({}));
+        let cmd_empty: Command = serde_json::from_value(mapped_empty).unwrap();
+        match cmd_empty {
+            Command::MemBootstrap(input) => assert!(input.context_files.is_empty()),
+            other => panic!("expected MemBootstrap, got {:?}", other.kind()),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "v1_to_v2_command called with unsupported command")]
+    fn v1_to_v2_command_panic_message_lists_only_unsupported() {
+        // Genuinely unsupported strings (mutations / typos) must still
+        // panic loudly — that signals a misrouted Socket-backend caller
+        // that should be using `daemon_v2()` with a typed Command.
+        let _ = v1_to_v2_command("totally_bogus_cmd_xyz", &serde_json::json!({}));
+    }
+
+    #[test]
+    fn v1_to_v2_command_no_mutations_silently_accepted() {
+        // Fence: every mutating command name must panic — they have no
+        // place in the mapper. If a future contributor adds (say) "mem_set"
+        // here, this test must catch it.
+        let mutation_names = [
+            "mem_set",
+            "gotcha_upsert",
+            "gotcha_confirm",
+            "gotcha_tombstone",
+            "decision_upsert",
+            "dev_note_upsert",
+            "file_enrich",
+            "file_reparse",
+            "file_edit_hook",
+            "doc_capture",
+            "session_log",
+            "consultation_hit",
+            "session_flush",
+            "session_harvest",
+        ];
+        for name in mutation_names {
+            let result = std::panic::catch_unwind(|| {
+                v1_to_v2_command(name, &serde_json::json!({}));
+            });
+            assert!(
+                result.is_err(),
+                "mutation command '{name}' must panic in v1_to_v2_command — \
+                 mutating callers must use daemon_v2() with typed Command"
+            );
+        }
+    }
+
+    // ── ADR-018: Request.agent additive field ───────────────────────────
+
+    /// Pre-multi-agent clients send wire JSON without an `agent` field.
+    /// ADR-018 requires this to keep deserializing. This test is the
+    /// backward-compatibility regression bar.
+    #[test]
+    fn request_without_agent_field_deserializes_as_none() {
+        let json = serde_json::json!({
+            "v": 2,
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "session": "660e8400-e29b-41d4-a716-446655440000",
+            "cmd": { "type": "ping" }
+        });
+        let req: Request = serde_json::from_value(json).unwrap();
+        assert!(
+            req.agent.is_none(),
+            "missing `agent` must decode to None (ADR-018 additive contract)"
+        );
+    }
+
+    #[test]
+    fn request_with_agent_field_deserializes_and_preserves_value() {
+        for (wire, expected) in [
+            ("claude", AgentKind::Claude),
+            ("codex", AgentKind::Codex),
+            ("cli", AgentKind::Cli),
+            ("supervisor", AgentKind::Supervisor),
+            ("unknown", AgentKind::Unknown),
+        ] {
+            let json = serde_json::json!({
+                "v": 2,
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "session": "660e8400-e29b-41d4-a716-446655440000",
+                "agent": wire,
+                "cmd": { "type": "ping" }
+            });
+            let req: Request = serde_json::from_value(json)
+                .unwrap_or_else(|e| panic!("decode failed for agent={wire}: {e}"));
+            assert_eq!(req.agent, Some(expected));
+        }
+    }
+
+    #[test]
+    fn request_with_unknown_agent_variant_rejected() {
+        let json = serde_json::json!({
+            "v": 2,
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "session": "660e8400-e29b-41d4-a716-446655440000",
+            "agent": "gemini",
+            "cmd": { "type": "ping" }
+        });
+        let res = serde_json::from_value::<Request>(json);
+        assert!(
+            res.is_err(),
+            "unknown agent variant must reject at decode (closed enum)"
+        );
+    }
+
+    #[test]
+    fn request_with_agent_round_trips_through_serialize_deserialize() {
+        let original = Request {
+            v: PROTOCOL_VERSION,
+            id: Uuid::new_v4(),
+            session: Uuid::new_v4(),
+            agent: Some(AgentKind::Codex),
+            cmd: Command::Ping,
+        };
+        let bytes = serde_json::to_vec(&original).unwrap();
+        let round_tripped: Request = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(round_tripped.agent, Some(AgentKind::Codex));
+        assert_eq!(round_tripped.v, PROTOCOL_VERSION);
     }
 }

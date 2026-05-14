@@ -27,7 +27,7 @@
 //!
 //! `mpsc::Sender::send()` acquires an internal lock on every call. With 8
 //! threads and 80k files, 80k individual sends ≈ 16ms of contention overhead.
-//! Flushing every [`FLUSH_THRESHOLD`] entries reduces sends to ~2 500,
+//! Flushing every `FLUSH_THRESHOLD` entries reduces sends to ~2 500,
 //! cutting that overhead to ~500µs while still giving the receiver batches
 //! early enough for meaningful parse pipelining.
 

@@ -125,7 +125,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
                     //   - No PID (legacy) → active only if recent
                     let active =
                         if let Some((_ts, pid)) = crate::cli::daemon::parse_sentinel(&content) {
-                            crate::cli::daemon::is_pid_alive(pid)
+                            mati_core::mcp::metadata::is_pid_alive(pid)
                         } else if let Ok(ts) = content.trim().parse::<u64>() {
                             now.saturating_sub(ts) < crate::cli::daemon::STARTING_STALE_SECS
                         } else {

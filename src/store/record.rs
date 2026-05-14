@@ -56,6 +56,28 @@ pub enum RecordSource {
     Import,
 }
 
+/// Which agent issued a daemon request, used for attribution in
+/// `MutationEvent` and `Record.created_by` / `Record.last_modified_by`.
+///
+/// Client-declared, not server-verified — same-UID processes are trusted
+/// (THREAT_MODEL.md §3.C, §3.I; ADR-018). The daemon stamps `pid` from
+/// `SO_PEERCRED` separately; this enum is the human/tool side of attribution.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    /// MCP stdio client (Claude Code's rmcp transport).
+    Claude,
+    /// Codex hooks (`codex-*` variants).
+    Codex,
+    /// Direct CLI invocation by the developer.
+    Cli,
+    /// Daemon-internal operations (e.g. repair on startup, periodic
+    /// reparse). Stamped server-side, never client-declared.
+    Supervisor,
+    /// Attribution unknown or pre-v2 record.
+    Unknown,
+}
+
 /// Semantic category of a record. Determines key prefix and injection behaviour.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

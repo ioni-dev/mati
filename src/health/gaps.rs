@@ -7,7 +7,7 @@
 //! risk_score = change_frequency * (1 - coverage_score)
 //! ```
 //!
-//! Coverage depends on gap type (see [`coverage_for_gap`]).
+//! Coverage depends on gap type (see `coverage_for_gap`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

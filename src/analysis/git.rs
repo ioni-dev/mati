@@ -1,6 +1,6 @@
 //! Git history mining — Layer 0 signal extraction via git2.
 //!
-//! Single-pass revwalk over full history (capped at [`MAX_COMMITS`] non-merge
+//! Single-pass revwalk over full history (capped at `MAX_COMMITS` non-merge
 //! commits) to extract per-file change frequency, last author, hotspot
 //! detection, rename tracking, and co-change pairs.
 //!

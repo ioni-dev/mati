@@ -7,6 +7,13 @@
 .DS_Store
 *.db
 
+# Local artifacts — audit reports, crash logs, profiler output
+mati-audit-*.pdf
+panic-window-*.txt
+*.prof
+*.flamegraph
+
+
 # Internal docs — local only, never commit
 TASKS.md
 ARCHITECTURE.md

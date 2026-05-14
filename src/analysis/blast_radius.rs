@@ -79,7 +79,7 @@ impl BlastRadius {
     /// count, and `traverse_incoming` at `TRANSITIVE_DEPTH` for the full
     /// transitive set. Transitive count excludes direct importers.
     ///
-    /// Prefer [`compute_all`] for batch computation — it's O(V+E) total
+    /// Prefer [`Self::compute_all`] for batch computation — it's O(V+E) total
     /// vs O(N*(V+E)) when calling this in a loop.
     pub fn compute(file_key: &str, graph: &Graph) -> Self {
         let direct_set: HashSet<String> = graph

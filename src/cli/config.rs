@@ -10,11 +10,6 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-use mati_core::store::enforcement::{
-    get_enforcement_mode, get_retention_days, set_enforcement_mode, set_retention_days,
-    EnforcementMode,
-};
-
 use super::proxy::StoreProxy;
 
 #[derive(Args)]
@@ -53,83 +48,27 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
 }
 
 async fn run_get(proxy: &StoreProxy, key: &str) -> Result<()> {
-    let store = proxy.direct_store().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config commands require direct store access.\n\
-             Stop the daemon first: mati daemon stop"
-        )
-    })?;
-
-    match key {
-        "enforcement.mode" => {
-            let mode = get_enforcement_mode(store).await;
-            let label = match mode {
-                EnforcementMode::Advisory => "advisory",
-                EnforcementMode::Strict => "strict",
-            };
-            println!("{label}");
-        }
-        "enforcement.retention" => {
-            let days = get_retention_days(store).await;
-            println!("{days}");
-        }
-        _ => {
-            anyhow::bail!(
-                "unknown config key: {key}\n\
-                 Valid keys: enforcement.mode, enforcement.retention"
-            );
-        }
-    }
+    let value = proxy.config_get(key).await?;
+    println!("{value}");
     Ok(())
 }
 
 async fn run_set(proxy: &StoreProxy, key: &str, value: &str) -> Result<()> {
-    let store = proxy.direct_store().ok_or_else(|| {
-        anyhow::anyhow!(
-            "config commands require direct store access.\n\
-             Stop the daemon first: mati daemon stop"
-        )
-    })?;
-
+    let old = proxy.config_set(key, value).await?;
     match key {
         "enforcement.mode" => {
-            let mode = match value {
-                "advisory" => EnforcementMode::Advisory,
-                "strict" => EnforcementMode::Strict,
-                _ => {
-                    anyhow::bail!(
-                        "invalid enforcement mode: {value}\n\
-                         Valid values: advisory, strict"
-                    );
-                }
-            };
-            let old = set_enforcement_mode(store, mode).await?;
-            let old_label = match old {
-                EnforcementMode::Advisory => "advisory",
-                EnforcementMode::Strict => "strict",
-            };
-            if old == mode {
+            if old == value {
                 println!("enforcement.mode is already {value}");
+            } else if old.is_empty() {
+                println!("enforcement.mode: {value}");
             } else {
-                println!("enforcement.mode: {old_label} → {value}");
+                println!("enforcement.mode: {old} → {value}");
             }
         }
         "enforcement.retention" => {
-            let days: u64 = value.parse().map_err(|_| {
-                anyhow::anyhow!("invalid retention value: {value} (expected integer days)")
-            })?;
-            if days == 0 {
-                anyhow::bail!("retention must be at least 1 day");
-            }
-            set_retention_days(store, days).await?;
-            println!("enforcement.retention: {days} days");
+            println!("enforcement.retention: {value} days");
         }
-        _ => {
-            anyhow::bail!(
-                "unknown config key: {key}\n\
-                 Valid keys: enforcement.mode, enforcement.retention"
-            );
-        }
+        _ => {}
     }
     Ok(())
 }
