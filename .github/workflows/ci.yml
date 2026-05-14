@@ -210,7 +210,12 @@ jobs:
           # lives inside the `mati` package; the action looks up packages
           # by their `[package].name` field.
           package: mati
-          baseline-rev: main
+          # `origin/main` rather than `main`: on PR runs GitHub Actions
+          # checks out the PR head, so the bare name `main` is not a
+          # local ref. `fetch-depth: 0` populates `origin/main` but does
+          # not create a local `main` branch, so `git rev-parse main^{tree}`
+          # would fail. The remote-tracking ref resolves cleanly.
+          baseline-rev: origin/main
 
   audit:
     name: Security audit
