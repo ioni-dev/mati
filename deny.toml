@@ -36,13 +36,20 @@ yanked = "warn"
 # in sync — if you ignore one here, link the ADR entry.
 #
 # Listed exceptions:
-#   RUSTSEC-2025-0119 — `paste` unmaintained. Transitive (pulled in via
-#   one of the candle/usearch/tantivy stacks). The crate is feature-frozen
-#   and continues to compile; there is no actively-maintained replacement
-#   the upstream chain has migrated to yet. Re-evaluate when upstream
-#   moves off it.
+#   RUSTSEC-2024-0436 — `paste` unmaintained. Transitive via the
+#   candle / gemm / tokenizers stack (semantic feature). Crate is
+#   feature-frozen and continues to compile; no actively-maintained
+#   replacement the upstream chain has migrated to yet.
+#   RUSTSEC-2025-0119 — `number_prefix` unmaintained. Transitive via
+#   indicatif (progress bars). Stable behavior, no replacement target.
+#
+# Both are silenced rather than fixed because the upstream chains have
+# not migrated. Re-evaluate when upstream moves off them. CI's advisory
+# DB may surface different IDs than a local install depending on its
+# snapshot age, so we ignore both proactively.
 ignore = [
-    { id = "RUSTSEC-2025-0119", reason = "paste is transitive and feature-frozen; no upstream migration target yet" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is transitive (candle stack) and feature-frozen; no upstream migration target yet" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix is transitive (indicatif) and stable; no replacement target" },
 ]
 
 [bans]
