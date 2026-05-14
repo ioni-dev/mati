@@ -25,7 +25,11 @@ use crate::store::record::{
     StalenessScore, StalenessTier,
 };
 
-use super::server::{proxy_daemon_result, ProxyDaemonResult};
+use super::protocol::{
+    self as proto, Command, DecisionUpsertInput, DevNoteUpsertInput, GotchaConfirmInput,
+    GotchaDraftInput, GotchaTombstoneInput,
+};
+use super::server::{proxy_daemon_result, proxy_daemon_v2, ProxyDaemonResult};
 use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
 
 /// Vector B — appended to every mem_bootstrap result (64 tokens, budget 77).
@@ -202,21 +206,49 @@ impl MatiServer {
         };
 
         match proxy_daemon_result(root, op, args).await {
-            ProxyDaemonResult::Ok(v) => {
-                if v.get("ok") != Some(&serde_json::Value::Bool(true)) {
-                    let err = v
-                        .get("error")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("daemon request failed");
-                    return json!({ "error": err }).to_string();
-                }
-                match v.get("data") {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(other) => other.to_string(),
-                    None => json!({ "error": "daemon response missing data" }).to_string(),
-                }
-            }
+            ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
             other => Self::socket_error(op, other),
+        }
+    }
+
+    /// Send a typed v2 [`Command`] over the daemon socket and format the
+    /// response the same way [`Self::socket_call`] does.
+    ///
+    /// Use this for mutating commands (gotcha_upsert/confirm/tombstone,
+    /// decision_upsert, dev_note_upsert) which have no entry in the legacy
+    /// v1→v2 mapper and would panic the rmcp task if routed through
+    /// [`Self::socket_call`].
+    async fn socket_call_typed(&self, cmd: Command) -> String {
+        let MatiBackend::Socket { root } = &self.backend else {
+            unreachable!("socket_call_typed only valid for socket backend");
+        };
+        let op = cmd.kind();
+        match proxy_daemon_v2(root, cmd).await {
+            ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
+            other => Self::socket_error(op, other),
+        }
+    }
+
+    /// Render a daemon envelope `{ok,data}` / `{ok:false,error}` into the
+    /// JSON string the rmcp `String` return type expects.
+    fn format_envelope(op: &str, v: serde_json::Value) -> String {
+        if v.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = v
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("daemon request failed");
+            // Surface the structured error code if present so callers can
+            // distinguish validation failures from store errors.
+            let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
+            if code.is_empty() {
+                return json!({ "error": err, "op": op }).to_string();
+            }
+            return json!({ "error": err, "op": op, "code": code }).to_string();
+        }
+        match v.get("data") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => json!({ "error": "daemon response missing data" }).to_string(),
         }
     }
 }
@@ -644,26 +676,33 @@ impl MatiServer {
                     .unwrap_or_default()
                     .as_secs();
 
-                // Validate key namespace
-                let valid_prefix = ["file:", "gotcha:", "decision:", "dev_note:"]
+                // Validate key namespace. `file:*` writes are intentionally
+                // excluded — file records are owned by the static-analysis
+                // pipeline (`mati init` Layer 0 + the `file_enrich` /
+                // `file_reparse` typed Commands), never by direct mem_set.
+                // The Socket path enforces the same restriction in
+                // `build_mem_set_command`; both backends now accept and
+                // reject identical key prefixes.
+                let valid_prefix = ["gotcha:", "decision:", "dev_note:"]
                     .iter()
                     .any(|p| params.key.starts_with(p));
                 if !valid_prefix {
                     return serde_json::json!({
-                        "error": "key must start with file:, gotcha:, decision:, or dev_note:"
+                        "error": "key must start with gotcha:, decision:, or dev_note:"
                     })
                     .to_string();
                 }
 
-                // Parse category
+                // Parse category. `File` is intentionally absent — file
+                // records are owned by the static-analysis pipeline (see the
+                // key-namespace check above for the full justification).
                 let category = match params.category.as_str() {
-                    "File" => Category::File,
                     "Gotcha" => Category::Gotcha,
                     "Decision" => Category::Decision,
                     "DevNote" => Category::DevNote,
                     other => {
                         return serde_json::json!({
-                    "error": format!("unknown category: {other}. Valid: File, Gotcha, Decision, DevNote")
+                    "error": format!("unknown category: {other}. Valid: Gotcha, Decision, DevNote")
                 })
                 .to_string();
                     }
@@ -696,7 +735,6 @@ impl MatiServer {
                 // This prevents miscategorized records (e.g., gotcha: key
                 // with Category::File) that would corrupt the knowledge store.
                 let expected_category = match params.key.split(':').next().unwrap_or("") {
-                    "file" => Category::File,
                     "gotcha" => Category::Gotcha,
                     "decision" => Category::Decision,
                     "dev_note" => Category::DevNote,
@@ -736,18 +774,6 @@ impl MatiServer {
                                 Ok(())
                             } else {
                                 Err("gotcha requires payload with non-empty 'rule' and 'reason'")
-                            }
-                        }
-                        Category::File => {
-                            let has_purpose = !params.value.is_empty()
-                                || obj
-                                    .and_then(|o| o.get("purpose"))
-                                    .and_then(|v| v.as_str())
-                                    .is_some_and(|s| !s.is_empty());
-                            if has_purpose {
-                                Ok(())
-                            } else {
-                                Err("file record requires non-empty value or payload.purpose")
                             }
                         }
                         Category::Decision => {
@@ -1026,25 +1052,176 @@ impl MatiServer {
                 .to_string()
             }
             MatiBackend::Socket { .. } => {
-                let cmd = match params.action.as_str() {
-                    "confirm" => "gotcha_confirm",
-                    "delete" => "gotcha_tombstone",
-                    _ => "mem_set",
-                };
-                self.socket_call(
-                    cmd,
-                    json!({
-                        "key": params.key,
-                        "value": params.value,
-                        "category": params.category,
-                        "payload": params.payload,
-                        "tags": params.tags,
-                        "priority": params.priority,
-                    }),
-                )
-                .await
+                // Pass-29 fix: route mem_set through typed Commands via
+                // proxy_daemon_v2 instead of the legacy v1 mapper. The
+                // mapper has no arms for gotcha_upsert / gotcha_confirm /
+                // gotcha_tombstone / decision_upsert / dev_note_upsert /
+                // the bogus literal "mem_set" — every prior call panicked
+                // the rmcp task and surfaced as `Transport closed` to the
+                // client.
+                match build_mem_set_command(&params) {
+                    Ok(cmd) => self.socket_call_typed(cmd).await,
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
             }
         }
+    }
+}
+
+/// Map a `MemSetParams` request to a typed v2 [`Command`] for daemon dispatch.
+///
+/// Returns `Err(String)` when the request cannot be expressed as a typed
+/// Command — the caller renders this into a JSON error envelope rather
+/// than panicking the MCP transport.
+///
+/// # Routing rules
+///
+/// - `action = "confirm"` / `"delete"` → key MUST start with `gotcha:`.
+///   This mirrors the Direct path's `mem_set_confirm` / `mem_set_delete`
+///   guards (tools.rs:~1058).
+/// - `action = "write"` (default) routes by key prefix:
+///   - `gotcha:*`   → [`Command::GotchaUpsert`]
+///   - `decision:*` → [`Command::DecisionUpsert`]
+///   - `dev_note:*` → [`Command::DevNoteUpsert`]
+///   - other        → error (file: writes have no public typed Command —
+///     file records are managed by the static-analysis pipeline +
+///     `file_enrich` / `file_reparse`, not direct mem_set).
+fn build_mem_set_command(params: &MemSetParams) -> Result<Command, String> {
+    match params.action.as_str() {
+        "confirm" => {
+            if !params.key.starts_with("gotcha:") {
+                return Err("confirm action only applies to gotcha: keys".into());
+            }
+            Ok(Command::GotchaConfirm(GotchaConfirmInput {
+                key: params.key.clone(),
+            }))
+        }
+        "delete" => {
+            if !params.key.starts_with("gotcha:") {
+                return Err("delete action only applies to gotcha: keys".into());
+            }
+            Ok(Command::GotchaTombstone(GotchaTombstoneInput {
+                key: params.key.clone(),
+            }))
+        }
+        "write" | "" => build_mem_set_write_command(params),
+        other => Err(format!(
+            "unknown action: {other}. Valid: write, confirm, delete"
+        )),
+    }
+}
+
+fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String> {
+    // Some MCP clients (Codex) send the payload as a JSON-encoded string;
+    // mirror the Direct-path normalization (tools.rs ~860).
+    let payload = match &params.payload {
+        serde_json::Value::String(s) => {
+            serde_json::from_str::<serde_json::Value>(s).unwrap_or_else(|_| params.payload.clone())
+        }
+        other => other.clone(),
+    };
+
+    let priority = parse_protocol_priority(&params.priority);
+
+    if let Some(stripped) = params.key.strip_prefix("gotcha:") {
+        if stripped.is_empty() {
+            return Err("gotcha key must not be just the prefix".into());
+        }
+        let rule = field_string(&payload, "rule")
+            .ok_or_else(|| "gotcha payload requires non-empty 'rule'".to_string())?;
+        let reason = field_string(&payload, "reason")
+            .ok_or_else(|| "gotcha payload requires non-empty 'reason'".to_string())?;
+        let severity = parse_protocol_severity(payload.get("severity").and_then(|v| v.as_str()));
+        let affected_files = field_string_list(&payload, "affected_files");
+        let ref_url = payload
+            .get("ref_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        return Ok(Command::GotchaUpsert(GotchaDraftInput {
+            key: params.key.clone(),
+            rule,
+            reason,
+            severity,
+            affected_files,
+            ref_url,
+            tags: params.tags.clone(),
+            priority,
+            source: None,
+        }));
+    }
+
+    if let Some(slug) = params.key.strip_prefix("decision:") {
+        if slug.is_empty() {
+            return Err("decision key must not be just the prefix".into());
+        }
+        let summary = field_string(&payload, "summary")
+            .ok_or_else(|| "decision payload requires non-empty 'summary'".to_string())?;
+        let rationale = field_string(&payload, "rationale")
+            .ok_or_else(|| "decision payload requires non-empty 'rationale'".to_string())?;
+        return Ok(Command::DecisionUpsert(DecisionUpsertInput {
+            slug: slug.to_string(),
+            value: params.value.clone(),
+            summary,
+            rationale,
+            tags: params.tags.clone(),
+            priority,
+        }));
+    }
+
+    if let Some(stripped) = params.key.strip_prefix("dev_note:") {
+        if stripped.is_empty() {
+            return Err("dev_note key must not be just the prefix".into());
+        }
+        if params.value.is_empty() {
+            return Err("dev_note requires non-empty value".into());
+        }
+        return Ok(Command::DevNoteUpsert(DevNoteUpsertInput {
+            key: Some(params.key.clone()),
+            text: params.value.clone(),
+            tags: params.tags.clone(),
+            priority,
+        }));
+    }
+
+    Err("mem_set write requires key with gotcha:/decision:/dev_note: prefix".into())
+}
+
+fn field_string(payload: &serde_json::Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn field_string_list(payload: &serde_json::Value, field: &str) -> Vec<String> {
+    payload
+        .get(field)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_protocol_priority(s: &str) -> proto::Priority {
+    match s {
+        "Critical" | "critical" => proto::Priority::Critical,
+        "High" | "high" => proto::Priority::High,
+        "Low" | "low" => proto::Priority::Low,
+        _ => proto::Priority::Normal,
+    }
+}
+
+fn parse_protocol_severity(s: Option<&str>) -> proto::Severity {
+    match s.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("critical") => proto::Severity::Critical,
+        Some("high") => proto::Severity::High,
+        Some("low") => proto::Severity::Low,
+        _ => proto::Severity::Normal,
     }
 }
 
@@ -1673,7 +1850,10 @@ pub async fn assemble_context_packet(
         if !impact_files.is_empty() {
             let mut impact_section = String::from("## Highest Impact Files\n");
             for (fr, _score) in impact_files.iter().take(3) {
-                let br = fr.blast_radius.as_ref().unwrap();
+                let br = fr
+                    .blast_radius
+                    .as_ref()
+                    .expect("filter_map above kept only files with Some(blast_radius)");
                 let line = format!(
                     "- `{}`: {} direct importers ({})\n",
                     fr.path,
@@ -2848,8 +3028,13 @@ mod tests {
 
     // ── mem_set tests ────────────────────────────────────────────────────────
 
+    /// Direct-path mem_set must reject `file:*` writes — they are owned by
+    /// the static-analysis pipeline (`mati init` Layer 0 + the
+    /// `file_enrich` / `file_reparse` typed Commands). Mirrors the Socket
+    /// path's rejection in `build_mem_set_command` so both backends behave
+    /// identically (regression for the codex smoke-test step 57 failure).
     #[tokio::test]
-    async fn mem_set_writes_new_file_record() {
+    async fn mem_set_rejects_file_writes_on_direct_path() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
@@ -2871,22 +3056,27 @@ mod tests {
             .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true);
-        assert_eq!(parsed["key"], "file:src/main.rs");
-        assert!((parsed["confidence"].as_f64().unwrap() - 0.60).abs() < 0.01);
+        let error = parsed["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected an error envelope, got: {result}"));
+        assert!(
+            error.contains("must start with"),
+            "file: write must be rejected by the prefix gate, got: {error}"
+        );
+        assert_eq!(parsed.get("ok"), None, "no record should be written");
 
-        // Read back and verify
+        // Confirm no record was persisted.
         let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("file:src/main.rs")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.value, "Handles CLI dispatch and binary entry point");
-        assert_eq!(record.source, RecordSource::ClaudeEnrich);
-        assert!(record.payload.is_some());
+        assert!(
+            graph
+                .store()
+                .get("file:src/main.rs")
+                .await
+                .unwrap()
+                .is_none(),
+            "file: write must not create a record"
+        );
     }
 
     #[tokio::test]
@@ -2933,75 +3123,10 @@ mod tests {
         assert_eq!(record.source, RecordSource::ClaudeEnrich);
     }
 
-    #[tokio::test]
-    async fn mem_set_preserves_existing_layer0_data() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        // Pre-populate a Layer 0 file record
-        let mut layer0 = Record::layer0_file_stub("file:src/db.rs", device_id(), 1, now());
-        layer0.payload = Some(serde_json::json!({
-            "path": "src/db.rs",
-            "purpose": "",
-            "entry_points": ["fn connect", "fn query"],
-            "imports": ["tokio", "sqlx"],
-            "gotcha_keys": [],
-            "decision_keys": [],
-            "todos": [],
-            "unsafe_count": 0,
-            "unwrap_count": 2,
-            "change_frequency": 45,
-            "last_author": "alice",
-            "is_hotspot": true,
-            "token_cost_estimate": 120,
-            "last_modified_session": 0
-        }));
-        store.put("file:src/db.rs", &layer0).await.unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
-
-        // Enrich — only send purpose and updated gotcha_keys
-        let result = server
-            .mem_set(Parameters(MemSetParams {
-                action: "write".to_string(),
-                key: "file:src/db.rs".to_string(),
-                value: "Manages database connection pooling and query execution".to_string(),
-                category: "File".to_string(),
-                payload: serde_json::json!({
-                    "purpose": "Manages database connection pooling and query execution",
-                    "gotcha_keys": ["gotcha:always-close-connections"]
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            }))
-            .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true);
-
-        // Verify Layer 0 fields preserved via merge
-        let graph_arc = server.graph_arc();
-        let graph = graph_arc.read().await;
-        let record = graph.store().get("file:src/db.rs").await.unwrap().unwrap();
-        let payload = record.payload.unwrap();
-
-        // Enrichment fields updated
-        assert_eq!(
-            payload["purpose"],
-            "Manages database connection pooling and query execution"
-        );
-        assert_eq!(payload["gotcha_keys"][0], "gotcha:always-close-connections");
-
-        // Layer 0 structural fields preserved
-        assert_eq!(payload["entry_points"][0], "fn connect");
-        assert_eq!(payload["imports"][0], "tokio");
-        assert_eq!(payload["change_frequency"], 45);
-        assert_eq!(payload["is_hotspot"], true);
-
-        // Source upgraded to ClaudeEnrich
-        assert_eq!(record.source, RecordSource::ClaudeEnrich);
-    }
+    // `mem_set_preserves_existing_layer0_data` was removed: file: writes
+    // are no longer accepted via mem_set on either backend. Layer 0
+    // preservation under enrichment is now exercised by the
+    // `file_enrich` typed Command's tests (see `handle_file_enrich`).
 
     #[tokio::test]
     async fn mem_set_rejects_invalid_key_prefix() {
@@ -3015,7 +3140,7 @@ mod tests {
                 action: "write".to_string(),
                 key: "session:12345".to_string(),
                 value: "test".to_string(),
-                category: "File".to_string(),
+                category: "Gotcha".to_string(),
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
@@ -3023,10 +3148,10 @@ mod tests {
             .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("must start with"));
+        let error = parsed["error"].as_str().unwrap();
+        assert!(error.contains("must start with"), "got: {error}");
+        // file: was deliberately removed from the accepted prefix list.
+        assert!(!error.contains("file:"), "got: {error}");
     }
 
     #[tokio::test]
@@ -3039,7 +3164,7 @@ mod tests {
         let result = server
             .mem_set(Parameters(MemSetParams {
                 action: "write".to_string(),
-                key: "file:test.rs".to_string(),
+                key: "gotcha:test".to_string(),
                 value: "test".to_string(),
                 category: "Unknown".to_string(),
                 payload: serde_json::json!({}),
@@ -3062,14 +3187,18 @@ mod tests {
         let graph = Graph::load(store).await.unwrap();
         let server = MatiServer::new(graph);
 
-        // gotcha: key with File category — must be rejected.
+        // gotcha: key with Decision category — must be rejected.
+        // (File is no longer a valid category for mem_set, so the prior
+        // gotcha:/File pairing now fails category parsing instead of the
+        // mismatch check; pick another valid-but-wrong category to keep
+        // exercising the mismatch arm.)
         let result = server
             .mem_set(Parameters(MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:should-fail".to_string(),
                 value: "test".to_string(),
-                category: "File".to_string(),
-                payload: serde_json::json!({"purpose": "test"}),
+                category: "Decision".to_string(),
+                payload: serde_json::json!({"summary": "x", "rationale": "y"}),
                 tags: vec![],
                 priority: "Normal".to_string(),
             }))
@@ -3449,12 +3578,13 @@ mod tests {
         let result = server
             .mem_set(Parameters(MemSetParams {
                 action: "write".to_string(),
-                key: "file:src/brand_new.rs".to_string(),
-                value: "Brand new module for regression test".to_string(),
-                category: "File".to_string(),
+                key: "gotcha:store-read-ok-none".to_string(),
+                value: "Regression rule because regression reason".to_string(),
+                category: "Gotcha".to_string(),
                 payload: serde_json::json!({
-                    "path": "src/brand_new.rs",
-                    "purpose": "Brand new module for regression test"
+                    "rule": "Regression rule",
+                    "reason": "regression reason",
+                    "severity": "Normal"
                 }),
                 tags: vec![],
                 priority: "Normal".to_string(),
@@ -3466,18 +3596,18 @@ mod tests {
             parsed["ok"], true,
             "writing a new key must succeed (Ok(None) arm)"
         );
-        assert_eq!(parsed["key"], "file:src/brand_new.rs");
+        assert_eq!(parsed["key"], "gotcha:store-read-ok-none");
 
         // Verify record persisted
         let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
         let record = graph
             .store()
-            .get("file:src/brand_new.rs")
+            .get("gotcha:store-read-ok-none")
             .await
             .unwrap()
             .expect("record must exist after write");
-        assert_eq!(record.value, "Brand new module for regression test");
+        assert_eq!(record.value, "Regression rule because regression reason");
 
         // Note: the Err(e) path (store read failure) returns:
         //   {"error": "store read failed — refusing to write: <details>"}
@@ -3717,17 +3847,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
 
-        // Seed a DeveloperManual record with high confidence.
-        let mut original = make_record(
-            "file:src/preserve.rs",
-            "Original purpose from Layer 0",
-            Category::File,
-            0.7,
-        );
+        // Seed a DeveloperManual record with high confidence. (Switched from
+        // a file: key to a gotcha: key after file: writes were removed from
+        // mem_set; the merge-on-overwrite semantics under test are the same.)
+        let mut original =
+            make_gotcha_record("gotcha:preserve-confirmation", "Original rule", true, 0.7);
         original.source = RecordSource::DeveloperManual;
         original.confidence.value = 0.85;
         original.confidence.confirmation_count = 3;
-        store.put("file:src/preserve.rs", &original).await.unwrap();
+        store
+            .put("gotcha:preserve-confirmation", &original)
+            .await
+            .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
         let server = MatiServer::new(graph);
@@ -3736,10 +3867,10 @@ mod tests {
         let result = server
             .mem_set(Parameters(MemSetParams {
                 action: "write".to_string(),
-                key: "file:src/preserve.rs".to_string(),
-                value: "Updated purpose from enrichment".to_string(),
-                category: "File".to_string(),
-                payload: serde_json::json!({"path": "src/preserve.rs"}),
+                key: "gotcha:preserve-confirmation".to_string(),
+                value: "Updated rule from enrichment".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({"reason": "updated reason"}),
                 tags: vec![],
                 priority: "Normal".to_string(),
             }))
@@ -3752,12 +3883,12 @@ mod tests {
         let graph = graph_arc.read().await;
         let record = graph
             .store()
-            .get("file:src/preserve.rs")
+            .get("gotcha:preserve-confirmation")
             .await
             .unwrap()
             .expect("record must exist");
         assert_eq!(
-            record.value, "Updated purpose from enrichment",
+            record.value, "Updated rule from enrichment",
             "value must be updated"
         );
         // DeveloperManual source + high confidence should be preserved
@@ -4099,5 +4230,165 @@ mod tests {
             core_pos < leaf_pos,
             "core.rs should appear before leaf.rs in impact section"
         );
+    }
+
+    // ── Pass-29 regression: build_mem_set_command routing ──────────────
+    //
+    // The Socket-backend mem_set previously dispatched
+    // "gotcha_confirm" / "gotcha_tombstone" / "mem_set" through the
+    // legacy v1 mapper (`v1_to_v2_command`) which has no entries for
+    // those commands and panicked the rmcp task. The fix routes through
+    // typed Commands; these tests pin the routing logic.
+    //
+    // All test inputs are constructed manually instead of via JSON
+    // parsing — `MemSetParams` is `Deserialize`-only.
+
+    fn make_params(action: &str, key: &str) -> MemSetParams {
+        MemSetParams {
+            action: action.to_string(),
+            key: key.to_string(),
+            value: String::new(),
+            category: String::new(),
+            payload: serde_json::Value::Object(serde_json::Map::new()),
+            tags: vec![],
+            priority: "Normal".to_string(),
+        }
+    }
+
+    #[test]
+    fn mem_set_socket_routes_gotcha_confirm() {
+        let p = make_params("confirm", "gotcha:foo");
+        let cmd = build_mem_set_command(&p).expect("must build");
+        assert_eq!(cmd.kind(), "gotcha_confirm");
+        assert_eq!(cmd.target_key(), "gotcha:foo");
+    }
+
+    #[test]
+    fn mem_set_socket_rejects_confirm_on_non_gotcha_key() {
+        let p = make_params("confirm", "decision:not-allowed");
+        let err = build_mem_set_command(&p).expect_err("must reject");
+        assert!(
+            err.contains("gotcha:"),
+            "error must mention gotcha: prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mem_set_socket_routes_gotcha_tombstone() {
+        let p = make_params("delete", "gotcha:foo");
+        let cmd = build_mem_set_command(&p).expect("must build");
+        assert_eq!(cmd.kind(), "gotcha_tombstone");
+        assert_eq!(cmd.target_key(), "gotcha:foo");
+    }
+
+    #[test]
+    fn mem_set_socket_routes_gotcha_upsert_by_key_prefix() {
+        let mut p = make_params("write", "gotcha:stripe-idempotency");
+        p.payload = serde_json::json!({
+            "rule": "Always include an idempotency key",
+            "reason": "Stripe retries cause double charges without it",
+            "severity": "High",
+            "affected_files": ["src/payments/stripe.rs"],
+        });
+        p.tags = vec!["payments".into()];
+        p.priority = "High".into();
+        let cmd = build_mem_set_command(&p).expect("must build");
+        assert_eq!(cmd.kind(), "gotcha_upsert");
+        match cmd {
+            Command::GotchaUpsert(input) => {
+                assert_eq!(input.key, "gotcha:stripe-idempotency");
+                assert_eq!(input.rule, "Always include an idempotency key");
+                assert_eq!(input.severity, proto::Severity::High);
+                assert_eq!(input.priority, proto::Priority::High);
+                assert_eq!(input.affected_files, vec!["src/payments/stripe.rs"]);
+                assert_eq!(input.tags, vec!["payments".to_string()]);
+            }
+            _ => panic!("expected GotchaUpsert"),
+        }
+    }
+
+    #[test]
+    fn mem_set_socket_routes_decision_upsert_by_key_prefix() {
+        let mut p = make_params("write", "decision:retry-strategy");
+        p.value = "We use exponential backoff because linear overloads downstream".into();
+        p.payload = serde_json::json!({
+            "summary": "Exponential backoff for all retries",
+            "rationale": "Linear retry caused cascading failures in prod 2024-01",
+        });
+        let cmd = build_mem_set_command(&p).expect("must build");
+        assert_eq!(cmd.kind(), "decision_upsert");
+        match cmd {
+            Command::DecisionUpsert(input) => {
+                assert_eq!(input.slug, "retry-strategy");
+                assert_eq!(input.summary, "Exponential backoff for all retries");
+                assert!(input.rationale.contains("cascading"));
+            }
+            _ => panic!("expected DecisionUpsert"),
+        }
+    }
+
+    #[test]
+    fn mem_set_socket_routes_dev_note_upsert_by_key_prefix() {
+        let mut p = make_params("write", "dev_note:remember-changelog");
+        p.value = "Remember to update the changelog before release".into();
+        let cmd = build_mem_set_command(&p).expect("must build");
+        assert_eq!(cmd.kind(), "dev_note_upsert");
+        match cmd {
+            Command::DevNoteUpsert(input) => {
+                assert_eq!(input.key.as_deref(), Some("dev_note:remember-changelog"));
+                assert!(input.text.contains("changelog"));
+            }
+            _ => panic!("expected DevNoteUpsert"),
+        }
+    }
+
+    #[test]
+    fn mem_set_socket_rejects_write_with_unknown_prefix() {
+        // file: writes are not supported via mem_set Socket path —
+        // there is no public typed Command for them.
+        let p = make_params("write", "file:src/main.rs");
+        let err = build_mem_set_command(&p).expect_err("must reject");
+        assert!(
+            err.contains("gotcha:") && err.contains("decision:") && err.contains("dev_note:"),
+            "error must list valid prefixes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mem_set_socket_rejects_unknown_action() {
+        let p = make_params("smuggle", "gotcha:foo");
+        let err = build_mem_set_command(&p).expect_err("must reject");
+        assert!(
+            err.contains("smuggle"),
+            "error must echo the bad action, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mem_set_socket_rejects_gotcha_write_missing_payload_fields() {
+        let p = make_params("write", "gotcha:incomplete");
+        let err = build_mem_set_command(&p).expect_err("must reject");
+        assert!(
+            err.contains("rule"),
+            "error must mention 'rule', got: {err}"
+        );
+    }
+
+    #[test]
+    fn mem_set_socket_handles_codex_string_payload() {
+        // Codex sends payload as a JSON-encoded string; the typed
+        // builder must transparently parse it (matching Direct path).
+        let mut p = make_params("write", "gotcha:codex-style");
+        p.payload = serde_json::Value::String(
+            r#"{"rule":"do X","reason":"because Y","severity":"low"}"#.to_string(),
+        );
+        let cmd = build_mem_set_command(&p).expect("must build from stringified payload");
+        match cmd {
+            Command::GotchaUpsert(input) => {
+                assert_eq!(input.rule, "do X");
+                assert_eq!(input.severity, proto::Severity::Low);
+            }
+            _ => panic!("expected GotchaUpsert"),
+        }
     }
 }

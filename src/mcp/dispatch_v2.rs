@@ -41,12 +41,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
 use crate::graph::Graph;
 use crate::mcp::metadata::PeerContext;
+use crate::mcp::metrics;
 use crate::mcp::protocol::{self, AuditEntry, Command, ErrorCode, Request, Response};
 use crate::store::session as sess;
 
@@ -79,70 +80,93 @@ pub(crate) async fn dispatch_v2(
     ctx: &RequestContext,
     req: Request,
 ) -> Response {
-    // 1. Version check — enforced before any dispatch or side effect.
-    if req.v != protocol::PROTOCOL_VERSION {
-        let resp = Response::err(
-            req.id,
-            ErrorCode::VersionMismatch,
-            format!(
-                "protocol version mismatch: client={} server={}",
-                req.v,
-                protocol::PROTOCOL_VERSION
-            ),
-        );
-        // Audit version mismatch for mutating commands (best-effort since
-        // the version itself is wrong — we don't know which tree to target).
-        if req.cmd.is_mutation() {
-            best_effort_audit(graph, ctx, &req, false, Some(ErrorCode::VersionMismatch)).await;
-        }
-        return resp;
-    }
+    // Capture command kind before dispatch so it survives any `req` move into
+    // a handler. The metrics layer is a process-global no-op when not
+    // initialized (tests, etc), so this is safe regardless of daemon state.
+    let command_kind = req.cmd.kind();
+    let start = Instant::now();
 
-    // 1b. Session fence — reject requests from stale clients whose cached
-    // daemon metadata predates a daemon restart. The client should re-read
-    // DaemonMetadata and retry once. Nil session on the request is tolerated
-    // only when the daemon itself has a nil session (test / legacy fallback).
-    if req.session != ctx.daemon_session {
-        let resp = Response::err(
-            req.id,
-            ErrorCode::SessionMismatch,
-            format!(
-                "session mismatch: request={} daemon={}; re-read daemon metadata and retry",
-                req.session, ctx.daemon_session
-            ),
-        );
-        if req.cmd.is_mutation() {
-            best_effort_audit(graph, ctx, &req, false, Some(ErrorCode::SessionMismatch)).await;
+    // Funnel every return path through a single block expression so the
+    // metric recorder below captures version-mismatch and session-mismatch
+    // rejections the same way it captures successful dispatches.
+    let resp: Response = 'dispatch: {
+        // 1. Version check — enforced before any dispatch or side effect.
+        if req.v != protocol::PROTOCOL_VERSION {
+            let resp = Response::err(
+                req.id,
+                ErrorCode::VersionMismatch,
+                format!(
+                    "protocol version mismatch: client={} server={}",
+                    req.v,
+                    protocol::PROTOCOL_VERSION
+                ),
+            );
+            // Audit version mismatch for mutating commands (best-effort since
+            // the version itself is wrong — we don't know which tree to target).
+            if req.cmd.is_mutation() {
+                best_effort_audit(graph, ctx, &req, false, Some(ErrorCode::VersionMismatch)).await;
+            }
+            break 'dispatch resp;
         }
-        return resp;
-    }
 
-    // 2. Dispatch based on command classification.
-    //
-    // All mutations and side-effecting reads have native handlers.
-    // Only pure reads (9 commands) use the v1 bridge, which cannot
-    // reach any mutation path.
-    let result = if is_side_effecting_read(&req.cmd) {
-        // MemGet / MemBootstrap: native handler with sessions-tree
-        // transactional audit + deferred cross-tree best-effort writes.
-        dispatch_side_effecting_read(graph, ctx, &req).await
-    } else if is_session_side(&req.cmd) {
-        // Session-side mutations: native handler with audit in sessions tree.
-        dispatch_session_side(graph, ctx, &req).await
-    } else if is_knowledge_mutation(&req.cmd) {
-        // Knowledge-side mutations: native handler with atomic mutation+audit
-        // in one transact_knowledge commit.
-        dispatch_knowledge_mutation(graph, ctx, &req).await
-    } else if is_compound(&req.cmd) {
-        // FileEditHook: compound (consultation hit in sessions + reparse in knowledge).
-        // Each substep has its own audit in its respective tree.
-        dispatch_file_edit_hook(graph, ctx, &req).await
-    } else {
-        // Pure reads only — no mutations, no side effects, no audit.
-        dispatch_via_v1(graph, ctx, &req).await
+        // 1b. Session fence — reject requests from stale clients whose cached
+        // daemon metadata predates a daemon restart. The client should re-read
+        // DaemonMetadata and retry once. Nil session on the request is tolerated
+        // only when the daemon itself has a nil session (test / legacy fallback).
+        if req.session != ctx.daemon_session {
+            let resp = Response::err(
+                req.id,
+                ErrorCode::SessionMismatch,
+                format!(
+                    "session mismatch: request={} daemon={}; re-read daemon metadata and retry",
+                    req.session, ctx.daemon_session
+                ),
+            );
+            if req.cmd.is_mutation() {
+                best_effort_audit(graph, ctx, &req, false, Some(ErrorCode::SessionMismatch)).await;
+            }
+            break 'dispatch resp;
+        }
+
+        // 2. Dispatch based on command classification.
+        //
+        // All mutations and side-effecting reads have native handlers.
+        // Only pure reads (9 commands) use the v1 bridge, which cannot
+        // reach any mutation path.
+        if is_side_effecting_read(&req.cmd) {
+            // MemGet / MemBootstrap: native handler with sessions-tree
+            // transactional audit + deferred cross-tree best-effort writes.
+            dispatch_side_effecting_read(graph, ctx, &req).await
+        } else if is_session_side(&req.cmd) {
+            // Session-side mutations: native handler with audit in sessions tree.
+            dispatch_session_side(graph, ctx, &req).await
+        } else if is_knowledge_mutation(&req.cmd) {
+            // Knowledge-side mutations: native handler with atomic mutation+audit
+            // in one transact_knowledge commit.
+            dispatch_knowledge_mutation(graph, ctx, &req).await
+        } else if is_compound(&req.cmd) {
+            // FileEditHook: compound (consultation hit in sessions + reparse in knowledge).
+            // Each substep has its own audit in its respective tree.
+            dispatch_file_edit_hook(graph, ctx, &req).await
+        } else if is_config_command(&req.cmd) {
+            // Runtime config get/set — talks to enforcement helpers that use
+            // raw bytes outside the transact_knowledge audit path. ConfigSet
+            // already emits an EnforcementConfigChanged event via the helper,
+            // which is the human-facing audit signal for config changes.
+            dispatch_config(graph, &req).await
+        } else {
+            // Pure reads only — no mutations, no side effects, no audit.
+            dispatch_via_v1(graph, ctx, &req).await
+        }
     };
 
-    result
+    // Saturating cast: per-request latencies above u32::MAX µs (~71 minutes)
+    // are pegged rather than wrapping to a tiny value.
+    let elapsed_us = start.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+    let is_error = matches!(resp, Response::Err { .. });
+    metrics::record(command_kind, elapsed_us, is_error);
+
+    resp
 }
 
 /// Returns true for side-effecting read commands (Category B).
@@ -182,6 +206,117 @@ fn is_knowledge_mutation(cmd: &Command) -> bool {
 /// Handled by dispatching to both paths — not a single-tree transaction.
 fn is_compound(cmd: &Command) -> bool {
     matches!(cmd, Command::FileEditHook(_))
+}
+
+/// Returns true for runtime configuration commands. These touch raw key/value
+/// pairs (`enforcement:mode`, `enforcement:retention_days`) and are routed
+/// through a dedicated dispatcher rather than the v1 bridge or the typical
+/// knowledge-mutation transactional audit path.
+fn is_config_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::ConfigGet(_) | Command::ConfigSet(_))
+}
+
+/// Dispatch ConfigGet / ConfigSet against the daemon's store.
+///
+/// ConfigGet is a pure read with no audit entry. ConfigSet calls the
+/// enforcement helpers, which already write an `EnforcementConfigChanged`
+/// event whenever the value actually changes — that event is the durable
+/// audit trail for config mutations.
+async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
+    use crate::store::enforcement::{
+        get_enforcement_mode, get_retention_days, set_enforcement_mode, set_retention_days,
+        EnforcementMode,
+    };
+
+    let request_id = req.id;
+    let g = graph.read().await;
+    let store = g.store();
+
+    match &req.cmd {
+        Command::ConfigGet(input) => {
+            let value = match input.key.as_str() {
+                "enforcement.mode" => {
+                    let mode = get_enforcement_mode(store).await;
+                    match mode {
+                        EnforcementMode::Advisory => "advisory".to_string(),
+                        EnforcementMode::Strict => "strict".to_string(),
+                    }
+                }
+                "enforcement.retention" => get_retention_days(store).await.to_string(),
+                other => {
+                    return Response::err(
+                        request_id,
+                        ErrorCode::ValidationFailed,
+                        format!(
+                            "unknown config key: {other}; valid keys: enforcement.mode, enforcement.retention"
+                        ),
+                    );
+                }
+            };
+            Response::ok(request_id, serde_json::Value::String(value))
+        }
+        Command::ConfigSet(input) => match input.key.as_str() {
+            "enforcement.mode" => {
+                let mode = match input.value.as_str() {
+                    "advisory" => EnforcementMode::Advisory,
+                    "strict" => EnforcementMode::Strict,
+                    other => {
+                        return Response::err(
+                            request_id,
+                            ErrorCode::ValidationFailed,
+                            format!(
+                                "invalid enforcement mode: {other}; valid values: advisory, strict"
+                            ),
+                        );
+                    }
+                };
+                match set_enforcement_mode(store, mode).await {
+                    Ok(old) => {
+                        let old_label = match old {
+                            EnforcementMode::Advisory => "advisory",
+                            EnforcementMode::Strict => "strict",
+                        };
+                        Response::ok(request_id, serde_json::json!({ "old": old_label }))
+                    }
+                    Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
+                }
+            }
+            "enforcement.retention" => {
+                let days: u64 = match input.value.parse() {
+                    Ok(d) if d > 0 => d,
+                    Ok(_) => {
+                        return Response::err(
+                            request_id,
+                            ErrorCode::ValidationFailed,
+                            "retention must be at least 1 day".to_string(),
+                        );
+                    }
+                    Err(_) => {
+                        return Response::err(
+                            request_id,
+                            ErrorCode::ValidationFailed,
+                            format!(
+                                "invalid retention value: {} (expected integer days)",
+                                input.value
+                            ),
+                        );
+                    }
+                };
+                match set_retention_days(store, days).await {
+                    Ok(()) => Response::ok(request_id, serde_json::Value::Null),
+                    Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
+                }
+            }
+            other => Response::err(
+                request_id,
+                ErrorCode::ValidationFailed,
+                format!(
+                    "unknown config key: {other}; valid keys: enforcement.mode, enforcement.retention"
+                ),
+            ),
+        },
+        _ => unreachable!("is_config_command guard"),
+    }
 }
 
 // ── Side-effecting read handlers ────────────────────────────────────────────
@@ -757,6 +892,7 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
     match cmd {
         // A. Pure reads
         Command::Ping => ("ping".into(), json!({})),
+        Command::Metrics => ("metrics".into(), json!({})),
         Command::Get(i) => ("get".into(), json!({ "key": i.key })),
         Command::HookEvaluate(i) => (
             "hook_evaluate".into(),
@@ -808,6 +944,11 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         | Command::SessionFlush
         | Command::SessionHarvest => {
             unreachable!("session-side commands are handled natively, not via v1 bridge")
+        }
+
+        // Config commands are handled natively — should not reach here.
+        Command::ConfigGet(_) | Command::ConfigSet(_) => {
+            unreachable!("config commands are handled natively, not via v1 bridge")
         }
     }
 }
@@ -933,6 +1074,7 @@ mod tests {
             v: PROTOCOL_VERSION,
             id: Uuid::new_v4(),
             session: test_session(),
+            agent: None,
             cmd,
         }
     }
@@ -968,6 +1110,7 @@ mod tests {
             v: 99,
             id: Uuid::new_v4(),
             session: Uuid::new_v4(),
+            agent: None,
             cmd: Command::Ping,
         };
         let resp = dispatch_v2(&graph, &ctx, req).await;
@@ -1402,6 +1545,7 @@ mod tests {
             v: 99,
             id: Uuid::new_v4(),
             session: Uuid::new_v4(),
+            agent: None,
             cmd: Command::MemGet(MemGetInput {
                 key: "file:test".into(),
             }),
@@ -1469,6 +1613,7 @@ mod tests {
             v: PROTOCOL_VERSION,
             id: Uuid::new_v4(),
             session: Uuid::new_v4(), // does NOT match test_session()
+            agent: None,
             cmd: Command::Ping,
         };
         let resp = dispatch_v2(&graph, &ctx, req).await;
@@ -1560,5 +1705,106 @@ mod tests {
         let entry: AuditEntry = rmp_serde::from_slice(&raw).unwrap();
         assert_eq!(entry.command_kind, "file_edit_hook:consultation");
         assert!(entry.accepted);
+    }
+
+    /// ConfigGet routes through the dedicated native dispatcher and returns
+    /// the default value (`advisory`) when nothing has been written yet.
+    #[tokio::test]
+    async fn config_get_returns_default_enforcement_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::ConfigGet(ConfigGetInput {
+            key: "enforcement.mode".into(),
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+
+        match resp {
+            Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("advisory")),
+            Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+        }
+    }
+
+    /// ConfigSet writes the value via the daemon path; the next ConfigGet
+    /// reflects the new value end-to-end through dispatch_v2.
+    #[tokio::test]
+    async fn config_set_then_get_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let set_req = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "enforcement.mode".into(),
+            value: "strict".into(),
+        }));
+        let set_resp = dispatch_v2(&graph, &ctx, set_req).await;
+        match set_resp {
+            Response::Ok { data, .. } => {
+                assert_eq!(data, serde_json::json!({ "old": "advisory" }));
+            }
+            Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+        }
+
+        let get_req = make_request(Command::ConfigGet(ConfigGetInput {
+            key: "enforcement.mode".into(),
+        }));
+        let get_resp = dispatch_v2(&graph, &ctx, get_req).await;
+        match get_resp {
+            Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("strict")),
+            Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+        }
+    }
+
+    /// Invalid enforcement mode value is rejected with ValidationFailed —
+    /// the daemon never persists garbage values.
+    #[tokio::test]
+    async fn config_set_rejects_invalid_enforcement_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "enforcement.mode".into(),
+            value: "paranoid".into(),
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+        match resp {
+            Response::Err { code, .. } => assert_eq!(code, ErrorCode::ValidationFailed),
+            Response::Ok { .. } => panic!("expected Err, got Ok"),
+        }
+    }
+
+    /// Unknown config key surfaces ValidationFailed on both get and set.
+    #[tokio::test]
+    async fn config_unknown_key_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let get_req = make_request(Command::ConfigGet(ConfigGetInput {
+            key: "nope.nope".into(),
+        }));
+        match dispatch_v2(&graph, &ctx, get_req).await {
+            Response::Err { code, .. } => assert_eq!(code, ErrorCode::ValidationFailed),
+            Response::Ok { .. } => panic!("expected ValidationFailed for unknown get key"),
+        }
+
+        let set_req = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "nope.nope".into(),
+            value: "x".into(),
+        }));
+        match dispatch_v2(&graph, &ctx, set_req).await {
+            Response::Err { code, .. } => assert_eq!(code, ErrorCode::ValidationFailed),
+            Response::Ok { .. } => panic!("expected ValidationFailed for unknown set key"),
+        }
     }
 }

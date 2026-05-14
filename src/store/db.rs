@@ -376,7 +376,7 @@ impl Store {
     /// Write multiple records to KV only, skipping the tantivy search index.
     ///
     /// Use this during bulk init passes where search indexing would block the
-    /// critical path. Follow with [`Self::index_records`] to update tantivy
+    /// critical path. Follow with [`Self::rebuild_search_index`] to update tantivy
     /// from the same in-memory records without a KV round-trip.
     ///
     /// Same durability semantics as [`Self::put_batch`]: at most 2 fsyncs.
@@ -580,7 +580,7 @@ impl Store {
 
     /// Scan records whose key starts with `prefix`, invoking `callback` for each.
     ///
-    /// Same tree routing and prefix semantics as [`scan_prefix`], but records
+    /// Same tree routing and prefix semantics as [`Self::scan_prefix`], but records
     /// are deserialized and passed to `callback` one at a time rather than
     /// collected into a `Vec`. Callers can begin processing (e.g. printing to
     /// stdout) before the full scan completes, giving time-to-first-row
@@ -959,6 +959,31 @@ impl Store {
             search.close()?;
         }
         Ok(())
+    }
+
+    /// Best-effort durability flush for shutdown paths.
+    ///
+    /// Calls SurrealKV's `flush_wal(sync=true)` on both trees so every
+    /// previously-committed transaction reaches disk. Non-consuming and
+    /// `&self` — works through a shared `Arc<RwLock<Graph>>` read lock on
+    /// the daemon shutdown path where ownership cannot be reclaimed.
+    ///
+    /// Necessary because SurrealKV's `Tree::Drop` only fire-and-forget-spawns
+    /// `core.close()` onto the current tokio runtime; if the runtime is
+    /// shutting down (signal handler, main return) that spawned task may not
+    /// run before the process exits, losing buffered "Eventual" writes.
+    ///
+    /// Errors are logged via `tracing::warn!` and not propagated — shutdown
+    /// paths must be infallible. Search index pending writes are committed
+    /// per `Search::add_record`/`add_records` call, so no separate flush
+    /// is needed here.
+    pub async fn flush_for_shutdown(&self) {
+        if let Err(e) = self.knowledge.flush_wal(true) {
+            tracing::warn!("flush_for_shutdown: knowledge tree flush failed: {e}");
+        }
+        if let Err(e) = self.sessions.flush_wal(true) {
+            tracing::warn!("flush_for_shutdown: sessions tree flush failed: {e}");
+        }
     }
 
     // -------------------------------------------------------------------------

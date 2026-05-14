@@ -14,7 +14,9 @@ use std::process::Command;
 use anyhow::Result;
 use clap::Args;
 
-use mati_core::store::{FileRecord, GotchaRecord, Priority, Record, RecordLifecycle, StalenessTier};
+use mati_core::store::{
+    FileRecord, GotchaRecord, Priority, Record, RecordLifecycle, StalenessTier,
+};
 
 use super::proxy::StoreProxy;
 
@@ -51,10 +53,12 @@ fn worst_staleness(gotchas: &[Record]) -> Option<StalenessTier> {
     gotchas
         .iter()
         .map(|g| g.staleness.tier.clone())
-        .filter(|t| matches!(
-            t,
-            StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
-        ))
+        .filter(|t| {
+            matches!(
+                t,
+                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
+            )
+        })
         .max_by_key(|t| match t {
             StalenessTier::Tombstone => 3,
             StalenessTier::Liability => 2,

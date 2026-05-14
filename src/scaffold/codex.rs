@@ -288,7 +288,12 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
     if doc.get("features").is_none() || !doc["features"].is_table() {
         doc["features"] = Item::Table(Table::new());
     }
-    doc["features"]["codex_hooks"] = value(true);
+    // Codex 2026-05+ renamed [features].codex_hooks → [features].hooks.
+    // The runtime emits a deprecation warning on the old key. Public docs
+    // still document codex_hooks (likely lagging the runtime); the warning
+    // is the source of truth. If a future Codex re-deprecates `hooks`,
+    // update this line and bump the scaffold installer version.
+    doc["features"]["hooks"] = value(true);
 
     if doc.get("mcp_servers").is_none() || !doc["mcp_servers"].is_table() {
         doc["mcp_servers"] = Item::Table(Table::new());
@@ -381,7 +386,7 @@ mod tests {
 
         let config = std::fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
         let doc = config.parse::<DocumentMut>().unwrap();
-        assert_eq!(doc["features"]["codex_hooks"].as_bool(), Some(true));
+        assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
         assert_eq!(
             doc["mcp_servers"]["mati"]["args"][0].as_str(),
             Some("serve")
@@ -426,7 +431,7 @@ mod tests {
         let config = std::fs::read_to_string(codex_dir.join("config.toml")).unwrap();
         let doc = config.parse::<DocumentMut>().unwrap();
         assert_eq!(doc["profiles"]["trusted"].as_bool(), Some(true));
-        assert_eq!(doc["features"]["codex_hooks"].as_bool(), Some(true));
+        assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
     }
 
     #[test]
@@ -589,9 +594,9 @@ mod tests {
             .parse::<DocumentMut>()
             .expect("config.toml must be valid TOML after recovery");
         assert_eq!(
-            doc["features"]["codex_hooks"].as_bool(),
+            doc["features"]["hooks"].as_bool(),
             Some(true),
-            "features.codex_hooks must be true"
+            "features.hooks must be true"
         );
     }
 }

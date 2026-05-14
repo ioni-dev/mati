@@ -115,7 +115,14 @@ impl Search {
         // and the caller must delete search_index/ and rebuild (C4).
         let fields = fields_from_schema(&index.schema())?;
 
-        let writer = index.writer(WRITER_HEAP_BYTES)?;
+        // Acquiring the writer takes the tantivy lockfile (.tantivy-writer.lock).
+        // When a previous `Search` instance for the same path was just dropped,
+        // the OS may not have released the file lock by the time we retry —
+        // observed under sustained parallel test load on Apple Silicon Darwin.
+        // Retry briefly with backoff before giving up. The retry budget is
+        // conservative (≤ ~30 ms total) so legitimate "another process holds
+        // the lock" failures still surface promptly to the caller.
+        let writer = open_writer_with_retry(&index)?;
         // Manual reload policy: we call reader.reload() explicitly at the
         // start of query_keys, guaranteeing read-after-write correctness
         // without relying on a background watcher thread.
@@ -318,7 +325,7 @@ impl Search {
         Ok(keys)
     }
 
-    /// Same as [`query_keys`] but returns `(score, key)` pairs where `score`
+    /// Same as [`Self::query_keys`] but returns `(score, key)` pairs where `score`
     /// is the raw BM25 relevance score from tantivy. Results are ordered by
     /// descending score. Used by `mem_query` text mode to surface relevance
     /// in the agent-facing response.
@@ -480,6 +487,35 @@ fn fields_from_schema(s: &Schema) -> Result<Fields> {
     })
 }
 
+/// Open the tantivy index writer, retrying briefly on transient `LockFailure`.
+///
+/// Tantivy uses a filesystem lockfile (`.tantivy-writer.lock`) acquired via
+/// `flock`. When a previous `Search` for the same path was just dropped, the
+/// kernel may not release the lock synchronously on macOS APFS — the second
+/// open then races with the first writer's destructor and gets `LockBusy`.
+///
+/// Retry budget is small on purpose: a real "another process holds the lock"
+/// situation should surface to the caller quickly, not be papered over with
+/// long sleeps. Six attempts with 1, 2, 4, 8, 16 ms backoff = ~31 ms ceiling.
+fn open_writer_with_retry(index: &Index) -> Result<IndexWriter> {
+    let mut delay_ms = 1u64;
+    let mut last_err: Option<TantivyError> = None;
+    for _ in 0..6 {
+        match index.writer(WRITER_HEAP_BYTES) {
+            Ok(w) => return Ok(w),
+            Err(TantivyError::LockFailure(e, hint)) => {
+                last_err = Some(TantivyError::LockFailure(e, hint));
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(16);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("tantivy writer lock acquisition exhausted retries")))
+}
+
 fn delete_by_key(
     index: &Index,
     writer: &IndexWriter,
@@ -614,6 +650,40 @@ mod tests {
             schema2.num_fields(),
             "schema must not drift between opens"
         );
+    }
+
+    /// Regression for the parallel-open lock race: stress drop-then-reopen of
+    /// the same path many times in rapid succession across multiple threads.
+    /// Without `open_writer_with_retry`, this surfaces `TantivyError::LockFailure`
+    /// intermittently on Apple Silicon Darwin under heavy `cargo test` load.
+    /// The retry path absorbs that transient — the test must succeed every run.
+    #[test]
+    fn open_drop_reopen_stress_no_lock_failure() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        // Each thread targets its own subdirectory: this exercises the
+        // drop-then-reopen race per path (sequential reopens of the same path)
+        // while running many such cycles concurrently for FS load.
+        let base = Arc::new(dir.path().to_path_buf());
+
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let base = Arc::clone(&base);
+            handles.push(thread::spawn(move || {
+                let path = base.join(format!("idx_{t}/search_index"));
+                for _ in 0..20 {
+                    let s = Search::open(&path).expect("open must not return LockFailure");
+                    let n = s.index.schema().num_fields();
+                    assert_eq!(n, 6, "schema must have 6 fields after every reopen");
+                    drop(s); // releases writer + lock
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

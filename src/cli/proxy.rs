@@ -27,6 +27,16 @@ pub struct StoreProxy {
 impl StoreProxy {
     /// Open a proxy. Routes through the socket if a daemon is running,
     /// falls back to direct `Store::open` otherwise.
+    ///
+    /// **Refuses to create state on first run.** `Store::open` is
+    /// "create-or-open" semantics, but most CLI commands aren't supposed
+    /// to scaffold a store as a side effect — only `mati init` and
+    /// `mati daemon start` should create state, and both bypass this
+    /// proxy by calling `Store::open` directly. So if there's no daemon
+    /// AND no existing store, we fail-clean with a recovery hint rather
+    /// than silently scattering empty `~/.mati/<slug>/` directories
+    /// across users' home directories when they run `mati status`,
+    /// `mati ls`, etc. from non-mati paths.
     pub async fn open(cwd: &Path) -> Result<Self> {
         let root = mati_root_for(cwd)?;
         match daemon_result(&root, "ping", json!({})).await {
@@ -34,7 +44,22 @@ impl StoreProxy {
                 inner: ProxyInner::Socket { root },
             }),
             DaemonResult::NotRunning | DaemonResult::StaleSocket => {
-                let store = Store::open(cwd).await?;
+                if !root.join("knowledge.db").exists() {
+                    anyhow::bail!(
+                        "no mati store initialized for this directory.\n\
+                         Run `mati init` to set up, or `cd` into a project that has been initialized."
+                    );
+                }
+                // Lock-contention retry: when N parallel CLI invocations hit
+                // direct-store mode (no daemon), only one can acquire the
+                // SurrealKV flock at a time. Without this loop, 19 of 20
+                // parallel invocations failed with "LOCK is already locked"
+                // — surfaced by the smoke test step 131 parallel-write probe.
+                // Backoff totals ~620ms (20+40+80+160+320), enough for a
+                // burst of ~20 writes to serialize without spurious failures.
+                // This is purely a safety net; the daemon path remains the
+                // recommended production configuration.
+                let store = open_store_with_lock_retry(cwd).await?;
                 Ok(Self {
                     inner: ProxyInner::Direct(store),
                 })
@@ -242,8 +267,12 @@ impl StoreProxy {
                             let err = resp
                                 .get("error")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            anyhow::bail!("daemon put failed: {err}")
+                                .unwrap_or("(no message returned)");
+                            anyhow::bail!(
+                                "daemon rejected put: {err}\n\
+                                 If this persists, restart the daemon: \
+                                 `mati daemon stop && mati daemon start`"
+                            )
                         }
                     }
                     other => Err(socket_read_error("put", other)),
@@ -461,7 +490,7 @@ impl StoreProxy {
     /// Records a `ControlChanged::Confirmed` enforcement event — used instead
     /// of `gotcha_write` so confirmations show up as `Confirmed` in the audit
     /// stream instead of generic `Updated`. No-op in socket mode; socket mode
-    /// uses [`daemon_gotcha_confirm`] which the daemon handler audits.
+    /// uses [`Self::daemon_gotcha_confirm`] which the daemon handler audits.
     pub async fn gotcha_confirm_direct(
         &self,
         record: &Record,
@@ -473,6 +502,122 @@ impl StoreProxy {
                     .await
             }
             ProxyInner::Socket { .. } => Ok(()),
+        }
+    }
+
+    /// Read a runtime config value (e.g. `enforcement.mode`).
+    ///
+    /// Routes through the daemon when running so `mati config get` works
+    /// during MCP sessions without needing exclusive store access.
+    pub async fn config_get(&self, key: &str) -> Result<String> {
+        use mati_core::mcp::protocol as p;
+        use mati_core::store::enforcement::{
+            get_enforcement_mode, get_retention_days, EnforcementMode,
+        };
+
+        match &self.inner {
+            ProxyInner::Direct(store) => match key {
+                "enforcement.mode" => Ok(match get_enforcement_mode(store).await {
+                    EnforcementMode::Advisory => "advisory".to_string(),
+                    EnforcementMode::Strict => "strict".to_string(),
+                }),
+                "enforcement.retention" => Ok(get_retention_days(store).await.to_string()),
+                other => anyhow::bail!(
+                    "unknown config key: {other}\n\
+                     Valid keys: enforcement.mode, enforcement.retention"
+                ),
+            },
+            ProxyInner::Socket { root } => {
+                let cmd = p::Command::ConfigGet(p::ConfigGetInput {
+                    key: key.to_string(),
+                });
+                match daemon_v2(root, cmd).await {
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            let data = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                            Ok(data.to_string())
+                        } else {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("{err}")
+                        }
+                    }
+                    other => Err(socket_read_error("config_get", other)),
+                }
+            }
+        }
+    }
+
+    /// Write a runtime config value. Returns the previous value as a string
+    /// (e.g. `"advisory"` → previous mode label) for callers that want to
+    /// report a transition. Empty string when there is no meaningful prior
+    /// value (e.g. retention writes don't surface the old number).
+    pub async fn config_set(&self, key: &str, value: &str) -> Result<String> {
+        use mati_core::mcp::protocol as p;
+        use mati_core::store::enforcement::{
+            set_enforcement_mode, set_retention_days, EnforcementMode,
+        };
+
+        match &self.inner {
+            ProxyInner::Direct(store) => match key {
+                "enforcement.mode" => {
+                    let mode = match value {
+                        "advisory" => EnforcementMode::Advisory,
+                        "strict" => EnforcementMode::Strict,
+                        other => anyhow::bail!(
+                            "invalid enforcement mode: {other}\n\
+                             Valid values: advisory, strict"
+                        ),
+                    };
+                    let old = set_enforcement_mode(store, mode).await?;
+                    Ok(match old {
+                        EnforcementMode::Advisory => "advisory".to_string(),
+                        EnforcementMode::Strict => "strict".to_string(),
+                    })
+                }
+                "enforcement.retention" => {
+                    let days: u64 = value.parse().map_err(|_| {
+                        anyhow::anyhow!("invalid retention value: {value} (expected integer days)")
+                    })?;
+                    if days == 0 {
+                        anyhow::bail!("retention must be at least 1 day");
+                    }
+                    set_retention_days(store, days).await?;
+                    Ok(String::new())
+                }
+                other => anyhow::bail!(
+                    "unknown config key: {other}\n\
+                     Valid keys: enforcement.mode, enforcement.retention"
+                ),
+            },
+            ProxyInner::Socket { root } => {
+                let cmd = p::Command::ConfigSet(p::ConfigSetInput {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                });
+                match daemon_v2(root, cmd).await {
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            let old = resp
+                                .get("data")
+                                .and_then(|d| d.get("old"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            Ok(old)
+                        } else {
+                            let err = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("{err}")
+                        }
+                    }
+                    other => Err(socket_read_error("config_set", other)),
+                }
+            }
         }
     }
 
@@ -619,6 +764,55 @@ impl StoreProxy {
             Err(_) => {
                 let _ = self.close().await;
                 result
+            }
+        }
+    }
+}
+
+/// Open `Store` with bounded retries on SurrealKV lock contention.
+///
+/// Used only in direct-mode (no daemon). On lock contention, sleep for
+/// a randomized 30–120ms (jitter prevents thundering herd) and retry,
+/// up to a total budget of ~15 seconds. A burst of 20 parallel CLI
+/// invocations each holds the lock for ~300–500ms (process spin-up +
+/// store open + quality scoring + record + graph edges); worst-case
+/// serial time for 20 writes is ~10s, comfortably under the budget.
+/// The daemon path remains the recommended production configuration —
+/// this is purely a safety net for ad-hoc parallel CLI usage.
+///
+/// Non-contention errors return immediately.
+async fn open_store_with_lock_retry(cwd: &Path) -> Result<Store> {
+    use std::time::{Duration, Instant};
+    const TOTAL_BUDGET: Duration = Duration::from_secs(15);
+    let start = Instant::now();
+    loop {
+        match Store::open(cwd).await {
+            Ok(s) => return Ok(s),
+            Err(err) => {
+                // The raw SurrealKV "already locked" error sits in the
+                // cause chain; the top-level anyhow message added by
+                // `open_knowledge_tree` (`src/store/db.rs:1115`) is just
+                // "failed to open knowledge.db". `format!("{err}")` only
+                // renders the top-level — walk the chain via `err.chain()`
+                // so we actually see the lock-contention text.
+                let is_lock = err.chain().any(|e| {
+                    let s = e.to_string();
+                    s.contains("already locked")
+                        || s.contains("WouldBlock")
+                        || s.contains("holds the lock")
+                });
+                if !is_lock || start.elapsed() >= TOTAL_BUDGET {
+                    return Err(err);
+                }
+                // Pseudo-random jitter without an extra dep — avoid the
+                // thundering-herd case where 19 retries wake up at the
+                // same instant and re-collide. A nanosecond-keyed jitter
+                // is plenty of entropy for the inter-process spread we
+                // need (10s of µs of variance is already more than the
+                // critical section width).
+                let nanos = start.elapsed().subsec_nanos() as u64;
+                let jitter_ms = 30 + (nanos % 90); // 30–119ms
+                tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
             }
         }
     }

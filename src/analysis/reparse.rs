@@ -5,7 +5,7 @@
 //! 1. Read file from disk. Missing → add FileDeleted staleness signal, return.
 //! 2. Detect language, construct WalkedFile, run parse_file().
 //! 3. Parse failure → log warning, return Ok (graceful degradation P9).
-//! 4. Fetch existing file:<path> record.
+//! 4. Fetch existing `file:<path>` record.
 //! 5. No record → create Layer 0 stub, persist, return.
 //! 6. Deserialize record.payload as FileRecord, compare structural fields.
 //! 7. Nothing changed → return early (no write).

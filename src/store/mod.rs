@@ -17,8 +17,9 @@ pub mod session;
 pub use db::{derive_slug, KnowledgeWriteOp, Store};
 pub use durability::Durability;
 pub use record::{
-    Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType, GotchaRecord,
-    KnowledgeGap, OnboardingScore, Priority, QualityScore, QualitySignal, QualityTier, Record,
-    RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload,
-    StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind, TombstoneReason,
+    AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,
+    GotchaRecord, KnowledgeGap, OnboardingScore, Priority, QualityScore, QualitySignal,
+    QualityTier, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry,
+    StaleReviewPayload, StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind,
+    TombstoneReason,
 };
