@@ -226,6 +226,26 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
         store.put(key, &record).await?;
     }
 
+    // 4. Best-effort enforcement event: ReceiptMinted.
+    //
+    // Mirrors the socket-mode path in `dispatch_v2::ConsultationHit` so the
+    // direct-mode CLI path (`mati explain` without a daemon, or any code
+    // calling `session::log_hit` against an open Store) produces the same
+    // `receipt_minted` row in `mati history --enforcement`. Without this
+    // parity, the enforcement audit log has gaps depending on whether the
+    // mint happened over socket or direct mode.
+    let _ = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ReceiptMinted,
+        crate::store::enforcement::SubjectKind::File,
+        key.to_string(),
+        "claude".to_string(),
+        None,
+        "consultation_requested".to_string(),
+        None,
+    )
+    .await;
+
     Ok(())
 }
 

@@ -443,13 +443,56 @@ impl MatiServer {
                 );
 
                 let mut summary_parts = Vec::new();
-                let mut remaining = limit;
 
-                for (kind, group_name, group_limit) in edge_groups {
-                    let keys = graph.neighbors(&params.query, kind);
+                // Round-robin allocation: when the caller's `limit` is smaller
+                // than the sum of per-kind caps, hand out slots one-at-a-time
+                // across kinds in priority order so every non-empty kind
+                // surfaces at least one record before any kind gets a second
+                // slot. Pre-fix, a global `remaining` budget plus first-kind
+                // priority meant 10+ gotchas on a hot file starved imports,
+                // co_changes, decisions, and notes — the smoke test caught
+                // this by querying a file with both gotchas AND imports and
+                // seeing imports come back empty.
+                let mut available: Vec<Vec<String>> = edge_groups
+                    .iter()
+                    .map(|(kind, _, cap)| {
+                        let keys = graph.neighbors(&params.query, kind);
+                        keys.into_iter().take(*cap).collect()
+                    })
+                    .collect();
+
+                // Per-kind quota = how many slots each kind gets from `limit`,
+                // computed via fair round-robin. Each round, every non-empty
+                // kind (still under its per-kind cap) gets one slot until
+                // `limit` is exhausted or every kind is empty.
+                let mut quotas: Vec<usize> = vec![0; edge_groups.len()];
+                let mut remaining = limit;
+                loop {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let mut handed_out = 0usize;
+                    for (i, slot_keys) in available.iter().enumerate() {
+                        if remaining == 0 {
+                            break;
+                        }
+                        if quotas[i] < slot_keys.len() {
+                            quotas[i] += 1;
+                            remaining -= 1;
+                            handed_out += 1;
+                        }
+                    }
+                    if handed_out == 0 {
+                        // Every kind has been fully allocated; nothing else to give.
+                        break;
+                    }
+                }
+
+                for (i, (kind, group_name, _)) in edge_groups.iter().enumerate() {
+                    let keys = std::mem::take(&mut available[i]);
                     let mut group_records = Vec::new();
 
-                    for key in keys.iter().take((*group_limit).min(remaining)) {
+                    for key in keys.iter().take(quotas[i]) {
                         if let Ok(Some(record)) = store.get(key).await {
                             if matches!(record.lifecycle, RecordLifecycle::Active) {
                                 let mut entry = serde_json::Map::new();
@@ -486,14 +529,17 @@ impl MatiServer {
                     if !group_records.is_empty() {
                         summary_parts.push(format!("{} {}", group_records.len(), group_name));
                     }
-                    remaining = remaining.saturating_sub(group_records.len());
+                    let _ = kind;
                     result.insert(
                         group_name.to_string(),
                         serde_json::Value::Array(group_records),
                     );
                 }
 
-                // DependencyAffects — add to decisions group
+                // DependencyAffects — add to decisions group, capped by
+                // whatever budget remains after the round-robin above. This
+                // keeps `limit` honored as a strict global ceiling even when
+                // DependencyAffects edges add to the decisions array.
                 if remaining > 0 {
                     let dep_keys = graph.neighbors(&params.query, &EdgeKind::DependencyAffects);
                     let mut dep_added = 0usize;
@@ -530,8 +576,8 @@ impl MatiServer {
                             }
                         }
                     }
-                    remaining -= dep_added;
-                    let _ = remaining; // suppress unused warning
+                    remaining = remaining.saturating_sub(dep_added);
+                    let _ = remaining;
                 }
 
                 let summary = if summary_parts.is_empty() {
@@ -1386,6 +1432,16 @@ impl MatiServer {
                     let _ = store.put(&file_key, &file_record).await;
                 }
             }
+            // Invalidate any prior consultation receipt on this file —
+            // a newly-confirmed gotcha changes what the agent must know
+            // about the file, so the bypass token from a pre-confirmation
+            // mem_get / explain must not carry over. Mirrors the
+            // socket-mode `handle_gotcha_confirm` cleanup so both backends
+            // share identical enforcement behavior. (Pre-fix the codex
+            // pre-bash hook silently allowed reads on files whose prior
+            // bootstrap `mem_get` had minted a still-valid receipt.)
+            let consulted_key = format!("session:consulted:{file_key}");
+            let _ = store.delete(&consulted_key).await;
         }
 
         // Propagate confirmation_count to linked file records
@@ -1483,6 +1539,20 @@ impl MatiServer {
 }
 
 /// Returns true if a gotcha record is eligible for injection into a context packet.
+///
+/// Two classes of gotchas surface in bootstrap:
+///
+/// 1. **Developer-confirmed gotchas** (`payload.confirmed = true`) — these are
+///    intentional captures and always inject when quality is acceptable.
+/// 2. **Auto-derived Layer 0 stubs with intrinsic signal value** —
+///    `gotcha:cochange:*`, `gotcha:revert:*`, `gotcha:ownership:*` records
+///    are minted by `mati init` from git history. They are NOT
+///    developer-confirmed (so they never trigger hook enforcement / file-read
+///    DENY), but their content is high-signal information the agent should
+///    see in bootstrap. Pre-fix these were marked `confirmed=true` at init
+///    which violated the "confirmed ⇒ developer-authoritative ⇒ confidence
+///    ≥ 0.80" schema invariant. Now we keep them `confirmed=false` and
+///    explicitly allowlist them here so bootstrap still surfaces them.
 fn is_injectable_gotcha(r: &Record) -> bool {
     if !matches!(r.lifecycle, RecordLifecycle::Active) {
         return false;
@@ -1490,11 +1560,18 @@ fn is_injectable_gotcha(r: &Record) -> bool {
     if r.staleness.tier == StalenessTier::Tombstone {
         return false;
     }
-    if let Some(gotcha) = r.payload_as::<GotchaRecord>() {
-        gotcha.confirmed && r.quality.value >= 0.4
-    } else {
-        false
+    if r.quality.value < 0.4 {
+        return false;
     }
+    if let Some(gotcha) = r.payload_as::<GotchaRecord>() {
+        if gotcha.confirmed {
+            return true;
+        }
+    }
+    // Auto-derived Layer 0 stubs: include advisory signals even unconfirmed.
+    r.key.starts_with("gotcha:cochange:")
+        || r.key.starts_with("gotcha:revert:")
+        || r.key.starts_with("gotcha:ownership:")
 }
 
 /// Resolve the existing record for a mem_set write path.

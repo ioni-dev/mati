@@ -199,6 +199,7 @@ fn is_knowledge_mutation(cmd: &Command) -> bool {
             | Command::DocCapture(_)
             | Command::DecisionUpsert(_)
             | Command::DevNoteUpsert(_)
+            | Command::RecordImport(_)
     )
 }
 
@@ -405,6 +406,9 @@ async fn dispatch_knowledge_mutation(
         }
         Command::DevNoteUpsert(input) => {
             handlers::handle_dev_note_upsert(store, ctx, request_id, input).await
+        }
+        Command::RecordImport(input) => {
+            handlers::handle_record_import(store, ctx, request_id, input).await
         }
         _ => {
             unreachable!("is_knowledge_mutation guard ensures only knowledge mutations reach here")
@@ -934,7 +938,8 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         | Command::FileEditHook(_)
         | Command::DocCapture(_)
         | Command::DecisionUpsert(_)
-        | Command::DevNoteUpsert(_) => {
+        | Command::DevNoteUpsert(_)
+        | Command::RecordImport(_) => {
             unreachable!("knowledge-side mutations are handled natively, not via v1 bridge")
         }
 

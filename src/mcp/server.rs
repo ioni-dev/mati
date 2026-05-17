@@ -94,6 +94,25 @@ impl ServerHandler for MatiServer {
 /// Lifecycle events (`serve_start`, `serve_failed`, `auto_repair*`,
 /// `serve_shutdown`) are appended throughout for `mati doctor`.
 pub async fn serve(repo_root: &Path) -> Result<()> {
+    // Cold-start clock. Used to emit `startup phase=X elapsed_ms=N` lifecycle
+    // events so callers waiting in `ensure_daemon` can observe progress
+    // through `lifecycle.log` rather than blindly polling the socket. See
+    // `src/mcp/daemon_lifecycle.rs::wait_for_ready`.
+    let startup_t0 = std::time::Instant::now();
+
+    // Compute the mati_root path up-front so we can emit phase events even
+    // before `open_with_retry` returns a store. The `cli` module is
+    // bin-only, so we replicate its `mati_root_for` logic inline against
+    // `store::derive_slug` (pub-exported) + `dirs::home_dir`. Falls back to
+    // a no-op if the home directory can't be resolved — the existing event
+    // paths already tolerate `record_lifecycle_event` failures silently.
+    let mati_root_for_events: Option<std::path::PathBuf> = dirs::home_dir()
+        .map(|h| h.join(".mati").join(crate::store::derive_slug(repo_root)));
+    if let Some(ref r) = mati_root_for_events {
+        super::metadata::record_lifecycle_event(r, "startup", "phase=opening_store");
+    }
+    let store_t0 = std::time::Instant::now();
+
     // Codex may spawn multiple instances of the MCP server concurrently.
     // Only one can acquire the SurrealKV exclusive lock. If the first attempt
     // fails with a lock error, retry a few times with backoff — the other
@@ -106,6 +125,20 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
     // the worst case.
     match open_with_retry(repo_root, 8, Duration::from_millis(250)).await? {
         ServerOpen::Direct(store) => {
+            // Phase: store_opened. Migration (if any) is now complete; the
+            // emit happens before we publish lifecycle events with the
+            // authoritative `store.root` so the ordering matches the cli
+            // path's emit-from-mati_root ordering.
+            if let Some(ref r) = mati_root_for_events {
+                super::metadata::record_lifecycle_event(
+                    r,
+                    "startup",
+                    &format!(
+                        "phase=store_opened elapsed_ms={}",
+                        store_t0.elapsed().as_millis()
+                    ),
+                );
+            }
             // Capture the runtime root before `store` moves into `Graph::load`.
             // The panic hook uses it to clean up sock/pid files on abnormal exit;
             // the explicit shutdown path below uses it without re-locking the graph.
@@ -219,6 +252,7 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
                 Arc::clone(&graph_arc),
                 repo_root_arc,
                 Arc::clone(&socket_shutdown),
+                startup_t0,
             ));
             let socket_abort = socket_inner.abort_handle();
             let (socket_death_tx, mut socket_death_rx) =
@@ -930,6 +964,11 @@ async fn serve_daemon_socket(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: Arc<std::path::PathBuf>,
     shutdown: Arc<Shutdown>,
+    // Cold-start clock from `serve()`. Used to emit `startup phase=ready
+    // elapsed_ms=N` once the socket is bound and accepting connections, so
+    // callers waiting in `ensure_daemon` can observe the full cold-start
+    // duration through `lifecycle.log`.
+    startup_t0: std::time::Instant,
 ) {
     let sock_path = {
         let g = graph.read().await;
@@ -1015,6 +1054,16 @@ async fn serve_daemon_socket(
         "daemon socket ready at {} (MCP-embedded, session={})",
         sock_path.display(),
         daemon_session,
+    );
+
+    // Phase: ready. Terminal success state of the cold-start sequence — the
+    // socket is bound, metadata is published, and the accept loop is about
+    // to start. Emit here so callers waiting in `ensure_daemon` can break
+    // out of their state-aware readiness loop.
+    super::metadata::record_lifecycle_event(
+        &parent_root,
+        "startup",
+        &format!("phase=ready elapsed_ms={}", startup_t0.elapsed().as_millis()),
     );
 
     // Capture daemon effective UID once — used for every peer credential check.
@@ -1308,8 +1357,25 @@ pub(crate) async fn socket_dispatch(
             };
 
             // 2. Fetch all linked gotcha records.
+            //
+            // The canonical link is `file_record.payload.gotcha_keys`, written
+            // atomically by `compute_file_link_updates`. But CLAUDE.md flags
+            // this field as a *derived* index that can drift from the
+            // canonical `gotcha:*` records (e.g. if a gotcha was created
+            // before the file record existed, or if a partial-write left the
+            // file link stale). To make enforcement robust against that
+            // drift, we union three sources:
+            //   (a) `file_record.payload.gotcha_keys`               (primary)
+            //   (b) in-memory graph edges `HasGotcha` from file_key  (secondary)
+            //   (c) reverse scan of `gotcha:*` records whose
+            //       `affected_files` contains the relative path     (fallback)
+            // Source (c) is bounded by the active-gotcha count and
+            // short-circuited when (a) or (b) already produced results, so
+            // it does not add cost on the hot path.
             let mut gotcha_records = serde_json::Map::new();
             let mut gotcha_error = false;
+            let mut linked_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
             if let Some(ref fr) = file_record {
                 if let Some(keys) = fr
                     .pointer("/payload/gotcha_keys")
@@ -1317,35 +1383,92 @@ pub(crate) async fn socket_dispatch(
                 {
                     for gk in keys {
                         if let Some(key_str) = gk.as_str() {
-                            match store.get(key_str).await {
-                                Ok(Some(grec)) => {
-                                    // Inline confirmed flag (same as "get" handler).
-                                    let confirmed = grec
-                                        .payload_as::<crate::store::GotchaRecord>()
-                                        .map(|g| g.confirmed)
-                                        .unwrap_or(false);
-                                    if let Ok(mut val) = serde_json::to_value(&grec) {
-                                        if let Some(obj) = val.as_object_mut() {
-                                            obj.insert(
-                                                "confirmed".to_string(),
-                                                serde_json::Value::Bool(confirmed),
-                                            );
-                                        }
-                                        gotcha_records.insert(key_str.to_string(), val);
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "hook_evaluate: store.get({key_str}) failed: {e}"
-                                    );
-                                    gotcha_error = true;
-                                }
+                            linked_keys.insert(key_str.to_string());
+                        }
+                    }
+                }
+            }
+
+            // (b) Graph-edge fallback. Loaded at boot from `graph:edge:*`,
+            // independent of the file record's denormalized list.
+            for nkey in g.neighbors(file_key, &crate::graph::EdgeKind::HasGotcha) {
+                linked_keys.insert(nkey);
+            }
+
+            // (c) Canonical reverse-lookup fallback. Only run when both
+            // derived indexes were empty AND a file record exists — covers
+            // the "file record present but gotcha_keys never synced" drift
+            // path that CLAUDE.md documents as a known trap. Bounded scan
+            // strips the relative path from the file_key once.
+            if linked_keys.is_empty() && file_record.is_some() {
+                let rel_path = file_key.strip_prefix("file:").unwrap_or(file_key);
+                if let Ok(all_gotchas) = store.scan_prefix("gotcha:").await {
+                    for r in all_gotchas {
+                        if !matches!(r.lifecycle, crate::store::RecordLifecycle::Active) {
+                            continue;
+                        }
+                        if let Some(g) = r.payload_as::<crate::store::GotchaRecord>() {
+                            if g.affected_files.iter().any(|af| af == rel_path) {
+                                linked_keys.insert(r.key.clone());
                             }
                         }
                     }
                 }
             }
+
+            for key_str in &linked_keys {
+                match store.get(key_str).await {
+                    Ok(Some(grec)) => {
+                        // Skip tombstoned gotchas so they never feed into enforcement.
+                        if !matches!(grec.lifecycle, crate::store::RecordLifecycle::Active) {
+                            continue;
+                        }
+                        // Inline confirmed flag (same as "get" handler).
+                        let confirmed = grec
+                            .payload_as::<crate::store::GotchaRecord>()
+                            .map(|g| g.confirmed)
+                            .unwrap_or(false);
+                        if let Ok(mut val) = serde_json::to_value(&grec) {
+                            if let Some(obj) = val.as_object_mut() {
+                                obj.insert(
+                                    "confirmed".to_string(),
+                                    serde_json::Value::Bool(confirmed),
+                                );
+                            }
+                            gotcha_records.insert(key_str.clone(), val);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("hook_evaluate: store.get({key_str}) failed: {e}");
+                        gotcha_error = true;
+                    }
+                }
+            }
+
+            // Project the unified gotcha_keys back into the returned
+            // file_record so decide.rs::evaluate (which iterates
+            // `payload.gotcha_keys`) sees every gotcha we just unioned —
+            // not just the ones the canonical link recorded.
+            let file_record = if let Some(mut fr) = file_record {
+                if !gotcha_records.is_empty() {
+                    if let Some(payload) = fr.pointer_mut("/payload") {
+                        if let Some(obj) = payload.as_object_mut() {
+                            let keys: Vec<serde_json::Value> = gotcha_records
+                                .keys()
+                                .map(|k| serde_json::Value::String(k.clone()))
+                                .collect();
+                            obj.insert(
+                                "gotcha_keys".to_string(),
+                                serde_json::Value::Array(keys),
+                            );
+                        }
+                    }
+                }
+                Some(fr)
+            } else {
+                None
+            };
 
             // 3. Consultation status.
             let consulted = sess::check_consulted(store, file_key)

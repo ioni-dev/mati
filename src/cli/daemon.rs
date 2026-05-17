@@ -158,6 +158,12 @@ pub enum DaemonResult {
 /// Exits cleanly on SIGINT, SIGTERM, or after [`IDLE_SHUTDOWN_SECS`] of wall-clock
 /// idle time. Removes the socket and PID file on any exit path.
 pub async fn run_daemon_start() -> Result<()> {
+    // Cold-start clock. Used to emit `startup phase=X elapsed_ms=N` lifecycle
+    // events so callers waiting in `ensure_daemon` can observe progress
+    // through `lifecycle.log` rather than blindly polling the socket. See
+    // `src/mcp/daemon_lifecycle.rs::wait_for_ready`.
+    let startup_t0 = std::time::Instant::now();
+
     let cwd = std::env::current_dir()?;
     // Compute mati_root separately so we can write the starting sentinel before
     // Store::open (which may fail). The sentinel tells `mati init` that a daemon
@@ -249,6 +255,15 @@ pub async fn run_daemon_start() -> Result<()> {
         );
         cleanup_sentinel();
     })?);
+
+    // Phase: opening_store. Migration (if pending) runs inside Store::open and
+    // emits its own granular events; see `src/store/migrations.rs::migrate`.
+    mati_core::mcp::metadata::record_lifecycle_event(
+        &mati_root,
+        "startup",
+        "phase=opening_store",
+    );
+    let store_t0 = std::time::Instant::now();
     let store = Store::open(&cwd).await.inspect_err(|e| {
         mati_core::mcp::metadata::record_lifecycle_event(
             &mati_root,
@@ -257,6 +272,11 @@ pub async fn run_daemon_start() -> Result<()> {
         );
         cleanup_sentinel();
     })?;
+    mati_core::mcp::metadata::record_lifecycle_event(
+        &mati_root,
+        "startup",
+        &format!("phase=store_opened elapsed_ms={}", store_t0.elapsed().as_millis()),
+    );
 
     // Clear stale session:consulted:* markers from previous sessions.
     if let Ok(keys) = store.scan_keys("session:consulted:").await {
@@ -398,6 +418,16 @@ pub async fn run_daemon_start() -> Result<()> {
     }
     // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
+
+    // Phase: ready. Terminal success state of the cold-start sequence. The
+    // socket is bound, metadata is published, and the daemon is committed to
+    // accepting connections. Callers waiting in `ensure_daemon` look for
+    // this event to break out of their state-aware readiness loop.
+    mati_core::mcp::metadata::record_lifecycle_event(
+        &mati_root,
+        "startup",
+        &format!("phase=ready elapsed_ms={}", startup_t0.elapsed().as_millis()),
+    );
 
     tracing::info!(
         path = %sock_path.display(),

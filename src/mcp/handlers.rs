@@ -436,6 +436,20 @@ pub(crate) async fn handle_gotcha_confirm(
     // Best-effort: ensure HasGotcha edges exist for all affected files.
     sync_has_gotcha_edges(store, key, &[], &affected_files).await;
 
+    // Best-effort: invalidate consultation receipts on every affected file.
+    //
+    // A newly-confirmed gotcha is information the agent has not seen. Any
+    // prior `session:consulted:file:<path>` receipt was minted before this
+    // gotcha existed (or before it was confirmed), so granting the agent a
+    // bypass on that stale receipt would let it edit a file under a
+    // confirmed gotcha without ever surfacing the rule. Drop the receipt
+    // so the next pre-read / pre-bash hook returns DENY and forces a fresh
+    // consultation.
+    for file_path in &affected_files {
+        let consulted_key = format!("session:consulted:file:{file_path}");
+        let _ = store.delete(&consulted_key).await;
+    }
+
     // Best-effort: record ControlChanged::Confirmed enforcement event.
     if let Err(e) = crate::store::enforcement::record_event(
         store,
@@ -1077,8 +1091,42 @@ pub(crate) async fn handle_mem_get(
     };
 
     // 2. Build response FIRST (must return before client timeout).
+    //
+    // Includes blast-radius warning injection for high-impact files. This
+    // logic used to live in `tools::MatiServer::mem_get` (Direct branch only)
+    // — meaning v1-dispatched mem_get calls saw the warning but v2-dispatched
+    // ones did not. Centralizing here closes that divergence so both
+    // protocol paths return identical responses (see
+    // `mem_get_v1_and_v2_responses_are_byte_identical` test).
     let response = match &record {
-        Some(r) => super::tools::record_to_agent_json(r),
+        Some(r) => {
+            let mut agent_json = super::tools::record_to_agent_json(r);
+            if r.category == Category::File {
+                if let Some(payload) = &r.payload {
+                    if let Ok(fr) = serde_json::from_value::<
+                        crate::store::record::FileRecord,
+                    >(payload.clone())
+                    {
+                        if let Some(ref br) = fr.blast_radius {
+                            use crate::analysis::blast_radius::BlastTier;
+                            if matches!(br.tier, BlastTier::High | BlastTier::Critical) {
+                                let warning = format!(
+                                    "HIGH IMPACT FILE: {} files directly depend on this. Modify with extra care.",
+                                    br.direct
+                                );
+                                if let Some(obj) = agent_json.as_object_mut() {
+                                    obj.insert(
+                                        "warnings".into(),
+                                        serde_json::json!([warning]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            agent_json
+        }
         None => serde_json::Value::Null,
     };
 
@@ -1112,6 +1160,27 @@ pub(crate) async fn handle_mem_get(
             "mem_get: sessions transaction failed (fail-open): {e}"
         );
     }
+
+    // 3b. Best-effort enforcement event: ReceiptMinted.
+    //
+    // Mirrors the dispatch in `Command::ConsultationHit` (dispatch_v2.rs:720)
+    // so the `mati history --enforcement` log contains a `receipt_minted`
+    // row whether the receipt was minted by an MCP `mem_get` or a CLI
+    // `mati explain` / `proxy.log_hit`. Without this, `mem_get`-only
+    // workflows produce a silent receipt with no audit-grade evidence
+    // that consultation happened, breaking the deny → consult → allow
+    // enforcement audit chain.
+    let _ = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ReceiptMinted,
+        crate::store::enforcement::SubjectKind::File,
+        input.key.clone(),
+        "claude".to_string(),
+        None,
+        "consultation_requested".to_string(),
+        None,
+    )
+    .await;
 
     // 4. Deferred best-effort: access_count bump + daily agg.
     if let Some(mut r) = record {
@@ -1391,4 +1460,275 @@ fn remove_gotcha_key_from_record(record: &mut Record, gotcha_key: &str) -> bool 
     let before = arr.len();
     arr.retain(|v| v.as_str() != Some(gotcha_key));
     arr.len() != before
+}
+
+// ── RecordImport ────────────────────────────────────────────────────────────
+
+/// Bulk-import knowledge-tree records verbatim. Splits the input into chunks
+/// and commits each chunk in one `transact_knowledge` call so an entire
+/// `mati export` round-trip completes in O(chunks) socket round-trips instead
+/// of O(records).
+///
+/// Records are partitioned by key prefix: any record whose `Durability::for_key`
+/// classifies as `Eventual` (session/analytics/audit/etc.) is skipped with a
+/// per-record skipped count returned to the client — those are daemon-owned
+/// runtime state, not user-authored knowledge, and have no place in an
+/// import payload.
+///
+/// Each chunk gets one audit row (target_key: count) so the audit log records
+/// the import without ballooning by 1500× entries.
+pub(crate) async fn handle_record_import(
+    store: &Store,
+    ctx: &RequestContext,
+    request_id: Uuid,
+    input: &protocol::RecordImportInput,
+) -> HandlerResult {
+    // Chunk size: bigger = fewer round-trips but more per-transaction memory.
+    // 200 records per transaction balances throughput against the SurrealKV
+    // transaction-size sweet spot.
+    const CHUNK: usize = 200;
+
+    let mut imported: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut chunk_buf: Vec<&Record> = Vec::with_capacity(CHUNK);
+
+    let valid_prefixes = ["gotcha:", "decision:", "dev_note:", "file:", "stage:", "dep:"];
+
+    // First pass: filter records into knowledge-tree-only buckets and skip
+    // anything that would route to the sessions tree or fails the prefix
+    // allowlist. This mirrors `transact_knowledge`'s precondition check;
+    // doing it upfront avoids aborting a 200-record transaction over a
+    // single stray record.
+    let mut accepted_refs: Vec<&Record> = Vec::with_capacity(input.records.len());
+    for r in &input.records {
+        let key_str = r.key.as_str();
+        if !valid_prefixes.iter().any(|p| key_str.starts_with(p)) {
+            skipped += 1;
+            continue;
+        }
+        if crate::store::Durability::for_key(key_str) != crate::store::Durability::Immediate {
+            skipped += 1;
+            continue;
+        }
+        accepted_refs.push(r);
+    }
+
+    for chunk in accepted_refs.chunks(CHUNK) {
+        chunk_buf.clear();
+        chunk_buf.extend(chunk.iter().copied());
+
+        // One audit row per chunk. target_key encodes the chunk size so
+        // operators can correlate audit entries with import progress.
+        let chunk_target = format!("record_import:{}records", chunk_buf.len());
+        let audit = make_audit(ctx, request_id, "record_import", &chunk_target, true, None)
+            .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
+
+        let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::with_capacity(chunk_buf.len() + 1);
+        for r in &chunk_buf {
+            ops.push(KnowledgeWriteOp::PutRecord {
+                key: r.key.as_str(),
+                record: r,
+            });
+        }
+        ops.push(KnowledgeWriteOp::PutRaw {
+            key: &audit.0,
+            value: &audit.1,
+        });
+
+        store
+            .transact_knowledge(&ops)
+            .await
+            .map_err(|e| (ErrorCode::StoreError, format!("import transact failed: {e}")))?;
+
+        imported += chunk_buf.len() as u64;
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "imported": imported,
+        "skipped": skipped,
+    }))
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Graph;
+    use crate::mcp::metadata::PeerContext;
+    use crate::store::record::Record;
+    use crate::store::Store;
+
+    fn test_peer() -> PeerContext {
+        PeerContext {
+            uid: 501,
+            pid: Some(99999),
+        }
+    }
+
+    fn test_ctx(repo_root: &std::path::Path) -> RequestContext {
+        RequestContext {
+            peer: test_peer(),
+            daemon_session: Uuid::from_bytes([0xAA; 16]),
+            repo_root: repo_root.to_path_buf(),
+        }
+    }
+
+    /// Build a File record whose payload encodes a High-tier blast radius.
+    ///
+    /// The payload is constructed as raw JSON rather than typed `FileRecord`
+    /// so this helper survives unrelated field additions to `FileRecord`
+    /// (it has 20+ fields, many tagged `#[serde(default)]`). The minimum
+    /// required surface is `path` + `blast_radius`.
+    fn high_impact_file_record(key: &str, tier: &str, direct: u32) -> Record {
+        let path = key.strip_prefix("file:").unwrap_or(key).to_string();
+        let payload = serde_json::json!({
+            "path": path,
+            "purpose": "Storage layer",
+            "entry_points": [],
+            "imports": [],
+            "gotcha_keys": [],
+            "decision_keys": [],
+            "todos": [],
+            "unsafe_count": 0,
+            "unwrap_count": 0,
+            "change_frequency": 0,
+            "last_author": null,
+            "is_hotspot": false,
+            "token_cost_estimate": 0,
+            "last_modified_session": 0,
+            "blast_radius": {
+                "direct": direct,
+                "transitive": direct * 5,
+                "score": direct as f32,
+                "tier": tier,
+            }
+        });
+        let mut record = Record::layer0_file_stub(
+            key.to_string(),
+            uuid::Uuid::nil(),
+            1,
+            0,
+        );
+        record.payload = Some(payload);
+        record
+    }
+
+    /// γ-C1 load-bearing test: the v2-native `handle_mem_get` and the
+    /// rmcp tool wrapper `MatiServer::mem_get` must produce semantically
+    /// identical agent-facing JSON for the same input.
+    ///
+    /// Before γ-C1, the rmcp tool's Direct branch in `tools.rs` injected a
+    /// blast-radius `warnings` field that `handle_mem_get` did not — meaning
+    /// v1-dispatched (`mati_root/socket → server.mem_get`) calls saw the
+    /// warning, but v2-dispatched (`Command::MemGet → handle_mem_get`)
+    /// calls did not. That divergence is a latent correctness bug. This
+    /// test pins parity so the two protocol paths can never drift again.
+    #[tokio::test]
+    async fn mem_get_v1_and_v2_responses_agree_on_blast_radius_warning() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemGetParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // BlastTier serde uses snake_case — "high" not "High".
+        let key = "file:src/hotspot.rs";
+        let record = high_impact_file_record(key, "high", 22);
+        store.put(key, &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+
+        // Path A: v2 native handler (after γ-C1 centralization).
+        let ctx = test_ctx(dir.path());
+        let input = crate::mcp::protocol::MemGetInput { key: key.into() };
+        let v2_value = {
+            let g = graph_arc.read().await;
+            handle_mem_get(g.store(), &graph_arc, &ctx, Uuid::new_v4(), &input)
+                .await
+                .expect("handle_mem_get must succeed for a known key")
+        };
+
+        // Path B: rmcp tool wrapper (v1 dispatch route). Returns a String;
+        // parse it back to a Value so we can compare structurally rather
+        // than relying on byte-identical formatting (the rmcp path uses
+        // `to_string_pretty`, the handler path uses raw values).
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+        let v1_string = server
+            .mem_get(Parameters(MemGetParams {
+                key: key.into(),
+            }))
+            .await;
+        let v1_value: serde_json::Value =
+            serde_json::from_str(&v1_string).expect("v1 mem_get must return valid JSON");
+
+        // The critical claim: both paths emit the blast-radius warning. If
+        // either side drifts in the future, this assertion catches it.
+        let v2_warnings = v2_value.get("warnings").cloned();
+        let v1_warnings = v1_value.get("warnings").cloned();
+        assert_eq!(
+            v2_warnings, v1_warnings,
+            "v1 and v2 mem_get must emit identical `warnings` field; \
+             v1={v1_warnings:?} v2={v2_warnings:?}"
+        );
+        assert!(
+            v2_warnings.is_some(),
+            "high-impact file must produce a warnings field, got v2={v2_value:?}"
+        );
+        // Belt-and-suspenders: the warning text must mention the impact.
+        let warnings_text = serde_json::to_string(&v2_warnings.unwrap()).unwrap();
+        assert!(
+            warnings_text.contains("HIGH IMPACT FILE") && warnings_text.contains("22"),
+            "warning content drift, got {warnings_text}"
+        );
+    }
+
+    /// Negative case: a low-impact file must produce NO `warnings` field on
+    /// either path. Pins the lower bound — the warning injection must be
+    /// gated on `BlastTier::High | Critical`, not unconditional.
+    #[tokio::test]
+    async fn mem_get_low_impact_file_emits_no_warnings_on_either_path() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemGetParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let key = "file:src/cold.rs";
+        let record = high_impact_file_record(key, "low", 1);
+        store.put(key, &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+
+        let ctx = test_ctx(dir.path());
+        let input = crate::mcp::protocol::MemGetInput { key: key.into() };
+        let v2_value = {
+            let g = graph_arc.read().await;
+            handle_mem_get(g.store(), &graph_arc, &ctx, Uuid::new_v4(), &input)
+                .await
+                .expect("handle_mem_get must succeed")
+        };
+
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+        let v1_string = server
+            .mem_get(Parameters(MemGetParams {
+                key: key.into(),
+            }))
+            .await;
+        let v1_value: serde_json::Value = serde_json::from_str(&v1_string).unwrap();
+
+        assert!(
+            v2_value.get("warnings").is_none(),
+            "Low-tier file must not produce warnings on v2 path, got {v2_value:?}"
+        );
+        assert!(
+            v1_value.get("warnings").is_none(),
+            "Low-tier file must not produce warnings on v1 path, got {v1_value:?}"
+        );
+    }
 }
