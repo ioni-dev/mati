@@ -1,0 +1,135 @@
+# Nextest configuration for mati.
+#
+# Why nextest is the production-grade test runner for this repo:
+#
+#   `cargo test` runs every test inside one shared binary process. Tokio
+#   runtimes, SurrealKV instances, OnceLock-installed panic hooks, the
+#   tokio blocking thread pool (default 512 threads), and the macOS
+#   `fseventsd` event queue all accumulate state across hundreds of tests
+#   in a single OS process. On Apple Silicon this accumulation saturates
+#   APFS + the `logd` firehose dispatch queue. When `logd` misses its
+#   kernel watchdog check-in (~120s), the kernel resets — that's the
+#   crash that triggered this work.
+#
+#   Nextest runs each test in its own subprocess. State is reclaimed
+#   when the process exits, so parallelism is safe even on modest
+#   hardware. Failed or wedged tests can't poison the next test. This
+#   is what rust-analyzer, RustCrypto, and the Rust compiler use.
+#
+# Quickstart:
+#   cargo install cargo-nextest --locked       # one-time
+#   cargo nextest run --lib                    # safe default (this file)
+#   cargo nextest run --lib --profile ci       # match CI behavior locally
+#   cargo nextest run --lib --profile stress   # no retries, surface flakes
+#
+# Vanilla `cargo test --lib` still works as a fallback (gated by
+# RUST_TEST_THREADS=1 in .cargo/config.toml) but is single-threaded and
+# slow. Use nextest for normal development.
+
+# ─── default profile: local development ──────────────────────────────────
+#
+# Modest parallelism. Per-process isolation makes 4 here *safer* than
+# `cargo test --test-threads=1` because no global state crosses tests.
+# Heavy test clusters are further capped via `[test-groups]` below.
+[profile.default]
+test-threads = 4
+
+# Anything slower than 30s is a wedged test, not a slow test — every
+# real test in this suite finishes in milliseconds. Terminate after
+# 4 grace periods (2 min total) to keep CI runs bounded.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# Don't fail-fast — collect the full failure picture in one run.
+fail-fast = false
+
+# Light retry for OS-level scheduling jitter (rare in this suite, but
+# cheap insurance against transient EAGAIN under load).
+retries = { backoff = "fixed", count = 1, delay = "100ms" }
+
+# Show output for failing tests by default.
+failure-output = "immediate-final"
+success-output = "never"
+
+# ─── ci profile: GitHub Actions ──────────────────────────────────────────
+#
+# CI machines are dedicated and Linux is more permissive with fs events;
+# push parallelism higher. Heavy clusters are still capped by test-groups.
+[profile.ci]
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 4 }
+fail-fast = false
+retries = { backoff = "exponential", count = 2, delay = "500ms", max-delay = "5s" }
+failure-output = "immediate-final"
+success-output = "never"
+final-status-level = "slow"
+
+# ─── stress profile: surface flakes ──────────────────────────────────────
+#
+# `cargo nextest run --lib --profile stress` to run each test without
+# retries. Use before cutting a release to expose intermittent failures.
+[profile.stress]
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 4 }
+fail-fast = false
+retries = { backoff = "fixed", count = 0 }
+
+# ─── resource-bound test groups ──────────────────────────────────────────
+#
+# Each group caps how many tests in that group can run simultaneously,
+# *regardless* of the profile's `test-threads`. This is the load-bearing
+# safety net: even if a contributor cranks `test-threads`, MCP and
+# compliance tests stay bounded.
+[test-groups]
+# MCP tests open many tokio runtimes + SurrealKV instances. Each in its
+# own subprocess is fine, but >2 concurrent subprocesses hammer APFS.
+mcp = { max-threads = 2 }
+
+# Compliance tests spawn a real `bash` subprocess that invokes a mock
+# `mati` binary — 3+ processes per test. Cap to keep total bounded.
+hook-compliance = { max-threads = 2 }
+
+# Daemon lifecycle tests spawn long-lived children (`sleep 60`, trap-sh).
+# Each can live up to 7s; running >1 concurrently risks process-table
+# pressure on weaker hardware.
+cli-daemon = { max-threads = 1 }
+
+# ─── group assignments ───────────────────────────────────────────────────
+#
+# Nextest requires per-profile override blocks. Define once for each
+# profile so the same caps apply locally and in CI.
+
+[[profile.default.overrides]]
+filter = 'test(/^mcp::/)'
+test-group = 'mcp'
+
+[[profile.default.overrides]]
+filter = 'test(/^hooks::compliance::/)'
+test-group = 'hook-compliance'
+
+[[profile.default.overrides]]
+filter = 'test(/^cli::daemon::/)'
+test-group = 'cli-daemon'
+
+[[profile.ci.overrides]]
+filter = 'test(/^mcp::/)'
+test-group = 'mcp'
+
+[[profile.ci.overrides]]
+filter = 'test(/^hooks::compliance::/)'
+test-group = 'hook-compliance'
+
+[[profile.ci.overrides]]
+filter = 'test(/^cli::daemon::/)'
+test-group = 'cli-daemon'
+
+[[profile.stress.overrides]]
+filter = 'test(/^mcp::/)'
+test-group = 'mcp'
+
+[[profile.stress.overrides]]
+filter = 'test(/^hooks::compliance::/)'
+test-group = 'hook-compliance'
+
+[[profile.stress.overrides]]
+filter = 'test(/^cli::daemon::/)'
+test-group = 'cli-daemon'
