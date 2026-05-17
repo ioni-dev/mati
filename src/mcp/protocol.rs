@@ -275,6 +275,20 @@ pub enum Command {
     /// Archive session, run promotions, collect stale reviews.
     #[serde(rename = "session_harvest")]
     SessionHarvest,
+
+    /// Bulk-import a batch of pre-built `Record`s into the knowledge tree.
+    /// Bypasses the semantic upsert handlers — records are written verbatim
+    /// so an `export → import` round-trip preserves every field
+    /// (`confirmed`, `source`, `confidence`, `lifecycle`, etc.) without
+    /// the destructive resets the typed upsert commands apply.
+    ///
+    /// Only `gotcha:*`, `decision:*`, `dev_note:*`, `file:*`, `stage:*`,
+    /// and `dep:*` keys are accepted (the knowledge-tree namespaces).
+    /// Session-tree keys (`session:*`, `analytics:*`, `compliance:*`,
+    /// `audit:*`) are rejected at the boundary — those are daemon-owned
+    /// telemetry that an `export` should never round-trip.
+    #[serde(rename = "record_import")]
+    RecordImport(RecordImportInput),
 }
 
 // ── Input DTOs ──────────────────────────────────────────────────────────────
@@ -568,6 +582,15 @@ pub struct ConsultationHitInput {
     pub key: String,
 }
 
+/// Input for `Command::RecordImport`. Records are written verbatim into the
+/// knowledge tree, preserving every field. The daemon validates each record's
+/// key prefix against the knowledge-namespace allowlist before writing.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordImportInput {
+    pub records: Vec<crate::store::Record>,
+}
+
 /// Input for `Command::ConfigGet`. `key` is the dotted config name
 /// (e.g. `enforcement.mode`, `enforcement.retention`).
 #[derive(Debug, Serialize, Deserialize)]
@@ -668,6 +691,7 @@ impl Command {
             Self::ConsultationHit(_) => "consultation_hit",
             Self::SessionFlush => "session_flush",
             Self::SessionHarvest => "session_harvest",
+            Self::RecordImport(_) => "record_import",
         }
     }
 
@@ -702,7 +726,8 @@ impl Command {
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
             | Self::SessionFlush
-            | Self::SessionHarvest => "",
+            | Self::SessionHarvest
+            | Self::RecordImport(_) => "",
         }
     }
 
@@ -733,6 +758,7 @@ impl Command {
             | Self::ConfigSet(_)
             | Self::SessionFlush
             | Self::SessionHarvest
+            | Self::RecordImport(_)
         )
     }
 }

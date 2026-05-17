@@ -796,39 +796,54 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
         "json" => {
             let content = std::fs::read_to_string(path)?;
             let records: Vec<Record> = serde_json::from_str(&content)?;
-            let pairs: Vec<(&str, &Record)> = records.iter().map(|r| (r.key.as_str(), r)).collect();
-            proxy.put_batch(&pairs).await?;
-            println!("Imported {} records from JSON.", records.len());
+            let (imported, skipped) = import_records_resilient(&proxy, &records).await;
+            println!("Imported {imported} records from JSON ({skipped} skipped).");
         }
         "md" => {
             let device_id = uuid::Uuid::new_v4();
             let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
-            let pairs: Vec<(&str, &Record)> =
-                import.records.iter().map(|r| (r.key.as_str(), r)).collect();
-            proxy.put_batch(&pairs).await?;
-            println!("Imported {} records from CLAUDE.md.", import.records.len());
+            let (imported, skipped) = import_records_resilient(&proxy, &import.records).await;
+            println!("Imported {imported} records from CLAUDE.md ({skipped} skipped).");
         }
         _ => {
             // Try JSON first, fall back to CLAUDE.md import
             let content = std::fs::read_to_string(path)?;
             if content.trim_start().starts_with('[') || content.trim_start().starts_with('{') {
                 let records: Vec<Record> = serde_json::from_str(&content)?;
-                let pairs: Vec<(&str, &Record)> =
-                    records.iter().map(|r| (r.key.as_str(), r)).collect();
-                proxy.put_batch(&pairs).await?;
-                println!("Imported {} records from JSON.", records.len());
+                let (imported, skipped) = import_records_resilient(&proxy, &records).await;
+                println!("Imported {imported} records from JSON ({skipped} skipped).");
             } else {
                 let device_id = uuid::Uuid::new_v4();
                 let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
-                let pairs: Vec<(&str, &Record)> =
-                    import.records.iter().map(|r| (r.key.as_str(), r)).collect();
-                proxy.put_batch(&pairs).await?;
-                println!("Imported {} records from CLAUDE.md.", import.records.len());
+                let (imported, skipped) =
+                    import_records_resilient(&proxy, &import.records).await;
+                println!("Imported {imported} records from CLAUDE.md ({skipped} skipped).");
             }
         }
     }
     proxy.close().await?;
     Ok(())
+}
+
+/// Import records via the bulk `RecordImport` v2 command. Routes through one
+/// daemon round-trip per 200-record chunk in socket mode, or one atomic
+/// `put_batch` in direct mode. Records destined for the sessions tree
+/// (`session:`, `analytics:`, `compliance:`, `audit:*`, `graph:edge:*`) are
+/// skipped at the boundary — those are daemon-owned runtime state, not
+/// user-authored knowledge.
+///
+/// Returns `(imported, skipped)` counts.
+async fn import_records_resilient(
+    proxy: &super::proxy::StoreProxy,
+    records: &[Record],
+) -> (usize, usize) {
+    match proxy.import_records(records).await {
+        Ok((imported, skipped)) => (imported as usize, skipped as usize),
+        Err(e) => {
+            eprintln!("  import failed: {e}");
+            (0, records.len())
+        }
+    }
 }
 
 // ── run_history (M-14-C stub) ────────────────────────────────────────────────
