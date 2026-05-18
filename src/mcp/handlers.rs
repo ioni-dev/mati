@@ -1788,6 +1788,679 @@ pub(crate) async fn handle_record_import(
     }))
 }
 
+// ── MemSet (γ-C1.85) ────────────────────────────────────────────────────────
+//
+// Native handler port of `tools::MatiServer::mem_set`'s Direct branch plus
+// the four `&self` helpers (`mem_set_confirm`, `try_confirm_once`,
+// `finalize_confirm`, `mem_set_delete`). The bytes here are intentionally
+// near-identical to the originals — γ-C1.85 is pure code motion to ensure
+// v1 (rmcp tool wrapper) and v2 (Socket → typed Commands) dispatch paths
+// converge on a single implementation. After γ-C4 removes the Direct
+// backend, this is the only entry point.
+
+/// γ-C1.85 entry point: route `mem_set` to the appropriate write / confirm
+/// / delete helper. Returns the JSON string the v1 rmcp tool used to return
+/// from its Direct branch — same envelope shape, same error strings.
+pub(crate) async fn handle_mem_set(
+    graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    _ctx: &RequestContext,
+    _request_id: Uuid,
+    params: &crate::mcp::types::MemSetParams,
+) -> String {
+    match params.action.as_str() {
+        "confirm" => apply_mem_set_confirm(graph_arc, &params.key).await,
+        "delete" => apply_mem_set_delete(graph_arc, &params.key).await,
+        "write" | "" => apply_mem_set_write(graph_arc, params).await,
+        other => serde_json::json!({
+            "error": format!("unknown action: {other}. Valid: write, confirm, delete")
+        })
+        .to_string(),
+    }
+}
+
+async fn apply_mem_set_write(
+    graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    params: &crate::mcp::types::MemSetParams,
+) -> String {
+    let graph = graph_arc.read().await;
+    let store = graph.store();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Validate key namespace. `file:*` writes are intentionally
+    // excluded — file records are owned by the static-analysis
+    // pipeline (`mati init` Layer 0 + the `file_enrich` /
+    // `file_reparse` typed Commands), never by direct mem_set.
+    // The Socket path enforces the same restriction in
+    // `build_mem_set_command`; both backends now accept and
+    // reject identical key prefixes.
+    let valid_prefix = ["gotcha:", "decision:", "dev_note:"]
+        .iter()
+        .any(|p| params.key.starts_with(p));
+    if !valid_prefix {
+        return serde_json::json!({
+            "error": "key must start with gotcha:, decision:, or dev_note:"
+        })
+        .to_string();
+    }
+
+    // Parse category. `File` is intentionally absent — file
+    // records are owned by the static-analysis pipeline (see the
+    // key-namespace check above for the full justification).
+    let category = match params.category.as_str() {
+        "Gotcha" => Category::Gotcha,
+        "Decision" => Category::Decision,
+        "DevNote" => Category::DevNote,
+        other => {
+            return serde_json::json!({
+                "error": format!("unknown category: {other}. Valid: Gotcha, Decision, DevNote")
+            })
+            .to_string();
+        }
+    };
+
+    // Parse priority
+    let priority = match params.priority.as_str() {
+        "Critical" => StorePriority::Critical,
+        "High" => StorePriority::High,
+        "Low" => StorePriority::Low,
+        _ => StorePriority::Normal,
+    };
+
+    // Fetch existing record to preserve Layer 0 structural data
+    let existing_record =
+        match super::tools::resolve_existing_for_write(store.get(&params.key).await) {
+            Ok(record) => record,
+            Err(error_json) => return error_json,
+        };
+
+    // A tombstoned record must not bleed its prior confirmation state
+    // into a resurrection — treat it as an unconfirmed write.
+    let is_tombstoned = existing_record
+        .as_ref()
+        .map(|r| matches!(r.lifecycle, RecordLifecycle::Tombstoned { .. }))
+        .unwrap_or(false);
+
+    // ── Semantic validation ──────────────────────────────────
+    // Key-category consistency: key prefix must match category.
+    // This prevents miscategorized records (e.g., gotcha: key
+    // with Category::File) that would corrupt the knowledge store.
+    let expected_category = match params.key.split(':').next().unwrap_or("") {
+        "gotcha" => Category::Gotcha,
+        "decision" => Category::Decision,
+        "dev_note" => Category::DevNote,
+        _ => unreachable!("key prefix already validated"),
+    };
+    if category != expected_category {
+        return serde_json::json!({
+            "error": format!(
+                "key prefix requires category {expected_category:?}, got {category:?}"
+            )
+        })
+        .to_string();
+    }
+
+    // Payload structural validation for new records. Updates to
+    // existing records use merge semantics (existing fields are
+    // preserved), so partial payloads are valid on update.
+    let is_new_record = existing_record.is_none() || is_tombstoned;
+    if is_new_record {
+        // Normalize for validation (Codex sends JSON-encoded strings).
+        let check_payload = match &params.payload {
+            serde_json::Value::String(s) => {
+                serde_json::from_str::<serde_json::Value>(s).unwrap_or_else(|_| params.payload.clone())
+            }
+            _ => params.payload.clone(),
+        };
+        let obj = check_payload.as_object();
+        if let Err(msg) = match &category {
+            Category::Gotcha => {
+                let valid = obj.is_some_and(|o| {
+                    let rule = o.get("rule").and_then(|v| v.as_str()).unwrap_or("");
+                    let reason = o.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                    !rule.is_empty() && !reason.is_empty()
+                });
+                if valid {
+                    Ok(())
+                } else {
+                    Err("gotcha requires payload with non-empty 'rule' and 'reason'")
+                }
+            }
+            Category::Decision => {
+                let valid = obj.is_some_and(|o| {
+                    let summary = o.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                    let rationale = o.get("rationale").and_then(|v| v.as_str()).unwrap_or("");
+                    !summary.is_empty() && !rationale.is_empty()
+                });
+                if valid {
+                    Ok(())
+                } else {
+                    Err("decision requires payload with non-empty 'summary' and 'rationale'")
+                }
+            }
+            Category::DevNote => {
+                if params.value.is_empty() {
+                    Err("dev_note requires non-empty value")
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        } {
+            return serde_json::json!({"error": msg}).to_string();
+        }
+    }
+
+    let was_confirmed = existing_record
+        .as_ref()
+        .map(|r| {
+            !is_tombstoned
+                && (r.source == RecordSource::DeveloperManual
+                    || r.confidence.value >= 0.80)
+        })
+        .unwrap_or(false);
+
+    // Capture old affected_files before mutation (for file-link sync)
+    let old_affected_files: Vec<String> = existing_record
+        .as_ref()
+        .filter(|r| r.key.starts_with("gotcha:"))
+        .and_then(|r| r.payload_as::<GotchaRecord>())
+        .map(|g| g.affected_files)
+        .unwrap_or_default();
+
+    let mut record = match existing_record {
+        Some(existing) => existing,
+        _ => Record {
+            key: params.key.clone(),
+            value: String::new(),
+            category: category.clone(),
+            priority: StorePriority::Normal,
+            tags: vec![],
+            created_at: now,
+            updated_at: now,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 0,
+                wall_clock: now,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+            payload: Some(serde_json::json!({})),
+        },
+    };
+
+    // A write to a tombstoned record revives it; reset
+    // confirmation counters so the new write starts fresh.
+    if is_tombstoned {
+        record.confidence.confirmation_count = 0;
+    }
+    record.lifecycle = RecordLifecycle::Active;
+
+    // Apply enrichment fields
+    record.value = params.value.clone();
+    record.category = category;
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+    record.priority = priority;
+
+    // Preserve confirmation state: if the existing record was previously confirmed
+    // (source=DeveloperManual or confidence>=0.80), keep source/confidence/tags.
+    // Otherwise set to ClaudeEnrich defaults.
+    if was_confirmed {
+        // Only update tags if the caller explicitly provided non-empty tags.
+        if !params.tags.is_empty() {
+            record.tags = params.tags.clone();
+        }
+    } else {
+        record.source = RecordSource::ClaudeEnrich;
+        record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+        record.tags = params.tags.clone();
+    }
+
+    // Merge payload: for existing records, preserve structural fields from
+    // Layer 0 (entry_points, imports, etc.) while overlaying enrichment.
+    // Some MCP clients (Codex) send the payload as a JSON-encoded string
+    // rather than a raw object. Parse it if so.
+    let new_payload = match &params.payload {
+        serde_json::Value::String(s) => {
+            serde_json::from_str::<serde_json::Value>(s).unwrap_or_else(|_| params.payload.clone())
+        }
+        other => other.clone(),
+    };
+    if new_payload.is_object() && !new_payload.as_object().is_none_or(|o| o.is_empty()) {
+        if let Some(existing_payload) = &record.payload {
+            // Merge: new values override, existing keys preserved
+            let mut merged = existing_payload.clone();
+            if let (Some(base), Some(overlay)) =
+                (merged.as_object_mut(), new_payload.as_object())
+            {
+                for (k, v) in overlay {
+                    // gotcha_keys is a derived index maintained by the
+                    // gotcha confirm/tombstone paths. Overwriting it on
+                    // file-record re-enrichment silently drops edges that
+                    // were added by gotcha confirm. Union-merge instead.
+                    if k == "gotcha_keys" {
+                        if let (Some(existing_arr), Some(new_arr)) = (
+                            base.get(k).and_then(|e| e.as_array()).cloned(),
+                            v.as_array(),
+                        ) {
+                            let mut union = existing_arr;
+                            for item in new_arr {
+                                if !union.contains(item) {
+                                    union.push(item.clone());
+                                }
+                            }
+                            base.insert(k.clone(), serde_json::Value::Array(union));
+                            continue;
+                        }
+                    }
+                    base.insert(k.clone(), v.clone());
+                }
+                record.payload = Some(serde_json::Value::Object(base.clone()));
+            } else {
+                record.payload = Some(new_payload);
+            }
+        } else {
+            record.payload = Some(new_payload);
+        }
+    }
+
+    // Normalize gotcha payload: severity must be snake_case for GotchaRecord deserialization.
+    // Claude sends "Critical"/"High"/"Normal"/"Low" but serde expects "critical"/"high"/etc.
+    if record.key.starts_with("gotcha:") {
+        if let Some(ref mut payload) = record.payload {
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(sev) = obj
+                    .get("severity")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_lowercase())
+                {
+                    obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                }
+            }
+        }
+    }
+
+    // Recompute quality. Only reset confidence for non-confirmed records —
+    // confirmed records keep their DeveloperManual confidence (0.80).
+    if !was_confirmed {
+        record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+    }
+    record.quality = quality::analyze(&record);
+
+    // Write record
+    let tier_label = format!("{:?}", record.quality.tier);
+    let record_key = record.key.clone();
+    if let Err(e) = store.put(&record.key, &record).await {
+        return serde_json::json!({"error": e.to_string()}).to_string();
+    }
+
+    // Extract affected_files for edge creation and file-link sync (gotchas only)
+    let affected_files: Vec<String> = if record_key.starts_with("gotcha:") {
+        record
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("affected_files"))
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    // Sync file:*.gotcha_keys — the derived index that diff and pre-read hooks use.
+    // This was previously skipped, leaving MCP-created gotchas invisible to
+    // enforcement surfaces even after confirmation.
+    if record_key.starts_with("gotcha:") {
+        if let Err(e) = crate::store::gotcha_ops::sync_gotcha_file_links(
+            store,
+            &record_key,
+            &old_affected_files,
+            &affected_files,
+        )
+        .await
+        {
+            tracing::warn!("mem_set: file link sync failed for {record_key}: {e}");
+            crate::store::repair::mark_dirty(
+                store,
+                &record_key,
+                &format!("mem_set link sync failed: {e}"),
+            )
+            .await;
+        }
+    }
+
+    let old_affected_set: HashSet<&str> =
+        old_affected_files.iter().map(String::as_str).collect();
+    let new_affected_set: HashSet<&str> =
+        affected_files.iter().map(String::as_str).collect();
+
+    drop(graph); // release read lock before taking write lock
+
+    // Keep the in-memory graph in sync with the persisted edge state.
+    // mem_set already updated file links above; here we remove stale
+    // HasGotcha edges for moved gotchas and add edges for newly-affected files.
+    if record_key.starts_with("gotcha:") {
+        let mut graph = graph_arc.write().await;
+
+        for file_path in old_affected_set.difference(&new_affected_set) {
+            let file_key = format!("file:{file_path}");
+            if let Err(e) = graph
+                .remove_edge(&file_key, &EdgeKind::HasGotcha, &record_key)
+                .await
+            {
+                tracing::warn!(
+                    "mem_set: stale edge removal failed for {file_key} → {record_key}: {e}"
+                );
+                crate::store::repair::mark_dirty(
+                    graph.store(),
+                    &record_key,
+                    &format!("mem_set edge remove failed: {e}"),
+                )
+                .await;
+            }
+        }
+
+        for file_path in new_affected_set.difference(&old_affected_set) {
+            let file_key = format!("file:{file_path}");
+            if let Err(e) = graph
+                .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
+                .await
+            {
+                tracing::warn!(
+                    "mem_set: edge add failed for {file_key} → {record_key}: {e}"
+                );
+                crate::store::repair::mark_dirty(
+                    graph.store(),
+                    &record_key,
+                    &format!("mem_set edge add failed: {e}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "key": record_key,
+        "confidence": record.confidence.value,
+        "quality": record.quality.value,
+        "tier": tier_label,
+    })
+    .to_string()
+}
+
+/// Confirm a gotcha record — sets confirmed=true, bumps confidence to 0.80,
+/// syncs file-record gotcha_keys. This is the MCP-native equivalent of
+/// `mati gotcha confirm`, needed because Codex Bash commands cannot access
+/// the daemon socket from the sandbox.
+async fn apply_mem_set_confirm(
+    graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    key: &str,
+) -> String {
+    if !key.starts_with("gotcha:") {
+        return serde_json::json!({"error": "confirm action only applies to gotcha: keys"})
+            .to_string();
+    }
+
+    // Retry loop: SurrealKV MVCC can return a transient write conflict
+    // when the confirm races with the preceding write on the same key.
+    // Each attempt acquires and releases the read lock to get a fresh snapshot.
+    const MAX_RETRIES: usize = 3;
+    let mut last_err: Option<String> = None;
+
+    for attempt in 0..MAX_RETRIES {
+        // Scope the read lock so it is dropped before finalize_confirm,
+        // which needs a write lock for graph edge updates.
+        let result = {
+            let graph = graph_arc.read().await;
+            let store = graph.store();
+            try_confirm_once(store, key).await
+        };
+
+        match result {
+            Ok((rec, files)) => {
+                return finalize_confirm(graph_arc, key, &rec, &files).await;
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                if msg.contains("write conflict") && attempt + 1 < MAX_RETRIES {
+                    tracing::debug!(
+                        "confirm {key}: write conflict (attempt {}), retrying",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    last_err = Some(msg);
+                    continue;
+                }
+                return serde_json::json!({"error": msg}).to_string();
+            }
+        }
+    }
+    serde_json::json!({"error": format!("store put: {}", last_err.unwrap_or_default())})
+        .to_string()
+}
+
+/// Single attempt at the confirm get-mutate-put cycle.
+async fn try_confirm_once(
+    store: &Store,
+    key: &str,
+) -> anyhow::Result<(Record, Vec<String>)> {
+    let mut record = store
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+
+    if record.category != Category::Gotcha {
+        anyhow::bail!("{key} is not a gotcha record");
+    }
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        anyhow::bail!("{key} is tombstoned — cannot confirm a deleted record");
+    }
+
+    // Set confirmed + normalize severity
+    if let Some(ref mut payload) = record.payload {
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(sev) = obj
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_lowercase())
+            {
+                obj.insert("severity".to_string(), serde_json::Value::String(sev));
+            }
+            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+
+    record.source = RecordSource::DeveloperManual;
+    record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+    record.confidence.confirmation_count += 1;
+    record.quality = quality::analyze(&record);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    let affected_files: Vec<String> = record
+        .payload_as::<GotchaRecord>()
+        .map(|g| g.affected_files)
+        .unwrap_or_default();
+
+    store.put(key, &record).await?;
+
+    // Record ControlChanged::Confirmed enforcement event — best-effort
+    if let Err(e) = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ControlChanged {
+            change_kind: crate::store::enforcement::ControlChangeKind::Confirmed,
+        },
+        crate::store::enforcement::SubjectKind::Control,
+        key.to_string(),
+        "developer".to_string(),
+        None,
+        "control_confirmed".to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("confirm: enforcement event recording failed for {key}: {e}");
+    }
+
+    Ok((record, affected_files))
+}
+
+/// Post-put work: sync file links, graph edges, consultation receipt.
+async fn finalize_confirm(
+    graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    key: &str,
+    record: &Record,
+    affected_files: &[String],
+) -> String {
+    // Acquire a fresh read lock for file-link sync.
+    let graph = graph_arc.read().await;
+    let store = graph.store();
+
+    // Sync file:*.gotcha_keys — best-effort
+    for file_path in affected_files {
+        let file_key = format!("file:{file_path}");
+        if let Ok(Some(mut file_record)) = store.get(&file_key).await {
+            let needs_link = file_record
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("gotcha_keys"))
+                .and_then(|v| v.as_array())
+                .map(|arr| !arr.iter().any(|v| v.as_str() == Some(key)))
+                .unwrap_or(true);
+            if needs_link {
+                if let Some(ref mut payload) = file_record.payload {
+                    if let Some(obj) = payload.as_object_mut() {
+                        let arr = obj.entry("gotcha_keys").or_insert(serde_json::json!([]));
+                        if let Some(arr) = arr.as_array_mut() {
+                            arr.push(serde_json::Value::String(key.to_string()));
+                        }
+                    }
+                }
+                let _ = store.put(&file_key, &file_record).await;
+            }
+        }
+        // Invalidate any prior consultation receipt on this file —
+        // a newly-confirmed gotcha changes what the agent must know
+        // about the file, so the bypass token from a pre-confirmation
+        // mem_get / explain must not carry over. Mirrors the
+        // socket-mode `handle_gotcha_confirm` cleanup so both backends
+        // share identical enforcement behavior. (Pre-fix the codex
+        // pre-bash hook silently allowed reads on files whose prior
+        // bootstrap `mem_get` had minted a still-valid receipt.)
+        let consulted_key = format!("session:consulted:{file_key}");
+        let _ = store.delete(&consulted_key).await;
+    }
+
+    // Propagate confirmation_count to linked file records
+    crate::store::gotcha_ops::propagate_confirmation_to_files(store, affected_files).await;
+
+    // Mint consultation receipt so hooks know this file was reviewed
+    let _ = crate::store::session::log_hit(store, key).await;
+
+    let confidence_value = record.confidence.value;
+    let quality_value = record.quality.value;
+
+    // Release the read lock before taking a write lock for graph edge updates.
+    drop(graph);
+
+    // Ensure HasGotcha edges exist in the in-memory graph for all affected files.
+    // This is idempotent (add_edge is a no-op if the edge already exists) and guards
+    // against gotchas that were written via the CLI path, whose graph edges landed in
+    // the persistent store but were never loaded into the running graph.
+    if !affected_files.is_empty() {
+        let mut g = graph_arc.write().await;
+        for file_path in affected_files {
+            let file_key = format!("file:{file_path}");
+            let _ = g.add_edge(&file_key, EdgeKind::HasGotcha, key).await;
+        }
+    }
+
+    serde_json::json!({
+        "ok": true,
+        "key": key,
+        "confirmed": true,
+        "confidence": confidence_value,
+        "quality": quality_value,
+    })
+    .to_string()
+}
+
+/// Tombstone a gotcha record — marks it as deleted, removes file-record
+/// links and graph edges. MCP-native equivalent of `mati gotcha delete`.
+async fn apply_mem_set_delete(
+    graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    key: &str,
+) -> String {
+    // Phase 1: read lock — validate and tombstone the record.
+    let affected_files = {
+        let graph = graph_arc.read().await;
+        let store = graph.store();
+
+        if !key.starts_with("gotcha:") {
+            return serde_json::json!({"error": "delete action only applies to gotcha: keys"})
+                .to_string();
+        }
+
+        let record = match store.get(key).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return serde_json::json!({"error": format!("record not found: {key}")}).to_string()
+            }
+            Err(e) => return serde_json::json!({"error": format!("store get: {e}")}).to_string(),
+        };
+
+        let affected: Vec<String> = record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default();
+
+        if let Err(e) =
+            crate::store::gotcha_ops::apply_gotcha_tombstone(store, key, &affected).await
+        {
+            return serde_json::json!({"error": format!("tombstone failed: {e}")}).to_string();
+        }
+
+        affected
+    }; // read lock dropped here
+
+    // Phase 2: write lock — clean up in-memory graph edges.
+    {
+        let mut graph = graph_arc.write().await;
+        for file_path in &affected_files {
+            let file_key = format!("file:{file_path}");
+            // remove_edge is idempotent — the persisted edge is already gone
+            // from apply_gotcha_tombstone; this cleans up the in-memory cache.
+            if let Err(e) = graph
+                .remove_edge(&file_key, &EdgeKind::HasGotcha, key)
+                .await
+            {
+                tracing::warn!(
+                    "mem_set_delete: in-memory edge cleanup failed for {file_key} → {key}: {e}"
+                );
+            }
+        }
+    }
+
+    serde_json::json!({"ok": true, "key": key, "tombstoned": true}).to_string()
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2257,6 +2930,101 @@ mod tests {
         assert!(
             msg.contains("semantic search requires"),
             "v1 error message must explain semantic feature requirement, got {msg:?}"
+        );
+    }
+
+    // ── γ-C1.85: mem_set parity ───────────────────────────────────────────
+    //
+    // Pins that the rmcp tool wrapper (v1) and the native `handle_mem_set`
+    // (v2 entry, used by Codex via the Socket backend) produce the same
+    // {"ok": true, ...} envelope for a gotcha write. If a future refactor
+    // makes the tools.rs delegation drift from `handle_mem_set`, this
+    // trips immediately.
+
+    /// γ-C1.85 load-bearing test: a gotcha `write` via `handle_mem_set` and
+    /// the same write via `MatiServer::mem_set` (Direct backend) must agree
+    /// on the envelope fields (`ok`, `key`, `tier`, presence of quality and
+    /// confidence). Two stores are used so each path writes to a fresh
+    /// fixture — that isolates the assertion to the envelope shape rather
+    /// than entangling it with `was_confirmed` carry-over on re-writes.
+    #[tokio::test]
+    async fn mem_set_v1_and_v2_responses_agree_on_gotcha_write() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemSetParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        fn make_params() -> MemSetParams {
+            MemSetParams {
+                action: "write".into(),
+                key: "gotcha:parity-pin".into(),
+                value: "stripe writes are not idempotent without keys".into(),
+                category: "Gotcha".into(),
+                payload: serde_json::json!({
+                    "rule": "always send Idempotency-Key on stripe writes",
+                    "reason": "duplicate charges on retry",
+                    "severity": "High",
+                    "affected_files": ["src/cli/proxy.rs"],
+                }),
+                priority: "Normal".into(),
+                tags: vec!["payments".into()],
+            }
+        }
+
+        // Path A: v2-native handler.
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let store_a = Store::open(dir_a.path()).await.unwrap();
+        let graph_a = Graph::load(store_a).await.unwrap();
+        let graph_arc_a = Arc::new(tokio::sync::RwLock::new(graph_a));
+        let ctx = test_ctx(dir_a.path());
+        let params_a = make_params();
+        let v2_str = handle_mem_set(&graph_arc_a, &ctx, Uuid::new_v4(), &params_a).await;
+        let v2_value: serde_json::Value =
+            serde_json::from_str(&v2_str).expect("handle_mem_set must return valid JSON");
+
+        // Path B: rmcp tool wrapper (Direct backend → delegates to
+        // handle_mem_set under γ-C1.85, so this is a self-check on the
+        // delegation glue).
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let store_b = Store::open(dir_b.path()).await.unwrap();
+        let graph_b = Graph::load(store_b).await.unwrap();
+        let graph_arc_b = Arc::new(tokio::sync::RwLock::new(graph_b));
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc_b));
+        let v1_str = server.mem_set(Parameters(make_params())).await;
+        let v1_value: serde_json::Value =
+            serde_json::from_str(&v1_str).expect("v1 mem_set must return valid JSON");
+
+        // The envelope shape must match. Both paths share the same
+        // ClaudeEnrich confidence / quality computation, so structural
+        // equality is achievable on the response object.
+        assert_eq!(
+            v2_value.get("ok"),
+            v1_value.get("ok"),
+            "v1/v2 mem_set must agree on `ok`; v1={v1_value:?} v2={v2_value:?}"
+        );
+        assert_eq!(
+            v2_value.get("key"),
+            v1_value.get("key"),
+            "v1/v2 mem_set must agree on `key`"
+        );
+        assert_eq!(
+            v2_value.get("tier"),
+            v1_value.get("tier"),
+            "v1/v2 mem_set must agree on quality `tier`"
+        );
+        assert_eq!(
+            v2_value.get("confidence"),
+            v1_value.get("confidence"),
+            "v1/v2 mem_set must agree on `confidence`"
+        );
+        assert_eq!(
+            v2_value.get("quality"),
+            v1_value.get("quality"),
+            "v1/v2 mem_set must agree on `quality`"
+        );
+        assert_eq!(
+            v2_value.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "happy-path gotcha write must succeed on both paths"
         );
     }
 }
