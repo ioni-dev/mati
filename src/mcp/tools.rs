@@ -8,7 +8,6 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -136,70 +135,25 @@ fn strip_payload(payload: &serde_json::Value, category: &Category) -> serde_json
     serde_json::Value::Object(stripped)
 }
 
-/// The MCP server struct. Holds an `Arc<tokio::sync::RwLock<Graph>>` which
-/// owns the Store internally.
+/// The MCP server struct. After γ-C4, `mati serve` is always a thin
+/// MCP-stdio ↔ UDS proxy that forwards every tool call to a separate
+/// daemon process (spawned by `mati daemon start` or auto-spawned via
+/// `daemon_lifecycle::ensure_daemon`). The daemon owns the store; this
+/// struct only carries the path to the daemon root so we know where to
+/// open the Unix socket.
 #[derive(Clone)]
 pub struct MatiServer {
-    backend: MatiBackend,
+    root: PathBuf,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
-#[derive(Clone)]
-enum MatiBackend {
-    Direct(Arc<tokio::sync::RwLock<Graph>>),
-    Socket { root: PathBuf },
-}
-
 impl MatiServer {
-    pub fn new(graph: Graph) -> Self {
-        Self {
-            backend: MatiBackend::Direct(Arc::new(tokio::sync::RwLock::new(graph))),
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    /// Construct from an already-wrapped Arc so callers can clone and share it
-    /// (e.g. to also start the daemon socket listener in the same process).
-    pub fn with_graph_arc(graph: Arc<tokio::sync::RwLock<Graph>>) -> Self {
-        Self {
-            backend: MatiBackend::Direct(graph),
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    /// Construct a socket-backed proxy for cases where another mati process
-    /// already owns the store lock.
+    /// Construct a socket-backed proxy rooted at `~/.mati/<slug>/`.
     pub fn with_socket_root(root: PathBuf) -> Self {
         Self {
-            backend: MatiBackend::Socket { root },
+            root,
             tool_router: Self::tool_router(),
         }
-    }
-
-    /// Expose the inner Arc so the caller can share the graph with other tasks
-    /// (e.g. the daemon socket listener spawned alongside `mati serve`).
-    pub fn graph_arc(&self) -> Arc<tokio::sync::RwLock<Graph>> {
-        match &self.backend {
-            MatiBackend::Direct(graph) => Arc::clone(graph),
-            MatiBackend::Socket { .. } => {
-                panic!("graph_arc is unavailable for a socket-backed MatiServer")
-            }
-        }
-    }
-
-    /// γ-C2 bench helper: invoke mem_get on this server bypassing rmcp's
-    /// `Parameters` wrapper. Lets integration tests measure mem_get latency
-    /// against either backend (Direct or Socket) at the same code path the
-    /// agent goes through. Returns the JSON response string mem_get would
-    /// have produced.
-    ///
-    /// `#[doc(hidden)]` so this never appears in the public API docs —
-    /// production code should never call this helper. Will be removed once
-    /// γ-C4 deletes the Direct backend and the benchmark gate is retired.
-    #[doc(hidden)]
-    pub async fn bench_mem_get(&self, key: String) -> String {
-        self.mem_get(Parameters(crate::mcp::types::MemGetParams { key }))
-            .await
     }
 
     fn socket_error(op: &str, result: ProxyDaemonResult) -> String {
@@ -213,11 +167,7 @@ impl MatiServer {
     }
 
     async fn socket_call(&self, op: &str, args: serde_json::Value) -> String {
-        let MatiBackend::Socket { root } = &self.backend else {
-            unreachable!("socket_call only valid for socket backend");
-        };
-
-        match proxy_daemon_result(root, op, args).await {
+        match proxy_daemon_result(&self.root, op, args).await {
             ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
             other => Self::socket_error(op, other),
         }
@@ -231,11 +181,8 @@ impl MatiServer {
     /// v1→v2 mapper and would panic the rmcp task if routed through
     /// [`Self::socket_call`].
     async fn socket_call_typed(&self, cmd: Command) -> String {
-        let MatiBackend::Socket { root } = &self.backend else {
-            unreachable!("socket_call_typed only valid for socket backend");
-        };
         let op = cmd.kind();
-        match proxy_daemon_v2(root, cmd).await {
+        match proxy_daemon_v2(&self.root, cmd).await {
             ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
             other => Self::socket_error(op, other),
         }
@@ -282,105 +229,8 @@ impl MatiServer {
         annotations(read_only_hint = true)
     )]
     pub(crate) async fn mem_get(&self, Parameters(params): Parameters<MemGetParams>) -> String {
-        match &self.backend {
-            MatiBackend::Direct(graph_arc) => {
-                let graph = graph_arc.read().await;
-                let store = graph.store();
-                match store.get(&params.key).await {
-                    Ok(Some(mut record)) => {
-                        if matches!(record.lifecycle, RecordLifecycle::Tombstoned { .. }) {
-                            return "null".to_string();
-                        }
-                        record.access_count += 1;
-
-                        // Build the response FIRST — must return before the MCP
-                        // client's response timeout. Codex closes the stdio pipe
-                        // within ~100ms of sending a request if no response arrives.
-                        let mut agent_json = record_to_agent_json(&record);
-
-                        // Inject blast radius warning for high-impact files.
-                        if record.category == Category::File {
-                            if let Some(payload) = &record.payload {
-                                if let Ok(fr) = serde_json::from_value::<
-                                    crate::store::record::FileRecord,
-                                >(payload.clone())
-                                {
-                                    if let Some(ref br) = fr.blast_radius {
-                                        use crate::analysis::blast_radius::BlastTier;
-                                        if matches!(br.tier, BlastTier::High | BlastTier::Critical)
-                                        {
-                                            let warning = format!(
-                                                "HIGH IMPACT FILE: {} files directly depend on this. Modify with extra care.",
-                                                br.direct
-                                            );
-                                            if let Some(obj) = agent_json.as_object_mut() {
-                                                obj.insert("warnings".into(), json!([warning]));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let response =
-                            serde_json::to_string_pretty(&agent_json).unwrap_or_else(|e| {
-                                format!("{{\"error\": \"serialization failed: {e}\"}}")
-                            });
-
-                        // Write ONLY the consultation receipt synchronously — it is
-                        // critical for hook enforcement (deny → mem_get → allow) and
-                        // is fast (~1ms, sessions tree, no tantivy index).
-                        let consulted_key = format!("session:consulted:{}", params.key);
-                        let _ = store
-                            .put(
-                                &consulted_key,
-                                &crate::store::session::session_record(
-                                    &consulted_key,
-                                    String::new(),
-                                ),
-                            )
-                            .await;
-
-                        // Defer the slow writes (access_count to knowledge tree +
-                        // daily hit aggregation + enforcement event) to a background
-                        // task. These go through tantivy indexing (~100-300ms) and would
-                        // cause Codex to close the stdio pipe before the response is
-                        // sent if done inline.
-                        let key_owned = params.key.clone();
-                        let graph_clone = Arc::clone(graph_arc);
-                        tokio::task::spawn(async move {
-                            let g = graph_clone.read().await;
-                            let s = g.store();
-                            let _ = s.put(&key_owned, &record).await;
-                            let agg_key = crate::store::session::today_key("analytics:hit_");
-                            let _ =
-                                crate::store::session::upsert_daily_agg(s, &agg_key, &key_owned)
-                                    .await;
-                            // Record ReceiptMinted enforcement event — best-effort
-                            let _ = crate::store::enforcement::record_event(
-                                s,
-                                crate::store::enforcement::EnforcementEventType::ReceiptMinted,
-                                crate::store::enforcement::SubjectKind::File,
-                                key_owned.clone(),
-                                "claude".to_string(),
-                                None,
-                                "consultation_requested".to_string(),
-                                None,
-                            )
-                            .await;
-                        });
-
-                        response
-                    }
-                    Ok(None) => "null".to_string(),
-                    Err(e) => format!("{{\"error\": \"{e}\"}}"),
-                }
-            }
-            MatiBackend::Socket { .. } => {
-                self.socket_call("mem_get", json!({ "key": params.key }))
-                    .await
-            }
-        }
+        self.socket_call("mem_get", json!({ "key": params.key }))
+            .await
     }
 
     /// Search the knowledge store using BM25 text search or graph traversal.
@@ -393,47 +243,11 @@ impl MatiServer {
         annotations(read_only_hint = true)
     )]
     pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
-        match &self.backend {
-            MatiBackend::Direct(graph_arc) => {
-                // γ-C1.5: delegate to the canonical handler so v1 (rmcp tool
-                // wrapper) and v2 (dispatch_v2 native arm) cannot drift. The
-                // mode string is converted to the typed `QueryMode` here;
-                // unknown modes surface as the same error response as before.
-                let mode = match params.mode.as_str() {
-                    "text" => super::protocol::QueryMode::Text,
-                    "tag" => super::protocol::QueryMode::Tag,
-                    "graph" => super::protocol::QueryMode::Graph,
-                    "semantic" => super::protocol::QueryMode::Semantic,
-                    other => {
-                        return format!(
-                            "{{\"error\": \"unknown mode: {other}. Valid modes: text, tag, graph, semantic\"}}"
-                        );
-                    }
-                };
-                let input = super::protocol::MemQueryInput {
-                    query: params.query.clone(),
-                    mode,
-                    limit: params.limit as u32,
-                };
-                let graph = graph_arc.read().await;
-                let store = graph.store();
-                match super::handlers::handle_mem_query(store, &graph, &input).await {
-                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
-                        format!("{{\"error\": \"serialization failed: {e}\"}}")
-                    }),
-                    Err((_code, msg)) => {
-                        format!("{{\"error\": \"{}\"}}", msg.replace('"', "\\\""))
-                    }
-                }
-            }
-            MatiBackend::Socket { .. } => {
-                self.socket_call(
-                    "mem_query",
-                    json!({ "query": params.query, "mode": params.mode, "limit": params.limit }),
-                )
-                .await
-            }
-        }
+        self.socket_call(
+            "mem_query",
+            json!({ "query": params.query, "mode": params.mode, "limit": params.limit }),
+        )
+        .await
     }
 
     /// Assemble a context packet for the current session.
@@ -449,34 +263,11 @@ impl MatiServer {
         &self,
         Parameters(params): Parameters<MemBootstrapParams>,
     ) -> String {
-        match &self.backend {
-            MatiBackend::Direct(graph_arc) => {
-                let graph = graph_arc.read().await;
-                let store = graph.store();
-
-                let context_files = params.context_files;
-                let _ = crate::store::session::log_bootstrap(store, "__bootstrap__").await;
-                for file in &context_files {
-                    let file_key = if file.starts_with("file:") {
-                        file.clone()
-                    } else {
-                        format!("file:{file}")
-                    };
-                    let _ = crate::store::session::log_hit(store, &file_key).await;
-                }
-                match assemble_context_packet(store, &graph, &context_files).await {
-                    Ok(packet) => packet.injection_string,
-                    Err(e) => format!("[mati] bootstrap error: {e}{VECTOR_B}"),
-                }
-            }
-            MatiBackend::Socket { .. } => {
-                self.socket_call(
-                    "mem_bootstrap",
-                    json!({ "context_files": params.context_files }),
-                )
-                .await
-            }
-        }
+        self.socket_call(
+            "mem_bootstrap",
+            json!({ "context_files": params.context_files }),
+        )
+        .await
     }
 
     /// Write an enriched knowledge record to the mati store.
@@ -494,35 +285,14 @@ impl MatiServer {
         )
     )]
     pub(crate) async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
-        match &self.backend {
-            MatiBackend::Direct(graph_arc) => {
-                // γ-C1.85: delegate to the canonical handler so v1 (rmcp tool
-                // wrapper) and v2 (Socket → typed Commands) paths converge.
-                // The synthesized ctx mirrors `handler_test_ctx` — for the
-                // in-process Direct call, the peer IS the daemon itself.
-                let ctx = crate::mcp::dispatch_v2::RequestContext {
-                    peer: crate::mcp::metadata::PeerContext {
-                        uid: crate::mcp::metadata::current_euid(),
-                        pid: Some(std::process::id()),
-                    },
-                    daemon_session: uuid::Uuid::nil(),
-                    repo_root: std::path::PathBuf::new(),
-                };
-                super::handlers::handle_mem_set(graph_arc, &ctx, uuid::Uuid::new_v4(), &params).await
-            }
-            MatiBackend::Socket { .. } => {
-                // Pass-29 fix: route mem_set through typed Commands via
-                // proxy_daemon_v2 instead of the legacy v1 mapper. The
-                // mapper has no arms for gotcha_upsert / gotcha_confirm /
-                // gotcha_tombstone / decision_upsert / dev_note_upsert /
-                // the bogus literal "mem_set" — every prior call panicked
-                // the rmcp task and surfaced as `Transport closed` to the
-                // client.
-                match build_mem_set_command(&params) {
-                    Ok(cmd) => self.socket_call_typed(cmd).await,
-                    Err(error) => json!({ "error": error }).to_string(),
-                }
-            }
+        // Route mem_set through typed Commands via proxy_daemon_v2. The
+        // legacy v1 mapper has no arms for gotcha_upsert / gotcha_confirm /
+        // gotcha_tombstone / decision_upsert / dev_note_upsert / the bogus
+        // literal "mem_set" — every prior call panicked the rmcp task and
+        // surfaced as `Transport closed` to the client.
+        match build_mem_set_command(&params) {
+            Ok(cmd) => self.socket_call_typed(cmd).await,
+            Err(error) => json!({ "error": error }).to_string(),
         }
     }
 }
@@ -1256,8 +1026,8 @@ mod tests {
 
     // ── γ-C3a helpers: handler-level test entry points ───────────────────────
     //
-    // After γ-C4 removes `MatiBackend::Direct`, these helpers replace the
-    // pattern `MatiServer::new(graph).mem_*(Parameters(...)).await`.
+    // γ-C4 removed `MatiBackend::Direct`. These helpers replaced the
+    // pre-γ pattern `MatiServer::new(graph).mem_*(Parameters(...)).await`.
     // They drive the canonical daemon-side handlers (mcp::handlers::*)
     // directly, returning a `String` so existing test assertions
     // (`result.contains(...)`, `assert_eq!(result, "null")`) keep working.
