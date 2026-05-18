@@ -880,6 +880,32 @@ mod tests {
 
     // ── Wire / protocol ─────────────────────────────────────────────────
 
+    /// γ-C3a: QueryMode owns string-to-enum validation at the protocol
+    /// boundary now that tools::mem_query no longer accepts a free-form
+    /// string. Pin the unknown-variant rejection so future schema changes
+    /// don't silently accept invalid modes.
+    #[test]
+    fn query_mode_deserialize_rejects_unknown_variant() {
+        let result: Result<QueryMode, _> = serde_json::from_str("\"invalid_mode\"");
+        assert!(
+            result.is_err(),
+            "QueryMode deserialization must reject unknown variants, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn query_mode_deserialize_accepts_all_known_variants() {
+        // Snake-case wire form per `#[serde(rename_all = "snake_case")]`.
+        for variant in &["text", "tag", "graph", "semantic"] {
+            let json = format!("\"{variant}\"");
+            let result: Result<QueryMode, _> = serde_json::from_str(&json);
+            assert!(
+                result.is_ok(),
+                "QueryMode must accept {variant:?}, got: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn valid_v2_ping_request_decodes() {
         let json = serde_json::json!({

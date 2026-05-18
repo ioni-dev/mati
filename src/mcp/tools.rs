@@ -1900,6 +1900,88 @@ mod tests {
         record
     }
 
+    // ── γ-C3a helpers: handler-level test entry points ───────────────────────
+    //
+    // After γ-C4 removes `MatiBackend::Direct`, these helpers replace the
+    // pattern `MatiServer::new(graph).mem_*(Parameters(...)).await`.
+    // They drive the canonical daemon-side handlers (mcp::handlers::*)
+    // directly, returning a `String` so existing test assertions
+    // (`result.contains(...)`, `assert_eq!(result, "null")`) keep working.
+
+    fn handler_test_ctx() -> crate::mcp::dispatch_v2::RequestContext {
+        crate::mcp::dispatch_v2::RequestContext {
+            peer: crate::mcp::metadata::PeerContext {
+                uid: 501,
+                pid: Some(99999),
+            },
+            daemon_session: uuid::Uuid::nil(),
+            repo_root: std::path::PathBuf::new(),
+        }
+    }
+
+    async fn call_mem_get(
+        graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+        key: &str,
+    ) -> String {
+        let ctx = handler_test_ctx();
+        let input = crate::mcp::protocol::MemGetInput {
+            key: key.to_string(),
+        };
+        let g = graph_arc.read().await;
+        match crate::mcp::handlers::handle_mem_get(
+            g.store(),
+            graph_arc,
+            &ctx,
+            uuid::Uuid::new_v4(),
+            &input,
+        )
+        .await
+        {
+            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()),
+            Err((_code, msg)) => format!("{{\"error\": \"{}\"}}", msg.replace('"', "\\\"")),
+        }
+    }
+
+    async fn call_mem_query(
+        graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+        query: &str,
+        mode: crate::mcp::protocol::QueryMode,
+        limit: u32,
+    ) -> String {
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: query.to_string(),
+            mode,
+            limit,
+        };
+        let g = graph_arc.read().await;
+        match crate::mcp::handlers::handle_mem_query(g.store(), &g, &input).await {
+            Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()),
+            Err((_code, msg)) => format!("{{\"error\": \"{}\"}}", msg.replace('"', "\\\"")),
+        }
+    }
+
+    async fn call_mem_bootstrap(
+        graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+        context_files: Vec<String>,
+    ) -> String {
+        let ctx = handler_test_ctx();
+        let input = crate::mcp::protocol::MemBootstrapInput { context_files };
+        let g = graph_arc.read().await;
+        match crate::mcp::handlers::handle_mem_bootstrap(
+            g.store(),
+            &g,
+            graph_arc,
+            &ctx,
+            uuid::Uuid::new_v4(),
+            &input,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err((_code, msg)) => format!("[mati] bootstrap error: {msg}"),
+        }
+    }
+
     // ── mem_get tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1907,13 +1989,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_get(Parameters(MemGetParams {
-                key: "file:nonexistent.rs".to_string(),
-            }))
-            .await;
+        let result = call_mem_get(&graph_arc, "file:nonexistent.rs").await;
         assert_eq!(result, "null");
     }
 
@@ -1925,13 +2003,9 @@ mod tests {
         store.put("gotcha:test", &record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_get(Parameters(MemGetParams {
-                key: "gotcha:test".to_string(),
-            }))
-            .await;
+        let result = call_mem_get(&graph_arc, "gotcha:test").await;
         assert!(result.contains("gotcha:test"));
         assert!(result.contains("test value"));
     }
@@ -1971,13 +2045,9 @@ mod tests {
         store.put("file:src/core.rs", &record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_get(Parameters(MemGetParams {
-                key: "file:src/core.rs".to_string(),
-            }))
-            .await;
+        let result = call_mem_get(&graph_arc, "file:src/core.rs").await;
 
         assert!(
             result.contains("HIGH IMPACT FILE"),
@@ -2021,13 +2091,9 @@ mod tests {
         store.put("file:src/leaf.rs", &record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_get(Parameters(MemGetParams {
-                key: "file:src/leaf.rs".to_string(),
-            }))
-            .await;
+        let result = call_mem_get(&graph_arc, "file:src/leaf.rs").await;
 
         assert!(
             !result.contains("HIGH IMPACT FILE"),
@@ -2050,50 +2116,43 @@ mod tests {
         store.put("gotcha:async-race", &record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "inference".to_string(),
-                mode: "text".to_string(),
-                limit: 10,
-            }))
-            .await;
+        let result = call_mem_query(
+            &graph_arc,
+            "inference",
+            crate::mcp::protocol::QueryMode::Text,
+            10,
+        )
+        .await;
         assert!(result.contains("gotcha:async-race"));
     }
 
-    #[tokio::test]
-    async fn mem_query_unknown_mode_returns_error() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
-
-        let result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "test".to_string(),
-                mode: "invalid".to_string(),
-                limit: 20,
-            }))
-            .await;
-        assert!(result.contains("unknown mode"));
-    }
+    // Note: γ-C3a deleted the `mem_query_unknown_mode_returns_error` test
+    // that used to live here. The unknown-mode string-to-enum conversion no
+    // longer happens in `tools::mem_query`'s body — after centralization,
+    // typed `QueryMode` is the input. The validation now lives at the
+    // protocol layer's serde Deserialize impl. Coverage moved to
+    // `protocol::tests::query_mode_deserialize_rejects_unknown_variant`.
 
     #[tokio::test]
     async fn mem_query_semantic_returns_feature_gate_error() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "test".to_string(),
-                mode: "semantic".to_string(),
-                limit: 20,
-            }))
-            .await;
-        assert!(result.contains("--features semantic"));
+        let result = call_mem_query(
+            &graph_arc,
+            "test",
+            crate::mcp::protocol::QueryMode::Semantic,
+            20,
+        )
+        .await;
+        assert!(
+            result.contains("--features semantic"),
+            "semantic mode must surface feature-gate error, got: {result}"
+        );
     }
 
     // ── mem_bootstrap tests ──────────────────────────────────────────────────
@@ -2103,13 +2162,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_bootstrap(Parameters(MemBootstrapParams {
-                context_files: vec![],
-            }))
-            .await;
+        let result = call_mem_bootstrap(&graph_arc, vec![]).await;
         assert!(result.contains("[mati] Before reading any file"));
         assert!(result.contains("mem_get"));
     }
@@ -3412,15 +3467,15 @@ mod tests {
         }
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "clamp test rule".to_string(),
-                mode: "text".to_string(),
-                limit: 100, // exceeds MAX_QUERY_LIMIT (50)
-            }))
-            .await;
+        let result = call_mem_query(
+            &graph_arc,
+            "clamp test rule",
+            crate::mcp::protocol::QueryMode::Text,
+            100, // exceeds MAX_QUERY_LIMIT (50)
+        )
+        .await;
 
         // Must not error
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
