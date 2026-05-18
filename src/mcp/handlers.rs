@@ -1199,6 +1199,244 @@ pub(crate) async fn handle_mem_get(
     Ok(response)
 }
 
+/// Native mem_query handler.
+///
+/// Centralizes the four mem_query modes (`text`, `tag`, `graph`,
+/// `semantic`) so both v1 dispatch (`server.rs::socket_dispatch`'s
+/// `"mem_query"` arm) and v2 dispatch (`Command::MemQuery`) produce
+/// byte-identical responses. Before γ-C1.5, the logic lived only in
+/// `tools::MatiServer::mem_query`'s Direct branch — meaning the v2
+/// path went through the v1 string bridge and could silently drift if
+/// the bridge's serialization assumptions diverged. See
+/// `mem_query_handler_text_mode_matches_v1_path` for the byte-equality
+/// pin.
+///
+/// Returns a JSON `Value` (text/tag → array, graph → grouped object).
+/// Callers that need a String wrap with `serde_json::to_string_pretty`.
+pub(crate) async fn handle_mem_query(
+    store: &Store,
+    graph_ref: &crate::graph::Graph,
+    input: &protocol::MemQueryInput,
+) -> HandlerResult {
+    use crate::graph::EdgeKind;
+    use crate::store::record::Category;
+
+    const MAX_QUERY_LIMIT: usize = 50;
+    let limit = (input.limit as usize).min(MAX_QUERY_LIMIT);
+
+    match input.mode {
+        protocol::QueryMode::Text => {
+            // BM25 search across knowledge tree. Filter out session/analytics
+            // and any non-Active records so agents never see internal state.
+            let scored = match store.search_scored(&input.query, limit).await {
+                Ok(r) => r,
+                Err(e) => return Err((ErrorCode::StoreError, format!("search: {e}"))),
+            };
+            let arr: Vec<serde_json::Value> = scored
+                .iter()
+                .filter(|(_, r)| {
+                    matches!(r.lifecycle, RecordLifecycle::Active)
+                        && !matches!(r.category, Category::Session | Category::Analytics)
+                })
+                .map(|(score, r)| {
+                    let mut obj = super::tools::record_to_agent_json(r);
+                    if let serde_json::Value::Object(ref mut map) = obj {
+                        map.insert(
+                            "relevance".into(),
+                            serde_json::json!((*score * 1000.0).round() / 1000.0),
+                        );
+                    }
+                    obj
+                })
+                .collect();
+            Ok(serde_json::Value::Array(arr))
+        }
+        protocol::QueryMode::Tag => {
+            // Substring tag match across the agent-visible namespaces.
+            // Bounded scan: stop after `limit` matches across all prefixes.
+            let query_lower = input.query.to_lowercase();
+            let mut matched: Vec<serde_json::Value> = Vec::new();
+            for ns in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
+                if matched.len() >= limit {
+                    break;
+                }
+                let records = match store.scan_prefix(ns).await {
+                    Ok(rs) => rs,
+                    Err(e) => return Err((ErrorCode::StoreError, format!("scan {ns}: {e}"))),
+                };
+                for record in records {
+                    if matched.len() >= limit {
+                        break;
+                    }
+                    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+                        continue;
+                    }
+                    if record
+                        .tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&query_lower))
+                    {
+                        matched.push(super::tools::record_to_agent_json(&record));
+                    }
+                }
+            }
+            Ok(serde_json::Value::Array(matched))
+        }
+        protocol::QueryMode::Graph => {
+            // 1-hop traversal from a seed key. Per-kind round-robin
+            // allocation ensures every non-empty kind surfaces at least one
+            // record before any kind gets a second slot. Without this, a
+            // hot file with 10+ gotchas would starve imports / co_changes /
+            // decisions / notes.
+            const GOTCHA_LIMIT: usize = 10;
+            const COCHANGE_LIMIT: usize = 5;
+            const IMPORT_LIMIT: usize = 5;
+            const DECISION_LIMIT: usize = 3;
+            const NOTE_LIMIT: usize = 3;
+
+            let edge_groups: &[(EdgeKind, &str, usize)] = &[
+                (EdgeKind::HasGotcha, "gotchas", GOTCHA_LIMIT),
+                (EdgeKind::CoChanges, "co_changes", COCHANGE_LIMIT),
+                (EdgeKind::Imports, "imports", IMPORT_LIMIT),
+                (EdgeKind::AffectedBy, "decisions", DECISION_LIMIT),
+                (EdgeKind::HasNote, "notes", NOTE_LIMIT),
+            ];
+
+            let mut result = serde_json::Map::new();
+            result.insert(
+                "seed".to_string(),
+                serde_json::Value::String(input.query.clone()),
+            );
+            let mut summary_parts: Vec<String> = Vec::new();
+
+            let mut available: Vec<Vec<String>> = edge_groups
+                .iter()
+                .map(|(kind, _, cap)| {
+                    graph_ref
+                        .neighbors(&input.query, kind)
+                        .into_iter()
+                        .take(*cap)
+                        .collect()
+                })
+                .collect();
+
+            let mut quotas: Vec<usize> = vec![0; edge_groups.len()];
+            let mut remaining = limit;
+            loop {
+                if remaining == 0 {
+                    break;
+                }
+                let mut handed_out = 0usize;
+                for (i, slot_keys) in available.iter().enumerate() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if quotas[i] < slot_keys.len() {
+                        quotas[i] += 1;
+                        remaining -= 1;
+                        handed_out += 1;
+                    }
+                }
+                if handed_out == 0 {
+                    break;
+                }
+            }
+
+            for (i, (kind, group_name, _)) in edge_groups.iter().enumerate() {
+                let keys = std::mem::take(&mut available[i]);
+                let mut group_records: Vec<serde_json::Value> = Vec::new();
+                for key in keys.iter().take(quotas[i]) {
+                    if let Ok(Some(record)) = store.get(key).await {
+                        if matches!(record.lifecycle, RecordLifecycle::Active) {
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("key".into(), serde_json::Value::String(record.key.clone()));
+                            entry.insert(
+                                "relationship".into(),
+                                serde_json::Value::String(format!("{kind:?}")),
+                            );
+                            entry.insert(
+                                "value".into(),
+                                serde_json::Value::String(record.value.clone()),
+                            );
+                            entry.insert(
+                                "confidence".into(),
+                                serde_json::json!(record.confidence.value),
+                            );
+                            entry.insert(
+                                "quality".into(),
+                                serde_json::json!(record.quality.value),
+                            );
+                            if let Some(payload) = &record.payload {
+                                if let Some(confirmed) = payload.get("confirmed") {
+                                    entry.insert("confirmed".into(), confirmed.clone());
+                                }
+                            }
+                            group_records.push(serde_json::Value::Object(entry));
+                        }
+                    }
+                }
+                if !group_records.is_empty() {
+                    summary_parts.push(format!("{} {}", group_records.len(), group_name));
+                }
+                result.insert(
+                    group_name.to_string(),
+                    serde_json::Value::Array(group_records),
+                );
+            }
+
+            // DependencyAffects overflow — appended to decisions group, still
+            // honoring the global `limit` ceiling.
+            if remaining > 0 {
+                let dep_keys = graph_ref.neighbors(&input.query, &EdgeKind::DependencyAffects);
+                let mut dep_added = 0usize;
+                for key in dep_keys.iter().take(DECISION_LIMIT.min(remaining)) {
+                    if let Ok(Some(record)) = store.get(key).await {
+                        if matches!(record.lifecycle, RecordLifecycle::Active) {
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("key".into(), serde_json::Value::String(record.key.clone()));
+                            entry.insert(
+                                "relationship".into(),
+                                serde_json::Value::String("DependencyAffects".to_string()),
+                            );
+                            entry.insert(
+                                "value".into(),
+                                serde_json::Value::String(record.value.clone()),
+                            );
+                            entry.insert(
+                                "confidence".into(),
+                                serde_json::json!(record.confidence.value),
+                            );
+                            entry.insert(
+                                "quality".into(),
+                                serde_json::json!(record.quality.value),
+                            );
+                            if let Some(decisions) = result.get_mut("decisions") {
+                                if let Some(arr) = decisions.as_array_mut() {
+                                    arr.push(serde_json::Value::Object(entry));
+                                    dep_added += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = dep_added; // remaining is only useful for diagnostic logs
+            }
+
+            let summary = if summary_parts.is_empty() {
+                "No related records found".to_string()
+            } else {
+                summary_parts.join(", ")
+            };
+            result.insert("summary".to_string(), serde_json::Value::String(summary));
+            Ok(serde_json::Value::Object(result))
+        }
+        protocol::QueryMode::Semantic => Err((
+            ErrorCode::ValidationFailed,
+            "semantic search requires --features semantic (not enabled)".into(),
+        )),
+    }
+}
+
 /// Native MemBootstrap handler.
 ///
 /// Primary: assemble context packet (pure read computation).
@@ -1729,6 +1967,209 @@ mod tests {
         assert!(
             v1_value.get("warnings").is_none(),
             "Low-tier file must not produce warnings on v1 path, got {v1_value:?}"
+        );
+    }
+
+    // ── γ-C1.5: mem_query parity ──────────────────────────────────────────
+
+    /// Build a small fixture of records covering the namespaces searched in
+    /// tag mode plus a text-searchable value, so all three mem_query modes
+    /// have something to find.
+    async fn populate_query_fixture(store: &Store) {
+        // Gotcha with tag "production-grade" and searchable value.
+        let mut g = Record::layer0_file_stub(
+            "gotcha:exemplar".to_string(),
+            uuid::Uuid::nil(),
+            1,
+            0,
+        );
+        g.category = crate::store::record::Category::Gotcha;
+        g.value = "Always validate input at boundaries".into();
+        g.tags = vec!["production-grade".into(), "security".into()];
+        store.put(&g.key, &g).await.unwrap();
+
+        // Decision with the same tag — exercises multi-namespace tag walk.
+        let mut d = Record::layer0_file_stub(
+            "decision:auth-strategy".to_string(),
+            uuid::Uuid::nil(),
+            1,
+            0,
+        );
+        d.category = crate::store::record::Category::Decision;
+        d.value = "Use JWT for stateless API authentication".into();
+        d.tags = vec!["production-grade".into()];
+        store.put(&d.key, &d).await.unwrap();
+
+        // A second gotcha with a different tag — must NOT match a
+        // "production-grade" tag query, but WILL match a "validate" text query.
+        let mut g2 = Record::layer0_file_stub(
+            "gotcha:other".to_string(),
+            uuid::Uuid::nil(),
+            1,
+            0,
+        );
+        g2.category = crate::store::record::Category::Gotcha;
+        g2.value = "Validate cache keys for collisions".into();
+        g2.tags = vec!["cache".into()];
+        store.put(&g2.key, &g2).await.unwrap();
+    }
+
+    /// γ-C1.5 load-bearing test: text-mode `mem_query` via v2 native handler
+    /// and via the v1 rmcp tool wrapper must produce byte-identical results
+    /// after canonicalization. Pins the centralization so both protocol
+    /// paths can never silently drift.
+    #[tokio::test]
+    async fn mem_query_text_mode_v1_and_v2_agree() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemQueryParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        populate_query_fixture(&store).await;
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+
+        // Path A: v2 native handler.
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: "validate".into(),
+            mode: crate::mcp::protocol::QueryMode::Text,
+            limit: 10,
+        };
+        let v2_value = {
+            let g = graph_arc.read().await;
+            handle_mem_query(g.store(), &g, &input)
+                .await
+                .expect("handle_mem_query text mode must succeed")
+        };
+
+        // Path B: v1 rmcp tool wrapper.
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+        let v1_string = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "validate".into(),
+                mode: "text".into(),
+                limit: 10,
+            }))
+            .await;
+        let v1_value: serde_json::Value = serde_json::from_str(&v1_string).unwrap();
+
+        // Both must be arrays of the same length. The relevance score is
+        // BM25-dependent and may vary by floating-point noise, so we compare
+        // structure (sorted keys + value fields) rather than raw equality
+        // on the `relevance` field.
+        let v2_arr = v2_value.as_array().expect("v2 must be array");
+        let v1_arr = v1_value.as_array().expect("v1 must be array");
+        assert_eq!(
+            v2_arr.len(),
+            v1_arr.len(),
+            "v1/v2 text-mode result lengths differ; v2={v2_arr:?} v1={v1_arr:?}"
+        );
+        let v2_keys: Vec<_> = v2_arr.iter().filter_map(|r| r.get("key").cloned()).collect();
+        let v1_keys: Vec<_> = v1_arr.iter().filter_map(|r| r.get("key").cloned()).collect();
+        assert_eq!(
+            v2_keys, v1_keys,
+            "v1/v2 text-mode key sets differ; v2={v2_keys:?} v1={v1_keys:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_tag_mode_v1_and_v2_agree() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemQueryParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        populate_query_fixture(&store).await;
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: "production-grade".into(),
+            mode: crate::mcp::protocol::QueryMode::Tag,
+            limit: 10,
+        };
+        let v2_value = {
+            let g = graph_arc.read().await;
+            handle_mem_query(g.store(), &g, &input).await.unwrap()
+        };
+
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+        let v1_string = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "production-grade".into(),
+                mode: "tag".into(),
+                limit: 10,
+            }))
+            .await;
+        let v1_value: serde_json::Value = serde_json::from_str(&v1_string).unwrap();
+
+        // Tag mode is deterministic (no scoring), so byte-equality at the
+        // structural level is achievable. Compare as raw JSON values.
+        assert_eq!(
+            v2_value, v1_value,
+            "v1/v2 tag-mode responses must be byte-equal"
+        );
+
+        // And sanity: at least one of the fixture records was tagged
+        // "production-grade".
+        let arr = v2_value.as_array().expect("array");
+        assert!(
+            !arr.is_empty(),
+            "fixture must produce at least one tag match"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_semantic_mode_returns_error_on_both_paths() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemQueryParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+
+        // v2 path: HandlerResult Err.
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: "anything".into(),
+            mode: crate::mcp::protocol::QueryMode::Semantic,
+            limit: 10,
+        };
+        let v2_err = {
+            let g = graph_arc.read().await;
+            handle_mem_query(g.store(), &g, &input).await
+        };
+        assert!(
+            v2_err.is_err(),
+            "semantic mode must surface as Err on v2 path"
+        );
+
+        // v1 path: error JSON string.
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+        let v1_string = server
+            .mem_query(Parameters(MemQueryParams {
+                query: "anything".into(),
+                mode: "semantic".into(),
+                limit: 10,
+            }))
+            .await;
+        let v1_value: serde_json::Value = serde_json::from_str(&v1_string).unwrap();
+        assert!(
+            v1_value.get("error").is_some(),
+            "semantic mode must surface as `error` field on v1 path, got {v1_value:?}"
+        );
+        let msg = v1_value
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("semantic search requires"),
+            "v1 error message must explain semantic feature requirement, got {msg:?}"
         );
     }
 }

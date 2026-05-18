@@ -383,248 +383,34 @@ impl MatiServer {
     pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
         match &self.backend {
             MatiBackend::Direct(graph_arc) => {
-                let mode = params.mode.as_str();
-                const MAX_QUERY_LIMIT: usize = 50;
-                let limit = params.limit.min(MAX_QUERY_LIMIT);
-
-                match mode {
-                    "text" => {
-                        let graph = graph_arc.read().await;
-                        let store = graph.store();
-                        match store.search_scored(&params.query, limit).await {
-                    Ok(scored_records) => {
-                        let stripped: Vec<serde_json::Value> = scored_records
-                            .iter()
-                            .filter(|(_, r)| {
-                                matches!(r.lifecycle, RecordLifecycle::Active)
-                                    && !matches!(r.category, Category::Session | Category::Analytics)
-                            })
-                            .map(|(score, r)| {
-                                let mut obj = record_to_agent_json(r);
-                                if let serde_json::Value::Object(ref mut map) = obj {
-                                    map.insert(
-                                        "relevance".into(),
-                                        serde_json::json!((*score * 1000.0).round() / 1000.0),
-                                    );
-                                }
-                                obj
-                            })
-                            .collect();
-                        serde_json::to_string_pretty(&stripped).unwrap_or_else(|e| {
-                            format!("{{\"error\": \"serialization failed: {e}\"}}")
-                        })
+                // γ-C1.5: delegate to the canonical handler so v1 (rmcp tool
+                // wrapper) and v2 (dispatch_v2 native arm) cannot drift. The
+                // mode string is converted to the typed `QueryMode` here;
+                // unknown modes surface as the same error response as before.
+                let mode = match params.mode.as_str() {
+                    "text" => super::protocol::QueryMode::Text,
+                    "tag" => super::protocol::QueryMode::Tag,
+                    "graph" => super::protocol::QueryMode::Graph,
+                    "semantic" => super::protocol::QueryMode::Semantic,
+                    other => {
+                        return format!(
+                            "{{\"error\": \"unknown mode: {other}. Valid modes: text, tag, graph, semantic\"}}"
+                        );
                     }
-                    Err(e) => format!("{{\"error\": \"{e}\"}}"),
-                }
-            }
-                    "graph" => {
-                        let graph = graph_arc.read().await;
-                        let store = graph.store();
-
-                // Per-kind limits ensure gotchas always surface
-                const GOTCHA_LIMIT: usize = 10;
-                const COCHANGE_LIMIT: usize = 5;
-                const IMPORT_LIMIT: usize = 5;
-                const DECISION_LIMIT: usize = 3;
-                const NOTE_LIMIT: usize = 3;
-
-                let edge_groups: &[(EdgeKind, &str, usize)] = &[
-                    (EdgeKind::HasGotcha, "gotchas", GOTCHA_LIMIT),
-                    (EdgeKind::CoChanges, "co_changes", COCHANGE_LIMIT),
-                    (EdgeKind::Imports, "imports", IMPORT_LIMIT),
-                    (EdgeKind::AffectedBy, "decisions", DECISION_LIMIT),
-                    (EdgeKind::HasNote, "notes", NOTE_LIMIT),
-                ];
-
-                let mut result = serde_json::Map::new();
-                result.insert(
-                    "seed".to_string(),
-                    serde_json::Value::String(params.query.clone()),
-                );
-
-                let mut summary_parts = Vec::new();
-
-                // Round-robin allocation: when the caller's `limit` is smaller
-                // than the sum of per-kind caps, hand out slots one-at-a-time
-                // across kinds in priority order so every non-empty kind
-                // surfaces at least one record before any kind gets a second
-                // slot. Pre-fix, a global `remaining` budget plus first-kind
-                // priority meant 10+ gotchas on a hot file starved imports,
-                // co_changes, decisions, and notes — the smoke test caught
-                // this by querying a file with both gotchas AND imports and
-                // seeing imports come back empty.
-                let mut available: Vec<Vec<String>> = edge_groups
-                    .iter()
-                    .map(|(kind, _, cap)| {
-                        let keys = graph.neighbors(&params.query, kind);
-                        keys.into_iter().take(*cap).collect()
-                    })
-                    .collect();
-
-                // Per-kind quota = how many slots each kind gets from `limit`,
-                // computed via fair round-robin. Each round, every non-empty
-                // kind (still under its per-kind cap) gets one slot until
-                // `limit` is exhausted or every kind is empty.
-                let mut quotas: Vec<usize> = vec![0; edge_groups.len()];
-                let mut remaining = limit;
-                loop {
-                    if remaining == 0 {
-                        break;
-                    }
-                    let mut handed_out = 0usize;
-                    for (i, slot_keys) in available.iter().enumerate() {
-                        if remaining == 0 {
-                            break;
-                        }
-                        if quotas[i] < slot_keys.len() {
-                            quotas[i] += 1;
-                            remaining -= 1;
-                            handed_out += 1;
-                        }
-                    }
-                    if handed_out == 0 {
-                        // Every kind has been fully allocated; nothing else to give.
-                        break;
-                    }
-                }
-
-                for (i, (kind, group_name, _)) in edge_groups.iter().enumerate() {
-                    let keys = std::mem::take(&mut available[i]);
-                    let mut group_records = Vec::new();
-
-                    for key in keys.iter().take(quotas[i]) {
-                        if let Ok(Some(record)) = store.get(key).await {
-                            if matches!(record.lifecycle, RecordLifecycle::Active) {
-                                let mut entry = serde_json::Map::new();
-                                entry.insert(
-                                    "key".to_string(),
-                                    serde_json::Value::String(record.key.clone()),
-                                );
-                                entry.insert(
-                                    "relationship".to_string(),
-                                    serde_json::Value::String(format!("{kind:?}")),
-                                );
-                                entry.insert(
-                                    "value".to_string(),
-                                    serde_json::Value::String(record.value.clone()),
-                                );
-                                entry.insert(
-                                    "confidence".to_string(),
-                                    serde_json::json!(record.confidence.value),
-                                );
-                                entry.insert(
-                                    "quality".to_string(),
-                                    serde_json::json!(record.quality.value),
-                                );
-                                if let Some(payload) = &record.payload {
-                                    if let Some(confirmed) = payload.get("confirmed") {
-                                        entry.insert("confirmed".to_string(), confirmed.clone());
-                                    }
-                                }
-                                group_records.push(serde_json::Value::Object(entry));
-                            }
-                        }
-                    }
-
-                    if !group_records.is_empty() {
-                        summary_parts.push(format!("{} {}", group_records.len(), group_name));
-                    }
-                    let _ = kind;
-                    result.insert(
-                        group_name.to_string(),
-                        serde_json::Value::Array(group_records),
-                    );
-                }
-
-                // DependencyAffects — add to decisions group, capped by
-                // whatever budget remains after the round-robin above. This
-                // keeps `limit` honored as a strict global ceiling even when
-                // DependencyAffects edges add to the decisions array.
-                if remaining > 0 {
-                    let dep_keys = graph.neighbors(&params.query, &EdgeKind::DependencyAffects);
-                    let mut dep_added = 0usize;
-                    for key in dep_keys.iter().take(DECISION_LIMIT.min(remaining)) {
-                        if let Ok(Some(record)) = store.get(key).await {
-                            if matches!(record.lifecycle, RecordLifecycle::Active) {
-                                let mut entry = serde_json::Map::new();
-                                entry.insert(
-                                    "key".to_string(),
-                                    serde_json::Value::String(record.key.clone()),
-                                );
-                                entry.insert(
-                                    "relationship".to_string(),
-                                    serde_json::Value::String("DependencyAffects".to_string()),
-                                );
-                                entry.insert(
-                                    "value".to_string(),
-                                    serde_json::Value::String(record.value.clone()),
-                                );
-                                entry.insert(
-                                    "confidence".to_string(),
-                                    serde_json::json!(record.confidence.value),
-                                );
-                                entry.insert(
-                                    "quality".to_string(),
-                                    serde_json::json!(record.quality.value),
-                                );
-                                if let Some(decisions) = result.get_mut("decisions") {
-                                    if let Some(arr) = decisions.as_array_mut() {
-                                        arr.push(serde_json::Value::Object(entry));
-                                        dep_added += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    remaining = remaining.saturating_sub(dep_added);
-                    let _ = remaining;
-                }
-
-                let summary = if summary_parts.is_empty() {
-                    "No related records found".to_string()
-                } else {
-                    summary_parts.join(", ")
                 };
-                result.insert("summary".to_string(), serde_json::Value::String(summary));
-
-                serde_json::to_string_pretty(&result)
-                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
-            }
-                    "tag" => {
-                        let graph = graph_arc.read().await;
-                        let store = graph.store();
-                        let query_lower = params.query.to_lowercase();
-                        let mut matched: Vec<serde_json::Value> = Vec::new();
-                        for ns in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
-                            if let Ok(records) = store.scan_prefix(ns).await {
-                                for record in records {
-                                    if !matches!(record.lifecycle, RecordLifecycle::Active) {
-                                        continue;
-                                    }
-                                    if record.tags.iter().any(|t| t.to_lowercase().contains(&query_lower)) {
-                                        matched.push(record_to_agent_json(&record));
-                                        if matched.len() >= limit {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if matched.len() >= limit {
-                                break;
-                            }
-                        }
-                        serde_json::to_string_pretty(&matched).unwrap_or_else(|e| {
-                            format!("{{\"error\": \"serialization failed: {e}\"}}")
-                        })
-                    }
-                    "semantic" => {
-                        "{\"error\": \"semantic search requires --features semantic (not enabled)\"}"
-                            .to_string()
-                    }
-                    _ => {
-                        format!(
-                            "{{\"error\": \"unknown mode: {mode}. Valid modes: text, tag, graph, semantic\"}}"
-                        )
+                let input = super::protocol::MemQueryInput {
+                    query: params.query.clone(),
+                    mode,
+                    limit: params.limit as u32,
+                };
+                let graph = graph_arc.read().await;
+                let store = graph.store();
+                match super::handlers::handle_mem_query(store, &graph, &input).await {
+                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|e| {
+                        format!("{{\"error\": \"serialization failed: {e}\"}}")
+                    }),
+                    Err((_code, msg)) => {
+                        format!("{{\"error\": \"{}\"}}", msg.replace('"', "\\\""))
                     }
                 }
             }
