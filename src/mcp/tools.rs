@@ -1336,6 +1336,14 @@ mod tests {
         }
     }
 
+    async fn call_mem_set(
+        graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+        params: crate::mcp::types::MemSetParams,
+    ) -> String {
+        let ctx = handler_test_ctx();
+        crate::mcp::handlers::handle_mem_set(graph_arc, &ctx, uuid::Uuid::new_v4(), &params).await
+    }
+
     // ── mem_get tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2325,10 +2333,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "file:src/main.rs".to_string(),
                 value: "Handles CLI dispatch and binary entry point".to_string(),
@@ -2339,8 +2348,9 @@ mod tests {
                 }),
                 tags: vec!["entry-point".to_string()],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let error = parsed["error"]
@@ -2353,7 +2363,6 @@ mod tests {
         assert_eq!(parsed.get("ok"), None, "no record should be written");
 
         // Confirm no record was persisted.
-        let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
         assert!(
             graph
@@ -2371,10 +2380,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams { action: "write".to_string(),
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams { action: "write".to_string(),
                 key: "gotcha:always-use-idempotency-keys".to_string(),
                 value: "Always pass idempotency_key to Stripe charge creation because duplicate charges cause customer refund disputes".to_string(),
                 category: "Gotcha".to_string(),
@@ -2389,8 +2399,9 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "Critical".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true);
@@ -2398,7 +2409,6 @@ mod tests {
         assert!(parsed["quality"].as_f64().unwrap() > 0.2);
 
         // Read back
-        let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
         let record = graph
             .store()
@@ -2420,10 +2430,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "session:12345".to_string(),
                 value: "test".to_string(),
@@ -2431,8 +2442,9 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         let error = parsed["error"].as_str().unwrap();
@@ -2446,10 +2458,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:test".to_string(),
                 value: "test".to_string(),
@@ -2457,8 +2470,9 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["error"]
@@ -2472,15 +2486,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // gotcha: key with Decision category — must be rejected.
         // (File is no longer a valid category for mem_set, so the prior
         // gotcha:/File pairing now fails category parsing instead of the
         // mismatch check; pick another valid-but-wrong category to keep
         // exercising the mismatch arm.)
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:should-fail".to_string(),
                 value: "test".to_string(),
@@ -2488,8 +2503,9 @@ mod tests {
                 payload: serde_json::json!({"summary": "x", "rationale": "y"}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
@@ -2506,10 +2522,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:missing-fields".to_string(),
                 value: "test".to_string(),
@@ -2517,8 +2534,9 @@ mod tests {
                 payload: serde_json::json!({"severity": "Normal"}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
@@ -2535,10 +2553,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "decision:incomplete".to_string(),
                 value: "test".to_string(),
@@ -2546,8 +2565,9 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
@@ -2564,10 +2584,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "dev_note:empty".to_string(),
                 value: "".to_string(),
@@ -2575,8 +2596,9 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(
@@ -2593,11 +2615,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // First write: full payload (new record).
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:partial-update".to_string(),
                 value: "test rule because test reason".to_string(),
@@ -2610,15 +2633,17 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true, "initial write must succeed");
 
         // Second write: partial payload (update) — must succeed because
         // payload validation is skipped for existing records (merge fills fields).
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:partial-update".to_string(),
                 value: "updated rule because updated reason".to_string(),
@@ -2626,8 +2651,9 @@ mod tests {
                 payload: serde_json::json!({"reason": "updated reason"}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             parsed["ok"], true,
@@ -2662,11 +2688,12 @@ mod tests {
             .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Update the gotcha's value via mem_set (simulates Claude editing the reason)
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:confirmed-edit-test".to_string(),
                 value: "Always test first because untested changes cause regressions".to_string(),
@@ -2682,14 +2709,14 @@ mod tests {
                 }),
                 tags: vec![], // empty — should NOT clear existing tags
                 priority: "High".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true);
 
         // Verify confirmation state preserved
-        let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
         let updated = graph
             .store()
@@ -2723,10 +2750,11 @@ mod tests {
         store.put("file:src/new.rs", &new_file).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        server
-            .mem_set(Parameters(MemSetParams {
+        call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:test-move".to_string(),
                 value: "Always update the paired file because drift breaks the feature".to_string(),
@@ -2742,11 +2770,13 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "High".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
-        server
-            .mem_set(Parameters(MemSetParams {
+        call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:test-move".to_string(),
                 value: "Always update the paired file because drift breaks the feature".to_string(),
@@ -2762,10 +2792,10 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "High".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
-        let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
 
         let old_file = graph.store().get("file:src/old.rs").await.unwrap().unwrap();
@@ -2860,10 +2890,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:store-read-ok-none".to_string(),
                 value: "Regression rule because regression reason".to_string(),
@@ -2875,8 +2906,9 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
@@ -2886,7 +2918,6 @@ mod tests {
         assert_eq!(parsed["key"], "gotcha:store-read-ok-none");
 
         // Verify record persisted
-        let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
         let record = graph
             .store()
@@ -2919,11 +2950,12 @@ mod tests {
         store.put("file:src/target.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Step 1: Write a gotcha linked to the file via affected_files.
-        let write_result = server
-            .mem_set(Parameters(MemSetParams {
+        let write_result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:graph-cleanup-test".to_string(),
                 value: "Never skip validation because it causes silent data corruption".to_string(),
@@ -2939,14 +2971,14 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "High".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&write_result).unwrap();
         assert_eq!(parsed["ok"], true, "gotcha write must succeed");
 
         // Step 2: Verify the in-memory graph has the HasGotcha edge.
         {
-            let graph_arc = server.graph_arc();
             let graph = graph_arc.read().await;
             let neighbors = graph.neighbors("file:src/target.rs", &EdgeKind::HasGotcha);
             assert!(
@@ -2956,8 +2988,9 @@ mod tests {
         }
 
         // Step 3: Delete the gotcha.
-        let delete_result = server
-            .mem_set(Parameters(MemSetParams {
+        let delete_result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "delete".to_string(),
                 key: "gotcha:graph-cleanup-test".to_string(),
                 value: String::new(),
@@ -2965,15 +2998,15 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&delete_result).unwrap();
         assert_eq!(parsed["ok"], true, "gotcha delete must succeed");
         assert_eq!(parsed["tombstoned"], true);
 
         // Step 4: Verify the in-memory graph no longer has the HasGotcha edge.
         {
-            let graph_arc = server.graph_arc();
             let graph = graph_arc.read().await;
             let neighbors = graph.neighbors("file:src/target.rs", &EdgeKind::HasGotcha);
             assert!(
@@ -2983,13 +3016,13 @@ mod tests {
         }
 
         // Also verify via graph query mode that the gotcha no longer appears.
-        let graph_query_result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "file:src/target.rs".to_string(),
-                mode: "graph".to_string(),
-                limit: 20,
-            }))
-            .await;
+        let graph_query_result = call_mem_query(
+            &graph_arc,
+            "file:src/target.rs",
+            crate::mcp::protocol::QueryMode::Graph,
+            20,
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&graph_query_result).unwrap();
         let gotchas = parsed["gotchas"]
             .as_array()
@@ -3021,12 +3054,13 @@ mod tests {
             .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Write 5 gotchas linked to the file
         for i in 0..5 {
-            let result = server
-                .mem_set(Parameters(MemSetParams {
+            let result = call_mem_set(
+                &graph_arc,
+                MemSetParams {
                     action: "write".to_string(),
                     key: format!("gotcha:limit-test-{i}"),
                     value: format!("Limit test gotcha {i}"),
@@ -3042,20 +3076,21 @@ mod tests {
                     }),
                     tags: vec![],
                     priority: "Normal".to_string(),
-                }))
-                .await;
+                },
+            )
+            .await;
             let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
             assert_eq!(parsed["ok"], true, "gotcha write {i} must succeed");
         }
 
         // Query with limit=3 — must get at most 3 total records across all groups.
-        let result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "file:src/graph_limit.rs".to_string(),
-                mode: "graph".to_string(),
-                limit: 3,
-            }))
-            .await;
+        let result = call_mem_query(
+            &graph_arc,
+            "file:src/graph_limit.rs",
+            crate::mcp::protocol::QueryMode::Graph,
+            3,
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed.get("error").is_none(), "graph query must not error");
 
@@ -3082,11 +3117,12 @@ mod tests {
         store.put("file:src/zero.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Write one gotcha so there's something to return if limit is ignored.
-        let _ = server
-            .mem_set(Parameters(MemSetParams {
+        let _ = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:zero-limit-test".to_string(),
                 value: "Should not appear".to_string(),
@@ -3102,16 +3138,17 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
-        let result = server
-            .mem_query(Parameters(MemQueryParams {
-                query: "file:src/zero.rs".to_string(),
-                mode: "graph".to_string(),
-                limit: 0,
-            }))
-            .await;
+        let result = call_mem_query(
+            &graph_arc,
+            "file:src/zero.rs",
+            crate::mcp::protocol::QueryMode::Graph,
+            0,
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
         let mut total = 0;
@@ -3148,11 +3185,12 @@ mod tests {
             .unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Overwrite with mem_set — should preserve confirmation state.
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:preserve-confirmation".to_string(),
                 value: "Updated rule from enrichment".to_string(),
@@ -3160,13 +3198,13 @@ mod tests {
                 payload: serde_json::json!({"reason": "updated reason"}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true, "overwrite must succeed");
 
         // Verify the record was updated but preserved confirmation state.
-        let graph_arc = server.graph_arc();
         let graph = graph_arc.read().await;
         let record = graph
             .store()
@@ -3203,11 +3241,12 @@ mod tests {
         store.put("file:src/b.rs", &f2).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Write a gotcha affecting both files
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:multi-file-tombstone".to_string(),
                 value: "Cross-file gotcha".to_string(),
@@ -3223,15 +3262,15 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true);
 
         // Verify both files have the edge
         {
-            let g = server.graph_arc();
-            let graph = g.read().await;
+            let graph = graph_arc.read().await;
             assert!(
                 graph
                     .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
@@ -3247,8 +3286,9 @@ mod tests {
         }
 
         // Delete the gotcha
-        let result = server
-            .mem_set(Parameters(MemSetParams {
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "delete".to_string(),
                 key: "gotcha:multi-file-tombstone".to_string(),
                 value: String::new(),
@@ -3256,15 +3296,15 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true);
 
         // Verify BOTH files lost the edge
         {
-            let g = server.graph_arc();
-            let graph = g.read().await;
+            let graph = graph_arc.read().await;
             assert!(
                 !graph
                     .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
@@ -3293,11 +3333,12 @@ mod tests {
         store.put("file:src/idem.rs", &file_record).await.unwrap();
 
         let graph = Graph::load(store).await.unwrap();
-        let server = MatiServer::new(graph);
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Write an unconfirmed gotcha
-        let _ = server
-            .mem_set(Parameters(MemSetParams {
+        let _ = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "write".to_string(),
                 key: "gotcha:idem-test".to_string(),
                 value: "Idempotency test rule".to_string(),
@@ -3313,12 +3354,14 @@ mod tests {
                 }),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
 
         // First confirm
-        let r1 = server
-            .mem_set(Parameters(MemSetParams {
+        let r1 = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "confirm".to_string(),
                 key: "gotcha:idem-test".to_string(),
                 value: String::new(),
@@ -3326,16 +3369,16 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let p1: serde_json::Value = serde_json::from_str(&r1).unwrap();
         assert_eq!(p1["ok"], true, "first confirm must succeed");
         assert_eq!(p1["confirmed"], true);
 
         // Read confirmation_count after first confirm
         let count_after_first = {
-            let g = server.graph_arc();
-            let graph = g.read().await;
+            let graph = graph_arc.read().await;
             let record = graph
                 .store()
                 .get("gotcha:idem-test")
@@ -3346,8 +3389,9 @@ mod tests {
         };
 
         // Second confirm
-        let r2 = server
-            .mem_set(Parameters(MemSetParams {
+        let r2 = call_mem_set(
+            &graph_arc,
+            MemSetParams {
                 action: "confirm".to_string(),
                 key: "gotcha:idem-test".to_string(),
                 value: String::new(),
@@ -3355,15 +3399,15 @@ mod tests {
                 payload: serde_json::json!({}),
                 tags: vec![],
                 priority: "Normal".to_string(),
-            }))
-            .await;
+            },
+        )
+        .await;
         let p2: serde_json::Value = serde_json::from_str(&r2).unwrap();
         assert_eq!(p2["ok"], true, "second confirm must succeed");
 
         // Read confirmation_count after second confirm
         let count_after_second = {
-            let g = server.graph_arc();
-            let graph = g.read().await;
+            let graph = graph_arc.read().await;
             let record = graph
                 .store()
                 .get("gotcha:idem-test")
