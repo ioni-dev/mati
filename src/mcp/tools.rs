@@ -190,6 +190,21 @@ impl MatiServer {
         }
     }
 
+    /// γ-C2 bench helper: invoke mem_get on this server bypassing rmcp's
+    /// `Parameters` wrapper. Lets integration tests measure mem_get latency
+    /// against either backend (Direct or Socket) at the same code path the
+    /// agent goes through. Returns the JSON response string mem_get would
+    /// have produced.
+    ///
+    /// `#[doc(hidden)]` so this never appears in the public API docs —
+    /// production code should never call this helper. Will be removed once
+    /// γ-C4 deletes the Direct backend and the benchmark gate is retired.
+    #[doc(hidden)]
+    pub async fn bench_mem_get(&self, key: String) -> String {
+        self.mem_get(Parameters(crate::mcp::types::MemGetParams { key }))
+            .await
+    }
+
     fn socket_error(op: &str, result: ProxyDaemonResult) -> String {
         let message = match result {
             ProxyDaemonResult::NotRunning => format!("{op}: daemon not running"),
