@@ -2123,6 +2123,93 @@ mod tests {
         );
     }
 
+    // ── γ-C1.75: mem_bootstrap output parity ──────────────────────────────
+    //
+    // Unlike mem_get and mem_query, mem_bootstrap's daemon-side
+    // `handle_mem_bootstrap` is already strictly more comprehensive than
+    // tools::mem_bootstrap's Direct branch — the handler does transactional
+    // sessions writes (audit + consultation receipts + bootstrap agg), the
+    // Direct branch only does loose `log_bootstrap` + `log_hit`. Both paths
+    // delegate to the same `assemble_context_packet` for the response body.
+    //
+    // C1.75 therefore reduces to an output-parity test: same input, same
+    // injection_string. Side-effect parity (audit/receipts written from
+    // Direct calls too) arrives with γ-C4 when the Direct branch is removed
+    // and Codex always proxies through the daemon.
+
+    /// γ-C1.75 load-bearing test: mem_bootstrap via v2 native handler and
+    /// via the v1 rmcp tool wrapper must produce the same injection_string
+    /// for the same input. Both paths share assemble_context_packet, so any
+    /// future refactor that breaks this convergence is caught here.
+    #[tokio::test]
+    async fn mem_bootstrap_v1_and_v2_produce_same_injection_string() {
+        use crate::mcp::tools::MatiServer;
+        use crate::mcp::types::MemBootstrapParams;
+        use rmcp::handler::server::wrapper::Parameters;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // Seed a file record so the bootstrap has something to surface.
+        let path = "src/example.rs";
+        let key = format!("file:{path}");
+        let mut record = Record::layer0_file_stub(key.clone(), uuid::Uuid::nil(), 1, 0);
+        record.payload = Some(serde_json::json!({
+            "path": path,
+            "purpose": "Example module for bootstrap parity test",
+            "entry_points": [],
+            "imports": [],
+            "gotcha_keys": [],
+            "decision_keys": [],
+            "todos": [],
+            "unsafe_count": 0,
+            "unwrap_count": 0,
+            "change_frequency": 0,
+            "last_author": null,
+            "is_hotspot": false,
+            "token_cost_estimate": 0,
+            "last_modified_session": 0
+        }));
+        store.put(&key, &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = Arc::new(tokio::sync::RwLock::new(graph));
+
+        // Path A: v2 native handler.
+        let ctx = test_ctx(dir.path());
+        let input = crate::mcp::protocol::MemBootstrapInput {
+            context_files: vec![path.into()],
+        };
+        let v2_str = {
+            let g = graph_arc.read().await;
+            handle_mem_bootstrap(g.store(), &g, &graph_arc, &ctx, Uuid::new_v4(), &input)
+                .await
+                .expect("handle_mem_bootstrap must succeed")
+        };
+
+        // Path B: v1 rmcp tool wrapper. Direct branch returns the
+        // injection_string directly (no Result wrapper).
+        let server = MatiServer::with_graph_arc(Arc::clone(&graph_arc));
+        let v1_str = server
+            .mem_bootstrap(Parameters(MemBootstrapParams {
+                context_files: vec![path.into()],
+            }))
+            .await;
+
+        // Both must surface the same context packet body. The
+        // assemble_context_packet output is deterministic for identical
+        // input + store state, so this is structurally enforceable.
+        assert_eq!(
+            v2_str, v1_str,
+            "mem_bootstrap injection_string must match across v1 and v2 paths"
+        );
+        // And neither path should silently produce an empty packet — the
+        // fixture has a real file record, so the bootstrap must mention it.
+        assert!(
+            v2_str.contains(path) || v2_str.contains(&key),
+            "injection_string must reference the seeded file, got: {v2_str}"
+        );
+    }
+
     #[tokio::test]
     async fn mem_query_semantic_mode_returns_error_on_both_paths() {
         use crate::mcp::tools::MatiServer;
