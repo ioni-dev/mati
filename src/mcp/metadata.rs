@@ -314,6 +314,35 @@ fn send_sigterm(_pid: u32) -> bool {
     false
 }
 
+/// Send SIGKILL to `pid` and poll for exit. γ-C6: used by
+/// `mati daemon stop --force` to bypass the SIGTERM grace period and
+/// terminate the daemon immediately. The 500ms reaping window matches
+/// the SIGKILL escalation phase of [`kill_and_wait`].
+pub async fn kill_directly(pid: u32) -> KillOutcome {
+    let started = std::time::Instant::now();
+    #[cfg(unix)]
+    {
+        // SAFETY: SIGKILL is non-catchable; the process either exits or
+        // we surface Stuck. `kill(2)` is a standard system call.
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if ret != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if !matches!(errno, Some(libc::ESRCH)) {
+                tracing::warn!(pid, ?errno, "kill_directly: SIGKILL rejected by kernel");
+                return KillOutcome::Stuck;
+            }
+            // ESRCH — already gone, treat as success.
+            return KillOutcome::KilledHard(started.elapsed());
+        }
+    }
+
+    let kill_window = std::time::Duration::from_millis(500);
+    if poll_until_exit(pid, kill_window, started).await {
+        return KillOutcome::KilledHard(started.elapsed());
+    }
+    KillOutcome::Stuck
+}
+
 /// Send SIGTERM to `pid`, wait up to `timeout` for the process to exit, and
 /// escalate to SIGKILL with a 500ms reaping window if it does not.
 ///
