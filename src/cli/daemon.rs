@@ -27,9 +27,13 @@
 //!
 //! Self-managing — no agent-specific session hooks required:
 //! - Start: `mati daemon start` (or any agent's session-start script)
-//! - Auto-shutdown: after [`IDLE_SHUTDOWN_SECS`] with no requests, using **wall clock**
-//!   so sleep/wake cycles correctly count toward idle time (tokio monotonic clock
-//!   freezes during system sleep and would never fire after a long hibernate).
+//! - Auto-shutdown: after [`IDLE_SHUTDOWN_SECS`] of wall-clock inactivity
+//!   AND zero active UDS connections. Wall-clock (vs tokio monotonic) so
+//!   sleep/wake cycles count toward idle time. The active-connection
+//!   gate (γ-C5) prevents the daemon from exiting while an `mati serve`
+//!   MCP proxy is holding a long-lived UDS connection — without the
+//!   gate, a long Claude/Codex session that paused between tool calls
+//!   would silently lose its daemon.
 //! - Signal shutdown: SIGINT / SIGTERM → flush store, remove socket + PID file.
 //! - Stop: `mati daemon stop` is **synchronous and authoritative**: when the
 //!   command returns Ok, the daemon process is gone, the SurrealKV flock is
@@ -156,6 +160,7 @@ pub enum DaemonResult {
 /// Start the daemon: open the Store, bind the Unix socket, and serve forever.
 ///
 /// Exits cleanly on SIGINT, SIGTERM, or after [`IDLE_SHUTDOWN_SECS`] of wall-clock
+/// inactivity with no active UDS connections (γ-C5 gate). For the historic wall-clock
 /// idle time. Removes the socket and PID file on any exit path.
 pub async fn run_daemon_start() -> Result<()> {
     // Cold-start clock. Used to emit `startup phase=X elapsed_ms=N` lifecycle
@@ -443,10 +448,25 @@ pub async fn run_daemon_start() -> Result<()> {
     // Wall-clock timestamp of last accepted connection.
     let last_wall = Arc::new(AtomicU64::new(wall_secs()));
 
-    // Idle-check background task (unchanged — same logic as before).
+    // γ-C5: live count of UDS connections currently being handled.
+    // Idle-shutdown is gated on BOTH last_wall staleness AND zero active
+    // connections — a long-running `mati serve` MCP proxy that keeps a
+    // UDS connection open between tool calls must not have the daemon
+    // exit out from under it. Incremented at accept time; decremented
+    // via RAII drop guard in the spawned handler so panics and abnormal
+    // task exits both correctly bring the count back down.
+    let active_connections = Arc::new(AtomicU64::new(0));
+
+    // Idle-check background task. After γ-C5 the predicate is:
+    //   shutdown ⇔ (now - last_wall >= IDLE_SHUTDOWN_SECS)
+    //              ∧ (active_connections == 0)
+    // The double condition prevents the historical foot-gun where a
+    // long-lived MCP-proxy connection kept appearing "idle" by the
+    // wall-clock metric and got shut down mid-session.
     let idle_notify = Arc::new(tokio::sync::Notify::new());
     {
         let last_wall = last_wall.clone();
+        let active_connections = active_connections.clone();
         let notify = idle_notify.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
@@ -455,7 +475,8 @@ pub async fn run_daemon_start() -> Result<()> {
                 interval.tick().await;
                 let now = wall_secs();
                 let last = last_wall.load(Ordering::Relaxed);
-                if now.saturating_sub(last) >= IDLE_SHUTDOWN_SECS {
+                let active = active_connections.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= IDLE_SHUTDOWN_SECS && active == 0 {
                     tracing::info!(
                         idle_secs = now.saturating_sub(last),
                         "mati daemon: idle shutdown"
@@ -512,6 +533,7 @@ pub async fn run_daemon_start() -> Result<()> {
             &repo_root,
             &listener,
             &last_wall,
+            &active_connections,
             &shutdown,
             daemon_euid,
             daemon_session,
@@ -646,6 +668,7 @@ async fn serve_loop_graceful(
     repo_root: &Path,
     listener: &UnixListener,
     last_wall: &AtomicU64,
+    active_connections: &Arc<AtomicU64>,
     shutdown: &mati_core::mcp::server::Shutdown,
     daemon_euid: u32,
     daemon_session: uuid::Uuid,
@@ -653,6 +676,18 @@ async fn serve_loop_graceful(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_DAEMON_CONNECTIONS));
     let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     let repo_root_arc: Arc<PathBuf> = Arc::new(repo_root.to_path_buf());
+
+    // RAII guard: decrement `active_connections` on task drop. Survives
+    // panics in the handler body (JoinSet catches panics, but the guard's
+    // Drop still runs as the future is dropped). Without this, an
+    // abnormal handler exit would leak the slot and stall the daemon's
+    // idle-shutdown forever.
+    struct ConnGuard(Arc<AtomicU64>);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 
     'accept: loop {
         // Reap completed handlers; treat panics as terminal so a single
@@ -703,11 +738,16 @@ async fn serve_loop_graceful(
         };
 
         // Spawn the handler. The permit lives inside the task body and
-        // releases on task completion (any exit kind).
+        // releases on task completion (any exit kind). γ-C5: also bump
+        // the active-connection counter and arm an RAII guard so the
+        // count decrements on any task exit (clean, error, or panic).
         let graph_clone = Arc::clone(&graph);
         let repo_root_clone = Arc::clone(&repo_root_arc);
+        active_connections.fetch_add(1, Ordering::Relaxed);
+        let conn_guard = ConnGuard(Arc::clone(active_connections));
         in_flight.spawn(async move {
             let _permit = permit;
+            let _conn_guard = conn_guard;
             if let Err(e) = mati_core::mcp::server::socket_handle_connection(
                 graph_clone,
                 &repo_root_clone,
