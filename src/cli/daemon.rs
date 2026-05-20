@@ -88,30 +88,53 @@ pub enum DaemonCommand {
 
 /// Arguments for `mati daemon stop`.
 ///
-/// `--force` is required to stop a socket owned by `mati serve` (MCP) or
-/// any unknown owner — preventing accidental disconnection of an active
-/// Claude Code MCP session. `--timeout` bounds the SIGTERM wait before
-/// escalating to SIGKILL. `--no-wait` is an escape hatch that signals
-/// SIGTERM and returns without waiting (useful for supervisor scripts
-/// that drive their own polling).
+/// Default behavior: SIGTERM the daemon, wait up to `--timeout` for exit,
+/// escalate to SIGKILL on timeout. After γ, `mati serve` proxies survive
+/// daemon restarts transparently via `ensure_daemon` auto-respawn, so the
+/// default flow is non-destructive to active MCP sessions.
+///
+/// Flag semantics (γ-C6):
+///
+/// - `--force`: send SIGKILL directly, no SIGTERM grace period. Useful
+///   when a daemon is wedged or you need an immediate kill. Also retains
+///   its historical meaning of overriding the safety refusal on
+///   MCP-owned / unknown-owned sockets (pre-γ daemons or out-of-band
+///   processes). Active `mati serve` proxies still auto-respawn the
+///   daemon — they remain reachable to their MCP clients.
+/// - `--include-mcp`: additionally kill any running `mati serve` proxy
+///   processes. This is the "I really want to end the MCP session"
+///   destructive option. Without it, killing the daemon leaves serve
+///   proxies running; with it, serve processes also die and Codex /
+///   Claude's MCP transport closes.
+/// - `--no-wait`: SIGTERM (or SIGKILL with `--force`) and return without
+///   waiting. Escape hatch for supervisor scripts.
 #[derive(Args, Debug, Default, Clone)]
 pub struct DaemonStopArgs {
-    /// Stop even if the socket is owned by an active MCP server (`mati serve`).
+    /// Skip the SIGTERM grace period — send SIGKILL directly.
     ///
-    /// Without this flag, an MCP-owned daemon refuses to stop and exits 1
-    /// so callers can detect the no-op and decide how to proceed. With it,
-    /// the daemon is signaled like any other.
+    /// Also overrides the historical safety refusal on MCP-owned or
+    /// unknown-owned sockets (rarely triggered post-γ — `mati serve` no
+    /// longer owns the daemon socket).
     #[arg(long)]
     pub force: bool,
 
+    /// Also kill any running `mati serve` proxy processes after stopping
+    /// the daemon. γ-C6: without this flag, MCP-stdio proxies survive
+    /// daemon restarts transparently via ensure_daemon. Use this only
+    /// when you explicitly want to end the active MCP session(s).
+    #[arg(long)]
+    pub include_mcp: bool,
+
     /// Maximum seconds to wait for the daemon to exit after SIGTERM
-    /// before escalating to SIGKILL. Clamped to `[1, 60]`.
+    /// before escalating to SIGKILL. Clamped to `[1, 60]`. Ignored when
+    /// `--force` is set (no SIGTERM to wait for).
     #[arg(long, default_value_t = 7)]
     pub timeout: u64,
 
-    /// Send SIGTERM and return immediately without waiting for the process
-    /// to exit. The next CLI call may still race the SurrealKV flock —
-    /// only use when an external supervisor will poll for exit.
+    /// Send the kill signal and return immediately without waiting for
+    /// the process to exit. The next CLI call may still race the
+    /// SurrealKV flock — only use when an external supervisor will poll
+    /// for exit.
     #[arg(long)]
     pub no_wait: bool,
 }
@@ -1299,6 +1322,116 @@ fn send_sigterm_only(_pid: u32) -> bool {
     false
 }
 
+/// Send SIGKILL directly via `libc::kill`. γ-C6: pairs with `--force
+/// --no-wait` to send the unblockable signal without entering the wait
+/// loop. Returns `true` on success or ESRCH (already gone).
+#[cfg(unix)]
+fn send_sigkill_only(pid: u32) -> bool {
+    // SAFETY: SIGKILL is non-catchable; the kernel either delivers
+    // (process exits) or returns ESRCH (already gone). `kill(2)` is a
+    // standard POSIX system call.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if ret == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    matches!(errno, Some(libc::ESRCH))
+}
+
+#[cfg(not(unix))]
+fn send_sigkill_only(_pid: u32) -> bool {
+    false
+}
+
+/// γ-C6: find and SIGKILL all `mati serve` processes on the host.
+///
+/// After γ, `mati serve` is a separate process from the daemon; killing
+/// the daemon alone does not end the MCP session. `--include-mcp` adds
+/// this cleanup so operators can fully terminate an active MCP session
+/// when needed (e.g. agent gone rogue, or operator wants to force a
+/// fresh session start).
+///
+/// Uses `pgrep -f "mati serve"` for portability across macOS + Linux.
+/// Best-effort — failures are logged but don't fail the stop command,
+/// because the daemon stop itself already succeeded by the time we're
+/// here. The user's primary intent (stop the daemon) is honored even if
+/// proxy cleanup fails.
+async fn kill_mati_serve_processes(root: &Path) {
+    let output = match std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg("mati serve")
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(
+                "kill_mati_serve_processes: pgrep failed: {e} \
+                 (is pgrep installed? skipping --include-mcp cleanup)"
+            );
+            eprintln!(
+                "[mati] warning: pgrep not available; could not locate `mati serve` processes"
+            );
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        // pgrep returns exit 1 when no matches — that's success for us.
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let my_pid = std::process::id();
+    let mut killed: Vec<u32> = Vec::new();
+    for line in stdout.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            if pid == my_pid {
+                // Don't suicide — the running `mati daemon stop`
+                // command itself matches "mati " but its argv is
+                // `mati daemon stop`, not `mati serve`. Belt-and-
+                // suspenders against pgrep pattern slop.
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                // SAFETY: SIGKILL is non-catchable. ESRCH on already-
+                // gone process is a benign no-op; any other error is
+                // logged but not fatal.
+                let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                if ret == 0 {
+                    killed.push(pid);
+                } else {
+                    let errno = std::io::Error::last_os_error().raw_os_error();
+                    if !matches!(errno, Some(libc::ESRCH)) {
+                        tracing::warn!(
+                            pid,
+                            ?errno,
+                            "kill_mati_serve_processes: SIGKILL failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !killed.is_empty() {
+        let pid_list = killed
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "mati daemon: --include-mcp killed {} serve proxy/proxies (pid={pid_list})",
+            killed.len()
+        );
+        mati_core::mcp::metadata::record_lifecycle_event(
+            root,
+            "stop_include_mcp",
+            &format!("killed={} pids={pid_list}", killed.len()),
+        );
+    }
+}
+
 /// Wait up to 500ms for the daemon to unlink its sock + pid files.
 /// If still present, unlink ourselves so the next CLI call doesn't see
 /// a half-dead daemon. Returns `true` if removal completed cleanly.
@@ -1467,25 +1600,42 @@ async fn kill_flow(
     let pre_session = mati_core::mcp::metadata::read_metadata(root).map(|m| m.session);
 
     if args.no_wait {
-        if !send_sigterm_only(pid) {
+        // γ-C6: --force + --no-wait → SIGKILL directly.
+        let (sent, signal_label) = if args.force {
+            (send_sigkill_only(pid), "KILL")
+        } else {
+            (send_sigterm_only(pid), "TERM")
+        };
+        if !sent {
             mati_core::mcp::metadata::record_lifecycle_event(
                 root,
                 "stop_end",
-                &format!("pid={pid} reason=signal_failed elapsed_ms=0 signal=TERM"),
+                &format!("pid={pid} reason=signal_failed elapsed_ms=0 signal={signal_label}"),
             );
-            anyhow::bail!("failed to send SIGTERM to pid {pid}");
+            anyhow::bail!("failed to send SIG{signal_label} to pid {pid}");
         }
-        println!("mati daemon: SIGTERM sent (pid {pid}); not waiting");
+        println!("mati daemon: SIG{signal_label} sent (pid {pid}); not waiting");
         mati_core::mcp::metadata::record_lifecycle_event(
             root,
             "stop_end",
-            &format!("pid={pid} reason=no_wait elapsed_ms=0 signal=TERM"),
+            &format!("pid={pid} reason=no_wait elapsed_ms=0 signal={signal_label}"),
         );
+        if args.include_mcp {
+            kill_mati_serve_processes(root).await;
+        }
         return Ok(());
     }
 
     let outer_start = std::time::Instant::now();
-    let outcome = kill_and_wait(pid, timeout).await;
+    // γ-C6: --force skips the SIGTERM grace period and sends SIGKILL
+    // directly. The historical "override safety refusal" meaning of
+    // --force is preserved by the refusal-bypass at the call sites
+    // upstream; here it now also reshapes the kill itself.
+    let outcome = if args.force {
+        mati_core::mcp::metadata::kill_directly(pid).await
+    } else {
+        kill_and_wait(pid, timeout).await
+    };
 
     match outcome {
         ExitOutcome::ExitedClean(elapsed) => {
@@ -1497,14 +1647,18 @@ async fn kill_flow(
             if !recycled {
                 wait_for_files_removed(root).await;
             }
+            let signal_label = if args.force { "KILL" } else { "TERM" };
             println!(
-                "mati daemon: stopped (pid {pid}, owner={owner_label}, took {elapsed_ms}ms, signal=TERM)"
+                "mati daemon: stopped (pid {pid}, owner={owner_label}, took {elapsed_ms}ms, signal={signal_label})"
             );
             mati_core::mcp::metadata::record_lifecycle_event(
                 root,
                 "stop_end",
-                &format!("pid={pid} reason=clean_exit elapsed_ms={elapsed_ms} signal=TERM"),
+                &format!("pid={pid} reason=clean_exit elapsed_ms={elapsed_ms} signal={signal_label}"),
             );
+            if args.include_mcp {
+                kill_mati_serve_processes(root).await;
+            }
             Ok(())
         }
         ExitOutcome::KilledHard(elapsed) => {
@@ -1525,6 +1679,9 @@ async fn kill_flow(
                 "stop_end",
                 &format!("pid={pid} reason=hard_kill elapsed_ms={elapsed_ms} signal=KILL"),
             );
+            if args.include_mcp {
+                kill_mati_serve_processes(root).await;
+            }
             Ok(())
         }
         ExitOutcome::Stuck => {
