@@ -280,6 +280,21 @@ pub fn current_qos_class_str() -> &'static str {
 
 // ── SIGTERM / SIGKILL escalation ────────────────────────────────────────────
 
+/// How long to poll for `is_pid_alive` after sending SIGKILL before
+/// declaring the process [`KillOutcome::Stuck`].
+///
+/// 500ms was the historical default; γ-C7 smoke surfaced cases where a
+/// daemon exited cleanly but only after ~600ms because its shutdown path
+/// completed a SurrealKV WAL fsync before letting the process die. The
+/// 500ms poll gave up too early and reported a false `Stuck` even though
+/// the next CLI call (~10ms later) saw the PID gone. 2s gives comfortable
+/// headroom for realistic shutdown work (WAL flush, in-flight handler
+/// drain) while still being well under any reasonable user wait
+/// threshold. SIGKILL itself is unblockable — anything that genuinely
+/// takes >2s to reap is either kernel-level uninterruptible I/O (rare)
+/// or a real bug worth surfacing.
+const SIGKILL_REAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Outcome of [`kill_and_wait`]. Carries elapsed wall time so callers can
 /// report or log exactly how the kill resolved.
 #[derive(Debug)]
@@ -316,8 +331,9 @@ fn send_sigterm(_pid: u32) -> bool {
 
 /// Send SIGKILL to `pid` and poll for exit. γ-C6: used by
 /// `mati daemon stop --force` to bypass the SIGTERM grace period and
-/// terminate the daemon immediately. The 500ms reaping window matches
-/// the SIGKILL escalation phase of [`kill_and_wait`].
+/// terminate the daemon immediately. The reaping window matches the
+/// SIGKILL escalation phase of [`kill_and_wait`] — see
+/// [`SIGKILL_REAP_WINDOW`] for the rationale.
 pub async fn kill_directly(pid: u32) -> KillOutcome {
     let started = std::time::Instant::now();
     #[cfg(unix)]
@@ -336,15 +352,15 @@ pub async fn kill_directly(pid: u32) -> KillOutcome {
         }
     }
 
-    let kill_window = std::time::Duration::from_millis(500);
-    if poll_until_exit(pid, kill_window, started).await {
+    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, started).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
     KillOutcome::Stuck
 }
 
 /// Send SIGTERM to `pid`, wait up to `timeout` for the process to exit, and
-/// escalate to SIGKILL with a 500ms reaping window if it does not.
+/// escalate to SIGKILL with [`SIGKILL_REAP_WINDOW`] of reaping budget if it
+/// does not.
 ///
 /// Used by both `mati daemon stop` and the unresponsive-recovery branch of
 /// `ensure_daemon` so the synchronous-exit guarantee is identical across
@@ -374,8 +390,7 @@ pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcom
         let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     }
 
-    let kill_window = std::time::Duration::from_millis(500);
-    if poll_until_exit(pid, kill_window, std::time::Instant::now()).await {
+    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, std::time::Instant::now()).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
 
