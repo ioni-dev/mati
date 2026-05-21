@@ -128,7 +128,16 @@ pub struct DaemonStopArgs {
     /// Maximum seconds to wait for the daemon to exit after SIGTERM
     /// before escalating to SIGKILL. Clamped to `[1, 60]`. Ignored when
     /// `--force` is set (no SIGTERM to wait for).
-    #[arg(long, default_value_t = 7)]
+    ///
+    /// Default bumped 7s → 20s in response to γ smoke evidence: under
+    /// heavy concurrent load, the daemon's `store.close()` path
+    /// (knowledge.db WAL fsync + sessions.db WAL fsync + tantivy index
+    /// commit, run in parallel via `tokio::try_join!`) can legitimately
+    /// take longer than 7 seconds. The 20s ceiling gives the close
+    /// sequence room to complete cleanly without forcing SIGKILL
+    /// escalation. Operators who need a faster fail-fast can pass
+    /// `--timeout 3` etc. explicitly.
+    #[arg(long, default_value_t = 20)]
     pub timeout: u64,
 
     /// Send the kill signal and return immediately without waiting for

@@ -283,17 +283,23 @@ pub fn current_qos_class_str() -> &'static str {
 /// How long to poll for `is_pid_alive` after sending SIGKILL before
 /// declaring the process [`KillOutcome::Stuck`].
 ///
-/// 500ms was the historical default; γ-C7 smoke surfaced cases where a
-/// daemon exited cleanly but only after ~600ms because its shutdown path
-/// completed a SurrealKV WAL fsync before letting the process die. The
-/// 500ms poll gave up too early and reported a false `Stuck` even though
-/// the next CLI call (~10ms later) saw the PID gone. 2s gives comfortable
-/// headroom for realistic shutdown work (WAL flush, in-flight handler
-/// drain) while still being well under any reasonable user wait
-/// threshold. SIGKILL itself is unblockable — anything that genuinely
-/// takes >2s to reap is either kernel-level uninterruptible I/O (rare)
-/// or a real bug worth surfacing.
-const SIGKILL_REAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// Historical defaults and rationale for each step:
+///
+/// - **500ms** (pre-γ): worked for lightly-loaded shutdowns where the
+///   kernel reaped within the first tens of ms.
+/// - **2s** (γ-C7 followup `04ef6e2`): targeted the case where a
+///   slow-shutdown daemon exited at ~600ms.
+/// - **5s** (this commit, γ-C7-followup-2): smoke evidence from
+///   `mati_step_27_stop.out` plus the `serve_shutdown signal_sigterm`
+///   lifecycle event shows the daemon's `store.close()` path can be in
+///   mid-fsync when SIGKILL hits. The kernel MUST wait for the
+///   uninterruptible fsync to complete before fully tearing down the
+///   process, during which `kill(pid, 0)` keeps reporting alive. Under
+///   smoke load (tantivy index commit + dual SurrealKV WAL fsync), this
+///   teardown can legitimately take 2-4 seconds. 5s provides headroom
+///   without unbounded patience — a genuinely-wedged daemon still
+///   surfaces as Stuck within 25s total (20s SIGTERM + 5s SIGKILL).
+const SIGKILL_REAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Outcome of [`kill_and_wait`]. Carries elapsed wall time so callers can
 /// report or log exactly how the kill resolved.
