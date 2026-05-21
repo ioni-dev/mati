@@ -544,18 +544,63 @@ pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcom
     })
 }
 
-/// Poll [`is_pid_alive`] until the PID is gone or `budget` elapses (from `started`).
+/// Poll [`is_pid_alive`] until the PID is **effectively gone** or `budget`
+/// elapses (from `started`). Returns `true` if the process is gone or in a
+/// zombie state, `false` if it's still genuinely alive when the budget runs
+/// out.
+///
+/// ## Why zombie detection is needed
+///
+/// γ-C7 followup smoke surfaced a real zombie scenario: when the daemon's
+/// parent process is a `mati serve` proxy (post-γ-C4 architecture), and
+/// the proxy doesn't call `waitpid()` on its children, the daemon process
+/// exits cleanly under SIGKILL but its proc-table entry stays as a zombie
+/// (`<defunct>`, state `'Z'`) until the proxy is killed or exits.
+///
+/// `kill(pid, 0)` continues returning success for zombies — the kernel
+/// considers the proc entry "alive" until reaped. So a pure `kill(0)`
+/// poll loop hangs until the budget expires, returning a false `Stuck`
+/// even though the zombie holds no FDs, no locks, no resources.
+///
+/// This was empirically captured by the `StuckDiagnostic` instrumentation
+/// added in commit `dd5f5a0`: the final snapshot showed
+/// `state="Z" comm="<defunct>"` — the smoking gun.
+///
+/// ## How the zombie check works
+///
+/// Every `ZOMBIE_CHECK_INTERVAL` poll iterations, when `kill(0)` reports
+/// alive, also run `ps -o state= -p <pid>`. If the state starts with `Z`,
+/// the process is a zombie — functionally dead (locks released by the
+/// kernel at exit, no further user-code execution) — and we return `true`.
+///
+/// `ps_field` spawns a subprocess (~10ms), so it's amortized across
+/// every 5 polls (250ms) to keep the per-iteration overhead low. Zombie
+/// state is monotonic — once entered, it never reverts — so sub-second
+/// detection is unnecessary.
 async fn poll_until_exit(
     pid: u32,
     budget: std::time::Duration,
     started: std::time::Instant,
 ) -> bool {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    const ZOMBIE_CHECK_INTERVAL: u32 = 5;
     let deadline = started + budget;
+    let mut iter: u32 = 0;
     while std::time::Instant::now() < deadline {
         if !is_pid_alive(pid) {
             return true;
         }
+        // Cheap zombie check on a sub-rate to avoid spawning ps on every
+        // 50ms tick. State only ever transitions toward `Z` from running
+        // states (R/S/T), never back.
+        if iter % ZOMBIE_CHECK_INTERVAL == 0 {
+            if let Some(state) = ps_field(pid, "state") {
+                if state.starts_with('Z') {
+                    return true;
+                }
+            }
+        }
+        iter = iter.wrapping_add(1);
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     false
