@@ -16,8 +16,8 @@ pub mod repair;
 pub mod session;
 
 pub use db::{derive_slug, KnowledgeWriteOp, Store};
-pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use durability::Durability;
+pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{
     AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,
     GotchaRecord, KnowledgeGap, OnboardingScore, Priority, QualityScore, QualitySignal,

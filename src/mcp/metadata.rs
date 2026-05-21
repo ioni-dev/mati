@@ -395,9 +395,7 @@ fn ps_field(pid: u32, field: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let trimmed = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+    let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if trimmed.is_empty() {
         None
     } else {

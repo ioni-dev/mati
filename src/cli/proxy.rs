@@ -413,8 +413,14 @@ impl StoreProxy {
                 // Partition out sessions-tree records (analytics/audit/etc.)
                 // and unsupported prefixes so `put_batch` doesn't reject the
                 // whole batch on a stray record.
-                let valid_prefixes =
-                    ["gotcha:", "decision:", "dev_note:", "file:", "stage:", "dep:"];
+                let valid_prefixes = [
+                    "gotcha:",
+                    "decision:",
+                    "dev_note:",
+                    "file:",
+                    "stage:",
+                    "dep:",
+                ];
                 let mut accepted: Vec<(&str, &Record)> = Vec::with_capacity(records.len());
                 let mut skipped: u64 = 0;
                 for r in records {
@@ -479,20 +485,14 @@ impl StoreProxy {
                     let chunk = records[i..j].to_vec();
                     i = j;
 
-                    let cmd = p::Command::RecordImport(p::RecordImportInput {
-                        records: chunk,
-                    });
+                    let cmd = p::Command::RecordImport(p::RecordImportInput { records: chunk });
                     match daemon_v2(root, cmd).await {
                         DaemonResult::Ok(resp) => {
                             if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                                imported += resp
-                                    .get("imported")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                skipped += resp
-                                    .get("skipped")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
+                                imported +=
+                                    resp.get("imported").and_then(|v| v.as_u64()).unwrap_or(0);
+                                skipped +=
+                                    resp.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
                             } else {
                                 let err = resp
                                     .get("error")

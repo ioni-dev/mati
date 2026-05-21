@@ -815,8 +815,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
             } else {
                 let device_id = uuid::Uuid::new_v4();
                 let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
-                let (imported, skipped) =
-                    import_records_resilient(&proxy, &import.records).await;
+                let (imported, skipped) = import_records_resilient(&proxy, &import.records).await;
                 println!("Imported {imported} records from CLAUDE.md ({skipped} skipped).");
             }
         }
