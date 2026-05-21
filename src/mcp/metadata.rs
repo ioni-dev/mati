@@ -280,6 +280,27 @@ pub fn current_qos_class_str() -> &'static str {
 
 // ── SIGTERM / SIGKILL escalation ────────────────────────────────────────────
 
+/// How long to poll for `is_pid_alive` after sending SIGKILL before
+/// declaring the process [`KillOutcome::Stuck`].
+///
+/// Historical defaults and rationale for each step:
+///
+/// - **500ms** (pre-γ): worked for lightly-loaded shutdowns where the
+///   kernel reaped within the first tens of ms.
+/// - **2s** (γ-C7 followup `04ef6e2`): targeted the case where a
+///   slow-shutdown daemon exited at ~600ms.
+/// - **5s** (this commit, γ-C7-followup-2): smoke evidence from
+///   `mati_step_27_stop.out` plus the `serve_shutdown signal_sigterm`
+///   lifecycle event shows the daemon's `store.close()` path can be in
+///   mid-fsync when SIGKILL hits. The kernel MUST wait for the
+///   uninterruptible fsync to complete before fully tearing down the
+///   process, during which `kill(pid, 0)` keeps reporting alive. Under
+///   smoke load (tantivy index commit + dual SurrealKV WAL fsync), this
+///   teardown can legitimately take 2-4 seconds. 5s provides headroom
+///   without unbounded patience — a genuinely-wedged daemon still
+///   surfaces as Stuck within 25s total (20s SIGTERM + 5s SIGKILL).
+const SIGKILL_REAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Outcome of [`kill_and_wait`]. Carries elapsed wall time so callers can
 /// report or log exactly how the kill resolved.
 #[derive(Debug)]
@@ -289,7 +310,108 @@ pub enum KillOutcome {
     /// SIGTERM was ignored or absorbed; SIGKILL succeeded.
     KilledHard(std::time::Duration),
     /// Process is still alive after SIGKILL — manual intervention required.
-    Stuck,
+    /// Carries a [`StuckDiagnostic`] so callers can surface the actual
+    /// process state at the moment we gave up. γ smoke surfaced cases
+    /// where the daemon was effectively gone (lock released, next CLI
+    /// command worked) but our `kill(0)` poll kept reporting alive; the
+    /// diagnostic snapshot lets us distinguish kill(0)-lying-after-SIGKILL,
+    /// zombie state, PID reuse (different process at that PID now), and
+    /// genuinely-still-alive cases on the next failure.
+    Stuck(StuckDiagnostic),
+}
+
+/// Diagnostic data captured at the moment [`KillOutcome::Stuck`] is
+/// returned. Includes timing for each phase and a `ps`-driven snapshot
+/// of the process state at both the start of the kill and the giving-up
+/// point — enabling root-cause analysis without re-running the failure.
+#[derive(Debug, Clone)]
+pub struct StuckDiagnostic {
+    pub pid: u32,
+    /// Elapsed wall time from [`kill_and_wait`] / [`kill_directly`] entry.
+    pub total_elapsed_ms: u64,
+    /// Time spent in the SIGTERM phase. `None` if [`kill_directly`] was
+    /// used (no SIGTERM phase).
+    pub sigterm_elapsed_ms: Option<u64>,
+    /// Time spent polling after SIGKILL.
+    pub sigkill_elapsed_ms: u64,
+    /// Process state when the kill started (via `ps -o ...`).
+    pub initial_snapshot: PidSnapshot,
+    /// Process state when we gave up (via `ps -o ...`).
+    pub final_snapshot: PidSnapshot,
+}
+
+/// `ps -o`-derived snapshot of a PID. Used by [`StuckDiagnostic`] to
+/// pin down why `kill_and_wait` gave up.
+///
+/// On the failure path we cross-check `kill(pid, 0)`'s lying-alive report
+/// against three orthogonal indicators:
+///
+/// - **`lstart`** changed between initial and final → the PID was reused
+///   by a different process (kernel reaped the old one, assigned PID to a
+///   new spawn).
+/// - **`state`** is `Z` → process really is a zombie awaiting reap by its
+///   parent. `kill(0)` succeeds because the proc entry exists; the
+///   process holds no resources.
+/// - **all fields `None`** → `ps` reports the PID is gone but `kill(0)`
+///   still says alive: macOS kernel proc-table lag (the proc structure
+///   hasn't been fully torn down even though the process has exited).
+/// - **same `lstart`, normal `state`** → process is genuinely still
+///   alive. Real Stuck case — daemon shutdown is wedged.
+#[derive(Debug, Clone, Default)]
+pub struct PidSnapshot {
+    /// Process start time as reported by `ps -o lstart=`. `None` if ps
+    /// can't find the PID.
+    pub lstart: Option<String>,
+    /// Process state: 'R' running, 'S' sleeping, 'Z' zombie, etc.
+    pub state: Option<String>,
+    /// Process command name as reported by `ps -o comm=`.
+    pub comm: Option<String>,
+}
+
+impl PidSnapshot {
+    /// Render as a compact one-line diagnostic string suitable for
+    /// inclusion in lifecycle events and stderr.
+    pub fn render(&self) -> String {
+        match (&self.lstart, &self.state, &self.comm) {
+            (None, None, None) => "ps:gone".into(),
+            _ => format!(
+                "lstart={:?} state={:?} comm={:?}",
+                self.lstart.as_deref().unwrap_or("?"),
+                self.state.as_deref().unwrap_or("?"),
+                self.comm.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+}
+
+/// Snapshot the named `ps` field for `pid`. Returns `None` if `ps` can't
+/// find the PID (process gone) or the call fails.
+fn ps_field(pid: u32, field: &str) -> Option<String> {
+    let pid_str = pid.to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", &format!("{field}="), "-p", &pid_str])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Capture a `PidSnapshot` via three `ps` calls (lstart, state, comm).
+/// Each call is ~10ms on macOS; total ~30ms. Only invoked on the Stuck
+/// path so the cost doesn't touch the hot path.
+pub fn snapshot_pid(pid: u32) -> PidSnapshot {
+    PidSnapshot {
+        lstart: ps_field(pid, "lstart"),
+        state: ps_field(pid, "state"),
+        comm: ps_field(pid, "comm"),
+    }
 }
 
 /// Send SIGTERM to `pid`. Returns `true` on success or when the kernel
@@ -314,8 +436,56 @@ fn send_sigterm(_pid: u32) -> bool {
     false
 }
 
+/// Send SIGKILL to `pid` and poll for exit. γ-C6: used by
+/// `mati daemon stop --force` to bypass the SIGTERM grace period and
+/// terminate the daemon immediately. The reaping window matches the
+/// SIGKILL escalation phase of [`kill_and_wait`] — see
+/// `SIGKILL_REAP_WINDOW` for the rationale.
+pub async fn kill_directly(pid: u32) -> KillOutcome {
+    let started = std::time::Instant::now();
+    let initial_snapshot = snapshot_pid(pid);
+    #[cfg(unix)]
+    {
+        // SAFETY: SIGKILL is non-catchable; the process either exits or
+        // we surface Stuck. `kill(2)` is a standard system call.
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if ret != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if !matches!(errno, Some(libc::ESRCH)) {
+                tracing::warn!(pid, ?errno, "kill_directly: SIGKILL rejected by kernel");
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                return KillOutcome::Stuck(StuckDiagnostic {
+                    pid,
+                    total_elapsed_ms: elapsed_ms,
+                    sigterm_elapsed_ms: None,
+                    sigkill_elapsed_ms: elapsed_ms,
+                    initial_snapshot,
+                    final_snapshot: snapshot_pid(pid),
+                });
+            }
+            // ESRCH — already gone, treat as success.
+            return KillOutcome::KilledHard(started.elapsed());
+        }
+    }
+
+    let sigkill_start = std::time::Instant::now();
+    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, started).await {
+        return KillOutcome::KilledHard(started.elapsed());
+    }
+    let sigkill_elapsed_ms = sigkill_start.elapsed().as_millis() as u64;
+    KillOutcome::Stuck(StuckDiagnostic {
+        pid,
+        total_elapsed_ms: started.elapsed().as_millis() as u64,
+        sigterm_elapsed_ms: None,
+        sigkill_elapsed_ms,
+        initial_snapshot,
+        final_snapshot: snapshot_pid(pid),
+    })
+}
+
 /// Send SIGTERM to `pid`, wait up to `timeout` for the process to exit, and
-/// escalate to SIGKILL with a 500ms reaping window if it does not.
+/// escalate to SIGKILL with `SIGKILL_REAP_WINDOW` of reaping budget if it
+/// does not.
 ///
 /// Used by both `mati daemon stop` and the unresponsive-recovery branch of
 /// `ensure_daemon` so the synchronous-exit guarantee is identical across
@@ -323,15 +493,26 @@ fn send_sigterm(_pid: u32) -> bool {
 /// gate, ownership check) and knows the PID is alive.
 pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcome {
     let started = std::time::Instant::now();
+    let initial_snapshot = snapshot_pid(pid);
 
     if !send_sigterm(pid) {
         tracing::warn!(pid, "kill_and_wait: SIGTERM rejected by kernel");
-        return KillOutcome::Stuck;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        return KillOutcome::Stuck(StuckDiagnostic {
+            pid,
+            total_elapsed_ms: elapsed_ms,
+            sigterm_elapsed_ms: Some(elapsed_ms),
+            sigkill_elapsed_ms: 0,
+            initial_snapshot,
+            final_snapshot: snapshot_pid(pid),
+        });
     }
 
+    let sigterm_start = std::time::Instant::now();
     if poll_until_exit(pid, timeout, started).await {
         return KillOutcome::ExitedClean(started.elapsed());
     }
+    let sigterm_elapsed_ms = sigterm_start.elapsed().as_millis() as u64;
 
     tracing::warn!(
         pid,
@@ -345,26 +526,79 @@ pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcom
         let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     }
 
-    let kill_window = std::time::Duration::from_millis(500);
-    if poll_until_exit(pid, kill_window, std::time::Instant::now()).await {
+    let sigkill_start = std::time::Instant::now();
+    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, sigkill_start).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
+    let sigkill_elapsed_ms = sigkill_start.elapsed().as_millis() as u64;
 
-    KillOutcome::Stuck
+    KillOutcome::Stuck(StuckDiagnostic {
+        pid,
+        total_elapsed_ms: started.elapsed().as_millis() as u64,
+        sigterm_elapsed_ms: Some(sigterm_elapsed_ms),
+        sigkill_elapsed_ms,
+        initial_snapshot,
+        final_snapshot: snapshot_pid(pid),
+    })
 }
 
-/// Poll [`is_pid_alive`] until the PID is gone or `budget` elapses (from `started`).
+/// Poll [`is_pid_alive`] until the PID is **effectively gone** or `budget`
+/// elapses (from `started`). Returns `true` if the process is gone or in a
+/// zombie state, `false` if it's still genuinely alive when the budget runs
+/// out.
+///
+/// ## Why zombie detection is needed
+///
+/// γ-C7 followup smoke surfaced a real zombie scenario: when the daemon's
+/// parent process is a `mati serve` proxy (post-γ-C4 architecture), and
+/// the proxy doesn't call `waitpid()` on its children, the daemon process
+/// exits cleanly under SIGKILL but its proc-table entry stays as a zombie
+/// (`<defunct>`, state `'Z'`) until the proxy is killed or exits.
+///
+/// `kill(pid, 0)` continues returning success for zombies — the kernel
+/// considers the proc entry "alive" until reaped. So a pure `kill(0)`
+/// poll loop hangs until the budget expires, returning a false `Stuck`
+/// even though the zombie holds no FDs, no locks, no resources.
+///
+/// This was empirically captured by the `StuckDiagnostic` instrumentation
+/// added in commit `dd5f5a0`: the final snapshot showed
+/// `state="Z" comm="<defunct>"` — the smoking gun.
+///
+/// ## How the zombie check works
+///
+/// Every `ZOMBIE_CHECK_INTERVAL` poll iterations, when `kill(0)` reports
+/// alive, also run `ps -o state= -p <pid>`. If the state starts with `Z`,
+/// the process is a zombie — functionally dead (locks released by the
+/// kernel at exit, no further user-code execution) — and we return `true`.
+///
+/// `ps_field` spawns a subprocess (~10ms), so it's amortized across
+/// every 5 polls (250ms) to keep the per-iteration overhead low. Zombie
+/// state is monotonic — once entered, it never reverts — so sub-second
+/// detection is unnecessary.
 async fn poll_until_exit(
     pid: u32,
     budget: std::time::Duration,
     started: std::time::Instant,
 ) -> bool {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    const ZOMBIE_CHECK_INTERVAL: u32 = 5;
     let deadline = started + budget;
+    let mut iter: u32 = 0;
     while std::time::Instant::now() < deadline {
         if !is_pid_alive(pid) {
             return true;
         }
+        // Cheap zombie check on a sub-rate to avoid spawning ps on every
+        // 50ms tick. State only ever transitions toward `Z` from running
+        // states (R/S/T), never back.
+        if iter % ZOMBIE_CHECK_INTERVAL == 0 {
+            if let Some(state) = ps_field(pid, "state") {
+                if state.starts_with('Z') {
+                    return true;
+                }
+            }
+        }
+        iter = iter.wrapping_add(1);
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     false

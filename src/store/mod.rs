@@ -10,12 +10,14 @@ pub mod db;
 pub mod durability;
 pub mod enforcement;
 pub mod gotcha_ops;
+pub mod migrations;
 pub mod record;
 pub mod repair;
 pub mod session;
 
 pub use db::{derive_slug, KnowledgeWriteOp, Store};
 pub use durability::Durability;
+pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{
     AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,
     GotchaRecord, KnowledgeGap, OnboardingScore, Priority, QualityScore, QualitySignal,

@@ -16,7 +16,10 @@
 //!   `mcp::handlers`. Consultation receipts + audit committed atomically
 //!   in sessions tree. Cross-tree access_count bumps are deferred best-effort.
 //! - **Compound** (FileEditHook): per-tree atomic batches with substep audit.
-//! - **Pure reads** (9 commands): v1 bridge for read-only dispatch. No
+//! - **MemQuery**: native pure-read handler via `dispatch_mem_query`
+//!   (γ-C1.5). Centralizes mode dispatch so v1 (rmcp tool wrapper) and
+//!   v2 (typed Command::MemQuery) produce byte-identical responses.
+//! - **Pure reads** (8 commands): v1 bridge for read-only dispatch. No
 //!   mutations, no audit, no side effects. The v1 bridge CANNOT reach
 //!   `put` or `delete` — no `Command` variant maps to those strings.
 //!
@@ -131,12 +134,19 @@ pub(crate) async fn dispatch_v2(
         // 2. Dispatch based on command classification.
         //
         // All mutations and side-effecting reads have native handlers.
-        // Only pure reads (9 commands) use the v1 bridge, which cannot
+        // Only pure reads (8 commands) use the v1 bridge, which cannot
         // reach any mutation path.
         if is_side_effecting_read(&req.cmd) {
             // MemGet / MemBootstrap: native handler with sessions-tree
             // transactional audit + deferred cross-tree best-effort writes.
             dispatch_side_effecting_read(graph, ctx, &req).await
+        } else if matches!(&req.cmd, Command::MemQuery(_)) {
+            // γ-C1.5: mem_query is a pure read (no audit, no side effects)
+            // but still has rich business logic — route natively to the
+            // canonical `handle_mem_query` so v1 and v2 dispatch can never
+            // drift. Pre-γ, this fell through to the v1 bridge which
+            // serialized back to a string and re-entered `MatiServer::mem_query`.
+            dispatch_mem_query(graph, &req).await
         } else if is_session_side(&req.cmd) {
             // Session-side mutations: native handler with audit in sessions tree.
             dispatch_session_side(graph, ctx, &req).await
@@ -199,6 +209,7 @@ fn is_knowledge_mutation(cmd: &Command) -> bool {
             | Command::DocCapture(_)
             | Command::DecisionUpsert(_)
             | Command::DevNoteUpsert(_)
+            | Command::RecordImport(_)
     )
 }
 
@@ -321,6 +332,24 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
 
 // ── Side-effecting read handlers ────────────────────────────────────────────
 
+/// Pure-read native dispatch for `Command::MemQuery`. Calls
+/// `handle_mem_query` directly — no audit, no consultation receipt, no
+/// deferred writes. γ-C1.5 contract: v1-string and v2-typed paths produce
+/// byte-identical responses for the same MemQueryInput.
+async fn dispatch_mem_query(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
+    use super::handlers;
+    let request_id = req.id;
+    let input = match &req.cmd {
+        Command::MemQuery(i) => i,
+        _ => unreachable!("dispatch_mem_query guard"),
+    };
+    let g = graph.read().await;
+    match handlers::handle_mem_query(g.store(), &g, input).await {
+        Ok(data) => Response::ok(request_id, data),
+        Err((code, msg)) => Response::err(request_id, code, msg),
+    }
+}
+
 async fn dispatch_side_effecting_read(
     graph: &Arc<tokio::sync::RwLock<Graph>>,
     ctx: &RequestContext,
@@ -405,6 +434,9 @@ async fn dispatch_knowledge_mutation(
         }
         Command::DevNoteUpsert(input) => {
             handlers::handle_dev_note_upsert(store, ctx, request_id, input).await
+        }
+        Command::RecordImport(input) => {
+            handlers::handle_record_import(store, ctx, request_id, input).await
         }
         _ => {
             unreachable!("is_knowledge_mutation guard ensures only knowledge mutations reach here")
@@ -911,10 +943,11 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             "session_check_consulted_recent".into(),
             json!({ "key": i.key, "ttl_secs": i.ttl_secs }),
         ),
-        Command::MemQuery(i) => (
-            "mem_query".into(),
-            json!({ "query": i.query, "mode": format!("{:?}", i.mode).to_lowercase(), "limit": i.limit }),
-        ),
+        // MemQuery is now handled natively via `dispatch_mem_query`
+        // (γ-C1.5). It must not reach this bridge.
+        Command::MemQuery(_) => {
+            unreachable!("MemQuery is handled natively, not via v1 bridge")
+        }
         Command::ScanEnforcementEvents(i) => (
             "scan_enforcement_events".into(),
             json!({ "since_seq": i.since_seq, "until_seq": i.until_seq }),
@@ -934,7 +967,8 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         | Command::FileEditHook(_)
         | Command::DocCapture(_)
         | Command::DecisionUpsert(_)
-        | Command::DevNoteUpsert(_) => {
+        | Command::DevNoteUpsert(_)
+        | Command::RecordImport(_) => {
             unreachable!("knowledge-side mutations are handled natively, not via v1 bridge")
         }
 
@@ -1240,9 +1274,14 @@ mod tests {
 
     #[tokio::test]
     async fn v1_bridge_only_handles_pure_reads() {
-        // The v1 bridge handles ONLY pure reads (Category A).
-        // All mutations AND side-effecting reads are handled natively.
-        // Verify the remaining v1 bridge commands never produce "put" or "delete".
+        // The v1 bridge handles ONLY pure reads that have no native dispatch
+        // arm. Mutations, side-effecting reads, AND `Command::MemQuery`
+        // (γ-C1.5) are all handled natively. Verify the remaining v1 bridge
+        // commands never produce "put" or "delete".
+        //
+        // Pre-γ-C1.5 this list contained 9 entries; MemQuery was the 9th.
+        // It now lives in `dispatch_mem_query` — see the byte-identical
+        // parity tests in `handlers::tests::mem_query_*`.
         let pure_read_commands: Vec<Command> = vec![
             Command::Ping,
             Command::Get(GetInput { key: "k".into() }),
@@ -1265,17 +1304,13 @@ mod tests {
                 key: "k".into(),
                 ttl_secs: 900,
             }),
-            Command::MemQuery(MemQueryInput {
-                query: "q".into(),
-                mode: QueryMode::Text,
-                limit: 20,
-            }),
         ];
 
         assert_eq!(
             pure_read_commands.len(),
-            9,
-            "must cover all 9 pure read commands"
+            8,
+            "must cover all 8 pure read commands still routed via v1 bridge \
+             (was 9 before γ-C1.5 moved MemQuery to a native arm)"
         );
         for cmd in pure_read_commands {
             assert!(!cmd.is_mutation(), "{} must not be a mutation", cmd.kind());
