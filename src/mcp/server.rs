@@ -760,7 +760,7 @@ pub(crate) async fn socket_dispatch(
             let ctx = build_v1_dispatch_ctx(repo_root);
             let response =
                 super::handlers::handle_mem_set(graph, &ctx, uuid::Uuid::new_v4(), &params).await;
-            return SocketResponse::ok(serde_json::Value::String(response));
+            SocketResponse::ok(serde_json::Value::String(response))
         }
 
         // ── Hook commands (store-only) ─────────────────────────────────

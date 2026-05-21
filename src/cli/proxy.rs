@@ -376,28 +376,6 @@ impl StoreProxy {
         }
     }
 
-    /// Write a batch of records.
-    pub async fn put_batch(&self, records: &[(&str, &Record)]) -> Result<()> {
-        match &self.inner {
-            ProxyInner::Direct(store) => store.put_batch(records).await,
-            ProxyInner::Socket { .. } => {
-                // Socket mode: write records one at a time via put.
-                // Each record is a separate daemon socket round-trip.
-                if records.len() > 100 {
-                    tracing::warn!(
-                        "put_batch: {} records via socket (O(N) round-trips) — \
-                         consider stopping the daemon for bulk imports",
-                        records.len()
-                    );
-                }
-                for &(key, record) in records {
-                    self.put(key, record).await?;
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// Bulk-import records, preserving every field. Routes through the
     /// typed `RecordImport` v2 command in socket mode (one round-trip per
     /// chunk of 200 records) and the atomic batch path in direct mode.

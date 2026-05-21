@@ -697,6 +697,12 @@ pub async fn run_daemon_start() -> Result<()> {
 ///
 /// Delegates per-connection work to the shared `socket_handle_connection`
 /// in `mcp::server`, which handles hook commands and MCP tool commands.
+//
+// Eight args (one over clippy's default `too_many_arguments` cap of 7) —
+// added `active_connections` in γ-C5. Single internal call site from
+// `run_daemon_start`; bundling into a config struct just to satisfy a
+// style lint for a one-callsite helper is over-engineering.
+#[allow(clippy::too_many_arguments)]
 async fn serve_loop_graceful(
     graph: Arc<tokio::sync::RwLock<Graph>>,
     repo_root: &Path,
