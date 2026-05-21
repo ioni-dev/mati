@@ -304,7 +304,110 @@ pub enum KillOutcome {
     /// SIGTERM was ignored or absorbed; SIGKILL succeeded.
     KilledHard(std::time::Duration),
     /// Process is still alive after SIGKILL — manual intervention required.
-    Stuck,
+    /// Carries a [`StuckDiagnostic`] so callers can surface the actual
+    /// process state at the moment we gave up. γ smoke surfaced cases
+    /// where the daemon was effectively gone (lock released, next CLI
+    /// command worked) but our `kill(0)` poll kept reporting alive; the
+    /// diagnostic snapshot lets us distinguish kill(0)-lying-after-SIGKILL,
+    /// zombie state, PID reuse (different process at that PID now), and
+    /// genuinely-still-alive cases on the next failure.
+    Stuck(StuckDiagnostic),
+}
+
+/// Diagnostic data captured at the moment [`KillOutcome::Stuck`] is
+/// returned. Includes timing for each phase and a `ps`-driven snapshot
+/// of the process state at both the start of the kill and the giving-up
+/// point — enabling root-cause analysis without re-running the failure.
+#[derive(Debug, Clone)]
+pub struct StuckDiagnostic {
+    pub pid: u32,
+    /// Elapsed wall time from [`kill_and_wait`] / [`kill_directly`] entry.
+    pub total_elapsed_ms: u64,
+    /// Time spent in the SIGTERM phase. `None` if [`kill_directly`] was
+    /// used (no SIGTERM phase).
+    pub sigterm_elapsed_ms: Option<u64>,
+    /// Time spent polling after SIGKILL.
+    pub sigkill_elapsed_ms: u64,
+    /// Process state when the kill started (via `ps -o ...`).
+    pub initial_snapshot: PidSnapshot,
+    /// Process state when we gave up (via `ps -o ...`).
+    pub final_snapshot: PidSnapshot,
+}
+
+/// `ps -o`-derived snapshot of a PID. Used by [`StuckDiagnostic`] to
+/// pin down why `kill_and_wait` gave up.
+///
+/// On the failure path we cross-check `kill(pid, 0)`'s lying-alive report
+/// against three orthogonal indicators:
+///
+/// - **`lstart`** changed between initial and final → the PID was reused
+///   by a different process (kernel reaped the old one, assigned PID to a
+///   new spawn).
+/// - **`state`** is `Z` → process really is a zombie awaiting reap by its
+///   parent. `kill(0)` succeeds because the proc entry exists; the
+///   process holds no resources.
+/// - **all fields `None`** → `ps` reports the PID is gone but `kill(0)`
+///   still says alive: macOS kernel proc-table lag (the proc structure
+///   hasn't been fully torn down even though the process has exited).
+/// - **same `lstart`, normal `state`** → process is genuinely still
+///   alive. Real Stuck case — daemon shutdown is wedged.
+#[derive(Debug, Clone, Default)]
+pub struct PidSnapshot {
+    /// Process start time as reported by `ps -o lstart=`. `None` if ps
+    /// can't find the PID.
+    pub lstart: Option<String>,
+    /// Process state: 'R' running, 'S' sleeping, 'Z' zombie, etc.
+    pub state: Option<String>,
+    /// Process command name as reported by `ps -o comm=`.
+    pub comm: Option<String>,
+}
+
+impl PidSnapshot {
+    /// Render as a compact one-line diagnostic string suitable for
+    /// inclusion in lifecycle events and stderr.
+    pub fn render(&self) -> String {
+        match (&self.lstart, &self.state, &self.comm) {
+            (None, None, None) => "ps:gone".into(),
+            _ => format!(
+                "lstart={:?} state={:?} comm={:?}",
+                self.lstart.as_deref().unwrap_or("?"),
+                self.state.as_deref().unwrap_or("?"),
+                self.comm.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+}
+
+/// Snapshot the named `ps` field for `pid`. Returns `None` if `ps` can't
+/// find the PID (process gone) or the call fails.
+fn ps_field(pid: u32, field: &str) -> Option<String> {
+    let pid_str = pid.to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", &format!("{field}="), "-p", &pid_str])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let trimmed = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Capture a `PidSnapshot` via three `ps` calls (lstart, state, comm).
+/// Each call is ~10ms on macOS; total ~30ms. Only invoked on the Stuck
+/// path so the cost doesn't touch the hot path.
+pub fn snapshot_pid(pid: u32) -> PidSnapshot {
+    PidSnapshot {
+        lstart: ps_field(pid, "lstart"),
+        state: ps_field(pid, "state"),
+        comm: ps_field(pid, "comm"),
+    }
 }
 
 /// Send SIGTERM to `pid`. Returns `true` on success or when the kernel
@@ -336,6 +439,7 @@ fn send_sigterm(_pid: u32) -> bool {
 /// [`SIGKILL_REAP_WINDOW`] for the rationale.
 pub async fn kill_directly(pid: u32) -> KillOutcome {
     let started = std::time::Instant::now();
+    let initial_snapshot = snapshot_pid(pid);
     #[cfg(unix)]
     {
         // SAFETY: SIGKILL is non-catchable; the process either exits or
@@ -345,17 +449,34 @@ pub async fn kill_directly(pid: u32) -> KillOutcome {
             let errno = std::io::Error::last_os_error().raw_os_error();
             if !matches!(errno, Some(libc::ESRCH)) {
                 tracing::warn!(pid, ?errno, "kill_directly: SIGKILL rejected by kernel");
-                return KillOutcome::Stuck;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                return KillOutcome::Stuck(StuckDiagnostic {
+                    pid,
+                    total_elapsed_ms: elapsed_ms,
+                    sigterm_elapsed_ms: None,
+                    sigkill_elapsed_ms: elapsed_ms,
+                    initial_snapshot,
+                    final_snapshot: snapshot_pid(pid),
+                });
             }
             // ESRCH — already gone, treat as success.
             return KillOutcome::KilledHard(started.elapsed());
         }
     }
 
+    let sigkill_start = std::time::Instant::now();
     if poll_until_exit(pid, SIGKILL_REAP_WINDOW, started).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
-    KillOutcome::Stuck
+    let sigkill_elapsed_ms = sigkill_start.elapsed().as_millis() as u64;
+    KillOutcome::Stuck(StuckDiagnostic {
+        pid,
+        total_elapsed_ms: started.elapsed().as_millis() as u64,
+        sigterm_elapsed_ms: None,
+        sigkill_elapsed_ms,
+        initial_snapshot,
+        final_snapshot: snapshot_pid(pid),
+    })
 }
 
 /// Send SIGTERM to `pid`, wait up to `timeout` for the process to exit, and
@@ -368,15 +489,26 @@ pub async fn kill_directly(pid: u32) -> KillOutcome {
 /// gate, ownership check) and knows the PID is alive.
 pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcome {
     let started = std::time::Instant::now();
+    let initial_snapshot = snapshot_pid(pid);
 
     if !send_sigterm(pid) {
         tracing::warn!(pid, "kill_and_wait: SIGTERM rejected by kernel");
-        return KillOutcome::Stuck;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        return KillOutcome::Stuck(StuckDiagnostic {
+            pid,
+            total_elapsed_ms: elapsed_ms,
+            sigterm_elapsed_ms: Some(elapsed_ms),
+            sigkill_elapsed_ms: 0,
+            initial_snapshot,
+            final_snapshot: snapshot_pid(pid),
+        });
     }
 
+    let sigterm_start = std::time::Instant::now();
     if poll_until_exit(pid, timeout, started).await {
         return KillOutcome::ExitedClean(started.elapsed());
     }
+    let sigterm_elapsed_ms = sigterm_start.elapsed().as_millis() as u64;
 
     tracing::warn!(
         pid,
@@ -390,11 +522,20 @@ pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcom
         let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     }
 
-    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, std::time::Instant::now()).await {
+    let sigkill_start = std::time::Instant::now();
+    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, sigkill_start).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
+    let sigkill_elapsed_ms = sigkill_start.elapsed().as_millis() as u64;
 
-    KillOutcome::Stuck
+    KillOutcome::Stuck(StuckDiagnostic {
+        pid,
+        total_elapsed_ms: started.elapsed().as_millis() as u64,
+        sigterm_elapsed_ms: Some(sigterm_elapsed_ms),
+        sigkill_elapsed_ms,
+        initial_snapshot,
+        final_snapshot: snapshot_pid(pid),
+    })
 }
 
 /// Poll [`is_pid_alive`] until the PID is gone or `budget` elapses (from `started`).
