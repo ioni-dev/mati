@@ -1103,9 +1103,8 @@ pub(crate) async fn handle_mem_get(
             let mut agent_json = super::tools::record_to_agent_json(r);
             if r.category == Category::File {
                 if let Some(payload) = &r.payload {
-                    if let Ok(fr) = serde_json::from_value::<
-                        crate::store::record::FileRecord,
-                    >(payload.clone())
+                    if let Ok(fr) =
+                        serde_json::from_value::<crate::store::record::FileRecord>(payload.clone())
                     {
                         if let Some(ref br) = fr.blast_radius {
                             use crate::analysis::blast_radius::BlastTier;
@@ -1115,10 +1114,7 @@ pub(crate) async fn handle_mem_get(
                                     br.direct
                                 );
                                 if let Some(obj) = agent_json.as_object_mut() {
-                                    obj.insert(
-                                        "warnings".into(),
-                                        serde_json::json!([warning]),
-                                    );
+                                    obj.insert("warnings".into(), serde_json::json!([warning]));
                                 }
                             }
                         }
@@ -1256,7 +1252,14 @@ pub(crate) async fn handle_mem_query(
             // Bounded scan: stop after `limit` matches across all prefixes.
             let query_lower = input.query.to_lowercase();
             let mut matched: Vec<serde_json::Value> = Vec::new();
-            for ns in &["gotcha:", "decision:", "file:", "stage:", "dev_note:", "dep:"] {
+            for ns in &[
+                "gotcha:",
+                "decision:",
+                "file:",
+                "stage:",
+                "dev_note:",
+                "dep:",
+            ] {
                 if matched.len() >= limit {
                     break;
                 }
@@ -1349,7 +1352,10 @@ pub(crate) async fn handle_mem_query(
                     if let Ok(Some(record)) = store.get(key).await {
                         if matches!(record.lifecycle, RecordLifecycle::Active) {
                             let mut entry = serde_json::Map::new();
-                            entry.insert("key".into(), serde_json::Value::String(record.key.clone()));
+                            entry.insert(
+                                "key".into(),
+                                serde_json::Value::String(record.key.clone()),
+                            );
                             entry.insert(
                                 "relationship".into(),
                                 serde_json::Value::String(format!("{kind:?}")),
@@ -1362,10 +1368,7 @@ pub(crate) async fn handle_mem_query(
                                 "confidence".into(),
                                 serde_json::json!(record.confidence.value),
                             );
-                            entry.insert(
-                                "quality".into(),
-                                serde_json::json!(record.quality.value),
-                            );
+                            entry.insert("quality".into(), serde_json::json!(record.quality.value));
                             if let Some(payload) = &record.payload {
                                 if let Some(confirmed) = payload.get("confirmed") {
                                     entry.insert("confirmed".into(), confirmed.clone());
@@ -1393,7 +1396,10 @@ pub(crate) async fn handle_mem_query(
                     if let Ok(Some(record)) = store.get(key).await {
                         if matches!(record.lifecycle, RecordLifecycle::Active) {
                             let mut entry = serde_json::Map::new();
-                            entry.insert("key".into(), serde_json::Value::String(record.key.clone()));
+                            entry.insert(
+                                "key".into(),
+                                serde_json::Value::String(record.key.clone()),
+                            );
                             entry.insert(
                                 "relationship".into(),
                                 serde_json::Value::String("DependencyAffects".to_string()),
@@ -1406,10 +1412,7 @@ pub(crate) async fn handle_mem_query(
                                 "confidence".into(),
                                 serde_json::json!(record.confidence.value),
                             );
-                            entry.insert(
-                                "quality".into(),
-                                serde_json::json!(record.quality.value),
-                            );
+                            entry.insert("quality".into(), serde_json::json!(record.quality.value));
                             if let Some(decisions) = result.get_mut("decisions") {
                                 if let Some(arr) = decisions.as_array_mut() {
                                     arr.push(serde_json::Value::Object(entry));
@@ -1730,7 +1733,14 @@ pub(crate) async fn handle_record_import(
     let mut skipped: u64 = 0;
     let mut chunk_buf: Vec<&Record> = Vec::with_capacity(CHUNK);
 
-    let valid_prefixes = ["gotcha:", "decision:", "dev_note:", "file:", "stage:", "dep:"];
+    let valid_prefixes = [
+        "gotcha:",
+        "decision:",
+        "dev_note:",
+        "file:",
+        "stage:",
+        "dep:",
+    ];
 
     // First pass: filter records into knowledge-tree-only buckets and skip
     // anything that would route to the sessions tree or fails the prefix
@@ -1773,10 +1783,12 @@ pub(crate) async fn handle_record_import(
             value: &audit.1,
         });
 
-        store
-            .transact_knowledge(&ops)
-            .await
-            .map_err(|e| (ErrorCode::StoreError, format!("import transact failed: {e}")))?;
+        store.transact_knowledge(&ops).await.map_err(|e| {
+            (
+                ErrorCode::StoreError,
+                format!("import transact failed: {e}"),
+            )
+        })?;
 
         imported += chunk_buf.len() as u64;
     }
@@ -1909,9 +1921,8 @@ async fn apply_mem_set_write(
     if is_new_record {
         // Normalize for validation (Codex sends JSON-encoded strings).
         let check_payload = match &params.payload {
-            serde_json::Value::String(s) => {
-                serde_json::from_str::<serde_json::Value>(s).unwrap_or_else(|_| params.payload.clone())
-            }
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                .unwrap_or_else(|_| params.payload.clone()),
             _ => params.payload.clone(),
         };
         let obj = check_payload.as_object();
@@ -1957,8 +1968,7 @@ async fn apply_mem_set_write(
         .as_ref()
         .map(|r| {
             !is_tombstoned
-                && (r.source == RecordSource::DeveloperManual
-                    || r.confidence.value >= 0.80)
+                && (r.source == RecordSource::DeveloperManual || r.confidence.value >= 0.80)
         })
         .unwrap_or(false);
 
@@ -2041,9 +2051,7 @@ async fn apply_mem_set_write(
         if let Some(existing_payload) = &record.payload {
             // Merge: new values override, existing keys preserved
             let mut merged = existing_payload.clone();
-            if let (Some(base), Some(overlay)) =
-                (merged.as_object_mut(), new_payload.as_object())
-            {
+            if let (Some(base), Some(overlay)) = (merged.as_object_mut(), new_payload.as_object()) {
                 for (k, v) in overlay {
                     // gotcha_keys is a derived index maintained by the
                     // gotcha confirm/tombstone paths. Overwriting it on
@@ -2139,10 +2147,8 @@ async fn apply_mem_set_write(
         }
     }
 
-    let old_affected_set: HashSet<&str> =
-        old_affected_files.iter().map(String::as_str).collect();
-    let new_affected_set: HashSet<&str> =
-        affected_files.iter().map(String::as_str).collect();
+    let old_affected_set: HashSet<&str> = old_affected_files.iter().map(String::as_str).collect();
+    let new_affected_set: HashSet<&str> = affected_files.iter().map(String::as_str).collect();
 
     drop(graph); // release read lock before taking write lock
 
@@ -2176,9 +2182,7 @@ async fn apply_mem_set_write(
                 .add_edge(&file_key, EdgeKind::HasGotcha, &record_key)
                 .await
             {
-                tracing::warn!(
-                    "mem_set: edge add failed for {file_key} → {record_key}: {e}"
-                );
+                tracing::warn!("mem_set: edge add failed for {file_key} → {record_key}: {e}");
                 crate::store::repair::mark_dirty(
                     graph.store(),
                     &record_key,
@@ -2246,15 +2250,11 @@ async fn apply_mem_set_confirm(
             }
         }
     }
-    serde_json::json!({"error": format!("store put: {}", last_err.unwrap_or_default())})
-        .to_string()
+    serde_json::json!({"error": format!("store put: {}", last_err.unwrap_or_default())}).to_string()
 }
 
 /// Single attempt at the confirm get-mutate-put cycle.
-async fn try_confirm_once(
-    store: &Store,
-    key: &str,
-) -> anyhow::Result<(Record, Vec<String>)> {
+async fn try_confirm_once(store: &Store, key: &str) -> anyhow::Result<(Record, Vec<String>)> {
     let mut record = store
         .get(key)
         .await?

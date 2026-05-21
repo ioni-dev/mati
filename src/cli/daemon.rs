@@ -295,11 +295,7 @@ pub async fn run_daemon_start() -> Result<()> {
 
     // Phase: opening_store. Migration (if pending) runs inside Store::open and
     // emits its own granular events; see `src/store/migrations.rs::migrate`.
-    mati_core::mcp::metadata::record_lifecycle_event(
-        &mati_root,
-        "startup",
-        "phase=opening_store",
-    );
+    mati_core::mcp::metadata::record_lifecycle_event(&mati_root, "startup", "phase=opening_store");
     let store_t0 = std::time::Instant::now();
     let store = Store::open(&cwd).await.inspect_err(|e| {
         mati_core::mcp::metadata::record_lifecycle_event(
@@ -312,7 +308,10 @@ pub async fn run_daemon_start() -> Result<()> {
     mati_core::mcp::metadata::record_lifecycle_event(
         &mati_root,
         "startup",
-        &format!("phase=store_opened elapsed_ms={}", store_t0.elapsed().as_millis()),
+        &format!(
+            "phase=store_opened elapsed_ms={}",
+            store_t0.elapsed().as_millis()
+        ),
     );
 
     // Clear stale session:consulted:* markers from previous sessions.
@@ -463,7 +462,10 @@ pub async fn run_daemon_start() -> Result<()> {
     mati_core::mcp::metadata::record_lifecycle_event(
         &mati_root,
         "startup",
-        &format!("phase=ready elapsed_ms={}", startup_t0.elapsed().as_millis()),
+        &format!(
+            "phase=ready elapsed_ms={}",
+            startup_t0.elapsed().as_millis()
+        ),
     );
 
     tracing::info!(
@@ -1412,11 +1414,7 @@ async fn kill_mati_serve_processes(root: &Path) {
                 } else {
                     let errno = std::io::Error::last_os_error().raw_os_error();
                     if !matches!(errno, Some(libc::ESRCH)) {
-                        tracing::warn!(
-                            pid,
-                            ?errno,
-                            "kill_mati_serve_processes: SIGKILL failed"
-                        );
+                        tracing::warn!(pid, ?errno, "kill_mati_serve_processes: SIGKILL failed");
                     }
                 }
             }
@@ -1663,7 +1661,9 @@ async fn kill_flow(
             mati_core::mcp::metadata::record_lifecycle_event(
                 root,
                 "stop_end",
-                &format!("pid={pid} reason=clean_exit elapsed_ms={elapsed_ms} signal={signal_label}"),
+                &format!(
+                    "pid={pid} reason=clean_exit elapsed_ms={elapsed_ms} signal={signal_label}"
+                ),
             );
             if args.include_mcp {
                 kill_mati_serve_processes(root).await;

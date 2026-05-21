@@ -336,10 +336,7 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
 /// `handle_mem_query` directly — no audit, no consultation receipt, no
 /// deferred writes. γ-C1.5 contract: v1-string and v2-typed paths produce
 /// byte-identical responses for the same MemQueryInput.
-async fn dispatch_mem_query(
-    graph: &Arc<tokio::sync::RwLock<Graph>>,
-    req: &Request,
-) -> Response {
+async fn dispatch_mem_query(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
     use super::handlers;
     let request_id = req.id;
     let input = match &req.cmd {

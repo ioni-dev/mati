@@ -232,9 +232,16 @@ pub async fn migrate(store: &Store) -> Result<()> {
 
         let records_migrated = extra_ops.len() as u64;
         let completed_at = now_secs();
-        commit_migration(store, next, extra_ops, started_at, completed_at, records_migrated)
-            .await
-            .with_context(|| format!("schema migration v{next} commit failed"))?;
+        commit_migration(
+            store,
+            next,
+            extra_ops,
+            started_at,
+            completed_at,
+            records_migrated,
+        )
+        .await
+        .with_context(|| format!("schema migration v{next} commit failed"))?;
 
         tracing::info!(
             version = next,
@@ -588,7 +595,9 @@ async fn snapshot_knowledge_tree(store: &Store, target_version: u32) -> Result<P
     }
 
     let backup_root = store.root.join("backups");
-    let dst = backup_root.join(format!("pre-v{target_version}")).join("knowledge.db");
+    let dst = backup_root
+        .join(format!("pre-v{target_version}"))
+        .join("knowledge.db");
 
     if dst.exists() {
         tracing::debug!(
@@ -666,11 +675,8 @@ async fn apply_v1_baseline(_store: &Store) -> Result<Vec<OwnedKnowledgeOp>> {
 /// developer-confirmed. To deny on a cochange/revert/ownership signal,
 /// developers explicitly confirm via `mati gotcha confirm`.
 async fn apply_v2_unconfirm_auto_derived_gotchas(store: &Store) -> Result<Vec<OwnedKnowledgeOp>> {
-    const AUTO_DERIVED_PREFIXES: &[&str] = &[
-        "gotcha:cochange:",
-        "gotcha:revert:",
-        "gotcha:ownership:",
-    ];
+    const AUTO_DERIVED_PREFIXES: &[&str] =
+        &["gotcha:cochange:", "gotcha:revert:", "gotcha:ownership:"];
 
     let now = now_secs();
     let mut ops = Vec::new();
@@ -1040,7 +1046,11 @@ mod tests {
 
         migrate(&store).await.unwrap();
 
-        let backup = store.root.join("backups").join("pre-v2").join("knowledge.db");
+        let backup = store
+            .root
+            .join("backups")
+            .join("pre-v2")
+            .join("knowledge.db");
         assert!(
             backup.exists(),
             "pre-migration snapshot must be created at {}",

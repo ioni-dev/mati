@@ -339,12 +339,8 @@ pub async fn ensure_daemon(mati_root: &Path) -> bool {
                     // may already be running. Use the full state-aware
                     // budget so a slow migration doesn't cause us to
                     // fall through and start a competing daemon.
-                    match wait_for_ready(
-                        mati_root,
-                        READINESS_HARD_CAP,
-                        READINESS_WEDGE_THRESHOLD,
-                    )
-                    .await
+                    match wait_for_ready(mati_root, READINESS_HARD_CAP, READINESS_WEDGE_THRESHOLD)
+                        .await
                     {
                         ReadinessOutcome::Ready => return true,
                         // Other terminal states fall through to our own spawn
@@ -720,12 +716,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        let outcome = wait_for_ready(
-            &root,
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        )
-        .await;
+        let outcome = wait_for_ready(&root, Duration::from_secs(5), Duration::from_secs(2)).await;
         let elapsed = start.elapsed();
 
         let _ = emitter.await;
@@ -753,12 +744,7 @@ mod tests {
         });
 
         let start = Instant::now();
-        let outcome = wait_for_ready(
-            &root,
-            Duration::from_secs(10),
-            Duration::from_secs(5),
-        )
-        .await;
+        let outcome = wait_for_ready(&root, Duration::from_secs(10), Duration::from_secs(5)).await;
         let elapsed = start.elapsed();
         let _ = emitter.await;
 
@@ -795,8 +781,8 @@ mod tests {
         let start = Instant::now();
         let outcome = wait_for_ready(
             &root,
-            Duration::from_secs(10),     // hard cap
-            Duration::from_millis(200),  // wedge threshold (short for test)
+            Duration::from_secs(10),    // hard cap
+            Duration::from_millis(200), // wedge threshold (short for test)
         )
         .await;
         let elapsed = start.elapsed();
@@ -843,8 +829,8 @@ mod tests {
         let start = Instant::now();
         let outcome = wait_for_ready(
             &root,
-            Duration::from_millis(250),  // hard cap (short for test)
-            Duration::from_secs(10),     // wedge threshold (won't fire)
+            Duration::from_millis(250), // hard cap (short for test)
+            Duration::from_secs(10),    // wedge threshold (won't fire)
         )
         .await;
         let elapsed = start.elapsed();
@@ -881,12 +867,7 @@ mod tests {
         let responder = spawn_ping_responder(&root).await;
 
         let start = Instant::now();
-        let outcome = wait_for_ready(
-            &root,
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        )
-        .await;
+        let outcome = wait_for_ready(&root, Duration::from_secs(5), Duration::from_secs(2)).await;
         let elapsed = start.elapsed();
         responder.abort();
 
@@ -920,12 +901,8 @@ mod tests {
         writeln!(f, "abc\tdef\tghi\tjkl").unwrap();
 
         let start = Instant::now();
-        let outcome = wait_for_ready(
-            &root,
-            Duration::from_secs(5),
-            Duration::from_millis(200),
-        )
-        .await;
+        let outcome =
+            wait_for_ready(&root, Duration::from_secs(5), Duration::from_millis(200)).await;
         let elapsed = start.elapsed();
 
         // Garbled events count as "no forward progress" — wedge timer fires.

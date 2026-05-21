@@ -126,7 +126,10 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
     super::metadata::record_lifecycle_event(
         &mati_root,
         "startup",
-        &format!("phase=ready elapsed_ms={}", startup_t0.elapsed().as_millis()),
+        &format!(
+            "phase=ready elapsed_ms={}",
+            startup_t0.elapsed().as_millis()
+        ),
     );
 
     // MCP stdio proxy: every tool call forwards over UDS to the daemon.
@@ -839,7 +842,8 @@ pub(crate) async fn socket_dispatch(
             // it does not add cost on the hot path.
             let mut gotcha_records = serde_json::Map::new();
             let mut gotcha_error = false;
-            let mut linked_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut linked_keys: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
 
             if let Some(ref fr) = file_record {
                 if let Some(keys) = fr
@@ -923,10 +927,7 @@ pub(crate) async fn socket_dispatch(
                                 .keys()
                                 .map(|k| serde_json::Value::String(k.clone()))
                                 .collect();
-                            obj.insert(
-                                "gotcha_keys".to_string(),
-                                serde_json::Value::Array(keys),
-                            );
+                            obj.insert("gotcha_keys".to_string(), serde_json::Value::Array(keys));
                         }
                     }
                 }
@@ -1559,7 +1560,6 @@ pub const IDLE_SHUTDOWN_SECS: u64 = 30 * 60; // 30 min
 
 /// How often to check wall-clock idle time. Shared with `cli::daemon`.
 pub const IDLE_CHECK_INTERVAL_SECS: u64 = 5 * 60; // 5 min
-
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
