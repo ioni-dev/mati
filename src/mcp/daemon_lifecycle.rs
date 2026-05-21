@@ -235,11 +235,12 @@ pub(crate) async fn wait_for_ready(
                 // an actual ping to confirm the socket is bound and
                 // answering, not just that the event was emitted.
                 if ev.event == "startup" && ev.phase() == Some("ready") {
-                    if matches!(
+                    let ping_ok = matches!(
                         proxy_daemon_result_no_spawn(mati_root, "ping", &serde_json::json!({}))
                             .await,
                         ProxyDaemonResult::Ok(_)
-                    ) {
+                    );
+                    if ping_ok {
                         return ReadinessOutcome::Ready;
                     }
                     // Event landed but ping not yet succeeding — keep
@@ -339,14 +340,14 @@ pub async fn ensure_daemon(mati_root: &Path) -> bool {
                     // may already be running. Use the full state-aware
                     // budget so a slow migration doesn't cause us to
                     // fall through and start a competing daemon.
-                    match wait_for_ready(mati_root, READINESS_HARD_CAP, READINESS_WEDGE_THRESHOLD)
-                        .await
+                    if let ReadinessOutcome::Ready =
+                        wait_for_ready(mati_root, READINESS_HARD_CAP, READINESS_WEDGE_THRESHOLD)
+                            .await
                     {
-                        ReadinessOutcome::Ready => return true,
-                        // Other terminal states fall through to our own spawn
-                        // — the peer that wrote the sentinel didn't finish.
-                        _ => {}
+                        return true;
                     }
+                    // Other terminal states fall through to our own spawn
+                    // — the peer that wrote the sentinel didn't finish.
                 }
             }
         }

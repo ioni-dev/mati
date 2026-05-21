@@ -440,7 +440,7 @@ fn send_sigterm(_pid: u32) -> bool {
 /// `mati daemon stop --force` to bypass the SIGTERM grace period and
 /// terminate the daemon immediately. The reaping window matches the
 /// SIGKILL escalation phase of [`kill_and_wait`] — see
-/// [`SIGKILL_REAP_WINDOW`] for the rationale.
+/// `SIGKILL_REAP_WINDOW` for the rationale.
 pub async fn kill_directly(pid: u32) -> KillOutcome {
     let started = std::time::Instant::now();
     let initial_snapshot = snapshot_pid(pid);
@@ -484,7 +484,7 @@ pub async fn kill_directly(pid: u32) -> KillOutcome {
 }
 
 /// Send SIGTERM to `pid`, wait up to `timeout` for the process to exit, and
-/// escalate to SIGKILL with [`SIGKILL_REAP_WINDOW`] of reaping budget if it
+/// escalate to SIGKILL with `SIGKILL_REAP_WINDOW` of reaping budget if it
 /// does not.
 ///
 /// Used by both `mati daemon stop` and the unresponsive-recovery branch of
