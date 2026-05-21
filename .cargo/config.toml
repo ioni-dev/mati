@@ -1,17 +1,37 @@
 # Per-repo cargo config for mati.
 #
-# Why RUST_TEST_THREADS=4:
-#   Each tokio test in `mcp/tools.rs` (59 tests) and `mcp/server.rs` (18 tests)
-#   opens its own SurrealKV instance via `Store::open(tempdir)`. SurrealKV
-#   cold-open + fsync does not scale linearly with parallelism, and on macOS
-#   14 simultaneous instances (default = num_cpus on M-series) can saturate
-#   APFS + the `logd` firehose dispatch queue. When `logd` misses its kernel
-#   watchdog check-in window (~120s), macOS panics the kernel.
+# Preferred local test runner is `cargo nextest run --lib`. See
+# `.config/nextest.toml` for the production-grade test config. The
+# settings below are the safety net for vanilla `cargo test` invocations
+# (e.g. by contributors who haven't yet installed cargo-nextest).
 #
-#   4 is the empirically-safe ceiling on Apple Silicon and still gives good
-#   wall-time on Linux CI. Override per-invocation with
-#   `RUST_TEST_THREADS=N cargo test` when you need more.
+# ─── aliases ──────────────────────────────────────────────────────────────
+[alias]
+# Short form for nextest. `cargo nt --lib` runs the suite with
+# per-test-subprocess isolation, profile-aware concurrency caps, and
+# resource-bound test groups (see .config/nextest.toml).
+nt = "nextest run"
+
+# ─── vanilla `cargo test` safety net ──────────────────────────────────────
 #
-#   `force = false` means an explicit env override wins.
+# Why RUST_TEST_THREADS=1 by default:
+#   Each tokio test in `mcp/tools.rs`, `mcp/server.rs`, `mcp/handlers.rs`,
+#   and `cli/daemon.rs` opens its own SurrealKV instance via
+#   `Store::open(tempdir)`. Many also spawn tokio runtimes whose blocking
+#   pool absorbs file I/O. SurrealKV cold-open + fsync does not scale
+#   linearly with parallelism, and with every `Store::open` now also running
+#   the v2 schema migration check, the cumulative filesystem activity over
+#   a full `cargo test --lib` run (~200+ tests, ~50MB of SurrealKV state
+#   created and dropped per test) saturates APFS and the macOS `logd`
+#   firehose dispatch queue. When `logd` misses its kernel watchdog
+#   check-in window (~120s), macOS panics the kernel.
+#
+#   1 is the empirically-safe default for the *full* test suite on Apple
+#   Silicon. Individual narrow filters can safely raise it:
+#     RUST_TEST_THREADS=4 cargo test --lib store::
+#     RUST_TEST_THREADS=4 cargo test --lib analysis::
+#   On Linux CI, override at the workflow level: `RUST_TEST_THREADS=8`.
+#
+#   `force = false` means an explicit env override always wins.
 [env]
-RUST_TEST_THREADS = { value = "4", force = false }
+RUST_TEST_THREADS = { value = "1", force = false }

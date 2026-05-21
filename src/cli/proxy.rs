@@ -184,22 +184,73 @@ impl StoreProxy {
                 use mati_core::mcp::protocol as p;
 
                 let cmd = if key.starts_with("gotcha:") {
+                    // Prefer the structured payload, but fall back to direct
+                    // JSON field extraction when `payload_as::<GotchaRecord>`
+                    // fails — older records or hand-imported JSON may carry a
+                    // payload that's missing a required field (e.g. an older
+                    // schema without `discovered_session`) yet still has a
+                    // valid `rule` + `reason` string. Returning empty strings
+                    // there used to surface as `daemon rejected put: rule
+                    // must not be empty` on `mati import` round-trips.
                     let gotcha = record.payload_as::<mati_core::store::GotchaRecord>();
+                    let payload_str_field = |name: &str| -> Option<String> {
+                        record
+                            .payload
+                            .as_ref()
+                            .and_then(|p| p.get(name))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    };
+                    let payload_string_list = |name: &str| -> Vec<String> {
+                        record
+                            .payload
+                            .as_ref()
+                            .and_then(|p| p.get(name))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+
+                    // record.value is the canonical rule text — set by every
+                    // write path. Use it as the final fallback when neither
+                    // structured nor field-level extraction yields a rule.
+                    let rule = gotcha
+                        .as_ref()
+                        .map(|g| g.rule.clone())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| payload_str_field("rule").filter(|s| !s.is_empty()))
+                        .or_else(|| {
+                            if record.value.is_empty() {
+                                None
+                            } else {
+                                Some(record.value.clone())
+                            }
+                        })
+                        .unwrap_or_default();
+                    let reason = gotcha
+                        .as_ref()
+                        .map(|g| g.reason.clone())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| payload_str_field("reason"))
+                        .unwrap_or_default();
+                    let affected_files = gotcha
+                        .as_ref()
+                        .map(|g| g.affected_files.clone())
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| payload_string_list("affected_files"));
                     p::Command::GotchaUpsert(p::GotchaDraftInput {
                         key: key.to_string(),
-                        rule: gotcha.as_ref().map(|g| g.rule.clone()).unwrap_or_default(),
-                        reason: gotcha
-                            .as_ref()
-                            .map(|g| g.reason.clone())
-                            .unwrap_or_default(),
+                        rule,
+                        reason,
                         severity: gotcha
                             .as_ref()
                             .map(|g| g.severity.clone().into())
                             .unwrap_or_default(),
-                        affected_files: gotcha
-                            .as_ref()
-                            .map(|g| g.affected_files.clone())
-                            .unwrap_or_default(),
+                        affected_files,
                         ref_url: gotcha.as_ref().and_then(|g| g.ref_url.clone()),
                         tags: record.tags.clone(),
                         priority: record.priority.clone().into(),
@@ -325,24 +376,113 @@ impl StoreProxy {
         }
     }
 
-    /// Write a batch of records.
-    pub async fn put_batch(&self, records: &[(&str, &Record)]) -> Result<()> {
+    /// Bulk-import records, preserving every field. Routes through the
+    /// typed `RecordImport` v2 command in socket mode (one round-trip per
+    /// chunk of 200 records) and the atomic batch path in direct mode.
+    /// Returns `(imported, skipped)` counts.
+    ///
+    /// Use this for `mati import` / `mati export` round-trips — the semantic
+    /// upsert commands (`GotchaUpsert` etc.) reset `confirmed`, recompute
+    /// confidence, and reject records missing required fields, all of which
+    /// turn a round-trip into a destructive rewrite.
+    pub async fn import_records(&self, records: &[Record]) -> Result<(u64, u64)> {
         match &self.inner {
-            ProxyInner::Direct(store) => store.put_batch(records).await,
-            ProxyInner::Socket { .. } => {
-                // Socket mode: write records one at a time via put.
-                // Each record is a separate daemon socket round-trip.
-                if records.len() > 100 {
-                    tracing::warn!(
-                        "put_batch: {} records via socket (O(N) round-trips) — \
-                         consider stopping the daemon for bulk imports",
-                        records.len()
+            ProxyInner::Direct(store) => {
+                // Partition out sessions-tree records (analytics/audit/etc.)
+                // and unsupported prefixes so `put_batch` doesn't reject the
+                // whole batch on a stray record.
+                let valid_prefixes = [
+                    "gotcha:",
+                    "decision:",
+                    "dev_note:",
+                    "file:",
+                    "stage:",
+                    "dep:",
+                ];
+                let mut accepted: Vec<(&str, &Record)> = Vec::with_capacity(records.len());
+                let mut skipped: u64 = 0;
+                for r in records {
+                    let key_str = r.key.as_str();
+                    let prefix_ok = valid_prefixes.iter().any(|p| key_str.starts_with(p));
+                    let immediate = matches!(
+                        mati_core::store::Durability::for_key(key_str),
+                        mati_core::store::Durability::Immediate
                     );
+                    if prefix_ok && immediate {
+                        accepted.push((key_str, r));
+                    } else {
+                        skipped += 1;
+                    }
                 }
-                for &(key, record) in records {
-                    self.put(key, record).await?;
+                store.put_batch(&accepted).await?;
+                Ok((accepted.len() as u64, skipped))
+            }
+            ProxyInner::Socket { root } => {
+                use mati_core::mcp::protocol as p;
+                // Build chunks that stay under the daemon's `MAX_FRAME_SIZE`
+                // (65,536 bytes). A typical knowledge record serializes to
+                // ~500–2,000 bytes once JSON-encoded; bounding by 48 KiB
+                // (leaving ~16 KiB headroom for the request envelope, audit
+                // metadata, and base64 expansion of binary payloads) keeps
+                // every chunk well under the wire limit without per-record
+                // size measurement. Falls back to a single record per chunk
+                // if any record is itself oversized — those individual
+                // failures will surface as daemon errors on that one chunk
+                // rather than wedging the whole import.
+                const FRAME_BUDGET: usize = 48 * 1024;
+                const MIN_CHUNK: usize = 1;
+
+                let mut imported: u64 = 0;
+                let mut skipped: u64 = 0;
+                let mut i = 0;
+                while i < records.len() {
+                    let mut size_so_far: usize = 0;
+                    let mut j = i;
+                    while j < records.len() {
+                        let est = serde_json::to_vec(&records[j])
+                            .map(|v| v.len() + 8)
+                            .unwrap_or(2048);
+                        // Always include at least MIN_CHUNK records, even if
+                        // the first record alone exceeds FRAME_BUDGET.
+                        if j > i && size_so_far + est > FRAME_BUDGET {
+                            break;
+                        }
+                        size_so_far += est;
+                        j += 1;
+                        if j - i >= 64 {
+                            // Hard cap on records per chunk so a pathological
+                            // input of tiny records can't construct a frame
+                            // that's borderline-oversized once envelope is
+                            // added.
+                            break;
+                        }
+                        if j == i + MIN_CHUNK && size_so_far > FRAME_BUDGET {
+                            break;
+                        }
+                    }
+                    let chunk = records[i..j].to_vec();
+                    i = j;
+
+                    let cmd = p::Command::RecordImport(p::RecordImportInput { records: chunk });
+                    match daemon_v2(root, cmd).await {
+                        DaemonResult::Ok(resp) => {
+                            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                                imported +=
+                                    resp.get("imported").and_then(|v| v.as_u64()).unwrap_or(0);
+                                skipped +=
+                                    resp.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+                            } else {
+                                let err = resp
+                                    .get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                anyhow::bail!("daemon rejected record_import: {err}");
+                            }
+                        }
+                        other => return Err(socket_read_error("record_import", other)),
+                    }
                 }
-                Ok(())
+                Ok((imported, skipped))
             }
         }
     }

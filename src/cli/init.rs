@@ -1356,6 +1356,12 @@ fn build_cochange_gotchas(
             (QualityScore::cochange_default(), 0.45_f32, Priority::Normal)
         };
 
+        // Cochange gotchas are Layer 0 stubs derived from git history, not
+        // developer-confirmed. They surface as candidates in `mati review` and
+        // appear in graph queries / blast radius, but they never trigger hook
+        // injection until a developer confirms them via `mati gotcha confirm`.
+        // Marking these `confirmed: true` would break the schema invariant
+        // "confirmed → confidence >= 0.80" (these sit at 0.45 / 0.65).
         let gotcha = GotchaRecord {
             rule: rule.clone(),
             reason,
@@ -1363,7 +1369,7 @@ fn build_cochange_gotchas(
             affected_files: vec![source.clone()],
             ref_url: None,
             discovered_session: now,
-            confirmed: true,
+            confirmed: false,
         };
 
         let key = format!("gotcha:cochange:{source}|{target}");
@@ -1803,7 +1809,13 @@ mod tests {
         let gotchas = build_cochange_gotchas(&signals, dev, 0, now);
         let ga = gotchas.iter().find(|g| g.source_path == "a.rs").unwrap();
         let gr: GotchaRecord = ga.record.payload_as().expect("payload should deserialize");
-        assert!(gr.confirmed);
+        // Cochange gotchas are Layer 0 stubs — `confirmed=false` until the
+        // developer reviews them via `mati review`. Marking them confirmed
+        // at init would assert confidence >= 0.80 (the developer-manual
+        // threshold), but cochange records sit at 0.45 / 0.65 — a schema
+        // invariant violation that surfaces as `mem_get` returning
+        // confidence below 0.80 for a record flagged confirmed=Y.
+        assert!(!gr.confirmed);
         assert!(gr.rule.contains("b.rs"));
         assert_eq!(gr.affected_files, vec!["a.rs"]);
     }

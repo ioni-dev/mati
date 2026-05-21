@@ -910,8 +910,12 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 /// claude post-compliance hook) when a file's consultation receipt was valid
 /// at the time of use — semantically a hit, so it rolls into `hits_7d`.
 /// `compliance:codex_shell_miss_*` is fired by `codex-post-bash` when a file
-/// was used without a valid receipt — semantically a bypass, so it rolls into
-/// `bypasses_7d` alongside `compliance:miss_*`.
+/// was used without a valid receipt. It is counted in **both** `misses_7d`
+/// (so the hook activity registers in the lookups denominator and `Hit rate`
+/// reflects real consultation behavior) AND `bypasses_7d` (so the separate
+/// "Bypasses" line still surfaces the bypass count to operators). The two
+/// counters are not disjoint by design — `bypasses_7d` is a strict subset
+/// signal layered on top of the lookups total.
 async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
@@ -954,6 +958,11 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
 
         if let Ok(Some(record)) = store.get(&codex_miss_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
+                // codex shell-misses count as both a miss (so the hook
+                // registered in the lookups denominator) and a bypass (so
+                // operators still see the bypass-count line). See the
+                // function docstring for the rationale.
+                misses += agg.count;
                 bypasses += agg.count;
             }
         }
