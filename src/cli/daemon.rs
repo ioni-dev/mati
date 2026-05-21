@@ -1684,15 +1684,34 @@ async fn kill_flow(
             }
             Ok(())
         }
-        ExitOutcome::Stuck => {
+        ExitOutcome::Stuck(diag) => {
             let elapsed_ms = outer_start.elapsed().as_millis();
-            mati_core::mcp::metadata::record_lifecycle_event(
-                root,
-                "stop_end",
-                &format!("pid={pid} reason=stuck elapsed_ms={elapsed_ms} signal=KILL"),
+            // Render the diagnostic so post-mortem analysis can pinpoint
+            // the actual cause: kill(0)-lying-after-SIGKILL, zombie,
+            // PID reuse, or genuinely-stuck. See `StuckDiagnostic` and
+            // `PidSnapshot` docstrings for the interpretation key.
+            let initial = diag.initial_snapshot.render();
+            let final_snap = diag.final_snapshot.render();
+            let sigterm_part = diag
+                .sigterm_elapsed_ms
+                .map(|ms| format!(" sigterm_ms={ms}"))
+                .unwrap_or_default();
+            let detail = format!(
+                "pid={pid} reason=stuck elapsed_ms={elapsed_ms} signal=KILL{sigterm_part} \
+                 sigkill_ms={} initial={{{initial}}} final={{{final_snap}}}",
+                diag.sigkill_elapsed_ms,
             );
+            mati_core::mcp::metadata::record_lifecycle_event(root, "stop_end", &detail);
+            eprintln!(
+                "[mati] daemon-stop Stuck diagnostic — \
+                 pid={pid} total_ms={} sigterm_ms={:?} sigkill_ms={}",
+                diag.total_elapsed_ms, diag.sigterm_elapsed_ms, diag.sigkill_elapsed_ms
+            );
+            eprintln!("[mati]   initial snapshot: {initial}");
+            eprintln!("[mati]   final snapshot:   {final_snap}");
             anyhow::bail!(
-                "mati daemon: failed (pid {pid}) — process did not exit even after SIGKILL; manual intervention required"
+                "mati daemon: failed (pid {pid}) — process did not exit even after SIGKILL; \
+                 manual intervention required (see lifecycle.log and stderr for diagnostic)"
             );
         }
     }
