@@ -967,6 +967,46 @@ pub async fn run(args: InitArgs) -> Result<()> {
             gap_analysis_score: 0.0,
         };
         let _ = store_ref.put("cluster:index", &cluster_record).await;
+
+        // ── 10b-ii. Persist co-change pairs as source of truth ──────────────
+        // Stored separately from CoChanges graph edges because edge values
+        // are timestamps only (`src/graph/graph.rs:118-123`) — the count is
+        // not recoverable from the persisted edge. `mati repair` (offline,
+        // no git mining available) needs the raw pair counts to recompute
+        // clusters correctly; without this record, repair has to fake
+        // counts (`MIN_COCHANGE_COUNT`) which bypasses the cluster filter
+        // and produces a giant single-component result (see DECISIONS.md
+        // ADR-021).
+        let pairs_payload = serde_json::json!({
+            "pairs": &co_change_pairs,
+            "total_files_at_init": file_records.len() + skipped_count,
+        });
+        let pairs_record = Record {
+            key: "analytics:co_change_pairs".to_string(),
+            value: format!("{} pairs (source of truth for clustering)", co_change_pairs.len()),
+            payload: Some(pairs_payload),
+            category: Category::Analytics,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: now_ts,
+            updated_at: now_ts,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id,
+                logical_clock: 1,
+                wall_clock: now_ts,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::StaticAnalysis,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            gap_analysis_score: 0.0,
+        };
+        let _ = store_ref.put("analytics:co_change_pairs", &pairs_record).await;
+
         println!(
             "  Clusters...                    {:>4} found   {:>4}ms",
             cluster_count,
