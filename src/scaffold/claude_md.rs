@@ -57,6 +57,119 @@ When enrichment is complete, print a summary:
   Gotcha candidates extracted: Z
   Run `mati review` to confirm candidates and activate hook enforcement.
   Run `mati stats` to see updated coverage and onboarding score.
+
+## /mati-enrich — extraction pipeline (v0.2)
+
+The four-stage pipeline below is the operational instruction set for
+extracting gotcha candidates. It SUPERSEDES the brief overview above
+for the actual extraction steps; the intro stays as the high-level
+intent. Apply all four stages per file.
+
+### Stage 1 — Setup (before reading)
+
+1. `mem_query mode=\"text\" query=\"<dirname-of-file>\" limit 5`
+   → top 5 confirmed gotchas as POSITIVE EXEMPLARS. If zero exist
+     (cold start), continue with schema-only guidance.
+2. `mem_get(\"file:<path>\")` — mints the consultation receipt, returns
+   existing gotcha_keys so duplicates aren't proposed.
+
+### Stage 2 — Enumeration (maximize recall)
+
+Read the file. Output a JSON array of candidates, using the POSITIVE
+EXEMPLARS as calibration for this project's specific bar.
+
+Signal ranking (extract from highest first):
+  HIGH:    WARNING / FIXME / HACK / SAFETY / IMPORTANT comments;
+           panic!/assert!/expect(\"…\") with non-trivial messages;
+           comments explaining \"why this looks weird\" or \"do not\".
+  MEDIUM:  Defensive guards (early returns, custom error paths);
+           non-obvious literal arguments (e.g. with_versioning(true, 0));
+           error handling that diverges from the rest of the file.
+  LOW:     Raw API usage with no comment context.
+
+Schema (strict JSON, one element per candidate):
+[
+  { \"candidate_id\": \"C1\",
+    \"signal_tier\": \"high\" | \"medium\" | \"low\",
+    \"file_line\": \"L42\",
+    \"evidence_quote\": \"exact text from file at that line\",
+    \"draft_rule\": \"imperative verb + specific target\",
+    \"draft_reason\": \"what breaks and why\",
+    \"draft_severity\": \"critical\" | \"high\" | \"normal\" | \"low\" } ]
+
+Goal: maximize recall. Weak candidates are OK — filtered next.
+
+### Stage 3 — Critique loop (bounded, 3 rounds)
+
+ROUND 1 — Specificity. Discard candidates failing ANY of:
+  Specific    — names a concrete API, value, or pattern
+                (NOT \"be careful\", \"review carefully\", \"complex code\")
+  Enforceable — could a hook deny a real mistake based on this rule?
+  Non-obvious — would a reviewer learn something not derivable from
+                type signatures alone?
+  Causal      — does the reason state WHAT breaks with \"because\"/\"since\"?
+
+ROUND 2 — Cross-reference verification (DETERMINISTIC, D-α).
+For each Round 1 survivor, call `mati verify-evidence` via Bash:
+  mati verify-evidence \\
+    --file <path> \\
+    --line <candidate.file_line> \\
+    --quote \"<candidate.evidence_quote>\" \\
+    --pattern \"<api/literal named in candidate.draft_rule>\"
+The CLI returns JSON. Parse it:
+  { \"verified\": true, ... }  → keep, add \"verified\": true
+  { \"verified\": false, ... } → DISCARD (hallucinated citation, or
+                                  rule generalizes beyond visible scope)
+Do NOT trust self-critique here. The CLI is the source of truth.
+
+ROUND 3 — Stability check. If Round 2 == Round 1, proceed. If
+Round 2 discarded items, re-run Round 2 on the new survivor set
+(cascading discards). Cap at 3 iterations total.
+
+### Stage 4 — Refinement and write
+
+For each verified candidate:
+
+1. Tighten rule: imperative verb first; concrete names not pronouns;
+   ≤ 80 chars where possible.
+2. Verify reason uses \"because\"/\"since\"/\"as\" — add if missing.
+3. Assign severity via HYBRID CLASSIFIER (D-β). Two passes:
+
+   3a. KEYWORD pass (deterministic):
+       contains \"panic\" / \"data loss\" / \"corruption\" / \"security\"
+         → critical
+       contains \"regress\" / \"wrong result\" / \"silent failure\" / \"race\" /
+                \"silently\" / \"lose\" / \"lost\" / \"unbounded\" / \"indefinite\"
+         → high
+       contains \"performance\" / \"warning\" / \"deprecation\" / \"slow\" /
+                \"lock\" / \"exclusive\" / \"contention\" / \"stale state\" /
+                \"false positive\" / \"inconsistent\"
+         → normal
+       else
+         → low
+
+   3b. SEMANTIC pass (LLM judgment) using rubric:
+       critical — data loss, corruption, security, unbounded growth
+       high     — wrong result, silent failure, race, broken invariant
+       normal   — performance, workflow blocker, non-obvious cleanup
+       low      — informational, stylistic, minor inconvenience
+
+   3c. If 3a and 3b agree → use that severity.
+       If they disagree → use the HIGHER + add tag \"severity-disputed\".
+
+4. Call `mem_set`:
+     key: `gotcha:<slug>`
+     rule, reason, severity (from step 3)
+     affected_files: [<path>]
+     tags: [\"enriched\"] + ([\"severity-disputed\"] if step 3c flagged)
+     confirmed: false
+
+### Notes
+
+- Per-file token budget: ~8K tokens for Stages 2-3 combined. If you
+  exceed, truncate Stage 2 candidates to top 10 by signal_tier.
+- The Rust-side quality gate still applies at write time. The
+  pipeline maximizes what gets through; the gate enforces the floor.
 ";
 
 fn vector_c_stub() -> String {

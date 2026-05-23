@@ -170,6 +170,10 @@ enum Commands {
         /// Repo-relative file path to re-parse
         path: String,
     },
+    /// Verify a candidate gotcha's evidence quote and pattern (deterministic
+    /// cross-reference check for `/mati-enrich` Stage 3 Round 2). Outputs JSON.
+    #[command(name = "verify-evidence")]
+    VerifyEvidence(cli::verify_evidence::VerifyEvidenceArgs),
     /// Fetch gotcha context for files (used by Codex UserPromptSubmit hook).
     /// Returns bootstrap markdown for the given context files via daemon socket.
     #[command(hide = true, name = "prompt-context")]
@@ -350,6 +354,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
+        Commands::VerifyEvidence(args) => cli::verify_evidence::run(args).await,
         Commands::PromptContext { files } => cli::hooks::run_prompt_context(&files).await,
     }
 }
