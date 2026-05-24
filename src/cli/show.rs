@@ -23,12 +23,27 @@ pub struct ShowArgs {
 
 #[derive(Args)]
 pub struct LsArgs {
-    /// Category to list: files, gotchas, decisions (omit for all)
+    /// Category to list: files, gotchas, decisions, notes, tombstoned (omit for all)
     pub category: Option<String>,
 
     /// Maximum file records to show (hotspots first; 0 = unlimited)
     #[arg(long, short = 'n', default_value = "200")]
     pub limit: usize,
+
+    /// (tombstoned only) Time window — e.g. "30d", "7d", "12h". Defaults to "30d".
+    #[arg(long)]
+    pub recent: Option<String>,
+
+    /// (tombstoned only) Directory filter — e.g. "src/cli". Required for the
+    /// tombstoned category since negative exemplars are keyed by dirname.
+    #[arg(long)]
+    pub dir: Option<String>,
+
+    /// (tombstoned only) Emit JSON instead of human-readable table.
+    /// Designed for programmatic consumption by `/mati-enrich`'s Stage 2
+    /// negative-exemplar retrieval.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -93,6 +108,9 @@ pub async fn run_show(args: ShowArgs) -> Result<()> {
         return run_ls(LsArgs {
             category,
             limit: 200,
+            recent: None,
+            dir: None,
+            json: false,
         })
         .await;
     }
@@ -394,8 +412,21 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
         Some("notes") | Some("note") | Some("dev_note") | Some("dev_notes") => {
             ls_notes(&store, use_color).await?
         }
+        Some("tombstoned") | Some("tombstones") => {
+            ls_tombstoned(
+                &store,
+                args.dir.as_deref(),
+                args.recent.as_deref(),
+                limit,
+                args.json,
+            )
+            .await?
+        }
         Some(other) => {
-            anyhow::bail!("unknown category '{other}'. Valid: files, gotchas, decisions, notes")
+            anyhow::bail!(
+                "unknown category '{other}'. \
+                 Valid: files, gotchas, decisions, notes, tombstoned"
+            )
         }
         None => {
             ls_files(&store, use_color, limit).await?;
@@ -713,6 +744,103 @@ async fn ls_notes(store: &StoreProxy, _use_color: bool) -> Result<()> {
 
     println!("{table}");
     println!("  {} note records", records.len());
+    Ok(())
+}
+
+// ── ls_tombstoned (D2-β) ────────────────────────────────────────────────────
+//
+// Reads `analytics:negative_exemplar:<dirname>:*` records (written by
+// `gotcha_ops::apply_gotcha_tombstone` since D3-foundation) and emits
+// the most-recent ones for a directory. Designed for two consumers:
+//
+// 1. Humans: a quick view of what gotchas were recently rejected in
+//    a directory ("why did we tombstone these?"). Pretty table by default.
+// 2. The `/mati-enrich` Stage 2 prompt (D2-γ): JSON output via `--json`
+//    so the agent can include the negative exemplars in the Deep-tier
+//    extraction prompt.
+//
+// Routes through `StoreProxy::scan_prefix` so it works whether the
+// daemon is up (via socket) or down (direct store).
+
+async fn ls_tombstoned(
+    store: &StoreProxy,
+    dir: Option<&str>,
+    recent: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    use mati_core::store::negative_exemplar::{NegativeExemplar, NEG_EXEMPLAR_PREFIX};
+
+    let dirname = dir.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--dir is required for `mati ls tombstoned` \
+             (negative exemplars are keyed by dirname; pass e.g. --dir src/cli)"
+        )
+    })?;
+
+    // Default window: 30d. Matches the spec's D2-β recommendation —
+    // long enough to capture recent tuning context, short enough to
+    // stay relevant.
+    let recent_str = recent.unwrap_or("30d");
+    let window_secs = parse_since_duration(recent_str)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let since_secs = now.saturating_sub(window_secs);
+
+    let scan_prefix = format!("{NEG_EXEMPLAR_PREFIX}{dirname}:");
+    let records = store.scan_prefix(&scan_prefix).await.unwrap_or_default();
+
+    let mut exemplars: Vec<NegativeExemplar> = records
+        .into_iter()
+        .filter_map(|r| r.payload.and_then(|p| serde_json::from_value(p).ok()))
+        .filter(|e: &NegativeExemplar| e.tombstoned_at >= since_secs)
+        .collect();
+    exemplars.sort_by(|a, b| b.tombstoned_at.cmp(&a.tombstoned_at));
+    // limit=0 means unlimited; otherwise truncate.
+    if limit > 0 {
+        exemplars.truncate(limit);
+    }
+
+    if json {
+        // Stable JSON envelope so the slash-flow can parse deterministically.
+        let envelope = serde_json::json!({
+            "dirname": dirname,
+            "window": recent_str,
+            "since_secs": since_secs,
+            "count": exemplars.len(),
+            "exemplars": &exemplars,
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+        return Ok(());
+    }
+
+    if exemplars.is_empty() {
+        println!(
+            "No tombstoned gotchas in {dirname} within the last {recent_str}."
+        );
+        return Ok(());
+    }
+
+    let use_color = std::io::stdout().is_terminal();
+    let (yellow, gray, reset) = if use_color {
+        (super::colors::YELLOW, super::colors::GRAY, super::colors::RESET)
+    } else {
+        ("", "", "")
+    };
+
+    println!(
+        "\n{yellow}Tombstoned gotchas in {dirname} (last {recent_str}) — {count} found{reset}\n",
+        count = exemplars.len()
+    );
+
+    for e in &exemplars {
+        println!("  {} {gray}({:?}){reset}", e.gotcha_key, e.severity);
+        println!("    rule:   {}", e.rule);
+        println!("    reason: {}", e.reason);
+        println!();
+    }
     Ok(())
 }
 
