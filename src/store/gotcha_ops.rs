@@ -244,9 +244,20 @@ pub async fn apply_gotcha_tombstone(
     key: &str,
     affected_files: &[String],
 ) -> Result<()> {
-    // 1. Tombstone the record — fail hard
+    // 1. Tombstone the record — fail hard.
+    //
+    // Snapshot the rule/reason/severity from the payload BEFORE flipping
+    // lifecycle to Tombstoned. The negative-exemplar archive write
+    // (step 1c below) needs them.
+    let mut exemplar_snapshot: Option<(String, String, crate::store::Priority)> = None;
     match store.get(key).await? {
         Some(mut record) => {
+            if let Some(ref payload) = record.payload {
+                if let Ok(gr) = serde_json::from_value::<crate::store::GotchaRecord>(payload.clone())
+                {
+                    exemplar_snapshot = Some((gr.rule, gr.reason, gr.severity));
+                }
+            }
             let now = now_secs();
             record.lifecycle = RecordLifecycle::Tombstoned {
                 reason: TombstoneReason::ManualDeletion,
@@ -286,6 +297,43 @@ pub async fn apply_gotcha_tombstone(
     .await
     {
         tracing::warn!("gotcha_tombstone: enforcement event recording failed for {key}: {e}");
+    }
+
+    // 1c. Negative-exemplar archive write — best-effort (D3 foundation).
+    //
+    // Captures rule + reason + severity into
+    // `analytics:negative_exemplar:<dirname>:<slug>` for each unique
+    // dirname in `affected_files`. Future `/mati-enrich` runs on the
+    // same directory read these via `mati ls tombstoned` (D2-β) and
+    // feed them to the LLM as NEGATIVE exemplars in Stage 2 prompts.
+    // This is the closed-loop quality mechanism that lets the extractor
+    // get sharper at this codebase over time.
+    //
+    // Failure does NOT block the tombstone — the gotcha is already gone
+    // from the canonical store; the exemplar archive is a learning
+    // signal, not a correctness invariant.
+    if let Some((rule, reason, severity)) = exemplar_snapshot.as_ref() {
+        match crate::store::negative_exemplar::write_on_tombstone(
+            store,
+            key,
+            rule,
+            reason,
+            severity,
+            affected_files,
+        )
+        .await
+        {
+            Ok(n) => tracing::debug!(
+                "gotcha_tombstone: negative_exemplar archived for {key} across {n} dirname(s)"
+            ),
+            Err(e) => tracing::warn!(
+                "gotcha_tombstone: negative_exemplar write failed for {key}: {e}"
+            ),
+        }
+    } else {
+        tracing::debug!(
+            "gotcha_tombstone: no GotchaRecord payload on {key}; skipping negative_exemplar archive"
+        );
     }
 
     // 2. Remove gotcha_keys from file records — best-effort
@@ -915,5 +963,64 @@ mod tests {
             s > 1_704_067_200,
             "now_secs() returned {s}; expected a post-2024 timestamp"
         );
+    }
+
+    /// D3 foundation regression: tombstone must write a negative-exemplar
+    /// record for each unique dirname in `affected_files`, capturing the
+    /// rule/reason/severity from the tombstoned gotcha. The exemplar is
+    /// what feeds back into future `/mati-enrich` runs on the same
+    /// directory so the extractor can avoid re-proposing similar
+    /// rejected rules. See `src/store/negative_exemplar.rs`.
+    #[tokio::test]
+    async fn tombstone_writes_negative_exemplar_per_unique_dirname() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Seed a gotcha that affects two files in different directories
+        // plus a second file in one of those dirnames (dedup target).
+        let record = make_gotcha_record(
+            "gotcha:vague-rule",
+            &["src/cli/repair.rs", "src/cli/init.rs", "src/store/db.rs"],
+        );
+        store.put("gotcha:vague-rule", &record).await.unwrap();
+
+        // Tombstone it.
+        apply_gotcha_tombstone(
+            &store,
+            "gotcha:vague-rule",
+            &[
+                "src/cli/repair.rs".into(),
+                "src/cli/init.rs".into(),
+                "src/store/db.rs".into(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // src/cli and src/store → 2 unique dirnames → 2 exemplars.
+        let cli_exemplar = store
+            .get("analytics:negative_exemplar:src/cli:vague-rule")
+            .await
+            .unwrap()
+            .expect("src/cli exemplar must exist");
+        let store_exemplar = store
+            .get("analytics:negative_exemplar:src/store:vague-rule")
+            .await
+            .unwrap()
+            .expect("src/store exemplar must exist");
+
+        // Payload carries rule/reason/severity from the make_gotcha_record helper.
+        for rec in [&cli_exemplar, &store_exemplar] {
+            let payload = rec.payload.clone().expect("payload present");
+            let exemplar: crate::store::negative_exemplar::NegativeExemplar =
+                serde_json::from_value(payload).unwrap();
+            assert_eq!(exemplar.gotcha_key, "gotcha:vague-rule");
+            assert_eq!(exemplar.rule, "test rule");
+            assert_eq!(exemplar.reason, "test reason");
+            assert_eq!(exemplar.severity, Priority::High);
+            assert!(exemplar.tombstoned_at > 0);
+        }
+
+        store.close().await.unwrap();
     }
 }
