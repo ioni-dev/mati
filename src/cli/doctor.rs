@@ -229,6 +229,12 @@ struct Report {
     checks: Vec<CheckResult>,
     lifecycle: Vec<LifecycleEntry>,
     summary: Summary,
+    /// D3: per-tier accuracy of `/mati-enrich` extractions, computed from
+    /// `analytics:extraction:*` records. `None` when the store wasn't
+    /// reachable (e.g. uninitialized repo); empty stats when the store is
+    /// reachable but no enrichment-tagged gotchas exist yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extraction: Option<mati_core::store::extraction::ExtractionStats>,
 }
 
 #[derive(Serialize)]
@@ -474,6 +480,12 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
 
+    // D3: extraction-quality stats. Routes through StoreProxy so it works
+    // whether the daemon owns the lock (socket-routed scan_prefix) or the
+    // store is direct-accessible. Default window: last 30 days — matches
+    // `mati ls tombstoned --recent`'s default and the spec.
+    let extraction = collect_extraction_stats(cwd).await;
+
     // Summary.
     let mut summary = Summary::default();
     for c in &checks {
@@ -491,7 +503,42 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
         checks,
         lifecycle,
         summary,
+        extraction,
     }
+}
+
+/// Read all `analytics:extraction:*` records via StoreProxy and aggregate.
+/// Returns `None` when the proxy can't be opened (uninitialized repo); an
+/// empty `ExtractionStats` (total=0) is a valid Some(stats) — means "no
+/// enrichment-tagged gotchas have been written yet."
+///
+/// Window: last 30 days, matching `mati ls tombstoned --recent`'s default
+/// and ENRICH_QUALITY.md Section 8.
+async fn collect_extraction_stats(
+    cwd: &Path,
+) -> Option<mati_core::store::extraction::ExtractionStats> {
+    use mati_core::store::extraction::{
+        aggregate_stats, ExtractionRecord, EXTRACTION_PREFIX,
+    };
+
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let records = proxy.scan_prefix(EXTRACTION_PREFIX).await.unwrap_or_default();
+    let _ = proxy.close().await;
+
+    let extractions: Vec<ExtractionRecord> = records
+        .into_iter()
+        .filter_map(|r| r.payload.and_then(|p| serde_json::from_value(p).ok()))
+        .collect();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let since = now.saturating_sub(30 * 86_400);
+    Some(aggregate_stats(&extractions, since, now))
 }
 
 fn read_lifecycle_tail(root: &Path, n: usize) -> Vec<LifecycleEntry> {
@@ -563,6 +610,10 @@ fn render_human(report: &Report, use_color: bool) {
         }
     }
 
+    if let Some(extraction) = &report.extraction {
+        render_extraction_section(extraction);
+    }
+
     println!();
     let s = &report.summary;
     if s.fail > 0 {
@@ -574,6 +625,74 @@ fn render_human(report: &Report, use_color: bool) {
         println!("Result: clean with {} warn ({} pass)", s.warn, s.pass);
     } else {
         println!("Result: all checks passed ({} pass)", s.pass);
+    }
+}
+
+/// Render the D3 extraction-quality section. Skipped entirely when no
+/// extractions have been recorded (`total == 0`) — keeps the doctor
+/// output clean on fresh installs.
+fn render_extraction_section(
+    s: &mati_core::store::extraction::ExtractionStats,
+) {
+    if s.total == 0 {
+        return;
+    }
+    println!();
+    println!("Extraction quality (last 30d, /mati-enrich pipeline)");
+    println!(
+        "  total           {:>4}",
+        s.total
+    );
+    println!(
+        "  confirmed       {:>4}  ({})",
+        s.confirmed,
+        rate_label(s.confirmed, s.total)
+    );
+    println!(
+        "  tombstoned      {:>4}  ({})",
+        s.tombstoned,
+        rate_label(s.tombstoned, s.total)
+    );
+    println!(
+        "  pending         {:>4}",
+        s.pending
+    );
+    if s.expired > 0 {
+        println!("  expired (>90d)  {:>4}", s.expired);
+    }
+
+    // Per-tier breakdown — only render tiers with non-zero data.
+    let tiers = [
+        ("fast    ", &s.per_tier.fast),
+        ("standard", &s.per_tier.standard),
+        ("deep    ", &s.per_tier.deep),
+        ("unknown ", &s.per_tier.unknown),
+    ];
+    let any_tier_used = tiers.iter().any(|(_, t)| t.total > 0);
+    if any_tier_used {
+        println!();
+        println!("  Per-tier:");
+        for (label, tier) in &tiers {
+            if tier.total == 0 {
+                continue;
+            }
+            let rate = tier.confirmed_rate().map_or_else(
+                || "—".to_string(),
+                |r| format!("{:>3.0}% confirmed", r * 100.0),
+            );
+            println!(
+                "    {label}  {:>3} extractions, {rate}",
+                tier.total
+            );
+        }
+    }
+}
+
+fn rate_label(n: u64, total: u64) -> String {
+    if total == 0 {
+        "0%".to_string()
+    } else {
+        format!("{}%", (n * 100) / total)
     }
 }
 

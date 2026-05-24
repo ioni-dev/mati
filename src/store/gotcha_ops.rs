@@ -180,6 +180,25 @@ pub async fn apply_gotcha_write(
         tracing::warn!("gotcha_write: enforcement event recording failed for {key}: {e}");
     }
 
+    // 2c. Extraction tracking — best-effort (D3 foundation).
+    //
+    // If the record's tags include "enriched" (set by `/mati-enrich`'s
+    // Stage 4 prompt), this gotcha is an enrichment output. We write an
+    // ExtractionRecord with outcome=Pending so `mati doctor` can later
+    // surface per-tier accuracy stats. Records without "enriched"
+    // (manual `mati gotcha add`, MCP `mem_set` from non-enrichment flows)
+    // are NOT tracked — keeps the analytics scoped to the enrichment
+    // pipeline. Only fires on new writes; updates don't re-create.
+    if is_new {
+        let _ = crate::store::extraction::write_on_extraction(
+            store,
+            key,
+            &record.tags,
+            new_files,
+        )
+        .await;
+    }
+
     let mut secondary_failed = false;
 
     // 3. Sync file-record gotcha_keys — best-effort
@@ -336,6 +355,15 @@ pub async fn apply_gotcha_tombstone(
         );
     }
 
+    // 1d. Mark matching ExtractionRecord as Tombstoned. No-op when this
+    // gotcha wasn't from `/mati-enrich`. Best-effort — never blocks.
+    let _ = crate::store::extraction::mark_outcome(
+        store,
+        key,
+        crate::store::extraction::ExtractionOutcome::Tombstoned,
+    )
+    .await;
+
     // 2. Remove gotcha_keys from file records — best-effort
     if let Err(e) = sync_gotcha_file_links(store, key, affected_files, &[]).await {
         tracing::warn!("gotcha_tombstone: file link cleanup failed for {key}: {e}");
@@ -416,6 +444,15 @@ pub async fn apply_gotcha_confirm(
     {
         tracing::warn!("gotcha_confirm: enforcement event recording failed for {key}: {e}");
     }
+
+    // Mark the matching ExtractionRecord (if any) as Confirmed. No-op when
+    // this gotcha wasn't from `/mati-enrich`. Best-effort — never blocks.
+    let _ = crate::store::extraction::mark_outcome(
+        store,
+        key,
+        crate::store::extraction::ExtractionOutcome::Confirmed,
+    )
+    .await;
 
     // Sync file-record gotcha_keys — best-effort. Confirm is purely additive:
     // all affected_files should have the link; none are removed.
@@ -963,6 +1000,102 @@ mod tests {
             s > 1_704_067_200,
             "now_secs() returned {s}; expected a post-2024 timestamp"
         );
+    }
+
+    /// D3 regression: enrichment-tagged gotchas must produce an
+    /// ExtractionRecord on write (outcome=Pending). Confirming the
+    /// gotcha must flip the outcome to Confirmed; tombstoning to
+    /// Tombstoned. Untagged gotchas (manual `mati gotcha add`) must
+    /// NOT produce an ExtractionRecord — keeps the analytics scoped
+    /// to the enrichment pipeline.
+    #[tokio::test]
+    async fn enriched_gotcha_lifecycle_flips_extraction_outcome() {
+        use crate::store::extraction::{key_for, ExtractionOutcome, ExtractionRecord};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // Build an "enriched" gotcha record with depth:deep tag.
+        let mut record = make_gotcha_record("gotcha:enriched-rule", &["src/cli/repair.rs"]);
+        record.tags = vec!["enriched".into(), "depth:deep".into()];
+
+        apply_gotcha_write(
+            &store,
+            &record,
+            &[],
+            &["src/cli/repair.rs".into()],
+            true,
+        )
+        .await
+        .unwrap();
+
+        // After write, ExtractionRecord must exist with outcome=Pending,
+        // depth=Deep, file_path set.
+        let rec = store
+            .get(&key_for("gotcha:enriched-rule"))
+            .await
+            .unwrap()
+            .expect("extraction record must exist for enriched gotcha");
+        let extraction: ExtractionRecord =
+            serde_json::from_value(rec.payload.expect("payload")).unwrap();
+        assert_eq!(extraction.outcome, ExtractionOutcome::Pending);
+        assert_eq!(
+            extraction.depth,
+            Some(crate::health::enrichment::EnrichmentDepth::Deep)
+        );
+        assert_eq!(extraction.file_path, "src/cli/repair.rs");
+        assert!(extraction.outcome_at.is_none());
+
+        // Confirm → outcome must flip to Confirmed.
+        apply_gotcha_confirm(&store, &record, &["src/cli/repair.rs".into()])
+            .await
+            .unwrap();
+        let rec = store
+            .get(&key_for("gotcha:enriched-rule"))
+            .await
+            .unwrap()
+            .unwrap();
+        let extraction: ExtractionRecord =
+            serde_json::from_value(rec.payload.unwrap()).unwrap();
+        assert_eq!(extraction.outcome, ExtractionOutcome::Confirmed);
+        assert!(extraction.outcome_at.is_some());
+
+        // Now write + tombstone another enriched gotcha — outcome flips to Tombstoned.
+        let mut t_record = make_gotcha_record("gotcha:tombstone-me", &["src/cli/init.rs"]);
+        t_record.tags = vec!["enriched".into(), "depth:fast".into()];
+        apply_gotcha_write(&store, &t_record, &[], &["src/cli/init.rs".into()], true)
+            .await
+            .unwrap();
+        apply_gotcha_tombstone(&store, "gotcha:tombstone-me", &["src/cli/init.rs".into()])
+            .await
+            .unwrap();
+
+        let rec = store
+            .get(&key_for("gotcha:tombstone-me"))
+            .await
+            .unwrap()
+            .unwrap();
+        let extraction: ExtractionRecord =
+            serde_json::from_value(rec.payload.unwrap()).unwrap();
+        assert_eq!(extraction.outcome, ExtractionOutcome::Tombstoned);
+        assert_eq!(
+            extraction.depth,
+            Some(crate::health::enrichment::EnrichmentDepth::Fast)
+        );
+
+        // Untagged gotcha must NOT produce an ExtractionRecord.
+        let untagged = make_gotcha_record("gotcha:manual-add", &["src/foo.rs"]);
+        // tags vec is empty by default in make_gotcha_record
+        apply_gotcha_write(&store, &untagged, &[], &["src/foo.rs".into()], true)
+            .await
+            .unwrap();
+        assert!(store
+            .get(&key_for("gotcha:manual-add"))
+            .await
+            .unwrap()
+            .is_none());
+
+        store.close().await.unwrap();
     }
 
     /// D3 foundation regression: tombstone must write a negative-exemplar
