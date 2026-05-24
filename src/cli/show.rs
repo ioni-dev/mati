@@ -296,6 +296,26 @@ fn print_record(record: &Record, use_color: bool) {
         }
     }
 
+    // ── Payload (Analytics + DevNote — categories without a dedicated renderer
+    //     above that still carry meaningful data in their JSON payload). Without
+    //     this block, `mati show analytics:extraction:<slug>` shows only metadata
+    //     and hides the per-extraction config / outcome / file_path / etc. that
+    //     the SOTA pipeline writes. Pretty-printed JSON keeps it human-scannable
+    //     without inventing a per-shape renderer for every analytics category.
+    if matches!(record.category, Category::Analytics | Category::DevNote) {
+        if let Some(ref payload) = record.payload {
+            if !payload.is_null() {
+                let pretty = serde_json::to_string_pretty(payload)
+                    .unwrap_or_else(|_| payload.to_string());
+                println!("{blue}  payload{reset}");
+                for line in pretty.lines() {
+                    println!("    {gray}{line}{reset}");
+                }
+                println!();
+            }
+        }
+    }
+
     // ── Metadata ──────────────────────────────────────────────────────────────
 
     let prio_color = pc(&record.priority);
@@ -647,15 +667,25 @@ async fn ls_gotchas(store: &StoreProxy, _use_color: bool) -> Result<()> {
 
     for r in &records {
         let key_short = r.key.strip_prefix("gotcha:").unwrap_or(&r.key);
-        let (rule, confirmed) = match r.payload_as::<mati_core::store::GotchaRecord>() {
+        let gotcha = r.payload_as::<mati_core::store::GotchaRecord>();
+        let (rule, confirmed) = match &gotcha {
             Some(gr) => (truncate(&gr.rule, 40), gr.confirmed),
             None => (truncate(&r.value, 40), false),
         };
-        let sev = priority_short(&r.priority);
+        // Severity from the gotcha payload, not the Record.priority — the
+        // payload field is what the user set when creating the gotcha
+        // (e.g. mem_set payload.severity = "high"); Record.priority is the
+        // record-level priority (often Normal regardless of severity).
+        // Falls back to Record.priority when the payload is missing.
+        let severity = gotcha
+            .as_ref()
+            .map(|gr| gr.severity.clone())
+            .unwrap_or_else(|| r.priority.clone());
+        let sev = priority_short(&severity);
         table.add_row(vec![
             Cell::new(key_short),
             Cell::new(&rule),
-            Cell::new(sev).fg(priority_comfy_color(&r.priority)),
+            Cell::new(sev).fg(priority_comfy_color(&severity)),
             Cell::new(format!("{:.2}", r.confidence.value))
                 .fg(score_comfy_color(r.confidence.value)),
             Cell::new(format!("{:.2}", r.quality.value)).fg(score_comfy_color(r.quality.value)),
