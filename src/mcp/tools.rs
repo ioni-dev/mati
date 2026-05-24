@@ -1233,6 +1233,122 @@ mod tests {
         );
     }
 
+    // ── mem_get enrichment_depth_hint (D2-α) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_get_includes_depth_hint_for_file_records() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // 50 LoC, Isolated blast, no cluster, no gotchas → score 0 → Fast
+        let fr = FileRecord {
+            path: "src/tiny.rs".to_string(),
+            purpose: "Tiny leaf module".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 100,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 50,
+            blast_radius: Some(crate::analysis::blast_radius::BlastRadius {
+                direct: 0,
+                transitive: 0,
+                score: 0.0,
+                tier: crate::analysis::blast_radius::BlastTier::Isolated,
+            }),
+            propagated_staleness: None,
+        };
+        let mut record = make_record("file:src/tiny.rs", "Tiny leaf", Category::File, 0.5);
+        record.payload = serde_json::to_value(&fr).ok();
+        store.put("file:src/tiny.rs", &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_get(&graph_arc, "file:src/tiny.rs").await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("enrichment_depth_hint").and_then(|v| v.as_str()),
+            Some("fast"),
+            "tiny isolated file should hint Fast tier; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_get_depth_hint_for_hotspot_is_deep() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // 500 LoC (+3) + High blast (+2) = 5 → Deep
+        let fr = FileRecord {
+            path: "src/core.rs".to_string(),
+            purpose: "Core hotspot".to_string(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: true,
+            token_cost_estimate: 5000,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 500,
+            blast_radius: Some(crate::analysis::blast_radius::BlastRadius {
+                direct: 20,
+                transitive: 30,
+                score: 35.0,
+                tier: crate::analysis::blast_radius::BlastTier::High,
+            }),
+            propagated_staleness: None,
+        };
+        let mut record = make_record("file:src/core.rs", "Core hotspot", Category::File, 0.5);
+        record.payload = serde_json::to_value(&fr).ok();
+        store.put("file:src/core.rs", &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_get(&graph_arc, "file:src/core.rs").await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("enrichment_depth_hint").and_then(|v| v.as_str()),
+            Some("deep"),
+            "large hotspot file should hint Deep tier; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_get_omits_depth_hint_for_non_file_records() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let record = make_record("gotcha:foo", "rule", Category::Gotcha, 0.6);
+        store.put("gotcha:foo", &record).await.unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_get(&graph_arc, "gotcha:foo").await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // depth_hint is scoped to file: keys; gotcha responses must NOT carry it.
+        assert!(
+            parsed.get("enrichment_depth_hint").is_none(),
+            "non-file records should not carry enrichment_depth_hint; got: {result}"
+        );
+    }
+
     // ── mem_query tests ──────────────────────────────────────────────────────
 
     #[tokio::test]

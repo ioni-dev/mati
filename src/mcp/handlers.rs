@@ -1106,8 +1106,12 @@ pub(crate) async fn handle_mem_get(
                     if let Ok(fr) =
                         serde_json::from_value::<crate::store::record::FileRecord>(payload.clone())
                     {
+                        use crate::analysis::blast_radius::BlastTier;
+
+                        // Existing: blast-warning injection for high-impact
+                        // files. Centralized here so both v1 and v2 dispatch
+                        // return identical responses.
                         if let Some(ref br) = fr.blast_radius {
-                            use crate::analysis::blast_radius::BlastTier;
                             if matches!(br.tier, BlastTier::High | BlastTier::Critical) {
                                 let warning = format!(
                                     "HIGH IMPACT FILE: {} files directly depend on this. Modify with extra care.",
@@ -1117,6 +1121,53 @@ pub(crate) async fn handle_mem_get(
                                     obj.insert("warnings".into(), serde_json::json!([warning]));
                                 }
                             }
+                        }
+
+                        // D2-α: adaptive enrichment depth hint. Pure
+                        // additive — older clients ignore the new field.
+                        // Cluster size requires a `cluster:index` lookup;
+                        // tolerate absence (cold init, repair in progress)
+                        // by treating the file as cluster-less.
+                        let blast_tier = fr
+                            .blast_radius
+                            .as_ref()
+                            .map(|b| b.tier)
+                            .unwrap_or(BlastTier::Isolated);
+                        let cluster_size = {
+                            let path = input
+                                .key
+                                .strip_prefix("file:")
+                                .unwrap_or(&input.key);
+                            let mut size = 0u32;
+                            if let Ok(Some(idx_rec)) = store.get("cluster:index").await {
+                                if let Some(payload) = idx_rec.payload {
+                                    if let Ok(idx) = serde_json::from_value::<
+                                        crate::analysis::clusters::ClusterIndex,
+                                    >(payload)
+                                    {
+                                        for cluster in &idx.clusters {
+                                            if cluster.members.iter().any(|m| m == path) {
+                                                size = cluster.size;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            size
+                        };
+                        let depth = crate::health::enrichment::enrichment_depth(
+                            fr.line_count,
+                            blast_tier,
+                            cluster_size,
+                            fr.gotcha_keys.len(),
+                            None, // comment_density not stored
+                        );
+                        if let Some(obj) = agent_json.as_object_mut() {
+                            obj.insert(
+                                "enrichment_depth_hint".into(),
+                                serde_json::json!(depth.as_str()),
+                            );
                         }
                     }
                 }
