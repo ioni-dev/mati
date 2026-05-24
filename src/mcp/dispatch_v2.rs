@@ -1683,7 +1683,10 @@ mod tests {
             .scan_keys("compliance:codex_shell_miss_")
             .await
             .unwrap();
-        assert!(!agg.is_empty(), "codex_shell_miss daily agg must be written");
+        assert!(
+            !agg.is_empty(),
+            "codex_shell_miss daily agg must be written"
+        );
 
         // NEW: enforcement event in the hash-chained log so `mati history`
         // surfaces it. Pre-fix the scan returned empty.

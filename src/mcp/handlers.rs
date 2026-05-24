@@ -1202,10 +1202,7 @@ pub(crate) async fn handle_mem_get(
                             .map(|b| b.tier)
                             .unwrap_or(BlastTier::Isolated);
                         let cluster_size = {
-                            let path = input
-                                .key
-                                .strip_prefix("file:")
-                                .unwrap_or(&input.key);
+                            let path = input.key.strip_prefix("file:").unwrap_or(&input.key);
                             let mut size = 0u32;
                             if let Ok(Some(idx_rec)) = store.get("cluster:index").await {
                                 if let Some(payload) = idx_rec.payload {

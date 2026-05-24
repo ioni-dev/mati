@@ -112,7 +112,11 @@ impl ExtractionConfig {
         format!(
             "{}+{}",
             self.signal_source.as_str(),
-            if self.with_negative_exemplars { "neg" } else { "no_neg" }
+            if self.with_negative_exemplars {
+                "neg"
+            } else {
+                "no_neg"
+            }
         )
     }
 }
@@ -222,10 +226,7 @@ pub async fn write_on_extraction(
     if !is_enriched {
         return Ok(false);
     }
-    let file_path = affected_files
-        .first()
-        .cloned()
-        .unwrap_or_default();
+    let file_path = affected_files.first().cloned().unwrap_or_default();
     let ts = now_secs();
     let extraction = ExtractionRecord {
         gotcha_key: gotcha_key.to_string(),
@@ -381,10 +382,7 @@ pub fn aggregate_stats(
         // Per-config bucket lookup. Use BTreeMap::entry to lazy-initialize
         // so missing configs don't appear with 0/0/0 noise.
         let config_label = e.config.label();
-        let config_stats: &mut TierStats = stats
-            .per_config
-            .entry(config_label)
-            .or_default();
+        let config_stats: &mut TierStats = stats.per_config.entry(config_label).or_default();
         config_stats.total += 1;
 
         match e.outcome {
@@ -416,10 +414,7 @@ fn analytics_record(key: &str, payload: &ExtractionRecord, created_at: u64) -> R
     let value = format!(
         "{:?} ({})",
         payload.outcome,
-        payload
-            .depth
-            .map(|d| d.as_str())
-            .unwrap_or("unknown")
+        payload.depth.map(|d| d.as_str()).unwrap_or("unknown")
     );
     Record {
         key: key.to_string(),
@@ -626,7 +621,10 @@ mod tests {
         let updated = mark_outcome(&store, "gotcha:r3", ExtractionOutcome::Tombstoned)
             .await
             .unwrap();
-        assert!(!updated, "second mark_outcome with same outcome must be no-op");
+        assert!(
+            !updated,
+            "second mark_outcome with same outcome must be no-op"
+        );
     }
 
     #[tokio::test]
@@ -743,11 +741,7 @@ mod tests {
                 vec!["enriched", "signal-source:llm", "with-neg-exemplars"],
                 ExtractionOutcome::Tombstoned,
             ),
-            (
-                "gotcha:d",
-                vec!["enriched"],
-                ExtractionOutcome::Confirmed,
-            ),
+            ("gotcha:d", vec!["enriched"], ExtractionOutcome::Confirmed),
         ];
         for (key, tags, outcome) in &cases {
             let owned: Vec<String> = tags.iter().map(|s| s.to_string()).collect();

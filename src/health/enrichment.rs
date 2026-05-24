@@ -3,10 +3,10 @@
 //! Maps per-file signals to a depth tier that the `/mati-enrich` slash flow
 //! uses to decide how aggressive to be during extraction:
 //!
-//! - **Fast**     — single-pass, schema-only guidance. ~30% of typical files.
+//! - **Fast** — single-pass, schema-only guidance. ~30% of typical files.
 //! - **Standard** — positive exemplars + Pass 3 Rounds 1 and 2. ~50% of files.
-//! - **Deep**     — full pipeline with positive AND negative exemplars +
-//!                  full critique loop. ~20% of files.
+//! - **Deep** — full pipeline with positive AND negative exemplars +
+//!   full critique loop. ~20% of files.
 //!
 //! Surfaced to the agent via the `enrichment_depth_hint` field on `mem_get`
 //! responses for `file:` keys (`src/mcp/handlers.rs::handle_mem_get`).

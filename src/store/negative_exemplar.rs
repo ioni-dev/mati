@@ -131,16 +131,20 @@ pub async fn write_on_tombstone(
             format!(
                 "tombstoned: {} (in {})",
                 truncate(rule, 60),
-                if dirname.is_empty() { "<root>" } else { dirname }
+                if dirname.is_empty() {
+                    "<root>"
+                } else {
+                    dirname
+                }
             ),
             serde_json::to_value(&exemplar).ok(),
             ts,
         );
         match store.put(&record.key, &record).await {
             Ok(()) => written += 1,
-            Err(e) => tracing::warn!(
-                "negative_exemplar write failed for {gotcha_key} in {dirname}: {e}"
-            ),
+            Err(e) => {
+                tracing::warn!("negative_exemplar write failed for {gotcha_key} in {dirname}: {e}")
+            }
         }
     }
     Ok(written)
@@ -165,7 +169,7 @@ pub async fn scan_recent_for_dirname(
         .filter_map(|r| r.payload.and_then(|p| serde_json::from_value(p).ok()))
         .filter(|e: &NegativeExemplar| e.tombstoned_at >= since_secs)
         .collect();
-    exemplars.sort_by(|a, b| b.tombstoned_at.cmp(&a.tombstoned_at));
+    exemplars.sort_by_key(|e| std::cmp::Reverse(e.tombstoned_at));
     exemplars.truncate(limit);
     Ok(exemplars)
 }
@@ -246,10 +250,7 @@ mod tests {
             "analytics:negative_exemplar:src/cli:vague-rule"
         );
         // Empty dirname (root files) — preserved
-        assert_eq!(
-            make_key("", "x"),
-            "analytics:negative_exemplar::x"
-        );
+        assert_eq!(make_key("", "x"), "analytics:negative_exemplar::x");
     }
 
     #[test]

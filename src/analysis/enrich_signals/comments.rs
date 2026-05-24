@@ -115,8 +115,13 @@ pub fn scan_unknown(source: &str, language: Language) -> Vec<Signal> {
     let prefixes: &[&str] = match language {
         Language::Python | Language::Ruby | Language::Elixir => &["#"],
         Language::Haskell | Language::Scala => &["--", "//"],
-        Language::C | Language::Cpp | Language::Go | Language::Java
-        | Language::JavaScript | Language::TypeScript | Language::Rust => &["//"],
+        Language::C
+        | Language::Cpp
+        | Language::Go
+        | Language::Java
+        | Language::JavaScript
+        | Language::TypeScript
+        | Language::Rust => &["//"],
         Language::Unknown => &["//", "#", "--", ";"],
     };
 
@@ -126,10 +131,7 @@ pub fn scan_unknown(source: &str, language: Language) -> Vec<Signal> {
         let trimmed = line.trim_start();
 
         // Look for an inline or whole-line comment.
-        let comment_start = prefixes
-            .iter()
-            .filter_map(|p| trimmed.find(p))
-            .min();
+        let comment_start = prefixes.iter().filter_map(|p| trimmed.find(p)).min();
         let Some(_) = comment_start else { continue };
 
         // Pull out the comment-suffix portion of the line for scanning.
@@ -240,8 +242,7 @@ mod tests {
 
     #[test]
     fn linter_disable_go_nolint() {
-        let sig =
-            scan_linter_disable("foo() //nolint:errcheck", 5, Language::Go).unwrap();
+        let sig = scan_linter_disable("foo() //nolint:errcheck", 5, Language::Go).unwrap();
         assert_eq!(sig.kind, SignalKind::LinterDisable);
     }
 

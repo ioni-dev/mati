@@ -26,8 +26,7 @@ const GO_QUERY_SRC: &str = r#"
 "#;
 
 static GO_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
-    tree_sitter::Query::new(&GO_LANGUAGE, GO_QUERY_SRC)
-        .expect("enrich_signals/go: invalid query")
+    tree_sitter::Query::new(&GO_LANGUAGE, GO_QUERY_SRC).expect("enrich_signals/go: invalid query")
 });
 
 thread_local! {

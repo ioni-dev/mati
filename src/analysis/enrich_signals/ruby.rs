@@ -23,8 +23,7 @@ const RB_QUERY_SRC: &str = r#"
 "#;
 
 static RB_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
-    tree_sitter::Query::new(&RB_LANGUAGE, RB_QUERY_SRC)
-        .expect("enrich_signals/ruby: invalid query")
+    tree_sitter::Query::new(&RB_LANGUAGE, RB_QUERY_SRC).expect("enrich_signals/ruby: invalid query")
 });
 
 thread_local! {

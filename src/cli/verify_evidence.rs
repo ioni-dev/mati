@@ -27,7 +27,7 @@ use serde::Serialize;
 
 /// Lines of context on each side of the cited line to scan.
 ///
-/// Matches the spec — Round 2 says "Re-read <path> at the cited file_line ± 5
+/// Matches the spec — Round 2 says "Re-read `<path>` at the cited file_line ± 5
 /// lines." Eleven-line window is generous enough to absorb off-by-one drift
 /// in LLM citations without losing precision.
 const WINDOW_LINES: usize = 5;
@@ -118,7 +118,10 @@ pub async fn run(args: VerifyEvidenceArgs) -> Result<()> {
 
 /// Parse `42` or `L42` → `Some(42)`. Empty / negative / non-numeric → error.
 fn parse_line_arg(raw: &str) -> Result<usize> {
-    let stripped = raw.strip_prefix('L').or_else(|| raw.strip_prefix('l')).unwrap_or(raw);
+    let stripped = raw
+        .strip_prefix('L')
+        .or_else(|| raw.strip_prefix('l'))
+        .unwrap_or(raw);
     let n: usize = stripped
         .parse()
         .with_context(|| format!("expected positive integer, got {raw:?}"))?;
@@ -132,8 +135,8 @@ fn parse_line_arg(raw: &str) -> Result<usize> {
 /// (1-based, clamped to file bounds). Missing lines past EOF are skipped.
 fn read_window(file: &str, line: usize, radius: usize) -> Result<String> {
     let path = Path::new(file);
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {file}"))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read {file}"))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let start = line.saturating_sub(radius + 1); // line is 1-based; vec is 0-based
@@ -149,8 +152,8 @@ fn read_window(file: &str, line: usize, radius: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn write_tmp(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -180,7 +183,10 @@ mod tests {
 
     #[test]
     fn window_returns_lines_around_target() {
-        let content = (1..=20).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=20)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let f = write_tmp(&content);
         let path = f.path().to_str().unwrap();
 

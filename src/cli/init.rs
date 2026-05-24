@@ -983,7 +983,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
         });
         let pairs_record = Record {
             key: "analytics:co_change_pairs".to_string(),
-            value: format!("{} pairs (source of truth for clustering)", co_change_pairs.len()),
+            value: format!(
+                "{} pairs (source of truth for clustering)",
+                co_change_pairs.len()
+            ),
             payload: Some(pairs_payload),
             category: Category::Analytics,
             priority: Priority::Normal,
@@ -1005,7 +1008,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
             confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
             gap_analysis_score: 0.0,
         };
-        let _ = store_ref.put("analytics:co_change_pairs", &pairs_record).await;
+        let _ = store_ref
+            .put("analytics:co_change_pairs", &pairs_record)
+            .await;
 
         println!(
             "  Clusters...                    {:>4} found   {:>4}ms",
