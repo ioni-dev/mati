@@ -174,6 +174,12 @@ enum Commands {
     /// cross-reference check for `/mati-enrich` Stage 3 Round 2). Outputs JSON.
     #[command(name = "verify-evidence")]
     VerifyEvidence(cli::verify_evidence::VerifyEvidenceArgs),
+    /// Extract enrichment signals (panic/assert/WARN comments/etc.) from a
+    /// source file using tree-sitter. Returns a JSON SignalReport that
+    /// `/mati-enrich`'s Stage 1 consumes instead of asking the LLM to
+    /// scan the file. SOTA pipeline foundation.
+    #[command(name = "extract-signals")]
+    ExtractSignals(cli::extract_signals::ExtractSignalsArgs),
     /// Fetch gotcha context for files (used by Codex UserPromptSubmit hook).
     /// Returns bootstrap markdown for the given context files via daemon socket.
     #[command(hide = true, name = "prompt-context")]
@@ -355,6 +361,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
         Commands::VerifyEvidence(args) => cli::verify_evidence::run(args).await,
+        Commands::ExtractSignals(args) => cli::extract_signals::run(args).await,
         Commands::PromptContext { files } => cli::hooks::run_prompt_context(&files).await,
     }
 }

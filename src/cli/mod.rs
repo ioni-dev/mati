@@ -7,6 +7,7 @@ pub mod diff;
 pub mod doctor;
 pub mod enrich;
 pub mod explain;
+pub mod extract_signals;
 pub mod gaps;
 pub mod gotcha;
 pub mod hook_decide;
