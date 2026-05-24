@@ -12,6 +12,7 @@ pub mod claude_md;
 pub mod clusters;
 pub mod deps;
 pub mod edges;
+pub mod enrich_signals;
 pub mod git;
 pub mod parser;
 pub mod propagation;
