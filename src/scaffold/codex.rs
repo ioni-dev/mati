@@ -129,7 +129,17 @@ routing, etc).
    to retrieve NEGATIVE EXEMPLARS — rules that were proposed for
    this directory and then tombstoned. Use them in Stage 2 to
    calibrate AGAINST proposing similar rules. If `count` is 0,
-   skip the negative block.
+   skip the negative block. Record whether the block was used —
+   controls the `with-neg-exemplars` tag in Stage 4.
+4. **SOTA path** (replaces the LLM file scan — preferred): call
+   `mati extract-signals --file <path>` via Bash for deterministic,
+   AST-aware signal extraction across all 12 supported languages.
+   Returns JSON
+   `{ file, language, signal_count, signals: [{ file_line, tier,
+      kind, evidence }, ...] }`. If `signal_count > 0`, use these
+   as the candidate list and SKIP the manual file scan; tag mem_set
+   with `signal-source:ast`. Otherwise fall back to the legacy LLM
+   file scan and tag `signal-source:llm`.
 
 ### Tier branches (D2)
 
@@ -230,12 +240,17 @@ For each verified candidate:
      key: `gotcha:<slug>`
      rule, reason, severity (from step 3)
      affected_files: [<path>]
-     tags: ["enriched", "depth:<tier>"]
-           + (["severity-disputed"] if step 3c flagged)
+     tags:  ["enriched", "depth:<tier>"]
+          + ["signal-source:ast"] (if Stage 1 step 4 used extract-signals)
+            else ["signal-source:llm"]
+          + ["with-neg-exemplars"] (if Stage 1 step 3 used negatives)
+          + (["severity-disputed"] if step 3c flagged)
      confirmed: false
 
-     The `depth:<tier>` tag (D3) lets `mati doctor` aggregate per-tier
-     extraction accuracy. `<tier>` is the value from Stage 1 step 2.
+     The `depth:<tier>` tag (D3) drives per-tier accuracy in
+     `mati doctor`. The `signal-source:*` and `with-neg-exemplars`
+     tags (SOTA-γ) drive per-config A/B so reviewers can prove the
+     SOTA pipeline outperforms the legacy LLM scan.
 
 ### Notes
 
