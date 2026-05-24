@@ -686,6 +686,32 @@ fn render_extraction_section(
             );
         }
     }
+
+    // SOTA-δ: per-config A/B breakdown. Hidden when only one config has
+    // data (the comparison is meaningless until at least two configs
+    // have extractions). Useful for proving the SOTA pipeline (`ast+*`)
+    // outperforms the legacy LLM-driven scan (`llm+*`).
+    let active_configs: Vec<_> = s
+        .per_config
+        .iter()
+        .filter(|(_, t)| t.total > 0)
+        .collect();
+    if active_configs.len() >= 2 {
+        println!();
+        println!("  Per-config (A/B):");
+        // Render in stable order: BTreeMap iteration is alphabetical
+        // which is fine — `ast+*` sorts before `llm+*`.
+        for (label, tier) in &active_configs {
+            let rate = tier.confirmed_rate().map_or_else(
+                || "—".to_string(),
+                |r| format!("{:>3.0}% confirmed", r * 100.0),
+            );
+            println!(
+                "    {label:>11}  {:>3} extractions, {rate}",
+                tier.total
+            );
+        }
+    }
 }
 
 fn rate_label(n: u64, total: u64) -> String {
