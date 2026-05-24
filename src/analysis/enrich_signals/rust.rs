@@ -30,12 +30,22 @@ static RUST_LANGUAGE: LazyLock<tree_sitter::Language> =
     LazyLock::new(|| tree_sitter_rust::LANGUAGE.into());
 
 const RUST_QUERY_SRC: &str = r#"
-  ; Panic-equivalent macros: matched by macro name in the predicate
-  ; so we capture the call sites uniformly. Tier defaults to HIGH for
-  ; all of them; comment context can elevate further.
+  ; Panic-equivalent macros. `bail!` and `ensure!` are anyhow-specific
+  ; but extremely common in mati's own codebase (and in any Rust crate
+  ; that uses anyhow) — both terminate execution by returning Err, so
+  ; they're semantically panic-class for enrichment purposes. Without
+  ; them, files like src/cli/repair.rs (which uses anyhow::bail! for
+  ; its daemon-running guard) return 0 signals despite having clear
+  ; "do not do this" intent.
   (macro_invocation macro: (identifier) @panic_macro
     (#match? @panic_macro
-      "^(panic|unreachable|todo|unimplemented|compile_error)$"))
+      "^(panic|unreachable|todo|unimplemented|compile_error|bail|ensure)$"))
+
+  ; Same applies to anyhow::bail! / anyhow::ensure! invoked via the
+  ; scoped_identifier path. The above matches the bare-name form;
+  ; this matches anyhow::bail! and friends.
+  (macro_invocation macro: (scoped_identifier name: (identifier) @panic_macro_scoped)
+    (#match? @panic_macro_scoped "^(bail|ensure|panic|unreachable|todo|unimplemented)$"))
 
   ; assert!/assert_eq!/assert_ne!/debug_assert!
   (macro_invocation macro: (identifier) @assert_macro
@@ -81,6 +91,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 
     let cap_idx_for_name = |name: &str| RUST_QUERY.capture_index_for_name(name).unwrap_or(u32::MAX);
     let panic_macro_idx = cap_idx_for_name("panic_macro");
+    let panic_macro_scoped_idx = cap_idx_for_name("panic_macro_scoped");
     let assert_macro_idx = cap_idx_for_name("assert_macro");
     let unwrap_call_idx = cap_idx_for_name("unwrap_call");
     let comment_idx = cap_idx_for_name("comment");
@@ -91,7 +102,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             let line = node.start_position().row as u32 + 1;
             let evidence = super::node_text(source_bytes, node);
 
-            let (kind, tier) = if cap.index == panic_macro_idx {
+            let (kind, tier) = if cap.index == panic_macro_idx
+                || cap.index == panic_macro_scoped_idx
+            {
                 (SignalKind::Panic, SignalTier::High)
             } else if cap.index == assert_macro_idx {
                 (SignalKind::Assert, SignalTier::High)
