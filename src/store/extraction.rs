@@ -39,6 +39,16 @@ pub const ENRICHED_TAG: &str = "enriched";
 /// Tag-prefix that carries the depth tier (e.g. `"depth:deep"`).
 pub const DEPTH_TAG_PREFIX: &str = "depth:";
 
+/// Tag-prefix carrying the signal source used to enumerate candidates
+/// in Stage 1/2: `"signal-source:ast"` (SOTA-α/β tree-sitter pipeline)
+/// or `"signal-source:llm"` (D2-γ prompt-driven scanning). Absent on
+/// older records — treated as `Llm` for compatibility.
+pub const SIGNAL_SOURCE_TAG_PREFIX: &str = "signal-source:";
+
+/// Tag flag set when the Deep-tier prompt actually included negative
+/// exemplars in Stage 2. Present = true; absent = false.
+pub const NEG_EXEMPLAR_TAG: &str = "with-neg-exemplars";
+
 /// Lifecycle outcome for an enrichment-produced candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +59,62 @@ pub enum ExtractionOutcome {
     Confirmed,
     /// Developer tombstoned via `mati gotcha delete` (or MCP equivalent).
     Tombstoned,
+}
+
+/// Source of Stage-1/2 signal enumeration. SOTA-α moved signal extraction
+/// from LLM-driven scanning to deterministic tree-sitter; this enum lets
+/// `mati doctor` A/B the two and prove the SOTA pipeline is actually
+/// producing higher-quality candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalSource {
+    /// Tree-sitter-driven signal extraction via `mati extract-signals`
+    /// (SOTA-α/β path).
+    Ast,
+    /// LLM-driven file scanning (D2-γ / pre-SOTA path).
+    Llm,
+}
+
+impl SignalSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignalSource::Ast => "ast",
+            SignalSource::Llm => "llm",
+        }
+    }
+}
+
+/// Per-extraction configuration parsed from gotcha tags. Powers the
+/// per-config breakdown in `mati doctor`'s extraction-quality section.
+///
+/// Backward-compat defaults: `signal_source = Llm`, `with_negative_exemplars
+/// = false` — matches pre-SOTA behavior so older records bucket sensibly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractionConfig {
+    pub signal_source: SignalSource,
+    pub with_negative_exemplars: bool,
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            signal_source: SignalSource::Llm,
+            with_negative_exemplars: false,
+        }
+    }
+}
+
+impl ExtractionConfig {
+    /// Stable label for grouping (`"llm+no_neg"`, `"ast+neg"`, etc.).
+    /// Used as the HashMap key in PerConfigStats so reports are
+    /// reproducible across runs.
+    pub fn label(&self) -> String {
+        format!(
+            "{}+{}",
+            self.signal_source.as_str(),
+            if self.with_negative_exemplars { "neg" } else { "no_neg" }
+        )
+    }
 }
 
 /// Per-extraction provenance + outcome. One record per enrichment-produced
@@ -67,6 +133,11 @@ pub struct ExtractionRecord {
     pub outcome: ExtractionOutcome,
     /// Unix secs when outcome transitioned from Pending. `None` while Pending.
     pub outcome_at: Option<u64>,
+    /// SOTA-γ: which pipeline configuration produced this candidate.
+    /// `Default::default()` (= llm + no_neg) for backward compat with
+    /// records written before this field was added.
+    #[serde(default)]
+    pub config: ExtractionConfig,
 }
 
 impl ExtractionRecord {
@@ -85,16 +156,30 @@ pub fn key_for(gotcha_key: &str) -> String {
     format!("{EXTRACTION_PREFIX}{slug}")
 }
 
-/// Inspect a gotcha record's tags and return:
-/// - `is_enriched`: true if the `enriched` tag is present (= the agent
-///   marked this as enrichment output)
+/// Parsed classification of a gotcha's enrichment tags.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TagClassification {
+    pub is_enriched: bool,
+    pub depth: Option<EnrichmentDepth>,
+    pub config: ExtractionConfig,
+}
+
+/// Inspect a gotcha record's tags and return the full parsed
+/// classification:
+/// - `is_enriched`: true iff the `enriched` tag is present
 /// - `depth`: Some(tier) if a `depth:<tier>` tag is present and valid
-pub fn classify_tags(tags: &[String]) -> (bool, Option<EnrichmentDepth>) {
+/// - `config`: parsed [`ExtractionConfig`] — defaults to `(Llm, false)`
+///   when the corresponding tags aren't present, preserving pre-SOTA-γ
+///   behavior for records that don't carry the new tags.
+pub fn classify_tags(tags: &[String]) -> TagClassification {
     let mut is_enriched = false;
     let mut depth = None;
+    let mut config = ExtractionConfig::default();
     for tag in tags {
         if tag == ENRICHED_TAG {
             is_enriched = true;
+        } else if tag == NEG_EXEMPLAR_TAG {
+            config.with_negative_exemplars = true;
         } else if let Some(rest) = tag.strip_prefix(DEPTH_TAG_PREFIX) {
             depth = match rest {
                 "fast" => Some(EnrichmentDepth::Fast),
@@ -102,9 +187,19 @@ pub fn classify_tags(tags: &[String]) -> (bool, Option<EnrichmentDepth>) {
                 "deep" => Some(EnrichmentDepth::Deep),
                 _ => None,
             };
+        } else if let Some(rest) = tag.strip_prefix(SIGNAL_SOURCE_TAG_PREFIX) {
+            config.signal_source = match rest {
+                "ast" => SignalSource::Ast,
+                "llm" => SignalSource::Llm,
+                _ => config.signal_source,
+            };
         }
     }
-    (is_enriched, depth)
+    TagClassification {
+        is_enriched,
+        depth,
+        config,
+    }
 }
 
 /// Write an ExtractionRecord on gotcha creation (only if the `enriched`
@@ -119,7 +214,11 @@ pub async fn write_on_extraction(
     tags: &[String],
     affected_files: &[String],
 ) -> Result<bool> {
-    let (is_enriched, depth) = classify_tags(tags);
+    let TagClassification {
+        is_enriched,
+        depth,
+        config,
+    } = classify_tags(tags);
     if !is_enriched {
         return Ok(false);
     }
@@ -135,6 +234,7 @@ pub async fn write_on_extraction(
         created_at: ts,
         outcome: ExtractionOutcome::Pending,
         outcome_at: None,
+        config,
     };
     let key = key_for(gotcha_key);
     let record = analytics_record(&key, &extraction, ts);
@@ -196,6 +296,12 @@ pub struct ExtractionStats {
     /// persisted lifecycle state.
     pub expired: u64,
     pub per_tier: PerTierStats,
+    /// SOTA-δ: per-config A/B breakdown. Each entry keyed by
+    /// `ExtractionConfig::label()` (`"ast+neg"`, `"llm+no_neg"`, …).
+    /// Lets reviewers prove the SOTA pipeline produces better-quality
+    /// candidates than the legacy LLM-driven scan.
+    #[serde(default)]
+    pub per_config: std::collections::BTreeMap<String, TierStats>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -272,14 +378,25 @@ pub fn aggregate_stats(
             None => &mut stats.per_tier.unknown,
         };
         tier_stats.total += 1;
+        // Per-config bucket lookup. Use BTreeMap::entry to lazy-initialize
+        // so missing configs don't appear with 0/0/0 noise.
+        let config_label = e.config.label();
+        let config_stats: &mut TierStats = stats
+            .per_config
+            .entry(config_label)
+            .or_default();
+        config_stats.total += 1;
+
         match e.outcome {
             ExtractionOutcome::Confirmed => {
                 stats.confirmed += 1;
                 tier_stats.confirmed += 1;
+                config_stats.confirmed += 1;
             }
             ExtractionOutcome::Tombstoned => {
                 stats.tombstoned += 1;
                 tier_stats.tombstoned += 1;
+                config_stats.tombstoned += 1;
             }
             ExtractionOutcome::Pending => {
                 if e.created_at < expiry_cutoff {
@@ -287,6 +404,7 @@ pub fn aggregate_stats(
                 } else {
                     stats.pending += 1;
                     tier_stats.pending += 1;
+                    config_stats.pending += 1;
                 }
             }
         }
@@ -342,33 +460,70 @@ mod tests {
 
     #[test]
     fn classify_tags_detects_enriched_and_depth() {
-        let (is_enriched, depth) = classify_tags(&[
-            "enriched".into(),
-            "depth:deep".into(),
-        ]);
-        assert!(is_enriched);
-        assert_eq!(depth, Some(EnrichmentDepth::Deep));
+        let c = classify_tags(&["enriched".into(), "depth:deep".into()]);
+        assert!(c.is_enriched);
+        assert_eq!(c.depth, Some(EnrichmentDepth::Deep));
+        // No signal-source / neg-exemplars tag → defaults to Llm + false.
+        assert_eq!(c.config.signal_source, SignalSource::Llm);
+        assert!(!c.config.with_negative_exemplars);
     }
 
     #[test]
     fn classify_tags_no_enriched_is_skipped() {
-        let (is_enriched, depth) = classify_tags(&["test".into(), "depth:fast".into()]);
-        assert!(!is_enriched);
-        assert_eq!(depth, Some(EnrichmentDepth::Fast));
+        let c = classify_tags(&["test".into(), "depth:fast".into()]);
+        assert!(!c.is_enriched);
+        assert_eq!(c.depth, Some(EnrichmentDepth::Fast));
     }
 
     #[test]
     fn classify_tags_unknown_depth_value_yields_none() {
-        let (is_enriched, depth) = classify_tags(&["enriched".into(), "depth:bogus".into()]);
-        assert!(is_enriched);
-        assert!(depth.is_none());
+        let c = classify_tags(&["enriched".into(), "depth:bogus".into()]);
+        assert!(c.is_enriched);
+        assert!(c.depth.is_none());
     }
 
     #[test]
     fn classify_tags_no_depth_tag_yields_none() {
-        let (is_enriched, depth) = classify_tags(&["enriched".into(), "other".into()]);
-        assert!(is_enriched);
-        assert!(depth.is_none());
+        let c = classify_tags(&["enriched".into(), "other".into()]);
+        assert!(c.is_enriched);
+        assert!(c.depth.is_none());
+    }
+
+    #[test]
+    fn classify_tags_picks_up_signal_source_ast_and_neg_exemplars() {
+        let c = classify_tags(&[
+            "enriched".into(),
+            "depth:deep".into(),
+            "signal-source:ast".into(),
+            "with-neg-exemplars".into(),
+        ]);
+        assert!(c.is_enriched);
+        assert_eq!(c.depth, Some(EnrichmentDepth::Deep));
+        assert_eq!(c.config.signal_source, SignalSource::Ast);
+        assert!(c.config.with_negative_exemplars);
+    }
+
+    #[test]
+    fn classify_tags_invalid_signal_source_keeps_default() {
+        let c = classify_tags(&["enriched".into(), "signal-source:bogus".into()]);
+        assert_eq!(c.config.signal_source, SignalSource::Llm);
+    }
+
+    #[test]
+    fn extraction_config_label_stable_for_all_combos() {
+        let combos = [
+            (SignalSource::Llm, false, "llm+no_neg"),
+            (SignalSource::Llm, true, "llm+neg"),
+            (SignalSource::Ast, false, "ast+no_neg"),
+            (SignalSource::Ast, true, "ast+neg"),
+        ];
+        for (src, neg, expected) in combos {
+            let cfg = ExtractionConfig {
+                signal_source: src,
+                with_negative_exemplars: neg,
+            };
+            assert_eq!(cfg.label(), expected, "{cfg:?}");
+        }
     }
 
     #[test]
@@ -549,6 +704,7 @@ mod tests {
             created_at: 1_000_000,
             outcome: ExtractionOutcome::Confirmed,
             outcome_at: Some(1_000_000 + 2 * 86_400),
+            config: ExtractionConfig::default(),
         };
         assert_eq!(extraction.days_to_outcome(), Some(2));
 
@@ -559,7 +715,65 @@ mod tests {
             created_at: 1_000_000,
             outcome: ExtractionOutcome::Pending,
             outcome_at: None,
+            config: ExtractionConfig::default(),
         };
         assert_eq!(pending.days_to_outcome(), None);
+    }
+
+    #[tokio::test]
+    async fn per_config_breakdown_aggregates_correctly() {
+        let store = fresh_store().await;
+
+        // Write 4 records across the 4 (signal_source × neg_exemplars)
+        // configs. Three confirmed, one tombstoned — proves per-config
+        // accuracy aggregation works.
+        let cases = [
+            (
+                "gotcha:a",
+                vec!["enriched", "signal-source:ast", "with-neg-exemplars"],
+                ExtractionOutcome::Confirmed,
+            ),
+            (
+                "gotcha:b",
+                vec!["enriched", "signal-source:ast"],
+                ExtractionOutcome::Confirmed,
+            ),
+            (
+                "gotcha:c",
+                vec!["enriched", "signal-source:llm", "with-neg-exemplars"],
+                ExtractionOutcome::Tombstoned,
+            ),
+            (
+                "gotcha:d",
+                vec!["enriched"],
+                ExtractionOutcome::Confirmed,
+            ),
+        ];
+        for (key, tags, outcome) in &cases {
+            let owned: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+            write_on_extraction(&store, key, &owned, &["src/x.rs".into()])
+                .await
+                .unwrap();
+            mark_outcome(&store, key, *outcome).await.unwrap();
+        }
+
+        let stats = compute_stats(&store, 0).await.unwrap();
+        assert_eq!(stats.total, 4);
+        assert_eq!(stats.confirmed, 3);
+        assert_eq!(stats.tombstoned, 1);
+
+        // Per-config buckets exist for each combination written.
+        assert_eq!(stats.per_config.get("ast+neg").unwrap().total, 1);
+        assert_eq!(stats.per_config.get("ast+no_neg").unwrap().total, 1);
+        assert_eq!(stats.per_config.get("llm+neg").unwrap().total, 1);
+        assert_eq!(stats.per_config.get("llm+no_neg").unwrap().total, 1);
+
+        // ast+* configs both confirmed.
+        assert_eq!(stats.per_config.get("ast+neg").unwrap().confirmed, 1);
+        assert_eq!(stats.per_config.get("ast+no_neg").unwrap().confirmed, 1);
+        // llm+neg got tombstoned.
+        assert_eq!(stats.per_config.get("llm+neg").unwrap().tombstoned, 1);
+        // llm+no_neg confirmed.
+        assert_eq!(stats.per_config.get("llm+no_neg").unwrap().confirmed, 1);
     }
 }
