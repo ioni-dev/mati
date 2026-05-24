@@ -517,15 +517,16 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
 async fn collect_extraction_stats(
     cwd: &Path,
 ) -> Option<mati_core::store::extraction::ExtractionStats> {
-    use mati_core::store::extraction::{
-        aggregate_stats, ExtractionRecord, EXTRACTION_PREFIX,
-    };
+    use mati_core::store::extraction::{aggregate_stats, ExtractionRecord, EXTRACTION_PREFIX};
 
     let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
         Ok(p) => p,
         Err(_) => return None,
     };
-    let records = proxy.scan_prefix(EXTRACTION_PREFIX).await.unwrap_or_default();
+    let records = proxy
+        .scan_prefix(EXTRACTION_PREFIX)
+        .await
+        .unwrap_or_default();
     let _ = proxy.close().await;
 
     let extractions: Vec<ExtractionRecord> = records
@@ -631,18 +632,13 @@ fn render_human(report: &Report, use_color: bool) {
 /// Render the D3 extraction-quality section. Skipped entirely when no
 /// extractions have been recorded (`total == 0`) — keeps the doctor
 /// output clean on fresh installs.
-fn render_extraction_section(
-    s: &mati_core::store::extraction::ExtractionStats,
-) {
+fn render_extraction_section(s: &mati_core::store::extraction::ExtractionStats) {
     if s.total == 0 {
         return;
     }
     println!();
     println!("Extraction quality (last 30d, /mati-enrich pipeline)");
-    println!(
-        "  total           {:>4}",
-        s.total
-    );
+    println!("  total           {:>4}", s.total);
     println!(
         "  confirmed       {:>4}  ({})",
         s.confirmed,
@@ -653,10 +649,7 @@ fn render_extraction_section(
         s.tombstoned,
         rate_label(s.tombstoned, s.total)
     );
-    println!(
-        "  pending         {:>4}",
-        s.pending
-    );
+    println!("  pending         {:>4}", s.pending);
     if s.expired > 0 {
         println!("  expired (>90d)  {:>4}", s.expired);
     }
@@ -680,10 +673,7 @@ fn render_extraction_section(
                 || "—".to_string(),
                 |r| format!("{:>3.0}% confirmed", r * 100.0),
             );
-            println!(
-                "    {label}  {:>3} extractions, {rate}",
-                tier.total
-            );
+            println!("    {label}  {:>3} extractions, {rate}", tier.total);
         }
     }
 
@@ -691,11 +681,7 @@ fn render_extraction_section(
     // data (the comparison is meaningless until at least two configs
     // have extractions). Useful for proving the SOTA pipeline (`ast+*`)
     // outperforms the legacy LLM-driven scan (`llm+*`).
-    let active_configs: Vec<_> = s
-        .per_config
-        .iter()
-        .filter(|(_, t)| t.total > 0)
-        .collect();
+    let active_configs: Vec<_> = s.per_config.iter().filter(|(_, t)| t.total > 0).collect();
     if active_configs.len() >= 2 {
         println!();
         println!("  Per-config (A/B):");
@@ -706,20 +692,16 @@ fn render_extraction_section(
                 || "—".to_string(),
                 |r| format!("{:>3.0}% confirmed", r * 100.0),
             );
-            println!(
-                "    {label:>11}  {:>3} extractions, {rate}",
-                tier.total
-            );
+            println!("    {label:>11}  {:>3} extractions, {rate}", tier.total);
         }
     }
 }
 
 fn rate_label(n: u64, total: u64) -> String {
-    if total == 0 {
-        "0%".to_string()
-    } else {
-        format!("{}%", (n * 100) / total)
-    }
+    (n * 100)
+        .checked_div(total)
+        .map(|pct| format!("{pct}%"))
+        .unwrap_or_else(|| "0%".to_string())
 }
 
 fn symbol_for(status: Status, use_color: bool) -> String {

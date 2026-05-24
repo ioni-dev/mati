@@ -95,10 +95,7 @@ async fn repair_pairs_record_matches_persisted_cluster_index() {
 
     // 3. Recompute clusters from the source-of-truth record (the path
     //    `mati repair` now takes).
-    let file_records = store
-        .scan_prefix("file:")
-        .await
-        .expect("scan file: prefix");
+    let file_records = store.scan_prefix("file:").await.expect("scan file: prefix");
     let total_files = file_records.len();
     let recomputed = ClusterIndex::compute(&pairs, total_files);
 
@@ -108,7 +105,10 @@ async fn repair_pairs_record_matches_persisted_cluster_index() {
     eprintln!("  persisted cluster:index total: {persisted_total}");
     eprintln!("  recomputed total: {}", recomputed.total);
     eprintln!("  persisted clustered_files: {persisted_clustered}");
-    eprintln!("  recomputed clustered_files: {}", recomputed.clustered_files);
+    eprintln!(
+        "  recomputed clustered_files: {}",
+        recomputed.clustered_files
+    );
 
     // 4. Assert: the source-of-truth pairs MUST produce the same cluster
     //    shape as what init persisted. Any divergence indicates either:

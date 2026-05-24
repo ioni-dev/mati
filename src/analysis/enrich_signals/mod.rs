@@ -214,7 +214,7 @@ pub(crate) fn trim_evidence(text: &str) -> String {
 /// Sort signals into the canonical output order: tier desc, then line asc.
 /// Stable so two extractors that produce signals in different traversal
 /// orders end up with identical reports.
-pub fn sort_canonical(signals: &mut Vec<Signal>) {
+pub fn sort_canonical(signals: &mut [Signal]) {
     signals.sort_by(|a, b| {
         let tier_rank = |t: SignalTier| match t {
             SignalTier::High => 2,

@@ -467,7 +467,8 @@ fn mcp_stdio_gotcha_lifecycle() {
         r#"{"key":"gotcha:lifecycle-test"}"#,
     );
     assert!(
-        confirmed_text.contains("\"confirmed\": true") || confirmed_text.contains("\"confirmed\":true"),
+        confirmed_text.contains("\"confirmed\": true")
+            || confirmed_text.contains("\"confirmed\":true"),
         "should be confirmed: {confirmed_text}"
     );
     assert!(

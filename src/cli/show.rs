@@ -305,8 +305,8 @@ fn print_record(record: &Record, use_color: bool) {
     if matches!(record.category, Category::Analytics | Category::DevNote) {
         if let Some(ref payload) = record.payload {
             if !payload.is_null() {
-                let pretty = serde_json::to_string_pretty(payload)
-                    .unwrap_or_else(|_| payload.to_string());
+                let pretty =
+                    serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string());
                 println!("{blue}  payload{reset}");
                 for line in pretty.lines() {
                     println!("    {gray}{line}{reset}");
@@ -827,7 +827,7 @@ async fn ls_tombstoned(
         .filter_map(|r| r.payload.and_then(|p| serde_json::from_value(p).ok()))
         .filter(|e: &NegativeExemplar| e.tombstoned_at >= since_secs)
         .collect();
-    exemplars.sort_by(|a, b| b.tombstoned_at.cmp(&a.tombstoned_at));
+    exemplars.sort_by_key(|e| std::cmp::Reverse(e.tombstoned_at));
     // limit=0 means unlimited; otherwise truncate.
     if limit > 0 {
         exemplars.truncate(limit);
@@ -847,15 +847,17 @@ async fn ls_tombstoned(
     }
 
     if exemplars.is_empty() {
-        println!(
-            "No tombstoned gotchas in {dirname} within the last {recent_str}."
-        );
+        println!("No tombstoned gotchas in {dirname} within the last {recent_str}.");
         return Ok(());
     }
 
     let use_color = std::io::stdout().is_terminal();
     let (yellow, gray, reset) = if use_color {
-        (super::colors::YELLOW, super::colors::GRAY, super::colors::RESET)
+        (
+            super::colors::YELLOW,
+            super::colors::GRAY,
+            super::colors::RESET,
+        )
     } else {
         ("", "", "")
     };

@@ -190,13 +190,8 @@ pub async fn apply_gotcha_write(
     // are NOT tracked — keeps the analytics scoped to the enrichment
     // pipeline. Only fires on new writes; updates don't re-create.
     if is_new {
-        let _ = crate::store::extraction::write_on_extraction(
-            store,
-            key,
-            &record.tags,
-            new_files,
-        )
-        .await;
+        let _ = crate::store::extraction::write_on_extraction(store, key, &record.tags, new_files)
+            .await;
     }
 
     let mut secondary_failed = false;
@@ -272,7 +267,8 @@ pub async fn apply_gotcha_tombstone(
     match store.get(key).await? {
         Some(mut record) => {
             if let Some(ref payload) = record.payload {
-                if let Ok(gr) = serde_json::from_value::<crate::store::GotchaRecord>(payload.clone())
+                if let Ok(gr) =
+                    serde_json::from_value::<crate::store::GotchaRecord>(payload.clone())
                 {
                     exemplar_snapshot = Some((gr.rule, gr.reason, gr.severity));
                 }
@@ -345,9 +341,9 @@ pub async fn apply_gotcha_tombstone(
             Ok(n) => tracing::debug!(
                 "gotcha_tombstone: negative_exemplar archived for {key} across {n} dirname(s)"
             ),
-            Err(e) => tracing::warn!(
-                "gotcha_tombstone: negative_exemplar write failed for {key}: {e}"
-            ),
+            Err(e) => {
+                tracing::warn!("gotcha_tombstone: negative_exemplar write failed for {key}: {e}")
+            }
         }
     } else {
         tracing::debug!(
@@ -1019,15 +1015,9 @@ mod tests {
         let mut record = make_gotcha_record("gotcha:enriched-rule", &["src/cli/repair.rs"]);
         record.tags = vec!["enriched".into(), "depth:deep".into()];
 
-        apply_gotcha_write(
-            &store,
-            &record,
-            &[],
-            &["src/cli/repair.rs".into()],
-            true,
-        )
-        .await
-        .unwrap();
+        apply_gotcha_write(&store, &record, &[], &["src/cli/repair.rs".into()], true)
+            .await
+            .unwrap();
 
         // After write, ExtractionRecord must exist with outcome=Pending,
         // depth=Deep, file_path set.
@@ -1055,8 +1045,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let extraction: ExtractionRecord =
-            serde_json::from_value(rec.payload.unwrap()).unwrap();
+        let extraction: ExtractionRecord = serde_json::from_value(rec.payload.unwrap()).unwrap();
         assert_eq!(extraction.outcome, ExtractionOutcome::Confirmed);
         assert!(extraction.outcome_at.is_some());
 
@@ -1075,8 +1064,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let extraction: ExtractionRecord =
-            serde_json::from_value(rec.payload.unwrap()).unwrap();
+        let extraction: ExtractionRecord = serde_json::from_value(rec.payload.unwrap()).unwrap();
         assert_eq!(extraction.outcome, ExtractionOutcome::Tombstoned);
         assert_eq!(
             extraction.depth,

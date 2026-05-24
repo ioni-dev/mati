@@ -5,10 +5,10 @@
 //!
 //! Detected:
 //! - HIGH: `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`,
-//!         `assert_eq!`, `assert_ne!`, `debug_assert!`, `compile_error!`
-//!         (all via `macro_invocation` capture)
+//!   `assert_eq!`, `assert_ne!`, `debug_assert!`, `compile_error!`
+//!   (all via `macro_invocation` capture)
 //! - HIGH: `// WARNING / FIXME / HACK / SAFETY / IMPORTANT` comments
-//!         (via `super::comments::scan_comment_text`)
+//!   (via `super::comments::scan_comment_text`)
 //! - MEDIUM: `.unwrap()`, `.expect(...)` field expressions on call sites
 //! - MEDIUM: `#[allow(...)]` lint disables (via comments scanner)
 //!
@@ -102,26 +102,25 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             let line = node.start_position().row as u32 + 1;
             let evidence = super::node_text(source_bytes, node);
 
-            let (kind, tier) = if cap.index == panic_macro_idx
-                || cap.index == panic_macro_scoped_idx
-            {
-                (SignalKind::Panic, SignalTier::High)
-            } else if cap.index == assert_macro_idx {
-                (SignalKind::Assert, SignalTier::High)
-            } else if cap.index == unwrap_call_idx {
-                (SignalKind::UnwrapLike, SignalTier::Medium)
-            } else if cap.index == comment_idx {
-                if let Some(sig) = comments::scan_comment_text(&evidence, line) {
-                    signals.push(sig);
-                } else if let Some(sig) =
-                    comments::scan_linter_disable(&evidence, line, Language::Rust)
-                {
-                    signals.push(sig);
-                }
-                continue;
-            } else {
-                continue;
-            };
+            let (kind, tier) =
+                if cap.index == panic_macro_idx || cap.index == panic_macro_scoped_idx {
+                    (SignalKind::Panic, SignalTier::High)
+                } else if cap.index == assert_macro_idx {
+                    (SignalKind::Assert, SignalTier::High)
+                } else if cap.index == unwrap_call_idx {
+                    (SignalKind::UnwrapLike, SignalTier::Medium)
+                } else if cap.index == comment_idx {
+                    if let Some(sig) = comments::scan_comment_text(&evidence, line) {
+                        signals.push(sig);
+                    } else if let Some(sig) =
+                        comments::scan_linter_disable(&evidence, line, Language::Rust)
+                    {
+                        signals.push(sig);
+                    }
+                    continue;
+                } else {
+                    continue;
+                };
 
             signals.push(Signal {
                 file_line: line,

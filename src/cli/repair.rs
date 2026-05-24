@@ -143,10 +143,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
                 Some(pairs) => {
                     let total_files = file_records.len();
                     let cluster_index =
-                        mati_core::analysis::clusters::ClusterIndex::compute(
-                            &pairs,
-                            total_files,
-                        );
+                        mati_core::analysis::clusters::ClusterIndex::compute(&pairs, total_files);
                     let cluster_record = mati_core::store::record::Record {
                         key: "cluster:index".to_string(),
                         value: format!(
