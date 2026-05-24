@@ -666,6 +666,27 @@ async fn dispatch_session_side(
                     )
                     .await;
                 }
+                // Codex's post-bash hook runs AFTER a shell command finished;
+                // by the time we observe "no consultation receipt", the
+                // bypass already happened. Record it as `BypassDetected`
+                // (label "bypass") rather than `Deny` — nothing was actually
+                // denied. Without this arm the event landed only in the
+                // daily `compliance:codex_shell_miss_<date>` aggregate and
+                // was invisible to `mati history --enforcement`
+                // (smoke finding step 128).
+                protocol::SessionEvent::CodexShellMiss => {
+                    let _ = crate::store::enforcement::record_event(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::BypassDetected,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "codex".to_string(),
+                        None,
+                        "codex_shell_pre_consult_miss".to_string(),
+                        None,
+                    )
+                    .await;
+                }
                 _ => {}
             }
 
@@ -1633,6 +1654,75 @@ mod tests {
         // Nothing in knowledge tree.
         let k_audit = g.store().scan_keys("audit:knowledge:").await.unwrap();
         assert!(k_audit.is_empty());
+    }
+
+    /// Regression: SessionLog with CodexShellMiss must produce a
+    /// `BypassDetected` enforcement event in the hash-chained log, not just
+    /// a daily aggregate. Smoke finding #128 — pre-fix, the event was
+    /// invisible to `mati history --enforcement`.
+    #[tokio::test]
+    async fn session_log_codex_shell_miss_records_bypass_enforcement_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::SessionLog(SessionLogInput {
+            event: SessionEvent::CodexShellMiss,
+            key: "file:src/cli/repair.rs".into(),
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+        assert!(matches!(resp, Response::Ok { .. }));
+
+        let g = graph.read().await;
+
+        // Daily aggregate (unchanged from pre-fix behavior).
+        let agg = g
+            .store()
+            .scan_keys("compliance:codex_shell_miss_")
+            .await
+            .unwrap();
+        assert!(
+            !agg.is_empty(),
+            "codex_shell_miss daily agg must be written"
+        );
+
+        // NEW: enforcement event in the hash-chained log so `mati history`
+        // surfaces it. Pre-fix the scan returned empty.
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .expect("scan enforcement events");
+        assert!(
+            !events.is_empty(),
+            "CodexShellMiss must record a hash-chained enforcement event \
+             (label='bypass') — regression for smoke finding #128"
+        );
+
+        let evt = &events[0];
+        assert_eq!(
+            evt.agent_type, "codex",
+            "codex-post-bash event must attribute agent=codex, got: {evt:?}"
+        );
+        assert_eq!(
+            evt.subject_key, "file:src/cli/repair.rs",
+            "subject_key must match input.key"
+        );
+        assert!(
+            matches!(
+                evt.event_type,
+                crate::store::enforcement::EnforcementEventType::BypassDetected
+            ),
+            "event_type must be BypassDetected, got: {:?}",
+            evt.event_type
+        );
+
+        // Sanity: the CLI label that `mati history --enforcement` would show
+        // for this event is "bypass" (per src/store/enforcement.rs:1000).
+        assert_eq!(
+            crate::store::enforcement::event_type_label(&evt.event_type),
+            "bypass"
+        );
     }
 
     #[tokio::test]

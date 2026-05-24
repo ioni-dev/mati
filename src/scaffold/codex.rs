@@ -106,6 +106,158 @@ Use `mati` as the codebase memory layer for this repository.
 - Codex PreToolUse hooks block unconsulted file reads via exit 2 + stderr.
 - PostToolUse logs compliance for analytics — no context injection.
 - Always call `mem_get("file:<path>")` before shell-inspecting a file.
+
+## /mati-enrich — extraction pipeline (v0.2)
+
+The four-stage pipeline below is the operational instruction set for
+extracting gotcha candidates during `/mati-enrich`. It supersedes the
+brief mem_set rules above for the extraction-specific steps; the
+rules above still apply for everything else (manual capture, confirm
+routing, etc).
+
+### Stage 1 — Setup (before reading)
+
+1. `mem_query mode="text" query="<dirname-of-file>" limit 5`
+   → top 5 confirmed gotchas as POSITIVE EXEMPLARS. If zero exist
+     (cold start), continue with schema-only guidance.
+2. `mem_get("file:<path>")` — mints the consultation receipt, returns
+   existing gotcha_keys, AND returns the `enrichment_depth_hint` field
+   (D2-α: one of "fast", "standard", "deep"). Use it to pick the
+   tier branch below. If absent (older daemon), default to "deep".
+3. **Deep tier only**: call via Bash
+   `mati ls tombstoned --dir <dirname-of-file> --recent 30d --json`
+   to retrieve NEGATIVE EXEMPLARS — rules that were proposed for
+   this directory and then tombstoned. Use them in Stage 2 to
+   calibrate AGAINST proposing similar rules. If `count` is 0,
+   skip the negative block. Record whether the block was used —
+   controls the `with-neg-exemplars` tag in Stage 4.
+4. **SOTA path** (replaces the LLM file scan — preferred): call
+   `mati extract-signals --file <path>` via Bash for deterministic,
+   AST-aware signal extraction across all 12 supported languages.
+   Returns JSON
+   `{ file, language, signal_count, signals: [{ file_line, tier,
+      kind, evidence }, ...] }`. If `signal_count > 0`, use these
+   as the candidate list and SKIP the manual file scan; tag mem_set
+   with `signal-source:ast`. Otherwise fall back to the legacy LLM
+   file scan and tag `signal-source:llm`.
+
+### Tier branches (D2)
+
+| Tier      | Stage 2     | Stage 3 critique | Negative exemplars |
+| --------- | ----------- | ---------------- | ------------------ |
+| fast      | schema only | skip             | no                 |
+| standard  | positive    | Round 1 + 2      | no                 |
+| deep      | positive    | Rounds 1, 2, 3   | yes                |
+
+`fast` for trivial files (LoC < 100, isolated blast, no cluster).
+`standard` is the default. `deep` runs the full pipeline including
+negative exemplars for hotspot / signal-rich files.
+
+### Stage 2 — Enumeration (maximize recall)
+
+Read the file. Output a JSON array of candidates, using the POSITIVE
+EXEMPLARS as calibration for this project's specific bar.
+
+Signal ranking (extract from highest first):
+  HIGH:    WARNING / FIXME / HACK / SAFETY / IMPORTANT comments;
+           panic!/assert!/expect("…") with non-trivial messages;
+           comments explaining "why this looks weird" or "do not".
+  MEDIUM:  Defensive guards (early returns, custom error paths);
+           non-obvious literal arguments (e.g. with_versioning(true, 0));
+           error handling that diverges from the rest of the file.
+  LOW:     Raw API usage with no comment context.
+
+Schema (strict JSON):
+[
+  { "candidate_id": "C1",
+    "signal_tier": "high" | "medium" | "low",
+    "file_line": "L42",
+    "evidence_quote": "exact text from file at that line",
+    "draft_rule": "imperative verb + specific target",
+    "draft_reason": "what breaks and why",
+    "draft_severity": "critical" | "high" | "normal" | "low" } ]
+
+Goal: maximize recall. Weak candidates are OK — filtered next.
+
+### Stage 3 — Critique loop (bounded, 3 rounds)
+
+ROUND 1 — Specificity. Discard candidates failing ANY of:
+  Specific    — names a concrete API, value, or pattern
+  Enforceable — could a hook deny a real mistake based on this rule?
+  Non-obvious — would a reviewer learn something not derivable from
+                type signatures alone?
+  Causal      — does the reason state WHAT breaks with "because"/"since"?
+
+ROUND 2 — Cross-reference verification (DETERMINISTIC, D-α).
+For each Round 1 survivor, call `mati verify-evidence` via Bash:
+  mati verify-evidence \
+    --file <path> \
+    --line <candidate.file_line> \
+    --quote "<candidate.evidence_quote>" \
+    --pattern "<api/literal named in candidate.draft_rule>"
+The CLI returns JSON. Parse it:
+  { "verified": true, ... }  → keep, add "verified": true
+  { "verified": false, ... } → DISCARD (hallucinated citation, or
+                                rule generalizes beyond visible scope)
+Do NOT trust self-critique here. The CLI is the source of truth.
+
+ROUND 3 — Stability check. If Round 2 == Round 1, proceed. If Round 2
+discarded items, re-run Round 2 on the new survivor set. Cap at 3
+iterations total.
+
+### Stage 4 — Refinement and write
+
+For each verified candidate:
+
+1. Tighten rule: imperative verb first; concrete names not pronouns;
+   ≤ 80 chars where possible.
+2. Verify reason uses "because"/"since"/"as" — add if missing.
+3. Assign severity via HYBRID CLASSIFIER (D-β). Two passes:
+
+   3a. KEYWORD pass (deterministic):
+       contains "panic" / "data loss" / "corruption" / "security"
+         → critical
+       contains "regress" / "wrong result" / "silent failure" / "race" /
+                "silently" / "lose" / "lost" / "unbounded" / "indefinite"
+         → high
+       contains "performance" / "warning" / "deprecation" / "slow" /
+                "lock" / "exclusive" / "contention" / "stale state" /
+                "false positive" / "inconsistent"
+         → normal
+       else
+         → low
+
+   3b. SEMANTIC pass (LLM judgment) using rubric:
+       critical — data loss, corruption, security, unbounded growth
+       high     — wrong result, silent failure, race, broken invariant
+       normal   — performance, workflow blocker, non-obvious cleanup
+       low      — informational, stylistic, minor inconvenience
+
+   3c. If 3a and 3b agree → use that severity.
+       If they disagree → use the HIGHER + add tag "severity-disputed".
+
+4. Call `mem_set`:
+     key: `gotcha:<slug>`
+     rule, reason, severity (from step 3)
+     affected_files: [<path>]
+     tags:  ["enriched", "depth:<tier>"]
+          + ["signal-source:ast"] (if Stage 1 step 4 used extract-signals)
+            else ["signal-source:llm"]
+          + ["with-neg-exemplars"] (if Stage 1 step 3 used negatives)
+          + (["severity-disputed"] if step 3c flagged)
+     confirmed: false
+
+     The `depth:<tier>` tag (D3) drives per-tier accuracy in
+     `mati doctor`. The `signal-source:*` and `with-neg-exemplars`
+     tags (SOTA-γ) drive per-config A/B so reviewers can prove the
+     SOTA pipeline outperforms the legacy LLM scan.
+
+### Notes
+
+- Per-file token budget: ~8K tokens for Stages 2-3 combined. If you
+  exceed, truncate Stage 2 candidates to top 10 by signal_tier.
+- Rust-side quality gate still applies at write time. The pipeline
+  maximizes what gets through; the gate enforces the floor.
 "#;
 
 const SKILL_CONFIG_PATH: &str = ".codex/skills/mati/SKILL.md";

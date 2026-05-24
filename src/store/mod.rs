@@ -9,8 +9,10 @@
 pub mod db;
 pub mod durability;
 pub mod enforcement;
+pub mod extraction;
 pub mod gotcha_ops;
 pub mod migrations;
+pub mod negative_exemplar;
 pub mod record;
 pub mod repair;
 pub mod session;

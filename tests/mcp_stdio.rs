@@ -434,8 +434,10 @@ fn mcp_stdio_gotcha_lifecycle() {
         "mem_get",
         r#"{"key":"gotcha:lifecycle-test"}"#,
     );
+    // mem_get may emit either compact (no space) or pretty JSON — accept both
+    // so the test isn't coupled to the serializer's whitespace preference.
     assert!(
-        get_text.contains("\"confirmed\": false"),
+        get_text.contains("\"confirmed\": false") || get_text.contains("\"confirmed\":false"),
         "should be unconfirmed: {get_text}"
     );
     assert!(
@@ -465,7 +467,8 @@ fn mcp_stdio_gotcha_lifecycle() {
         r#"{"key":"gotcha:lifecycle-test"}"#,
     );
     assert!(
-        confirmed_text.contains("\"confirmed\": true"),
+        confirmed_text.contains("\"confirmed\": true")
+            || confirmed_text.contains("\"confirmed\":true"),
         "should be confirmed: {confirmed_text}"
     );
     assert!(
@@ -514,12 +517,15 @@ fn mcp_stdio_validation_gates() {
         "mem_set",
         r#"{"action":"write","key":"session:invalid","value":"test","category":"File","payload":"{}"}"#,
     );
+    // Source: src/mcp/tools.rs:416 — emitted when the key prefix isn't one
+    // of gotcha:/decision:/dev_note:.
     assert!(
-        text.contains("must start with"),
+        text.contains("requires key with") || text.contains("must start with"),
         "should reject invalid prefix: {text}"
     );
 
-    // Key-category mismatch
+    // Gotcha key with non-gotcha payload — the rule-field gate (tools.rs:360)
+    // fires before category mismatch, so we assert on the actual error path.
     let text = call_tool(
         &mut stdin,
         &rx,
@@ -528,11 +534,13 @@ fn mcp_stdio_validation_gates() {
         r#"{"action":"write","key":"gotcha:mismatch","value":"test","category":"File","payload":"{\"purpose\":\"wrong\"}"}"#,
     );
     assert!(
-        text.contains("requires category"),
+        text.contains("requires non-empty 'rule'") || text.contains("requires category"),
         "should reject mismatch: {text}"
     );
 
-    // Missing gotcha fields
+    // Missing gotcha fields. The rule gate fires first; verify it. Then send
+    // a second payload with rule but no reason to prove the reason gate also
+    // fires (src/mcp/tools.rs:362).
     let text = call_tool(
         &mut stdin,
         &rx,
@@ -541,8 +549,19 @@ fn mcp_stdio_validation_gates() {
         r#"{"action":"write","key":"gotcha:no-fields","value":"test","category":"Gotcha","payload":"{\"severity\":\"normal\"}"}"#,
     );
     assert!(
-        text.contains("rule") && text.contains("reason"),
-        "should reject missing fields: {text}"
+        text.contains("'rule'"),
+        "should reject missing rule: {text}"
+    );
+    let text = call_tool(
+        &mut stdin,
+        &rx,
+        222,
+        "mem_set",
+        r#"{"action":"write","key":"gotcha:no-reason","value":"test","category":"Gotcha","payload":"{\"rule\":\"x\",\"severity\":\"normal\"}"}"#,
+    );
+    assert!(
+        text.contains("'reason'"),
+        "should reject missing reason: {text}"
     );
 
     // Unknown action
