@@ -71,7 +71,27 @@ intent. Apply all four stages per file.
    → top 5 confirmed gotchas as POSITIVE EXEMPLARS. If zero exist
      (cold start), continue with schema-only guidance.
 2. `mem_get(\"file:<path>\")` — mints the consultation receipt, returns
-   existing gotcha_keys so duplicates aren't proposed.
+   existing gotcha_keys, AND returns the `enrichment_depth_hint` field
+   (D2-α: one of \"fast\", \"standard\", \"deep\"). Use it to pick the
+   tier branch below. If absent (older daemon), default to \"deep\".
+3. **Deep tier only**: call via Bash
+   `mati ls tombstoned --dir <dirname-of-file> --recent 30d --json`
+   to retrieve NEGATIVE EXEMPLARS — rules that were proposed for
+   this directory and then tombstoned. Use them in Stage 2 to
+   calibrate AGAINST proposing similar rules. If `count` is 0,
+   skip the negative block.
+
+### Tier branches (D2)
+
+| Tier      | Stage 2     | Stage 3 critique | Negative exemplars |
+| --------- | ----------- | ---------------- | ------------------ |
+| fast      | schema only | skip             | no                 |
+| standard  | positive    | Round 1 + 2      | no                 |
+| deep      | positive    | Rounds 1, 2, 3   | yes                |
+
+`fast` for trivial files (LoC < 100, isolated blast, no cluster).
+`standard` is the default. `deep` runs the full pipeline including
+negative exemplars for hotspot / signal-rich files.
 
 ### Stage 2 — Enumeration (maximize recall)
 
@@ -161,8 +181,12 @@ For each verified candidate:
      key: `gotcha:<slug>`
      rule, reason, severity (from step 3)
      affected_files: [<path>]
-     tags: [\"enriched\"] + ([\"severity-disputed\"] if step 3c flagged)
+     tags: [\"enriched\", \"depth:<tier>\"]
+           + ([\"severity-disputed\"] if step 3c flagged)
      confirmed: false
+
+     The `depth:<tier>` tag (D3) lets `mati doctor` aggregate per-tier
+     extraction accuracy. `<tier>` is the value from Stage 1 step 2.
 
 ### Notes
 
