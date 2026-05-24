@@ -89,7 +89,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
         for cap in m.captures {
             let node = cap.node;
             let line = node.start_position().row as u32 + 1;
-            let evidence = node_text(source_bytes, node);
+            let evidence = super::node_text(source_bytes, node);
 
             let (kind, tier) = if cap.index == panic_macro_idx {
                 (SignalKind::Panic, SignalTier::High)
@@ -98,18 +98,12 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             } else if cap.index == unwrap_call_idx {
                 (SignalKind::UnwrapLike, SignalTier::Medium)
             } else if cap.index == comment_idx {
-                // Defer to shared comment scanner — may return None for
-                // ordinary comments (we don't want every // comment as a
-                // signal). Linter-disable patterns also handled.
                 if let Some(sig) = comments::scan_comment_text(&evidence, line) {
                     signals.push(sig);
-                    continue;
-                }
-                if let Some(sig) =
+                } else if let Some(sig) =
                     comments::scan_linter_disable(&evidence, line, Language::Rust)
                 {
                     signals.push(sig);
-                    continue;
                 }
                 continue;
             } else {
@@ -120,31 +114,12 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
                 file_line: line,
                 tier,
                 kind,
-                evidence: trim_evidence(&evidence),
+                evidence: super::trim_evidence(&evidence),
             });
         }
     }
 
     Ok(signals)
-}
-
-fn node_text(source: &[u8], node: tree_sitter::Node) -> String {
-    let start = node.start_byte();
-    let end = node.end_byte().min(source.len());
-    if start >= end {
-        return String::new();
-    }
-    String::from_utf8_lossy(&source[start..end]).into_owned()
-}
-
-fn trim_evidence(text: &str) -> String {
-    let one_line = text.replace('\n', " ");
-    if one_line.chars().count() <= 200 {
-        one_line.trim().to_string()
-    } else {
-        let truncated: String = one_line.chars().take(200).collect();
-        format!("{}…", truncated.trim_end())
-    }
 }
 
 #[cfg(test)]

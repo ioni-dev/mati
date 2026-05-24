@@ -26,7 +26,18 @@ use crate::analysis::walker::Language;
 
 pub mod comments;
 pub mod rust;
-// Additional language modules land in the next commit.
+// Additional language modules:
+pub mod c;
+pub mod cpp;
+pub mod elixir;
+pub mod go;
+pub mod haskell;
+pub mod java;
+pub mod javascript;
+pub mod python;
+pub mod ruby;
+pub mod scala;
+pub mod typescript;
 
 /// Signal strength tier — drives the prompt's "extract from highest first"
 /// ranking in Stage 2.
@@ -149,11 +160,21 @@ pub fn extract_signals(path: &Path, language: Language) -> Result<SignalReport> 
 
     let mut signals = match language {
         Language::Rust => rust::extract(&source)?,
-        // All other supported languages are wired in the next commit.
-        // Until then they fall through to the comment-only scan, which
-        // still catches WARNING/FIXME/HACK markers and `noqa`-style
-        // linter disables — useful even without AST queries.
-        _ => comments::scan_unknown(&source, language),
+        Language::Python => python::extract(&source)?,
+        Language::TypeScript => typescript::extract(&source)?,
+        Language::JavaScript => javascript::extract(&source)?,
+        Language::Go => go::extract(&source)?,
+        Language::Java => java::extract(&source)?,
+        Language::C => c::extract(&source)?,
+        Language::Cpp => cpp::extract(&source)?,
+        Language::Ruby => ruby::extract(&source)?,
+        Language::Scala => scala::extract(&source)?,
+        Language::Elixir => elixir::extract(&source)?,
+        Language::Haskell => haskell::extract(&source)?,
+        // Unknown / unsupported file types still get caught via the
+        // comment-only fallback so .toml, .md, .yaml, etc. surface
+        // WARNING/FIXME markers and linter disables.
+        Language::Unknown => comments::scan_unknown(&source, language),
     };
 
     sort_canonical(&mut signals);
@@ -164,6 +185,30 @@ pub fn extract_signals(path: &Path, language: Language) -> Result<SignalReport> 
         signal_count: signals.len(),
         signals,
     })
+}
+
+/// Read a tree-sitter node's source-text slice. Used by every per-language
+/// extractor — hoisted here so each module stays focused on its query.
+pub(crate) fn node_text(source: &[u8], node: tree_sitter::Node) -> String {
+    let start = node.start_byte();
+    let end = node.end_byte().min(source.len());
+    if start >= end {
+        return String::new();
+    }
+    String::from_utf8_lossy(&source[start..end]).into_owned()
+}
+
+/// Collapse newlines and cap evidence at 200 characters with an ellipsis
+/// suffix. Shared by all per-language extractors so SignalReport JSON
+/// stays bounded regardless of source complexity.
+pub(crate) fn trim_evidence(text: &str) -> String {
+    let one_line = text.replace('\n', " ");
+    if one_line.chars().count() <= 200 {
+        one_line.trim().to_string()
+    } else {
+        let truncated: String = one_line.chars().take(200).collect();
+        format!("{}…", truncated.trim_end())
+    }
 }
 
 /// Sort signals into the canonical output order: tier desc, then line asc.
