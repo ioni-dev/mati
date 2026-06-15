@@ -26,7 +26,7 @@
 //! log and:
 //!   - returns `Ready` as soon as `startup phase=ready` lands + a ping
 //!     succeeds (typical cold start: <300ms)
-//!   - returns `Failed` immediately when `serve_failed` is observed
+//!   - returns `Failed` immediately when `serve_failed` or `panic` is observed
 //!   - returns `Wedged` if no new event has landed for `wedge_threshold`
 //!     (default 15s) — useful when migration or repair has hung
 //!   - returns `HardCap` if the absolute `hard_cap` (default 60s) elapses
@@ -77,8 +77,9 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) enum ReadinessOutcome {
     /// Daemon emitted `startup phase=ready` and a ping confirmed reachability.
     Ready,
-    /// Daemon emitted `serve_failed` — startup aborted. The reason string is
-    /// the lifecycle event's `detail` field.
+    /// Daemon emitted `serve_failed` (handled fatal error) or `panic` (panic
+    /// hook, just before unwind) — startup aborted. The reason string is the
+    /// lifecycle event's `detail` field.
     Failed(String),
     /// `lifecycle.log` stopped emitting new events for at least
     /// `READINESS_WEDGE_THRESHOLD`. The last observed phase is included
@@ -225,7 +226,14 @@ pub(crate) async fn wait_for_ready(
         if !new_events.is_empty() {
             last_progress_at = Instant::now();
             for ev in &new_events {
-                if ev.event == "serve_failed" {
+                // `serve_failed` is the handled-error terminal signal;
+                // `panic` is emitted by the daemon's panic hook
+                // (`metadata.rs`) just before it unwinds. Both are terminal —
+                // treat them identically. Without the `panic` arm, a startup
+                // panic would surface only via the 15s wedge path with a
+                // misleading "stuck at <last phase>" diagnostic instead of the
+                // panic's real location/payload, which is in `detail`.
+                if ev.event == "serve_failed" || ev.event == "panic" {
                     return ReadinessOutcome::Failed(ev.detail.clone());
                 }
                 if let Some(p) = ev.phase() {
@@ -761,6 +769,49 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "Failed must surface quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_returns_failed_immediately_on_panic_event() {
+        // A panic during cold start (e.g. an unexpected unwrap/assert inside
+        // Store::open or a migration) is recorded by the daemon's panic hook
+        // as a `panic` lifecycle event just before the process unwinds. It
+        // must be treated as terminal exactly like `serve_failed` — surfaced
+        // as `Failed` in one poll tick, NOT left to the 15s wedge path with a
+        // misleading "stuck at <phase>" diagnostic.
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let emitter_root = root.clone();
+        let emitter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_event(&emitter_root, "startup", "phase=opening_store");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            write_event(
+                &emitter_root,
+                "panic",
+                "src/store/db.rs:1119 called `Option::unwrap()` on a `None` value",
+            );
+        });
+
+        let start = Instant::now();
+        let outcome = wait_for_ready(&root, Duration::from_secs(10), Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        let _ = emitter.await;
+
+        match outcome {
+            ReadinessOutcome::Failed(detail) => {
+                assert!(
+                    detail.contains("db.rs:1119"),
+                    "failure detail must surface the panic location, got {detail:?}"
+                );
+            }
+            other => panic!("expected Failed on panic event, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a startup panic must surface as Failed quickly, took {elapsed:?}"
         );
     }
 
