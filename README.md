@@ -1,28 +1,26 @@
 # mati
 
-A knowledge store for codebases. It stores what you've learned about each file, injects the relevant records before Claude reads, and blocks reads it can already answer.
+A knowledge store for codebases. mati remembers what you've learned about each file, surfaces the relevant records before Claude reads, and can skip the read entirely when the stored context is enough.
 
 Single Rust binary. MCP stdio server. Claude Code plugin.
 
-For compliance teams that need signed audit trails and SOC 2/HIPAA evidence, see [mati Enterprise](https://mati.dev).
+Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://getmati.dev)).
 
 ---
 
 ## The name
 
-**mati** is a Nahuatl verb. It means "to know" or "to think." UNAM's Gran Diccionario Náhuatl defines it as a transitive verb: *nicmati* means "I know it," *quimati* means "he or she knows it." ([source](https://gdn.iib.unam.mx/diccionario/mati/182730))
-
-The name fits. The tool's job is knowing things about your codebase so you don't have to restate them.
+**mati** is a Nahuatl verb meaning "to know" or "to think." UNAM's Gran Diccionario Náhuatl lists it as transitive: _nicmati_ is "I know it," _quimati_ is "he or she knows it" ([source](https://gdn.iib.unam.mx/diccionario/mati/182730)). That is the tool's job: know things about your codebase so you don't have to keep restating them.
 
 ---
 
 ## The problem
 
-Knowledge about a codebase lives in people's heads. Why `with_versioning(true, 0)` means indefinite retention, not "disabled." Why that auth middleware does something non-obvious. Why the test suite must run under `cargo nextest` and not vanilla `cargo test`. This stuff gets explained in Slack threads, in code review comments, sometimes in a GOTCHAS.md that nobody reads.
+A lot of what you know about a codebase never makes it into the codebase. Why `with_versioning(true, 0)` means indefinite retention and not "disabled." Why a piece of auth middleware does something non-obvious. Why the test suite has to run under `cargo nextest` instead of vanilla `cargo test`. It lands in Slack threads, in review comments, or in a markdown file nobody opens.
 
-When the developer who knew it leaves, it's gone. When Claude opens a file for the twentieth time, you re-explain it from scratch.
+When the person who knew it leaves, it's gone. When Claude opens the same file for the twentieth time, you explain it again from scratch.
 
-mati is built for that: it stores what you've learned as structured records attached to files, confirmed by developers, and enforced at the hook level.
+mati stores that knowledge as structured records attached to files, confirmed by developers, and enforced at the hook level.
 
 ---
 
@@ -41,34 +39,34 @@ mati runs as two processes:
                         └──────────────────────┘
 ```
 
-`mati serve` is a thin MCP-stdio forwarder. It starts the daemon if one isn't running, then proxies tool calls over a Unix socket.
+`mati serve` is a thin MCP-stdio forwarder. It starts the daemon if one isn't already running, then proxies tool calls over a Unix socket.
 
-`mati daemon` owns the store. It holds the SurrealKV lock, answers queries, and shuts itself down after 30 minutes of idle with no active connections.
+`mati daemon` owns the store. It holds the SurrealKV lock, answers queries, and shuts down after 30 minutes idle with no active connections.
 
 ### The four MCP tools
 
 mati exposes exactly four tools. That's a hard constraint: every tool definition costs tokens on every call.
 
-| Tool | What it does |
-|---|---|
+| Tool            | What it does                                                    |
+| --------------- | --------------------------------------------------------------- |
 | `mem_bootstrap` | Returns a token-budgeted context packet for the current session |
-| `mem_get` | Looks up a record by key (`file:<path>`, `gotcha:<slug>`, etc.) |
-| `mem_query` | Text search + graph traversal |
-| `mem_set` | Writes a record |
+| `mem_get`       | Looks up a record by key (`file:<path>`, `gotcha:<slug>`, etc.) |
+| `mem_query`     | Text search + graph traversal                                   |
+| `mem_set`       | Writes a record                                                 |
 
 ### Records and gotchas
 
-Every file gets a `file:<path>` record with a purpose summary, entry points, and a list of attached gotcha keys. Gotchas are the core unit: a rule, a reason, a severity, and a `confirmed` flag.
+Every file gets a `file:<path>` record: a purpose summary, entry points, and the keys of any attached gotchas. Gotchas are the core unit, each one a rule, a reason, a severity, and a `confirmed` flag.
 
-Unconfirmed gotchas are candidates. They exist in the graph but don't affect Claude's behavior. Once a developer confirms one, mati starts enforcing it.
+Unconfirmed gotchas are candidates. They sit in the graph but don't change Claude's behavior. Confirming one turns on enforcement for it.
 
-The enforcement rule is simple: if a record has `confidence >= 0.6`, `confirmed = true`, and `quality >= 0.4`, the pre-read hook injects it before Claude opens the file. High-confidence records can deny the read entirely and inject the record instead. Lower-confidence records attach context without blocking.
+Enforcement is a single threshold. If a record has `confidence >= 0.6`, `confirmed = true`, and `quality >= 0.4`, the pre-read hook injects it before Claude opens the file. A high-confidence record can deny the read outright and hand Claude the record instead. Lower-confidence records attach context without blocking.
 
 ### Static analysis
 
-`mati init` runs a Layer 0 scan: tree-sitter parsing across 12 languages, import graph construction, co-change clustering from git history. No LLM calls.
+`mati init` runs a Layer 0 scan with no LLM calls: tree-sitter parsing across 12 languages, import-graph construction, and co-change clustering from git history.
 
-`mati enrich` runs Layer 1: Claude reads each file, extracts gotcha candidates using a four-stage pipeline (setup, enumeration, critique loop, write). Run `mati review` afterward to confirm candidates and activate enforcement.
+`mati enrich` runs Layer 1 through Claude Code: Claude reads each file and extracts gotcha candidates via a four-stage pipeline (setup, enumeration, critique loop, write). Run `mati review` afterward to confirm candidates and turn on enforcement.
 
 ---
 
@@ -108,82 +106,69 @@ mati stats
 
 ## CLI reference
 
-| Command | What it does |
-|---|---|
-| `mati init` | Layer 0 scan and scaffold |
-| `mati enrich [path]` | Layer 1 enrichment via Claude |
-| `mati gotcha add` | Add a gotcha interactively |
-| `mati gotcha confirm <key>` | Confirm a candidate and activate it |
-| `mati review` | Batch confirm or tombstone candidates |
-| `mati status` | Knowledge health dashboard |
-| `mati stats` | Coverage and onboarding score |
-| `mati gaps` | Files with no records or low confidence |
-| `mati stale` | Records that haven't been touched since a file changed |
-| `mati explain <file>` | File briefing: gotchas, blast radius, co-change partners, cluster membership |
-| `mati clusters` | Co-change clusters from git history |
-| `mati diff <key>` | Show record history |
-| `mati repair` | Reconcile derived indexes against canonical records |
-| `mati repair --check` | Same, exits non-zero if drift is found (CI-safe) |
-| `mati doctor` | Aggregated health check |
-| `mati daemon start/stop/status` | Manage the background daemon |
-| `mati check` | Environment self-test |
+| Command                         | What it does                                                                 |
+| ------------------------------- | ---------------------------------------------------------------------------- |
+| `mati init`                     | Layer 0 scan and scaffold                                                    |
+| `mati enrich [path]`            | Layer 1 enrichment via Claude                                                |
+| `mati gotcha add`               | Add a gotcha interactively                                                   |
+| `mati gotcha confirm <key>`     | Confirm a candidate and activate it                                          |
+| `mati review`                   | Batch confirm or tombstone candidates                                        |
+| `mati status`                   | Knowledge health dashboard                                                   |
+| `mati stats`                    | Coverage and onboarding score                                                |
+| `mati gaps`                     | Files with no records or low confidence                                      |
+| `mati stale`                    | Records that haven't been touched since a file changed                       |
+| `mati explain <file>`           | File briefing: gotchas, blast radius, co-change partners, cluster membership |
+| `mati clusters`                 | Co-change clusters from git history                                          |
+| `mati diff [range]`             | Pre-merge check: surface gotchas for files in a git diff range               |
+| `mati repair`                   | Reconcile derived indexes against canonical records                          |
+| `mati repair --check`           | Same, exits non-zero if drift is found (CI-safe)                             |
+| `mati doctor`                   | Aggregated health check                                                      |
+| `mati daemon start/stop/status` | Manage the background daemon                                                 |
+| `mati check`                    | Environment self-test                                                        |
 
 ---
 
 ## Stack
 
-These are locked. Don't swap without adding an entry to `DECISIONS.md`.
+These are locked. Don't swap them without a strong, documented reason.
 
-| Crate | Purpose |
-|---|---|
-| `surrealkv` | Primary KV store. SurrealKV, not redb or sled |
-| `petgraph` | In-memory graph. Edges persisted in SurrealKV |
-| `tantivy` | Full-text BM25 search |
-| `rmcp` | MCP stdio server (Rust MCP SDK) |
-| `tree-sitter` | Static analysis parser, 12 language grammars |
-| `ignore` | Repo walking, respects `.gitignore` |
-| `git2` | Git history mining |
-| `rayon` | Parallel file processing |
-| `clap` + `comfy-table` | CLI. No TUI framework, no ratatui |
+| Crate                  | Purpose                                       |
+| ---------------------- | --------------------------------------------- |
+| `surrealkv`            | Primary KV store. SurrealKV, not redb or sled |
+| `petgraph`             | In-memory graph. Edges persisted in SurrealKV |
+| `tantivy`              | Full-text BM25 search                         |
+| `rmcp`                 | MCP stdio server (Rust MCP SDK)               |
+| `tree-sitter`          | Static analysis parser, 12 language grammars  |
+| `ignore`               | Repo walking, respects `.gitignore`           |
+| `git2`                 | Git history mining                            |
+| `rayon`                | Parallel file processing                      |
+| `clap` + `comfy-table` | CLI. No TUI framework, no ratatui             |
 
-The semantic layer (vector search via `candle` + `usearch`) is feature-gated behind `--features semantic`. It's not compiled into the default binary.
+The semantic layer (vector search via `candle` + `usearch`) is feature-gated behind `--features semantic`. It isn't compiled into the default binary.
 
 ---
 
-## Free for developers. Paid for compliance teams.
+## Free local tool, paid audit layer for teams
 
-mati is the complete product for a solo developer. Everything here is free and always will be.
+mati is the complete product for a solo developer, and all of it is free. From the first run, the enforcement engine records every DENY, every ALLOW, and every hook decision to a hash-chained, append-only event log. That log stays local and yours.
 
-One thing to know: the enforcement engine records every DENY, every ALLOW, and every consultation in a hash-chained, tamper-evident event log — from the day you install it. That log is local, append-only, and yours.
+**mati Enterprise** reads that log and turns it into signed audit artifacts for teams at regulated companies:
 
-For teams at regulated companies, **mati Enterprise** reads that log and produces signed audit artifacts:
-
-- Signed audit PDF export (cryptographically signed, hash-chained, tamper-evident)
-- License-verified enforcement reports
+- Signed audit PDF export (cryptographically signed, tamper-evident)
+- Enforcement reports tied to license state
 - Extended retention controls
-- Direct founder support
 
-The following features are reserved for mati Enterprise and will never be in this repo:
+Also Enterprise-only, and not in this repo: multi-repo sync and a cross-repo gotcha registry; SSO, SAML, OIDC, RBAC; managed Slack / Teams / PagerDuty integration; compliance packs for HIPAA, SOC 2, and PCI; and a centralized governance dashboard.
 
-- Multi-repo sync and cross-repo gotcha registry
-- SSO, SAML, OIDC, RBAC
-- Managed Slack / Teams / PagerDuty integration
-- Curated compliance packs (HIPAA, SOC 2, PCI)
-- Centralized governance dashboard
+Enterprise is a reporting layer on top of the local log. The enforcement path itself is identical in both tiers: local-only, deterministic, zero network calls. mati never phones home.
 
-The enforcement path is identical across both tiers: zero network calls, local-only, deterministic. Enterprise adds the reporting layer — it never changes the enforcement behavior.
-
-One invariant across both tiers: **the enforcement path makes zero network calls.** DENY and ALLOW decisions are local, always. mati never phones home.
-
-See [mati.dev](https://mati.dev) for the enterprise tier, or [SALES_HANDOFF.md] in the mati-cloud repo for internal sales documentation.
+See [getmati.dev](https://getmati.dev) for the Enterprise tier.
 
 ---
 
 ## Contributing
 
-Read `ARCHITECTURE.md` first. It has the full data model, hook decision matrix, process lifecycle, and everything else that doesn't fit in a README.
-
-`DECISIONS.md` lists locked choices and why. `GOTCHAS.md` has the traps that bit us during development.
+See `CONTRIBUTING.md` for how to contribute and what's in scope (mati is open core, so some features live in the commercial tier). `ARCHITECTURE.md` has the data model, hook decision matrix, and process lifecycle.
 
 Tests run under `cargo-nextest`:
 
@@ -193,3 +178,9 @@ cargo nextest run --lib
 ```
 
 Vanilla `cargo test` works but is constrained to single-threaded execution. See `CLAUDE.md` for why.
+
+---
+
+## License
+
+mati is released under the [MIT License](LICENSE). The "mati" name and logo are trademarks of the project — see [TRADEMARK.md](TRADEMARK.md).
