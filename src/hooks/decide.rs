@@ -348,12 +348,16 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
         let gquality = json_f32(grec, "/quality/value");
         let rule = json_str(grec, "/value");
 
+        // Only confirmed, injectable gotchas contribute to the injected
+        // context (P4: unconfirmed gotchas never influence injection). Gating
+        // the rule push here also bounds the payload — without it, every
+        // attached gotcha, including unconfirmed Layer-0 stubs, was dumped into
+        // the context (a single hotspot file with 1k+ stubs produced ~47 KB).
         if confirmed && gconfidence >= 0.6 && gquality >= 0.4 {
             deny_signal = true;
-        }
-
-        if !rule.is_empty() {
-            context_lines.push(format!("\u{26a0} {rule}"));
+            if !rule.is_empty() {
+                context_lines.push(format!("\u{26a0} {rule}"));
+            }
         }
     }
 
@@ -833,7 +837,15 @@ mod tests {
         };
         let result = evaluate(&input);
         // No deny signal — falls through to advisory (confidence 0.7 >= 0.3, quality 0.5 >= 0.4).
-        assert!(matches!(&result.decision, Decision::Advisory { .. }));
+        // P4: the unconfirmed gotcha's rule must NOT leak into the injected
+        // context — only confirmed gotchas contribute to injection.
+        match &result.decision {
+            Decision::Advisory { context } => assert!(
+                !context.contains("Do not use unwrap here"),
+                "unconfirmed gotcha rule leaked into injected context: {context:?}"
+            ),
+            other => panic!("expected Advisory, got {other:?}"),
+        }
     }
 
     #[test]
