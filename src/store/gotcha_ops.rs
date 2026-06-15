@@ -510,32 +510,58 @@ async fn update_file_gotcha_key(
     add: bool,
 ) -> Result<()> {
     let file_key = format!("file:{file_path}");
-    let Some(mut record) = store.get(&file_key).await? else {
-        // File record doesn't exist yet. Mark dirty so `mati repair`
-        // back-fills the link when the file is later indexed by init.
-        if add {
-            crate::store::repair::mark_dirty(
-                store,
-                gotcha_key,
-                &format!("file record missing at link-sync time: {file_key}"),
-            )
-            .await;
+
+    // Bounded retry on optimistic-concurrency write conflicts. Concurrent
+    // gotcha writes touching the same file:<path> record (e.g. parallel
+    // `mati gotcha add` to one file in direct mode) race on this
+    // read-modify-write under SurrealKV MVCC. Re-read on each attempt so we
+    // re-apply against the latest gotcha_keys rather than clobbering a
+    // sibling's concurrent add. Without this, the conflict falls through to
+    // the caller's best-effort dirty-marker path and needs `mati repair`.
+    const MAX_RETRIES: usize = 4;
+    for attempt in 0..MAX_RETRIES {
+        let Some(mut record) = store.get(&file_key).await? else {
+            // File record doesn't exist yet. Mark dirty so `mati repair`
+            // back-fills the link when the file is later indexed by init.
+            if add {
+                crate::store::repair::mark_dirty(
+                    store,
+                    gotcha_key,
+                    &format!("file record missing at link-sync time: {file_key}"),
+                )
+                .await;
+            }
+            return Ok(());
+        };
+
+        let changed = if add {
+            add_gotcha_key(&mut record, gotcha_key)
+        } else {
+            remove_gotcha_key(&mut record, gotcha_key)
+        };
+
+        if !changed {
+            return Ok(());
         }
-        return Ok(());
-    };
 
-    let changed = if add {
-        add_gotcha_key(&mut record, gotcha_key)
-    } else {
-        remove_gotcha_key(&mut record, gotcha_key)
-    };
-
-    if changed {
         let now = now_secs();
         record.updated_at = now;
         record.version.logical_clock += 1;
         record.version.wall_clock = now;
-        store.put(&file_key, &record).await?;
+
+        match store.put(&file_key, &record).await {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if attempt + 1 < MAX_RETRIES
+                    && e.to_string().to_lowercase().contains("write conflict") =>
+            {
+                // Another writer committed file:<path> between our get and put.
+                // Back off briefly (5/10/20ms) and retry against a fresh read.
+                tokio::time::sleep(std::time::Duration::from_millis(5u64 << attempt)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(())
