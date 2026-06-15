@@ -26,4 +26,9 @@ CLAUDE.md
 mati\ -\ readme.md
 
 *.md
+
+# Public OSS-release docs — override the *.md ignore above
+!CONTRIBUTING.md
+!TRADEMARK.md
+
 docs/REAL_LIFE_TEST_REPORT_M11.md
