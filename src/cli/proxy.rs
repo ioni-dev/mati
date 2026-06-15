@@ -467,10 +467,20 @@ impl StoreProxy {
                     match daemon_v2(root, cmd).await {
                         DaemonResult::Ok(resp) => {
                             if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                                imported +=
-                                    resp.get("imported").and_then(|v| v.as_u64()).unwrap_or(0);
-                                skipped +=
-                                    resp.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+                                // The daemon handler's payload is nested under
+                                // `data` by `send_v2_raw`; read the counts from
+                                // there, not the envelope top level (reading the
+                                // top level always yields 0/0 — the records still
+                                // import, but the reported count is wrong).
+                                let data = resp.get("data");
+                                imported += data
+                                    .and_then(|d| d.get("imported"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                skipped += data
+                                    .and_then(|d| d.get("skipped"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
                             } else {
                                 let err = resp
                                     .get("error")
