@@ -264,13 +264,25 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
     };
 
     // ── Scan all namespaces in parallel ───────────────────────────────────
-    let (files, gotchas, decisions, notes, deps) = tokio::try_join!(
+    let (mut files, mut gotchas, mut decisions, mut notes, mut deps) = tokio::try_join!(
         store.scan_prefix("file:"),
         store.scan_prefix("gotcha:"),
         store.scan_prefix("decision:"),
         store.scan_prefix("dev_note:"),
         store.scan_prefix("dep:"),
     )?;
+
+    // Count only Active records. Tombstoned/superseded records must not inflate
+    // the dashboard counts — `mati ls` already filters this way, but `status`
+    // used to count every lifecycle, over-reporting totals and the confirmed
+    // count (notably confirmed-then-tombstoned gotchas). Filtering at the source
+    // fixes both the live render below and the StatusSnapshot cache built from
+    // these vecs.
+    files.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+    gotchas.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+    decisions.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+    notes.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+    deps.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
 
     // ── Project name from cwd ─────────────────────────────────────────────
     let project = cwd
