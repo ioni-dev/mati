@@ -5,9 +5,8 @@ edition     = "2021"
 rust-version = "1.82"
 description = "Engineering knowledge that survives turnover"
 license     = "MIT"
-repository  = "https://github.com/mati-dev/mati"
-homepage    = "https://mati.dev"
-documentation = "https://docs.mati.dev"
+repository  = "https://github.com/ioni-dev/mati"
+homepage    = "https://getmati.dev"
 keywords    = ["ai", "mcp", "claude", "knowledge", "developer-tools"]
 categories  = ["command-line-utilities", "development-tools"]
 exclude     = [".claude/", "docs/", "*.md"]
@@ -110,7 +109,7 @@ rayon = "1.11.0"
 # default-features = false: skip vendored libgit2, use system.
 git2 = { version = "0.20.4", default-features = false, features = ["vendored-openssl"] }
 
-# --- MCP stdio server (P3 — three tools hard constraint) ---
+# --- MCP stdio server (P3 — four tools hard constraint) ---
 # Rust MCP SDK, stdio transport, <10ms startup.
 rmcp = { version = "1.2.0", features = ["server", "transport-io"] }
 
