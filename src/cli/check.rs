@@ -361,10 +361,22 @@ async fn check_daemon(mati_root_opt: Option<PathBuf>) -> CheckItem {
             let ms = latency.as_secs_f64() * 1000.0;
             CheckItem::pass("daemon", Some(format!("ping {ms:.1}ms")))
         }
-        DaemonResult::NotRunning | DaemonResult::StaleSocket => CheckItem::warn(
+        // Not running at rest is benign: the daemon idle-shuts-down after
+        // 30min and auto-starts on demand via `ensure_daemon` when a hook or
+        // `mati serve` next runs. Enforcement is not degraded — the first call
+        // just pays ~150ms spawn latency. Mirror `mati doctor`, which treats
+        // this as informational rather than a warning, so `mati check` doesn't
+        // print a misleading "degraded" banner for the normal idle state.
+        DaemonResult::NotRunning => CheckItem::pass(
             "daemon",
-            "not running — hook latency ~150ms",
-            Some("run: mati daemon start".to_string()),
+            Some("not running (OK — auto-starts on demand; ~150ms on first call)".to_string()),
+        ),
+        // A stale socket is a real anomaly (a dead daemon left its socket
+        // behind), so it stays a warning with a cleanup hint.
+        DaemonResult::StaleSocket => CheckItem::warn(
+            "daemon",
+            "stale socket detected",
+            Some("run: mati daemon stop  to clean up".to_string()),
         ),
         DaemonResult::Unresponsive => CheckItem::fail(
             "daemon",

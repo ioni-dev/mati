@@ -150,6 +150,47 @@ pub(crate) fn make_session_audit(
 /// Result type for handlers: Ok data or (ErrorCode, message).
 type HandlerResult = std::result::Result<serde_json::Value, (ErrorCode, String)>;
 
+/// Max attempts for `retry_on_write_conflict` (initial try + 3 retries).
+const WRITE_CONFLICT_RETRIES: usize = 4;
+
+/// Bounded retry for daemon write handlers that commit via `transact_knowledge`.
+///
+/// SurrealKV uses optimistic MVCC and the daemon serves connections
+/// concurrently (dispatch holds only a shared graph read-lock, not a global
+/// write lock), so a concurrent knowledge-tree write — most often
+/// enforcement-event recording / consultation-receipt minting bumping the hot
+/// `enforcement:seq` key — can collide with a gotcha confirm/upsert/tombstone
+/// commit and surface `TransactionWriteConflict`. The `op` closure MUST
+/// re-read and rebuild its write set on each call: a conflict means the
+/// snapshot it built ops against is stale, so replaying the same ops could
+/// clobber a concurrent writer. Backoff is 5/10/20ms; any error whose message
+/// is not a write conflict (validation, not-found, …) returns immediately
+/// without retry.
+async fn retry_on_write_conflict<T, F, Fut>(mut op: F) -> Result<T, (ErrorCode, String)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, (ErrorCode, String)>>,
+{
+    for attempt in 0..WRITE_CONFLICT_RETRIES {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err((_, ref msg))
+                if attempt + 1 < WRITE_CONFLICT_RETRIES
+                    && msg.to_lowercase().contains("write conflict") =>
+            {
+                // Another knowledge-tree writer committed inside our
+                // read→commit window. Back off briefly and retry against a
+                // fresh read.
+                tokio::time::sleep(std::time::Duration::from_millis(5u64 << attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // The final attempt's retry guard is false, so the loop always returns via
+    // the catch-all `Err` arm above before reaching here.
+    unreachable!("retry_on_write_conflict loop always returns within the body")
+}
+
 // ── GotchaUpsert ────────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_gotcha_upsert(
@@ -171,6 +212,84 @@ pub(crate) async fn handle_gotcha_upsert(
     if input.rule.is_empty() {
         return Err((ErrorCode::ValidationFailed, "rule must not be empty".into()));
     }
+
+    // Read-modify-commit under bounded write-conflict retry. The daemon serves
+    // writes concurrently, so a sibling enforcement-event / receipt write can
+    // collide with this commit (see `retry_on_write_conflict`).
+    let (record, is_new, old_affected_files) =
+        retry_on_write_conflict(|| upsert_commit_once(store, ctx, request_id, input, now)).await?;
+
+    let quality_val = record.quality.value;
+    let tier_label = format!("{:?}", record.quality.tier);
+
+    // Best-effort: sync HasGotcha graph edges (cross-tree, outside transaction).
+    sync_has_gotcha_edges(store, key, &old_affected_files, &input.affected_files).await;
+
+    // Best-effort: record ControlChanged enforcement event.
+    let change_kind = if is_new {
+        crate::store::enforcement::ControlChangeKind::Created
+    } else {
+        crate::store::enforcement::ControlChangeKind::Updated
+    };
+    let reason_code = if is_new {
+        "control_created"
+    } else {
+        "control_updated"
+    };
+    if let Err(e) = crate::store::enforcement::record_event(
+        store,
+        crate::store::enforcement::EnforcementEventType::ControlChanged { change_kind },
+        crate::store::enforcement::SubjectKind::Control,
+        key.clone(),
+        "developer".to_string(),
+        None,
+        reason_code.to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("gotcha_upsert: enforcement event recording failed for {key}: {e}");
+    }
+
+    // SOTA-γ telemetry hook (D3): if the input tags mark this as an
+    // enrichment-produced gotcha ("enriched"), persist an ExtractionRecord
+    // capturing depth + config so `mati doctor`'s per-tier and per-config
+    // A/B sections have data to aggregate. Mirror of the
+    // `gotcha_ops::apply_gotcha_write` hook — the MCP path has its own
+    // atomic transaction loop and doesn't go through that function, so
+    // the hook is duplicated here. Best-effort; failure logs but doesn't
+    // propagate (analytics, not correctness).
+    if is_new {
+        let _ = crate::store::extraction::write_on_extraction(
+            store,
+            key,
+            &input.tags,
+            &input.affected_files,
+        )
+        .await;
+    }
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "key": key,
+        "confidence": record.confidence.value,
+        "quality": quality_val,
+        "tier": tier_label,
+    }))
+}
+
+/// One read-modify-commit attempt for `handle_gotcha_upsert`. Re-invoked by
+/// `retry_on_write_conflict`; re-reads `existing` each call so a retry rebuilds
+/// `is_new` / `old_affected_files` / file-link updates against fresh state.
+/// Returns the committed record plus the post-commit inputs the caller needs.
+async fn upsert_commit_once(
+    store: &Store,
+    ctx: &RequestContext,
+    request_id: Uuid,
+    input: &protocol::GotchaDraftInput,
+    now: u64,
+) -> Result<(Record, bool, Vec<String>), (ErrorCode, String)> {
+    let key = &input.key;
 
     let existing = store
         .get(key)
@@ -263,9 +382,6 @@ pub(crate) async fn handle_gotcha_upsert(
     record.payload = serde_json::to_value(&gotcha).ok();
     record.quality = quality::analyze(&record);
 
-    let quality_val = record.quality.value;
-    let tier_label = format!("{:?}", record.quality.tier);
-
     // Compute file-link updates for the same transaction.
     let file_link_updates =
         compute_file_link_updates(store, key, &old_affected_files, &input.affected_files).await;
@@ -294,60 +410,7 @@ pub(crate) async fn handle_gotcha_upsert(
         .await
         .map_err(|e| (ErrorCode::StoreError, format!("transact failed: {e}")))?;
 
-    // Best-effort: sync HasGotcha graph edges (cross-tree, outside transaction).
-    sync_has_gotcha_edges(store, key, &old_affected_files, &input.affected_files).await;
-
-    // Best-effort: record ControlChanged enforcement event.
-    let change_kind = if is_new {
-        crate::store::enforcement::ControlChangeKind::Created
-    } else {
-        crate::store::enforcement::ControlChangeKind::Updated
-    };
-    let reason_code = if is_new {
-        "control_created"
-    } else {
-        "control_updated"
-    };
-    if let Err(e) = crate::store::enforcement::record_event(
-        store,
-        crate::store::enforcement::EnforcementEventType::ControlChanged { change_kind },
-        crate::store::enforcement::SubjectKind::Control,
-        key.clone(),
-        "developer".to_string(),
-        None,
-        reason_code.to_string(),
-        None,
-    )
-    .await
-    {
-        tracing::warn!("gotcha_upsert: enforcement event recording failed for {key}: {e}");
-    }
-
-    // SOTA-γ telemetry hook (D3): if the input tags mark this as an
-    // enrichment-produced gotcha ("enriched"), persist an ExtractionRecord
-    // capturing depth + config so `mati doctor`'s per-tier and per-config
-    // A/B sections have data to aggregate. Mirror of the
-    // `gotcha_ops::apply_gotcha_write` hook — the MCP path has its own
-    // atomic transaction loop and doesn't go through that function, so
-    // the hook is duplicated here. Best-effort; failure logs but doesn't
-    // propagate (analytics, not correctness).
-    if is_new {
-        let _ = crate::store::extraction::write_on_extraction(
-            store,
-            key,
-            &input.tags,
-            &input.affected_files,
-        )
-        .await;
-    }
-
-    Ok(serde_json::json!({
-        "ok": true,
-        "key": key,
-        "confidence": record.confidence.value,
-        "quality": quality_val,
-        "tier": tier_label,
-    }))
+    Ok((record, is_new, old_affected_files))
 }
 
 // ── GotchaConfirm ───────────────────────────────────────────────────────────
@@ -368,88 +431,13 @@ pub(crate) async fn handle_gotcha_confirm(
         ));
     }
 
-    let mut record = store
-        .get(key)
-        .await
-        .map_err(|e| (ErrorCode::StoreError, format!("store read: {e}")))?
-        .ok_or_else(|| (ErrorCode::NotFound, format!("record not found: {key}")))?;
-
-    if record.category != Category::Gotcha {
-        return Err((
-            ErrorCode::ValidationFailed,
-            format!("{key} is not a gotcha record"),
-        ));
-    }
-    if !matches!(record.lifecycle, RecordLifecycle::Active) {
-        return Err((
-            ErrorCode::InvalidStateTransition,
-            format!("{key} is tombstoned — cannot confirm"),
-        ));
-    }
-
-    // Set confirmed + normalize severity.
-    if let Some(ref mut payload) = record.payload {
-        if let Some(obj) = payload.as_object_mut() {
-            if let Some(sev) = obj
-                .get("severity")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_lowercase())
-            {
-                obj.insert("severity".to_string(), serde_json::Value::String(sev));
-            }
-            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
-        }
-    }
-
-    record.source = RecordSource::DeveloperManual;
-    record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
-    record.confidence.confirmation_count += 1;
-    record.quality = quality::analyze(&record);
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
+    // Read-modify-commit under bounded write-conflict retry (see
+    // `retry_on_write_conflict`).
+    let (record, affected_files) =
+        retry_on_write_conflict(|| confirm_commit_once(store, ctx, request_id, key, now)).await?;
 
     let confidence_val = record.confidence.value;
     let quality_val = record.quality.value;
-
-    // Compute file-link updates + confirmation propagation for same transaction.
-    let affected_files: Vec<String> = record
-        .payload_as::<GotchaRecord>()
-        .map(|g| g.affected_files)
-        .unwrap_or_default();
-    let file_link_updates = compute_file_link_updates(store, key, &[], &affected_files).await;
-    let confirmation_updates = compute_confirmation_propagation(store, &affected_files).await;
-
-    // Atomic: gotcha record + file-link updates + confirmation propagation + audit.
-    // Audit is required — fail closed if serialization fails.
-    let (audit_key, audit_bytes) =
-        make_audit(ctx, request_id, "gotcha_confirm", key, true, None)
-            .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
-    let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
-    ops.push(KnowledgeWriteOp::PutRecord {
-        key,
-        record: &record,
-    });
-    for (fkey, frec) in &file_link_updates {
-        ops.push(KnowledgeWriteOp::PutRecord {
-            key: fkey.as_str(),
-            record: frec,
-        });
-    }
-    for (fkey, frec) in &confirmation_updates {
-        ops.push(KnowledgeWriteOp::PutRecord {
-            key: fkey.as_str(),
-            record: frec,
-        });
-    }
-    ops.push(KnowledgeWriteOp::PutRaw {
-        key: &audit_key,
-        value: &audit_bytes,
-    });
-    store
-        .transact_knowledge(&ops)
-        .await
-        .map_err(|e| (ErrorCode::StoreError, format!("transact failed: {e}")))?;
 
     // Best-effort: ensure HasGotcha edges exist for all affected files.
     sync_has_gotcha_edges(store, key, &[], &affected_files).await;
@@ -506,6 +494,101 @@ pub(crate) async fn handle_gotcha_confirm(
     }))
 }
 
+/// One read-modify-commit attempt for `handle_gotcha_confirm`. Re-invoked by
+/// `retry_on_write_conflict`; re-reads the gotcha each call so a retry confirms
+/// against fresh state. Returns the confirmed record plus its affected files
+/// for the caller's post-commit steps. Validation errors (not-found, not a
+/// gotcha, tombstoned) are non-write-conflict errors and so are not retried.
+async fn confirm_commit_once(
+    store: &Store,
+    ctx: &RequestContext,
+    request_id: Uuid,
+    key: &str,
+    now: u64,
+) -> Result<(Record, Vec<String>), (ErrorCode, String)> {
+    let mut record = store
+        .get(key)
+        .await
+        .map_err(|e| (ErrorCode::StoreError, format!("store read: {e}")))?
+        .ok_or_else(|| (ErrorCode::NotFound, format!("record not found: {key}")))?;
+
+    if record.category != Category::Gotcha {
+        return Err((
+            ErrorCode::ValidationFailed,
+            format!("{key} is not a gotcha record"),
+        ));
+    }
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        return Err((
+            ErrorCode::InvalidStateTransition,
+            format!("{key} is tombstoned — cannot confirm"),
+        ));
+    }
+
+    // Set confirmed + normalize severity.
+    if let Some(ref mut payload) = record.payload {
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(sev) = obj
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_lowercase())
+            {
+                obj.insert("severity".to_string(), serde_json::Value::String(sev));
+            }
+            obj.insert("confirmed".to_string(), serde_json::Value::Bool(true));
+        }
+    }
+
+    record.source = RecordSource::DeveloperManual;
+    record.confidence.value = ConfidenceScore::base_for_source(&RecordSource::DeveloperManual);
+    record.confidence.confirmation_count += 1;
+    record.quality = quality::analyze(&record);
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    // Compute file-link updates + confirmation propagation for same transaction.
+    let affected_files: Vec<String> = record
+        .payload_as::<GotchaRecord>()
+        .map(|g| g.affected_files)
+        .unwrap_or_default();
+    let file_link_updates = compute_file_link_updates(store, key, &[], &affected_files).await;
+    let confirmation_updates = compute_confirmation_propagation(store, &affected_files).await;
+
+    // Atomic: gotcha record + file-link updates + confirmation propagation + audit.
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) =
+        make_audit(ctx, request_id, "gotcha_confirm", key, true, None)
+            .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
+    let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
+    ops.push(KnowledgeWriteOp::PutRecord {
+        key,
+        record: &record,
+    });
+    for (fkey, frec) in &file_link_updates {
+        ops.push(KnowledgeWriteOp::PutRecord {
+            key: fkey.as_str(),
+            record: frec,
+        });
+    }
+    for (fkey, frec) in &confirmation_updates {
+        ops.push(KnowledgeWriteOp::PutRecord {
+            key: fkey.as_str(),
+            record: frec,
+        });
+    }
+    ops.push(KnowledgeWriteOp::PutRaw {
+        key: &audit_key,
+        value: &audit_bytes,
+    });
+    store
+        .transact_knowledge(&ops)
+        .await
+        .map_err(|e| (ErrorCode::StoreError, format!("transact failed: {e}")))?;
+
+    Ok((record, affected_files))
+}
+
 // ── GotchaTombstone ─────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_gotcha_tombstone(
@@ -524,58 +607,10 @@ pub(crate) async fn handle_gotcha_tombstone(
         ));
     }
 
-    let mut record = store
-        .get(key)
-        .await
-        .map_err(|e| (ErrorCode::StoreError, format!("store read: {e}")))?
-        .ok_or_else(|| (ErrorCode::NotFound, format!("record not found: {key}")))?;
-
-    let gotcha_snapshot = record.payload_as::<GotchaRecord>();
-    let affected_files: Vec<String> = gotcha_snapshot
-        .as_ref()
-        .map(|g| g.affected_files.clone())
-        .unwrap_or_default();
-    // D3 hook: snapshot rule/reason/severity BEFORE lifecycle flips to
-    // Tombstoned (the payload survives the flip, but doing it here mirrors
-    // the gotcha_ops path and makes the snapshot order obvious to readers).
-    let neg_exemplar_data: Option<(String, String, crate::store::Priority)> = gotcha_snapshot
-        .as_ref()
-        .map(|g| (g.rule.clone(), g.reason.clone(), g.severity.clone()));
-
-    record.lifecycle = RecordLifecycle::Tombstoned {
-        reason: TombstoneReason::ManualDeletion,
-        at: now,
-    };
-    record.updated_at = now;
-    record.version.logical_clock += 1;
-    record.version.wall_clock = now;
-
-    // Compute file-link cleanup for same transaction.
-    let file_link_updates = compute_file_link_updates(store, key, &affected_files, &[]).await;
-
-    // Atomic: tombstoned record + file-link cleanup + audit.
-    // Audit is required — fail closed if serialization fails.
-    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "gotcha_tombstone", key, true, None)
-        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
-    let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
-    ops.push(KnowledgeWriteOp::PutRecord {
-        key,
-        record: &record,
-    });
-    for (fkey, frec) in &file_link_updates {
-        ops.push(KnowledgeWriteOp::PutRecord {
-            key: fkey.as_str(),
-            record: frec,
-        });
-    }
-    ops.push(KnowledgeWriteOp::PutRaw {
-        key: &audit_key,
-        value: &audit_bytes,
-    });
-    store
-        .transact_knowledge(&ops)
-        .await
-        .map_err(|e| (ErrorCode::StoreError, format!("transact failed: {e}")))?;
+    // Read-modify-commit under bounded write-conflict retry (see
+    // `retry_on_write_conflict`).
+    let (affected_files, neg_exemplar_data) =
+        retry_on_write_conflict(|| tombstone_commit_once(store, ctx, request_id, key, now)).await?;
 
     // Best-effort: remove HasGotcha edges for all affected files.
     sync_has_gotcha_edges(store, key, &affected_files, &[]).await;
@@ -631,6 +666,79 @@ pub(crate) async fn handle_gotcha_tombstone(
     .await;
 
     Ok(serde_json::json!({"ok": true, "key": key, "tombstoned": true}))
+}
+
+/// One read-modify-commit attempt for `handle_gotcha_tombstone`. Re-invoked by
+/// `retry_on_write_conflict`; re-reads the gotcha each call. Returns the
+/// affected files and the negative-exemplar snapshot for the caller's
+/// post-commit steps.
+async fn tombstone_commit_once(
+    store: &Store,
+    ctx: &RequestContext,
+    request_id: Uuid,
+    key: &str,
+    now: u64,
+) -> Result<
+    (
+        Vec<String>,
+        Option<(String, String, crate::store::Priority)>,
+    ),
+    (ErrorCode, String),
+> {
+    let mut record = store
+        .get(key)
+        .await
+        .map_err(|e| (ErrorCode::StoreError, format!("store read: {e}")))?
+        .ok_or_else(|| (ErrorCode::NotFound, format!("record not found: {key}")))?;
+
+    let gotcha_snapshot = record.payload_as::<GotchaRecord>();
+    let affected_files: Vec<String> = gotcha_snapshot
+        .as_ref()
+        .map(|g| g.affected_files.clone())
+        .unwrap_or_default();
+    // D3 hook: snapshot rule/reason/severity BEFORE lifecycle flips to
+    // Tombstoned (the payload survives the flip, but doing it here mirrors
+    // the gotcha_ops path and makes the snapshot order obvious to readers).
+    let neg_exemplar_data: Option<(String, String, crate::store::Priority)> = gotcha_snapshot
+        .as_ref()
+        .map(|g| (g.rule.clone(), g.reason.clone(), g.severity.clone()));
+
+    record.lifecycle = RecordLifecycle::Tombstoned {
+        reason: TombstoneReason::ManualDeletion,
+        at: now,
+    };
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+
+    // Compute file-link cleanup for same transaction.
+    let file_link_updates = compute_file_link_updates(store, key, &affected_files, &[]).await;
+
+    // Atomic: tombstoned record + file-link cleanup + audit.
+    // Audit is required — fail closed if serialization fails.
+    let (audit_key, audit_bytes) = make_audit(ctx, request_id, "gotcha_tombstone", key, true, None)
+        .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
+    let mut ops: Vec<KnowledgeWriteOp<'_>> = Vec::new();
+    ops.push(KnowledgeWriteOp::PutRecord {
+        key,
+        record: &record,
+    });
+    for (fkey, frec) in &file_link_updates {
+        ops.push(KnowledgeWriteOp::PutRecord {
+            key: fkey.as_str(),
+            record: frec,
+        });
+    }
+    ops.push(KnowledgeWriteOp::PutRaw {
+        key: &audit_key,
+        value: &audit_bytes,
+    });
+    store
+        .transact_knowledge(&ops)
+        .await
+        .map_err(|e| (ErrorCode::StoreError, format!("transact failed: {e}")))?;
+
+    Ok((affected_files, neg_exemplar_data))
 }
 
 // ── FileEnrich ──────────────────────────────────────────────────────────────

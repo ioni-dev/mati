@@ -424,12 +424,24 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
                                 report.missing_edges.len(),
                                 report.stale_edges.len(),
                             );
+                            // `mati repair` reconciles derived indexes against
+                            // existing records, but it cannot CREATE a missing
+                            // file:<path> record — that needs a `mati init`
+                            // re-index. So when the drift includes missing_file
+                            // links (a gotcha references an un-indexed path),
+                            // point at init first; otherwise plain repair fixes
+                            // stale links and graph edges.
+                            let fix = if !report.missing_file_links.is_empty() {
+                                "mati init  (re-index missing files), then mati repair"
+                            } else {
+                                "mati repair"
+                            };
                             checks.push(CheckResult {
                                 section: "integrity",
                                 name: "drift",
                                 status: Status::Fail,
                                 detail,
-                                fix: Some("mati repair"),
+                                fix: Some(fix),
                             });
                         } else {
                             checks.push(CheckResult {
