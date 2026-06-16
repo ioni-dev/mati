@@ -5,6 +5,12 @@
 
 /target/
 .DS_Store
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+.idea/
 *.db
 
 # Local artifacts — audit reports, crash logs, profiler output
@@ -30,5 +36,6 @@ mati\ -\ readme.md
 !TRADEMARK.md
 !ARCHITECTURE.md
 !CLAUDE.md
+!SECURITY.md
 
 docs/REAL_LIFE_TEST_REPORT_M11.md

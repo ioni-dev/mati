@@ -1,11 +1,10 @@
 {
   "name": "mati",
   "version": "0.1.0",
-  "description": "Engineering knowledge that survives turnover. Persistent, queryable knowledge store for codebases — accumulates per-file gotchas, architectural decisions, and project state, then surfaces them to Claude on demand via MCP stdio.",
-  "author": "mati-dev",
-  "homepage": "https://mati.dev",
-  "repository": "https://github.com/mati-dev/mati",
-  "documentation": "https://docs.mati.dev",
+  "description": "Engineering knowledge that survives turnover. A persistent, queryable knowledge store for codebases that accumulates per-file gotchas, architectural decisions, and project state, then surfaces them to Claude on demand via MCP stdio.",
+  "author": "Jonathan Jaime",
+  "homepage": "https://getmati.dev",
+  "repository": "https://github.com/ioni-dev/mati",
   "license": "MIT",
   "keywords": ["ai", "mcp", "claude", "knowledge", "developer-tools"],
   "server": {
@@ -25,18 +24,22 @@
     {
       "name": "mem_bootstrap",
       "description": "Assemble a context packet for the current coding session. Gathers confirmed gotchas, file records, and architectural decisions relevant to the provided context_files, within a 2,000-token budget. Call this at session start."
+    },
+    {
+      "name": "mem_set",
+      "description": "Write a knowledge record. Keys must use a gotcha:/decision:/dev_note: prefix; supports write, confirm, and delete actions. Used during enrichment and manual capture."
     }
   ],
   "install": {
     "instructions": "Run `mati init` in your project root after installing the binary.",
     "methods": [
       {
-        "type": "shell",
-        "command": "curl -fsSL https://install.mati.dev | sh"
-      },
-      {
         "type": "cargo",
         "command": "cargo install mati"
+      },
+      {
+        "type": "shell",
+        "command": "curl -fsSL https://github.com/ioni-dev/mati/releases/latest/download/install.sh | bash"
       }
     ]
   }

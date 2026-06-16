@@ -1,5 +1,5 @@
 {
-  "name": "@mati-dev/mati",
+  "name": "@ioni-dev/mati",
   "version": "0.1.0",
   "description": "Engineering knowledge that survives turnover",
   "bin": { "mati": "bin/mati" },
