@@ -1,8 +1,8 @@
 # mati
 
-A knowledge store for codebases. mati remembers what you've learned about each file, surfaces the relevant records before Claude reads, and can skip the read entirely when the stored context is enough.
+mati makes what your team knows about a codebase impossible for an AI agent to skip. It is not another memory store the model can choose to recall or ignore. When Claude or Codex reads or edits a file, mati's hook surfaces the confirmed gotchas and decisions attached to it and blocks the operation until they've been consulted. The decision is made at the hook level, deterministically, outside the model's discretion.
 
-Single Rust binary. MCP stdio server. Claude Code plugin.
+Single Rust binary. MCP stdio server. Claude Code and Codex integration.
 
 Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://getmati.dev)).
 
@@ -20,7 +20,9 @@ A lot of what you know about a codebase never makes it into the codebase. Why `w
 
 When the person who knew it leaves, it's gone. When Claude opens the same file for the twentieth time, you explain it again from scratch.
 
-mati stores that knowledge as structured records attached to files, confirmed by developers, and enforced at the hook level.
+And even when it _is_ written down, it gets ignored. A comment, a doc, a CONTRIBUTING note: an AI agent (or a hurried teammate) reads right past it. Knowledge that exists but isn't consulted is the same as knowledge that doesn't exist.
+
+mati captures that knowledge as structured records attached to files, confirmed by developers, and enforces it at the hook level: an agent can't read or edit a file until the knowledge attached to it has been surfaced.
 
 ---
 
@@ -29,7 +31,7 @@ mati stores that knowledge as structured records attached to files, confirmed by
 mati runs as two processes:
 
 ```
-   Claude Code
+   Claude Code / Codex
         | stdio (MCP)
   ┌─────▼──────┐        ┌──────────────────────┐
   │ mati serve │  UDS   │ mati daemon          │
@@ -60,7 +62,7 @@ Every file gets a `file:<path>` record: a purpose summary, entry points, and the
 
 Unconfirmed gotchas are candidates. They sit in the graph but don't change Claude's behavior. Confirming one turns on enforcement for it.
 
-Enforcement is a single threshold. If a record has `confidence >= 0.6`, `confirmed = true`, and `quality >= 0.4`, the pre-read hook injects it before Claude opens the file. A high-confidence record can deny the read outright and hand Claude the record instead. Lower-confidence records attach context without blocking.
+Enforcement is a single threshold. If a record has `confidence >= 0.6`, `confirmed = true`, and `quality >= 0.4`, the pre-read hook surfaces it before the file is opened, and on Codex the pre-edit hook gates edits too. A high-confidence record can deny the read or edit outright and hand the agent the record instead. Lower-confidence records attach context without blocking.
 
 ### Static analysis
 
@@ -183,4 +185,4 @@ Vanilla `cargo test` works but is constrained to single-threaded execution. See 
 
 ## License
 
-mati is released under the [MIT License](LICENSE). The "mati" name and logo are trademarks of the project — see [TRADEMARK.md](TRADEMARK.md).
+mati is released under the [MIT License](LICENSE). The "mati" name and logo are trademarks of the project. See [TRADEMARK.md](TRADEMARK.md).
