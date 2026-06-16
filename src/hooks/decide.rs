@@ -240,6 +240,61 @@ fn positional_arg(cmd_part: &str, first: bool) -> Option<String> {
     }
 }
 
+// ── apply_patch envelope parsing ────────────────────────────────────────────
+
+/// Maximum number of files a single `apply_patch` is gated against. A patch
+/// touching more than this is rare; the cap bounds per-file daemon round-trips
+/// so the hook stays well inside its deadline. Files beyond the cap are NOT
+/// gated (fail-open bias for the edit path) and the caller logs the truncation.
+pub const MAX_APPLY_PATCH_FILES: usize = 50;
+
+/// Extract the target file paths from a Codex `apply_patch` envelope.
+///
+/// Codex delivers the patch as a single string in `tool_input.command`:
+///
+/// ```text
+/// *** Begin Patch
+/// *** Update File: src/a.rs
+/// @@ ...
+///  context
+/// -old
+/// +new
+/// *** Add File: src/b.rs
+/// +contents
+/// *** Delete File: src/c.rs
+/// *** Move to: src/a_renamed.rs
+/// *** End Patch
+/// ```
+///
+/// Markers are matched only at column 0. Diff body lines are prefixed with a
+/// space/`+`/`-`/`@@`, so a content line that happens to contain
+/// `*** Update File:` (e.g. `+*** Update File: x`) does NOT collide with a real
+/// envelope marker. Returns paths in first-seen order with duplicates removed;
+/// the caller normalizes each. Add/Update/Delete and the rename source +
+/// destination are all included — `evaluate()` allows any path with no
+/// confirmed gotcha, so over-collecting is harmless.
+pub fn extract_apply_patch_files(patch: &str) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "*** Update File: ",
+        "*** Add File: ",
+        "*** Delete File: ",
+        "*** Move to: ",
+    ];
+    let mut files: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        for marker in MARKERS {
+            if let Some(rest) = line.strip_prefix(marker) {
+                let path = rest.trim();
+                if !path.is_empty() && !files.iter().any(|f| f == path) {
+                    files.push(path.to_string());
+                }
+                break;
+            }
+        }
+    }
+    files
+}
+
 // ── Path Normalization ──────────────────────────────────────────────────────
 
 /// Normalize `file_path` to a lexical repo-relative path.
@@ -484,6 +539,71 @@ fn json_string_array(val: &serde_json::Value, pointer: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── extract_apply_patch_files ────────────────────────────────────────
+
+    #[test]
+    fn apply_patch_single_update() {
+        let patch =
+            "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch\n";
+        assert_eq!(extract_apply_patch_files(patch), vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn apply_patch_multi_file_add_update_delete() {
+        let patch = "*** Begin Patch\n\
+            *** Update File: src/a.rs\n@@\n+x\n\
+            *** Add File: src/b.rs\n+y\n\
+            *** Delete File: src/c.rs\n\
+            *** End Patch\n";
+        assert_eq!(
+            extract_apply_patch_files(patch),
+            vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
+    }
+
+    #[test]
+    fn apply_patch_rename_includes_source_and_destination() {
+        let patch =
+            "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n+x\n*** End Patch\n";
+        assert_eq!(
+            extract_apply_patch_files(patch),
+            vec!["src/old.rs", "src/new.rs"]
+        );
+    }
+
+    #[test]
+    fn apply_patch_ignores_marker_inside_diff_body() {
+        // A diff line that ADDS text resembling a marker must NOT be parsed as
+        // an envelope marker: diff body lines are prefixed (+/-/space), so they
+        // never begin at column 0 with "*** ".
+        let patch = "*** Begin Patch\n\
+            *** Update File: src/real.rs\n@@\n\
+            +*** Update File: src/fake.rs\n\
+            + *** Add File: src/also_fake.rs\n\
+            *** End Patch\n";
+        assert_eq!(extract_apply_patch_files(patch), vec!["src/real.rs"]);
+    }
+
+    #[test]
+    fn apply_patch_dedups_repeated_path() {
+        let patch =
+            "*** Begin Patch\n*** Update File: src/a.rs\n*** Update File: src/a.rs\n*** End Patch\n";
+        assert_eq!(extract_apply_patch_files(patch), vec!["src/a.rs"]);
+    }
+
+    #[test]
+    fn apply_patch_empty_or_no_markers() {
+        assert!(extract_apply_patch_files("").is_empty());
+        assert!(extract_apply_patch_files("just some text\nno markers here").is_empty());
+        assert!(extract_apply_patch_files("*** Begin Patch\n*** End Patch\n").is_empty());
+    }
+
+    #[test]
+    fn apply_patch_trims_trailing_whitespace() {
+        let patch = "*** Update File: src/spaced.rs   \n";
+        assert_eq!(extract_apply_patch_files(patch), vec!["src/spaced.rs"]);
+    }
 
     // ── classify_command ─────────────────────────────────────────────────
 

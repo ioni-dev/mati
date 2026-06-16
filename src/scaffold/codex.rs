@@ -39,6 +39,16 @@ const HOOKS_JSON: &str = r#"{
             "statusMessage": "Checking file knowledge..."
           }
         ]
+      },
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .codex/hooks/pre-apply-patch.sh",
+            "statusMessage": "Checking file knowledge before edit..."
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -272,6 +282,10 @@ pub const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
         crate::hooks::codex_user_prompt::SCRIPT,
     ),
     ("pre-bash.sh", crate::hooks::codex_pre_bash::SCRIPT),
+    (
+        "pre-apply-patch.sh",
+        crate::hooks::codex_pre_apply_patch::SCRIPT,
+    ),
     ("post-bash.sh", crate::hooks::codex_post_bash::SCRIPT),
     ("stop.sh", crate::hooks::codex_stop::SCRIPT),
 ];

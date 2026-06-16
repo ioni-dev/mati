@@ -2,6 +2,7 @@
 // Each module exports a `pub const SCRIPT: &str` with the bash script content.
 
 pub mod codex_post_bash;
+pub mod codex_pre_apply_patch;
 pub mod codex_pre_bash;
 pub mod codex_session_start;
 pub mod codex_stop;

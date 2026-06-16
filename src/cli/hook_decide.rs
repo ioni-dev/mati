@@ -21,6 +21,10 @@ pub enum HookVariant {
     ClaudePreBash,
     CodexPreBash,
     CodexPostBash,
+    /// Codex PreToolUse(apply_patch): gate file *edits*. Multi-file flow
+    /// (`run_apply_patch`) — parses the patch envelope and denies if any
+    /// touched file has an unconsulted confirmed gotcha.
+    CodexPreApplyPatch,
 }
 
 #[derive(Args, Debug)]
@@ -62,6 +66,13 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     std::io::stdin().read_to_string(&mut input_str)?;
     let input: serde_json::Value =
         serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+
+    // apply_patch is multi-file: it parses the patch envelope and evaluates
+    // every touched path, so it has its own flow rather than the single-path
+    // pipeline below.
+    if args.variant == HookVariant::CodexPreApplyPatch {
+        return run_apply_patch(&input).await;
+    }
 
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
@@ -175,6 +186,9 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
             let class = decide::classify_command(cmd)?;
             decide::extract_file_path(cmd, class)
         }
+        // apply_patch is multi-file and handled by `run_apply_patch` before the
+        // single-path pipeline; never reaches here.
+        HookVariant::CodexPreApplyPatch => None,
     }
 }
 
@@ -248,6 +262,114 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
     Ok(())
 }
 
+// ── codex-pre-apply-patch flow ──────────────────────────────────────────────
+
+/// Multi-file edit enforcement for Codex `apply_patch`.
+///
+/// Parses the patch envelope into target paths, evaluates each against the
+/// gotcha store, and denies (exit 2 + stderr) if ANY touched file has a
+/// confirmed gotcha the agent has not consulted. Fails OPEN at every step
+/// (no command, no paths, unreachable daemon, per-file eval error, file count
+/// over the cap) — wrongly blocking all edits is worse than missing a gotcha.
+async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
+    let variant = HookVariant::CodexPreApplyPatch;
+
+    // 1. Patch text from tool_input.command.
+    let Some(cmd) = input
+        .pointer("/tool_input/command")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        emit_allow(variant);
+        return Ok(());
+    };
+
+    // 2. Parse target paths from the envelope.
+    let mut raw_paths = decide::extract_apply_patch_files(cmd);
+    if raw_paths.is_empty() {
+        emit_allow(variant);
+        return Ok(());
+    }
+    if raw_paths.len() > decide::MAX_APPLY_PATCH_FILES {
+        log_fail_open(
+            "<apply_patch>",
+            &format!(
+                "patch touches {} files; gating only the first {}",
+                raw_paths.len(),
+                decide::MAX_APPLY_PATCH_FILES
+            ),
+        );
+        raw_paths.truncate(decide::MAX_APPLY_PATCH_FILES);
+    }
+
+    // 3. Repo root + mati root + daemon (shared shape with the single-path flow).
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd);
+    let repo_root_str = repo_root.as_ref().and_then(|p| p.to_str());
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(r) => r,
+        Err(_) => {
+            log_fail_open("<apply_patch>", "cannot determine mati root");
+            emit_allow(variant);
+            return Ok(());
+        }
+    };
+    if !ensure_daemon(&mati_root).await {
+        log_fail_open("<apply_patch>", "daemon not running after auto-start");
+        emit_allow(variant);
+        return Ok(());
+    }
+
+    // 4. Evaluate each touched path; collect the ones that must be consulted.
+    let mut denied: Vec<String> = Vec::new();
+    let mut events: Vec<HookEvent> = Vec::new();
+    for raw in &raw_paths {
+        let rel_path = decide::normalize_path(raw, repo_root_str);
+        let file_key = format!("file:{rel_path}");
+        let eval_data = match daemon_result(
+            &mati_root,
+            "hook_evaluate",
+            serde_json::json!({ "file_key": &file_key, "include_recent": true }),
+        )
+        .await
+        {
+            DaemonResult::Ok(resp) => resp.get("data").cloned().unwrap_or(serde_json::Value::Null),
+            _ => {
+                // Per-file fail-open: don't block the whole edit on one bad lookup.
+                log_fail_open(&rel_path, "hook_evaluate failed");
+                continue;
+            }
+        };
+
+        let adapter = process_eval_response(variant, &rel_path, &eval_data);
+        if matches!(adapter.decision, Decision::Deny { .. }) {
+            denied.push(file_key);
+            events.extend(adapter.events);
+        }
+    }
+
+    // 5. Fire compliance events for the blocked files (fire-and-forget).
+    fire_events(&mati_root, &events).await;
+
+    // 6. Deny if any file needs consultation; otherwise allow.
+    if denied.is_empty() {
+        emit_allow(variant);
+        return Ok(());
+    }
+    let msg = if denied.len() == 1 {
+        format!("mati: call mem_get(\"{}\") before editing", denied[0])
+    } else {
+        format!(
+            "mati: consult these files before editing — call mem_get for each: {}",
+            denied.join(", ")
+        )
+    };
+    eprintln!("{msg}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::process::exit(2);
+}
+
 // ── Fail-open telemetry ─────────────────────────────────────────────────────
 
 fn log_fail_open(rel_path: &str, reason: &str) {
@@ -300,7 +422,7 @@ fn platform_events(
     events: Vec<HookEvent>,
 ) -> Vec<HookEvent> {
     match variant {
-        HookVariant::CodexPreBash => events
+        HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => events
             .into_iter()
             .filter_map(|e| match e {
                 HookEvent::Miss { .. } => Some(e),
@@ -380,7 +502,9 @@ fn emit_allow(variant: HookVariant) {
                 r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
             );
         }
-        HookVariant::CodexPreBash | HookVariant::CodexPostBash => {
+        HookVariant::CodexPreBash
+        | HookVariant::CodexPostBash
+        | HookVariant::CodexPreApplyPatch => {
             // Silent exit 0.
         }
     }
@@ -445,7 +569,7 @@ fn check_eval_data(
 ) -> EvalDataCheck {
     let include_recent = matches!(
         variant,
-        HookVariant::CodexPreBash | HookVariant::CodexPostBash
+        HookVariant::CodexPreBash | HookVariant::CodexPostBash | HookVariant::CodexPreApplyPatch
     );
     let already_consulted = if include_recent {
         eval_data
@@ -540,7 +664,7 @@ fn format_decision(
             let stdout = format_claude_output(decision);
             (stdout, String::new(), 0)
         }
-        HookVariant::CodexPreBash => match decision {
+        HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => match decision {
             Decision::Deny { file_key, .. } => {
                 let stderr = format!("mati: call mem_get(\"{file_key}\") first");
                 (String::new(), stderr, 2)
@@ -804,6 +928,34 @@ mod tests {
             result.events
         );
         assert!(matches!(result.decision, Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn e2e_codex_apply_patch_deny_exit2_when_unconsulted() {
+        // apply_patch reads the recent-TTL receipt (consulted_recent). With no
+        // receipt, a confirmed gotcha on a touched file must deny the edit.
+        let data = deny_eligible_eval_data();
+        let result = process_eval_response(HookVariant::CodexPreApplyPatch, "src/main.rs", &data);
+
+        assert_eq!(result.exit_code, 2, "apply_patch deny must exit 2");
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(&result.events[0], HookEvent::CodexShellBlocked { key } if key == "file:src/main.rs"),
+            "apply_patch deny must emit CodexShellBlocked, got: {:?}",
+            result.events
+        );
+    }
+
+    #[test]
+    fn e2e_codex_apply_patch_allows_after_consult() {
+        // Once the file has a recent consultation receipt, the edit is allowed.
+        let mut data = deny_eligible_eval_data();
+        data["consulted_recent"] = json!(true);
+        let result = process_eval_response(HookVariant::CodexPreApplyPatch, "src/main.rs", &data);
+
+        assert_eq!(result.exit_code, 0, "consulted edit must be allowed");
+        assert!(!matches!(result.decision, Decision::Deny { .. }));
     }
 
     #[test]

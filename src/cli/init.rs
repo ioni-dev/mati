@@ -2171,7 +2171,7 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                     println!(
                         "    {g}.codex/config.toml             MCP server + hooks feature flag{r}"
                     );
-                    println!("    {g}.codex/hooks/                  5 hooks (session-start, prompt-submit, pre-bash, post-bash, stop){r}");
+                    println!("    {g}.codex/hooks/                  6 hooks (session-start, prompt-submit, pre-bash, pre-apply-patch, post-bash, stop){r}");
                     println!("    {g}.codex/skills/mati/            skill instructions for agent guidance{r}");
                 }
                 if !missing_deps.is_empty() {
