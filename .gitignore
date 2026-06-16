@@ -16,13 +16,11 @@ panic-window-*.txt
 
 # Internal docs — local only, never commit
 TASKS.md
-ARCHITECTURE.md
 mati\ -\ architecture.md
 BENCHMARKS.md
 GOTCHAS.md
 ROADMAP.md
 DECISIONS.md
-CLAUDE.md
 mati\ -\ readme.md
 
 *.md
@@ -30,5 +28,7 @@ mati\ -\ readme.md
 # Public OSS-release docs — override the *.md ignore above
 !CONTRIBUTING.md
 !TRADEMARK.md
+!ARCHITECTURE.md
+!CLAUDE.md
 
 docs/REAL_LIFE_TEST_REPORT_M11.md
