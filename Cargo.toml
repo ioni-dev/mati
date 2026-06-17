@@ -1,9 +1,9 @@
 [package]
 name        = "mati"
-version     = "0.1.0"
+version     = "0.1.1"
 edition     = "2021"
 rust-version = "1.82"
-description = "Engineering knowledge that survives turnover"
+description = "An enforcement layer for codebase knowledge: confirmed gotchas gate what AI agents read and edit at the hook level. Not a passive memory store."
 license     = "MIT"
 repository  = "https://github.com/ioni-dev/mati"
 homepage    = "https://getmati.dev"
