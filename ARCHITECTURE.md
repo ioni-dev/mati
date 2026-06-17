@@ -6,15 +6,21 @@ Code comments and other docs use the `§N` shorthand for cross-references, for e
 
 ## §1: Overview
 
-mati is an enforcement layer for what a team knows about its own codebase. It is not a passive memory store that an agent may or may not consult. When Claude or Codex touches a file, mati can require that the relevant institutional knowledge be surfaced first, and it can block the operation until that happens.
+mati is an enforcement layer for what a team knows about its own codebase. Not just a passive memory store that an agent might consult if it happens to ask.
 
-That distinction is the whole point. Most "memory for AI" tools are opt-in: they hold context the model can recall if it decides to. mati is the opposite. The decision is made at the hook level, deterministically, outside the model's discretion. If a file has a confirmed, high-confidence gotcha attached and the agent has not consulted it, the pre-read hook denies the read (and on Codex the pre-edit hook denies the edit) until it does. Knowledge that has been captured cannot be silently skipped.
+When Claude Code reads a file, mati can require the relevant institutional knowledge to be surfaced first. On Codex, the same idea applies to `apply_patch` edits through the pre-edit hook. In those enforced paths, if the agent has not consulted the attached knowledge yet, mati can stop the operation until it does.
 
-What mati enforces is the knowledge developers usually carry in their heads: per-file gotchas, architectural decisions, odd project state, and the implementation details that never make it into comments. It captures that, lets developers confirm it, then makes it queryable, measurable, and, where it matters, mandatory. Every DENY, ALLOW, and consultation is written to a local, hash-chained event log, so there is an auditable trail that the knowledge was actually put in front of the agent.
+That distinction is the point. Most “memory for AI” tools are opt-in. They store context, and the model may or may not retrieve it. mati works differently. The decision happens at the hook layer, deterministically, outside the model’s discretion. If a file has a confirmed, high-confidence gotcha attached and the agent has not consulted it, the hook denies the read, or the Codex patch edit, until the consultation happens.
 
-The underlying purpose is institutional memory that survives turnover: the kind of knowledge that otherwise lives in Slack, in a half-remembered incident, or nowhere useful at all. Enforcement is what keeps that memory from being ignored the moment it is inconvenient.
+So the captured knowledge cannot be quietly skipped.
 
-There is a side benefit: a high-confidence record can sometimes replace a full file read and reduce token usage. Nice property. Not the core design goal.
+What mati enforces is the stuff developers usually carry around in their heads: per-file gotchas, architectural decisions, weird project state, and the implementation details that never make it into comments. It captures those records, lets developers confirm them, then makes them queryable, measurable, and, where it matters, mandatory.
+
+It also leaves a local audit trail. Deny decisions, allow-after-receipt decisions, and consultation receipts are written to a hash-chained event log, so there is a record that the knowledge was actually put in front of the agent.
+
+The larger purpose is institutional memory that survives turnover. The kind of knowledge that otherwise lives in Slack, in a half-remembered incident, or nowhere useful at all. Enforcement is what keeps that memory from being ignored the moment it becomes inconvenient.
+
+There is a side benefit: a high-confidence record can sometimes replace a full file read and reduce token usage. Useful. But not the reason mati exists.
 
 ---
 

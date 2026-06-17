@@ -1,16 +1,12 @@
 # mati
 
-mati makes what your team knows about a codebase impossible for an AI agent to skip. It is not another memory store the model can choose to recall or ignore. When Claude or Codex reads or edits a file, mati's hook surfaces the confirmed gotchas and decisions attached to it and blocks the operation until they've been consulted. The decision is made at the hook level, deterministically, outside the model's discretion.
+mati makes what your team knows about a codebase enforceable in the paths where AI agents touch it. It is not another memory store the model can choose to recall or ignore. When an agent goes to act on a file that has a confirmed gotcha attached, mati's hook surfaces that gotcha and can block the operation until it has been consulted. The decision is made at the hook level, deterministically, outside the model's discretion.
+
+Coverage today: Claude Code gates file reads, Codex gates `apply_patch` edits, and both catch shell-command reads (`cat`, `grep`, and similar commands) on a best-effort basis. Claude Code edits are not gated yet.
 
 Single Rust binary. MCP stdio server. Claude Code and Codex integration.
 
 Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://getmati.dev)).
-
----
-
-## The name
-
-**mati** is a Nahuatl verb meaning "to know" or "to think." UNAM's Gran Diccionario Náhuatl lists it as transitive: _nicmati_ is "I know it," _quimati_ is "he or she knows it" ([source](https://gdn.iib.unam.mx/diccionario/mati/182730)). That is the tool's job: know things about your codebase so you don't have to keep restating them.
 
 ---
 
@@ -22,7 +18,48 @@ When the person who knew it leaves, it's gone. When Claude opens the same file f
 
 And even when it _is_ written down, it gets ignored. A comment, a doc, a CONTRIBUTING note: an AI agent (or a hurried teammate) reads right past it. Knowledge that exists but isn't consulted is the same as knowledge that doesn't exist.
 
-mati captures that knowledge as structured records attached to files, confirmed by developers, and enforces it at the hook level: an agent can't read or edit a file until the knowledge attached to it has been surfaced.
+mati captures that knowledge as structured records attached to files, confirmed by developers, and enforced at the hook level where the agent integration supports it. In those paths, the agent does not get to read or edit first and discover the gotcha later. The relevant knowledge is surfaced before the operation proceeds.
+
+---
+
+## Why it matters
+
+The cost of lost or ignored knowledge scales with your team, and now with the number of AI agents touching your code.
+
+- **Agents stop repeating known mistakes.** An agent that doesn't know why `with_versioning(true, 0)` is intentional may "fix" it. mati makes it read the reason first when that gotcha is confirmed, attached to the file, and reached through an enforced hook path.
+- **Knowledge survives turnover.** When the person who understood a subsystem leaves, the gotchas they confirmed stay attached to the files. The next developer, and the next agent, still get them.
+- **Onboarding gets faster, and you can measure it.** `mati stats` reports coverage and an onboarding score, so knowledge health is a number you can track, not a feeling.
+- **Enforcement is auditable.** Deny decisions, allow-after-receipt decisions, and consultation receipts are written to a local, hash-chained log. You can show that a rule was put in front of the agent, not just that it was written down somewhere.
+
+---
+
+## What this looks like
+
+A confirmed gotcha is a small structured record attached to a file:
+
+```text
+gotcha:surrealkv-versioning   (file: src/store/db.rs)
+rule:     Never pass 0 as the retention arg to with_versioning.
+reason:   0 means "retain all versions forever," not "disabled."
+severity: high   confirmed: true
+```
+
+When an agent tries to read `src/store/db.rs` through Claude Code, or patch-edit it through Codex, without consulting it, the hook blocks the operation and hands back the rule instead of letting the agent guess:
+
+```text
+[mati] read of src/store/db.rs blocked
+mati: call mem_get("file:src/store/db.rs") first
+```
+
+The agent reads the reason, then proceeds. In the enforced path, it does not get to skip it.
+
+---
+
+## Who it's for
+
+- **Solo developers** tired of re-explaining the same context to an agent. Free, local, no account.
+- **Teams shipping with AI agents**, where the same codebase mistakes resurface across people, sessions, and agents.
+- **Regulated or audit-conscious orgs** that need a tamper-evident record that a rule was enforced, not just documented.
 
 ---
 
@@ -60,9 +97,9 @@ mati exposes exactly four tools. That's a hard constraint: every tool definition
 
 Every file gets a `file:<path>` record: a purpose summary, entry points, and the keys of any attached gotchas. Gotchas are the core unit, each one a rule, a reason, a severity, and a `confirmed` flag.
 
-Unconfirmed gotchas are candidates. They sit in the graph but don't change Claude's behavior. Confirming one turns on enforcement for it.
+Unconfirmed gotchas are candidates. They sit in the graph but don't change the agent's behavior. Confirming one turns on enforcement for it.
 
-Enforcement is a single threshold. If a record has `confidence >= 0.6`, `confirmed = true`, and `quality >= 0.4`, the pre-read hook surfaces it before the file is opened, and on Codex the pre-edit hook gates edits too. A high-confidence record can deny the read or edit outright and hand the agent the record instead. Lower-confidence records attach context without blocking.
+Enforcement keys on gotchas, against a single threshold. If a gotcha is `confirmed = true` with `confidence >= 0.6` and `quality >= 0.4`, its hook can deny the operation outright (a Claude Code read, or a Codex `apply_patch` edit) and hand the agent the gotcha instead. File records have no `confirmed` flag; they drive a separate, lower-confidence advisory path that attaches context without ever blocking.
 
 ### Static analysis
 
@@ -78,20 +115,15 @@ Enforcement is a single threshold. If a record has `confidence >= 0.6`, `confirm
 # Install
 cargo install mati
 
-# Initialize a project
+# Initialize a project and install the agent integration. Runs the Layer 0
+# scan, then installs the MCP server (.mcp.json) and the enforcement hooks
+# (.claude/settings.json). Use --codex for the Codex integration instead.
 cd your-project
-mati init
+mati init --claude
 
-# Add the MCP server to Claude Code
-# In .claude/settings.json:
-{
-  "mcpServers": {
-    "mati": {
-      "command": "mati",
-      "args": ["serve"]
-    }
-  }
-}
+# The hooks are what enforce. Without them you get tool access but no
+# blocking. To (re)install just the hooks later, without a full re-init:
+#   mati hooks --claude     # or: mati hooks --codex
 
 # Enrich a file or directory
 mati enrich src/auth/
@@ -152,7 +184,7 @@ The semantic layer (vector search via `candle` + `usearch`) is feature-gated beh
 
 ## Free local tool, paid audit layer for teams
 
-mati is the complete product for a solo developer, and all of it is free. From the first run, the enforcement engine records every DENY, every ALLOW, and every hook decision to a hash-chained, append-only event log. That log stays local and yours.
+mati is the complete product for a solo developer, and all of it is free. From the first run, the enforcement engine records deny decisions, allow-after-receipt decisions, and consultation receipts (plus control and config changes) to a hash-chained, append-only event log. That log stays local and yours.
 
 **mati Enterprise** reads that log and turns it into signed audit artifacts for teams at regulated companies:
 
@@ -180,6 +212,12 @@ cargo nextest run --lib
 ```
 
 Vanilla `cargo test` works but is constrained to single-threaded execution. See `CLAUDE.md` for why.
+
+---
+
+## The name
+
+**mati** is a Nahuatl verb meaning "to know" or "to think." UNAM's Gran Diccionario Náhuatl lists it as transitive: _nicmati_ is "I know it," _quimati_ is "he or she knows it" ([source](https://gdn.iib.unam.mx/diccionario/mati/182730)). The tool's job is the same: know what matters about your codebase, and make sure it is actually used instead of explained again and again.
 
 ---
 
