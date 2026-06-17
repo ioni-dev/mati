@@ -22,6 +22,10 @@ path = "src/main.rs"
 [[bin]]
 name    = "bench_real"
 path    = "src/bin/bench_real/main.rs"
+# Dev/benchmark tool only. Gated behind `bench-bin` so it is NOT built or
+# installed by a default `cargo install mati`. Run it with:
+#   cargo run --features bench-bin --bin bench_real
+required-features = ["bench-bin"]
 
 [lib]
 name = "mati_core"
@@ -33,6 +37,10 @@ path = "src/lib.rs"
 
 [features]
 default = []
+
+# Builds the bench_real dev binary (see [[bin]] bench_real). Off by default so
+# it is excluded from `cargo install mati`.
+bench-bin = []
 
 # opt-in: mati enable-semantic
 # downloads all-MiniLM-L6-v2 (23MB quantized), builds HNSW index
