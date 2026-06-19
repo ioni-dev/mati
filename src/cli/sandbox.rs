@@ -30,9 +30,8 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use mati_core::store::{GotchaRecord, RecordLifecycle};
+use mati_core::store::{GotchaRecord, Record, RecordLifecycle};
 
-use super::daemon::mati_root_for;
 use super::proxy::StoreProxy;
 
 /// Tag → shell-deny mapping. Explicit opt-in only; severity is never used.
@@ -52,7 +51,11 @@ pub struct SandboxArgs {
 pub enum SandboxCommand {
     /// Compile crown-jewel gotchas into sandbox deny rules (preview, or --apply).
     Compile(CompileArgs),
-    /// Remove mati-managed sandbox deny rules from .claude/settings.local.json.
+    /// Mark a file's confirmed gotcha crown-jewel, then write the deny floor.
+    Protect(ProtectArgs),
+    /// Remove a file's crown-jewel protection and re-sync settings.local.json.
+    Unprotect(ProtectArgs),
+    /// Remove all mati-managed sandbox deny rules from settings.local.json.
     Clear,
 }
 
@@ -61,6 +64,21 @@ pub struct CompileArgs {
     /// Write the rules into .claude/settings.local.json (default: preview only).
     #[arg(long)]
     pub apply: bool,
+    /// With --apply, allow removing protections whose crown-jewel tag is gone.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ProtectArgs {
+    /// Repo-relative file path (must already have a confirmed gotcha).
+    pub file: String,
+    /// Also deny shell *reads* (for secrets), not just writes.
+    #[arg(long)]
+    pub read: bool,
+    /// Confirm when the gotcha also covers other files (the tag is per-gotcha).
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// Sandbox filesystem deny rules. Paths are repo-relative after `compile_relative`
@@ -322,13 +340,28 @@ fn write_settings_atomic(path: &Path, v: &Value) -> Result<()> {
 pub async fn run(args: SandboxArgs) -> Result<()> {
     match args.command {
         SandboxCommand::Compile(a) => run_compile(a).await,
+        SandboxCommand::Protect(a) => run_protect(a, true).await,
+        SandboxCommand::Unprotect(a) => run_protect(a, false).await,
         SandboxCommand::Clear => run_clear().await,
     }
 }
 
+/// The project root that `affected_files` are relative to and where `.claude`
+/// lives — the nearest ancestor with a `.claude` or `.git` marker, NOT the
+/// `~/.mati/<slug>` store dir. Falls back to the canonical cwd.
 fn repo_root_for(cwd: &Path) -> Result<PathBuf> {
-    let root = mati_root_for(cwd)?;
-    Ok(std::fs::canonicalize(&root).unwrap_or(root))
+    let start = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut dir: &Path = &start;
+    loop {
+        if dir.join(".claude").is_dir() || dir.join(".git").exists() {
+            return Ok(dir.to_path_buf());
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => break,
+        }
+    }
+    Ok(start)
 }
 
 fn settings_local_path(repo_root: &Path) -> PathBuf {
@@ -339,48 +372,19 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = repo_root_for(&cwd)?;
     let store = StoreProxy::open(&cwd).await?;
-    let records = store.scan_prefix("gotcha:").await?;
-
-    let mut items: Vec<(Vec<String>, bool, bool, Vec<String>)> = Vec::new();
-    for r in &records {
-        let active = matches!(r.lifecycle, RecordLifecycle::Active);
-        let (confirmed, files) = match r.payload_as::<GotchaRecord>() {
-            Some(g) => (g.confirmed, g.affected_files),
-            None => (false, Vec::new()),
-        };
-        let tagged = r
-            .tags
-            .iter()
-            .any(|t| t == TAG_DENY_WRITE || t == TAG_DENY_READ);
-        if tagged && active && !confirmed {
-            eprintln!("warning: {} is tagged crown-jewel but not confirmed — not enforced (run `mati gotcha confirm`)", r.key);
-        } else if tagged && active && files.is_empty() {
-            eprintln!(
-                "warning: {} is tagged crown-jewel but has no affected_files — nothing to deny",
-                r.key
-            );
-        }
-        items.push((r.tags.clone(), active, confirmed, files));
+    let (abs, skipped, warnings) = compute_rules(&store, &repo_root).await?;
+    for w in &warnings {
+        eprintln!("warning: {w}");
     }
-
-    let rel = compile_relative(items.iter().map(|(t, a, c, f)| GotchaSel {
-        tags: t,
-        active: *a,
-        confirmed: *c,
-        files: f,
-    }));
-    let (abs, skipped) = resolve_rules(&repo_root, &rel);
     for s in &skipped {
         eprintln!(
-            "warning: {s} resolves outside the repo — skipped (sandbox denies are clamped to the repo for safety)"
+            "warning: {s} resolves outside the repo — skipped (denies are clamped to the repo)"
         );
     }
 
     let path = settings_local_path(&repo_root);
     if args.apply {
-        let existing = read_settings(&path)?;
-        let merged = apply_into_settings(existing, &repo_root, &abs);
-        write_settings_atomic(&path, &merged)?;
+        materialize(&path, &repo_root, &abs, true, args.force)?;
         println!(
             "Applied {} denyWrite + {} denyRead entr{} to {}",
             abs.deny_write.len(),
@@ -394,7 +398,194 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
         );
         enablement_hint();
     } else {
+        if let Ok(existing) = read_settings(&path) {
+            for r in drifted_removals(&existing, &repo_root, &abs) {
+                eprintln!("drift: {r} is in your sandbox config but no longer has a confirmed crown-jewel gotcha — `--apply` would remove it");
+            }
+        }
         print_preview(&abs, &path);
+    }
+    Ok(())
+}
+
+/// Scan the store → absolute deny rules, plus out-of-repo skips and warnings.
+async fn compute_rules(
+    store: &StoreProxy,
+    repo_root: &Path,
+) -> Result<(SandboxRules, BTreeSet<String>, Vec<String>)> {
+    let records = store.scan_prefix("gotcha:").await?;
+    let mut warnings = Vec::new();
+    let mut items: Vec<(Vec<String>, bool, bool, Vec<String>)> = Vec::new();
+    for r in &records {
+        let active = matches!(r.lifecycle, RecordLifecycle::Active);
+        let (confirmed, files) = match r.payload_as::<GotchaRecord>() {
+            Some(g) => (g.confirmed, g.affected_files),
+            None => (false, Vec::new()),
+        };
+        let tagged = r
+            .tags
+            .iter()
+            .any(|t| t == TAG_DENY_WRITE || t == TAG_DENY_READ);
+        if tagged && active && !confirmed {
+            warnings.push(format!(
+                "{} is tagged crown-jewel but not confirmed — not enforced (run `mati gotcha confirm`)",
+                r.key
+            ));
+        } else if tagged && active && files.is_empty() {
+            warnings.push(format!(
+                "{} is tagged crown-jewel but has no affected_files",
+                r.key
+            ));
+        }
+        items.push((r.tags.clone(), active, confirmed, files));
+    }
+    let rel = compile_relative(items.iter().map(|(t, a, c, f)| GotchaSel {
+        tags: t,
+        active: *a,
+        confirmed: *c,
+        files: f,
+    }));
+    let (abs, skipped) = resolve_rules(repo_root, &rel);
+    Ok((abs, skipped, warnings))
+}
+
+/// Write the rules into settings.local.json. When `guarded`, refuse to remove
+/// mati-owned entries that drifted (their crown-jewel tag is gone) unless
+/// `force` — a security floor is never silently removed.
+fn materialize(
+    path: &Path,
+    repo_root: &Path,
+    abs: &SandboxRules,
+    guarded: bool,
+    force: bool,
+) -> Result<()> {
+    let existing = read_settings(path)?;
+    let removals = drifted_removals(&existing, repo_root, abs);
+    if guarded && !removals.is_empty() && !force {
+        eprintln!(
+            "Refusing to remove {} sandbox protection(s) whose crown-jewel tag is gone:",
+            removals.len()
+        );
+        for r in &removals {
+            eprintln!("  {r}");
+        }
+        bail!("re-tag via `mati sandbox protect <file>`, or pass --force to remove them");
+    }
+    for r in &removals {
+        eprintln!("note: removing sandbox protection for {r}");
+    }
+    let merged = apply_into_settings(existing, repo_root, abs);
+    write_settings_atomic(path, &merged)
+}
+
+/// mati-owned (under-repo) entries currently in settings that `abs` would drop.
+fn drifted_removals(existing: &Value, repo_root: &Path, abs: &SandboxRules) -> BTreeSet<String> {
+    let mut removed = BTreeSet::new();
+    for (key, new_set) in [("denyWrite", &abs.deny_write), ("denyRead", &abs.deny_read)] {
+        let Some(arr) = settings_array(existing, key) else {
+            continue;
+        };
+        for s in arr.iter().filter_map(|v| v.as_str()) {
+            if is_mati_owned(s, repo_root) && !new_set.contains(s) {
+                removed.insert(s.to_string());
+            }
+        }
+    }
+    removed
+}
+
+fn settings_array<'a>(root: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
+    root.get("sandbox")?.get("filesystem")?.get(key)?.as_array()
+}
+
+fn add_tags(tags: &mut Vec<String>, add: &[&str]) {
+    for t in add {
+        if !tags.iter().any(|x| x == t) {
+            tags.push((*t).to_string());
+        }
+    }
+}
+
+fn remove_tags(tags: &mut Vec<String>, rm: &[&str]) {
+    tags.retain(|t| !rm.iter().any(|r| r == t));
+}
+
+/// `protect`/`unprotect`: (un)tag a file's confirmed gotcha(s) crown-jewel, then
+/// re-sync settings.local.json. Intentional, so the drift guard is off.
+async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
+    let verb = if add { "protect" } else { "unprotect" };
+    let cwd = std::env::current_dir()?;
+    let repo_root = repo_root_for(&cwd)?;
+    let store = StoreProxy::open(&cwd).await?;
+    let file = normalize_rel(&args.file);
+
+    let matched: Vec<Record> = store
+        .scan_prefix("gotcha:")
+        .await?
+        .into_iter()
+        .filter(|r| {
+            matches!(r.lifecycle, RecordLifecycle::Active)
+                && r.payload_as::<GotchaRecord>()
+                    .map(|g| {
+                        g.confirmed && g.affected_files.iter().any(|af| normalize_rel(af) == file)
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    if matched.is_empty() {
+        bail!(
+            "no confirmed gotcha covers `{file}` — add one first:\n  \
+             mati gotcha add {file} -r \"<rule>\"   then   mati gotcha confirm <key>"
+        );
+    }
+
+    // Blast radius: the crown-jewel tag is per-gotcha, so a multi-file gotcha
+    // would (un)protect ALL its files. Surface that and require --yes.
+    for r in &matched {
+        if let Some(g) = r.payload_as::<GotchaRecord>() {
+            let others: Vec<String> = g
+                .affected_files
+                .iter()
+                .map(|f| normalize_rel(f))
+                .filter(|f| *f != file)
+                .collect();
+            if !others.is_empty() && !args.yes {
+                eprintln!("`{}` also covers: {}", r.key, others.join(", "));
+                bail!("the crown-jewel tag is per-gotcha, so this would {verb} those too — re-run with --yes to confirm, or split the gotcha");
+            }
+        }
+    }
+
+    let to_add: Vec<&str> = if args.read {
+        vec![TAG_DENY_WRITE, TAG_DENY_READ]
+    } else {
+        vec![TAG_DENY_WRITE]
+    };
+    let mut n = 0;
+    for r in &matched {
+        if let Some(mut rec) = store.get(&r.key).await? {
+            if add {
+                add_tags(&mut rec.tags, &to_add);
+            } else {
+                remove_tags(&mut rec.tags, &[TAG_DENY_WRITE, TAG_DENY_READ]);
+            }
+            store.put(&r.key, &rec).await?;
+            n += 1;
+        }
+    }
+
+    // Re-materialize — intentional change, so the drift guard is off.
+    let (abs, _skipped, _warnings) = compute_rules(&store, &repo_root).await?;
+    let path = settings_local_path(&repo_root);
+    materialize(&path, &repo_root, &abs, false, true)?;
+
+    println!(
+        "{}ed `{file}` ({n} gotcha(s) updated); synced {}.",
+        if add { "Protect" } else { "Unprotect" },
+        path.display()
+    );
+    if add {
+        enablement_hint();
     }
     Ok(())
 }
@@ -591,6 +782,39 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_sandbox_shape(&json!({})).is_ok());
+    }
+
+    // ── tag helpers + drift detection ────────────────────────────────────────
+
+    #[test]
+    fn add_and_remove_tags_dedupe() {
+        let mut tags = sv(&["enriched"]);
+        add_tags(&mut tags, &["crown-jewel", "sandbox-deny-read"]);
+        add_tags(&mut tags, &["crown-jewel"]); // idempotent
+        assert_eq!(tags.iter().filter(|t| *t == "crown-jewel").count(), 1);
+        assert!(tags.contains(&"sandbox-deny-read".to_string()));
+        remove_tags(&mut tags, &["crown-jewel", "sandbox-deny-read"]);
+        assert_eq!(tags, sv(&["enriched"]), "only the sandbox tags are removed");
+    }
+
+    #[test]
+    fn drifted_removals_flags_dropped_tag_only() {
+        let repo = Path::new("/work/repo");
+        let existing = json!({ "sandbox": { "filesystem": {
+            "denyWrite": ["/work/repo/still.rs", "/work/repo/dropped.rs", "~/.ssh"]
+        } } });
+        let mut abs = SandboxRules::default();
+        abs.deny_write.insert("/work/repo/still.rs".to_string());
+        let drift = drifted_removals(&existing, repo, &abs);
+        assert!(
+            drift.contains("/work/repo/dropped.rs"),
+            "tag-dropped entry flagged"
+        );
+        assert!(
+            !drift.contains("/work/repo/still.rs"),
+            "still-protected not flagged"
+        );
+        assert!(!drift.contains("~/.ssh"), "user entry never flagged");
     }
 
     // ── path resolution (filesystem) ─────────────────────────────────────────
