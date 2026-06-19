@@ -154,6 +154,7 @@ mati stats
 | `mati explain <file>`           | File briefing: gotchas, blast radius, co-change partners, cluster membership |
 | `mati clusters`                 | Co-change clusters from git history                                          |
 | `mati diff [range]`             | Pre-merge check: surface gotchas for files in a git diff range               |
+| `mati sandbox protect <file>`   | Compile a crown-jewel file into an OS-level sandbox deny floor (opt-in, macOS/Linux/WSL2) |
 | `mati repair`                   | Reconcile derived indexes against canonical records                          |
 | `mati repair --check`           | Same, exits non-zero if drift is found (CI-safe)                             |
 | `mati doctor`                   | Aggregated health check                                                      |
