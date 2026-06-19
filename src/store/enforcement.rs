@@ -27,10 +27,12 @@ use super::db::Store;
 // Constants (FROZEN for v1)
 // ─────────────────────────────────────────────
 
-/// Schema version for the enforcement event envelope. Frozen at 1 for v1.
+/// Schema version for the enforcement event envelope. v2 adds `agent_session`,
+/// appended to the canonical form and hashed only for v2+ events; v1 events keep
+/// their original 14-field canonical layout and hashes (see `compute_hash`).
 /// Increment only when fields are added or serialization changes.
 /// Verifiers must reject events with unknown schema versions.
-pub const SCHEMA_VERSION: u8 = 1;
+pub const SCHEMA_VERSION: u8 = 2;
 
 /// Hash algorithm used for event_hash and prev_hash.
 /// Frozen for v1. Do not change without incrementing SCHEMA_VERSION.
@@ -115,6 +117,13 @@ pub struct EnforcementEvent {
     /// Hash of the gotcha/config state that was used to make this decision.
     /// Proves which rule text and thresholds were in force at decision time.
     pub decision_basis_hash: Option<String>,
+
+    /// The AI agent SESSION that triggered this event (Claude Code `session_id`).
+    /// Enables per-actor audit attribution — proving the same session that
+    /// consulted a file also acted on it. `None` for events with no session
+    /// (Codex, config changes, gaps). Added in schema_version 2; hashed only for
+    /// v2+ events (see `compute_hash`).
+    pub agent_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +245,29 @@ struct CanonicalEvent<'a> {
     decision_basis_hash: Option<&'a str>,
 }
 
+/// schema_version 2 canonical form: the v1 fields followed by `agent_session`,
+/// appended at the END so v1 events (serialized via `CanonicalEvent`) keep a
+/// byte-identical canonical form and their original hashes.
+#[derive(Serialize)]
+struct CanonicalEventV2<'a> {
+    event_id: &'a str,
+    schema_version: u8,
+    seq_no: u64,
+    recorded_at_ms: u64,
+    event_type: &'a EnforcementEventType,
+    prev_hash: &'a str,
+    installation_id: &'a str,
+    actor_local: &'a Option<ActorLocal>,
+    agent_type: &'a str,
+    subject_kind: SubjectKind,
+    subject_key: &'a str,
+    canonical_subject_hash: Option<&'a str>,
+    receipt_id: Option<&'a str>,
+    decision_reason_code: &'a str,
+    decision_basis_hash: Option<&'a str>,
+    agent_session: Option<&'a str>,
+}
+
 impl EnforcementEvent {
     /// Compute the canonical hash of this event.
     ///
@@ -243,26 +275,49 @@ impl EnforcementEvent {
     /// This function is frozen for schema_version 1 — do not modify
     /// without incrementing SCHEMA_VERSION.
     pub fn compute_hash(&self) -> String {
-        let canonical = CanonicalEvent {
-            event_id: &self.event_id,
-            schema_version: self.schema_version,
-            seq_no: self.seq_no,
-            recorded_at_ms: self.recorded_at_ms,
-            event_type: &self.event_type,
-            prev_hash: &self.prev_hash,
-            installation_id: &self.installation_id,
-            actor_local: &self.actor_local,
-            agent_type: &self.agent_type,
-            subject_kind: self.subject_kind,
-            subject_key: &self.subject_key,
-            canonical_subject_hash: self.canonical_subject_hash.as_deref(),
-            receipt_id: self.receipt_id.as_deref(),
-            decision_reason_code: &self.decision_reason_code,
-            decision_basis_hash: self.decision_basis_hash.as_deref(),
+        // schema_version 1 hashes the original 14-field canonical form; v2+ hashes
+        // the 15-field form with `agent_session` appended. Branching here keeps
+        // every pre-existing v1 event's hash byte-identical (no false tamper).
+        let json = if self.schema_version >= 2 {
+            let canonical = CanonicalEventV2 {
+                event_id: &self.event_id,
+                schema_version: self.schema_version,
+                seq_no: self.seq_no,
+                recorded_at_ms: self.recorded_at_ms,
+                event_type: &self.event_type,
+                prev_hash: &self.prev_hash,
+                installation_id: &self.installation_id,
+                actor_local: &self.actor_local,
+                agent_type: &self.agent_type,
+                subject_kind: self.subject_kind,
+                subject_key: &self.subject_key,
+                canonical_subject_hash: self.canonical_subject_hash.as_deref(),
+                receipt_id: self.receipt_id.as_deref(),
+                decision_reason_code: &self.decision_reason_code,
+                decision_basis_hash: self.decision_basis_hash.as_deref(),
+                agent_session: self.agent_session.as_deref(),
+            };
+            serde_json::to_string(&canonical).expect("canonical serialization must not fail")
+        } else {
+            let canonical = CanonicalEvent {
+                event_id: &self.event_id,
+                schema_version: self.schema_version,
+                seq_no: self.seq_no,
+                recorded_at_ms: self.recorded_at_ms,
+                event_type: &self.event_type,
+                prev_hash: &self.prev_hash,
+                installation_id: &self.installation_id,
+                actor_local: &self.actor_local,
+                agent_type: &self.agent_type,
+                subject_kind: self.subject_kind,
+                subject_key: &self.subject_key,
+                canonical_subject_hash: self.canonical_subject_hash.as_deref(),
+                receipt_id: self.receipt_id.as_deref(),
+                decision_reason_code: &self.decision_reason_code,
+                decision_basis_hash: self.decision_basis_hash.as_deref(),
+            };
+            serde_json::to_string(&canonical).expect("canonical serialization must not fail")
         };
-
-        let json =
-            serde_json::to_string(&canonical).expect("canonical serialization must not fail");
 
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
@@ -482,6 +537,9 @@ pub struct EnforcementEventWriter {
     seq: SeqAllocator,
     installation_id: String,
     prev_hash: String,
+    /// Agent session (Claude Code `session_id`) to attribute written events to,
+    /// for per-actor audit (schema_version 2). `None` unless set before `write`.
+    agent_session: Option<String>,
 }
 
 impl EnforcementEventWriter {
@@ -498,6 +556,7 @@ impl EnforcementEventWriter {
             seq,
             installation_id,
             prev_hash,
+            agent_session: None,
         })
     }
 
@@ -581,6 +640,7 @@ impl EnforcementEventWriter {
             receipt_id,
             decision_reason_code,
             decision_basis_hash,
+            agent_session: self.agent_session.clone(),
         };
 
         // Compute and set the event hash
@@ -723,19 +783,22 @@ pub async fn set_enforcement_mode(store: &Store, mode: EnforcementMode) -> Resul
         .put_raw(ENFORCEMENT_MODE_KEY, value.as_bytes())
         .await?;
 
-    // Record config change event if the mode actually changed
+    // Record config change event if the mode actually changed. The audit event
+    // uses the USER-FACING vocabulary (audit.write_durability / best_effort),
+    // even though the internal enum + stored value stay advisory/strict (frozen
+    // by the RecordingGap hash contract and the storage round-trip).
     if old != mode {
-        let old_str = match old {
-            EnforcementMode::Advisory => "advisory",
+        let user_label = |m: EnforcementMode| match m {
+            EnforcementMode::Advisory => "best_effort",
             EnforcementMode::Strict => "strict",
         };
         // Best-effort — don't fail the config change if event recording fails
         let _ = record_event(
             store,
             EnforcementEventType::EnforcementConfigChanged {
-                setting: "enforcement.mode".to_string(),
-                old_value: old_str.to_string(),
-                new_value: value.to_string(),
+                setting: "audit.write_durability".to_string(),
+                old_value: user_label(old).to_string(),
+                new_value: user_label(mode).to_string(),
             },
             SubjectKind::Config,
             "enforcement:mode".to_string(),
@@ -816,10 +879,40 @@ pub async fn record_event(
     decision_reason_code: String,
     decision_basis_hash: Option<String>,
 ) -> Result<Option<EnforcementEvent>> {
+    record_event_with_session(
+        store,
+        event_type,
+        subject_kind,
+        subject_key,
+        agent_type,
+        receipt_id,
+        decision_reason_code,
+        decision_basis_hash,
+        None,
+    )
+    .await
+}
+
+/// Like [`record_event`], but attributes the event to an AI agent SESSION
+/// (Claude Code `session_id`) for per-actor audit (schema_version 2). Used by the
+/// hook-event path, which carries the `session_id` from the PreToolUse input.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_event_with_session(
+    store: &Store,
+    event_type: EnforcementEventType,
+    subject_kind: SubjectKind,
+    subject_key: String,
+    agent_type: String,
+    receipt_id: Option<String>,
+    decision_reason_code: String,
+    decision_basis_hash: Option<String>,
+    agent_session: Option<String>,
+) -> Result<Option<EnforcementEvent>> {
     let mode = get_enforcement_mode(store).await;
 
     let result = async {
         let mut writer = EnforcementEventWriter::new(store).await?;
+        writer.agent_session = agent_session;
         writer
             .write(
                 store,
@@ -1032,6 +1125,7 @@ mod tests {
             receipt_id: None,
             decision_reason_code: "gotcha_above_threshold".to_string(),
             decision_basis_hash: Some("def456".to_string()),
+            agent_session: None,
         }
     }
 
@@ -1132,8 +1226,40 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_one() {
-        assert_eq!(SCHEMA_VERSION, 1);
+    fn schema_version_is_two() {
+        assert_eq!(SCHEMA_VERSION, 2);
         assert_eq!(HASH_ALGORITHM, "sha256");
+    }
+
+    #[test]
+    fn v2_hash_includes_agent_session() {
+        // A v2 event hashes `agent_session`, so changing it changes the hash —
+        // tamper-evident per-actor attribution. v1 events (frozen_test_event) are
+        // unaffected: their hash stays the v1 golden value asserted above.
+        let mut e_none = frozen_test_event();
+        e_none.schema_version = 2;
+        e_none.agent_session = None;
+        let h_none = e_none.compute_hash();
+
+        let mut e_session = e_none.clone();
+        e_session.agent_session = Some("sess-abc".to_string());
+        let h_session = e_session.compute_hash();
+
+        assert_ne!(
+            h_none, h_session,
+            "agent_session must be part of the v2 canonical hash"
+        );
+        // Determinism: same v2 event → same hash.
+        assert_eq!(h_session, e_session.compute_hash());
+
+        // The v2 form (even with agent_session=None) differs from the v1 form of
+        // the same event — proving compute_hash branches on schema_version.
+        let mut as_v1 = e_none.clone();
+        as_v1.schema_version = 1;
+        assert_ne!(
+            h_none,
+            as_v1.compute_hash(),
+            "v1 and v2 canonical forms must differ (14 vs 15 fields)"
+        );
     }
 }

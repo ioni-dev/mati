@@ -18,6 +18,14 @@ use mati_core::hooks::decide::{self, Decision, EnforcementInput, HookEvent};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookVariant {
     ClaudePreRead,
+    /// Claude PreToolUse(Edit|Write|NotebookEdit): gate file *edits*. Uses
+    /// `consulted_recent` (a recent-consultation TTL, matching the Codex
+    /// `apply_patch` edit gate) — NOT the read gate's persistent `consulted` — so
+    /// an edit must be preceded by a *recent* mem_get: read-then-edit flows within
+    /// the TTL, and blind or stale-consult edits deny. Non-deny outcomes DEFER to
+    /// the normal permission flow instead of emitting `allow` — edits are
+    /// permission-required, so force-allow would suppress the user's edit prompt.
+    ClaudePreEdit,
     ClaudePreBash,
     CodexPreBash,
     CodexPostBash,
@@ -118,7 +126,13 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     // 7. Single hook_evaluate round-trip.
     let file_key = format!("file:{rel_path}");
-    let include_recent = matches!(args.variant, HookVariant::CodexPreBash);
+    // ClaudePreEdit and CodexPreBash both want the recent-TTL consultation, not
+    // the persistent `consulted` flag: an edit / shell-read must be freshly
+    // preceded by a mem_get (matches the Codex apply_patch edit gate).
+    let include_recent = matches!(
+        args.variant,
+        HookVariant::CodexPreBash | HookVariant::ClaudePreEdit
+    );
 
     let eval_data = match daemon_result(
         &mati_root,
@@ -142,7 +156,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     let adapter = process_eval_response(args.variant, &rel_path, &eval_data);
 
     // Fire events (non-blocking).
-    fire_events(&mati_root, &adapter.events).await;
+    // session_id (Claude Code provides it at the top level of the hook input)
+    // attributes these audit events to this agent session — per-actor audit.
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
+    fire_events(&mati_root, &adapter.events, session_id).await;
 
     // Fail-open telemetry for store/gotcha errors.
     if let EvalDataCheck::FailOpen(reason) = check_eval_data(args.variant, &rel_path, &eval_data) {
@@ -168,10 +185,15 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
 fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<String> {
     match variant {
-        HookVariant::ClaudePreRead => {
-            // Structured file_path from Claude Code.
+        HookVariant::ClaudePreRead | HookVariant::ClaudePreEdit => {
+            // Structured path from Claude Code. Read/Edit/Write use `file_path`;
+            // NotebookEdit uses `notebook_path`. We check both (plus a legacy
+            // `path` fallback) so the edit gate covers every edit-class tool in
+            // the matcher regardless of which field the tool populates — rather
+            // than assuming one field for a tool whose schema we haven't pinned.
             input
                 .pointer("/tool_input/file_path")
+                .or_else(|| input.pointer("/tool_input/notebook_path"))
                 .or_else(|| input.pointer("/tool_input/path"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
@@ -255,6 +277,7 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
         mati_core::mcp::protocol::Command::SessionLog(mati_core::mcp::protocol::SessionLogInput {
             event,
             key: file_key.clone(),
+            session_id: None,
         });
     let _ = super::daemon::daemon_v2(mati_root, cmd).await;
 
@@ -350,7 +373,9 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     }
 
     // 5. Fire compliance events for the blocked files (fire-and-forget).
-    fire_events(&mati_root, &events).await;
+    // Codex apply_patch: no Claude session_id in the input; attribution is via
+    // agent_type ("codex"). Per-actor session attribution is a Claude-path feature.
+    fire_events(&mati_root, &events, None).await;
 
     // 6. Deny if any file needs consultation; otherwise allow.
     if denied.is_empty() {
@@ -453,6 +478,19 @@ fn platform_events(
             // Post-bash uses its own flow — should not reach here.
             events
         }
+        HookVariant::ClaudePreEdit => events
+            .into_iter()
+            // Plane 2: translate to edit-attributed events and KEEP them, so the
+            // audit trail records both that a stale/blind edit was blocked
+            // (EditBlocked → Deny) and that a consulted edit proceeded
+            // (EditConsulted → AllowAfterReceipt), each with an edit-specific
+            // reason code. Drop the rest — the read gate owns Hit/Miss here.
+            .filter_map(|e| match e {
+                HookEvent::BlockedUnconsultedRead { key } => Some(HookEvent::EditBlocked { key }),
+                HookEvent::ComplianceHit { key } => Some(HookEvent::EditConsulted { key }),
+                _ => None,
+            })
+            .collect(),
         HookVariant::ClaudePreRead | HookVariant::ClaudePreBash => {
             // Claude delivers context for all non-silent outcomes.
             events
@@ -462,8 +500,11 @@ fn platform_events(
 
 // ── Event firing ────────────────────────────────────────────────────────────
 
-async fn fire_events(mati_root: &Path, events: &[HookEvent]) {
+async fn fire_events(mati_root: &Path, events: &[HookEvent], session_id: Option<&str>) {
     use mati_core::mcp::protocol as p;
+    // Per-actor audit attribution (schema_version 2): tag each SessionLog with the
+    // agent session that triggered it, when the platform provides one.
+    let sid = || session_id.map(str::to_string);
     for event in events {
         let cmd = match event {
             HookEvent::Hit { key } => {
@@ -472,20 +513,34 @@ async fn fire_events(mati_root: &Path, events: &[HookEvent]) {
             HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::Miss,
                 key: key.clone(),
+                session_id: sid(),
             }),
             HookEvent::BlockedUnconsultedRead { key } => {
                 p::Command::SessionLog(p::SessionLogInput {
                     event: p::SessionEvent::ComplianceMiss,
                     key: key.clone(),
+                    session_id: sid(),
                 })
             }
             HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::CodexShellMiss,
                 key: key.clone(),
+                session_id: sid(),
             }),
             HookEvent::ComplianceHit { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::ComplianceHit,
                 key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::EditConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::EditConsulted,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::EditBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::EditBlocked,
+                key: key.clone(),
+                session_id: sid(),
             }),
         };
         // Fire-and-forget — drop silently on failure (P9).
@@ -504,8 +559,11 @@ fn emit_allow(variant: HookVariant) {
         }
         HookVariant::CodexPreBash
         | HookVariant::CodexPostBash
-        | HookVariant::CodexPreApplyPatch => {
-            // Silent exit 0.
+        | HookVariant::CodexPreApplyPatch
+        | HookVariant::ClaudePreEdit => {
+            // Silent exit 0 = defer to the normal permission flow. For edits this
+            // is deliberate: emitting "allow" would suppress the user's edit
+            // prompt on every non-gotcha file (edits are permission-required).
         }
     }
 }
@@ -569,7 +627,10 @@ fn check_eval_data(
 ) -> EvalDataCheck {
     let include_recent = matches!(
         variant,
-        HookVariant::CodexPreBash | HookVariant::CodexPostBash | HookVariant::CodexPreApplyPatch
+        HookVariant::CodexPreBash
+            | HookVariant::CodexPostBash
+            | HookVariant::CodexPreApplyPatch
+            | HookVariant::ClaudePreEdit
     );
     let already_consulted = if include_recent {
         eval_data
@@ -664,6 +725,23 @@ fn format_decision(
             let stdout = format_claude_output(decision);
             (stdout, String::new(), 0)
         }
+        HookVariant::ClaudePreEdit => match decision {
+            Decision::Deny { file_key, .. } => {
+                let path = file_key.strip_prefix("file:").unwrap_or(file_key);
+                let reason = format!(
+                    "[mati] Confirmed gotcha on {path} — call mem_get(\"{file_key}\") \
+                     and read the record before editing this file."
+                );
+                let escaped = escape_json_string(&reason);
+                let stdout = format!(
+                    r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"{escaped}"}}}}"#
+                );
+                (stdout, String::new(), 0)
+            }
+            // Non-deny: DEFER to the normal permission flow (empty stdout, exit 0).
+            // Deliberately NOT permissionDecision:"allow" — see pre_edit.rs.
+            _ => (String::new(), String::new(), 0),
+        },
         HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => match decision {
             Decision::Deny { file_key, .. } => {
                 let stderr = format!("mati: call mem_get(\"{file_key}\") first");
@@ -1245,5 +1323,141 @@ mod tests {
         assert!(matches!(result.decision, Decision::NoRecord));
         assert_eq!(result.events.len(), 1);
         assert!(matches!(&result.events[0], HookEvent::Miss { .. }));
+    }
+
+    // ── ClaudePreEdit (WI-01, L1 edit-gate) ─────────────────────────────
+
+    #[test]
+    fn extract_path_claude_pre_edit_file_path() {
+        // Edit/Write both pass the target at tool_input.file_path, same as Read.
+        let input = json!({"tool_input": {"file_path": "/repo/src/pay.rs"}});
+        assert_eq!(
+            extract_path(&input, HookVariant::ClaudePreEdit),
+            Some("/repo/src/pay.rs".into())
+        );
+    }
+
+    #[test]
+    fn extract_path_claude_pre_edit_notebook_path() {
+        // NotebookEdit carries the target at tool_input.notebook_path, not
+        // file_path — the edit gate must still extract it so notebooks are gated.
+        let input = json!({"tool_input": {"notebook_path": "/repo/nb/analysis.ipynb"}});
+        assert_eq!(
+            extract_path(&input, HookVariant::ClaudePreEdit),
+            Some("/repo/nb/analysis.ipynb".into())
+        );
+    }
+
+    #[test]
+    fn extract_path_codex_pre_bash_egrep_and_fgrep() {
+        // egrep/fgrep satisfy Claude's read-before-edit; mati now detects them so
+        // they can't be used to satisfy the read requirement unconsulted.
+        let egrep = json!({"tool_input": {"command": "egrep TODO src/main.rs"}});
+        assert_eq!(
+            extract_path(&egrep, HookVariant::CodexPreBash),
+            Some("src/main.rs".into())
+        );
+        let fgrep = json!({"tool_input": {"command": "fgrep needle src/main.rs"}});
+        assert_eq!(
+            extract_path(&fgrep, HookVariant::CodexPreBash),
+            Some("src/main.rs".into())
+        );
+    }
+
+    #[test]
+    fn e2e_claude_pre_edit_denies_blind_edit() {
+        // Blind edit (no consultation receipt) to a confirmed-gotcha file must be
+        // denied with an edit-flavored Claude PreToolUse deny JSON.
+        let data = deny_eligible_eval_data();
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
+
+        assert_eq!(
+            result.exit_code, 0,
+            "Claude always exits 0; deny is in the JSON"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("deny stdout must be valid JSON");
+        assert_eq!(
+            json.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|v| v.as_str()),
+            Some("deny")
+        );
+        assert!(
+            json.pointer("/hookSpecificOutput/permissionDecisionReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("before editing"),
+            "deny reason must be edit-flavored, got: {}",
+            result.stdout
+        );
+        // Plane 2: records an edit-attributed Deny enforcement event.
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(&result.events[0], HookEvent::EditBlocked { .. }));
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+    }
+
+    #[test]
+    fn e2e_claude_pre_edit_defers_after_consult() {
+        // With a RECENT consultation receipt (consulted_recent, matching the
+        // Codex apply_patch edit gate), the edit DEFERS to the normal permission
+        // flow (empty stdout, exit 0) — deliberately NOT a forced allow.
+        let mut data = deny_eligible_eval_data();
+        data["consulted_recent"] = json!(true);
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.stdout.is_empty(),
+            "consulted edit must DEFER (empty stdout), not force-allow, got: {}",
+            result.stdout
+        );
+        assert!(result.stderr.is_empty());
+        assert!(matches!(result.decision, Decision::AlreadyConsulted { .. }));
+        // Plane 2: a consulted edit records an EditConsulted event (→
+        // AllowAfterReceipt, reason `edit_after_receipt`) — the audit evidence
+        // that this edit was preceded by a recent consult.
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(&result.events[0], HookEvent::EditConsulted { .. }));
+    }
+
+    #[test]
+    fn e2e_claude_pre_edit_defers_no_record() {
+        // No record / no gotcha → defer (never force-allow, never block) so the
+        // user's normal edit-permission flow applies.
+        let data = json!({
+            "file_key": "file:src/new.rs",
+            "file_record": null,
+            "gotcha_records": {},
+            "consulted": false,
+            "consulted_recent": false,
+            "store_error": false,
+            "gotcha_error": false
+        });
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/new.rs", &data);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.is_empty(), "no-record edit must defer");
+        assert!(matches!(result.decision, Decision::NoRecord));
+        // No block event for a non-gotcha file.
+        assert!(result.events.is_empty());
+    }
+
+    #[test]
+    fn e2e_claude_pre_edit_store_error_defers() {
+        // Fail-open: a store error must defer (empty stdout), never block the edit.
+        let data = json!({
+            "file_key": "file:src/main.rs",
+            "file_record": null,
+            "gotcha_records": {},
+            "consulted": false,
+            "consulted_recent": false,
+            "store_error": true,
+            "gotcha_error": false
+        });
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
+
+        assert_eq!(result.exit_code, 0, "store error must fail open (defer)");
+        assert!(result.stdout.is_empty());
+        assert_eq!(result.decision, Decision::Allow);
     }
 }

@@ -864,8 +864,8 @@ async fn strict_mode_enforcement_config_records_change_event() {
         new_value,
     } = &config_events[0].event_type
     {
-        assert_eq!(setting, "enforcement.mode");
-        assert_eq!(old_value, "advisory");
+        assert_eq!(setting, "audit.write_durability");
+        assert_eq!(old_value, "best_effort");
         assert_eq!(new_value, "strict");
     }
 
@@ -876,9 +876,9 @@ async fn strict_mode_enforcement_config_records_change_event() {
         new_value,
     } = &config_events[1].event_type
     {
-        assert_eq!(setting, "enforcement.mode");
+        assert_eq!(setting, "audit.write_durability");
         assert_eq!(old_value, "strict");
-        assert_eq!(new_value, "advisory");
+        assert_eq!(new_value, "best_effort");
     }
 
     // In strict mode, record_event should propagate errors
@@ -906,6 +906,45 @@ async fn strict_mode_enforcement_config_records_change_event() {
 // ─────────────────────────────────────────────
 // Test 12: Config set/get round-trips correctly
 // ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn record_event_with_session_attributes_event_v2() {
+    use mati_core::store::enforcement::record_event_with_session;
+    let (_dir, store) = temp_store().await;
+
+    record_event_with_session(
+        &store,
+        EnforcementEventType::Deny,
+        SubjectKind::File,
+        "file:src/pay.rs".to_string(),
+        "claude".to_string(),
+        None,
+        "edit_blocked_unconsulted".to_string(),
+        None,
+        Some("sess-xyz".to_string()),
+    )
+    .await
+    .expect("record");
+
+    let events = scan_enforcement_events(&store, 1, 100).await.expect("scan");
+    let ev = events
+        .iter()
+        .find(|e| matches!(e.event_type, EnforcementEventType::Deny))
+        .expect("deny event recorded");
+    assert_eq!(
+        ev.agent_session.as_deref(),
+        Some("sess-xyz"),
+        "the agent session must be recorded on the event"
+    );
+    assert_eq!(ev.schema_version, 2, "new events are schema_version 2");
+    // The session is part of the v2 canonical form, so a recorded event
+    // self-verifies (event_hash == compute_hash) — tamper-evident attribution.
+    assert_eq!(
+        ev.event_hash,
+        ev.compute_hash(),
+        "v2 event must self-verify"
+    );
+}
 
 #[tokio::test]
 async fn config_enforcement_mode_round_trips() {
@@ -975,8 +1014,8 @@ async fn config_set_enforcement_mode_records_event() {
         new_value,
     } = &config_events[0].event_type
     {
-        assert_eq!(setting, "enforcement.mode");
-        assert_eq!(old_value, "advisory");
+        assert_eq!(setting, "audit.write_durability");
+        assert_eq!(old_value, "best_effort");
         assert_eq!(new_value, "strict");
     } else {
         panic!("expected EnforcementConfigChanged");

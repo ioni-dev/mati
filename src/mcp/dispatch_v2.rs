@@ -246,10 +246,10 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
     match &req.cmd {
         Command::ConfigGet(input) => {
             let value = match input.key.as_str() {
-                "enforcement.mode" => {
+                "audit.write_durability" => {
                     let mode = get_enforcement_mode(store).await;
                     match mode {
-                        EnforcementMode::Advisory => "advisory".to_string(),
+                        EnforcementMode::Advisory => "best_effort".to_string(),
                         EnforcementMode::Strict => "strict".to_string(),
                     }
                 }
@@ -259,7 +259,7 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                         request_id,
                         ErrorCode::ValidationFailed,
                         format!(
-                            "unknown config key: {other}; valid keys: enforcement.mode, enforcement.retention"
+                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention"
                         ),
                     );
                 }
@@ -267,16 +267,16 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
             Response::ok(request_id, serde_json::Value::String(value))
         }
         Command::ConfigSet(input) => match input.key.as_str() {
-            "enforcement.mode" => {
+            "audit.write_durability" => {
                 let mode = match input.value.as_str() {
-                    "advisory" => EnforcementMode::Advisory,
+                    "best_effort" => EnforcementMode::Advisory,
                     "strict" => EnforcementMode::Strict,
                     other => {
                         return Response::err(
                             request_id,
                             ErrorCode::ValidationFailed,
                             format!(
-                                "invalid enforcement mode: {other}; valid values: advisory, strict"
+                                "invalid audit.write_durability: {other}; valid values: best_effort, strict"
                             ),
                         );
                     }
@@ -284,7 +284,7 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                 match set_enforcement_mode(store, mode).await {
                     Ok(old) => {
                         let old_label = match old {
-                            EnforcementMode::Advisory => "advisory",
+                            EnforcementMode::Advisory => "best_effort",
                             EnforcementMode::Strict => "strict",
                         };
                         Response::ok(request_id, serde_json::json!({ "old": old_label }))
@@ -322,7 +322,7 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                 request_id,
                 ErrorCode::ValidationFailed,
                 format!(
-                    "unknown config key: {other}; valid keys: enforcement.mode, enforcement.retention"
+                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention"
                 ),
             ),
         },
@@ -586,6 +586,11 @@ async fn dispatch_session_side(
                 protocol::SessionEvent::CodexShellMiss => "compliance:codex_shell_miss_",
                 protocol::SessionEvent::Bootstrap => "analytics:bootstrap_",
                 protocol::SessionEvent::PromptNudge => "analytics:codex_prompt_nudge_",
+                // Edit-gate events share the read aggregates (coarse counts); the
+                // edit-vs-read distinction lives in the hash-chained event's
+                // decision_reason_code, not the daily aggregate.
+                protocol::SessionEvent::EditConsulted => "compliance:allow_after_receipt_",
+                protocol::SessionEvent::EditBlocked => "compliance:miss_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -641,7 +646,7 @@ async fn dispatch_session_side(
             // Best-effort enforcement event recording (post-transaction).
             match input.event {
                 protocol::SessionEvent::ComplianceMiss => {
-                    let _ = crate::store::enforcement::record_event(
+                    let _ = crate::store::enforcement::record_event_with_session(
                         store,
                         crate::store::enforcement::EnforcementEventType::Deny,
                         crate::store::enforcement::SubjectKind::File,
@@ -650,11 +655,12 @@ async fn dispatch_session_side(
                         None,
                         "gotcha_above_threshold".to_string(),
                         None,
+                        input.session_id.clone(),
                     )
                     .await;
                 }
                 protocol::SessionEvent::ComplianceHit => {
-                    let _ = crate::store::enforcement::record_event(
+                    let _ = crate::store::enforcement::record_event_with_session(
                         store,
                         crate::store::enforcement::EnforcementEventType::AllowAfterReceipt,
                         crate::store::enforcement::SubjectKind::File,
@@ -663,6 +669,7 @@ async fn dispatch_session_side(
                         None,
                         "receipt_valid".to_string(),
                         None,
+                        input.session_id.clone(),
                     )
                     .await;
                 }
@@ -684,6 +691,38 @@ async fn dispatch_session_side(
                         None,
                         "codex_shell_pre_consult_miss".to_string(),
                         None,
+                    )
+                    .await;
+                }
+                // Plane 2: edit-time audit evidence. Same frozen event TYPES as
+                // reads (AllowAfterReceipt / Deny) — only the decision_reason_code
+                // differs, so the trail attributes the edit gate without touching
+                // the frozen hash contract.
+                protocol::SessionEvent::EditConsulted => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::AllowAfterReceipt,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "edit_after_receipt".to_string(),
+                        None,
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::EditBlocked => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "edit_blocked_unconsulted".to_string(),
+                        None,
+                        input.session_id.clone(),
                     )
                     .await;
                 }
@@ -1210,6 +1249,7 @@ mod tests {
         let req = make_request(Command::SessionLog(SessionLogInput {
             event: SessionEvent::Miss,
             key: "file:test".into(),
+            session_id: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -1408,6 +1448,7 @@ mod tests {
             Command::SessionLog(SessionLogInput {
                 event: SessionEvent::Miss,
                 key: "k".into(),
+                session_id: None,
             }),
             Command::ConsultationHit(ConsultationHitInput { key: "k".into() }),
             Command::SessionFlush,
@@ -1635,6 +1676,7 @@ mod tests {
         let req = make_request(Command::SessionLog(SessionLogInput {
             event: SessionEvent::ComplianceMiss,
             key: "file:src/auth.rs".into(),
+            session_id: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -1671,6 +1713,7 @@ mod tests {
         let req = make_request(Command::SessionLog(SessionLogInput {
             event: SessionEvent::CodexShellMiss,
             key: "file:src/cli/repair.rs".into(),
+            session_id: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -1843,12 +1886,12 @@ mod tests {
         let ctx = test_ctx(dir.path());
 
         let req = make_request(Command::ConfigGet(ConfigGetInput {
-            key: "enforcement.mode".into(),
+            key: "audit.write_durability".into(),
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
 
         match resp {
-            Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("advisory")),
+            Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("best_effort")),
             Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
         }
     }
@@ -1864,19 +1907,19 @@ mod tests {
         let ctx = test_ctx(dir.path());
 
         let set_req = make_request(Command::ConfigSet(ConfigSetInput {
-            key: "enforcement.mode".into(),
+            key: "audit.write_durability".into(),
             value: "strict".into(),
         }));
         let set_resp = dispatch_v2(&graph, &ctx, set_req).await;
         match set_resp {
             Response::Ok { data, .. } => {
-                assert_eq!(data, serde_json::json!({ "old": "advisory" }));
+                assert_eq!(data, serde_json::json!({ "old": "best_effort" }));
             }
             Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
         }
 
         let get_req = make_request(Command::ConfigGet(ConfigGetInput {
-            key: "enforcement.mode".into(),
+            key: "audit.write_durability".into(),
         }));
         let get_resp = dispatch_v2(&graph, &ctx, get_req).await;
         match get_resp {
@@ -1896,7 +1939,7 @@ mod tests {
         let ctx = test_ctx(dir.path());
 
         let req = make_request(Command::ConfigSet(ConfigSetInput {
-            key: "enforcement.mode".into(),
+            key: "audit.write_durability".into(),
             value: "paranoid".into(),
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;

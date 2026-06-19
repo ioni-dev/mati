@@ -33,6 +33,7 @@ use super::post_compliance;
 use super::post_edit;
 use super::pre_bash;
 use super::pre_compact;
+use super::pre_edit;
 use super::pre_read;
 use super::session_end;
 
@@ -572,6 +573,35 @@ fn preread_wrapper_executes_hook_decide_with_correct_variant() {
     assert!(
         log.contains("ARGS: hook-decide claude-pre-read"),
         "wrapper must pass variant claude-pre-read, log: {log}"
+    );
+}
+
+#[test]
+fn preedit_wrapper_executes_hook_decide_with_correct_variant() {
+    let h = WrapperHarness::new();
+    // The edit gate denies via a Claude PreToolUse deny JSON on stdout, exit 0.
+    let response = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[mati] before editing this file."}}"#;
+    h.write_mock(response, "", 0);
+    let out = h.run(
+        pre_edit::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
+
+    assert_eq!(out.exit_code, 0, "wrapper must propagate exit 0");
+    assert_eq!(
+        out.stdout.trim(),
+        response,
+        "wrapper must relay the deny JSON"
+    );
+
+    let log = h.invocation_log();
+    assert!(
+        log.contains("ARGS: hook-decide claude-pre-edit"),
+        "wrapper must pass variant claude-pre-edit, log: {log}"
+    );
+    assert!(
+        log.contains(r#"STDIN: {"tool_input":{"file_path":"src/main.rs"}}"#),
+        "wrapper must pass stdin through, log: {log}"
     );
 }
 

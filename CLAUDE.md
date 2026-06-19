@@ -193,8 +193,19 @@ never block Claude on a mati outage — hooks fail open (P9).
   (ARCHITECTURE.md §10.3): editing a file with an unconsulted confirmed gotcha
   is denied (exit 2) until `mem_get`. It parses the patch envelope for exact
   paths, so unlike the `cat` path it is immune to the wrapper/quoting bypass
-  above. Codex fires `PreToolUse` for `apply_patch` but not native reads;
-  Claude edits are not gated. Fails open on any fault (parse/daemon/version).
+  above. Codex fires `PreToolUse` for `apply_patch` but not native reads.
+  Claude edits are covered PRIMARILY by the read gate (transitively): Claude
+  Code's own read-before-edit rule forces a prior read, which the read gate gates,
+  so a *naive* blind edit is stopped by Claude Code's "File must be read first"
+  guard *before* any PreToolUse hook runs (confirmed by live test). The
+  `claude-pre-edit` hook (the `ClaudePreEdit` adapter, on `Edit`/`Write`/
+  `NotebookEdit`) is a BACKSTOP, not the primary blocker: keyed on
+  `consulted_recent` (TTL), it denies via `permissionDecision: deny` only an edit
+  whose consultation has gone stale, or one that satisfied read-before-edit via a
+  shell read the best-effort pre-bash path missed. Non-deny outcomes DEFER (empty
+  stdout), never `allow` — edits are permission-required, so force-allow would
+  suppress the user's edit prompt (reads are no-permission tools, so the read
+  gate's `allow` is a harmless no-op there). All hooks fail open on any fault.
 - **`confirmed: false` records are Layer 0 stubs** — graph nodes and gap signals
   only, never injected. Only `confirmed: true` with `confidence >= 0.6` and
   `quality >= 0.4` can deny a read.

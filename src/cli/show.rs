@@ -1097,10 +1097,10 @@ async fn run_enforcement_history(
     };
 
     println!(
-        "{:>6}  {:19}  {:16}  {:30}  {:6}",
-        "SEQ", "TIMESTAMP", "TYPE", "SUBJECT", "REASON"
+        "{:>6}  {:19}  {:16}  {:30}  {:24}  {:12}",
+        "SEQ", "TIMESTAMP", "TYPE", "SUBJECT", "REASON", "SESSION"
     );
-    println!("{}", "-".repeat(90));
+    println!("{}", "-".repeat(104));
 
     for event in &events {
         let ts = chrono::DateTime::from_timestamp_millis(event.recorded_at_ms as i64)
@@ -1116,10 +1116,11 @@ async fn run_enforcement_history(
         };
 
         println!(
-            "{:>6}  {ts}  {color}{type_label:<16}{reset}  {}  {}",
+            "{:>6}  {ts}  {color}{type_label:<16}{reset}  {:30}  {:24}  {}",
             event.seq_no,
             truncate_str(&event.subject_key, 30),
             &event.decision_reason_code,
+            event.agent_session.as_deref().unwrap_or("-"),
         );
     }
 

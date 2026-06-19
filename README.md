@@ -2,7 +2,7 @@
 
 mati makes what your team knows about a codebase enforceable in the paths where AI agents touch it. It is not another memory store the model can choose to recall or ignore. When an agent goes to act on a file that has a confirmed gotcha attached, mati's hook surfaces that gotcha and can block the operation until it has been consulted. The decision is made at the hook level, deterministically, outside the model's discretion.
 
-Coverage today: Claude Code gates file reads, Codex gates `apply_patch` edits, and both catch shell-command reads (`cat`, `grep`, and similar commands) on a best-effort basis. Claude Code edits are not gated yet.
+Coverage today: Claude Code gates file reads and edits (`Edit`/`Write`/`NotebookEdit`), Codex gates `apply_patch` edits, and both catch shell-command reads (`cat`, `grep`, and similar commands) on a best-effort basis.
 
 Single Rust binary. MCP stdio server. Claude Code and Codex integration.
 
@@ -44,7 +44,7 @@ reason:   0 means "retain all versions forever," not "disabled."
 severity: high   confirmed: true
 ```
 
-When an agent tries to read `src/store/db.rs` through Claude Code, or patch-edit it through Codex, without consulting it, the hook blocks the operation and hands back the rule instead of letting the agent guess:
+When an agent tries to read or edit `src/store/db.rs` through Claude Code, or patch-edit it through Codex, without consulting it, the hook blocks the operation and hands back the rule instead of letting the agent guess:
 
 ```text
 [mati] read of src/store/db.rs blocked
@@ -99,7 +99,7 @@ Every file gets a `file:<path>` record: a purpose summary, entry points, and the
 
 Unconfirmed gotchas are candidates. They sit in the graph but don't change the agent's behavior. Confirming one turns on enforcement for it.
 
-Enforcement keys on gotchas, against a single threshold. If a gotcha is `confirmed = true` with `confidence >= 0.6` and `quality >= 0.4`, its hook can deny the operation outright (a Claude Code read, or a Codex `apply_patch` edit) and hand the agent the gotcha instead. File records have no `confirmed` flag; they drive a separate, lower-confidence advisory path that attaches context without ever blocking.
+Enforcement keys on gotchas, against a single threshold. If a gotcha is `confirmed = true` with `confidence >= 0.6` and `quality >= 0.4`, its hook can deny the operation outright (a Claude Code read or edit, or a Codex `apply_patch` edit) and hand the agent the gotcha instead. File records have no `confirmed` flag; they drive a separate, lower-confidence advisory path that attaches context without ever blocking.
 
 ### Static analysis
 

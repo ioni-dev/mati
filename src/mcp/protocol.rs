@@ -203,7 +203,7 @@ pub enum Command {
     #[serde(rename = "scan_enforcement_events")]
     ScanEnforcementEvents(ScanEnforcementEventsInput),
 
-    /// Read a runtime configuration value (e.g. enforcement.mode).
+    /// Read a runtime configuration value (e.g. audit.write_durability).
     /// Pure read — no audit, no side effects.
     #[serde(rename = "config_get")]
     ConfigGet(ConfigGetInput),
@@ -555,10 +555,15 @@ pub struct DevNoteUpsertInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLogInput {
-    /// The event type (closed enum, 6 variants).
+    /// The event type (closed enum, 8 variants).
     pub event: SessionEvent,
     /// The record key this event pertains to.
     pub key: String,
+    /// The AI agent session (Claude Code `session_id`) that triggered this event,
+    /// for per-actor audit attribution (schema_version 2). Optional — absent for
+    /// older clients and agents that provide no session.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Session analytics event types. Each maps to a daily aggregation key prefix.
@@ -571,6 +576,14 @@ pub enum SessionEvent {
     Miss,
     ComplianceMiss,
     ComplianceHit,
+    /// Claude edit gate: an edit DEFERRED because a recent consultation receipt
+    /// exists. Records `AllowAfterReceipt` with an edit-specific reason code, so
+    /// the audit trail proves the edit (not just the read) was preceded by a
+    /// consult (Plane 2 evidence).
+    EditConsulted,
+    /// Claude edit gate: an edit was DENIED (stale or shell-evaded — no recent
+    /// consult). Records `Deny` with an edit-specific reason code.
+    EditBlocked,
     CodexShellMiss,
     Bootstrap,
     PromptNudge,
@@ -592,7 +605,7 @@ pub struct RecordImportInput {
 }
 
 /// Input for `Command::ConfigGet`. `key` is the dotted config name
-/// (e.g. `enforcement.mode`, `enforcement.retention`).
+/// (e.g. `audit.write_durability`, `enforcement.retention`).
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGetInput {
@@ -1465,6 +1478,7 @@ mod tests {
                 Command::SessionLog(SessionLogInput {
                     event: SessionEvent::Miss,
                     key: "k".into(),
+                    session_id: None,
                 }),
             ),
             (
@@ -1514,6 +1528,7 @@ mod tests {
         assert!(Command::SessionLog(SessionLogInput {
             event: SessionEvent::Miss,
             key: "k".into(),
+            session_id: None,
         })
         .is_mutation());
         assert!(Command::SessionFlush.is_mutation());
