@@ -38,6 +38,16 @@ const SETTINGS_JSON: &str = r#"{
             "timeout": 3000
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-edit.sh",
+            "timeout": 3000
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -51,7 +61,7 @@ const SETTINGS_JSON: &str = r#"{
         ]
       },
       {
-        "matcher": "Edit|Write|MultiEdit",
+        "matcher": "Edit|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
@@ -96,6 +106,7 @@ const SETTINGS_JSON: &str = r#"{
 /// Replaces the pass-through stubs from M-06-J with real hook logic (M-09).
 pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("pre-read.sh", crate::hooks::pre_read::SCRIPT),
+    ("pre-edit.sh", crate::hooks::pre_edit::SCRIPT),
     ("pre-bash.sh", crate::hooks::pre_bash::SCRIPT),
     (
         "post-read-compliance.sh",
@@ -360,7 +371,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 6),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 7),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -504,6 +515,7 @@ mod tests {
         // Enforcement logic is now in Rust (hooks::decide + cli::hook_decide).
         // Shell wrappers just exec the correct hook-decide variant.
         assert!(crate::hooks::pre_read::SCRIPT.contains("exec mati hook-decide claude-pre-read"));
+        assert!(crate::hooks::pre_edit::SCRIPT.contains("exec mati hook-decide claude-pre-edit"));
         assert!(crate::hooks::pre_bash::SCRIPT.contains("exec mati hook-decide claude-pre-bash"));
     }
 

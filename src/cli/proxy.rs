@@ -655,7 +655,7 @@ impl StoreProxy {
         }
     }
 
-    /// Read a runtime config value (e.g. `enforcement.mode`).
+    /// Read a runtime config value (e.g. `audit.write_durability`).
     ///
     /// Routes through the daemon when running so `mati config get` works
     /// during MCP sessions without needing exclusive store access.
@@ -667,14 +667,14 @@ impl StoreProxy {
 
         match &self.inner {
             ProxyInner::Direct(store) => match key {
-                "enforcement.mode" => Ok(match get_enforcement_mode(store).await {
-                    EnforcementMode::Advisory => "advisory".to_string(),
+                "audit.write_durability" => Ok(match get_enforcement_mode(store).await {
+                    EnforcementMode::Advisory => "best_effort".to_string(),
                     EnforcementMode::Strict => "strict".to_string(),
                 }),
                 "enforcement.retention" => Ok(get_retention_days(store).await.to_string()),
                 other => anyhow::bail!(
                     "unknown config key: {other}\n\
-                     Valid keys: enforcement.mode, enforcement.retention"
+                     Valid keys: audit.write_durability, enforcement.retention"
                 ),
             },
             ProxyInner::Socket { root } => {
@@ -712,18 +712,18 @@ impl StoreProxy {
 
         match &self.inner {
             ProxyInner::Direct(store) => match key {
-                "enforcement.mode" => {
+                "audit.write_durability" => {
                     let mode = match value {
-                        "advisory" => EnforcementMode::Advisory,
+                        "best_effort" => EnforcementMode::Advisory,
                         "strict" => EnforcementMode::Strict,
                         other => anyhow::bail!(
-                            "invalid enforcement mode: {other}\n\
-                             Valid values: advisory, strict"
+                            "invalid audit.write_durability: {other}\n\
+                             Valid values: best_effort, strict"
                         ),
                     };
                     let old = set_enforcement_mode(store, mode).await?;
                     Ok(match old {
-                        EnforcementMode::Advisory => "advisory".to_string(),
+                        EnforcementMode::Advisory => "best_effort".to_string(),
                         EnforcementMode::Strict => "strict".to_string(),
                     })
                 }
@@ -739,7 +739,7 @@ impl StoreProxy {
                 }
                 other => anyhow::bail!(
                     "unknown config key: {other}\n\
-                     Valid keys: enforcement.mode, enforcement.retention"
+                     Valid keys: audit.write_durability, enforcement.retention"
                 ),
             },
             ProxyInner::Socket { root } => {

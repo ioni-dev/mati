@@ -85,6 +85,7 @@ pub async fn run_log_miss(key: &str) -> Result<()> {
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::Miss,
         key: key.to_string(),
+        session_id: None,
     }))
     .await
 }
@@ -102,6 +103,7 @@ pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::ComplianceMiss,
         key: key.to_string(),
+        session_id: None,
     }))
     .await
 }
@@ -111,6 +113,7 @@ pub async fn run_log_compliance_hit(key: &str) -> Result<()> {
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::ComplianceHit,
         key: key.to_string(),
+        session_id: None,
     }))
     .await
 }
@@ -120,6 +123,7 @@ pub async fn run_log_codex_shell_miss(key: &str) -> Result<()> {
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::CodexShellMiss,
         key: key.to_string(),
+        session_id: None,
     }))
     .await
 }
@@ -129,6 +133,7 @@ pub async fn run_log_bootstrap(key: &str) -> Result<()> {
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::Bootstrap,
         key: key.to_string(),
+        session_id: None,
     }))
     .await
 }
@@ -138,6 +143,7 @@ pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::PromptNudge,
         key: key.to_string(),
+        session_id: None,
     }))
     .await
 }

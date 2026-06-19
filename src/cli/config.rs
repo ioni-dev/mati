@@ -1,8 +1,8 @@
 //! CLI config subcommand for enforcement settings.
 //!
 //! ```text
-//! mati config get enforcement.mode
-//! mati config set enforcement.mode strict
+//! mati config get audit.write_durability
+//! mati config set audit.write_durability strict
 //! mati config get enforcement.retention
 //! mati config set enforcement.retention 365
 //! ```
@@ -22,12 +22,12 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., enforcement.mode, enforcement.retention)
+        /// Configuration key (e.g., audit.write_durability, enforcement.retention)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., enforcement.mode, enforcement.retention)
+        /// Configuration key (e.g., audit.write_durability, enforcement.retention)
         key: String,
         /// Value to set
         value: String,
@@ -56,13 +56,13 @@ async fn run_get(proxy: &StoreProxy, key: &str) -> Result<()> {
 async fn run_set(proxy: &StoreProxy, key: &str, value: &str) -> Result<()> {
     let old = proxy.config_set(key, value).await?;
     match key {
-        "enforcement.mode" => {
+        "audit.write_durability" => {
             if old == value {
-                println!("enforcement.mode is already {value}");
+                println!("audit.write_durability is already {value}");
             } else if old.is_empty() {
-                println!("enforcement.mode: {value}");
+                println!("audit.write_durability: {value}");
             } else {
-                println!("enforcement.mode: {old} → {value}");
+                println!("audit.write_durability: {old} → {value}");
             }
         }
         "enforcement.retention" => {

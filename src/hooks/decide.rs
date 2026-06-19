@@ -55,6 +55,12 @@ pub enum HookEvent {
     CodexShellBlocked { key: String },
     /// Post-bash confirmed a consulted read — daemon `log_compliance_hit`.
     ComplianceHit { key: String },
+    /// Claude edit gate: edit DEFERRED because a recent consultation exists —
+    /// records `AllowAfterReceipt` with reason `edit_after_receipt` (Plane 2).
+    EditConsulted { key: String },
+    /// Claude edit gate: edit DENIED (no recent consult) — records `Deny` with
+    /// reason `edit_blocked_unconsulted` (Plane 2).
+    EditBlocked { key: String },
 }
 
 /// Input to the enforcement decision engine.
@@ -78,7 +84,7 @@ pub struct EnforcementResult {
 // ── Command Classification ──────────────────────────────────────────────────
 
 const CAT_LIKE: &[&str] = &["cat", "less", "head", "tail", "bat"];
-const GREP_LIKE: &[&str] = &["grep", "rg", "sed", "awk"];
+const GREP_LIKE: &[&str] = &["grep", "egrep", "fgrep", "rg", "sed", "awk"];
 
 /// Returns true if `trimmed` starts with `word` followed by whitespace
 /// (or is exactly `word`). Prevents `"catch"` matching `"cat"`.
