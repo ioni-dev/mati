@@ -115,7 +115,7 @@ rayon = "1.11.0"
 # --- Git history mining ---
 # change_frequency, co_change_pairs, hotspot detection.
 # default-features = false: skip vendored libgit2, use system.
-git2 = { version = "0.20.4", default-features = false, features = ["vendored-openssl"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-openssl"] }
 
 # --- MCP stdio server (P3 — four tools hard constraint) ---
 # Rust MCP SDK, stdio transport, <10ms startup.
