@@ -8,28 +8,37 @@
 //! at the OS level, leaving the consultation-gated Read/Edit tools as the only
 //! way the agent can touch it. See `MATI-SOTA-ARCHITECTURE.md` (L3).
 //!
-//! Invariant: the generator is OSS — enforcement mechanisms are identical in
-//! both tiers (README). Enterprise only adds managed-settings org push around it.
+//! Design (validated through three review passes + a live Claude Code test):
+//! - **Absolute canonical paths** — never `./`-relative (CC's `./` resolution and
+//!   profile canonicalization are undocumented; an unresolved deny would silently
+//!   fail to protect). Absolute canonical is exactly what Seatbelt matches.
+//! - **Target `.claude/settings.local.json`** (per-user, gitignored): mati owns
+//!   only the `denyRead`/`denyWrite` entries that are **under the repo root**;
+//!   everything else (the user's `~/`, `./`, out-of-repo absolutes) is preserved.
+//!   CC merges these arrays across scopes (deny wins), so they coexist with the
+//!   user's own denies in `settings.json`. Ownership-by-location → no manifest.
+//! - mati never writes `sandbox.enabled` (per-user / Enterprise-managed opt-in).
+//!   Team-wide enforcement is the Enterprise managed-settings tier.
 //!
-//! Safety: this is the highest-risk layer (it mutates security config), so it is
-//! explicit-tag-only (never severity-derived), **preview-default** (this command
-//! only reports what it would write; mutation lands behind a later `--apply`),
-//! and reversible.
+//! Safety: highest-risk layer (mutates security config) → explicit-tag-only
+//! (never severity-derived), preview-default (writes only on `--apply`),
+//! reversible (`clear`), out-of-repo paths skipped, malformed settings refused.
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
-use mati_core::store::GotchaRecord;
+use mati_core::store::{GotchaRecord, RecordLifecycle};
 
+use super::daemon::mati_root_for;
 use super::proxy::StoreProxy;
 
 /// Tag → shell-deny mapping. Explicit opt-in only; severity is never used.
-///
-/// - `crown-jewel`: the shell / subprocess path cannot WRITE the file (protect
-///   critical logic from out-of-gate modification). Reads still work.
-/// - `sandbox-deny-read`: additionally, the shell cannot READ the file (secrets
-///   / exfiltration protection).
+/// - `crown-jewel`: shell / subprocess cannot WRITE the file (protect critical
+///   logic from out-of-gate modification). Reads still work.
+/// - `sandbox-deny-read`: additionally, the shell cannot READ the file (secrets).
 const TAG_DENY_WRITE: &str = "crown-jewel";
 const TAG_DENY_READ: &str = "sandbox-deny-read";
 
@@ -41,12 +50,21 @@ pub struct SandboxArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SandboxCommand {
-    /// Preview the sandbox deny rules compiled from crown-jewel gotchas.
-    Compile,
+    /// Compile crown-jewel gotchas into sandbox deny rules (preview, or --apply).
+    Compile(CompileArgs),
+    /// Remove mati-managed sandbox deny rules from .claude/settings.local.json.
+    Clear,
 }
 
-/// The sandbox filesystem deny rules compiled from gotchas. Paths are
-/// project-root-relative (`./`-prefixed) and therefore portable across machines.
+#[derive(Args, Debug)]
+pub struct CompileArgs {
+    /// Write the rules into .claude/settings.local.json (default: preview only).
+    #[arg(long)]
+    pub apply: bool,
+}
+
+/// Sandbox filesystem deny rules. Paths are repo-relative after `compile_relative`
+/// and absolute-canonical after `resolve_rules`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SandboxRules {
     pub deny_read: BTreeSet<String>,
@@ -59,188 +77,541 @@ impl SandboxRules {
     }
 }
 
-/// Pure mapping: confirmed + explicitly-tagged gotchas → sandbox deny entries.
-///
-/// Each item is `(tags, confirmed, affected_files)`. Unconfirmed gotchas and
-/// gotchas carrying no sandbox tag contribute nothing — enforcement is
-/// explicit-tag-only, never derived from severity.
-pub fn compile_rules<'a>(
-    gotchas: impl Iterator<Item = (&'a [String], bool, &'a [String])>,
-) -> SandboxRules {
+/// One gotcha's sandbox-relevant fields. Both `active` and `confirmed` must hold
+/// for it to gate — tombstoned/superseded/unconfirmed records never enforce.
+pub struct GotchaSel<'a> {
+    pub tags: &'a [String],
+    pub active: bool,
+    pub confirmed: bool,
+    pub files: &'a [String],
+}
+
+/// Pure: select repo-relative paths and their deny kind. Explicit-tag-only,
+/// never severity-derived; Active + confirmed only.
+pub fn compile_relative<'a>(gotchas: impl Iterator<Item = GotchaSel<'a>>) -> SandboxRules {
     let mut rules = SandboxRules::default();
-    for (tags, confirmed, files) in gotchas {
-        if !confirmed {
+    for g in gotchas {
+        if !g.active || !g.confirmed {
             continue;
         }
-        let deny_write = tags.iter().any(|t| t == TAG_DENY_WRITE);
-        let deny_read = tags.iter().any(|t| t == TAG_DENY_READ);
+        let deny_write = g.tags.iter().any(|t| t == TAG_DENY_WRITE);
+        let deny_read = g.tags.iter().any(|t| t == TAG_DENY_READ);
         if !deny_write && !deny_read {
             continue;
         }
-        for f in files {
-            let entry = normalize_sandbox_path(f);
-            if entry.is_empty() {
+        for f in g.files {
+            let rel = normalize_rel(f);
+            if rel.is_empty() {
                 continue;
             }
             if deny_write {
-                rules.deny_write.insert(entry.clone());
+                rules.deny_write.insert(rel.clone());
             }
             if deny_read {
-                rules.deny_read.insert(entry);
+                rules.deny_read.insert(rel);
             }
         }
     }
     rules
 }
 
-/// Normalize a repo-relative path to a project-root-relative sandbox entry:
-/// forward slashes, collapse any leading `./` or `/`, then `./`-prefix.
-///
-/// Claude Code resolves `./` against the project root and canonicalizes the
-/// path before building the OS profile; Seatbelt then matches the canonical
-/// (symlink-resolved) path, so a symlink to a denied file cannot bypass the
-/// floor (verified live against `sandbox-exec`, 2026-06-19).
-fn normalize_sandbox_path(repo_rel: &str) -> String {
-    let p = repo_rel.replace('\\', "/");
-    let p = p.trim_start_matches("./").trim_start_matches('/');
-    if p.is_empty() {
-        return String::new();
-    }
-    format!("./{p}")
+/// Clean repo-relative form: forward slashes, no leading `./` or `/`.
+fn normalize_rel(p: &str) -> String {
+    p.replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
 }
 
-pub async fn run(args: SandboxArgs) -> Result<()> {
-    match args.command {
-        SandboxCommand::Compile => run_compile().await,
+/// Resolve a repo-relative path to an absolute, canonical path UNDER `repo_root`.
+/// Returns `None` if it resolves outside the repo (safety: a gotcha must never
+/// deny `~` / `/etc` and brick the agent's shell).
+fn resolve_under_repo(repo_root: &Path, rel: &str) -> Option<PathBuf> {
+    let resolved = canonicalize_lenient(&repo_root.join(rel))?;
+    resolved.starts_with(repo_root).then_some(resolved)
+}
+
+/// `std::fs::canonicalize` that tolerates a non-existent leaf: canonicalize the
+/// longest existing ancestor (resolving symlinks), then re-append the missing
+/// tail. So a file not yet created — or one under a symlinked parent — still
+/// yields the canonical path Seatbelt will match.
+fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return Some(c);
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        let parent = cur.parent()?;
+        tail.push(cur.file_name()?.to_os_string());
+        if let Ok(cp) = std::fs::canonicalize(parent) {
+            let mut out = cp;
+            for comp in tail.iter().rev() {
+                out.push(comp);
+            }
+            return Some(out);
+        }
+        cur = parent;
     }
 }
 
-async fn run_compile() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let store = StoreProxy::open(&cwd).await?;
-    let records = store.scan_prefix("gotcha:").await?;
+/// Resolve relative rules to absolute paths under `repo_root`; return the
+/// absolute rules plus any paths skipped for resolving outside the repo.
+fn resolve_rules(repo_root: &Path, rel: &SandboxRules) -> (SandboxRules, BTreeSet<String>) {
+    let mut abs = SandboxRules::default();
+    let mut skipped = BTreeSet::new();
+    for r in &rel.deny_write {
+        match resolve_under_repo(repo_root, r) {
+            Some(p) => {
+                abs.deny_write.insert(p.to_string_lossy().into_owned());
+            }
+            None => {
+                skipped.insert(r.clone());
+            }
+        }
+    }
+    for r in &rel.deny_read {
+        match resolve_under_repo(repo_root, r) {
+            Some(p) => {
+                abs.deny_read.insert(p.to_string_lossy().into_owned());
+            }
+            None => {
+                skipped.insert(r.clone());
+            }
+        }
+    }
+    (abs, skipped)
+}
 
-    let items: Vec<(Vec<String>, bool, Vec<String>)> = records
-        .iter()
-        .map(|r| {
-            let (confirmed, files) = match r.payload_as::<GotchaRecord>() {
-                Some(gr) => (gr.confirmed, gr.affected_files),
-                None => (false, Vec::new()),
-            };
-            (r.tags.clone(), confirmed, files)
-        })
-        .collect();
+// ── settings.local.json materialization (pure transforms + IO) ───────────────
 
-    let rules = compile_rules(
-        items
-            .iter()
-            .map(|(t, c, f)| (t.as_slice(), *c, f.as_slice())),
-    );
+/// An entry is mati-owned iff it is an absolute path under the canonical repo
+/// root. The user's `~/`, `./`, and out-of-repo absolute denies are NOT owned.
+fn is_mati_owned(entry: &str, repo_root: &Path) -> bool {
+    Path::new(entry).starts_with(repo_root)
+}
 
-    print_preview(&rules);
+/// Merge mati's absolute deny rules into a settings object, owning only entries
+/// under `repo_root` and preserving everything else. Pure.
+fn apply_into_settings(mut root: Value, repo_root: &Path, abs: &SandboxRules) -> Value {
+    {
+        let sandbox = ensure_child(&mut root, "sandbox");
+        let fs = ensure_child(sandbox, "filesystem");
+        set_owned_array(fs, "denyWrite", repo_root, &abs.deny_write);
+        set_owned_array(fs, "denyRead", repo_root, &abs.deny_read);
+    }
+    root
+}
+
+/// Remove mati-owned (under-repo) entries from the sandbox deny arrays. Pure.
+fn clear_from_settings(mut root: Value, repo_root: &Path) -> Value {
+    if let Some(fs) = nav_mut(&mut root, &["sandbox", "filesystem"]) {
+        set_owned_array(fs, "denyWrite", repo_root, &BTreeSet::new());
+        set_owned_array(fs, "denyRead", repo_root, &BTreeSet::new());
+    }
+    root
+}
+
+/// Rewrite `key`'s array to `(existing entries NOT mati-owned) ∪ mati`. Removes
+/// the key entirely when the result is empty (no dangling `[]`).
+fn set_owned_array(fs: &mut Value, key: &str, repo_root: &Path, mati: &BTreeSet<String>) {
+    let Value::Object(map) = fs else {
+        return;
+    };
+    let mut kept: Vec<Value> = Vec::new();
+    if let Some(Value::Array(existing)) = map.get(key) {
+        for v in existing {
+            match v.as_str() {
+                Some(s) if is_mati_owned(s, repo_root) => {} // drop: mati-managed, recomputed below
+                _ => kept.push(v.clone()),                   // preserve user entries / non-strings
+            }
+        }
+    }
+    kept.extend(mati.iter().map(|m| Value::String(m.clone())));
+    if kept.is_empty() {
+        map.remove(key);
+    } else {
+        map.insert(key.to_string(), Value::Array(kept));
+    }
+}
+
+fn ensure_child<'a>(v: &'a mut Value, key: &str) -> &'a mut Value {
+    if !v.is_object() {
+        *v = Value::Object(Map::new());
+    }
+    match v {
+        Value::Object(map) => map
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Object(Map::new())),
+        _ => unreachable!("v was just coerced to an object"),
+    }
+}
+
+fn nav_mut<'a>(root: &'a mut Value, keys: &[&str]) -> Option<&'a mut Value> {
+    let mut cur = root;
+    for k in keys {
+        cur = cur.as_object_mut()?.get_mut(*k)?;
+    }
+    Some(cur)
+}
+
+fn read_settings(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(Value::Object(Map::new()));
+    }
+    let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if s.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    let v: Value = serde_json::from_str(&s).with_context(|| {
+        format!(
+            "{} is not valid JSON — fix or remove it (refusing to overwrite)",
+            path.display()
+        )
+    })?;
+    if !v.is_object() {
+        bail!("{} is not a JSON object", path.display());
+    }
+    validate_sandbox_shape(&v)?;
+    Ok(v)
+}
+
+/// Refuse to proceed if the user's existing sandbox config has the wrong shape —
+/// never silently coerce/discard their data.
+fn validate_sandbox_shape(root: &Value) -> Result<()> {
+    let Some(sb) = root.get("sandbox") else {
+        return Ok(());
+    };
+    if !sb.is_object() {
+        bail!("settings `sandbox` is not an object");
+    }
+    let Some(fs) = sb.get("filesystem") else {
+        return Ok(());
+    };
+    if !fs.is_object() {
+        bail!("settings `sandbox.filesystem` is not an object");
+    }
+    for k in ["denyRead", "denyWrite"] {
+        if let Some(a) = fs.get(k) {
+            if !a.is_array() {
+                bail!("settings `sandbox.filesystem.{k}` is not an array");
+            }
+        }
+    }
     Ok(())
 }
 
-fn print_preview(rules: &SandboxRules) {
-    if rules.is_empty() {
-        println!("No crown-jewel gotchas found.");
+/// Atomic write: serialize, write a sibling temp file, then rename over the
+/// target (same directory → same filesystem → atomic).
+fn write_settings_atomic(path: &Path, v: &Value) -> Result<()> {
+    let dir = path.parent().context("settings path has no parent")?;
+    std::fs::create_dir_all(dir)?;
+    let body = serde_json::to_string_pretty(v)? + "\n";
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("settings.local.json");
+    let tmp = path.with_file_name(format!(".{name}.mati-tmp"));
+    std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(())
+}
+
+// ── command entry points ─────────────────────────────────────────────────────
+
+pub async fn run(args: SandboxArgs) -> Result<()> {
+    match args.command {
+        SandboxCommand::Compile(a) => run_compile(a).await,
+        SandboxCommand::Clear => run_clear().await,
+    }
+}
+
+fn repo_root_for(cwd: &Path) -> Result<PathBuf> {
+    let root = mati_root_for(cwd)?;
+    Ok(std::fs::canonicalize(&root).unwrap_or(root))
+}
+
+fn settings_local_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".claude").join("settings.local.json")
+}
+
+async fn run_compile(args: CompileArgs) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = repo_root_for(&cwd)?;
+    let store = StoreProxy::open(&cwd).await?;
+    let records = store.scan_prefix("gotcha:").await?;
+
+    let mut items: Vec<(Vec<String>, bool, bool, Vec<String>)> = Vec::new();
+    for r in &records {
+        let active = matches!(r.lifecycle, RecordLifecycle::Active);
+        let (confirmed, files) = match r.payload_as::<GotchaRecord>() {
+            Some(g) => (g.confirmed, g.affected_files),
+            None => (false, Vec::new()),
+        };
+        let tagged = r
+            .tags
+            .iter()
+            .any(|t| t == TAG_DENY_WRITE || t == TAG_DENY_READ);
+        if tagged && active && !confirmed {
+            eprintln!("warning: {} is tagged crown-jewel but not confirmed — not enforced (run `mati gotcha confirm`)", r.key);
+        } else if tagged && active && files.is_empty() {
+            eprintln!(
+                "warning: {} is tagged crown-jewel but has no affected_files — nothing to deny",
+                r.key
+            );
+        }
+        items.push((r.tags.clone(), active, confirmed, files));
+    }
+
+    let rel = compile_relative(items.iter().map(|(t, a, c, f)| GotchaSel {
+        tags: t,
+        active: *a,
+        confirmed: *c,
+        files: f,
+    }));
+    let (abs, skipped) = resolve_rules(&repo_root, &rel);
+    for s in &skipped {
+        eprintln!(
+            "warning: {s} resolves outside the repo — skipped (sandbox denies are clamped to the repo for safety)"
+        );
+    }
+
+    let path = settings_local_path(&repo_root);
+    if args.apply {
+        let existing = read_settings(&path)?;
+        let merged = apply_into_settings(existing, &repo_root, &abs);
+        write_settings_atomic(&path, &merged)?;
+        println!(
+            "Applied {} denyWrite + {} denyRead entr{} to {}",
+            abs.deny_write.len(),
+            abs.deny_read.len(),
+            if abs.deny_write.len() + abs.deny_read.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            path.display()
+        );
+        enablement_hint();
+    } else {
+        print_preview(&abs, &path);
+    }
+    Ok(())
+}
+
+async fn run_clear() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = repo_root_for(&cwd)?;
+    let path = settings_local_path(&repo_root);
+    if !path.exists() {
+        println!("Nothing to clear: {} does not exist.", path.display());
+        return Ok(());
+    }
+    let existing = read_settings(&path)?;
+    let cleared = clear_from_settings(existing, &repo_root);
+    write_settings_atomic(&path, &cleared)?;
+    println!(
+        "Cleared mati-managed (in-repo) sandbox deny rules from {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn enablement_hint() {
+    println!(
+        "\nThese OS-level denies cover the agent's shell and every subprocess it spawns;\n\
+         the agent can still reach the files through the consultation-gated Read/Edit\n\
+         tools (L1). They take effect only once the Claude Code sandbox is enabled\n\
+         (`/sandbox`, or `sandbox.enabled` in settings) on macOS / Linux / WSL2.\n\
+         Run `mati sandbox clear` to remove them."
+    );
+}
+
+fn print_preview(abs: &SandboxRules, path: &Path) {
+    if abs.is_empty() {
+        println!("No crown-jewel gotchas resolve to in-repo files.");
         println!(
             "Tag a confirmed gotcha with `{TAG_DENY_WRITE}` (deny shell writes) or \
-             `{TAG_DENY_READ}` (deny shell reads) to compile a sandbox floor."
+             `{TAG_DENY_READ}` (deny shell reads), then `mati sandbox compile --apply`."
         );
         return;
     }
-
-    println!("Sandbox floor preview (Plane 3 / L3) — preview only, nothing written.");
-    println!("Would add to .claude/settings.json under \"sandbox\" → \"filesystem\":\n");
-
-    if !rules.deny_write.is_empty() {
-        println!("  denyWrite (shell / subprocess cannot modify):");
-        for p in &rules.deny_write {
-            println!("    {p}");
-        }
-    }
-    if !rules.deny_read.is_empty() {
-        println!("  denyRead (shell / subprocess cannot read):");
-        for p in &rules.deny_read {
-            println!("    {p}");
-        }
-    }
     println!(
-        "\nThese are OS-level (Seatbelt / bubblewrap) and cover every subprocess. The agent\n\
-         can still reach these files through the consultation-gated Read/Edit tools (L1).\n\
-         Requires the Claude Code sandbox to be enabled (`/sandbox` or sandbox.enabled).\n\
-         Writing them (`mati sandbox compile --apply`) lands in the next step."
+        "Sandbox floor preview — nothing written. `--apply` writes to {}.\n",
+        path.display()
     );
+    if !abs.deny_write.is_empty() {
+        println!("  denyWrite (shell / subprocess cannot modify):");
+        for p in &abs.deny_write {
+            println!("    {p}");
+        }
+    }
+    if !abs.deny_read.is_empty() {
+        println!("  denyRead (shell / subprocess cannot read):");
+        for p in &abs.deny_read {
+            println!("    {p}");
+        }
+    }
+    enablement_hint();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn s(v: &[&str]) -> Vec<String> {
+    fn sv(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
     }
+    fn sel<'a>(tags: &'a [String], confirmed: bool, files: &'a [String]) -> GotchaSel<'a> {
+        GotchaSel {
+            tags,
+            active: true,
+            confirmed,
+            files,
+        }
+    }
+
+    // ── compile_relative (pure selection) ────────────────────────────────────
 
     #[test]
-    fn compile_maps_crown_jewel_to_deny_write() {
-        let tags = s(&["crown-jewel"]);
-        let files = s(&["src/payments/fraud.rs"]);
-        let rules = compile_rules([(tags.as_slice(), true, files.as_slice())].into_iter());
-        assert!(rules.deny_write.contains("./src/payments/fraud.rs"));
-        assert!(rules.deny_read.is_empty());
+    fn crown_jewel_maps_to_deny_write_relative() {
+        let t = sv(&["crown-jewel"]);
+        let f = sv(&["./src/payments/fraud.rs"]);
+        let r = compile_relative([sel(&t, true, &f)].into_iter());
+        assert!(r.deny_write.contains("src/payments/fraud.rs"));
+        assert!(r.deny_read.is_empty());
     }
 
     #[test]
-    fn compile_maps_deny_read_tag() {
-        let tags = s(&["sandbox-deny-read"]);
-        let files = s(&[".env.production"]);
-        let rules = compile_rules([(tags.as_slice(), true, files.as_slice())].into_iter());
-        assert!(rules.deny_read.contains("./.env.production"));
-        assert!(rules.deny_write.is_empty());
+    fn deny_read_tag_and_compose() {
+        let t = sv(&["crown-jewel", "sandbox-deny-read"]);
+        let f = sv(&["secrets/key.pem"]);
+        let r = compile_relative([sel(&t, true, &f)].into_iter());
+        assert!(r.deny_write.contains("secrets/key.pem"));
+        assert!(r.deny_read.contains("secrets/key.pem"));
     }
 
     #[test]
-    fn both_tags_compose_on_one_file() {
-        let tags = s(&["crown-jewel", "sandbox-deny-read"]);
-        let files = s(&["secrets/key.pem"]);
-        let rules = compile_rules([(tags.as_slice(), true, files.as_slice())].into_iter());
-        assert!(rules.deny_write.contains("./secrets/key.pem"));
-        assert!(rules.deny_read.contains("./secrets/key.pem"));
+    fn unconfirmed_inactive_and_untagged_contribute_nothing() {
+        let t = sv(&["crown-jewel"]);
+        let f = sv(&["src/x.rs"]);
+        // unconfirmed
+        assert!(compile_relative([sel(&t, false, &f)].into_iter()).is_empty());
+        // inactive (tombstoned/superseded)
+        let inactive = GotchaSel {
+            tags: &t,
+            active: false,
+            confirmed: true,
+            files: &f,
+        };
+        assert!(compile_relative([inactive].into_iter()).is_empty());
+        // untagged
+        let untagged = sv(&["enriched", "depth:deep"]);
+        assert!(compile_relative([sel(&untagged, true, &f)].into_iter()).is_empty());
+    }
+
+    // ── ownership / merge (pure transforms) ──────────────────────────────────
+
+    #[test]
+    fn is_mati_owned_only_under_repo() {
+        let repo = Path::new("/work/repo");
+        assert!(is_mati_owned("/work/repo/src/x.rs", repo));
+        assert!(!is_mati_owned("/work/other/x.rs", repo));
+        assert!(!is_mati_owned("~/.ssh/id_rsa", repo));
+        assert!(!is_mati_owned("./src/x.rs", repo));
     }
 
     #[test]
-    fn unconfirmed_gotchas_are_ignored() {
-        let tags = s(&["crown-jewel"]);
-        let files = s(&["src/x.rs"]);
-        let rules = compile_rules([(tags.as_slice(), false, files.as_slice())].into_iter());
-        assert!(rules.is_empty(), "unconfirmed gotchas must never gate");
-    }
-
-    #[test]
-    fn untagged_gotchas_contribute_nothing() {
-        let tags = s(&["enriched", "depth:deep"]);
-        let files = s(&["src/x.rs"]);
-        let rules = compile_rules([(tags.as_slice(), true, files.as_slice())].into_iter());
+    fn apply_preserves_user_entries_and_owns_in_repo() {
+        let repo = Path::new("/work/repo");
+        let existing = json!({
+            "sandbox": { "filesystem": { "denyWrite": ["~/.ssh", "/work/repo/OLD.rs"] } },
+            "env": { "X": "1" }
+        });
+        let mut abs = SandboxRules::default();
+        abs.deny_write.insert("/work/repo/src/new.rs".to_string());
+        let out = apply_into_settings(existing, repo, &abs);
+        let dw = out["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap();
+        let set: BTreeSet<&str> = dw.iter().filter_map(|v| v.as_str()).collect();
+        assert!(set.contains("~/.ssh"), "user entry preserved");
         assert!(
-            rules.is_empty(),
-            "explicit-tag-only: no sandbox tag -> no rule"
+            set.contains("/work/repo/src/new.rs"),
+            "new mati entry present"
         );
+        assert!(
+            !set.contains("/work/repo/OLD.rs"),
+            "stale in-repo entry dropped"
+        );
+        assert_eq!(out["env"]["X"], "1", "unrelated settings untouched");
     }
 
     #[test]
-    fn paths_normalize_and_dedupe() {
-        let tags = s(&["crown-jewel"]);
-        let a = s(&["./src/x.rs"]);
-        let b = s(&["src/x.rs"]);
-        let rules = compile_rules(
-            [
-                (tags.as_slice(), true, a.as_slice()),
-                (tags.as_slice(), true, b.as_slice()),
-            ]
-            .into_iter(),
+    fn apply_is_idempotent() {
+        let repo = Path::new("/work/repo");
+        let mut abs = SandboxRules::default();
+        abs.deny_read.insert("/work/repo/.env".to_string());
+        let once = apply_into_settings(json!({}), repo, &abs);
+        let twice = apply_into_settings(once.clone(), repo, &abs);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn clear_removes_only_in_repo_entries() {
+        let repo = Path::new("/work/repo");
+        let existing = json!({
+            "sandbox": { "filesystem": {
+                "denyWrite": ["/work/repo/a.rs", "~/.aws"],
+                "denyRead": ["/work/repo/.env"]
+            } }
+        });
+        let out = clear_from_settings(existing, repo);
+        let dw: Vec<&str> = out["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(dw, vec!["~/.aws"], "user entry kept, mati entry removed");
+        // denyRead had only an in-repo entry → array removed entirely
+        assert!(out["sandbox"]["filesystem"].get("denyRead").is_none());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_shape() {
+        assert!(validate_sandbox_shape(&json!({"sandbox": "on"})).is_err());
+        assert!(validate_sandbox_shape(&json!({"sandbox": {"filesystem": []}})).is_err());
+        assert!(
+            validate_sandbox_shape(&json!({"sandbox": {"filesystem": {"denyRead": "x"}}})).is_err()
         );
-        assert_eq!(rules.deny_write.len(), 1, "./x and x are the same entry");
-        assert!(rules.deny_write.contains("./src/x.rs"));
+        assert!(
+            validate_sandbox_shape(&json!({"sandbox": {"filesystem": {"denyRead": ["x"]}}}))
+                .is_ok()
+        );
+        assert!(validate_sandbox_shape(&json!({})).is_ok());
+    }
+
+    // ── path resolution (filesystem) ─────────────────────────────────────────
+
+    #[test]
+    fn resolve_clamps_to_repo_and_handles_missing_leaf() {
+        let dir = std::env::temp_dir().join(format!("mati-sbx-test-{}", std::process::id()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/exists.rs"), "x").unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        // existing file → resolved under repo
+        assert!(resolve_under_repo(&repo, "src/exists.rs").is_some());
+        // not-yet-existent leaf → still resolves (lenient ancestor canonicalize)
+        let missing = resolve_under_repo(&repo, "src/not_yet.rs");
+        assert!(missing.is_some());
+        assert!(missing.unwrap().starts_with(&repo));
+        // escapes the repo → skipped
+        assert!(resolve_under_repo(&repo, "../escape.rs").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
