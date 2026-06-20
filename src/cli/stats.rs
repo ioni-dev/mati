@@ -174,7 +174,10 @@ async fn enforcement_metrics_30d(
 /// `--json`: emit enforcement + gotcha-lifecycle metrics as one JSON
 /// object for time-series tracking. Always fresh (bypasses the display cache).
 async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
-    let project = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let project = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     let now = now_secs();
 
     let mut gotchas = store.scan_prefix("gotcha:").await?;
@@ -332,7 +335,11 @@ pub async fn run(args: StatsArgs) -> Result<()> {
     // Gotcha health: stale-or-worse gotchas needing review. (Confirmed
     // share is reported by the Review backlog section below.)
     let gh = gotcha_health(&gotchas);
-    let stale_c = if gh.stale_or_worse == 0 { green } else { yellow };
+    let stale_c = if gh.stale_or_worse == 0 {
+        green
+    } else {
+        yellow
+    };
     println!(
         "    Stale gotchas          {stale_c}{}{reset}  {gray}(stale / liability / tombstone){reset}",
         gh.stale_or_worse
@@ -556,7 +563,10 @@ pub async fn run(args: StatsArgs) -> Result<()> {
                 counts.receipts_minted
             );
             let bp_c = if counts.bypasses > 0 { red } else { green };
-            println!("    Bypasses               {bp_c}{}{reset}", counts.bypasses);
+            println!(
+                "    Bypasses               {bp_c}{}{reset}",
+                counts.bypasses
+            );
             let gap_c = if counts.gaps > 0 { yellow } else { green };
             println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
 
@@ -643,10 +653,8 @@ pub async fn run(args: StatsArgs) -> Result<()> {
     }
 
     // ── Review backlog ────────────────────────────────────────────────
-    let unconfirmed: Vec<&mati_core::store::Record> = gotchas
-        .iter()
-        .filter(|r| !gotcha_is_confirmed(r))
-        .collect();
+    let unconfirmed: Vec<&mati_core::store::Record> =
+        gotchas.iter().filter(|r| !gotcha_is_confirmed(r)).collect();
 
     if !unconfirmed.is_empty() {
         let oldest_created = unconfirmed

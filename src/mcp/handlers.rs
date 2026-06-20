@@ -2769,13 +2769,25 @@ mod link_sync_tests {
         let store = Store::open(dir.path()).await.expect("open store");
 
         let mut seed = Record::layer0_file_stub("file:src/exists.rs", uuid::Uuid::new_v4(), 1, 1);
-        let fr0 =
-            FileRecord::layer0_stub("src/exists.rs", vec![], vec![], vec![], 0, 0, 0, None, false, 0, 1);
+        let fr0 = FileRecord::layer0_stub(
+            "src/exists.rs",
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+            0,
+            None,
+            false,
+            0,
+            1,
+        );
         seed.payload = serde_json::to_value(&fr0).ok();
         store.put("file:src/exists.rs", &seed).await.expect("seed");
 
         let updates =
-            compute_file_link_updates(&store, "gotcha:y", &[], &["src/exists.rs".to_string()]).await;
+            compute_file_link_updates(&store, "gotcha:y", &[], &["src/exists.rs".to_string()])
+                .await;
 
         assert_eq!(updates.len(), 1);
         let fr: FileRecord = updates[0].1.payload_as().expect("payload");
