@@ -141,6 +141,17 @@ fn normalize_rel(p: &str) -> String {
         .to_string()
 }
 
+/// Files a gotcha covers beyond `target` (normalized) — the blast radius of
+/// (un)protecting through its per-gotcha crown-jewel tag. Empty for a
+/// single-file gotcha; callers require `--yes` when it is non-empty.
+fn blast_radius(target: &str, affected_files: &[String]) -> Vec<String> {
+    affected_files
+        .iter()
+        .map(|f| normalize_rel(f))
+        .filter(|f| f != target)
+        .collect()
+}
+
 /// Resolve a repo-relative path to an absolute, canonical path UNDER `repo_root`.
 /// Returns `None` if it resolves outside the repo (safety: a gotcha must never
 /// deny `~` / `/etc` and brick the agent's shell).
@@ -543,12 +554,7 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
     // would (un)protect ALL its files. Surface that and require --yes.
     for r in &matched {
         if let Some(g) = r.payload_as::<GotchaRecord>() {
-            let others: Vec<String> = g
-                .affected_files
-                .iter()
-                .map(|f| normalize_rel(f))
-                .filter(|f| *f != file)
-                .collect();
+            let others = blast_radius(&file, &g.affected_files);
             if !others.is_empty() && !args.yes {
                 eprintln!("`{}` also covers: {}", r.key, others.join(", "));
                 bail!("the crown-jewel tag is per-gotcha, so this would {verb} those too — re-run with --yes to confirm, or split the gotcha");
@@ -837,5 +843,57 @@ mod tests {
         assert!(resolve_under_repo(&repo, "../escape.rs").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── command-path edges (blast radius, drift guard, subdir launch) ────────
+
+    #[test]
+    fn blast_radius_lists_only_extra_files() {
+        assert!(blast_radius("src/a.rs", &sv(&["src/a.rs"])).is_empty());
+        let extra = blast_radius("src/a.rs", &sv(&["src/a.rs", "./src/b.rs", "src/c.rs"]));
+        assert_eq!(
+            extra,
+            sv(&["src/b.rs", "src/c.rs"]),
+            "normalized, target excluded"
+        );
+    }
+
+    #[test]
+    fn materialize_guard_blocks_drift_unless_forced() {
+        let dir = std::env::temp_dir().join(format!("mati-sbx-mat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Path::new("/work/repo");
+        let path = dir.join("settings.local.json");
+        std::fs::write(
+            &path,
+            r#"{"sandbox":{"filesystem":{"denyWrite":["/work/repo/x.rs"]}}}"#,
+        )
+        .unwrap();
+        let empty = SandboxRules::default();
+        // guarded + drift + not forced → refuse, and the file is left untouched
+        assert!(materialize(&path, repo, &empty, true, false).is_err());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("/work/repo/x.rs"));
+        // forced → removes the drifted entry
+        assert!(materialize(&path, repo, &empty, true, true).is_ok());
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("/work/repo/x.rs"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn repo_root_walks_up_to_project_marker() {
+        let base = std::env::temp_dir().join(format!("mati-sbx-root-{}", std::process::id()));
+        let repo = base.join("repo");
+        let deep = repo.join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_c = std::fs::canonicalize(&repo).unwrap();
+        // launched from a deep subdir → resolves up to the .git/.claude root
+        assert_eq!(repo_root_for(&deep).unwrap(), repo_c);
+        assert_eq!(repo_root_for(&repo).unwrap(), repo_c);
+        std::fs::remove_dir_all(&base).ok();
     }
 }
