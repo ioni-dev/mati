@@ -30,6 +30,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use mati_core::store::enforcement::{record_event, EnforcementEventType, SubjectKind};
 use mati_core::store::{GotchaRecord, Record, RecordLifecycle};
 
 use super::proxy::StoreProxy;
@@ -396,6 +397,7 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
     let path = settings_local_path(&repo_root);
     if args.apply {
         materialize(&path, &repo_root, &abs, true, args.force)?;
+        audit_sandbox(&store, "apply", &abs).await;
         println!(
             "Applied {} denyWrite + {} denyRead entr{} to {}",
             abs.deny_write.len(),
@@ -584,6 +586,7 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
     let (abs, _skipped, _warnings) = compute_rules(&store, &repo_root).await?;
     let path = settings_local_path(&repo_root);
     materialize(&path, &repo_root, &abs, false, true)?;
+    audit_sandbox(&store, if add { "protect" } else { "unprotect" }, &abs).await;
 
     println!(
         "{}ed `{file}` ({n} gotcha(s) updated); synced {}.",
@@ -594,6 +597,36 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
         enablement_hint();
     }
     Ok(())
+}
+
+/// Best-effort audit: record the sandbox-floor change as an
+/// `EnforcementConfigChanged` event in the hash-chained log (L4 attribution).
+/// Records in direct mode — the usual case for this admin command. When a daemon
+/// holds the store (an active agent session), it is skipped; socket-mode
+/// recording is a documented follow-up.
+async fn audit_sandbox(store: &StoreProxy, action: &str, abs: &SandboxRules) {
+    let Some(s) = store.direct_store() else {
+        return;
+    };
+    let _ = record_event(
+        s,
+        EnforcementEventType::EnforcementConfigChanged {
+            setting: "sandbox.floor".to_string(),
+            old_value: String::new(),
+            new_value: format!(
+                "{} denyWrite + {} denyRead",
+                abs.deny_write.len(),
+                abs.deny_read.len()
+            ),
+        },
+        SubjectKind::Config,
+        "sandbox.floor".to_string(),
+        "cli".to_string(),
+        None,
+        format!("sandbox_{action}"),
+        None,
+    )
+    .await;
 }
 
 async fn run_clear() -> Result<()> {
@@ -607,6 +640,9 @@ async fn run_clear() -> Result<()> {
     let existing = read_settings(&path)?;
     let cleared = clear_from_settings(existing, &repo_root);
     write_settings_atomic(&path, &cleared)?;
+    if let Ok(store) = StoreProxy::open(&cwd).await {
+        audit_sandbox(&store, "clear", &SandboxRules::default()).await;
+    }
     println!(
         "Cleared mati-managed (in-repo) sandbox deny rules from {}",
         path.display()
