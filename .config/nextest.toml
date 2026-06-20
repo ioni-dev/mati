@@ -34,6 +34,14 @@
 [profile.default]
 test-threads = 4
 
+# Exclude Criterion benchmark binaries (`harness = false`) from the test run.
+# `--all-targets` (used in CI) otherwise hands the bench binaries to nextest,
+# which runs the full benchmarks — they blow past `slow-timeout` and the run
+# fails after a multi-hour churn of timeouts. Benches are compile-checked by the
+# dedicated "Benches compile" CI job, so they never need to *run* here. Inherited
+# by the `ci` and `stress` profiles. (Run a bench with `cargo bench` directly.)
+default-filter = 'not kind(bench)'
+
 # Anything slower than 30s is a wedged test, not a slow test — every
 # real test in this suite finishes in milliseconds. Terminate after
 # 4 grace periods (2 min total) to keep CI runs bounded.
