@@ -78,7 +78,7 @@ use crate::store::db::Store;
 use crate::store::enforcement::{
     record_event, ControlChangeKind, EnforcementEventType, SubjectKind,
 };
-use crate::store::record::{Record, RecordLifecycle, TombstoneReason};
+use crate::store::record::{FileRecord, Record, RecordLifecycle, TombstoneReason};
 
 /// Wall-clock seconds since the UNIX epoch, used to stamp graph edges
 /// written by the gotcha mutation pipeline.
@@ -521,15 +521,34 @@ async fn update_file_gotcha_key(
     const MAX_RETRIES: usize = 4;
     for attempt in 0..MAX_RETRIES {
         let Some(mut record) = store.get(&file_key).await? else {
-            // File record doesn't exist yet. Mark dirty so `mati repair`
-            // back-fills the link when the file is later indexed by init.
+            // File record doesn't exist yet — a file `init` never indexed
+            // (e.g. `mati gotcha add newfile.rs` / `mem_set` before re-init).
+            // Create-on-write: persist a minimal layer-0 file stub carrying this
+            // gotcha key so the read gate — which keys on
+            // `file_record.payload.gotcha_keys` (hooks/decide.rs) — enforces
+            // IMMEDIATELY. Without this the gotcha is silently inert until the
+            // next `mati init` §8c back-fill. init/reparse later merge
+            // real analysis and preserve gotcha_keys (reparse.rs).
             if add {
-                crate::store::repair::mark_dirty(
-                    store,
-                    gotcha_key,
-                    &format!("file record missing at link-sync time: {file_key}"),
-                )
-                .await;
+                let now = now_secs();
+                let mut stub =
+                    Record::layer0_file_stub(file_key.clone(), uuid::Uuid::new_v4(), 1, now);
+                let mut fr = FileRecord::layer0_stub(
+                    file_path,
+                    vec![],
+                    vec![],
+                    vec![],
+                    0,
+                    0,
+                    0,
+                    None,
+                    false,
+                    0,
+                    now,
+                );
+                fr.gotcha_keys = vec![gotcha_key.to_string()];
+                stub.payload = serde_json::to_value(&fr).ok();
+                store.put(&file_key, &stub).await?;
             }
             return Ok(());
         };
