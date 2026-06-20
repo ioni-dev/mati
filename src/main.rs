@@ -104,6 +104,8 @@ enum Commands {
     // ── Infrastructure ───────────────────────────────────────────────────
     /// Install or update agent hooks without a full re-init (safe while daemon is running)
     Hooks(cli::init::HooksArgs),
+    /// Compile crown-jewel gotchas into a Claude Code sandbox deny floor (L3)
+    Sandbox(cli::sandbox::SandboxArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Generate user-level service unit (launchd/systemd) to keep the daemon alive
@@ -288,6 +290,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Check => cli::check::run().await,
         Commands::Doctor(args) => cli::doctor::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
+        Commands::Sandbox(args) => cli::sandbox::run(args).await,
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
             cli::daemon::DaemonCommand::Stop(args) => cli::daemon::run_daemon_stop(args).await,

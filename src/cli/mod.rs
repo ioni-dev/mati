@@ -17,6 +17,7 @@ pub mod proxy;
 pub mod repair;
 pub mod reparse;
 pub mod review;
+pub mod sandbox;
 pub mod show;
 pub mod stale;
 pub mod stats;

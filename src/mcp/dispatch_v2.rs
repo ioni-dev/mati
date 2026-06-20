@@ -224,7 +224,10 @@ fn is_compound(cmd: &Command) -> bool {
 /// through a dedicated dispatcher rather than the v1 bridge or the typical
 /// knowledge-mutation transactional audit path.
 fn is_config_command(cmd: &Command) -> bool {
-    matches!(cmd, Command::ConfigGet(_) | Command::ConfigSet(_))
+    matches!(
+        cmd,
+        Command::ConfigGet(_) | Command::ConfigSet(_) | Command::SandboxAudit(_)
+    )
 }
 
 /// Dispatch ConfigGet / ConfigSet against the daemon's store.
@@ -326,6 +329,27 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                 ),
             ),
         },
+        Command::SandboxAudit(input) => {
+            // Best-effort: record the L3 sandbox-floor change as an
+            // EnforcementConfigChanged event in the hash-chained log (socket-mode
+            // counterpart of the CLI's direct-mode recording).
+            let _ = crate::store::enforcement::record_event(
+                store,
+                crate::store::enforcement::EnforcementEventType::EnforcementConfigChanged {
+                    setting: input.setting.clone(),
+                    old_value: String::new(),
+                    new_value: input.new_value.clone(),
+                },
+                crate::store::enforcement::SubjectKind::Config,
+                input.setting.clone(),
+                "cli".to_string(),
+                None,
+                input.reason.clone(),
+                None,
+            )
+            .await;
+            Response::ok(request_id, serde_json::Value::Null)
+        }
         _ => unreachable!("is_config_command guard"),
     }
 }
@@ -1041,7 +1065,7 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         }
 
         // Config commands are handled natively — should not reach here.
-        Command::ConfigGet(_) | Command::ConfigSet(_) => {
+        Command::ConfigGet(_) | Command::ConfigSet(_) | Command::SandboxAudit(_) => {
             unreachable!("config commands are handled natively, not via v1 bridge")
         }
     }
