@@ -30,7 +30,6 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use mati_core::store::enforcement::{record_event, EnforcementEventType, SubjectKind};
 use mati_core::store::{GotchaRecord, Record, RecordLifecycle};
 
 use super::proxy::StoreProxy;
@@ -605,28 +604,14 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
 /// holds the store (an active agent session), it is skipped; socket-mode
 /// recording is a documented follow-up.
 async fn audit_sandbox(store: &StoreProxy, action: &str, abs: &SandboxRules) {
-    let Some(s) = store.direct_store() else {
-        return;
-    };
-    let _ = record_event(
-        s,
-        EnforcementEventType::EnforcementConfigChanged {
-            setting: "sandbox.floor".to_string(),
-            old_value: String::new(),
-            new_value: format!(
-                "{} denyWrite + {} denyRead",
-                abs.deny_write.len(),
-                abs.deny_read.len()
-            ),
-        },
-        SubjectKind::Config,
-        "sandbox.floor".to_string(),
-        "cli".to_string(),
-        None,
-        format!("sandbox_{action}"),
-        None,
-    )
-    .await;
+    let new_value = format!(
+        "{} denyWrite + {} denyRead",
+        abs.deny_write.len(),
+        abs.deny_read.len()
+    );
+    store
+        .record_sandbox_audit(&new_value, &format!("sandbox_{action}"))
+        .await;
 }
 
 async fn run_clear() -> Result<()> {

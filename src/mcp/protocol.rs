@@ -260,6 +260,12 @@ pub enum Command {
     #[serde(rename = "config_set")]
     ConfigSet(ConfigSetInput),
 
+    /// Record an `EnforcementConfigChanged` audit event for an L3 sandbox-floor
+    /// change (`mati sandbox` apply/clear/protect/unprotect). Lets the CLI log
+    /// the change even when a daemon holds the store (socket mode).
+    #[serde(rename = "sandbox_audit")]
+    SandboxAudit(SandboxAuditInput),
+
     /// Append a session analytics event (6 homogeneous event types).
     #[serde(rename = "session_log")]
     SessionLog(SessionLogInput),
@@ -621,6 +627,16 @@ pub struct ConfigSetInput {
     pub value: String,
 }
 
+/// Input for `Command::SandboxAudit`. The dispatcher records an
+/// `EnforcementConfigChanged` event verbatim from these fields.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxAuditInput {
+    pub setting: String,
+    pub new_value: String,
+    pub reason: String,
+}
+
 // ── Shared enums ────────────────────────────────────────────────────────────
 
 /// Severity level for gotcha records. Closed enum.
@@ -689,6 +705,7 @@ impl Command {
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
             Self::ConfigGet(_) => "config_get",
             Self::ConfigSet(_) => "config_set",
+            Self::SandboxAudit(_) => "sandbox_audit",
             Self::MemGet(_) => "mem_get",
             Self::MemBootstrap(_) => "mem_bootstrap",
             Self::GotchaUpsert(_) => "gotcha_upsert",
@@ -734,6 +751,7 @@ impl Command {
             Self::ConsultationHit(i) => &i.key,
             Self::ConfigGet(i) => &i.key,
             Self::ConfigSet(i) => &i.key,
+            Self::SandboxAudit(i) => &i.setting,
             Self::Ping
             | Self::Metrics
             | Self::MemBootstrap(_)
@@ -769,6 +787,7 @@ impl Command {
             | Self::SessionLog(_)
             | Self::ConsultationHit(_)
             | Self::ConfigSet(_)
+            | Self::SandboxAudit(_)
             | Self::SessionFlush
             | Self::SessionHarvest
             | Self::RecordImport(_)

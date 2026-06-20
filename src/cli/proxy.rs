@@ -655,6 +655,42 @@ impl StoreProxy {
         }
     }
 
+    /// Best-effort: record an L3 sandbox-floor change as an
+    /// `EnforcementConfigChanged` event, in either mode. Direct mode records
+    /// straight to the store; socket mode sends a `SandboxAudit` command so the
+    /// event still lands when a daemon holds the store. Never fails the caller.
+    pub async fn record_sandbox_audit(&self, new_value: &str, reason: &str) {
+        const SETTING: &str = "sandbox.floor";
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                let _ = mati_core::store::enforcement::record_event(
+                    store,
+                    mati_core::store::enforcement::EnforcementEventType::EnforcementConfigChanged {
+                        setting: SETTING.to_string(),
+                        old_value: String::new(),
+                        new_value: new_value.to_string(),
+                    },
+                    mati_core::store::enforcement::SubjectKind::Config,
+                    SETTING.to_string(),
+                    "cli".to_string(),
+                    None,
+                    reason.to_string(),
+                    None,
+                )
+                .await;
+            }
+            ProxyInner::Socket { root } => {
+                use mati_core::mcp::protocol as p;
+                let cmd = p::Command::SandboxAudit(p::SandboxAuditInput {
+                    setting: SETTING.to_string(),
+                    new_value: new_value.to_string(),
+                    reason: reason.to_string(),
+                });
+                let _ = daemon_v2(root, cmd).await;
+            }
+        }
+    }
+
     /// Read a runtime config value (e.g. `audit.write_durability`).
     ///
     /// Routes through the daemon when running so `mati config get` works
