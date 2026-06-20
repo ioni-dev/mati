@@ -113,8 +113,9 @@ is the operational copy. Reject if proposed here:
 - SSO, SAML, OIDC, RBAC, SCIM.
 - Managed Slack/Teams/PagerDuty integration (OSS may emit webhook-compatible
   stdout; the managed, authenticated, routed integration is enterprise).
-- Curated compliance packs (HIPAA, SOC 2, PCI) — OSS ships the `--pack`
-  loader/format only; the maintained pack content is enterprise.
+- Curated compliance packs (HIPAA, SOC 2, PCI). The `--pack` compliance-pack
+  loader/format is planned and is not in this repo; the maintained pack content
+  is enterprise.
 - Policy-as-code continuous sync; centralized governance dashboard / web UI;
   air-gapped installer with signed release artifacts.
 - **Any network call in the enforcement path.** DENY/ALLOW/receipt is local,

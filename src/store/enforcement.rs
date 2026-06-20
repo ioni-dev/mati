@@ -1051,23 +1051,39 @@ pub async fn scan_events_since(store: &Store, since_ms: u64) -> Result<Vec<Enfor
 /// Count enforcement events by type within a time window.
 pub async fn count_events_by_type(store: &Store, since_ms: u64) -> Result<EnforcementEventCounts> {
     let events = scan_events_since(store, since_ms).await?;
+    Ok(aggregate_event_counts(&events))
+}
+
+/// Aggregate a slice of events into typed counts.
+///
+/// Pure (no store / no I/O) so the aggregation — including the `ControlChanged`
+/// lifecycle breakdown — is unit-testable from hand-built events.
+pub fn aggregate_event_counts(events: &[EnforcementEvent]) -> EnforcementEventCounts {
     let mut counts = EnforcementEventCounts {
         total: events.len() as u64,
         ..Default::default()
     };
-    for e in &events {
+    for e in events {
         match &e.event_type {
             EnforcementEventType::Deny => counts.denials += 1,
             EnforcementEventType::AllowAfterReceipt => counts.allowed_after_receipt += 1,
             EnforcementEventType::ReceiptMinted => counts.receipts_minted += 1,
             EnforcementEventType::BypassDetected => counts.bypasses += 1,
-            EnforcementEventType::ControlChanged { .. } => counts.controls_changed += 1,
+            EnforcementEventType::ControlChanged { change_kind } => {
+                counts.controls_changed += 1;
+                match change_kind {
+                    ControlChangeKind::Created => counts.controls_created += 1,
+                    ControlChangeKind::Confirmed => counts.controls_confirmed += 1,
+                    ControlChangeKind::Updated => counts.controls_updated += 1,
+                    ControlChangeKind::Deleted => counts.controls_removed += 1,
+                }
+            }
             EnforcementEventType::EnforcementConfigChanged { .. } => counts.config_changes += 1,
             EnforcementEventType::RecordingGap { .. } => counts.gaps += 1,
             EnforcementEventType::RetentionPruned { .. } => counts.retention_prunes += 1,
         }
     }
-    Ok(counts)
+    counts
 }
 
 /// Aggregated event counts for CLI display.
@@ -1078,10 +1094,130 @@ pub struct EnforcementEventCounts {
     pub allowed_after_receipt: u64,
     pub receipts_minted: u64,
     pub bypasses: u64,
+    /// Total `ControlChanged` events (sum of the four `controls_*` lifecycle
+    /// counters below).
     pub controls_changed: u64,
+    /// Lifecycle breakdown of `ControlChanged` events (control == confirmed
+    /// gotcha). These let `mati stats` report gotcha created/confirmed/updated/
+    /// removed velocity from the audit log without new capture.
+    pub controls_created: u64,
+    pub controls_confirmed: u64,
+    pub controls_updated: u64,
+    pub controls_removed: u64,
     pub config_changes: u64,
     pub gaps: u64,
     pub retention_prunes: u64,
+}
+
+/// Derived enforcement metrics (PMF/friction signals) computed from the
+/// raw event stream. All derived from existing events — no new capture.
+#[derive(Debug, Default)]
+pub struct DerivedEnforcementMetrics {
+    /// Distinct `agent_session` ids that produced at least one `Deny`.
+    ///
+    /// `Deny` is hook-path and carries a session id; `ReceiptMinted` is
+    /// MCP-path and does not (schema_version 2). So only *blocks* can be
+    /// attributed to sessions, not consultations.
+    pub blocked_sessions: u64,
+    /// `Deny` events that carry a session id — the numerator for the ratio.
+    pub attributed_denials: u64,
+    /// `attributed_denials / blocked_sessions`; `None` when no denied session
+    /// carries an id (nothing to attribute).
+    pub blocks_per_session: Option<f64>,
+    /// Median milliseconds from a `Deny` to the next `ReceiptMinted` on the
+    /// **same `subject_key`** (paired by subject + temporal order, since
+    /// receipts lack a session id), counting only pairs within
+    /// `CONSULTED_RECENT_TTL_SECS` — the system's own "recent consult" window.
+    /// A later receipt is a separate interaction, not a response to the block.
+    /// Measures how long an agent takes to consult after being blocked. `None`
+    /// when no Deny→consult pair exists inside the window.
+    pub median_time_to_consult_ms: Option<u64>,
+    /// Number of Deny→consult pairs that fed the median.
+    pub consult_pairs: u64,
+}
+
+/// Compute [`DerivedEnforcementMetrics`] from a slice of events.
+///
+/// Pure (no store / no I/O) so it is unit-testable from hand-built events.
+pub fn derive_enforcement_metrics(events: &[EnforcementEvent]) -> DerivedEnforcementMetrics {
+    use std::collections::{BTreeSet, HashMap};
+
+    // --- blocks per session: Deny events carry session ids ---
+    let mut blocked_sessions: BTreeSet<&str> = BTreeSet::new();
+    let mut attributed_denials = 0u64;
+    for e in events {
+        if matches!(e.event_type, EnforcementEventType::Deny) {
+            if let Some(sid) = e.agent_session.as_deref() {
+                blocked_sessions.insert(sid);
+                attributed_denials += 1;
+            }
+        }
+    }
+    let blocks_per_session = if blocked_sessions.is_empty() {
+        None
+    } else {
+        Some(attributed_denials as f64 / blocked_sessions.len() as f64)
+    };
+
+    // --- time to consult: Deny -> next ReceiptMinted on the same subject ---
+    // Index receipt timestamps per subject, sorted ascending, so each Deny can
+    // find the first consultation at or after it.
+    let mut receipts_by_subject: HashMap<&str, Vec<u64>> = HashMap::new();
+    for e in events {
+        if matches!(e.event_type, EnforcementEventType::ReceiptMinted) {
+            receipts_by_subject
+                .entry(e.subject_key.as_str())
+                .or_default()
+                .push(e.recorded_at_ms);
+        }
+    }
+    for times in receipts_by_subject.values_mut() {
+        times.sort_unstable();
+    }
+    // Only a consult within this window counts as a response to the block;
+    // a later receipt is a separate interaction (avoids cross-day/cross-session
+    // pairs that would inflate the median).
+    let window_ms = crate::store::session::CONSULTED_RECENT_TTL_SECS * 1_000;
+    let mut deltas: Vec<u64> = Vec::new();
+    for e in events {
+        if matches!(e.event_type, EnforcementEventType::Deny) {
+            if let Some(times) = receipts_by_subject.get(e.subject_key.as_str()) {
+                // First receipt at or after this deny (sorted ascending).
+                if let Some(&t) = times.iter().find(|&&t| t >= e.recorded_at_ms) {
+                    let delta = t - e.recorded_at_ms;
+                    if delta <= window_ms {
+                        deltas.push(delta);
+                    }
+                }
+            }
+        }
+    }
+    let consult_pairs = deltas.len() as u64;
+    let median_time_to_consult_ms = median_u64(&mut deltas);
+
+    DerivedEnforcementMetrics {
+        blocked_sessions: blocked_sessions.len() as u64,
+        attributed_denials,
+        blocks_per_session,
+        median_time_to_consult_ms,
+        consult_pairs,
+    }
+}
+
+/// Median of a slice (mutated: sorted in place). Even counts average the two
+/// middle values (integer division). `None` for an empty slice.
+fn median_u64(values: &mut [u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let n = values.len();
+    let mid = n / 2;
+    if n % 2 == 1 {
+        Some(values[mid])
+    } else {
+        Some((values[mid - 1] + values[mid]) / 2)
+    }
 }
 
 /// Format an event type as a short display string.
@@ -1157,6 +1293,154 @@ mod tests {
         let hash2 = event.compute_hash();
 
         assert_ne!(hash1, hash2, "changing seq_no must change the hash");
+    }
+
+    /// Build an event of a given type from the frozen template.
+    fn event_of(event_type: EnforcementEventType) -> EnforcementEvent {
+        EnforcementEvent {
+            event_type,
+            ..frozen_test_event()
+        }
+    }
+
+    #[test]
+    fn aggregate_event_counts_breaks_out_control_lifecycle() {
+        use EnforcementEventType::*;
+        let events = vec![
+            event_of(Deny),
+            event_of(Deny),
+            event_of(AllowAfterReceipt),
+            event_of(ReceiptMinted),
+            event_of(BypassDetected),
+            event_of(ControlChanged {
+                change_kind: ControlChangeKind::Created,
+            }),
+            event_of(ControlChanged {
+                change_kind: ControlChangeKind::Confirmed,
+            }),
+            event_of(ControlChanged {
+                change_kind: ControlChangeKind::Confirmed,
+            }),
+            event_of(ControlChanged {
+                change_kind: ControlChangeKind::Updated,
+            }),
+            event_of(ControlChanged {
+                change_kind: ControlChangeKind::Deleted,
+            }),
+        ];
+
+        let counts = aggregate_event_counts(&events);
+
+        assert_eq!(counts.total, 10);
+        assert_eq!(counts.denials, 2);
+        assert_eq!(counts.allowed_after_receipt, 1);
+        assert_eq!(counts.receipts_minted, 1);
+        assert_eq!(counts.bypasses, 1);
+
+        // Lifecycle breakout.
+        assert_eq!(counts.controls_created, 1);
+        assert_eq!(counts.controls_confirmed, 2);
+        assert_eq!(counts.controls_updated, 1);
+        assert_eq!(counts.controls_removed, 1);
+
+        // The total must equal the sum of the four lifecycle counters.
+        assert_eq!(counts.controls_changed, 5);
+        assert_eq!(
+            counts.controls_changed,
+            counts.controls_created
+                + counts.controls_confirmed
+                + counts.controls_updated
+                + counts.controls_removed
+        );
+    }
+
+    #[test]
+    fn aggregate_event_counts_empty_is_all_zero() {
+        let counts = aggregate_event_counts(&[]);
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.controls_changed, 0);
+        assert_eq!(counts.denials, 0);
+    }
+
+    /// Build an event with explicit type/subject/time/session over the template.
+    fn ev(
+        event_type: EnforcementEventType,
+        subject: &str,
+        at_ms: u64,
+        session: Option<&str>,
+    ) -> EnforcementEvent {
+        EnforcementEvent {
+            event_type,
+            subject_key: subject.to_string(),
+            recorded_at_ms: at_ms,
+            agent_session: session.map(str::to_string),
+            ..frozen_test_event()
+        }
+    }
+
+    #[test]
+    fn derive_metrics_blocks_per_session_and_time_to_consult() {
+        use EnforcementEventType::*;
+        let events = vec![
+            // sessA blocked on x@1000, consulted x@1500 (delta 500)
+            ev(Deny, "file:x.rs", 1000, Some("sessA")),
+            ev(ReceiptMinted, "file:x.rs", 1500, None),
+            // sessB blocked on y@2000, consulted y@2300 (delta 300)
+            ev(Deny, "file:y.rs", 2000, Some("sessB")),
+            ev(ReceiptMinted, "file:y.rs", 2300, None),
+            // sessA blocked again on y@3000 — no later receipt on y → no pair
+            ev(Deny, "file:y.rs", 3000, Some("sessA")),
+        ];
+
+        let m = derive_enforcement_metrics(&events);
+
+        assert_eq!(m.blocked_sessions, 2, "distinct sessions with a deny");
+        assert_eq!(m.attributed_denials, 3);
+        assert_eq!(m.blocks_per_session, Some(1.5)); // 3 denials / 2 sessions
+        assert_eq!(m.consult_pairs, 2); // only denies with a later same-subject receipt
+        assert_eq!(m.median_time_to_consult_ms, Some(400)); // median([300,500])
+    }
+
+    #[test]
+    fn derive_metrics_no_sessioned_denials_yields_none() {
+        use EnforcementEventType::*;
+        // Denies without a session id (e.g. pre-v2 events) cannot be attributed.
+        let events = vec![
+            ev(Deny, "file:x.rs", 1000, None),
+            ev(ReceiptMinted, "file:x.rs", 1200, None),
+        ];
+        let m = derive_enforcement_metrics(&events);
+        assert_eq!(m.blocked_sessions, 0);
+        assert_eq!(m.attributed_denials, 0);
+        assert_eq!(m.blocks_per_session, None);
+        // Time-to-consult still pairs by subject regardless of session.
+        assert_eq!(m.consult_pairs, 1);
+        assert_eq!(m.median_time_to_consult_ms, Some(200));
+    }
+
+    #[test]
+    fn derive_metrics_excludes_consults_beyond_window() {
+        use EnforcementEventType::*;
+        let window_ms = crate::store::session::CONSULTED_RECENT_TTL_SECS * 1_000;
+        let events = vec![
+            // In-window consult (delta == window boundary, inclusive) → counts.
+            ev(Deny, "file:a.rs", 0, Some("s1")),
+            ev(ReceiptMinted, "file:a.rs", window_ms, None),
+            // Out-of-window consult (1ms past) → excluded (a separate interaction).
+            ev(Deny, "file:b.rs", 0, Some("s2")),
+            ev(ReceiptMinted, "file:b.rs", window_ms + 1, None),
+        ];
+        let m = derive_enforcement_metrics(&events);
+        assert_eq!(m.consult_pairs, 1, "only the in-window pair counts");
+        assert_eq!(m.median_time_to_consult_ms, Some(window_ms));
+    }
+
+    #[test]
+    fn median_u64_odd_even_and_empty() {
+        assert_eq!(median_u64(&mut []), None);
+        assert_eq!(median_u64(&mut [5]), Some(5));
+        assert_eq!(median_u64(&mut [3, 1, 2]), Some(2)); // odd → middle
+        assert_eq!(median_u64(&mut [4, 1, 3, 2]), Some(2)); // even → (2+3)/2 = 2
     }
 
     #[test]
