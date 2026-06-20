@@ -8,14 +8,19 @@ use serde::{Deserialize, Serialize};
 use mati_core::health::{gaps, onboarding};
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, Store,
+    RecordSource, RecordVersion, StalenessScore, StalenessTier, Store,
 };
 
 use super::colors;
 use super::proxy::StoreProxy;
 
 #[derive(Args)]
-pub struct StatsArgs {}
+pub struct StatsArgs {
+    /// Emit enforcement + gotcha-lifecycle metrics as JSON for time-series
+    /// tracking and scripting. Bypasses the display cache (always fresh).
+    #[arg(long)]
+    pub json: bool,
+}
 
 /// Daily aggregation record value — mirrors `DailyAgg` in hooks.rs.
 #[derive(Deserialize)]
@@ -84,9 +89,150 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-pub async fn run(_args: StatsArgs) -> Result<()> {
+/// Current-state gotcha health, computed from active `gotcha:` records.
+struct GotchaHealth {
+    /// Active gotcha records (any confirmation state).
+    active: u64,
+    /// Confirmed gotchas (those eligible to gate, given the threshold).
+    confirmed: u64,
+    /// Gotchas at `Stale`/`Liability`/`Tombstone` staleness — needs review.
+    stale_or_worse: u64,
+}
+
+/// A gotcha counts as confirmed unless its payload explicitly says
+/// `confirmed: false` (missing / non-bool → confirmed). Mirrors the Review-backlog
+/// definition so every confirmed count in `mati stats` agrees.
+fn gotcha_is_confirmed(r: &Record) -> bool {
+    r.payload
+        .as_ref()
+        .and_then(|p| p.get("confirmed"))
+        .and_then(|v| v.as_bool())
+        != Some(false)
+}
+
+/// Compute [`GotchaHealth`] from already-scanned, active gotcha records.
+fn gotcha_health(gotchas: &[Record]) -> GotchaHealth {
+    let confirmed = gotchas.iter().filter(|r| gotcha_is_confirmed(r)).count() as u64;
+    let stale_or_worse = gotchas
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.staleness.tier,
+                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
+            )
+        })
+        .count() as u64;
+    GotchaHealth {
+        active: gotchas.len() as u64,
+        confirmed,
+        stale_or_worse,
+    }
+}
+
+/// Human-friendly duration from milliseconds (e.g. `350ms`, `1.2s`, `2.5m`).
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
+}
+
+/// Scan the last-30d enforcement events once and compute both the typed
+/// counts and the derived friction metrics. `None` when no direct store is
+/// available or the scan fails — best-effort, like the rest of `mati stats`.
+async fn enforcement_metrics_30d(
+    store: &StoreProxy,
+    now_ms: u64,
+) -> Option<(
+    mati_core::store::enforcement::EnforcementEventCounts,
+    mati_core::store::enforcement::DerivedEnforcementMetrics,
+)> {
+    let since_ms = now_ms.saturating_sub(30 * 86_400_000);
+    // Route through the proxy (not `direct_store()`) so metrics render whether
+    // or not a daemon holds the store — the daemon is the recommended prod
+    // config, and previously the whole Enforcement section silently vanished
+    // under it. The proxy command filters by seq; scan all and window by ms here
+    // to match `scan_events_since` semantics (last 30 days).
+    match store.scan_enforcement_events(0, u64::MAX).await {
+        Ok(mut events) => {
+            events.retain(|e| e.recorded_at_ms >= since_ms);
+            Some((
+                mati_core::store::enforcement::aggregate_event_counts(&events),
+                mati_core::store::enforcement::derive_enforcement_metrics(&events),
+            ))
+        }
+        Err(e) => {
+            tracing::debug!("enforcement event scan failed: {e}");
+            None
+        }
+    }
+}
+
+/// `--json`: emit enforcement + gotcha-lifecycle metrics as one JSON
+/// object for time-series tracking. Always fresh (bypasses the display cache).
+async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
+    let project = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+    let now = now_secs();
+
+    let mut gotchas = store.scan_prefix("gotcha:").await?;
+    gotchas.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
+    let health = gotcha_health(&gotchas);
+
+    let enforcement = match enforcement_metrics_30d(store, now * 1_000).await {
+        Some((counts, derived)) => serde_json::json!({
+            "available": true,
+            "total": counts.total,
+            "denials": counts.denials,
+            "allowed_after_receipt": counts.allowed_after_receipt,
+            "consulted": counts.receipts_minted,
+            "bypasses": counts.bypasses,
+            "gaps": counts.gaps,
+            "controls": {
+                "changed": counts.controls_changed,
+                "created": counts.controls_created,
+                "confirmed": counts.controls_confirmed,
+                "updated": counts.controls_updated,
+                "removed": counts.controls_removed,
+            },
+            "derived": {
+                "blocked_sessions": derived.blocked_sessions,
+                "attributed_denials": derived.attributed_denials,
+                "blocks_per_session": derived.blocks_per_session,
+                "median_time_to_consult_ms": derived.median_time_to_consult_ms,
+                "consult_pairs": derived.consult_pairs,
+            }
+        }),
+        None => serde_json::json!({ "available": false }),
+    };
+
+    let out = serde_json::json!({
+        "project": project,
+        "computed_at": now,
+        "window_days": 30,
+        "gotchas": {
+            "active": health.active,
+            "confirmed": health.confirmed,
+            "stale_or_worse": health.stale_or_worse,
+        },
+        "enforcement_30d": enforcement,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+pub async fn run(args: StatsArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let store = StoreProxy::open(&cwd).await?;
+
+    if args.json {
+        let result = run_json(&store, &cwd).await;
+        store.close().await?;
+        return result;
+    }
 
     // ── Cache check: reuse snapshot when write-seq unchanged ──────────────
     let now = now_secs();
@@ -181,6 +327,15 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     };
     println!(
         "    Gotchas per hotspot    {gph_color}{gotchas_per_hotspot:.1}{reset}  (target >= 2.0)"
+    );
+
+    // Gotcha health: stale-or-worse gotchas needing review. (Confirmed
+    // share is reported by the Review backlog section below.)
+    let gh = gotcha_health(&gotchas);
+    let stale_c = if gh.stale_or_worse == 0 { green } else { yellow };
+    println!(
+        "    Stale gotchas          {stale_c}{}{reset}  {gray}(stale / liability / tombstone){reset}",
+        gh.stale_or_worse
     );
 
     // Decisions documented
@@ -383,48 +538,56 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // 4b. Enforcement events (last 30 days)
     // ════════════════════════════════════════════════════════════════════════════
 
-    if let Some(direct_store) = store.direct_store() {
-        let thirty_days_ms = {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            now_ms.saturating_sub(30 * 86_400_000)
-        };
-        match mati_core::store::enforcement::count_events_by_type(direct_store, thirty_days_ms)
-            .await
-        {
-            Ok(counts) if counts.total > 0 => {
-                println!("  {bold}{blue}Enforcement (30d){reset}");
-                println!("    Total events           {white}{}{reset}", counts.total);
-                let deny_color = if counts.denials > 0 { red } else { green };
-                println!(
-                    "    Denials                {deny_color}{}{reset}",
-                    counts.denials
-                );
-                println!(
-                    "    Allowed after receipt  {green}{}{reset}",
-                    counts.allowed_after_receipt
-                );
-                let bp_c = if counts.bypasses > 0 { red } else { green };
-                println!(
-                    "    Bypasses               {bp_c}{}{reset}",
-                    counts.bypasses
-                );
-                let gap_c = if counts.gaps > 0 { yellow } else { green };
-                println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
-                println!(
-                    "    Controls changed       {white}{}{reset}",
-                    counts.controls_changed
-                );
-                println!();
+    if let Some((counts, derived)) = enforcement_metrics_30d(&store, now * 1_000).await {
+        if counts.total > 0 {
+            println!("  {bold}{blue}Enforcement (30d){reset}");
+            println!("    Total events           {white}{}{reset}", counts.total);
+            let deny_color = if counts.denials > 0 { red } else { green };
+            println!(
+                "    Denials (blocked)      {deny_color}{}{reset}",
+                counts.denials
+            );
+            println!(
+                "    Allowed after receipt  {green}{}{reset}",
+                counts.allowed_after_receipt
+            );
+            println!(
+                "    Consulted (receipts)   {white}{}{reset}",
+                counts.receipts_minted
+            );
+            let bp_c = if counts.bypasses > 0 { red } else { green };
+            println!("    Bypasses               {bp_c}{}{reset}", counts.bypasses);
+            let gap_c = if counts.gaps > 0 { yellow } else { green };
+            println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
+
+            // Derived friction metrics.
+            match derived.blocks_per_session {
+                Some(bps) => println!(
+                    "    Blocks / session       {white}{bps:.1}{reset}  {gray}({} sessions){reset}",
+                    derived.blocked_sessions
+                ),
+                None => println!("    Blocks / session       {gray}\u{2014}{reset}"),
             }
-            Ok(_) => {
-                // No enforcement events yet — skip the section silently
+            match derived.median_time_to_consult_ms {
+                Some(ms) => println!(
+                    "    Median time-to-consult {white}{}{reset}  {gray}(n={}){reset}",
+                    format_duration_ms(ms),
+                    derived.consult_pairs
+                ),
+                None => println!("    Median time-to-consult {gray}\u{2014}{reset}"),
             }
-            Err(e) => {
-                tracing::debug!("enforcement event count failed: {e}");
+
+            // Gotcha lifecycle from ControlChanged events.
+            if counts.controls_changed > 0 {
+                println!(
+                    "    Gotcha lifecycle       {gray}created{reset} {white}{}{reset} {gray}· confirmed{reset} {white}{}{reset} {gray}· updated{reset} {white}{}{reset} {gray}· removed{reset} {white}{}{reset}",
+                    counts.controls_created,
+                    counts.controls_confirmed,
+                    counts.controls_updated,
+                    counts.controls_removed
+                );
             }
+            println!();
         }
     }
 
@@ -482,13 +645,7 @@ pub async fn run(_args: StatsArgs) -> Result<()> {
     // ── Review backlog ────────────────────────────────────────────────
     let unconfirmed: Vec<&mati_core::store::Record> = gotchas
         .iter()
-        .filter(|r| {
-            r.payload
-                .as_ref()
-                .and_then(|p| p.get("confirmed"))
-                .and_then(|v| v.as_bool())
-                == Some(false)
-        })
+        .filter(|r| !gotcha_is_confirmed(r))
         .collect();
 
     if !unconfirmed.is_empty() {

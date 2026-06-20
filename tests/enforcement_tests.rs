@@ -1042,3 +1042,181 @@ async fn config_set_enforcement_mode_records_event() {
         "setting same mode should not record another event"
     );
 }
+
+// ─────────────────────────────────────────────
+// Derived metrics survive the real store round-trip
+// ─────────────────────────────────────────────
+
+/// Closes the gap unit tests can't: that `agent_session` recorded via the real
+/// write path persists through a `scan_events_since` round-trip, so
+/// `derive_enforcement_metrics` produces a NON-null `blocks_per_session` from
+/// genuinely stored events (not hand-built ones). Also exercises Deny→consult
+/// pairing against real `recorded_at_ms` stamping.
+#[tokio::test]
+async fn derived_metrics_from_real_store_roundtrip() {
+    use mati_core::store::enforcement::{
+        aggregate_event_counts, derive_enforcement_metrics, record_event_with_session,
+        scan_events_since,
+    };
+    use mati_core::store::session::CONSULTED_RECENT_TTL_SECS;
+
+    let (_dir, store) = temp_store().await;
+
+    // sessA is blocked on two files; sessB on one → 3 denials across 2 sessions.
+    let denials = [
+        ("file:src/a.rs", "sessA"),
+        ("file:src/b.rs", "sessA"),
+        ("file:src/c.rs", "sessB"),
+    ];
+    for (subject, session) in denials {
+        record_event_with_session(
+            &store,
+            EnforcementEventType::Deny,
+            SubjectKind::File,
+            subject.to_string(),
+            "claude".to_string(),
+            None,
+            "gotcha_above_threshold".to_string(),
+            None,
+            Some(session.to_string()),
+        )
+        .await
+        .expect("record sessioned deny");
+    }
+
+    // Consultation receipts (MCP path → no session id), recorded after the
+    // denials so each receipt timestamp is >= its subject's deny timestamp.
+    for subject in ["file:src/a.rs", "file:src/b.rs", "file:src/c.rs"] {
+        record_event_with_session(
+            &store,
+            EnforcementEventType::ReceiptMinted,
+            SubjectKind::File,
+            subject.to_string(),
+            "claude".to_string(),
+            None,
+            "consultation_requested".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("record receipt");
+    }
+
+    // Read back through the real scan path (the part pure unit tests skip).
+    let events = scan_events_since(&store, 0).await.expect("scan events");
+    let counts = aggregate_event_counts(&events);
+    let derived = derive_enforcement_metrics(&events);
+
+    // Counts survived the store round-trip.
+    assert_eq!(counts.denials, 3, "three denials recorded");
+    assert_eq!(counts.receipts_minted, 3, "three receipts recorded");
+
+    // THE GAP CLOSER: session ids persisted through write+scan, so
+    // blocks-per-session is attributable and non-null.
+    assert_eq!(derived.blocked_sessions, 2, "sessA + sessB");
+    assert_eq!(derived.attributed_denials, 3);
+    assert_eq!(
+        derived.blocks_per_session,
+        Some(1.5),
+        "3 denials / 2 sessions"
+    );
+
+    // Deny→consult pairs found via real recorded_at_ms; each delta within window.
+    assert_eq!(derived.consult_pairs, 3, "one consult pair per subject");
+    let median = derived
+        .median_time_to_consult_ms
+        .expect("median exists once pairs are found");
+    assert!(
+        median <= CONSULTED_RECENT_TTL_SECS * 1_000,
+        "real-time deltas must fall inside the consult window (got {median}ms)"
+    );
+}
+
+// ─────────────────────────────────────────────
+// `gotcha add` on an un-indexed file must still wire the read gate
+// ─────────────────────────────────────────────
+
+/// Regression: `mati gotcha add` (→ `apply_gotcha_write`) on a file that
+/// `init` never indexed must still wire the read gate. The gate (`hooks/decide.rs`)
+/// finds gotchas via the file record's denormalized `payload.gotcha_keys`. The
+/// create-on-write fix in `update_file_gotcha_key` persists a minimal layer-0
+/// file stub carrying the gotcha key when no file record exists, so the gotcha
+/// enforces immediately instead of staying inert until the next `mati init`.
+#[tokio::test]
+async fn gotcha_add_on_unindexed_file_wires_read_gate() {
+    use mati_core::store::gotcha_ops::apply_gotcha_write;
+    use mati_core::store::record::{
+        Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
+        RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    };
+
+    let (_dir, store) = temp_store().await;
+    let file = "src/never_indexed_by_init.rs";
+    let gkey = "gotcha:never-bypass-the-gate";
+
+    let gotcha = GotchaRecord {
+        rule: "Never bypass the gate".into(),
+        reason: "It is load-bearing".into(),
+        severity: Priority::Critical,
+        affected_files: vec![file.into()],
+        ref_url: None,
+        discovered_session: 1_000_000,
+        confirmed: true,
+    };
+    let record = Record {
+        key: gkey.into(),
+        value: "Never bypass the gate because it is load-bearing".into(),
+        payload: serde_json::to_value(&gotcha).ok(),
+        category: Category::Gotcha,
+        priority: Priority::Critical,
+        tags: vec![],
+        created_at: 1_000_000,
+        updated_at: 1_000_000,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: uuid::Uuid::new_v4(),
+            logical_clock: 1,
+            wall_clock: 1_000_000,
+        },
+        quality: QualityScore::developer_entry_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: RecordSource::DeveloperManual,
+        confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+        gap_analysis_score: 0.0,
+    };
+
+    // Exactly what `mati gotcha add <file>` does for a brand-new file.
+    apply_gotcha_write(&store, &record, &[], &[file.to_string()], true)
+        .await
+        .expect("write gotcha");
+
+    assert!(
+        store.get(gkey).await.expect("get gotcha").is_some(),
+        "gotcha record should exist"
+    );
+
+    // The fix: a file record is created carrying the gotcha key, so the read
+    // gate can see it. (Previously, no file record existed → gate inert.)
+    let file_record = store
+        .get(&format!("file:{file}"))
+        .await
+        .expect("get file record")
+        .expect("gotcha add must create a file record so the read gate fires");
+    let fr: FileRecord = file_record
+        .payload_as()
+        .expect("file record payload is a FileRecord");
+    assert!(
+        fr.gotcha_keys.contains(&gkey.to_string()),
+        "the created file record must carry the gotcha key in gotcha_keys (got {:?})",
+        fr.gotcha_keys
+    );
+    // The created record must be Active + Fresh so the gate proceeds to check
+    // gotchas rather than treating it as a stale/tombstoned passthrough.
+    assert!(matches!(
+        file_record.lifecycle,
+        mati_core::store::RecordLifecycle::Active
+    ));
+}
