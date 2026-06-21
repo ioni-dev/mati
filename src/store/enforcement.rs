@@ -1059,8 +1059,8 @@ async fn shared_writer(store: &Store) -> Result<Arc<tokio::sync::Mutex<Enforceme
 /// Record a single enforcement event through the store's serialized writer.
 ///
 /// All event writes funnel through one [`EnforcementEventWriter`] per store
-/// (see [`shared_writer`]), so the hash chain stays intact and seq numbers never
-/// collide under concurrency.
+/// (via the internal `shared_writer` registry), so the hash chain stays intact
+/// and seq numbers never collide under concurrency.
 ///
 /// Respects the enforcement mode: in advisory mode, write failures are
 /// logged but Ok(None) is returned. In strict mode, write failures propagate.
