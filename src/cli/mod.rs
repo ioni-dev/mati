@@ -23,4 +23,5 @@ pub mod stale;
 pub mod stats;
 pub mod status;
 pub mod supervisor;
+pub mod verify_chain;
 pub mod verify_evidence;
