@@ -1,8 +1,8 @@
 //! `mati verify-chain` — verify the integrity of the local enforcement audit chain.
 //!
 //! Recomputes every event's hash AND re-checks the `prev_hash` linkage using the
-//! same `mati_core::store::enforcement::verify_chain` primitive that backs the
-//! enterprise signed-report verifier. Local, read-only, zero-network. Routes
+//! shared `mati_core::store::enforcement::verify_chain` primitive — one source of
+//! truth for the frozen hash contract. Local, read-only, zero-network. Routes
 //! through the daemon when one is running (via `StoreProxy`), so it never needs
 //! exclusive store access.
 //!

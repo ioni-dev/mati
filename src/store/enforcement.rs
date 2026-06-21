@@ -414,9 +414,9 @@ impl ChainVerification {
 /// pruned prefix (the earliest surviving event's dangling `prev_hash`) is not
 /// reported as a break.
 ///
-/// Pure: no store access, no network, no mutation. The same primitive backs the
-/// OSS self-check and the enterprise signed-report verification, so the frozen
-/// hash contract has a single source of truth.
+/// Pure: no store access, no network, no mutation. A single shared primitive so
+/// every consumer verifies against one source of truth for the frozen hash
+/// contract.
 pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
     let mut sorted: Vec<&EnforcementEvent> = events.iter().collect();
     sorted.sort_by_key(|e| e.seq_no);
