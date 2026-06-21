@@ -14,7 +14,9 @@
 //!   Gaps in seq_no are acceptable (crash recovery) but hash chain breaks
 //!   indicate tampering or corruption.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -1009,11 +1011,56 @@ pub fn compute_decision_basis_hash(gotchas: &[(String, serde_json::Value)]) -> S
 // Standalone Event Recording
 // ─────────────────────────────────────────────
 
-/// Record a single enforcement event without requiring a long-lived writer.
+/// Process-global registry of per-store serialized enforcement writers.
 ///
-/// Creates a fresh writer on each call (loads seq + prev_hash from store).
-/// Correct for hash chain continuity. Slightly slower than using a shared
-/// writer (~2 extra reads), but avoids threading a writer through all paths.
+/// One long-lived [`EnforcementEventWriter`] per store (keyed by store root)
+/// serializes the whole `prev_hash`-capture → seq-allocation → event-write
+/// critical section. Without it, each `record_event` built a fresh writer that
+/// independently captured `prev_hash`/seq, so concurrent writers collided on a
+/// seq number (silently overwriting an already-recorded event) or shared a
+/// `prev_hash` (breaking the chain). Caching the head in memory also drops the
+/// O(N) `scan_keys` the per-call writer ran on every single event.
+///
+/// Cross-process correctness comes from SurrealKV's exclusive per-path lock:
+/// only one process can open (and thus write to) a store at a time, and each
+/// process loads the current head when it first writes.
+static ENFORCEMENT_WRITERS: OnceLock<
+    StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<EnforcementEventWriter>>>>,
+> = OnceLock::new();
+
+/// Get (or lazily create) the single serialized writer for `store`.
+async fn shared_writer(store: &Store) -> Result<Arc<tokio::sync::Mutex<EnforcementEventWriter>>> {
+    let registry = ENFORCEMENT_WRITERS.get_or_init(|| StdMutex::new(HashMap::new()));
+
+    // Fast path: a writer already exists for this store.
+    if let Some(writer) = registry
+        .lock()
+        .expect("enforcement writer registry poisoned")
+        .get(&store.root)
+        .cloned()
+    {
+        return Ok(writer);
+    }
+
+    // Slow path: build the writer (async I/O) OUTSIDE the registry lock, then
+    // insert. Double-checked — a concurrent caller may have inserted first, in
+    // which case we keep theirs and drop ours (both loaded the same head).
+    let writer = Arc::new(tokio::sync::Mutex::new(
+        EnforcementEventWriter::new(store).await?,
+    ));
+    Ok(registry
+        .lock()
+        .expect("enforcement writer registry poisoned")
+        .entry(store.root.clone())
+        .or_insert(writer)
+        .clone())
+}
+
+/// Record a single enforcement event through the store's serialized writer.
+///
+/// All event writes funnel through one [`EnforcementEventWriter`] per store
+/// (see [`shared_writer`]), so the hash chain stays intact and seq numbers never
+/// collide under concurrency.
 ///
 /// Respects the enforcement mode: in advisory mode, write failures are
 /// logged but Ok(None) is returned. In strict mode, write failures propagate.
@@ -1060,7 +1107,8 @@ pub async fn record_event_with_session(
     let mode = get_enforcement_mode(store).await;
 
     let result = async {
-        let mut writer = EnforcementEventWriter::new(store).await?;
+        let writer = shared_writer(store).await?;
+        let mut writer = writer.lock().await;
         writer.agent_session = agent_session;
         writer
             .write(
@@ -1176,8 +1224,12 @@ pub async fn detect_startup_gap(store: &Store, gap_threshold_ms: u64) -> Result<
     let age = current.saturating_sub(last.recorded_at_ms);
 
     if age > gap_threshold_ms {
-        let mut writer = EnforcementEventWriter::new(store).await?;
+        // Route through the shared writer so the cached chain head stays in sync
+        // with this RecordingGap write.
+        let writer = shared_writer(store).await?;
         writer
+            .lock()
+            .await
             .detect_and_record_gap(store, last.recorded_at_ms, current, GapCause::Unknown)
             .await?;
     }
@@ -1574,6 +1626,55 @@ mod tests {
         assert_eq!(b.kind, ChainBreakKind::Linkage);
         assert_eq!(b.seq_no, 3);
         assert_eq!(b.prev_seq_no, Some(1));
+    }
+
+    /// Regression: concurrent `record_event` calls must produce an intact,
+    /// collision-free chain. Before the per-store serialized writer, each call
+    /// built a fresh writer that independently captured `prev_hash`/seq, so racing
+    /// writers shared a `prev_hash` (linkage break) or collided on a seq (event
+    /// loss). Multi-threaded + 64 writers reliably exercises the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_record_event_keeps_chain_intact() {
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path()).await.unwrap());
+
+        let n: u64 = 64;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                record_event(
+                    &s,
+                    EnforcementEventType::Deny,
+                    SubjectKind::File,
+                    format!("file:src/f{i}.rs"),
+                    "claude".to_string(),
+                    None,
+                    "gotcha_above_threshold".to_string(),
+                    None,
+                )
+                .await
+                .expect("record_event")
+            }));
+        }
+        for h in handles {
+            h.await.expect("task join");
+        }
+
+        let events = scan_enforcement_events(&store, 0, u64::MAX).await.unwrap();
+        // No seq collisions → every concurrent write persisted as a distinct event.
+        assert_eq!(
+            events.len() as u64,
+            n,
+            "all {n} concurrent writes must persist (no seq collision / event loss)"
+        );
+        // No prev_hash races → the chain verifies intact.
+        let v = verify_chain(&events);
+        assert!(
+            v.is_valid(),
+            "concurrent writes must yield an intact chain, got {v:?}"
+        );
     }
 
     #[test]
