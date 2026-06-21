@@ -14,7 +14,9 @@
 //!   Gaps in seq_no are acceptable (crash recovery) but hash chain breaks
 //!   indicate tampering or corruption.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -323,6 +325,155 @@ impl EnforcementEvent {
         hasher.update(json.as_bytes());
         format!("{:x}", hasher.finalize())
     }
+}
+
+// ─────────────────────────────────────────────
+// Chain Verification (read-side integrity check)
+// ─────────────────────────────────────────────
+
+/// The kind of integrity failure a [`ChainBreak`] records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainBreakKind {
+    /// `prev_hash` does not match the predecessor's `event_hash`. Caused by a
+    /// deleted/inserted/re-pointed event — or, most commonly on a busy store, a
+    /// concurrent write that captured the same `prev_hash` (distinguishable by a
+    /// near-zero gap between the break and its predecessor; see [`ChainBreak`]).
+    Linkage,
+    /// The stored `event_hash` does not match a fresh `compute_hash()` — the
+    /// event body was altered after recording.
+    Tampered,
+    /// The event's `schema_version` is newer than this binary understands, so
+    /// its canonical form cannot be reproduced for verification.
+    UnknownSchema,
+}
+
+/// A single integrity failure located in the chain, with enough context to
+/// characterize it. For a `Linkage` break, a near-zero delta between
+/// `recorded_at_ms` and `prev_recorded_at_ms` indicates a concurrent write
+/// rather than tampering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainBreak {
+    pub kind: ChainBreakKind,
+    /// Seq number of the offending event.
+    pub seq_no: u64,
+    pub recorded_at_ms: u64,
+    pub event_type: String,
+    /// Predecessor context — populated for `Linkage` breaks only.
+    pub prev_seq_no: Option<u64>,
+    pub prev_recorded_at_ms: Option<u64>,
+    pub prev_event_type: Option<String>,
+}
+
+/// Result of verifying the integrity of an enforcement event chain.
+///
+/// Verification is a READ-SIDE check over already-recorded events: it never
+/// mutates the store and performs no network I/O. It is the inverse of the
+/// write-time hash contract — it recomputes each event's hash AND re-checks the
+/// `prev_hash` linkage, so it detects both:
+///
+/// - **content tampering** — an event whose body was altered after recording
+///   while its stored `event_hash` was left untouched (a linkage-only check
+///   misses this, because the stored hashes still chain together); and
+/// - **linkage breaks** — a deleted, inserted, or re-pointed event, where one
+///   event's `prev_hash` no longer matches its predecessor's `event_hash`.
+///
+/// A full from-genesis rewrite (every hash recomputed consistently) is *not*
+/// detectable here by design — that is the inherent limit of a local,
+/// externally-unanchored chain, and is addressed at the custody layer, not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainVerification {
+    /// Events whose hash was recomputed and compared (excludes unknown-schema).
+    pub checked: usize,
+    /// Events whose stored `event_hash` does not match a fresh `compute_hash()`
+    /// — i.e. the content was altered after recording.
+    pub tampered_events: usize,
+    /// Adjacent events where `prev_hash` does not match the predecessor's
+    /// `event_hash`. The earliest surviving event is never counted, so a
+    /// legitimately retention-pruned prefix is not a break.
+    pub linkage_breaks: usize,
+    /// Events with a `schema_version` newer than this binary understands. Their
+    /// canonical form cannot be reproduced, so they are reported, not verified.
+    pub unknown_schema: usize,
+    /// Every located break, in seq order. Empty when the chain is intact.
+    pub breaks: Vec<ChainBreak>,
+}
+
+impl ChainVerification {
+    /// True only when the chain is fully intact and fully verifiable: no content
+    /// tampering, no linkage breaks, and no events this binary cannot verify.
+    pub fn is_valid(&self) -> bool {
+        self.tampered_events == 0 && self.linkage_breaks == 0 && self.unknown_schema == 0
+    }
+}
+
+/// Verify the integrity of a set of enforcement events.
+///
+/// `events` may be in any order — they are sorted by `seq_no` for the linkage
+/// check. The linkage check compares only *consecutive present* events, so a
+/// pruned prefix (the earliest surviving event's dangling `prev_hash`) is not
+/// reported as a break.
+///
+/// Pure: no store access, no network, no mutation. A single shared primitive so
+/// every consumer verifies against one source of truth for the frozen hash
+/// contract.
+pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
+    let mut sorted: Vec<&EnforcementEvent> = events.iter().collect();
+    sorted.sort_by_key(|e| e.seq_no);
+
+    let mut result = ChainVerification::default();
+    let mut prev: Option<&EnforcementEvent> = None;
+
+    for e in sorted {
+        // Linkage uses the stored hashes, so it is schema-independent.
+        if let Some(p) = prev {
+            if e.prev_hash != p.event_hash {
+                result.linkage_breaks += 1;
+                result.breaks.push(ChainBreak {
+                    kind: ChainBreakKind::Linkage,
+                    seq_no: e.seq_no,
+                    recorded_at_ms: e.recorded_at_ms,
+                    event_type: event_type_label(&e.event_type).to_string(),
+                    prev_seq_no: Some(p.seq_no),
+                    prev_recorded_at_ms: Some(p.recorded_at_ms),
+                    prev_event_type: Some(event_type_label(&p.event_type).to_string()),
+                });
+            }
+        }
+
+        // Content integrity: only events whose schema this binary can
+        // canonicalize are recomputed; newer schemas are reported as unknown.
+        if e.schema_version > SCHEMA_VERSION {
+            result.unknown_schema += 1;
+            result.breaks.push(ChainBreak {
+                kind: ChainBreakKind::UnknownSchema,
+                seq_no: e.seq_no,
+                recorded_at_ms: e.recorded_at_ms,
+                event_type: event_type_label(&e.event_type).to_string(),
+                prev_seq_no: None,
+                prev_recorded_at_ms: None,
+                prev_event_type: None,
+            });
+        } else {
+            result.checked += 1;
+            if e.event_hash != e.compute_hash() {
+                result.tampered_events += 1;
+                result.breaks.push(ChainBreak {
+                    kind: ChainBreakKind::Tampered,
+                    seq_no: e.seq_no,
+                    recorded_at_ms: e.recorded_at_ms,
+                    event_type: event_type_label(&e.event_type).to_string(),
+                    prev_seq_no: None,
+                    prev_recorded_at_ms: None,
+                    prev_event_type: None,
+                });
+            }
+        }
+
+        prev = Some(e);
+    }
+
+    result
 }
 
 // ─────────────────────────────────────────────
@@ -860,11 +1011,56 @@ pub fn compute_decision_basis_hash(gotchas: &[(String, serde_json::Value)]) -> S
 // Standalone Event Recording
 // ─────────────────────────────────────────────
 
-/// Record a single enforcement event without requiring a long-lived writer.
+/// Process-global registry of per-store serialized enforcement writers.
 ///
-/// Creates a fresh writer on each call (loads seq + prev_hash from store).
-/// Correct for hash chain continuity. Slightly slower than using a shared
-/// writer (~2 extra reads), but avoids threading a writer through all paths.
+/// One long-lived [`EnforcementEventWriter`] per store (keyed by store root)
+/// serializes the whole `prev_hash`-capture → seq-allocation → event-write
+/// critical section. Without it, each `record_event` built a fresh writer that
+/// independently captured `prev_hash`/seq, so concurrent writers collided on a
+/// seq number (silently overwriting an already-recorded event) or shared a
+/// `prev_hash` (breaking the chain). Caching the head in memory also drops the
+/// O(N) `scan_keys` the per-call writer ran on every single event.
+///
+/// Cross-process correctness comes from SurrealKV's exclusive per-path lock:
+/// only one process can open (and thus write to) a store at a time, and each
+/// process loads the current head when it first writes.
+static ENFORCEMENT_WRITERS: OnceLock<
+    StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<EnforcementEventWriter>>>>,
+> = OnceLock::new();
+
+/// Get (or lazily create) the single serialized writer for `store`.
+async fn shared_writer(store: &Store) -> Result<Arc<tokio::sync::Mutex<EnforcementEventWriter>>> {
+    let registry = ENFORCEMENT_WRITERS.get_or_init(|| StdMutex::new(HashMap::new()));
+
+    // Fast path: a writer already exists for this store.
+    if let Some(writer) = registry
+        .lock()
+        .expect("enforcement writer registry poisoned")
+        .get(&store.root)
+        .cloned()
+    {
+        return Ok(writer);
+    }
+
+    // Slow path: build the writer (async I/O) OUTSIDE the registry lock, then
+    // insert. Double-checked — a concurrent caller may have inserted first, in
+    // which case we keep theirs and drop ours (both loaded the same head).
+    let writer = Arc::new(tokio::sync::Mutex::new(
+        EnforcementEventWriter::new(store).await?,
+    ));
+    Ok(registry
+        .lock()
+        .expect("enforcement writer registry poisoned")
+        .entry(store.root.clone())
+        .or_insert(writer)
+        .clone())
+}
+
+/// Record a single enforcement event through the store's serialized writer.
+///
+/// All event writes funnel through one [`EnforcementEventWriter`] per store
+/// (via the internal `shared_writer` registry), so the hash chain stays intact
+/// and seq numbers never collide under concurrency.
 ///
 /// Respects the enforcement mode: in advisory mode, write failures are
 /// logged but Ok(None) is returned. In strict mode, write failures propagate.
@@ -911,7 +1107,8 @@ pub async fn record_event_with_session(
     let mode = get_enforcement_mode(store).await;
 
     let result = async {
-        let mut writer = EnforcementEventWriter::new(store).await?;
+        let writer = shared_writer(store).await?;
+        let mut writer = writer.lock().await;
         writer.agent_session = agent_session;
         writer
             .write(
@@ -1027,8 +1224,12 @@ pub async fn detect_startup_gap(store: &Store, gap_threshold_ms: u64) -> Result<
     let age = current.saturating_sub(last.recorded_at_ms);
 
     if age > gap_threshold_ms {
-        let mut writer = EnforcementEventWriter::new(store).await?;
+        // Route through the shared writer so the cached chain head stays in sync
+        // with this RecordingGap write.
+        let writer = shared_writer(store).await?;
         writer
+            .lock()
+            .await
             .detect_and_record_gap(store, last.recorded_at_ms, current, GapCause::Unknown)
             .await?;
     }
@@ -1301,6 +1502,179 @@ mod tests {
             event_type,
             ..frozen_test_event()
         }
+    }
+
+    /// Build a valid, hash-linked chain of `n` events (seq 1..=n).
+    fn chained(n: u64) -> Vec<EnforcementEvent> {
+        let mut out = Vec::new();
+        let mut prev = String::new();
+        for i in 1..=n {
+            let mut e = EnforcementEvent {
+                seq_no: i,
+                prev_hash: prev.clone(),
+                event_hash: String::new(),
+                ..frozen_test_event()
+            };
+            e.event_hash = e.compute_hash();
+            prev = e.event_hash.clone();
+            out.push(e);
+        }
+        out
+    }
+
+    #[test]
+    fn verify_chain_accepts_intact_chain() {
+        let events = chained(4);
+        let v = verify_chain(&events);
+        assert!(v.is_valid());
+        assert_eq!(v.checked, 4);
+        assert_eq!(v.tampered_events, 0);
+        assert_eq!(v.linkage_breaks, 0);
+        assert_eq!(v.unknown_schema, 0);
+    }
+
+    #[test]
+    fn verify_chain_is_order_independent() {
+        let mut events = chained(4);
+        events.reverse();
+        assert!(verify_chain(&events).is_valid());
+    }
+
+    #[test]
+    fn verify_chain_detects_content_tamper_without_rehash() {
+        // The exact attack the linkage-only verifier missed: alter the body but
+        // leave the stored event_hash untouched, so the chain still links.
+        let mut events = chained(3);
+        events[1].subject_key = "file:src/evil.rs".to_string();
+        let v = verify_chain(&events);
+        assert_eq!(v.tampered_events, 1);
+        assert_eq!(v.linkage_breaks, 0);
+        assert!(!v.is_valid());
+    }
+
+    #[test]
+    fn verify_chain_detects_linkage_break_from_deleted_event() {
+        let mut events = chained(3);
+        events.remove(1); // drop the middle event (seq 2)
+        let v = verify_chain(&events);
+        assert_eq!(v.linkage_breaks, 1);
+        assert_eq!(v.tampered_events, 0);
+        assert!(!v.is_valid());
+    }
+
+    #[test]
+    fn verify_chain_ignores_retention_pruned_prefix() {
+        let mut events = chained(3);
+        events.remove(0); // prune the earliest event (seq 1)
+        let v = verify_chain(&events);
+        assert!(
+            v.is_valid(),
+            "pruned prefix must not be a false linkage break"
+        );
+        assert_eq!(v.linkage_breaks, 0);
+        assert_eq!(v.tampered_events, 0);
+    }
+
+    #[test]
+    fn verify_chain_flags_unknown_schema_version() {
+        let mut e = frozen_test_event();
+        e.schema_version = SCHEMA_VERSION + 1;
+        e.event_hash = e.compute_hash();
+        let v = verify_chain(&[e]);
+        assert_eq!(v.unknown_schema, 1);
+        assert_eq!(v.checked, 0);
+        assert!(!v.is_valid());
+    }
+
+    #[test]
+    fn verify_chain_verifies_v2_events_clean() {
+        let mut e = frozen_test_event();
+        e.schema_version = 2;
+        e.agent_session = Some("session-xyz".to_string());
+        e.event_hash = e.compute_hash();
+        let v = verify_chain(&[e]);
+        assert!(v.is_valid());
+        assert_eq!(v.checked, 1);
+    }
+
+    #[test]
+    fn verify_chain_empty_is_valid() {
+        let v = verify_chain(&[]);
+        assert!(v.is_valid());
+        assert_eq!(v.checked, 0);
+    }
+
+    #[test]
+    fn verify_chain_records_tampered_break_location() {
+        let mut events = chained(3);
+        events[2].subject_key = "file:src/evil.rs".to_string();
+        let v = verify_chain(&events);
+        assert_eq!(v.breaks.len(), 1);
+        let b = &v.breaks[0];
+        assert_eq!(b.kind, ChainBreakKind::Tampered);
+        assert_eq!(b.seq_no, 3);
+        assert!(b.prev_seq_no.is_none());
+    }
+
+    #[test]
+    fn verify_chain_records_linkage_break_with_predecessor() {
+        let mut events = chained(3);
+        events.remove(1); // delete seq 2; seq 3 now directly follows seq 1
+        let v = verify_chain(&events);
+        assert_eq!(v.breaks.len(), 1);
+        let b = &v.breaks[0];
+        assert_eq!(b.kind, ChainBreakKind::Linkage);
+        assert_eq!(b.seq_no, 3);
+        assert_eq!(b.prev_seq_no, Some(1));
+    }
+
+    /// Regression: concurrent `record_event` calls must produce an intact,
+    /// collision-free chain. Before the per-store serialized writer, each call
+    /// built a fresh writer that independently captured `prev_hash`/seq, so racing
+    /// writers shared a `prev_hash` (linkage break) or collided on a seq (event
+    /// loss). Multi-threaded + 64 writers reliably exercises the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_record_event_keeps_chain_intact() {
+        use std::sync::Arc;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path()).await.unwrap());
+
+        let n: u64 = 64;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                record_event(
+                    &s,
+                    EnforcementEventType::Deny,
+                    SubjectKind::File,
+                    format!("file:src/f{i}.rs"),
+                    "claude".to_string(),
+                    None,
+                    "gotcha_above_threshold".to_string(),
+                    None,
+                )
+                .await
+                .expect("record_event")
+            }));
+        }
+        for h in handles {
+            h.await.expect("task join");
+        }
+
+        let events = scan_enforcement_events(&store, 0, u64::MAX).await.unwrap();
+        // No seq collisions → every concurrent write persisted as a distinct event.
+        assert_eq!(
+            events.len() as u64,
+            n,
+            "all {n} concurrent writes must persist (no seq collision / event loss)"
+        );
+        // No prev_hash races → the chain verifies intact.
+        let v = verify_chain(&events);
+        assert!(
+            v.is_valid(),
+            "concurrent writes must yield an intact chain, got {v:?}"
+        );
     }
 
     #[test]

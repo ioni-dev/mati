@@ -93,6 +93,10 @@ enum Commands {
     Check,
     /// \[Maintenance\] Diagnostic health report — daemon, integrity, lifecycle
     Doctor(cli::doctor::DoctorArgs),
+    /// \[Maintenance\] Verify the enforcement audit chain — recompute every
+    /// event hash and check the prev_hash linkage. Exits non-zero on any break.
+    #[command(name = "verify-chain")]
+    VerifyChain(cli::verify_chain::VerifyChainArgs),
     /// \[Maintenance\] List records by quality tier
     QualityCheck,
     /// \[Maintenance\] Re-open a record for improvement
@@ -289,6 +293,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Repair(args) => cli::repair::run(args).await,
         Commands::Check => cli::check::run().await,
         Commands::Doctor(args) => cli::doctor::run(args).await,
+        Commands::VerifyChain(args) => cli::verify_chain::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Sandbox(args) => cli::sandbox::run(args).await,
         Commands::Daemon(args) => match args.command {
