@@ -99,6 +99,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // resolve against the hook process cwd, which is the repo root when set by
     // Claude Code / Codex. If the platform changes cwd semantics, relative paths
     // may need a tool_input.workdir field to resolve correctly.
+    //
+    // `rel_path` is the LEXICAL key — the primary gate. When it finds no
+    // gotcha, the canonical-key fallback below (WI-20) re-evaluates the
+    // symlink's real target so the gate still fires.
     let rel_path = decide::normalize_path(&raw_path, repo_root_str);
 
     // 4. Resolve mati root (for daemon socket). Use repo_root for consistent slug.
@@ -153,7 +157,58 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     };
 
     // 8–11. Process eval response through the adapter pipeline.
-    let adapter = process_eval_response(args.variant, &rel_path, &eval_data);
+    let mut adapter = process_eval_response(args.variant, &rel_path, &eval_data);
+
+    // Fail-open telemetry for store/gotcha errors on the LEXICAL evaluation.
+    // This describes the lexical lookup that just ran; the canonical fallback
+    // below has its own per-lookup error handling (a failed canonical
+    // hook_evaluate simply leaves the lexical decision intact).
+    let lexical_fail_open = match check_eval_data(args.variant, &rel_path, &eval_data) {
+        EvalDataCheck::FailOpen(reason) => Some(reason),
+        EvalDataCheck::Ok(_) => None,
+    };
+
+    // WI-20: canonical-key fallback (symlink-bypass close).
+    //
+    // The lexical key (`file:<rel_path>`) is the primary gate and is evaluated
+    // first, above — never weakened. ONLY when the lexical gate did NOT deny do
+    // we resolve the symlink: a symlink to a gotcha'd file has a different
+    // lexical key, so the lexical gate misses it. We canonicalize the accessed
+    // path (resolving symlinks), strip the canonicalized repo_root, and evaluate
+    // that target's key too. If the real target carries an unconsulted confirmed
+    // gotcha, the gate fires on it. Fully defensive: any failure (no repo root,
+    // canonicalize error, target outside the repo, identical key) leaves the
+    // lexical-only decision untouched. Perf: one extra realpath + one daemon
+    // round-trip, and only on the non-deny path, so the common case is zero-cost.
+    if !matches!(adapter.decision, Decision::Deny { .. }) {
+        if let Some(canon_rel) =
+            canonical_rel_path(&raw_path, &cwd, repo_root.as_deref(), &rel_path)
+        {
+            let canon_key = format!("file:{canon_rel}");
+            if let DaemonResult::Ok(resp) = daemon_result(
+                &mati_root,
+                "hook_evaluate",
+                serde_json::json!({
+                    "file_key": &canon_key,
+                    "include_recent": include_recent,
+                }),
+            )
+            .await
+            {
+                let canon_eval = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                let canon_adapter = process_eval_response(args.variant, &canon_rel, &canon_eval);
+                // Only ESCALATE: adopt the canonical result solely when it denies.
+                // A non-deny canonical outcome never downgrades the lexical
+                // decision (e.g. a lexical Advisory must survive). The canonical
+                // adapter is self-contained — its deny reason and audit events
+                // already key on `canon_rel` (the real target) — so swapping the
+                // adapter alone re-points output + events at the resolved file.
+                if matches!(canon_adapter.decision, Decision::Deny { .. }) {
+                    adapter = canon_adapter;
+                }
+            }
+        }
+    }
 
     // Fire events (non-blocking).
     // session_id (Claude Code provides it at the top level of the hook input)
@@ -161,8 +216,8 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     let session_id = input.get("session_id").and_then(|v| v.as_str());
     fire_events(&mati_root, &adapter.events, session_id).await;
 
-    // Fail-open telemetry for store/gotcha errors.
-    if let EvalDataCheck::FailOpen(reason) = check_eval_data(args.variant, &rel_path, &eval_data) {
+    // Emit the lexical fail-open telemetry captured before the fallback.
+    if let Some(reason) = lexical_fail_open {
         log_fail_open(&rel_path, &reason);
     }
 
@@ -233,6 +288,66 @@ fn discover_repo_root(cwd: &Path) -> Option<PathBuf> {
             PathBuf::from(trimmed)
         })
     })
+}
+
+/// WI-20: compute the CANONICAL repo-relative key for the symlink-bypass
+/// fallback, or `None` if the canonical resolution can't be trusted.
+///
+/// Returns `Some(canonical_rel)` ONLY when, after resolving symlinks on the
+/// accessed path, both hold:
+///
+///   - the canonical target lands UNDER the canonical repo root, AND
+///   - the canonical key DIFFERS from the lexical key (`lexical_rel`).
+///
+/// Otherwise returns `None`, leaving the lexical-only decision intact. This is
+/// the additive half of the gate: it never weakens the lexical lookup — the
+/// caller only consults it when the lexical gate did not already deny.
+///
+/// Defensive by construction: a missing repo root, a `canonicalize` failure, a
+/// target resolving outside the repo, or a no-op (same key) all yield `None`.
+/// Reuses [`super::sandbox::canonicalize_lenient`] so symlink resolution matches
+/// the L3 sandbox floor exactly (canonicalize; on a non-existent leaf,
+/// canonicalize the parent and re-append the leaf).
+fn canonical_rel_path(
+    raw_path: &str,
+    cwd: &Path,
+    repo_root: Option<&Path>,
+    lexical_rel: &str,
+) -> Option<String> {
+    // No repo root → we can't strip a prefix to form a repo-relative key.
+    let repo_root = repo_root?;
+
+    // Resolve the repo root itself through symlinks so the `starts_with`
+    // containment check below is sound (e.g. macOS `/var` → `/private/var`).
+    let canon_root = super::sandbox::canonicalize_lenient(repo_root)?;
+
+    // Build the ABSOLUTE accessed path. A relative shell arg (`cat foo.rs`)
+    // resolves against the hook process cwd (the repo root under Claude/Codex).
+    let raw = Path::new(raw_path);
+    let abs_access = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    };
+
+    // Resolve symlinks on the accessed path (this is the whole point: a symlink
+    // to a gotcha'd file canonicalizes to the real target).
+    let canon_access = super::sandbox::canonicalize_lenient(&abs_access)?;
+
+    // Containment: the canonical target must be inside the repo. Out-of-repo
+    // targets can't match a store key and must never deny — fall back to lexical.
+    let stripped = canon_access.strip_prefix(&canon_root).ok()?;
+    let stripped_str = stripped.to_str()?;
+
+    // Normalize to the same lexical key shape used at registration / lookup.
+    let canon_rel = decide::normalize_path(stripped_str, None);
+
+    // Zero-cost no-op: if the canonical key equals the lexical one (no symlink
+    // involved), skip the redundant second daemon round-trip.
+    if canon_rel == lexical_rel {
+        return None;
+    }
+    Some(canon_rel)
 }
 
 // ── Daemon readiness ────────────────────────────────────────────────────────
@@ -1459,5 +1574,120 @@ mod tests {
         assert_eq!(result.exit_code, 0, "store error must fail open (defer)");
         assert!(result.stdout.is_empty());
         assert_eq!(result.decision, Decision::Allow);
+    }
+
+    // ── canonical_rel_path (WI-20 symlink-bypass fallback) ──────────────────
+    //
+    // These exercise the canonical-key resolver directly against a real
+    // filesystem (tempdir + real symlinks). The full deny-through-symlink
+    // enforcement is proven end-to-end in `tests/hook_decide_integration.rs`.
+
+    // Unix-only: these create real symlinks via `std::os::unix::fs::symlink`.
+    // The CI test matrix is Unix-only (ubuntu + macos); gating at the function
+    // level keeps them honest if a Windows runner is ever added, matching the
+    // integration test's `#[cfg(unix)]`.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_rel_resolves_symlink_to_real_target_key() {
+        // A symlink to a real in-repo file must canonicalize to the REAL
+        // target's repo-relative key — this is the bypass-closing resolution.
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/real.rs"), "fn x() {}\n").unwrap();
+        // link.rs (at repo root) → src/real.rs
+        std::os::unix::fs::symlink(root.join("src/real.rs"), root.join("link.rs")).unwrap();
+
+        // Accessed via the symlink. Lexical key would be "link.rs"; canonical
+        // must resolve to "src/real.rs".
+        let got = canonical_rel_path(
+            root.join("link.rs").to_str().unwrap(),
+            root,
+            Some(root),
+            "link.rs",
+        );
+        assert_eq!(got.as_deref(), Some("src/real.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_rel_relative_access_resolves_against_cwd() {
+        // A bare relative shell arg (`cat link.rs`) resolves against cwd (the
+        // repo root) before canonicalization.
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/real.rs"), "fn x() {}\n").unwrap();
+        std::os::unix::fs::symlink(root.join("src/real.rs"), root.join("link.rs")).unwrap();
+
+        let got = canonical_rel_path("link.rs", root, Some(root), "link.rs");
+        assert_eq!(got.as_deref(), Some("src/real.rs"));
+    }
+
+    #[test]
+    fn canonical_rel_non_symlink_is_noop() {
+        // A plain (non-symlink) in-repo file canonicalizes back to its own
+        // lexical key — the helper returns None so we skip the redundant
+        // second daemon round-trip (zero-cost common path).
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/real.rs"), "fn x() {}\n").unwrap();
+
+        let got = canonical_rel_path(
+            root.join("src/real.rs").to_str().unwrap(),
+            root,
+            Some(root),
+            "src/real.rs",
+        );
+        assert_eq!(got, None, "non-symlink access must not trigger a fallback");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_rel_outside_repo_is_none() {
+        // A symlink pointing OUTSIDE the repo must NOT yield a key — it can't
+        // match a store record and must never deny. Falls back to lexical-only.
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let outside = tempfile::TempDir::new().expect("tempdir");
+        let root = repo.path();
+        std::fs::write(outside.path().join("secret.rs"), "fn x() {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.rs"), root.join("escape.rs"))
+            .unwrap();
+
+        let got = canonical_rel_path(
+            root.join("escape.rs").to_str().unwrap(),
+            root,
+            Some(root),
+            "escape.rs",
+        );
+        assert_eq!(got, None, "out-of-repo symlink target must yield no key");
+    }
+
+    #[test]
+    fn canonical_rel_no_repo_root_is_none() {
+        // Without a repo root we can't form a repo-relative key — fall back to
+        // lexical-only (never crash).
+        let got = canonical_rel_path("/some/abs/path.rs", Path::new("/tmp"), None, "path.rs");
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn canonical_rel_nonexistent_leaf_under_real_dir() {
+        // canonicalize_lenient tolerates a missing leaf: a not-yet-created file
+        // under a real (possibly symlinked) directory still yields its key.
+        let repo = tempfile::TempDir::new().expect("tempdir");
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        // No symlink, leaf does not exist → canonicalizes to its own lexical
+        // key → no-op (None).
+        let got = canonical_rel_path(
+            root.join("src/ghost.rs").to_str().unwrap(),
+            root,
+            Some(root),
+            "src/ghost.rs",
+        );
+        assert_eq!(got, None);
     }
 }

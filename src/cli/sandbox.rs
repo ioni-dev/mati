@@ -164,7 +164,11 @@ fn resolve_under_repo(repo_root: &Path, rel: &str) -> Option<PathBuf> {
 /// longest existing ancestor (resolving symlinks), then re-append the missing
 /// tail. So a file not yet created — or one under a symlinked parent — still
 /// yields the canonical path Seatbelt will match.
-fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+///
+/// Shared with `cli::hook_decide`'s canonical-key enforcement fallback (WI-20):
+/// the read/edit gate resolves a symlinked access path through this same helper
+/// so a symlink to a gotcha'd file resolves to the real target's lexical key.
+pub(super) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     if let Ok(c) = std::fs::canonicalize(path) {
         return Some(c);
     }

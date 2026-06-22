@@ -386,3 +386,172 @@ fn hook_decide_deny_then_allow_after_consultation() {
     // repo_dir and home_dir drop here -> temp directories cleaned up.
     eprintln!("[hook-decide] all assertions passed");
 }
+
+/// WI-20 symlink-bypass closure (end-to-end).
+///
+/// Proves the canonical-key enforcement fallback closes the symlink bypass:
+///
+///   1. A confirmed gotcha on the REAL file `src/test.rs`, accessed via a
+///      SYMLINK `link.rs` → `src/test.rs`, DENIES (exit 2). Before WI-20 the
+///      symlink's distinct lexical key (`file:link.rs`) had no gotcha, so the
+///      gate was bypassed. The canonical fallback resolves the symlink to the
+///      real target's key and the gate fires.
+///   2. A symlink to a NON-gotcha'd file (`safe_link.rs` → `src/safe.rs`)
+///      ALLOWS (exit 0) — no false positive.
+///   3. Direct (non-symlink) access of the gotcha'd file still DENIES (exit 2),
+///      proving the lexical gate is unchanged.
+///
+/// Unix-only: relies on `std::os::unix::fs::symlink`.
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn hook_decide_denies_gotcha_through_symlink() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    // A second, non-gotcha'd source file for the no-false-positive case.
+    std::fs::write(repo.join("src/safe.rs"), "pub fn ok() -> bool { true }\n")
+        .expect("write safe.rs");
+
+    // Symlinks (created before `mati init` so they're part of the tree):
+    //   link.rs      → src/test.rs  (the gotcha'd file)
+    //   safe_link.rs → src/safe.rs  (no gotcha)
+    std::os::unix::fs::symlink(repo.join("src/test.rs"), repo.join("link.rs"))
+        .expect("symlink link.rs");
+    std::os::unix::fs::symlink(repo.join("src/safe.rs"), repo.join("safe_link.rs"))
+        .expect("symlink safe_link.rs");
+
+    // ── Init store ──────────────────────────────────────────────────────────
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+    let r = run(&bin, repo, home, &["ping"]);
+    assert_eq!(r.code, 0, "ping after init failed");
+
+    // ── Confirmed gotcha on the REAL file ───────────────────────────────────
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "gotcha",
+            "add",
+            "src/test.rs",
+            "-r",
+            "Never bypass auth token validation",
+            "-m",
+            "Skipping validation allows unauthorized access to protected endpoints",
+        ],
+    );
+    assert_eq!(
+        r.code, 0,
+        "mati gotcha add failed:\n{}\n{}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stdout.contains("Created gotcha:"),
+        "expected 'Created gotcha:', got: {}",
+        r.stdout
+    );
+    let r = run(&bin, repo, home, &["ping"]);
+    assert_eq!(r.code, 0, "ping after gotcha add failed");
+
+    // ── Daemon ──────────────────────────────────────────────────────────────
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable within 5 seconds",
+    );
+
+    // ── 1. cat THROUGH THE SYMLINK must DENY (the bypass is closed) ──────────
+    let r = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "codex-pre-bash"],
+        r#"{"tool_input":{"command":"cat link.rs"}}"#,
+    );
+    assert_eq!(
+        r.code, 2,
+        "symlink to a gotcha'd file must DENY (exit 2) — the bypass must be closed.\n\
+         stdout: {}\nstderr: {}",
+        r.stdout, r.stderr,
+    );
+    assert!(
+        r.stderr.contains("mem_get"),
+        "deny stderr should instruct mem_get.\nstderr: {}",
+        r.stderr,
+    );
+    eprintln!("[wi20] cat through symlink: exit 2 (deny) -- bypass closed");
+
+    // ── 2. cat a symlink to a NON-gotcha'd file must ALLOW (no false +) ──────
+    let r = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "codex-pre-bash"],
+        r#"{"tool_input":{"command":"cat safe_link.rs"}}"#,
+    );
+    assert_eq!(
+        r.code, 0,
+        "symlink to a non-gotcha'd file must ALLOW (exit 0) — no false positive.\n\
+         stdout: {}\nstderr: {}",
+        r.stdout, r.stderr,
+    );
+    eprintln!("[wi20] cat safe symlink: exit 0 (allow) -- no false positive");
+
+    // ── 3. Direct (non-symlink) access still DENIES (lexical gate intact) ────
+    let r = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "codex-pre-bash"],
+        r#"{"tool_input":{"command":"cat src/test.rs"}}"#,
+    );
+    assert_eq!(
+        r.code, 2,
+        "direct access of the gotcha'd file must still DENY (exit 2).\n\
+         stdout: {}\nstderr: {}",
+        r.stdout, r.stderr,
+    );
+    eprintln!("[wi20] direct cat: exit 2 (deny) -- lexical gate unchanged");
+
+    // ── 4. Claude pre-read THROUGH the symlink: JSON deny, exit 0 ───────────
+    // Claude communicates deny via JSON (permissionDecision=deny), exit 0.
+    let r = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-read"],
+        // Absolute symlink path, as Claude Code passes file_path.
+        &format!(
+            r#"{{"tool_input":{{"file_path":"{}"}}}}"#,
+            repo.join("link.rs").display()
+        ),
+    );
+    assert_eq!(r.code, 0, "claude-pre-read always exits 0");
+    let response: serde_json::Value = serde_json::from_str(r.stdout.trim())
+        .unwrap_or_else(|e| panic!("claude-pre-read stdout not JSON: {e}\n{}", r.stdout));
+    let permission = response
+        .pointer("/hookSpecificOutput/permissionDecision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        permission, "deny",
+        "claude-pre-read through a symlink to a gotcha'd file must deny.\nJSON: {}",
+        r.stdout,
+    );
+    eprintln!("[wi20] claude-pre-read through symlink: deny -- correct");
+
+    eprintln!("[wi20] all symlink-bypass assertions passed");
+}

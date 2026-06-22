@@ -310,7 +310,7 @@ graph:edge:<from>:<kind>:<to>
 enforcement:event:<seq_no>
 ```
 
-`file:<path>` uses repo-relative paths, normalized lexically. It does not resolve symlinks. On case-insensitive filesystems, case-folding is applied.
+`file:<path>` uses repo-relative paths, normalized lexically. The store key itself does not resolve symlinks; on case-insensitive filesystems, case-folding is applied. Enforcement adds a canonical-key fallback (§24) so a read or edit routed through an in-repo symlink to a gotcha'd file still trips the gate.
 
 ---
 
@@ -895,6 +895,10 @@ Peer credentials are checked through `SO_PEERCRED` on Linux and `LOCAL_PEERCRED`
 **C9: bash `cat` bypass, around 2-5% miss rate.**
 
 `pre-bash.sh` catches `cat <file>`, but not every variant. Variable expansion (`cat "$FILE"`), process substitution, piped input, and unusual quoting are not caught. This is known and accepted. The compliance monitor tracks and reports it. Do not chase 100% coverage here; the false positives are not worth the marginal gain.
+
+**In-repo symlink access resolves to the real target for enforcement (WI-20).**
+
+A gotcha is keyed by the lexical repo-relative path, so an agent could route around the gate by reading or editing a gotcha'd file through a symlink whose key differs. The read/edit decision path adds an escalate-only canonical-key fallback: when the lexical gate does not deny, it resolves the accessed path through symlinks (shared with the L3 sandbox's `canonicalize_lenient`), strips the canonicalized repo root, and evaluates the real target's key too — adopting that result only when it denies. It is fully fail-open (no repo root, a `canonicalize` failure, an out-of-repo target, or an identical key all leave the lexical decision intact) and costs one extra `realpath` plus one daemon round-trip, only on the non-deny path. This closes the in-repo symlink bypass at the hook level (L1). It does not change the lexical store key. Hardlink aliases (which `canonicalize` does not resolve) and out-of-tree targets remain out of scope for the hook tier; the L3 OS floor (`mati sandbox`) is what denies crown-jewel files across the shell and its subprocesses.
 
 **petgraph is in-memory only.**
 
