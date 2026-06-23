@@ -191,7 +191,7 @@ mati is the complete product for a solo developer, and all of it is free. From t
 
 - Signed audit PDF export (cryptographically signed, tamper-evident)
 - Enforcement reports tied to license state
-- Extended retention controls
+- Extended retention controls _(in development)_
 
 Also Enterprise-only, and not in this repo: multi-repo sync and a cross-repo gotcha registry; SSO, SAML, OIDC, RBAC; managed Slack / Teams / PagerDuty integration; compliance packs for HIPAA, SOC 2, and PCI; and a centralized governance dashboard.
 
