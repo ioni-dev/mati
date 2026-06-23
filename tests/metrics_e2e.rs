@@ -42,6 +42,12 @@ impl Drop for ChildGuard {
     }
 }
 
+// CI-QUARANTINED (WI-21): this races deterministically on the CI runners —
+// `mati doctor --internal --json` is queried before the daemon's metrics
+// snapshot is initialized, so `version` comes back `None`. Excluded from the
+// gating "Ignored integration tests" job via `-E` in ci.yml until the test
+// waits for metrics readiness before snapshotting. Still runs (and passes)
+// locally.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn metrics_snapshot_reflects_dispatch_traffic() {
