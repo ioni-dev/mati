@@ -1,9 +1,10 @@
 //! `mati doctor` — diagnostic health aggregator for support and CI.
 //!
-//! Fans out to: daemon reachability, dirty-marker presence, drift check,
-//! and recent lifecycle events. Exits 0 if everything is healthy; non-zero
-//! if any check is in a fail state. Intended as the "paste this output"
-//! command for support requests and as a CI gate for repository health.
+//! Fans out to: enforcement wiring (reused from `mati check`), daemon
+//! reachability, dirty-marker presence, drift check, and recent lifecycle
+//! events. Exits 0 if everything is healthy; non-zero if any check is in a
+//! fail state. Intended as the "paste this output" command for support
+//! requests and as a CI gate for repository health.
 //!
 //! Drift checks require direct store access. When the daemon holds the
 //! exclusive lock, those checks report "skipped" rather than failing —
@@ -20,6 +21,7 @@ use serde::Serialize;
 use mati_core::store::repair::{check_gotcha_indexes, is_dirty, read_dirty_marker};
 use mati_core::store::Store;
 
+use super::check::{self, CheckItem, CheckStatus};
 use super::daemon::{daemon_result, mati_root_for, DaemonResult};
 
 /// Doctor command arguments.
@@ -278,6 +280,16 @@ struct Summary {
 async fn collect(cwd: &Path, root: &Path) -> Report {
     let mut checks: Vec<CheckResult> = Vec::new();
 
+    // Enforcement wiring — fold in `mati check`'s pipeline probes so `mati
+    // doctor` answers the #1 silent-failure question: "is enforcement actually
+    // wired into the agent?" (hook scripts present + executable, settings.json
+    // registers them + the mati MCP server, mati on PATH, awk float math).
+    // These are side-effect-free and never touch the store, so they remain
+    // available even when the daemon holds the store lock (unlike the integrity
+    // checks below). `enforcement_results` drops check's own `store` and
+    // `daemon` items — doctor already reports those in its own sections.
+    checks.extend(enforcement_results(check::run_silent(cwd).await));
+
     // Daemon ping.
     let daemon_state = daemon_result(root, "ping", serde_json::json!({})).await;
     match &daemon_state {
@@ -317,7 +329,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // `integrity` checks — `dirty_marker` followed by `drift` — in that
     // order, regardless of whether the daemon holds the lock, the store
     // is uninitialized, or `Store::open` failed. Consumers parsing
-    // `mati doctor --json` rely on `version: 1` meaning the same set of
+    // `mati doctor --json` rely on `version: 2` meaning the same set of
     // check names appears in the same order across all scenarios, so
     // `.checks[]` indices and a name-keyed lookup both stay stable.
     //
@@ -510,13 +522,68 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     }
 
     Report {
-        version: 1,
+        version: 2,
         root: root.display().to_string(),
         checks,
         lifecycle,
         summary,
         extraction,
     }
+}
+
+/// Map `mati check`'s enforcement-pipeline probes into doctor `CheckResult`s.
+///
+/// Drops the `store` and `daemon` items — doctor already reports those via its
+/// own `integrity` and `daemon` sections, so folding them in would duplicate
+/// rows. The remaining probes (git repo, mati-on-PATH, awk float math, hook
+/// scripts, settings.json wiring) answer the question doctor couldn't before:
+/// "is enforcement actually wired into the agent?" None of them open the store,
+/// so they stay available even when the daemon holds the lock. Names are
+/// normalized to snake_case to match doctor's existing convention (`ping`,
+/// `dirty_marker`, `drift`).
+fn enforcement_results(items: Vec<CheckItem>) -> Vec<CheckResult> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let name: &'static str = match item.label {
+                "git repo" => "git_repo",
+                "mati in PATH" => "mati_on_path",
+                "awk float math" => "awk_float_math",
+                "hooks" => "hooks",
+                "settings.json" => "settings_json",
+                // `store` and `daemon` are already covered by doctor's own
+                // integrity/daemon sections — skip to avoid duplicate rows.
+                _ => return None,
+            };
+            let (status, detail) = match item.status {
+                CheckStatus::Pass(extra) => {
+                    (Status::Pass, extra.unwrap_or_else(|| "ok".to_string()))
+                }
+                CheckStatus::Warn(msg) => (Status::Warn, msg),
+                CheckStatus::Fail(msg) => (Status::Fail, msg),
+            };
+            // `detail` already carries the specifics (e.g. "missing:
+            // pre-read.sh"); `fix` is a static, name-keyed one-liner.
+            let fix = if matches!(status, Status::Pass) {
+                None
+            } else {
+                Some(match name {
+                    "git_repo" => "run mati from inside a git repository",
+                    "mati_on_path" => "ensure the mati binary is on PATH",
+                    "awk_float_math" => "install awk/gawk and ensure it is on PATH",
+                    // hooks + settings.json are both regenerated by init
+                    _ => "mati init",
+                })
+            };
+            Some(CheckResult {
+                section: "enforcement",
+                name,
+                status,
+                detail,
+                fix,
+            })
+        })
+        .collect()
 }
 
 /// Read all `analytics:extraction:*` records via StoreProxy and aggregate.
@@ -593,6 +660,7 @@ fn render_human(report: &Report, use_color: bool) {
                 println!();
             }
             let title = match c.section {
+                "enforcement" => "Enforcement",
                 "daemon" => "Daemon",
                 "integrity" => "Integrity",
                 other => other,
@@ -869,10 +937,10 @@ mod tests {
     /// Schema-stability invariant for `mati doctor --json`:
     /// every scenario (no-daemon-no-store, no-daemon-with-store,
     /// daemon-running, daemon-unresponsive, store-open-failed) must emit
-    /// exactly one `daemon/ping` check followed by `integrity/dirty_marker`
-    /// then `integrity/drift`, in that order. CI consumers parse the report
-    /// by name and by index, and a `version: 1` schema must keep both
-    /// stable.
+    /// the five `enforcement/*` probes first, then exactly one `daemon/ping`
+    /// check followed by `integrity/dirty_marker` then `integrity/drift`, in
+    /// that order. CI consumers parse the report by name and by index, and a
+    /// `version: 2` schema must keep both stable.
     ///
     /// This is a hermetic test: it drives `collect()` against a tempdir
     /// with no daemon and no `knowledge.db`, exercising the no-store
@@ -889,12 +957,19 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                ("enforcement", "git_repo"),
+                ("enforcement", "mati_on_path"),
+                ("enforcement", "awk_float_math"),
+                ("enforcement", "hooks"),
+                ("enforcement", "settings_json"),
                 ("daemon", "ping"),
                 ("integrity", "dirty_marker"),
                 ("integrity", "drift"),
             ],
-            "doctor JSON check sequence must be ping → dirty_marker → drift"
+            "doctor JSON check sequence must be the enforcement probes \
+             (git_repo → mati_on_path → awk_float_math → hooks → settings_json) \
+             then ping → dirty_marker → drift"
         );
-        assert_eq!(report.version, 1);
+        assert_eq!(report.version, 2);
     }
 }
