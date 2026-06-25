@@ -79,7 +79,7 @@ pub async fn run() -> Result<()> {
 /// Run all checks and return results without printing anything.
 /// Used by `mati init` to surface warnings at the end of init.
 pub async fn run_silent(cwd: &Path) -> Vec<CheckItem> {
-    let mut items = Vec::with_capacity(9);
+    let mut items = Vec::with_capacity(10);
 
     // ── Check 1: git repo ────────────────────────────────────────────────────
     items.push(check_git_repo(cwd));
@@ -94,7 +94,10 @@ pub async fn run_silent(cwd: &Path) -> Vec<CheckItem> {
     // ── Check 4: awk float math ──────────────────────────────────────────────
     items.push(check_awk_float_math());
 
-    // ── Checks 5–8: per-host hook wiring (Claude + Codex) ─────────────────────
+    // ── Check 5: at least one agent host wired ───────────────────────────────
+    items.push(check_agent_host(cwd));
+
+    // ── Checks 6–9: per-host hook wiring (Claude + Codex) ─────────────────────
     // Each is gated on the host's directory. A project using only one agent
     // reports the other host as "not configured" (Pass), never a false failure
     // — Codex-only and Claude-only are both first-class (see `mati hooks`).
@@ -103,7 +106,7 @@ pub async fn run_silent(cwd: &Path) -> Vec<CheckItem> {
     items.push(check_codex_hooks(cwd));
     items.push(check_codex_config(cwd));
 
-    // ── Check 7: daemon reachable ────────────────────────────────────────────
+    // ── Check 10: daemon reachable ───────────────────────────────────────────
     items.push(check_daemon(mati_root_opt).await);
 
     items
@@ -221,6 +224,24 @@ fn check_awk_float_math() -> CheckItem {
                     .to_string(),
             ),
         ),
+    }
+}
+
+/// At least one agent host (`.claude/` or `.codex/`) must be wired, or there is
+/// no enforcement at all. Fails only when neither is present — otherwise it is
+/// the single signal that catches "store exists, but nothing is enforcing it".
+fn check_agent_host(cwd: &Path) -> CheckItem {
+    let has_claude = cwd.join(".claude").is_dir();
+    let has_codex = cwd.join(".codex").is_dir();
+    match (has_claude, has_codex) {
+        (false, false) => CheckItem::fail(
+            "agent host",
+            "no agent host wired — neither .claude/ nor .codex/ present",
+            Some("run: mati hooks --claude  (or --codex)".to_string()),
+        ),
+        (true, true) => CheckItem::pass("agent host", Some("claude + codex".to_string())),
+        (true, false) => CheckItem::pass("agent host", Some("claude".to_string())),
+        (false, true) => CheckItem::pass("agent host", Some("codex".to_string())),
     }
 }
 
@@ -779,6 +800,31 @@ mod tests {
         assert!(
             item.is_fail(),
             "expected FAIL when mcpServers.mati is absent: {:?}",
+            item.status
+        );
+    }
+
+    // ── Agent-host guard ─────────────────────────────────────────────────────
+
+    #[test]
+    fn check_agent_host_fails_when_neither_wired() {
+        let dir = TempDir::new().unwrap();
+        let item = check_agent_host(dir.path());
+        assert!(
+            item.is_fail(),
+            "neither .claude/ nor .codex/ should FAIL: {:?}",
+            item.status
+        );
+    }
+
+    #[test]
+    fn check_agent_host_passes_with_one_host() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        let item = check_agent_host(dir.path());
+        assert!(
+            !item.is_fail(),
+            "one wired host (.codex/) should pass: {:?}",
             item.status
         );
     }

@@ -549,6 +549,7 @@ fn enforcement_results(items: Vec<CheckItem>) -> Vec<CheckResult> {
                 "git repo" => "git_repo",
                 "mati in PATH" => "mati_on_path",
                 "awk float math" => "awk_float_math",
+                "agent host" => "agent_host",
                 "claude hooks" => "claude_hooks",
                 "claude config" => "claude_config",
                 "codex hooks" => "codex_hooks",
@@ -573,6 +574,7 @@ fn enforcement_results(items: Vec<CheckItem>) -> Vec<CheckResult> {
                     "git_repo" => "run mati from inside a git repository",
                     "mati_on_path" => "ensure the mati binary is on PATH",
                     "awk_float_math" => "install awk/gawk and ensure it is on PATH",
+                    "agent_host" => "mati hooks --claude  (or --codex)",
                     "codex_hooks" | "codex_config" => "mati hooks --codex",
                     // claude_hooks / claude_config
                     _ => "mati hooks --claude",
@@ -963,6 +965,7 @@ mod tests {
                 ("enforcement", "git_repo"),
                 ("enforcement", "mati_on_path"),
                 ("enforcement", "awk_float_math"),
+                ("enforcement", "agent_host"),
                 ("enforcement", "claude_hooks"),
                 ("enforcement", "claude_config"),
                 ("enforcement", "codex_hooks"),
@@ -972,9 +975,9 @@ mod tests {
                 ("integrity", "drift"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
-             (git_repo → mati_on_path → awk_float_math → claude_hooks → \
-             claude_config → codex_hooks → codex_config) then ping → \
-             dirty_marker → drift"
+             (git_repo → mati_on_path → awk_float_math → agent_host → \
+             claude_hooks → claude_config → codex_hooks → codex_config) then \
+             ping → dirty_marker → drift"
         );
         assert_eq!(report.version, 2);
     }
