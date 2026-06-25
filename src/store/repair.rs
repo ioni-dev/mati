@@ -65,6 +65,29 @@ use crate::store::record::{
     StalenessScore,
 };
 
+/// Read-only store access used by the integrity *check* paths, so they can run
+/// against either a direct [`Store`] or a daemon-routed proxy (e.g. the CLI's
+/// `StoreProxy`, which routes reads through the daemon socket). Only the three
+/// read primitives the checks need — all writes stay on `&Store`.
+#[allow(async_fn_in_trait)]
+pub trait RepairReader {
+    async fn get(&self, key: &str) -> Result<Option<Record>>;
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<Record>>;
+    async fn scan_keys(&self, prefix: &str) -> Result<Vec<String>>;
+}
+
+impl RepairReader for Store {
+    async fn get(&self, key: &str) -> Result<Option<Record>> {
+        Store::get(self, key).await
+    }
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<Record>> {
+        Store::scan_prefix(self, prefix).await
+    }
+    async fn scan_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        Store::scan_keys(self, prefix).await
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -189,8 +212,8 @@ pub async fn mark_dirty(store: &Store, gotcha_key: &str, cause: &str) {
 }
 
 /// Read the current dirty marker, if any.
-pub async fn read_dirty_marker(store: &Store) -> Option<DirtyMarker> {
-    store
+pub async fn read_dirty_marker<R: RepairReader>(reader: &R) -> Option<DirtyMarker> {
+    reader
         .get(DIRTY_MARKER_KEY)
         .await
         .ok()
@@ -199,8 +222,8 @@ pub async fn read_dirty_marker(store: &Store) -> Option<DirtyMarker> {
 }
 
 /// Check whether the gotcha index is currently marked dirty.
-pub async fn is_dirty(store: &Store) -> bool {
-    read_dirty_marker(store)
+pub async fn is_dirty<R: RepairReader>(reader: &R) -> bool {
+    read_dirty_marker(reader)
         .await
         .map(|m| m.dirty)
         .unwrap_or(false)
@@ -210,13 +233,13 @@ pub async fn is_dirty(store: &Store) -> bool {
 
 /// Compute the diff between canonical gotcha state and derived indexes.
 /// Does not write anything.
-pub async fn check_gotcha_indexes(store: &Store) -> Result<RepairReport> {
+pub async fn check_gotcha_indexes<R: RepairReader>(reader: &R) -> Result<RepairReport> {
     // Phase 1: derive desired state from canonical gotcha records
-    let (desired_file_links, desired_edges, scanned_gotchas) = derive_desired_state(store).await?;
+    let (desired_file_links, desired_edges, scanned_gotchas) = derive_desired_state(reader).await?;
 
     // Phase 2: diff against actual state
-    let (actual_file_links, scanned_files) = read_actual_file_links(store).await?;
-    let actual_edges = read_actual_edges(store).await?;
+    let (actual_file_links, scanned_files) = read_actual_file_links(reader).await?;
+    let actual_edges = read_actual_edges(reader).await?;
 
     let (missing_file_links, stale_file_links) =
         diff_file_links(&desired_file_links, &actual_file_links);
@@ -483,14 +506,14 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Phase 1: build desired state from canonical gotcha records.
-async fn derive_desired_state(
-    store: &Store,
+async fn derive_desired_state<R: RepairReader>(
+    reader: &R,
 ) -> Result<(
     HashMap<String, BTreeSet<String>>,
     BTreeSet<(String, String)>,
     usize,
 )> {
-    let gotchas = store.scan_prefix("gotcha:").await?;
+    let gotchas = reader.scan_prefix("gotcha:").await?;
     let scanned = gotchas.len();
 
     let mut desired_file_links: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -517,8 +540,10 @@ async fn derive_desired_state(
 }
 
 /// Read actual gotcha_keys from all file records.
-async fn read_actual_file_links(store: &Store) -> Result<(HashMap<String, Vec<String>>, usize)> {
-    let files = store.scan_prefix("file:").await?;
+async fn read_actual_file_links<R: RepairReader>(
+    reader: &R,
+) -> Result<(HashMap<String, Vec<String>>, usize)> {
+    let files = reader.scan_prefix("file:").await?;
     let count = files.len();
     let mut actual: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -538,8 +563,8 @@ async fn read_actual_file_links(store: &Store) -> Result<(HashMap<String, Vec<St
 }
 
 /// Read actual HasGotcha edges from the graph edge store.
-async fn read_actual_edges(store: &Store) -> Result<BTreeSet<(String, String)>> {
-    let edge_keys = store.scan_keys("graph:edge:").await?;
+async fn read_actual_edges<R: RepairReader>(reader: &R) -> Result<BTreeSet<(String, String)>> {
+    let edge_keys = reader.scan_keys("graph:edge:").await?;
     let mut actual = BTreeSet::new();
 
     for key in &edge_keys {
