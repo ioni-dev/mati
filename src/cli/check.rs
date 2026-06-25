@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use mati_core::scaffold::codex::CODEX_HOOK_SCRIPTS;
 use mati_core::scaffold::settings::HOOK_SCRIPTS;
 
 use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
@@ -78,7 +79,7 @@ pub async fn run() -> Result<()> {
 /// Run all checks and return results without printing anything.
 /// Used by `mati init` to surface warnings at the end of init.
 pub async fn run_silent(cwd: &Path) -> Vec<CheckItem> {
-    let mut items = Vec::with_capacity(7);
+    let mut items = Vec::with_capacity(9);
 
     // ── Check 1: git repo ────────────────────────────────────────────────────
     items.push(check_git_repo(cwd));
@@ -93,11 +94,14 @@ pub async fn run_silent(cwd: &Path) -> Vec<CheckItem> {
     // ── Check 4: awk float math ──────────────────────────────────────────────
     items.push(check_awk_float_math());
 
-    // ── Check 5: hooks installed + executable ────────────────────────────────
-    items.push(check_hooks(cwd));
-
-    // ── Check 6: settings.json complete ─────────────────────────────────────
-    items.push(check_settings_json(cwd));
+    // ── Checks 5–8: per-host hook wiring (Claude + Codex) ─────────────────────
+    // Each is gated on the host's directory. A project using only one agent
+    // reports the other host as "not configured" (Pass), never a false failure
+    // — Codex-only and Claude-only are both first-class (see `mati hooks`).
+    items.push(check_claude_hooks(cwd));
+    items.push(check_claude_config(cwd));
+    items.push(check_codex_hooks(cwd));
+    items.push(check_codex_config(cwd));
 
     // ── Check 7: daemon reachable ────────────────────────────────────────────
     items.push(check_daemon(mati_root_opt).await);
@@ -220,9 +224,15 @@ fn check_awk_float_math() -> CheckItem {
     }
 }
 
-fn check_hooks(cwd: &Path) -> CheckItem {
+/// Claude hook scripts present + executable under `.claude/hooks/`.
+/// Gated on `.claude/` existing so a Codex-only project isn't failed.
+fn check_claude_hooks(cwd: &Path) -> CheckItem {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    if !cwd.join(".claude").is_dir() {
+        return CheckItem::pass("claude hooks", Some("not configured".to_string()));
+    }
 
     let hooks_dir = cwd.join(".claude").join("hooks");
     let total = HOOK_SCRIPTS.len();
@@ -251,7 +261,7 @@ fn check_hooks(cwd: &Path) -> CheckItem {
 
     if missing.is_empty() && not_exec.is_empty() {
         return CheckItem::pass(
-            "hooks",
+            "claude hooks",
             Some(format!("{total}/{total} installed, executable")),
         );
     }
@@ -265,23 +275,90 @@ fn check_hooks(cwd: &Path) -> CheckItem {
     }
 
     CheckItem::fail(
-        "hooks",
+        "claude hooks",
         format!(
             "{}/{total} ok — {}",
             total - missing.len() - not_exec.len(),
             problems.join("; ")
         ),
-        Some("run: mati init  to reinstall hooks".to_string()),
+        Some("run: mati hooks --claude  to reinstall".to_string()),
     )
 }
 
-fn check_settings_json(cwd: &Path) -> CheckItem {
+/// Codex hook scripts present + executable under `.codex/hooks/`.
+/// Gated on `.codex/` existing so a Claude-only project isn't failed.
+fn check_codex_hooks(cwd: &Path) -> CheckItem {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    if !cwd.join(".codex").is_dir() {
+        return CheckItem::pass("codex hooks", Some("not configured".to_string()));
+    }
+
+    let hooks_dir = cwd.join(".codex").join("hooks");
+    let total = CODEX_HOOK_SCRIPTS.len();
+    let mut missing: Vec<String> = Vec::new();
+    let mut not_exec: Vec<String> = Vec::new();
+
+    for (name, _) in CODEX_HOOK_SCRIPTS {
+        let path = hooks_dir.join(name);
+        if !path.exists() {
+            missing.push(name.to_string());
+            continue;
+        }
+        #[cfg(unix)]
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                let mode = meta.permissions().mode();
+                if mode & 0o111 == 0 {
+                    not_exec.push(name.to_string());
+                }
+            }
+            Err(_) => {
+                missing.push(name.to_string());
+            }
+        }
+    }
+
+    if missing.is_empty() && not_exec.is_empty() {
+        return CheckItem::pass(
+            "codex hooks",
+            Some(format!("{total}/{total} installed, executable")),
+        );
+    }
+
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("missing: {}", missing.join(", ")));
+    }
+    if !not_exec.is_empty() {
+        problems.push(format!("not executable: {}", not_exec.join(", ")));
+    }
+
+    CheckItem::fail(
+        "codex hooks",
+        format!(
+            "{}/{total} ok — {}",
+            total - missing.len() - not_exec.len(),
+            problems.join("; ")
+        ),
+        Some("run: mati hooks --codex  to reinstall".to_string()),
+    )
+}
+
+/// Claude `settings.json` registers every hook + the mati MCP server.
+/// Gated on `.claude/` existing.
+fn check_claude_config(cwd: &Path) -> CheckItem {
+    if !cwd.join(".claude").is_dir() {
+        return CheckItem::pass("claude config", Some("not configured".to_string()));
+    }
+
     let path = cwd.join(".claude").join("settings.json");
     if !path.exists() {
         return CheckItem::fail(
-            "settings.json",
+            "claude config",
             "settings.json not found",
-            Some("run: mati init".to_string()),
+            Some("run: mati hooks --claude".to_string()),
         );
     }
 
@@ -289,7 +366,7 @@ fn check_settings_json(cwd: &Path) -> CheckItem {
         Ok(c) => c,
         Err(e) => {
             return CheckItem::fail(
-                "settings.json",
+                "claude config",
                 format!("cannot read settings.json: {e}"),
                 None::<String>,
             );
@@ -300,9 +377,9 @@ fn check_settings_json(cwd: &Path) -> CheckItem {
         Ok(v) => v,
         Err(e) => {
             return CheckItem::fail(
-                "settings.json",
+                "claude config",
                 format!("invalid JSON: {e}"),
-                Some("run: mati init  to regenerate settings.json".to_string()),
+                Some("run: mati hooks --claude  to regenerate settings.json".to_string()),
             );
         }
     };
@@ -321,7 +398,7 @@ fn check_settings_json(cwd: &Path) -> CheckItem {
 
     if absent_hooks.is_empty() && mcp_ok {
         return CheckItem::pass(
-            "settings.json",
+            "claude config",
             Some(format!(
                 "{} hooks + mcpServers registered",
                 HOOK_SCRIPTS.len()
@@ -338,9 +415,64 @@ fn check_settings_json(cwd: &Path) -> CheckItem {
     }
 
     CheckItem::fail(
-        "settings.json",
+        "claude config",
         problems.join("; "),
-        Some("run: mati init  to regenerate settings.json".to_string()),
+        Some("run: mati hooks --claude  to regenerate settings.json".to_string()),
+    )
+}
+
+/// Codex wiring: `.codex/hooks.json` registers every hook script and
+/// `.codex/config.toml` registers the mati MCP server. Gated on `.codex/`.
+fn check_codex_config(cwd: &Path) -> CheckItem {
+    if !cwd.join(".codex").is_dir() {
+        return CheckItem::pass("codex config", Some("not configured".to_string()));
+    }
+
+    let codex_dir = cwd.join(".codex");
+    let mut problems: Vec<String> = Vec::new();
+
+    // hooks.json — must parse and reference each hook script path.
+    match std::fs::read_to_string(codex_dir.join("hooks.json")) {
+        Ok(content) => {
+            if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                problems.push("hooks.json: invalid JSON".to_string());
+            } else {
+                let absent: Vec<&str> = CODEX_HOOK_SCRIPTS
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .filter(|n| !content.contains(&format!(".codex/hooks/{n}")))
+                    .collect();
+                if !absent.is_empty() {
+                    problems.push(format!("hooks.json: scripts absent: {}", absent.join(", ")));
+                }
+            }
+        }
+        Err(_) => problems.push("hooks.json: not found".to_string()),
+    }
+
+    // config.toml — must register the mati MCP server. A substring match keeps
+    // this dependency-free and mirrors the Claude settings.json check;
+    // toml_edit writes the table header `[mcp_servers.mati]`.
+    match std::fs::read_to_string(codex_dir.join("config.toml")) {
+        Ok(content) => {
+            if !content.contains("mcp_servers.mati") {
+                problems.push("config.toml: mcp_servers.mati missing".to_string());
+            }
+        }
+        Err(_) => problems.push("config.toml: not found".to_string()),
+    }
+
+    if problems.is_empty() {
+        return CheckItem::pass(
+            "codex config",
+            Some("hooks.json + mcp_servers.mati registered".to_string()),
+        );
+    }
+
+    CheckItem::fail(
+        "codex config",
+        problems.join("; "),
+        Some("run: mati hooks --codex  to regenerate".to_string()),
     )
 }
 
@@ -529,7 +661,7 @@ mod tests {
             std::fs::set_permissions(&first_path, perms).unwrap();
         }
 
-        let item = check_hooks(dir.path());
+        let item = check_claude_hooks(dir.path());
         assert!(
             item.is_fail(),
             "expected FAIL when first hook is not executable: {:?}",
@@ -553,7 +685,7 @@ mod tests {
             std::fs::set_permissions(&path, perms).unwrap();
         }
 
-        let item = check_hooks(dir.path());
+        let item = check_claude_hooks(dir.path());
         assert!(
             !item.is_fail(),
             "expected PASS when all hooks are present and executable: {:?}",
@@ -586,7 +718,7 @@ mod tests {
 
         std::fs::write(claude_dir.join("settings.json"), &json).unwrap();
 
-        let item = check_settings_json(dir.path());
+        let item = check_claude_config(dir.path());
         assert!(
             !item.is_fail(),
             "expected PASS for valid settings.json: {:?}",
@@ -615,7 +747,7 @@ mod tests {
 
         std::fs::write(claude_dir.join("settings.json"), &json).unwrap();
 
-        let item = check_settings_json(dir.path());
+        let item = check_claude_config(dir.path());
         // Should fail because not all hooks are referenced.
         if HOOK_SCRIPTS.len() > 1 {
             assert!(
@@ -643,10 +775,142 @@ mod tests {
 
         std::fs::write(claude_dir.join("settings.json"), &json).unwrap();
 
-        let item = check_settings_json(dir.path());
+        let item = check_claude_config(dir.path());
         assert!(
             item.is_fail(),
             "expected FAIL when mcpServers.mati is absent: {:?}",
+            item.status
+        );
+    }
+
+    // ── Host gating (Claude-only / Codex-only must not cross-fail) ───────────
+
+    #[test]
+    fn check_claude_hooks_not_configured_passes() {
+        // A Codex-only project has no .claude/ — must read as "not configured",
+        // not a failure.
+        let dir = TempDir::new().unwrap();
+        let item = check_claude_hooks(dir.path());
+        assert!(
+            !item.is_fail(),
+            "absent .claude/ should be 'not configured', not FAIL: {:?}",
+            item.status
+        );
+    }
+
+    #[test]
+    fn check_codex_hooks_not_configured_passes() {
+        // A Claude-only project has no .codex/.
+        let dir = TempDir::new().unwrap();
+        let item = check_codex_hooks(dir.path());
+        assert!(
+            !item.is_fail(),
+            "absent .codex/ should be 'not configured', not FAIL: {:?}",
+            item.status
+        );
+    }
+
+    // ── Codex hook scripts ───────────────────────────────────────────────────
+
+    #[test]
+    fn check_codex_hooks_missing_scripts_fails() {
+        // .codex/ exists but the hook scripts aren't installed → FAIL.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".codex").join("hooks")).unwrap();
+        let item = check_codex_hooks(dir.path());
+        assert!(
+            item.is_fail(),
+            "missing codex hook scripts should FAIL: {:?}",
+            item.status
+        );
+    }
+
+    #[test]
+    fn check_codex_hooks_complete_passes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let hooks_dir = dir.path().join(".codex").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        for (name, content) in CODEX_HOOK_SCRIPTS {
+            let path = hooks_dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let item = check_codex_hooks(dir.path());
+        assert!(
+            !item.is_fail(),
+            "all codex hooks present + executable should pass: {:?}",
+            item.status
+        );
+    }
+
+    // ── Codex config (hooks.json + config.toml) ──────────────────────────────
+
+    fn write_codex_hooks_json(codex_dir: &std::path::Path) {
+        let refs: String = CODEX_HOOK_SCRIPTS
+            .iter()
+            .map(|(n, _)| format!("\"bash .codex/hooks/{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            codex_dir.join("hooks.json"),
+            format!("{{ \"hooks\": [{refs}] }}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn check_codex_config_complete_passes() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        write_codex_hooks_json(&codex_dir);
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.mati]\ncommand = \"mati\"\n",
+        )
+        .unwrap();
+        let item = check_codex_config(dir.path());
+        assert!(
+            !item.is_fail(),
+            "complete codex config should pass: {:?}",
+            item.status
+        );
+    }
+
+    #[test]
+    fn check_codex_config_missing_mcp_fails() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        write_codex_hooks_json(&codex_dir);
+        // config.toml present but no mati MCP server registered.
+        std::fs::write(codex_dir.join("config.toml"), "[other]\nx = 1\n").unwrap();
+        let item = check_codex_config(dir.path());
+        assert!(
+            item.is_fail(),
+            "missing mcp_servers.mati should FAIL: {:?}",
+            item.status
+        );
+    }
+
+    #[test]
+    fn check_codex_config_missing_hooks_json_fails() {
+        let dir = TempDir::new().unwrap();
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        // config.toml is fine, but hooks.json is absent.
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.mati]\ncommand = \"mati\"\n",
+        )
+        .unwrap();
+        let item = check_codex_config(dir.path());
+        assert!(
+            item.is_fail(),
+            "missing hooks.json should FAIL: {:?}",
             item.status
         );
     }
