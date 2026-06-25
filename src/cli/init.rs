@@ -2119,7 +2119,17 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                         ""
                     };
                     println!("    {g}.claude/settings.json          hook registrations + MCP server config{r}");
-                    println!("    {g}.claude/hooks/                 6 hooks (pre-read, pre-bash, compliance, edit, compact, session-end){r}");
+                    // Derive count + names from HOOK_SCRIPTS so this line can
+                    // never drift out of sync with what was actually installed.
+                    let claude_hooks: Vec<&str> = mati_core::scaffold::settings::HOOK_SCRIPTS
+                        .iter()
+                        .map(|(n, _)| n.trim_end_matches(".sh"))
+                        .collect();
+                    println!(
+                        "    {g}.claude/hooks/                 {} hooks ({}){r}",
+                        claude_hooks.len(),
+                        claude_hooks.join(", ")
+                    );
                     println!("    {g}.claude/CLAUDE.md              knowledge capture + enrichment instructions{r}");
                 }
                 if !missing_deps.is_empty() {
@@ -2171,7 +2181,17 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                     println!(
                         "    {g}.codex/config.toml             MCP server + hooks feature flag{r}"
                     );
-                    println!("    {g}.codex/hooks/                  6 hooks (session-start, prompt-submit, pre-bash, pre-apply-patch, post-bash, stop){r}");
+                    // Derive count + names from CODEX_HOOK_SCRIPTS (single source
+                    // of truth) so the summary always matches what was installed.
+                    let codex_hooks: Vec<&str> = mati_core::scaffold::codex::CODEX_HOOK_SCRIPTS
+                        .iter()
+                        .map(|(n, _)| n.trim_end_matches(".sh"))
+                        .collect();
+                    println!(
+                        "    {g}.codex/hooks/                  {} hooks ({}){r}",
+                        codex_hooks.len(),
+                        codex_hooks.join(", ")
+                    );
                     println!("    {g}.codex/skills/mati/            skill instructions for agent guidance{r}");
                 }
                 if !missing_deps.is_empty() {
