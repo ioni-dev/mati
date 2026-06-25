@@ -501,6 +501,11 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
         }
     }
 
+    // Audit-chain integrity — routed through StoreProxy so it runs even while
+    // the daemon holds the store lock (unlike dirty_marker/drift above). Reuses
+    // the frozen-contract primitive `enforcement::verify_chain`.
+    checks.push(collect_chain_check(cwd).await);
+
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
 
@@ -589,6 +594,54 @@ fn enforcement_results(items: Vec<CheckItem>) -> Vec<CheckResult> {
             })
         })
         .collect()
+}
+
+/// Verify the enforcement audit chain. Routed through `StoreProxy`, so unlike
+/// the `Store::open`-based dirty_marker/drift checks it runs even while the
+/// daemon holds the store lock. Reuses `enforcement::verify_chain` — the single
+/// source of truth for the frozen hash contract (same primitive as
+/// `mati verify-chain`). Read-only, zero-network.
+async fn collect_chain_check(cwd: &Path) -> CheckResult {
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult {
+                section: "integrity",
+                name: "chain",
+                status: Status::Info,
+                detail: "skipped — no store initialized for this directory".to_string(),
+                fix: None,
+            };
+        }
+    };
+    let events = proxy
+        .scan_enforcement_events(0, u64::MAX)
+        .await
+        .unwrap_or_default();
+    let _ = proxy.close().await;
+
+    let total = events.len();
+    let result = mati_core::store::enforcement::verify_chain(&events);
+    if result.is_valid() {
+        CheckResult {
+            section: "integrity",
+            name: "chain",
+            status: Status::Pass,
+            detail: format!("intact — {total} event(s), every hash verified"),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            section: "integrity",
+            name: "chain",
+            status: Status::Fail,
+            detail: format!(
+                "BROKEN — {} tampered, {} linkage break(s), {} unknown-schema of {total} event(s)",
+                result.tampered_events, result.linkage_breaks, result.unknown_schema
+            ),
+            fix: Some("mati verify-chain --verbose"),
+        }
+    }
 }
 
 /// Read all `analytics:extraction:*` records via StoreProxy and aggregate.
@@ -973,11 +1026,12 @@ mod tests {
                 ("daemon", "ping"),
                 ("integrity", "dirty_marker"),
                 ("integrity", "drift"),
+                ("integrity", "chain"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
-             ping → dirty_marker → drift"
+             ping → dirty_marker → drift → chain"
         );
         assert_eq!(report.version, 2);
     }
