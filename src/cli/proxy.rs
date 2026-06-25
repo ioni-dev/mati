@@ -955,6 +955,22 @@ impl StoreProxy {
     }
 }
 
+/// `StoreProxy` exposes the read primitives `mati doctor`'s integrity checks
+/// need, so they run via the daemon socket when one holds the lock. `scan_keys`
+/// isn't a native proxy op — derive it from `scan_prefix` (keys only).
+impl mati_core::store::repair::RepairReader for StoreProxy {
+    async fn get(&self, key: &str) -> Result<Option<Record>> {
+        StoreProxy::get(self, key).await
+    }
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<Record>> {
+        StoreProxy::scan_prefix(self, prefix).await
+    }
+    async fn scan_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let recs = StoreProxy::scan_prefix(self, prefix).await?;
+        Ok(recs.into_iter().map(|r| r.key).collect())
+    }
+}
+
 /// Open `Store` with bounded retries on SurrealKV lock contention.
 ///
 /// Used only in direct-mode (no daemon). On lock contention, sleep for

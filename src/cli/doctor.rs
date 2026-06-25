@@ -1,9 +1,10 @@
 //! `mati doctor` — diagnostic health aggregator for support and CI.
 //!
-//! Fans out to: daemon reachability, dirty-marker presence, drift check,
-//! and recent lifecycle events. Exits 0 if everything is healthy; non-zero
-//! if any check is in a fail state. Intended as the "paste this output"
-//! command for support requests and as a CI gate for repository health.
+//! Fans out to: enforcement wiring (reused from `mati check`), daemon
+//! reachability, dirty-marker presence, drift check, and recent lifecycle
+//! events. Exits 0 if everything is healthy; non-zero if any check is in a
+//! fail state. Intended as the "paste this output" command for support
+//! requests and as a CI gate for repository health.
 //!
 //! Drift checks require direct store access. When the daemon holds the
 //! exclusive lock, those checks report "skipped" rather than failing —
@@ -17,9 +18,7 @@ use anyhow::Result;
 use clap::Args;
 use serde::Serialize;
 
-use mati_core::store::repair::{check_gotcha_indexes, is_dirty, read_dirty_marker};
-use mati_core::store::Store;
-
+use super::check::{self, CheckItem, CheckStatus};
 use super::daemon::{daemon_result, mati_root_for, DaemonResult};
 
 /// Doctor command arguments.
@@ -278,6 +277,16 @@ struct Summary {
 async fn collect(cwd: &Path, root: &Path) -> Report {
     let mut checks: Vec<CheckResult> = Vec::new();
 
+    // Enforcement wiring — fold in `mati check`'s pipeline probes so `mati
+    // doctor` answers the #1 silent-failure question: "is enforcement actually
+    // wired into the agent?" (hook scripts present + executable, settings.json
+    // registers them + the mati MCP server, mati on PATH, awk float math).
+    // These are side-effect-free and never touch the store, so they remain
+    // available even when the daemon holds the store lock (unlike the integrity
+    // checks below). `enforcement_results` drops check's own `store` and
+    // `daemon` items — doctor already reports those in its own sections.
+    checks.extend(enforcement_results(check::run_silent(cwd).await));
+
     // Daemon ping.
     let daemon_state = daemon_result(root, "ping", serde_json::json!({})).await;
     match &daemon_state {
@@ -313,181 +322,116 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
 
     // Integrity: dirty_marker + drift.
     //
-    // Schema-stability invariant: this block always pushes exactly two
-    // `integrity` checks — `dirty_marker` followed by `drift` — in that
-    // order, regardless of whether the daemon holds the lock, the store
-    // is uninitialized, or `Store::open` failed. Consumers parsing
-    // `mati doctor --json` rely on `version: 1` meaning the same set of
-    // check names appears in the same order across all scenarios, so
-    // `.checks[]` indices and a name-keyed lookup both stay stable.
+    // Schema-stability invariant: always exactly two `integrity` checks —
+    // `dirty_marker` then `drift`, in that order — in every scenario, so
+    // `mati doctor --json` (version 2) stays index-stable.
     //
-    // Skip Store::open whenever the daemon (or some still-living former
-    // daemon) is holding the lock. Treating only `Ok` as "daemon owns
-    // store" would attempt Store::open in the `Unresponsive` case — which
-    // is *guaranteed* to fail with "already locked" and emit a redundant
-    // `store_open FAIL` next to the `ping FAIL`. Both states mean
-    // "another process holds the lock; integrity not verifiable from
-    // here", which is one signal, not two.
-    let daemon_holds_lock = matches!(
-        daemon_state,
-        DaemonResult::Ok(_) | DaemonResult::Unresponsive
-    );
-    if daemon_holds_lock {
-        let lock_detail = match daemon_state {
-            DaemonResult::Ok(_) => "skipped — daemon holds the store lock",
-            DaemonResult::Unresponsive => {
-                "skipped — daemon is unresponsive; integrity unverifiable until it is restarted"
-            }
-            _ => "skipped",
-        };
-        let drift_detail = match daemon_state {
-            DaemonResult::Ok(_) => {
-                "skipped — daemon holds the store lock; auto-drain runs on its side"
-            }
-            DaemonResult::Unresponsive => {
-                "skipped — daemon is unresponsive; integrity unverifiable until it is restarted"
-            }
-            _ => "skipped",
-        };
-        checks.push(CheckResult {
-            section: "integrity",
-            name: "dirty_marker",
-            status: Status::Info,
-            detail: lock_detail.into(),
-            fix: None,
-        });
-        checks.push(CheckResult {
-            section: "integrity",
-            name: "drift",
-            status: Status::Info,
-            detail: drift_detail.into(),
-            fix: None,
-        });
-    } else if !root.join("knowledge.db").exists() {
-        // Doctor must be side-effect-free. `Store::open` is "create-or-open"
-        // — it would scaffold `~/.mati/<slug>/` and initialize SurrealKV
-        // files in a directory that has no mati state yet. Diagnostic tools
-        // should report state, not create it. So bail out here when the
-        // store hasn't been initialized.
-        //
-        // Fold the "run `mati init`" hint into the skip detail (instead of
-        // emitting an extra `integrity/store` check that other scenarios
-        // omit) to keep the JSON shape stable across scenarios.
-        let no_store_detail =
-            "skipped — no store initialized for this directory (run `mati init` to set up)";
-        checks.push(CheckResult {
-            section: "integrity",
-            name: "dirty_marker",
-            status: Status::Info,
-            detail: no_store_detail.into(),
-            fix: Some("mati init"),
-        });
-        checks.push(CheckResult {
-            section: "integrity",
-            name: "drift",
-            status: Status::Info,
-            detail: no_store_detail.into(),
-            fix: Some("mati init"),
-        });
-    } else {
-        match Store::open(cwd).await {
-            Ok(store) => {
-                if is_dirty(&store).await {
-                    let detail = match read_dirty_marker(&store).await {
-                        Some(m) => format!("{} key(s) flagged: {}", m.affected_keys.len(), m.cause),
-                        None => "flagged but cause not readable".to_string(),
-                    };
-                    checks.push(CheckResult {
-                        section: "integrity",
-                        name: "dirty_marker",
-                        status: Status::Warn,
-                        detail,
-                        fix: Some("mati repair --fast"),
-                    });
-                } else {
-                    checks.push(CheckResult {
-                        section: "integrity",
-                        name: "dirty_marker",
-                        status: Status::Pass,
-                        detail: "not set".into(),
-                        fix: None,
-                    });
-                }
-
-                match check_gotcha_indexes(&store).await {
-                    Ok(report) => {
-                        if report.has_drift() {
-                            let detail = format!(
-                                "missing_file={}, stale_file={}, missing_edge={}, stale_edge={}",
-                                report.missing_file_links.len(),
-                                report.stale_file_links.len(),
-                                report.missing_edges.len(),
-                                report.stale_edges.len(),
-                            );
-                            // `mati repair` reconciles derived indexes against
-                            // existing records, but it cannot CREATE a missing
-                            // file:<path> record — that needs a `mati init`
-                            // re-index. So when the drift includes missing_file
-                            // links (a gotcha references an un-indexed path),
-                            // point at init first; otherwise plain repair fixes
-                            // stale links and graph edges.
-                            let fix = if !report.missing_file_links.is_empty() {
-                                "mati init  (re-index missing files), then mati repair"
-                            } else {
-                                "mati repair"
-                            };
-                            checks.push(CheckResult {
-                                section: "integrity",
-                                name: "drift",
-                                status: Status::Fail,
-                                detail,
-                                fix: Some(fix),
-                            });
-                        } else {
-                            checks.push(CheckResult {
-                                section: "integrity",
-                                name: "drift",
-                                status: Status::Pass,
-                                detail: "no drift detected".into(),
-                                fix: None,
-                            });
-                        }
-                    }
-                    Err(e) => checks.push(CheckResult {
-                        section: "integrity",
-                        name: "drift",
-                        status: Status::Fail,
-                        detail: format!("check error: {e}"),
-                        fix: None,
-                    }),
-                }
-
-                let _ = store.close().await;
-            }
-            Err(e) => {
-                // Store-open failure: emit BOTH dirty_marker and drift as
-                // Fail with the same root cause, so the `checks[]` shape
-                // matches the other scenarios (always exactly two integrity
-                // checks: dirty_marker then drift). The detail carries the
-                // open error so triagers see the actual cause.
-                let detail = format!("store open failed: {e}");
+    // Routed through `StoreProxy` (read-only), so — unlike the old
+    // `Store::open` path that went `skipped` — these now report even while the
+    // daemon holds the store lock: the proxy routes the reads through the
+    // daemon socket. On an uninitialised repo the proxy refuses to open (it
+    // won't scaffold state) and we emit Info rows pointing at `mati init`.
+    match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(proxy) => {
+            if mati_core::store::repair::is_dirty(&proxy).await {
+                let detail = match mati_core::store::repair::read_dirty_marker(&proxy).await {
+                    Some(m) => format!("{} key(s) flagged: {}", m.affected_keys.len(), m.cause),
+                    None => "flagged but cause not readable".to_string(),
+                };
                 checks.push(CheckResult {
                     section: "integrity",
                     name: "dirty_marker",
-                    status: Status::Fail,
-                    detail: detail.clone(),
-                    fix: None,
+                    status: Status::Warn,
+                    detail,
+                    fix: Some("mati repair --fast"),
                 });
+            } else {
                 checks.push(CheckResult {
                     section: "integrity",
-                    name: "drift",
-                    status: Status::Fail,
-                    detail,
+                    name: "dirty_marker",
+                    status: Status::Pass,
+                    detail: "not set".into(),
                     fix: None,
                 });
             }
+
+            match mati_core::store::repair::check_gotcha_indexes(&proxy).await {
+                Ok(report) => {
+                    if report.has_drift() {
+                        let detail = format!(
+                            "missing_file={}, stale_file={}, missing_edge={}, stale_edge={}",
+                            report.missing_file_links.len(),
+                            report.stale_file_links.len(),
+                            report.missing_edges.len(),
+                            report.stale_edges.len(),
+                        );
+                        // `mati repair` reconciles derived indexes against
+                        // existing records but cannot CREATE a missing
+                        // file:<path> record — that needs a `mati init`
+                        // re-index. So when the drift includes missing_file
+                        // links, point at init first; otherwise plain repair
+                        // fixes stale links and graph edges.
+                        let fix = if !report.missing_file_links.is_empty() {
+                            "mati init  (re-index missing files), then mati repair"
+                        } else {
+                            "mati repair"
+                        };
+                        checks.push(CheckResult {
+                            section: "integrity",
+                            name: "drift",
+                            status: Status::Fail,
+                            detail,
+                            fix: Some(fix),
+                        });
+                    } else {
+                        checks.push(CheckResult {
+                            section: "integrity",
+                            name: "drift",
+                            status: Status::Pass,
+                            detail: "no drift detected".into(),
+                            fix: None,
+                        });
+                    }
+                }
+                Err(e) => checks.push(CheckResult {
+                    section: "integrity",
+                    name: "drift",
+                    status: Status::Fail,
+                    detail: format!("check error: {e}"),
+                    fix: None,
+                }),
+            }
+
+            let _ = proxy.close().await;
+        }
+        Err(_) => {
+            // Proxy refuses to open when there's no store (and no daemon) — we
+            // report state, never scaffold it. Same two rows, so the JSON
+            // shape stays stable across scenarios.
+            let no_store_detail =
+                "skipped — no store initialized for this directory (run `mati init` to set up)";
+            checks.push(CheckResult {
+                section: "integrity",
+                name: "dirty_marker",
+                status: Status::Info,
+                detail: no_store_detail.into(),
+                fix: Some("mati init"),
+            });
+            checks.push(CheckResult {
+                section: "integrity",
+                name: "drift",
+                status: Status::Info,
+                detail: no_store_detail.into(),
+                fix: Some("mati init"),
+            });
         }
     }
+
+    // Audit-chain integrity — routed through StoreProxy so it runs even while
+    // the daemon holds the store lock (unlike dirty_marker/drift above). Reuses
+    // the frozen-contract primitive `enforcement::verify_chain`.
+    checks.push(collect_chain_check(cwd).await);
+    checks.push(collect_freshness_check(cwd).await);
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -510,12 +454,168 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     }
 
     Report {
-        version: 1,
+        version: 2,
         root: root.display().to_string(),
         checks,
         lifecycle,
         summary,
         extraction,
+    }
+}
+
+/// Map `mati check`'s enforcement-pipeline probes into doctor `CheckResult`s.
+///
+/// Drops the `store` and `daemon` items — doctor already reports those via its
+/// own `integrity` and `daemon` sections, so folding them in would duplicate
+/// rows. The remaining probes (git repo, mati-on-PATH, awk float math, hook
+/// scripts, settings.json wiring) answer the question doctor couldn't before:
+/// "is enforcement actually wired into the agent?" None of them open the store,
+/// so they stay available even when the daemon holds the lock. Names are
+/// normalized to snake_case to match doctor's existing convention (`ping`,
+/// `dirty_marker`, `drift`).
+fn enforcement_results(items: Vec<CheckItem>) -> Vec<CheckResult> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let name: &'static str = match item.label {
+                "git repo" => "git_repo",
+                "mati in PATH" => "mati_on_path",
+                "awk float math" => "awk_float_math",
+                "agent host" => "agent_host",
+                "claude hooks" => "claude_hooks",
+                "claude config" => "claude_config",
+                "codex hooks" => "codex_hooks",
+                "codex config" => "codex_config",
+                // `store` and `daemon` are already covered by doctor's own
+                // integrity/daemon sections — skip to avoid duplicate rows.
+                _ => return None,
+            };
+            let (status, detail) = match item.status {
+                CheckStatus::Pass(extra) => {
+                    (Status::Pass, extra.unwrap_or_else(|| "ok".to_string()))
+                }
+                CheckStatus::Warn(msg) => (Status::Warn, msg),
+                CheckStatus::Fail(msg) => (Status::Fail, msg),
+            };
+            // `detail` already carries the specifics (e.g. "missing:
+            // pre-read.sh"); `fix` is a static, name-keyed one-liner.
+            let fix = if matches!(status, Status::Pass) {
+                None
+            } else {
+                Some(match name {
+                    "git_repo" => "run mati from inside a git repository",
+                    "mati_on_path" => "ensure the mati binary is on PATH",
+                    "awk_float_math" => "install awk/gawk and ensure it is on PATH",
+                    "agent_host" => "mati hooks --claude  (or --codex)",
+                    "codex_hooks" | "codex_config" => "mati hooks --codex",
+                    // claude_hooks / claude_config
+                    _ => "mati hooks --claude",
+                })
+            };
+            Some(CheckResult {
+                section: "enforcement",
+                name,
+                status,
+                detail,
+                fix,
+            })
+        })
+        .collect()
+}
+
+/// Verify the enforcement audit chain. Routed through `StoreProxy`, so unlike
+/// the `Store::open`-based dirty_marker/drift checks it runs even while the
+/// daemon holds the store lock. Reuses `enforcement::verify_chain` — the single
+/// source of truth for the frozen hash contract (same primitive as
+/// `mati verify-chain`). Read-only, zero-network.
+async fn collect_chain_check(cwd: &Path) -> CheckResult {
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult {
+                section: "integrity",
+                name: "chain",
+                status: Status::Info,
+                detail: "skipped — no store initialized for this directory".to_string(),
+                fix: None,
+            };
+        }
+    };
+    let events = proxy
+        .scan_enforcement_events(0, u64::MAX)
+        .await
+        .unwrap_or_default();
+    let _ = proxy.close().await;
+
+    let total = events.len();
+    let result = mati_core::store::enforcement::verify_chain(&events);
+    if result.is_valid() {
+        CheckResult {
+            section: "integrity",
+            name: "chain",
+            status: Status::Pass,
+            detail: format!("intact — {total} event(s), every hash verified"),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            section: "integrity",
+            name: "chain",
+            status: Status::Fail,
+            detail: format!(
+                "BROKEN — {} tampered, {} linkage break(s), {} unknown-schema of {total} event(s)",
+                result.tampered_events, result.linkage_breaks, result.unknown_schema
+            ),
+            fix: Some("mati verify-chain --verbose"),
+        }
+    }
+}
+
+/// Knowledge freshness — how many records have gone stale relative to the code.
+/// Reads the write-seq-validated stale cache via StoreProxy (cheap; no full
+/// scan). `Info` when the cache is cold (run `mati stale`); `Warn` when records
+/// are stale — advisory, since stale knowledge degrades enforcement quality but
+/// doesn't break it, so this never fails the CI gate.
+async fn collect_freshness_check(cwd: &Path) -> CheckResult {
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult {
+                section: "knowledge",
+                name: "freshness",
+                status: Status::Info,
+                detail: "skipped — no store initialized for this directory".to_string(),
+                fix: None,
+            };
+        }
+    };
+    let summary = crate::cli::stale::cached_stale_summary(&proxy).await;
+    let _ = proxy.close().await;
+    match summary {
+        None => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Info,
+            detail: "unknown — run `mati stale` for a current count".to_string(),
+            fix: None,
+        },
+        Some(s) if s.total == 0 => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Pass,
+            detail: "no stale records".to_string(),
+            fix: None,
+        },
+        Some(s) => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Warn,
+            detail: format!(
+                "{} stale record(s) ({} stale, {} liability, {} tombstone)",
+                s.total, s.stale, s.liability, s.tombstone
+            ),
+            fix: Some("mati stale  (then mati init / mati reparse to refresh)"),
+        },
     }
 }
 
@@ -593,8 +693,10 @@ fn render_human(report: &Report, use_color: bool) {
                 println!();
             }
             let title = match c.section {
+                "enforcement" => "Enforcement",
                 "daemon" => "Daemon",
                 "integrity" => "Integrity",
+                "knowledge" => "Knowledge",
                 other => other,
             };
             println!("{title}");
@@ -869,10 +971,10 @@ mod tests {
     /// Schema-stability invariant for `mati doctor --json`:
     /// every scenario (no-daemon-no-store, no-daemon-with-store,
     /// daemon-running, daemon-unresponsive, store-open-failed) must emit
-    /// exactly one `daemon/ping` check followed by `integrity/dirty_marker`
-    /// then `integrity/drift`, in that order. CI consumers parse the report
-    /// by name and by index, and a `version: 1` schema must keep both
-    /// stable.
+    /// the five `enforcement/*` probes first, then exactly one `daemon/ping`
+    /// check followed by `integrity/dirty_marker` then `integrity/drift`, in
+    /// that order. CI consumers parse the report by name and by index, and a
+    /// `version: 2` schema must keep both stable.
     ///
     /// This is a hermetic test: it drives `collect()` against a tempdir
     /// with no daemon and no `knowledge.db`, exercising the no-store
@@ -889,12 +991,25 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                ("enforcement", "git_repo"),
+                ("enforcement", "mati_on_path"),
+                ("enforcement", "awk_float_math"),
+                ("enforcement", "agent_host"),
+                ("enforcement", "claude_hooks"),
+                ("enforcement", "claude_config"),
+                ("enforcement", "codex_hooks"),
+                ("enforcement", "codex_config"),
                 ("daemon", "ping"),
                 ("integrity", "dirty_marker"),
                 ("integrity", "drift"),
+                ("integrity", "chain"),
+                ("knowledge", "freshness"),
             ],
-            "doctor JSON check sequence must be ping → dirty_marker → drift"
+            "doctor JSON check sequence must be the enforcement probes \
+             (git_repo → mati_on_path → awk_float_math → agent_host → \
+             claude_hooks → claude_config → codex_hooks → codex_config) then \
+             ping → dirty_marker → drift → chain → freshness"
         );
-        assert_eq!(report.version, 1);
+        assert_eq!(report.version, 2);
     }
 }
