@@ -505,6 +505,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // the daemon holds the store lock (unlike dirty_marker/drift above). Reuses
     // the frozen-contract primitive `enforcement::verify_chain`.
     checks.push(collect_chain_check(cwd).await);
+    checks.push(collect_freshness_check(cwd).await);
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -644,6 +645,54 @@ async fn collect_chain_check(cwd: &Path) -> CheckResult {
     }
 }
 
+/// Knowledge freshness — how many records have gone stale relative to the code.
+/// Reads the write-seq-validated stale cache via StoreProxy (cheap; no full
+/// scan). `Info` when the cache is cold (run `mati stale`); `Warn` when records
+/// are stale — advisory, since stale knowledge degrades enforcement quality but
+/// doesn't break it, so this never fails the CI gate.
+async fn collect_freshness_check(cwd: &Path) -> CheckResult {
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult {
+                section: "knowledge",
+                name: "freshness",
+                status: Status::Info,
+                detail: "skipped — no store initialized for this directory".to_string(),
+                fix: None,
+            };
+        }
+    };
+    let summary = crate::cli::stale::cached_stale_summary(&proxy).await;
+    let _ = proxy.close().await;
+    match summary {
+        None => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Info,
+            detail: "unknown — run `mati stale` for a current count".to_string(),
+            fix: None,
+        },
+        Some(s) if s.total == 0 => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Pass,
+            detail: "no stale records".to_string(),
+            fix: None,
+        },
+        Some(s) => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Warn,
+            detail: format!(
+                "{} stale record(s) ({} stale, {} liability, {} tombstone)",
+                s.total, s.stale, s.liability, s.tombstone
+            ),
+            fix: Some("mati stale  (then mati init / mati reparse to refresh)"),
+        },
+    }
+}
+
 /// Read all `analytics:extraction:*` records via StoreProxy and aggregate.
 /// Returns `None` when the proxy can't be opened (uninitialized repo); an
 /// empty `ExtractionStats` (total=0) is a valid Some(stats) — means "no
@@ -721,6 +770,7 @@ fn render_human(report: &Report, use_color: bool) {
                 "enforcement" => "Enforcement",
                 "daemon" => "Daemon",
                 "integrity" => "Integrity",
+                "knowledge" => "Knowledge",
                 other => other,
             };
             println!("{title}");
@@ -1027,11 +1077,12 @@ mod tests {
                 ("integrity", "dirty_marker"),
                 ("integrity", "drift"),
                 ("integrity", "chain"),
+                ("knowledge", "freshness"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
-             ping → dirty_marker → drift → chain"
+             ping → dirty_marker → drift → chain → freshness"
         );
         assert_eq!(report.version, 2);
     }

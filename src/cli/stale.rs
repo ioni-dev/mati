@@ -111,6 +111,45 @@ pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
 
 // ── Args ─────────────────────────────────────────────────────────────────────
 
+// ── doctor freshness helper ───────────────────────────────────────────────────
+
+/// Stale-record counts by tier — used by `mati doctor`'s freshness check.
+pub(crate) struct StaleSummary {
+    pub total: usize,
+    pub stale: usize,
+    pub liability: usize,
+    pub tombstone: usize,
+}
+
+/// Read stale counts from the write-seq-validated cache. Returns `None` when no
+/// valid cache exists (the caller treats that as "unknown — run `mati stale`").
+/// Cheap: a single cache read, never a full scan.
+pub(crate) async fn cached_stale_summary(proxy: &StoreProxy) -> Option<StaleSummary> {
+    let current_seq = proxy.read_write_seq();
+    let cached = proxy.get(STALE_CACHE_KEY).await.ok()??;
+    let entry = cached.payload_as::<StaleCache>()?;
+    if entry.write_seq != current_seq {
+        return None;
+    }
+    let mut s = StaleSummary {
+        total: entry.records.len(),
+        stale: 0,
+        liability: 0,
+        tombstone: 0,
+    };
+    for r in &entry.records {
+        match r.staleness.tier {
+            StalenessTier::Stale => s.stale += 1,
+            StalenessTier::Liability => s.liability += 1,
+            StalenessTier::Tombstone => s.tombstone += 1,
+            _ => {}
+        }
+    }
+    Some(s)
+}
+
+// ── Args ─────────────────────────────────────────────────────────────────────
+
 #[derive(Args)]
 pub struct StaleArgs {
     /// Show full signal details and action hints per record
