@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
 pub mod analysis;
+pub mod eval;
 pub mod graph;
 pub mod health;
 pub mod hooks;

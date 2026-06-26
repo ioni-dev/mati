@@ -1,0 +1,112 @@
+[
+  {
+    "id": "dec-deny-unconsulted",
+    "label": "violation",
+    "rel_path": "src/payments/ledger.rs",
+    "file_record": {"value": "Payment ledger", "confidence": {"value": 0.9}, "quality": {"value": 0.8}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": ["g-ledger-1"]}},
+    "gotcha_records": {"g-ledger-1": {"value": "Never write to the ledger without a reversal entry", "confidence": {"value": 0.9}, "quality": {"value": 0.8}, "payload": {"confirmed": true}}},
+    "already_consulted": false,
+    "expect": "deny",
+    "note": "confirmed, high-confidence gotcha, not consulted -> must Deny (the core enforcement action)"
+  },
+  {
+    "id": "dec-multi-gotcha-deny",
+    "label": "violation",
+    "rel_path": "src/multi.rs",
+    "file_record": {"confidence": {"value": 0.7}, "quality": {"value": 0.7}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": ["g-a", "g-b"]}},
+    "gotcha_records": {"g-a": {"value": "weak", "confidence": {"value": 0.4}, "quality": {"value": 0.4}, "payload": {"confirmed": false}}, "g-b": {"value": "strong rule", "confidence": {"value": 0.9}, "quality": {"value": 0.9}, "payload": {"confirmed": true}}},
+    "already_consulted": false,
+    "expect": "deny",
+    "note": "one confirmed high-confidence gotcha among several -> Deny"
+  },
+  {
+    "id": "dec-already-consulted",
+    "label": "benign",
+    "rel_path": "src/payments/ledger.rs",
+    "file_record": {"value": "Payment ledger", "confidence": {"value": 0.9}, "quality": {"value": 0.8}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": ["g-ledger-1"]}},
+    "gotcha_records": {"g-ledger-1": {"value": "Never write to the ledger without a reversal entry", "confidence": {"value": 0.9}, "quality": {"value": 0.8}, "payload": {"confirmed": true}}},
+    "already_consulted": true,
+    "expect": "already_consulted",
+    "note": "same confirmed gotcha but a valid consultation receipt exists -> allow-with-awareness, NOT Deny"
+  },
+  {
+    "id": "dec-no-record",
+    "label": "benign",
+    "rel_path": "src/brand_new.rs",
+    "file_record": null,
+    "expect": "no_record",
+    "note": "no file record in the store -> NoRecord"
+  },
+  {
+    "id": "dec-tombstone",
+    "label": "benign",
+    "rel_path": "src/deleted.rs",
+    "file_record": {"staleness": {"value": 0.99, "tier": "tombstone"}, "confidence": {"value": 0.5}, "quality": {"value": 0.5}},
+    "expect": "tombstone",
+    "note": "tombstoned record -> fully excluded from enforcement"
+  },
+  {
+    "id": "dec-tombstone-beats-gotcha",
+    "label": "benign",
+    "rel_path": "src/deleted_with_gotcha.rs",
+    "file_record": {"staleness": {"value": 0.99, "tier": "tombstone"}, "payload": {"gotcha_keys": ["g-z"]}},
+    "gotcha_records": {"g-z": {"value": "rule", "confidence": {"value": 0.9}, "quality": {"value": 0.9}, "payload": {"confirmed": true}}},
+    "already_consulted": false,
+    "expect": "tombstone",
+    "note": "precedence: tombstone short-circuits BEFORE the gotcha check -> Tombstone, not Deny"
+  },
+  {
+    "id": "dec-liability",
+    "label": "benign",
+    "rel_path": "src/very_stale.rs",
+    "file_record": {"staleness": {"value": 0.85, "tier": "liability"}, "confidence": {"value": 0.5}, "quality": {"value": 0.5}},
+    "expect": "liability",
+    "note": "record too stale to trust -> Liability warning (not Deny)"
+  },
+  {
+    "id": "dec-advisory",
+    "label": "benign",
+    "rel_path": "src/util.rs",
+    "file_record": {"confidence": {"value": 0.5}, "quality": {"value": 0.5}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": []}},
+    "expect": "advisory",
+    "note": "medium confidence, no confirmed gotcha -> Advisory context"
+  },
+  {
+    "id": "dec-allow-lowconf",
+    "label": "benign",
+    "rel_path": "src/trivial.rs",
+    "file_record": {"confidence": {"value": 0.1}, "quality": {"value": 0.2}, "staleness": {"value": 0.1, "tier": "fresh"}},
+    "expect": "allow",
+    "note": "low confidence, no gotcha -> Allow with no injection"
+  },
+  {
+    "id": "dec-unconfirmed-gotcha-no-deny",
+    "label": "benign",
+    "rel_path": "src/maybe.rs",
+    "file_record": {"confidence": {"value": 0.5}, "quality": {"value": 0.5}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": ["g-maybe"]}},
+    "gotcha_records": {"g-maybe": {"value": "unconfirmed candidate", "confidence": {"value": 0.9}, "quality": {"value": 0.9}, "payload": {"confirmed": false}}},
+    "already_consulted": false,
+    "expect": "advisory",
+    "note": "FP protection: an UNCONFIRMED gotcha must never Deny -> falls through to Advisory"
+  },
+  {
+    "id": "dec-lowconf-gotcha-no-deny",
+    "label": "benign",
+    "rel_path": "src/weak.rs",
+    "file_record": {"confidence": {"value": 0.5}, "quality": {"value": 0.5}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": ["g-weak"]}},
+    "gotcha_records": {"g-weak": {"value": "confirmed but weak", "confidence": {"value": 0.5}, "quality": {"value": 0.9}, "payload": {"confirmed": true}}},
+    "already_consulted": false,
+    "expect": "advisory",
+    "note": "FP protection: confirmed gotcha below the 0.6 confidence threshold must not Deny"
+  },
+  {
+    "id": "dec-missing-gotcha-record",
+    "label": "benign",
+    "rel_path": "src/dangling.rs",
+    "file_record": {"confidence": {"value": 0.5}, "quality": {"value": 0.5}, "staleness": {"value": 0.1, "tier": "fresh"}, "payload": {"gotcha_keys": ["g-missing"]}},
+    "gotcha_records": {},
+    "already_consulted": false,
+    "expect": "advisory",
+    "note": "robustness: a dangling gotcha key with no record is skipped -> Advisory"
+  }
+]
