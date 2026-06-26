@@ -121,16 +121,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
+      # Software Bill of Materials for the SHIPPED build. Generated from the
+      # default feature set — exactly what the release binaries above are built
+      # with (no `semantic`), so the SBOM lists the same dependency closure that
+      # the build-time + runtime zero-network attestations (see ci.yml) cover.
+      # Ships with every release so security teams can diff/scan the closure
+      # offline instead of taking the "zero network" claim on faith.
+      - name: Generate SBOM (CycloneDX) for the shipped build
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json
+          sbom="$(ls mati*.cdx.json bom.json 2>/dev/null | head -1 || true)"
+          if [ -z "${sbom:-}" ]; then sbom="$(find . -maxdepth 2 -name '*.cdx.json' | head -1)"; fi
+          test -n "${sbom:-}" && test -f "$sbom"
+          cp "$sbom" artifacts/mati-sbom.cdx.json
+          echo "SBOM: $sbom -> artifacts/mati-sbom.cdx.json ($(wc -c < artifacts/mati-sbom.cdx.json) bytes)"
+
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum mati-*.tar.gz > checksums.txt
+          sha256sum mati-*.tar.gz mati-sbom.cdx.json > checksums.txt
           cat checksums.txt
 
       - name: Publish release
@@ -141,6 +160,7 @@ jobs:
             artifacts/mati-aarch64-unknown-linux-musl.tar.gz
             artifacts/mati-x86_64-apple-darwin.tar.gz
             artifacts/mati-aarch64-apple-darwin.tar.gz
+            artifacts/mati-sbom.cdx.json
             artifacts/checksums.txt
           generate_release_notes: true
         env:

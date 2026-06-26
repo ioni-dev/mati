@@ -197,6 +197,8 @@ Also Enterprise-only, and not in this repo: multi-repo sync and a cross-repo got
 
 Enterprise is a reporting layer on top of the local log. The enforcement path itself is identical in both tiers: local-only, deterministic, zero network calls. mati never phones home.
 
+That's verifiable, not just asserted. On every change, CI fails the build if the default binary links any HTTP-client crate (dependency ban) and proves the enforcement path opens no outbound socket (syscall audit under a network namespace); `mati doctor` surfaces the same posture in-tool; and every release ships a [CycloneDX](https://cyclonedx.org) SBOM of the exact dependency closure. Don't take our word for it — check the bill of materials.
+
 See [getmati.dev](https://getmati.dev) for the Enterprise tier.
 
 ---
