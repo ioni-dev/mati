@@ -1,0 +1,12 @@
+{
+  "_comment": "Detection-layer eval baseline. `known_gaps` lists case ids whose CURRENT detection output does not match ground truth — the honest, version-controlled 'here is exactly what we currently miss' disclosure. The corpus test asserts the failing set equals this list exactly: a NEW miss fails CI (regression), and a newly-FIXED gap also fails (so the baseline must be updated down, ratcheting recall up). Each gap below is a real enforcement-bypass class for the bash file-read gate; hardening them is follow-up work tracked separately from this corpus.",
+  "known_gaps": [
+    "adv-abspath-cat",
+    "adv-cat-multifile",
+    "adv-env-cat",
+    "adv-grep-quoted-pattern",
+    "adv-head-n-value",
+    "adv-sudo-cat",
+    "adv-tail-n-value"
+  ]
+}
