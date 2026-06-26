@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod diff;
 pub mod doctor;
 pub mod enrich;
+pub mod eval;
 pub mod explain;
 pub mod extract_signals;
 pub mod gaps;
