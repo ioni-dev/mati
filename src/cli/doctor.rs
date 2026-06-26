@@ -433,6 +433,12 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     checks.push(collect_chain_check(cwd).await);
     checks.push(collect_freshness_check(cwd).await);
 
+    // Network/telemetry posture — a compile-time attestation surfaced in-tool,
+    // so an auditor sees mati's headline invariant by running `mati doctor`
+    // rather than reading the CI workflow. Appended last so the `--json`
+    // (version 2) array stays index-stable for existing consumers.
+    checks.push(collect_network_attestation());
+
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
 
@@ -460,6 +466,48 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
         lifecycle,
         summary,
         extraction,
+    }
+}
+
+/// Surface the build's network/telemetry posture as a first-class doctor row.
+///
+/// This is the in-tool face of mati's headline invariant ("zero network calls,
+/// never phones home"): an auditor running `mati doctor` sees the posture
+/// directly instead of having to read the CI workflow. It is a *compile-time*
+/// attestation, deliberately NOT a runtime probe — a probe would itself be a
+/// network call, contradicting the very property being attested. The hard proof
+/// lives in CI (the build-time dep-ban + the runtime syscall audit); this row
+/// reports which build you are running.
+///
+/// Accurate via `cfg!(feature = "semantic")`: the default (enforcement) build
+/// links no network/HTTP-client crate; the opt-in `semantic` feature is the one
+/// documented exception — it fetches the embedding model via hf-hub on first
+/// use — and is disclosed honestly rather than hidden.
+fn collect_network_attestation() -> CheckResult {
+    if cfg!(feature = "semantic") {
+        CheckResult {
+            section: "attestation",
+            name: "network",
+            status: Status::Info,
+            detail: "semantic feature enabled — embedding-model fetch via hf-hub \
+                     is linked (opt-in; downloads all-MiniLM-L6-v2 on first use). \
+                     Enforcement decisions remain local and make no outbound \
+                     connection."
+                .into(),
+            fix: None,
+        }
+    } else {
+        CheckResult {
+            section: "attestation",
+            name: "network",
+            status: Status::Pass,
+            detail: "no network/HTTP-client dependency linked in this build; the \
+                     enforcement path makes no outbound connection (verified in \
+                     CI: build-time dep-ban + runtime syscall audit). mati never \
+                     phones home."
+                .into(),
+            fix: None,
+        }
     }
 }
 
@@ -697,6 +745,7 @@ fn render_human(report: &Report, use_color: bool) {
                 "daemon" => "Daemon",
                 "integrity" => "Integrity",
                 "knowledge" => "Knowledge",
+                "attestation" => "Attestation",
                 other => other,
             };
             println!("{title}");
@@ -1004,11 +1053,14 @@ mod tests {
                 ("integrity", "drift"),
                 ("integrity", "chain"),
                 ("knowledge", "freshness"),
+                ("attestation", "network"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
-             ping → dirty_marker → drift → chain → freshness"
+             ping → dirty_marker → drift → chain → freshness → network \
+             (the network attestation is appended last so the --json array \
+             stays index-stable for existing consumers)"
         );
         assert_eq!(report.version, 2);
     }
