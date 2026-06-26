@@ -173,10 +173,17 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
 
 /// Extract the target file path from a classified command.
 ///
-/// Replicates the bash hook heuristic:
-/// - CatLike: prefer first double-quoted path, fallback to first non-flag arg.
-/// - GrepLike: prefer last double-quoted path, fallback to last non-flag arg
-///   (strip surrounding single quotes).
+/// Tokenizes the command shell-style (honoring quotes) and picks the file by
+/// each command's real grammar:
+/// - CatLike (`cat/less/head/tail/bat FILE`): the file is the FIRST positional.
+/// - GrepLike (`grep/rg/sed/awk [flags] PATTERN [FILE...]`): the first
+///   positional is the search PATTERN; the file is the LAST positional, and
+///   exists only when there is one after the pattern (otherwise stdin is read).
+///
+/// Using real tokens + position — instead of a "the file is whatever's quoted"
+/// heuristic — is what lets `grep -r "secret" src/db.rs` resolve to `src/db.rs`
+/// (the path) rather than `secret` (the quoted pattern), while still handling
+/// quoted paths that contain spaces.
 ///
 /// Stops at pipe (`|`), semicolon (`;`), `&&`, `||`.
 pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
@@ -185,26 +192,20 @@ pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
     // not `cat`).
     let eff = effective_command(cmd);
 
-    // Isolate the command portion before shell operators.
+    // Isolate the command portion before shell operators, then tokenize it the
+    // way a shell would so a quoted path keeps its spaces as one token and a
+    // quoted pattern is just its inner text.
     let cmd_part = split_at_shell_operator(&eff);
+    let positionals = positional_args(&shell_tokens(cmd_part));
 
     match class {
-        CommandClass::CatLike => {
-            if let Some(q) = extract_first_double_quoted(cmd_part) {
-                return Some(q);
-            }
-            positional_arg(cmd_part, true)
-        }
+        CommandClass::CatLike => positionals.first().cloned(),
         CommandClass::GrepLike => {
-            if let Some(q) = extract_last_double_quoted(cmd_part) {
-                return Some(q);
+            if positionals.len() >= 2 {
+                positionals.last().cloned()
+            } else {
+                None
             }
-            positional_arg(cmd_part, false).map(|s| {
-                // Strip surrounding single quotes (grep patterns).
-                s.trim_start_matches('\'')
-                    .trim_end_matches('\'')
-                    .to_string()
-            })
         }
     }
 }
@@ -244,73 +245,67 @@ fn split_at_shell_operator(s: &str) -> &str {
     s
 }
 
-/// Extract the content of the first double-quoted string.
-fn extract_first_double_quoted(s: &str) -> Option<String> {
-    let start = s.find('"')? + 1;
-    let end = s[start..].find('"')? + start;
-    let inner = &s[start..end];
-    if inner.is_empty() {
-        None
-    } else {
-        Some(inner.to_string())
-    }
-}
-
-/// Extract the content of the last double-quoted string.
-fn extract_last_double_quoted(s: &str) -> Option<String> {
-    let mut last: Option<String> = None;
-    let mut pos = 0;
-    while pos < s.len() {
-        if let Some(offset) = s[pos..].find('"') {
-            let abs_start = pos + offset + 1;
-            if let Some(end_offset) = s[abs_start..].find('"') {
-                let inner = &s[abs_start..abs_start + end_offset];
-                if !inner.is_empty() {
-                    last = Some(inner.to_string());
+/// Split a command into shell-style tokens, honoring single and double quotes
+/// (the quotes are stripped from the returned tokens). Not a full shell parser
+/// — enough for path extraction: a quoted path keeps its spaces as one token,
+/// and a quoted pattern becomes just its inner text. Runs of whitespace are
+/// collapsed; an unterminated quote consumes to end of input (best effort).
+fn shell_tokens(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {
+                in_token = true;
+                let quote = c;
+                for q in chars.by_ref() {
+                    if q == quote {
+                        break;
+                    }
+                    cur.push(q);
                 }
-                pos = abs_start + end_offset + 1;
-            } else {
-                break;
             }
-        } else {
-            break;
+            c if c.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            c => {
+                in_token = true;
+                cur.push(c);
+            }
         }
     }
-    last
+    if in_token {
+        tokens.push(cur);
+    }
+    tokens
 }
 
-/// Extract first or last positional (non-flag) argument after the command word.
-fn positional_arg(cmd_part: &str, first: bool) -> Option<String> {
-    let words: Vec<&str> = cmd_part.split_whitespace().collect();
-    if words.len() < 2 {
-        return None;
-    }
-    // Collect non-flag args, skipping a purely-numeric token that follows a
-    // flag — it's the flag's value, not the file (`tail -n 100 file`,
-    // `head -c 5 file`). Without this, `100`/`5` get picked as the path.
-    let mut args: Vec<&str> = Vec::new();
+/// Positional (non-flag) arguments after the command word, in order. Skips a
+/// purely-numeric token that follows a flag — it is the flag's value, not a
+/// file (`tail -n 100 file`, `head -c 5 file`).
+fn positional_args(tokens: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
     let mut prev_was_flag = false;
-    for &w in &words[1..] {
-        if w.starts_with('-') {
+    for t in tokens.iter().skip(1) {
+        if t.starts_with('-') {
             prev_was_flag = true;
             continue;
         }
-        if prev_was_flag && !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()) {
+        if prev_was_flag && !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
             prev_was_flag = false;
             continue;
         }
         prev_was_flag = false;
-        args.push(w);
+        if !t.is_empty() {
+            args.push(t.clone());
+        }
     }
-    if args.is_empty() {
-        return None;
-    }
-    let picked = if first { args[0] } else { args[args.len() - 1] };
-    if picked.is_empty() {
-        None
-    } else {
-        Some(picked.to_string())
-    }
+    args
 }
 
 // ── apply_patch envelope parsing ────────────────────────────────────────────
@@ -1400,5 +1395,50 @@ mod tests {
         // Pinned so a future change that closes it also updates the eval
         // baseline (tests/fixtures/eval/baseline.json :: adv-sudo-uroot-cat).
         assert_eq!(classify_command("sudo -u root cat src/secret.rs"), None);
+    }
+
+    // ── quote-aware tokenizer: grep grammar (pattern vs path) ─────────────
+
+    #[test]
+    fn extract_grep_quoted_pattern_picks_the_path() {
+        // The quoted token is the PATTERN; the file is the last positional.
+        assert_eq!(
+            extract_file_path("grep -r \"secret\" src/db.rs", CommandClass::GrepLike),
+            Some("src/db.rs".to_string())
+        );
+        assert_eq!(
+            extract_file_path("grep \"pat\" \"src/db.rs\"", CommandClass::GrepLike),
+            Some("src/db.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_grep_without_file_reads_stdin() {
+        // Only a pattern, no file -> no path to gate.
+        assert_eq!(
+            extract_file_path("grep \"secret\"", CommandClass::GrepLike),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_cat_quoted_path_with_spaces() {
+        // The tokenizer keeps a quoted path's spaces as a single token.
+        assert_eq!(
+            extract_file_path("cat \"src/with space.rs\"", CommandClass::CatLike),
+            Some("src/with space.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_tokens_honor_quotes() {
+        assert_eq!(
+            shell_tokens("grep -r \"a b\" file.rs"),
+            vec!["grep", "-r", "a b", "file.rs"]
+        );
+        assert_eq!(
+            shell_tokens("awk '{print $1}' src/db.rs"),
+            vec!["awk", "{print $1}", "src/db.rs"]
+        );
     }
 }
