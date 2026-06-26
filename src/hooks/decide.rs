@@ -101,9 +101,61 @@ fn matches_command_word(trimmed: &str, word: &str) -> bool {
     trimmed.as_bytes()[word.len()].is_ascii_whitespace()
 }
 
+/// Command prefixes that wrap the real command without changing what it reads:
+/// `sudo cat …`, `env LOG=1 cat …`, `nice cat …`. Stripped before classifying
+/// so the read gate sees `cat`, not the wrapper. Wrapper *flags* (e.g.
+/// `sudo -u root`) are intentionally NOT parsed here — guessing which take a
+/// value risks mis-stripping a real argument, so that narrow case is left as a
+/// tracked gap rather than handled unsafely.
+const PREFIX_WORDS: &[&str] = &[
+    "sudo", "doas", "env", "nice", "ionice", "nohup", "setsid", "stdbuf", "command", "time",
+];
+
+/// Is `tok` a `NAME=VALUE` shell environment assignment?
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.find('=') {
+        Some(eq) if eq > 0 => {
+            let name = &tok[..eq];
+            name.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+/// Normalize a command for detection: strip leading env assignments and wrapper
+/// prefixes (`sudo`/`env`/`nice`/…), then reduce the command word to its
+/// basename (`/bin/cat` → `cat`). Returns the effective command, left-trimmed.
+/// Pure; closes the prefix and absolute-path bypass classes for the read gate.
+fn effective_command(cmd: &str) -> String {
+    let mut rest = cmd.trim_start();
+    loop {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..end];
+        if tok.is_empty() {
+            break;
+        }
+        if is_env_assignment(tok) || PREFIX_WORDS.contains(&tok) {
+            rest = rest[end..].trim_start();
+            continue;
+        }
+        break;
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (word, args) = rest.split_at(end);
+    let base = word.rsplit('/').next().unwrap_or(word);
+    let mut out = String::with_capacity(base.len() + args.len());
+    out.push_str(base);
+    out.push_str(args);
+    out
+}
+
 /// Classify a bash command string. Returns `None` for non-file-read commands.
 pub fn classify_command(cmd: &str) -> Option<CommandClass> {
-    let trimmed = cmd.trim_start();
+    let eff = effective_command(cmd);
+    let trimmed = eff.as_str();
     for &word in CAT_LIKE {
         if matches_command_word(trimmed, word) {
             return Some(CommandClass::CatLike);
@@ -128,10 +180,13 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
 ///
 /// Stops at pipe (`|`), semicolon (`;`), `&&`, `||`.
 pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
-    let trimmed = cmd.trim_start();
+    // Same normalization as `classify_command` so prefixes/abs-paths don't
+    // throw off positional extraction (`sudo cat foo` must extract `foo`,
+    // not `cat`).
+    let eff = effective_command(cmd);
 
     // Isolate the command portion before shell operators.
-    let cmd_part = split_at_shell_operator(trimmed);
+    let cmd_part = split_at_shell_operator(&eff);
 
     match class {
         CommandClass::CatLike => {
@@ -230,11 +285,23 @@ fn positional_arg(cmd_part: &str, first: bool) -> Option<String> {
     if words.len() < 2 {
         return None;
     }
-    let args: Vec<&str> = words[1..]
-        .iter()
-        .filter(|w| !w.starts_with('-'))
-        .copied()
-        .collect();
+    // Collect non-flag args, skipping a purely-numeric token that follows a
+    // flag — it's the flag's value, not the file (`tail -n 100 file`,
+    // `head -c 5 file`). Without this, `100`/`5` get picked as the path.
+    let mut args: Vec<&str> = Vec::new();
+    let mut prev_was_flag = false;
+    for &w in &words[1..] {
+        if w.starts_with('-') {
+            prev_was_flag = true;
+            continue;
+        }
+        if prev_was_flag && !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()) {
+            prev_was_flag = false;
+            continue;
+        }
+        prev_was_flag = false;
+        args.push(w);
+    }
     if args.is_empty() {
         return None;
     }
@@ -1249,5 +1316,89 @@ mod tests {
         } else {
             panic!("expected Advisory, got {:?}", result.decision);
         }
+    }
+
+    // ── detection hardening: prefixes, abs-path, numeric flag values ──────
+
+    #[test]
+    fn classify_strips_sudo_prefix() {
+        assert_eq!(
+            classify_command("sudo cat src/secret.rs"),
+            Some(CommandClass::CatLike)
+        );
+    }
+
+    #[test]
+    fn classify_strips_env_assignment_prefix() {
+        assert_eq!(
+            classify_command("env LOG=1 cat src/secret.rs"),
+            Some(CommandClass::CatLike)
+        );
+        assert_eq!(
+            classify_command("LOG=1 DEBUG=2 cat src/secret.rs"),
+            Some(CommandClass::CatLike)
+        );
+    }
+
+    #[test]
+    fn classify_reduces_absolute_path_to_basename() {
+        assert_eq!(
+            classify_command("/bin/cat src/secret.rs"),
+            Some(CommandClass::CatLike)
+        );
+    }
+
+    #[test]
+    fn classify_prefix_on_non_read_stays_none() {
+        // Stripping a wrapper must not invent a read: `sudo rm` is still not one.
+        assert_eq!(classify_command("sudo rm -rf build"), None);
+        assert_eq!(classify_command("env X=1 ls"), None);
+    }
+
+    #[test]
+    fn extract_through_sudo_prefix() {
+        assert_eq!(
+            extract_file_path("sudo cat src/secret.rs", CommandClass::CatLike),
+            Some("src/secret.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_through_abs_path() {
+        assert_eq!(
+            extract_file_path("/bin/cat src/secret.rs", CommandClass::CatLike),
+            Some("src/secret.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_skips_numeric_flag_value() {
+        // The `100`/`5` are arguments to `-n`/`-c`, not the file.
+        assert_eq!(
+            extract_file_path("tail -n 100 src/secret.rs", CommandClass::CatLike),
+            Some("src/secret.rs".to_string())
+        );
+        assert_eq!(
+            extract_file_path("head -c 5 src/secret.rs", CommandClass::CatLike),
+            Some("src/secret.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_keeps_attached_numeric_flag() {
+        // `-5` is itself a flag (starts with '-'), already filtered; path follows.
+        assert_eq!(
+            extract_file_path("head -5 src/db.rs", CommandClass::CatLike),
+            Some("src/db.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn sudo_with_flags_is_a_known_gap() {
+        // Documents the boundary of the prefix fix: wrapper-flag arity is
+        // ambiguous (`-u` takes a value), so this is intentionally NOT handled.
+        // Pinned so a future change that closes it also updates the eval
+        // baseline (tests/fixtures/eval/baseline.json :: adv-sudo-uroot-cat).
+        assert_eq!(classify_command("sudo -u root cat src/secret.rs"), None);
     }
 }
