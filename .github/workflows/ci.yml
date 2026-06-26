@@ -299,3 +299,24 @@ jobs:
 
       - name: cargo deny check (bans + advisories + sources)
         run: cargo deny check bans advisories sources
+
+      # Zero-network attestation: the DEFAULT build — what `cargo install mati`
+      # ships, and what runs the enforcement hot path — must link NO network /
+      # HTTP-client crate. This makes CLAUDE.md's invariant ("DENY/ALLOW/receipt
+      # is local, zero network, always ... never phones home") machine-enforced
+      # and a permanent regression guard. The opt-in `semantic` feature downloads
+      # an embedding model via hf-hub and is the one documented exception, so it
+      # is intentionally excluded here (this check uses --no-default-features).
+      - name: Zero-network attestation (default build links no HTTP client)
+        run: |
+          set -euo pipefail
+          net=$(cargo tree --no-default-features --edges normal --prefix none --format '{p}' \
+                | awk '{print $1}' | sort -u \
+                | grep -iE '^(reqwest|hyper|hyper-util|hyper-rustls|hyper-tls|h2|ureq|isahc|surf|attohttpc|curl|curl-sys)$' \
+                || true)
+          if [ -n "$net" ]; then
+            echo "::error::network-capable crate(s) in the DEFAULT (enforcement) build — violates the zero-network invariant (CLAUDE.md):"
+            echo "$net"
+            exit 1
+          fi
+          echo "OK: default build links no network/HTTP-client crate"
