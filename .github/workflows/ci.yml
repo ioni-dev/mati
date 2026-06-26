@@ -411,3 +411,21 @@ jobs:
             echo "  OK: 'mati init' completes with no network namespace"
           fi
           echo "zero-network runtime attestation: PASS"
+
+  eval-corpus:
+    name: Eval / regression corpus
+    runs-on: ubuntu-latest
+    # Detection-layer eval corpus (idea 4, P0). Replays a labeled corpus through
+    # the pure enforcement detection functions (classify_command +
+    # extract_file_path) and gates on the committed baseline: a NEW miss fails
+    # CI (regression), and a FIXED gap also fails (forcing an honest baseline
+    # update that ratchets recall up). Runs on PRs — unlike the full `test` job,
+    # which is push-to-main only — so the enforcement-correctness number is
+    # visible on every change. Pure functions: no store, daemon, or network.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run detection eval corpus
+        run: cargo test --locked --test eval_corpus -- --nocapture
