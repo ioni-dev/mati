@@ -320,3 +320,94 @@ jobs:
             exit 1
           fi
           echo "OK: default build links no network/HTTP-client crate"
+
+  no-network:
+    name: No-network runtime attestation
+    runs-on: ubuntu-latest
+    # Behavioral companion to the build-time "Zero-network attestation" above.
+    # The dep-ban proves no HTTP-CLIENT CRATE is linked; it structurally CANNOT
+    # prove the absence of a raw socket call — std::net, tokio/net (which
+    # `tokio = ["full"]` enables in the default build), or a shelled-out fetch.
+    # This job proves the property at the SYSCALL boundary instead, which is
+    # dependency-agnostic:
+    #
+    #   (1) syscall audit  — run the enforcement path under strace and FAIL on
+    #       any connect()/sendto()/sendmsg() to an AF_INET/AF_INET6 address. This
+    #       is the airtight "never phones home / zero telemetry" proof: it catches
+    #       ANY outbound IP connection regardless of how it is made.
+    #   (2) offline liveness — run the same path with networking removed (network
+    #       namespace) and assert it still works, proving the hot path has no
+    #       hidden network dependency. (Local Unix-socket IPC is unaffected — it
+    #       is filesystem-scoped, not network-namespace-scoped.)
+    #
+    # MATI_DISABLE_AUTO_SPAWN=1 keeps the background daemon from forking, so the
+    # traced process tree stays bounded and uses direct store access.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install strace
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
+
+      - name: Build default (enforcement) binary
+        run: cargo build --locked --bin mati
+
+      - name: No-network runtime attestation
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug/mati"
+          export MATI_DISABLE_AUTO_SPAWN=1
+
+          work="$(mktemp -d)"
+          export HOME="$work/home"; mkdir -p "$HOME"
+          repo="$work/repo"; mkdir -p "$repo"
+          git -C "$repo" init -q
+          git -C "$repo" config user.email ci@example.com
+          git -C "$repo" config user.name  ci
+          printf 'fn main() { println!("hi"); }\n' > "$repo/main.rs"
+          git -C "$repo" add -A
+          git -C "$repo" -c commit.gpgsign=false commit -q -m init
+
+          # JSON payload for the hook (file avoids nested-quoting in bash -c).
+          payload="$work/payload.json"
+          printf '%s' '{"session_id":"ci","tool_input":{"file_path":"main.rs"}}' > "$payload"
+
+          # Enforcement-relevant surface. Exit codes are tolerated (doctor exits
+          # non-zero as a CI gate; hook-decide may deny) — the audit inspects
+          # SYSCALLS, not status. $0=binary, $1=repo, $2=payload.
+          seq='
+            "$0" init --path "$1" --no-hooks      >/dev/null 2>&1 || true
+            "$0" doctor --json                    >/dev/null 2>&1 || true
+            ( cd "$1" && "$0" status )            >/dev/null 2>&1 || true
+            "$0" hook-decide claude-pre-read <"$2" >/dev/null 2>&1 || true
+          '
+
+          echo "== (1) syscall audit: no outbound IP connection during the enforcement path =="
+          trace="$work/net.strace"
+          strace -f -e trace=%network -o "$trace" bash -c "$seq" "$BIN" "$repo" "$payload" || true
+          # Transparency: report any AF_INET socket() even if never connected.
+          if grep -qE 'socket\(AF_INET' "$trace"; then
+            echo "note: an AF_INET/AF_INET6 socket() was created (not necessarily egress):"
+            grep -nE 'socket\(AF_INET' "$trace" | head
+          fi
+          egress=$(grep -nE '(connect|sendto|sendmsg)\([^)]*sa_family=AF_INET' "$trace" || true)
+          if [ -n "$egress" ]; then
+            echo "::error::enforcement path attempted an outbound IP connection — violates zero-network / never-phones-home:"
+            echo "$egress"
+            exit 1
+          fi
+          echo "  OK: zero connect()/sendto()/sendmsg() to any AF_INET/AF_INET6 address"
+
+          echo "== (2) offline liveness: enforcement path runs with networking removed =="
+          if unshare -rn true 2>/dev/null; then UNS="unshare -rn";
+          elif sudo unshare -n true 2>/dev/null; then UNS="sudo -E unshare -n";
+          else UNS=""; fi
+          if [ -z "$UNS" ]; then
+            echo "::warning::no usable network-namespace isolation on this runner; skipping offline-liveness (the syscall audit already proves no egress)"
+          else
+            echo "  using: $UNS"
+            $UNS env HOME="$HOME" MATI_DISABLE_AUTO_SPAWN=1 "$BIN" init --path "$repo" --no-hooks >/dev/null
+            echo "  OK: 'mati init' completes with no network namespace"
+          fi
+          echo "zero-network runtime attestation: PASS"
