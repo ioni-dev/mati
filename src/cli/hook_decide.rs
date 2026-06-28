@@ -210,6 +210,56 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         }
     }
 
+    // Multi-file bash reads (`cat a.rs b.rs`, `grep pat f1 f2`): the single-path
+    // flow above fully evaluated the PRIMARY file; gate the REMAINING files too
+    // so a gotcha on a non-primary file still denies. Escalate-only, mirroring
+    // the canonical fallback (a non-deny extra file never downgrades the
+    // decision) and a no-op when the command names a single file — the common
+    // case — so it adds zero daemon round-trips there. Capped like apply_patch.
+    if !matches!(adapter.decision, Decision::Deny { .. })
+        && matches!(
+            args.variant,
+            HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+        )
+    {
+        if let Some(cmd) = input
+            .pointer("/tool_input/command")
+            .and_then(|v| v.as_str())
+        {
+            if let Some(class) = decide::classify_command(cmd) {
+                for extra_raw in decide::extract_file_paths(cmd, class)
+                    .into_iter()
+                    .take(decide::MAX_APPLY_PATCH_FILES)
+                {
+                    let extra_rel = decide::normalize_path(&extra_raw, repo_root_str);
+                    if extra_rel == rel_path {
+                        continue; // primary already evaluated above
+                    }
+                    let extra_key = format!("file:{extra_rel}");
+                    if let DaemonResult::Ok(resp) = daemon_result(
+                        &mati_root,
+                        "hook_evaluate",
+                        serde_json::json!({
+                            "file_key": &extra_key,
+                            "include_recent": include_recent,
+                        }),
+                    )
+                    .await
+                    {
+                        let extra_eval =
+                            resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                        let extra_adapter =
+                            process_eval_response(args.variant, &extra_rel, &extra_eval);
+                        if matches!(extra_adapter.decision, Decision::Deny { .. }) {
+                            adapter = extra_adapter;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Fire events (non-blocking).
     // session_id (Claude Code provides it at the top level of the hook input)
     // attributes these audit events to this agent session — per-actor audit.

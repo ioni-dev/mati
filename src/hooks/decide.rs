@@ -171,40 +171,46 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
 
 // ── File Path Extraction ────────────────────────────────────────────────────
 
-/// Extract the target file path from a classified command.
+/// Extract the PRIMARY target file path from a classified command — the first
+/// file for cat-like, the last positional for grep-like. The single-path
+/// companion to [`extract_file_paths`]; see it for the tokenizer + grammar.
+pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
+    let paths = extract_file_paths(cmd, class);
+    match class {
+        CommandClass::CatLike => paths.into_iter().next(),
+        CommandClass::GrepLike => paths.into_iter().next_back(),
+    }
+}
+
+/// Extract ALL target file paths from a classified command, in order. The
+/// multi-file companion to [`extract_file_path`] — lets the read gate catch a
+/// gotcha on a non-first file (`cat a.rs b.rs`, `grep pat f1 f2`).
 ///
-/// Tokenizes the command shell-style (honoring quotes) and picks the file by
-/// each command's real grammar:
-/// - CatLike (`cat/less/head/tail/bat FILE`): the file is the FIRST positional.
+/// Tokenizes the command shell-style (honoring quotes) and reads files by each
+/// command's real grammar:
+/// - CatLike (`cat/less/head/tail/bat FILE...`): every positional is a file.
 /// - GrepLike (`grep/rg/sed/awk [flags] PATTERN [FILE...]`): the first
-///   positional is the search PATTERN; the file is the LAST positional, and
-///   exists only when there is one after the pattern (otherwise stdin is read).
+///   positional is the search PATTERN; the rest are files (none after the
+///   pattern ⇒ stdin, so no files).
 ///
 /// Using real tokens + position — instead of a "the file is whatever's quoted"
 /// heuristic — is what lets `grep -r "secret" src/db.rs` resolve to `src/db.rs`
-/// (the path) rather than `secret` (the quoted pattern), while still handling
-/// quoted paths that contain spaces.
-///
-/// Stops at pipe (`|`), semicolon (`;`), `&&`, `||`.
-pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
+/// (the path) not `secret` (the quoted pattern), while still handling quoted
+/// paths that contain spaces. Stops at pipe (`|`), semicolon (`;`), `&&`, `||`.
+pub fn extract_file_paths(cmd: &str, class: CommandClass) -> Vec<String> {
     // Same normalization as `classify_command` so prefixes/abs-paths don't
-    // throw off positional extraction (`sudo cat foo` must extract `foo`,
-    // not `cat`).
+    // throw off extraction (`sudo cat foo` must extract `foo`, not `cat`).
     let eff = effective_command(cmd);
-
-    // Isolate the command portion before shell operators, then tokenize it the
-    // way a shell would so a quoted path keeps its spaces as one token and a
-    // quoted pattern is just its inner text.
     let cmd_part = split_at_shell_operator(&eff);
     let positionals = positional_args(&shell_tokens(cmd_part));
 
     match class {
-        CommandClass::CatLike => positionals.first().cloned(),
+        CommandClass::CatLike => positionals,
         CommandClass::GrepLike => {
             if positionals.len() >= 2 {
-                positionals.last().cloned()
+                positionals[1..].to_vec()
             } else {
-                None
+                Vec::new()
             }
         }
     }
@@ -1439,6 +1445,44 @@ mod tests {
         assert_eq!(
             shell_tokens("awk '{print $1}' src/db.rs"),
             vec!["awk", "{print $1}", "src/db.rs"]
+        );
+    }
+
+    // ── multi-file extraction (`cat a.rs b.rs`, `grep pat f1 f2`) ─────────
+
+    #[test]
+    fn extract_file_paths_cat_returns_all_files() {
+        assert_eq!(
+            extract_file_paths("cat src/a.rs src/b.rs", CommandClass::CatLike),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+        assert_eq!(
+            extract_file_paths("cat -n src/only.rs", CommandClass::CatLike),
+            vec!["src/only.rs"]
+        );
+    }
+
+    #[test]
+    fn extract_file_paths_grep_drops_the_pattern() {
+        // grep PATTERN FILE... — the pattern is not a file.
+        assert_eq!(
+            extract_file_paths("grep -i secret src/a.rs src/b.rs", CommandClass::GrepLike),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+        // Only a pattern, no file -> no paths.
+        assert!(extract_file_paths("grep secret", CommandClass::GrepLike).is_empty());
+    }
+
+    #[test]
+    fn extract_file_path_is_the_primary_of_paths() {
+        // singular = first cat file / last grep file.
+        assert_eq!(
+            extract_file_path("cat a.rs b.rs", CommandClass::CatLike).as_deref(),
+            Some("a.rs")
+        );
+        assert_eq!(
+            extract_file_path("grep pat f1 f2", CommandClass::GrepLike).as_deref(),
+            Some("f2")
         );
     }
 }
