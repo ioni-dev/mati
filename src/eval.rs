@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::hooks::decide::{
-    classify_command, evaluate, extract_file_path, CommandClass, Decision, EnforcementInput,
+    classify_command, evaluate, extract_file_paths, CommandClass, Decision, EnforcementInput,
 };
 
 // ── Embedded corpus (relative to this file, src/eval.rs) ─────────────────────
@@ -44,8 +44,11 @@ struct DetectionCase {
     label: String,
     /// Ground-truth class: "cat_like" | "grep_like" | "none".
     expect_class: String,
+    /// Ground-truth set of files the gate must check (order-independent). One
+    /// entry for a single-file read, several for `cat a.rs b.rs`, empty when no
+    /// file is read (benign, or `grep PATTERN` with no file).
     #[serde(default)]
-    expect_path: Option<String>,
+    expect_paths: Vec<String>,
     #[serde(default)]
     #[allow(dead_code)]
     note: Option<String>,
@@ -157,8 +160,19 @@ fn parse_class(s: &str) -> Option<CommandClass> {
 
 fn detection_pass(c: &DetectionCase) -> bool {
     let got_class = classify_command(&c.cmd);
-    let got_path = got_class.and_then(|cl| extract_file_path(&c.cmd, cl));
-    got_class == parse_class(&c.expect_class) && got_path == c.expect_path
+    if got_class != parse_class(&c.expect_class) {
+        return false;
+    }
+    // The gate checks the SET of files a command reads, so compare
+    // order-independently. `cat a.rs b.rs` must yield {a.rs, b.rs}.
+    let mut got_paths = match got_class {
+        Some(cl) => extract_file_paths(&c.cmd, cl),
+        None => Vec::new(),
+    };
+    let mut want = c.expect_paths.clone();
+    got_paths.sort();
+    want.sort();
+    got_paths == want
 }
 
 /// Stable name for a `Decision` variant (ignores the inner context strings,
@@ -337,17 +351,17 @@ mod tests {
     #[test]
     fn detection_pass_can_fail() {
         // Same discipline as the 1.2 grep validation: prove the scorer trips.
-        let mk = |expect_class: &str, expect_path: Option<&str>| DetectionCase {
+        let mk = |expect_class: &str, expect_paths: &[&str]| DetectionCase {
             id: "x".into(),
             cmd: "cat src/main.rs".into(),
             label: "violation".into(),
             expect_class: expect_class.into(),
-            expect_path: expect_path.map(str::to_string),
+            expect_paths: expect_paths.iter().map(|s| s.to_string()).collect(),
             note: None,
         };
-        assert!(detection_pass(&mk("cat_like", Some("src/main.rs"))));
-        assert!(!detection_pass(&mk("cat_like", Some("WRONG.rs"))));
-        assert!(!detection_pass(&mk("none", None)));
+        assert!(detection_pass(&mk("cat_like", &["src/main.rs"])));
+        assert!(!detection_pass(&mk("cat_like", &["WRONG.rs"])));
+        assert!(!detection_pass(&mk("none", &[])));
     }
 
     #[test]

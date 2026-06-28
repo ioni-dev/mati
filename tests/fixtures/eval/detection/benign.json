@@ -1,8 +1,8 @@
 [
-  {"id":"bn-echo","cmd":"echo hello world","label":"benign","expect_class":"none","expect_path":null,"note":"echo is not a file-read"},
-  {"id":"bn-ls","cmd":"ls -la src/","label":"benign","expect_class":"none","expect_path":null,"note":"ls lists, does not read contents"},
-  {"id":"bn-git","cmd":"git commit -m wip","label":"benign","expect_class":"none","expect_path":null,"note":"git is not a file-read command"},
-  {"id":"bn-catch","cmd":"catch_errors.sh run","label":"benign","expect_class":"none","expect_path":null,"note":"word boundary: catch != cat"},
-  {"id":"bn-category","cmd":"category --list","label":"benign","expect_class":"none","expect_path":null,"note":"word boundary: category != cat"},
-  {"id":"bn-npm-cat","cmd":"npm run cat","label":"benign","expect_class":"none","expect_path":null,"note":"first word npm; 'cat' is a script name, not a read"}
+  {"id":"bn-echo","cmd":"echo hello world","label":"benign","expect_class":"none","expect_paths":[],"note":"echo is not a file-read"},
+  {"id":"bn-ls","cmd":"ls -la src/","label":"benign","expect_class":"none","expect_paths":[],"note":"ls lists, does not read contents"},
+  {"id":"bn-git","cmd":"git commit -m wip","label":"benign","expect_class":"none","expect_paths":[],"note":"git is not a file-read command"},
+  {"id":"bn-catch","cmd":"catch_errors.sh run","label":"benign","expect_class":"none","expect_paths":[],"note":"word boundary: catch != cat"},
+  {"id":"bn-category","cmd":"category --list","label":"benign","expect_class":"none","expect_paths":[],"note":"word boundary: category != cat"},
+  {"id":"bn-npm-cat","cmd":"npm run cat","label":"benign","expect_class":"none","expect_paths":[],"note":"first word npm; 'cat' is a script name, not a read"}
 ]

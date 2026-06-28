@@ -1,8 +1,6 @@
 {
-  "_comment": "Per-layer eval baseline (idea 4). `detection` and `decision` each list case ids whose CURRENT output does not match ground truth — the honest, version-controlled 'here is exactly what we currently miss' disclosure, surfaced by `mati eval`. The eval gate asserts each layer's failing set equals its list exactly: a NEW miss fails CI (regression), and a newly-FIXED gap also fails (so the baseline must be updated, ratcheting recall up). The remaining detection gaps need a quote-aware tokenizer (grep pattern vs path), multi-path support (multi-file cat), or wrapper-flag parsing (sudo with flags). The decision layer is currently exact (no gaps).",
+  "_comment": "Per-layer eval baseline (idea 4). `detection`/`decision` list case ids whose CURRENT output does not match ground truth \u2014 the honest, version-controlled 'here is exactly what we miss' disclosure, surfaced by `mati eval`. The gate asserts each layer's failing set equals its list exactly: a NEW miss fails CI, a FIXED gap forces a baseline update (ratcheting recall up). The grep pattern-vs-path and multi-file-cat gaps were closed (quote-aware tokenizer + multi-path gate); the remaining detection gap is sudo-with-flags (ambiguous wrapper-flag arity). The decision layer is exact.",
   "detection": [
-    "adv-cat-multifile",
-    "adv-grep-quoted-pattern",
     "adv-sudo-uroot-cat"
   ],
   "decision": []
