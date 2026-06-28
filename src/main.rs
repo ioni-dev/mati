@@ -96,6 +96,8 @@ enum Commands {
     /// \[Maintenance\] Run the enforcement regression corpus — reports
     /// detection/decision recall + false-positive rate against a baseline
     Eval(cli::eval::EvalArgs),
+    /// \[Maintenance\] Verify a signed policy-floor bundle (org policy packs)
+    Policy(cli::policy::PolicyArgs),
     /// \[Maintenance\] Verify the enforcement audit chain — recompute every
     /// event hash and check the prev_hash linkage. Exits non-zero on any break.
     #[command(name = "verify-chain")]
@@ -297,6 +299,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Check => cli::check::run().await,
         Commands::Doctor(args) => cli::doctor::run(args).await,
         Commands::Eval(args) => cli::eval::run(args).await,
+        Commands::Policy(args) => cli::policy::run(args).await,
         Commands::VerifyChain(args) => cli::verify_chain::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Sandbox(args) => cli::sandbox::run(args).await,
