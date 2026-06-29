@@ -144,6 +144,7 @@ mati stats
 | ------------------------------- | ---------------------------------------------------------------------------- |
 | `mati init`                     | Layer 0 scan and scaffold                                                    |
 | `mati enrich [path]`            | Layer 1 enrichment via Claude                                                |
+| `mati suggest`                  | Propose gotcha candidates from CODEOWNERS and code markers                   |
 | `mati gotcha add`               | Add a gotcha interactively                                                   |
 | `mati gotcha confirm <key>`     | Confirm a candidate and activate it                                          |
 | `mati review`                   | Batch confirm or tombstone candidates                                        |
@@ -152,6 +153,7 @@ mati stats
 | `mati gaps`                     | Files with no records or low confidence                                      |
 | `mati stale`                    | Records that haven't been touched since a file changed                       |
 | `mati explain <file>`           | File briefing: gotchas, blast radius, co-change partners, cluster membership |
+| `mati search <query>`           | Keyword search across gotchas, decisions, notes, and files                  |
 | `mati clusters`                 | Co-change clusters from git history                                          |
 | `mati diff [range]`             | Pre-merge check: surface gotchas for files in a git diff range               |
 | `mati sandbox protect <file>`   | Compile a crown-jewel file into an OS-level sandbox deny floor (opt-in, macOS/Linux/WSL2) |
@@ -160,6 +162,7 @@ mati stats
 | `mati doctor`                   | Aggregated health check                                                      |
 | `mati daemon start/stop/status` | Manage the background daemon                                                 |
 | `mati check`                    | Environment self-test                                                        |
+| `mati completion <shell>`       | Generate a shell completion script (bash, zsh, fish, etc.)                  |
 
 ---
 
