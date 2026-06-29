@@ -1,4 +1,10 @@
-# mati
+<p align="center">
+  <img src="assets/mati-logo.svg" alt="mati" width="300">
+</p>
+
+<p align="center">
+  <b>Deterministic guardrails for AI coding agents.</b>
+</p>
 
 mati makes what your team knows about a codebase enforceable in the paths where AI agents touch it. It is not another memory store the model can choose to recall or ignore. When an agent goes to act on a file that has a confirmed gotcha attached, mati's hook surfaces that gotcha and can block the operation until it has been consulted. The decision is made at the hook level, deterministically, outside the model's discretion.
 
