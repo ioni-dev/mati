@@ -43,16 +43,21 @@ struct Cli {
 enum Commands {
     // ── Core workflow ────────────────────────────────────────────────────
     /// Build project memory — scan files, mine git history, detect patterns
+    #[command(visible_alias = "i")]
     Init(cli::init::InitArgs),
     /// File briefing — gotchas, decisions, and co-changes before editing
+    #[command(visible_alias = "e")]
     Explain(cli::explain::ExplainArgs),
     /// Pre-merge check — surface gotchas for files in a diff range
+    #[command(visible_alias = "d")]
     Diff(cli::diff::DiffArgs),
     /// Project memory dashboard — record counts, health, and next actions
+    #[command(visible_alias = "s")]
     Status(cli::status::StatusArgs),
 
     // ── Knowledge management ─────────────────────────────────────────────
     /// Manage gotcha records (add, edit, delete, confirm, list)
+    #[command(visible_alias = "g")]
     Gotcha(cli::gotcha::GotchaArgs),
     /// Show a record by key
     Show(cli::show::ShowArgs),
@@ -84,7 +89,14 @@ enum Commands {
 
     // ── Configuration ─────────────────────────────────────────────────────
     /// Get or set enforcement configuration (mode, retention)
+    #[command(visible_alias = "c")]
     Config(cli::config::ConfigArgs),
+    /// Generate a shell completion script (bash, zsh, fish, …)
+    Completion {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 
     // ── Maintenance ──────────────────────────────────────────────────────
     /// \[Maintenance\] Confirm auto-detected candidates for hook enforcement
@@ -295,6 +307,11 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Note { text } => run_note(&text).await,
         Commands::Suggest(args) => cli::suggest::run(args).await,
         Commands::Search(args) => cli::search::run(args).await,
+        Commands::Completion { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "mati", &mut std::io::stdout());
+            Ok(())
+        }
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
         Commands::Review(args) => cli::review::run(args).await,
