@@ -18,6 +18,9 @@ pub struct ConfigArgs {
     pub command: ConfigCommand,
 }
 
+/// All known config keys (mirrors the set validated in `proxy::config_get`).
+const CONFIG_KEYS: &[&str] = &["audit.write_durability", "enforcement.retention"];
+
 #[derive(Subcommand)]
 pub enum ConfigCommand {
     /// Get a configuration value
@@ -32,6 +35,8 @@ pub enum ConfigCommand {
         /// Value to set
         value: String,
     },
+    /// Show all resolved configuration values
+    Dump,
 }
 
 pub async fn run(args: ConfigArgs) -> Result<()> {
@@ -41,6 +46,7 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
     let result = match args.command {
         ConfigCommand::Get { ref key } => run_get(&proxy, key).await,
         ConfigCommand::Set { ref key, ref value } => run_set(&proxy, key, value).await,
+        ConfigCommand::Dump => run_dump(&proxy).await,
     };
 
     proxy.close().await?;
@@ -50,6 +56,17 @@ pub async fn run(args: ConfigArgs) -> Result<()> {
 async fn run_get(proxy: &StoreProxy, key: &str) -> Result<()> {
     let value = proxy.config_get(key).await?;
     println!("{value}");
+    Ok(())
+}
+
+/// Print every known config key with its resolved value.
+async fn run_dump(proxy: &StoreProxy) -> Result<()> {
+    for key in CONFIG_KEYS {
+        match proxy.config_get(key).await {
+            Ok(value) => println!("{key} = {value}"),
+            Err(e) => println!("{key} = <unavailable: {e}>"),
+        }
+    }
     Ok(())
 }
 
