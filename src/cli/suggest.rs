@@ -111,7 +111,7 @@ async fn write_candidates(proxy: &StoreProxy, candidates: &[Record]) -> Result<(
 }
 
 /// Read the first existing CODEOWNERS file under the repo root.
-fn read_codeowners(root: &Path) -> Option<String> {
+pub(crate) fn read_codeowners(root: &Path) -> Option<String> {
     CODEOWNERS_LOCATIONS
         .iter()
         .find_map(|loc| std::fs::read_to_string(root.join(loc)).ok())
