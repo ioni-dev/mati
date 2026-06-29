@@ -645,6 +645,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
     }
 
+    // ── 8c. CODEOWNERS ownership candidates (idea 2.2) ───────────────────────
+    let codeowners_record_structs =
+        build_codeowners_candidates(&root, &store, device_id, logical_clock, now).await;
+
     // Combine all records
     let all_records: Vec<Record> = claude_import
         .records
@@ -655,6 +659,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .chain(cochange_record_structs.iter())
         .chain(revert_record_structs.iter())
         .chain(ownership_record_structs.iter())
+        .chain(codeowners_record_structs.iter())
         .cloned()
         .collect();
 
@@ -1308,6 +1313,39 @@ pub async fn run(args: InitArgs) -> Result<()> {
     println!();
 
     Ok(())
+}
+
+// ── CODEOWNERS onboarding candidates (idea 2.2) ──────────────────────────────
+
+/// Build CODEOWNERS ownership candidate records, skipping any key that already
+/// exists so a re-init never resets a confirmation/edit. Marker candidates are
+/// left to the on-demand `mati suggest` (they need a full file-content read,
+/// which would blow init's scan budget).
+async fn build_codeowners_candidates(
+    root: &std::path::Path,
+    store: &Store,
+    device_id: Uuid,
+    clock_start: u64,
+    now: u64,
+) -> Vec<Record> {
+    use mati_core::analysis::onboarding;
+    let Some(content) = crate::cli::suggest::read_codeowners(root) else {
+        return Vec::new();
+    };
+    let rules = onboarding::parse_codeowners(&content);
+    let candidates = onboarding::codeowners_candidates(&rules, device_id, clock_start, now);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let existing: std::collections::HashSet<String> =
+        match store.scan_prefix("gotcha:codeowners:").await {
+            Ok(records) => records.into_iter().map(|r| r.key).collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+    candidates
+        .into_iter()
+        .filter(|r| !existing.contains(&r.key))
+        .collect()
 }
 
 // ── Co-change gotcha generation ───────────────────────────────────────────────
