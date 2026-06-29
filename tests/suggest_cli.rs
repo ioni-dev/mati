@@ -13,7 +13,11 @@ fn suggest_dry_run_proposes_codeowners_and_marker_candidates() {
     let root = tmp.path();
     std::fs::create_dir_all(root.join(".github")).unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join(".github/CODEOWNERS"), "src/payments/** @pay-team\n").unwrap();
+    std::fs::write(
+        root.join(".github/CODEOWNERS"),
+        "src/payments/** @pay-team\n",
+    )
+    .unwrap();
     std::fs::write(
         root.join("src/main.rs"),
         "fn main() {\n    // DO NOT REMOVE: load-bearing init order\n}\n",
@@ -40,7 +44,12 @@ fn suggest_dry_run_proposes_codeowners_and_marker_candidates() {
 fn suggest_dry_run_empty_repo_finds_nothing() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let out = Command::new(bin())
-        .args(["suggest", "--dry-run", "--path", tmp.path().to_str().unwrap()])
+        .args([
+            "suggest",
+            "--dry-run",
+            "--path",
+            tmp.path().to_str().unwrap(),
+        ])
         .output()
         .expect("run mati suggest");
     assert!(out.status.success());

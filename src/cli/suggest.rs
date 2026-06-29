@@ -125,6 +125,10 @@ fn read_text_files(root: &Path) -> Vec<(String, String)> {
     files
         .into_iter()
         .filter(|f| f.size_bytes <= MAX_SCAN_FILE_BYTES)
-        .filter_map(|f| std::fs::read_to_string(&f.abs_path).ok().map(|c| (f.rel_path, c)))
+        .filter_map(|f| {
+            std::fs::read_to_string(&f.abs_path)
+                .ok()
+                .map(|c| (f.rel_path, c))
+        })
         .collect()
 }

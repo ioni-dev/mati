@@ -295,8 +295,7 @@ let normal = 2;\n";
         assert_eq!(recs.len(), 1);
         assert!(is_unconfirmed_gotcha(&recs[0]));
         assert_eq!(recs[0].key, "gotcha:codeowners:src/payments/**");
-        let g: GotchaRecord =
-            serde_json::from_value(recs[0].payload.clone().unwrap()).unwrap();
+        let g: GotchaRecord = serde_json::from_value(recs[0].payload.clone().unwrap()).unwrap();
         assert_eq!(g.affected_files, vec!["src/payments/**"]);
         assert!(!g.confirmed);
     }
