@@ -73,6 +73,8 @@ enum Commands {
         /// Note text
         text: String,
     },
+    /// Propose gotcha candidates from existing repo artifacts (CODEOWNERS, markers)
+    Suggest(cli::suggest::SuggestArgs),
     /// Export knowledge base to markdown or JSON
     Export(cli::show::ExportArgs),
     /// Import from CLAUDE.md or JSON
@@ -289,6 +291,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::QualityCheck => run_quality_check().await,
         Commands::Improve { key } => run_improve(&key).await,
         Commands::Note { text } => run_note(&text).await,
+        Commands::Suggest(args) => cli::suggest::run(args).await,
         Commands::Export(args) => cli::show::run_export(args).await,
         Commands::Import(args) => cli::show::run_import(args).await,
         Commands::Review(args) => cli::review::run(args).await,
