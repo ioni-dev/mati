@@ -14,6 +14,7 @@ pub mod deps;
 pub mod edges;
 pub mod enrich_signals;
 pub mod git;
+pub mod onboarding;
 pub mod parser;
 pub mod propagation;
 pub mod reparse;
