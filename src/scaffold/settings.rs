@@ -87,7 +87,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/session-end.sh"
+            "command": ".claude/hooks/session-end.sh",
+            "timeout": 3000
           }
         ]
       }
