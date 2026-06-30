@@ -335,18 +335,26 @@ pub async fn session_flush(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Clear all consult receipts for the session.
+/// Delete all consult receipts (`session:consulted:*`) from the store.
 ///
-/// Mirrors the receipt-cleanup loop in `session_harvest`. Used by the PostCompact
-/// hook: compaction wipes the agent's memory of consulted gotchas, but receipts are
-/// time-based and survive, so PreToolUse would not re-block. Clearing them forces a
-/// fresh mem_get on next access.
-pub async fn session_clear_consults(store: &Store) -> Result<()> {
+/// Shared by `session_clear_consults` (PostCompact) and the end-of-session
+/// `session_harvest` / `session_harvest_no_staleness` cleanup. Propagates store
+/// errors; the daemon-startup stale-marker sweep keeps its own fail-soft loop.
+async fn delete_all_receipts(store: &Store) -> Result<()> {
     let consulted_keys = store.scan_keys("session:consulted:").await?;
     for k in &consulted_keys {
         store.delete(k).await?;
     }
     Ok(())
+}
+
+/// Clear all consult receipts for the session.
+///
+/// Used by the PostCompact hook: compaction wipes the agent's memory of consulted
+/// gotchas, but receipts are time-based and survive, so PreToolUse would not
+/// re-block. Clearing them forces a fresh mem_get on next access.
+pub async fn session_clear_consults(store: &Store) -> Result<()> {
+    delete_all_receipts(store).await
 }
 
 // ── session_harvest ───────────────────────────────────────────────────────────
@@ -406,10 +414,7 @@ pub async fn session_harvest(store: &Store, cwd: &Path) -> Result<()> {
     store.put(&session_key, &perm).await?;
 
     // Clean up session:consulted:* markers
-    let consulted_keys = store.scan_keys("session:consulted:").await?;
-    for k in &consulted_keys {
-        store.delete(k).await?;
-    }
+    delete_all_receipts(store).await?;
 
     // Update stage:current with last session timestamp
     if let Some(mut stage) = store.get("stage:current").await? {
@@ -473,10 +478,7 @@ pub async fn session_harvest_no_staleness(store: &Store) -> Result<()> {
     store.put(&session_key, &perm).await?;
 
     // Clean up consulted markers
-    let consulted_keys = store.scan_keys("session:consulted:").await?;
-    for k in &consulted_keys {
-        store.delete(k).await?;
-    }
+    delete_all_receipts(store).await?;
 
     // Update stage:current
     if let Some(mut stage) = store.get("stage:current").await? {
