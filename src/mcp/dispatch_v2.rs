@@ -193,6 +193,7 @@ fn is_session_side(cmd: &Command) -> bool {
             | Command::ConsultationHit(_)
             | Command::SessionFlush
             | Command::SessionHarvest
+            | Command::SessionClearConsults
     )
 }
 
@@ -935,6 +936,19 @@ async fn dispatch_session_side(
             }
         }
 
+        Command::SessionClearConsults => {
+            // Silent scan+delete — no audit entry by design. Compaction wipes the
+            // agent's memory, so clearing receipts is a maintenance action, not a
+            // semantic mutation worth auditing. Fail-open on error (log, not crash).
+            match sess::session_clear_consults(store).await {
+                Ok(()) => Response::ok(request_id, serde_json::Value::Null),
+                Err(e) => {
+                    tracing::warn!(error = %e, "session_clear_consults failed; post-compaction re-block window not restored");
+                    Response::err(request_id, ErrorCode::StoreError, e.to_string())
+                }
+            }
+        }
+
         _ => unreachable!("is_session_side guard ensures only session commands reach here"),
     }
 }
@@ -1060,7 +1074,8 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         Command::SessionLog(_)
         | Command::ConsultationHit(_)
         | Command::SessionFlush
-        | Command::SessionHarvest => {
+        | Command::SessionHarvest
+        | Command::SessionClearConsults => {
             unreachable!("session-side commands are handled natively, not via v1 bridge")
         }
 
@@ -1294,6 +1309,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_session_clear_consults_deletes_receipts_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        // Mint two consult receipts through the real v2 path.
+        for key in ["file:a.rs", "file:b.rs"] {
+            let req = make_request(Command::ConsultationHit(ConsultationHitInput {
+                key: key.into(),
+            }));
+            assert!(matches!(
+                dispatch_v2(&graph, &ctx, req).await,
+                Response::Ok { .. }
+            ));
+        }
+
+        // Two receipts exist; capture the audit count so we can prove the clear adds none.
+        let audit_before = {
+            let g = graph.read().await;
+            assert_eq!(
+                g.store()
+                    .scan_keys("session:consulted:")
+                    .await
+                    .unwrap()
+                    .len(),
+                2,
+                "two receipts should exist before clear"
+            );
+            g.store().scan_keys("audit:session:").await.unwrap().len()
+        };
+
+        // Clear through the v2 dispatch path.
+        let req = make_request(Command::SessionClearConsults);
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, req).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        assert!(
+            g.store()
+                .scan_keys("session:consulted:")
+                .await
+                .unwrap()
+                .is_empty(),
+            "all receipts should be gone after clear"
+        );
+        assert_eq!(
+            g.store().scan_keys("audit:session:").await.unwrap().len(),
+            audit_before,
+            "clear must be silent — it must not write an audit:session:* entry"
+        );
+    }
+
+    #[tokio::test]
     async fn v2_pure_read_does_not_write_audit() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
@@ -1477,6 +1549,7 @@ mod tests {
             Command::ConsultationHit(ConsultationHitInput { key: "k".into() }),
             Command::SessionFlush,
             Command::SessionHarvest,
+            Command::SessionClearConsults,
             // Side-effecting reads.
             Command::MemGet(MemGetInput { key: "k".into() }),
             Command::MemBootstrap(MemBootstrapInput {

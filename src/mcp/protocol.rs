@@ -282,6 +282,10 @@ pub enum Command {
     #[serde(rename = "session_harvest")]
     SessionHarvest,
 
+    /// Clear all consult receipts (PostCompact: force re-block after compaction).
+    #[serde(rename = "session_clear_consults")]
+    SessionClearConsults,
+
     /// Bulk-import a batch of pre-built `Record`s into the knowledge tree.
     /// Bypasses the semantic upsert handlers — records are written verbatim
     /// so an `export → import` round-trip preserves every field
@@ -721,6 +725,7 @@ impl Command {
             Self::ConsultationHit(_) => "consultation_hit",
             Self::SessionFlush => "session_flush",
             Self::SessionHarvest => "session_harvest",
+            Self::SessionClearConsults => "session_clear_consults",
             Self::RecordImport(_) => "record_import",
         }
     }
@@ -758,6 +763,7 @@ impl Command {
             | Self::ScanEnforcementEvents(_)
             | Self::SessionFlush
             | Self::SessionHarvest
+            | Self::SessionClearConsults
             | Self::RecordImport(_) => "",
         }
     }
@@ -790,6 +796,7 @@ impl Command {
             | Self::SandboxAudit(_)
             | Self::SessionFlush
             | Self::SessionHarvest
+            | Self::SessionClearConsults
             | Self::RecordImport(_)
         )
     }
@@ -1317,6 +1324,18 @@ mod tests {
     }
 
     #[test]
+    fn session_clear_consults_decodes() {
+        let json = serde_json::json!({
+            "v": 2,
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "session": "660e8400-e29b-41d4-a716-446655440000",
+            "cmd": { "type": "session_clear_consults" }
+        });
+        let req: Request = serde_json::from_value(json).unwrap();
+        assert!(matches!(req.cmd, Command::SessionClearConsults));
+    }
+
+    #[test]
     fn dev_note_upsert_create_mode() {
         let json = serde_json::json!({
             "v": 2,
@@ -1506,9 +1525,10 @@ mod tests {
             ),
             ("session_flush", Command::SessionFlush),
             ("session_harvest", Command::SessionHarvest),
+            ("session_clear_consults", Command::SessionClearConsults),
         ];
 
-        assert_eq!(cases.len(), 25, "must cover all 25 command variants");
+        assert_eq!(cases.len(), 26, "must cover all 26 command variants");
         for (expected_kind, cmd) in &cases {
             assert_eq!(
                 cmd.kind(),
@@ -1552,6 +1572,7 @@ mod tests {
         .is_mutation());
         assert!(Command::SessionFlush.is_mutation());
         assert!(Command::SessionHarvest.is_mutation());
+        assert!(Command::SessionClearConsults.is_mutation());
     }
 
     #[test]
@@ -1603,6 +1624,7 @@ mod tests {
             ""
         );
         assert_eq!(Command::SessionFlush.target_key(), "");
+        assert_eq!(Command::SessionClearConsults.target_key(), "");
     }
 
     #[test]
@@ -1745,6 +1767,7 @@ mod tests {
             "consultation_hit",
             "session_flush",
             "session_harvest",
+            "session_clear_consults",
         ];
         for name in mutation_names {
             let result = std::panic::catch_unwind(|| {

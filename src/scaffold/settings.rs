@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Hook and MCP server registration for `.claude/settings.json`.
 ///
 /// Contains two top-level keys:
-/// - `hooks` — PreToolUse / PostToolUse / PreCompact / SessionEnd (ARCHITECTURE.md §10)
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / Stop (ARCHITECTURE.md §10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 const SETTINGS_JSON: &str = r#"{
   "hooks": {
@@ -56,7 +56,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/post-read-compliance.sh"
+            "command": ".claude/hooks/post-read-compliance.sh",
+            "async": true
           }
         ]
       },
@@ -65,7 +66,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/post-edit.sh"
+            "command": ".claude/hooks/post-edit.sh",
+            "async": true
           }
         ]
       }
@@ -80,12 +82,44 @@ const SETTINGS_JSON: &str = r#"{
         ]
       }
     ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/post-compact.sh"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/session-end.sh"
+            "command": ".claude/hooks/session-end.sh",
+            "timeout": 3000
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/subagent-start.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/stop.sh",
+            "async": true
           }
         ]
       }
@@ -114,7 +148,10 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ),
     ("post-edit.sh", crate::hooks::post_edit::SCRIPT),
     ("pre-compact.sh", crate::hooks::pre_compact::SCRIPT),
+    ("post-compact.sh", crate::hooks::post_compact::SCRIPT),
     ("session-end.sh", crate::hooks::session_end::SCRIPT),
+    ("subagent-start.sh", crate::hooks::subagent_start::SCRIPT),
+    ("stop.sh", crate::hooks::claude_stop::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -371,7 +408,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 7),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 10),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -381,7 +418,10 @@ mod tests {
         assert!(parsed["hooks"]["PreToolUse"].is_array());
         assert!(parsed["hooks"]["PostToolUse"].is_array());
         assert!(parsed["hooks"]["PreCompact"].is_array());
+        assert!(parsed["hooks"]["PostCompact"].is_array());
         assert!(parsed["hooks"]["SessionEnd"].is_array());
+        assert!(parsed["hooks"]["SubagentStart"].is_array());
+        assert!(parsed["hooks"]["Stop"].is_array());
         // MCP server registered with portable bare command.
         let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
         assert_eq!(cmd, "mati", "command must be bare 'mati' for portability");

@@ -335,6 +335,28 @@ pub async fn session_flush(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Delete all consult receipts (`session:consulted:*`) from the store.
+///
+/// Shared by `session_clear_consults` (PostCompact) and the end-of-session
+/// `session_harvest` / `session_harvest_no_staleness` cleanup. Propagates store
+/// errors; the daemon-startup stale-marker sweep keeps its own fail-soft loop.
+async fn delete_all_receipts(store: &Store) -> Result<()> {
+    let consulted_keys = store.scan_keys("session:consulted:").await?;
+    for k in &consulted_keys {
+        store.delete(k).await?;
+    }
+    Ok(())
+}
+
+/// Clear all consult receipts for the session.
+///
+/// Used by the PostCompact hook: compaction wipes the agent's memory of consulted
+/// gotchas, but receipts are time-based and survive, so PreToolUse would not
+/// re-block. Clearing them forces a fresh mem_get on next access.
+pub async fn session_clear_consults(store: &Store) -> Result<()> {
+    delete_all_receipts(store).await
+}
+
 // ── session_harvest ───────────────────────────────────────────────────────────
 
 /// Archive session, run staleness analysis, auto-promote gotchas.
@@ -392,10 +414,7 @@ pub async fn session_harvest(store: &Store, cwd: &Path) -> Result<()> {
     store.put(&session_key, &perm).await?;
 
     // Clean up session:consulted:* markers
-    let consulted_keys = store.scan_keys("session:consulted:").await?;
-    for k in &consulted_keys {
-        store.delete(k).await?;
-    }
+    delete_all_receipts(store).await?;
 
     // Update stage:current with last session timestamp
     if let Some(mut stage) = store.get("stage:current").await? {
@@ -459,10 +478,7 @@ pub async fn session_harvest_no_staleness(store: &Store) -> Result<()> {
     store.put(&session_key, &perm).await?;
 
     // Clean up consulted markers
-    let consulted_keys = store.scan_keys("session:consulted:").await?;
-    for k in &consulted_keys {
-        store.delete(k).await?;
-    }
+    delete_all_receipts(store).await?;
 
     // Update stage:current
     if let Some(mut stage) = store.get("stage:current").await? {
@@ -821,5 +837,32 @@ mod tests {
         assert!(check_consulted_recent(&store, key, 900)
             .await
             .expect("fresh receipt should be valid"));
+    }
+
+    #[tokio::test]
+    async fn session_clear_consults_deletes_all_receipts() {
+        let (_dir, store) = temp_store().await;
+        let key1 = "file:src/main.rs";
+        let key2 = "file:src/lib.rs";
+
+        log_hit(&store, key1).await.expect("log first hit");
+        log_hit(&store, key2).await.expect("log second hit");
+
+        // Verify receipts exist before clearing.
+        let before = store
+            .scan_keys("session:consulted:")
+            .await
+            .expect("scan before");
+        assert_eq!(before.len(), 2, "expected two receipts before clear");
+
+        session_clear_consults(&store)
+            .await
+            .expect("clear_consults should succeed");
+
+        let after = store
+            .scan_keys("session:consulted:")
+            .await
+            .expect("scan after");
+        assert!(after.is_empty(), "all receipts should be gone after clear");
     }
 }
