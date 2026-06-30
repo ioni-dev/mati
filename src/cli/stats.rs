@@ -90,19 +90,19 @@ fn now_secs() -> u64 {
 }
 
 /// Current-state gotcha health, computed from active `gotcha:` records.
-struct GotchaHealth {
+pub(crate) struct GotchaHealth {
     /// Active gotcha records (any confirmation state).
-    active: u64,
+    pub(crate) active: u64,
     /// Confirmed gotchas (those eligible to gate, given the threshold).
-    confirmed: u64,
+    pub(crate) confirmed: u64,
     /// Gotchas at `Stale`/`Liability`/`Tombstone` staleness — needs review.
-    stale_or_worse: u64,
+    pub(crate) stale_or_worse: u64,
 }
 
 /// A gotcha counts as confirmed unless its payload explicitly says
 /// `confirmed: false` (missing / non-bool → confirmed). Mirrors the Review-backlog
 /// definition so every confirmed count in `mati stats` agrees.
-fn gotcha_is_confirmed(r: &Record) -> bool {
+pub(crate) fn gotcha_is_confirmed(r: &Record) -> bool {
     r.payload
         .as_ref()
         .and_then(|p| p.get("confirmed"))
@@ -111,7 +111,7 @@ fn gotcha_is_confirmed(r: &Record) -> bool {
 }
 
 /// Compute [`GotchaHealth`] from already-scanned, active gotcha records.
-fn gotcha_health(gotchas: &[Record]) -> GotchaHealth {
+pub(crate) fn gotcha_health(gotchas: &[Record]) -> GotchaHealth {
     let confirmed = gotchas.iter().filter(|r| gotcha_is_confirmed(r)).count() as u64;
     let stale_or_worse = gotchas
         .iter()

@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Hook and MCP server registration for `.claude/settings.json`.
 ///
 /// Contains two top-level keys:
-/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd (ARCHITECTURE.md §10)
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart (ARCHITECTURE.md §10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 const SETTINGS_JSON: &str = r#"{
   "hooks": {
@@ -102,6 +102,16 @@ const SETTINGS_JSON: &str = r#"{
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/subagent-start.sh"
+          }
+        ]
+      }
     ]
   },
   "mcpServers": {
@@ -129,6 +139,7 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("pre-compact.sh", crate::hooks::pre_compact::SCRIPT),
     ("post-compact.sh", crate::hooks::post_compact::SCRIPT),
     ("session-end.sh", crate::hooks::session_end::SCRIPT),
+    ("subagent-start.sh", crate::hooks::subagent_start::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -385,7 +396,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 8),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 9),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -397,6 +408,7 @@ mod tests {
         assert!(parsed["hooks"]["PreCompact"].is_array());
         assert!(parsed["hooks"]["PostCompact"].is_array());
         assert!(parsed["hooks"]["SessionEnd"].is_array());
+        assert!(parsed["hooks"]["SubagentStart"].is_array());
         // MCP server registered with portable bare command.
         let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
         assert_eq!(cmd, "mati", "command must be bare 'mati' for portability");

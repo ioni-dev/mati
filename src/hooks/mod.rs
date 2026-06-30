@@ -13,6 +13,7 @@ pub mod post_edit;
 pub mod pre_bash;
 pub mod post_compact;
 pub mod pre_compact;
+pub mod subagent_start;
 pub mod pre_edit;
 pub mod pre_read;
 pub mod session_end;

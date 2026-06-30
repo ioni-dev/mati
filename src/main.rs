@@ -189,6 +189,9 @@ enum Commands {
     SessionHarvest,
     #[command(hide = true)]
     SessionClearConsults,
+    /// Emit SubagentStart hook JSON — inject mati awareness into a freshly-spawned subagent.
+    #[command(hide = true, name = "subagent-context")]
+    SubagentContext,
     #[command(hide = true)]
     EditHook {
         /// Repo-relative file path
@@ -398,6 +401,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
         Commands::SessionClearConsults => cli::hooks::run_session_clear_consults().await,
+        Commands::SubagentContext => cli::subagent_context::run_subagent_context().await,
         Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
