@@ -366,6 +366,9 @@ impl StoreProxy {
                 let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
                     mati_core::mcp::protocol::ConsultationHitInput {
                         key: key.to_string(),
+                        actor: None,
+                        session_id: None,
+                        agent_id: None,
                     },
                 );
                 match daemon_v2(root, cmd).await {

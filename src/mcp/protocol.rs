@@ -320,6 +320,10 @@ pub struct HookEvaluateInput {
     pub file_key: String,
     #[serde(default)]
     pub include_recent: bool,
+    /// Actor scope for the consult-receipt lookup: `agent_id` for a subagent,
+    /// `None` (global) for the main thread. Drives per-actor enforcement.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -603,6 +607,14 @@ pub enum SessionEvent {
 #[serde(deny_unknown_fields)]
 pub struct ConsultationHitInput {
     pub key: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Claude session_id (the session) — for ReceiptMinted audit attribution.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Subagent agent_id when present (fallback attribution).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// Input for `Command::RecordImport`. Records are written verbatim into the
@@ -861,6 +873,7 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "type": "hook_evaluate",
             "file_key": args["file_key"],
             "include_recent": args.get("include_recent").and_then(|v| v.as_bool()).unwrap_or(false),
+            "actor": args["actor"],
         }),
         "scan_prefix" => json!({"type": "scan_prefix", "prefix": args["prefix"]}),
         "history" => {
@@ -1312,6 +1325,24 @@ mod tests {
     }
 
     #[test]
+    fn hook_evaluate_v1_to_v2_preserves_actor() {
+        // Regression (per-actor enforcement): the client→daemon round-trip is
+        // v1 args → v1_to_v2_command → typed Command. `actor` must survive — it
+        // was once dropped here, and HookEvaluateInput's deny_unknown_fields even
+        // made a partial fix fail-open. Live-E2E caught it; this locks it in.
+        let v1_args = serde_json::json!({
+            "file_key": "file:x", "include_recent": false, "actor": "agentZ"
+        });
+        let v2 = v1_to_v2_command("hook_evaluate", &v1_args);
+        let cmd: Command =
+            serde_json::from_value(v2).expect("v1->v2 hook_evaluate must deserialize WITH actor");
+        match cmd {
+            Command::HookEvaluate(i) => assert_eq!(i.actor.as_deref(), Some("agentZ")),
+            other => panic!("expected HookEvaluate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn session_harvest_decodes() {
         let json = serde_json::json!({
             "v": 2,
@@ -1394,6 +1425,7 @@ mod tests {
                 Command::HookEvaluate(HookEvaluateInput {
                     file_key: "f".into(),
                     include_recent: false,
+                    actor: None,
                 }),
             ),
             (
@@ -1521,7 +1553,12 @@ mod tests {
             ),
             (
                 "consultation_hit",
-                Command::ConsultationHit(ConsultationHitInput { key: "k".into() }),
+                Command::ConsultationHit(ConsultationHitInput {
+                    key: "k".into(),
+                    actor: None,
+                    session_id: None,
+                    agent_id: None,
+                }),
             ),
             ("session_flush", Command::SessionFlush),
             ("session_harvest", Command::SessionHarvest),
@@ -1852,5 +1889,42 @@ mod tests {
         let round_tripped: Request = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(round_tripped.agent, Some(AgentKind::Codex));
         assert_eq!(round_tripped.v, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn consultation_hit_input_actor_is_optional() {
+        // Without actor field: must decode to actor: None (new fields also default to None).
+        let without_actor: ConsultationHitInput =
+            serde_json::from_value(serde_json::json!({"key": "file:x"})).unwrap();
+        assert_eq!(without_actor.key, "file:x");
+        assert_eq!(without_actor.actor, None);
+        assert_eq!(without_actor.session_id, None);
+        assert_eq!(without_actor.agent_id, None);
+
+        // With actor field: must decode actor correctly; new fields default to None.
+        let with_actor: ConsultationHitInput =
+            serde_json::from_value(serde_json::json!({"key": "file:x", "actor": "a"})).unwrap();
+        assert_eq!(with_actor.key, "file:x");
+        assert_eq!(with_actor.actor, Some("a".to_string()));
+        assert_eq!(with_actor.session_id, None);
+        assert_eq!(with_actor.agent_id, None);
+
+        // session_id and agent_id round-trip correctly.
+        let with_session: ConsultationHitInput = serde_json::from_value(serde_json::json!({
+            "key": "file:x",
+            "session_id": "sess-abc",
+            "agent_id": "agent-xyz"
+        }))
+        .unwrap();
+        assert_eq!(with_session.key, "file:x");
+        assert_eq!(with_session.actor, None);
+        assert_eq!(with_session.session_id, Some("sess-abc".to_string()));
+        assert_eq!(with_session.agent_id, Some("agent-xyz".to_string()));
+
+        // Round-trip through serde_json preserves all fields.
+        let round_tripped: ConsultationHitInput =
+            serde_json::from_str(&serde_json::to_string(&with_session).unwrap()).unwrap();
+        assert_eq!(round_tripped.session_id, Some("sess-abc".to_string()));
+        assert_eq!(round_tripped.agent_id, Some("agent-xyz".to_string()));
     }
 }

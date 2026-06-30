@@ -1351,7 +1351,7 @@ pub(crate) async fn handle_mem_get(
     };
 
     // 3. Sessions-tree transaction: consultation receipt + audit.
-    let receipt = match crate::store::session::consultation_receipt_staged(&input.key) {
+    let receipt = match crate::store::session::consultation_receipt_staged(&input.key, None) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -1705,7 +1705,7 @@ pub(crate) async fn handle_mem_bootstrap(
         } else {
             format!("file:{file}")
         };
-        if let Ok(receipt) = crate::store::session::consultation_receipt_staged(&file_key) {
+        if let Ok(receipt) = crate::store::session::consultation_receipt_staged(&file_key, None) {
             session_writes.push(receipt);
         }
         // Per-file daily hit agg.

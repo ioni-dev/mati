@@ -164,11 +164,19 @@ pub async fn upsert_daily_agg_staged(
     Ok((agg_key.to_string(), bytes))
 }
 
+fn receipt_key(key: &str, actor: Option<&str>) -> String {
+    match actor {
+        Some(a) => format!("session:consulted:{a}:{key}"),
+        None => format!("session:consulted:{key}"),
+    }
+}
+
 /// Compute the consultation receipt record WITHOUT persisting.
 ///
-/// Returns `(key, serialized_record_bytes)` for staging.
-pub fn consultation_receipt_staged(key: &str) -> Result<(String, Vec<u8>)> {
-    let consulted_key = format!("session:consulted:{key}");
+/// When `actor` is `Some`, writes an actor-scoped key `session:consulted:<actor>:<key>`
+/// alongside the global key path. Pass `None` for all existing callers (global).
+pub fn consultation_receipt_staged(key: &str, actor: Option<&str>) -> Result<(String, Vec<u8>)> {
+    let consulted_key = receipt_key(key, actor);
     let record = session_record(&consulted_key, String::new());
     let bytes = rmp_serde::to_vec_named(&record)
         .with_context(|| format!("failed to serialize consulted receipt for {consulted_key}"))?;
@@ -211,7 +219,7 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     upsert_daily_agg(store, &agg_key, key).await?;
 
     // 2. Mark as consulted for session tracking
-    let consulted_key = format!("session:consulted:{key}");
+    let consulted_key = receipt_key(key, None);
     store
         .put(
             &consulted_key,
@@ -293,15 +301,29 @@ pub async fn log_bootstrap(store: &Store, key: &str) -> Result<()> {
 
 // ── check_consulted ───────────────────────────────────────────────────────────
 
-/// Return true if `session:consulted:{key}` exists (set by `log_hit`).
-pub async fn check_consulted(store: &Store, key: &str) -> Result<bool> {
-    let consulted_key = format!("session:consulted:{key}");
+/// Return true if the consulted marker exists (set by `log_hit` / capture hook).
+///
+/// When `actor` is `Some(id)`, reads the actor-scoped key
+/// `session:consulted:<id>:<key>` (subagent path); `None` reads the global key
+/// `session:consulted:<key>` (main-thread path — unchanged).
+pub async fn check_consulted(store: &Store, key: &str, actor: Option<&str>) -> Result<bool> {
+    let consulted_key = receipt_key(key, actor);
     Ok(store.get(&consulted_key).await?.is_some())
 }
 
 /// Return true if the consulted marker exists and is newer than `ttl_secs`.
-pub async fn check_consulted_recent(store: &Store, key: &str, ttl_secs: u64) -> Result<bool> {
-    let consulted_key = format!("session:consulted:{key}");
+///
+/// When `actor` is `Some(id)`, reads the actor-scoped key
+/// `session:consulted:<id>:<key>` (subagent enforcement path).
+/// When `actor` is `None`, reads the global key `session:consulted:<key>`
+/// (main-thread path — unchanged behaviour).
+pub async fn check_consulted_recent(
+    store: &Store,
+    key: &str,
+    ttl_secs: u64,
+    actor: Option<&str>,
+) -> Result<bool> {
+    let consulted_key = receipt_key(key, actor);
     let Some(record) = store.get(&consulted_key).await? else {
         return Ok(false);
     };
@@ -828,15 +850,89 @@ mod tests {
         let (_dir, store) = temp_store().await;
         let key = "file:src/main.rs";
 
-        assert!(!check_consulted_recent(&store, key, 900)
+        assert!(!check_consulted_recent(&store, key, 900, None)
             .await
             .expect("no receipt yet"));
 
         log_hit(&store, key).await.expect("log consultation hit");
 
-        assert!(check_consulted_recent(&store, key, 900)
+        assert!(check_consulted_recent(&store, key, 900, None)
             .await
             .expect("fresh receipt should be valid"));
+    }
+
+    #[tokio::test]
+    async fn consult_receipt_is_actor_scoped_when_actor_present() {
+        let (_dir, store) = temp_store().await;
+
+        // Actor-scoped receipt: actor Some("agentA").
+        let (k, v) = consultation_receipt_staged("file:x", Some("agentA")).unwrap();
+        store.transact_sessions_raw(&[(&k, &v)]).await.unwrap();
+
+        let keys = store.scan_keys("session:consulted:").await.unwrap();
+        assert!(
+            keys.iter().any(|k| k == "session:consulted:agentA:file:x"),
+            "actor-scoped key must be present, got: {keys:?}"
+        );
+        assert!(
+            !keys.iter().any(|k| k == "session:consulted:file:x"),
+            "global key must NOT be written by actor-scoped call, got: {keys:?}"
+        );
+
+        // Global receipt: actor None.
+        let (k2, v2) = consultation_receipt_staged("file:x", None).unwrap();
+        store.transact_sessions_raw(&[(&k2, &v2)]).await.unwrap();
+
+        let keys2 = store.scan_keys("session:consulted:").await.unwrap();
+        assert!(
+            keys2.iter().any(|k| k == "session:consulted:file:x"),
+            "global key must be present with actor=None, got: {keys2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_requires_actor_scoped_receipt_for_subagent() {
+        let (_dir, store) = temp_store().await;
+
+        // Write an actor-scoped receipt for agentA / file:x.
+        let (k, v) = consultation_receipt_staged("file:x", Some("agentA")).unwrap();
+        store.transact_sessions_raw(&[(&k, &v)]).await.unwrap();
+
+        // agentA's own receipt is found.
+        assert!(
+            check_consulted_recent(&store, "file:x", 900, Some("agentA"))
+                .await
+                .expect("agentA receipt lookup"),
+            "agentA should see its own actor-scoped receipt"
+        );
+
+        // A DIFFERENT subagent (agentB) does NOT see agentA's receipt.
+        assert!(
+            !check_consulted_recent(&store, "file:x", 900, Some("agentB"))
+                .await
+                .expect("agentB receipt lookup"),
+            "agentB must NOT ride agentA's receipt"
+        );
+
+        // Write a GLOBAL receipt for file:y (main-thread path).
+        let (k2, v2) = consultation_receipt_staged("file:y", None).unwrap();
+        store.transact_sessions_raw(&[(&k2, &v2)]).await.unwrap();
+
+        // Main thread (actor=None) sees the global receipt unchanged.
+        assert!(
+            check_consulted_recent(&store, "file:y", 900, None)
+                .await
+                .expect("global receipt lookup"),
+            "main thread must still see the global receipt"
+        );
+
+        // A subagent does NOT ride the global (main-thread) receipt.
+        assert!(
+            !check_consulted_recent(&store, "file:y", 900, Some("agentA"))
+                .await
+                .expect("agentA vs global receipt lookup"),
+            "subagent must NOT ride the global main-thread receipt"
+        );
     }
 
     #[tokio::test]

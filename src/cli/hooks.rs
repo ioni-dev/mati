@@ -94,6 +94,9 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
     use mati_core::mcp::protocol as p;
     hook_fire_v2(p::Command::ConsultationHit(p::ConsultationHitInput {
         key: key.to_string(),
+        actor: None,
+        session_id: None,
+        agent_id: None,
     }))
     .await
 }
