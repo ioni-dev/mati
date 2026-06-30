@@ -5,6 +5,7 @@ pub mod codex_post_bash;
 pub mod codex_pre_apply_patch;
 pub mod codex_pre_bash;
 pub mod codex_session_start;
+pub mod claude_stop;
 pub mod codex_stop;
 pub mod codex_user_prompt;
 pub mod decide;
