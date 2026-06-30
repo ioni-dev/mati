@@ -520,7 +520,7 @@ async fn dispatch_file_edit_hook(
         // Stage session-tree writes.
         let agg_key = sess::today_key("analytics:hit_");
         let staged_agg = sess::upsert_daily_agg_staged(store, &agg_key, &file_key).await;
-        let staged_receipt = sess::consultation_receipt_staged(&file_key);
+        let staged_receipt = sess::consultation_receipt_staged(&file_key, None);
         let audit_entry = build_audit_entry(
             ctx,
             request_id,
@@ -776,21 +776,22 @@ async fn dispatch_session_side(
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
-            let staged_receipt = match sess::consultation_receipt_staged(&input.key) {
-                Ok(s) => s,
-                Err(e) => {
-                    let entry = build_audit_entry(
-                        ctx,
-                        request_id,
-                        &command_kind,
-                        &target_key,
-                        false,
-                        Some(ErrorCode::StoreError),
-                    );
-                    write_session_audit(store, &entry).await;
-                    return Response::err(request_id, ErrorCode::StoreError, e.to_string());
-                }
-            };
+            let staged_receipt =
+                match sess::consultation_receipt_staged(&input.key, input.actor.as_deref()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let entry = build_audit_entry(
+                            ctx,
+                            request_id,
+                            &command_kind,
+                            &target_key,
+                            false,
+                            Some(ErrorCode::StoreError),
+                        );
+                        write_session_audit(store, &entry).await;
+                        return Response::err(request_id, ErrorCode::StoreError, e.to_string());
+                    }
+                };
             let audit_entry =
                 build_audit_entry(ctx, request_id, &command_kind, &target_key, true, None);
             // Audit is required — fail closed if serialization fails.
@@ -834,8 +835,8 @@ async fn dispatch_session_side(
                 let _ = store.put(&input.key, &target_record).await;
             }
 
-            // Best-effort enforcement event: ReceiptMinted
-            let _ = crate::store::enforcement::record_event(
+            // Best-effort enforcement event: ReceiptMinted — session-attributed.
+            let _ = crate::store::enforcement::record_event_with_session(
                 store,
                 crate::store::enforcement::EnforcementEventType::ReceiptMinted,
                 crate::store::enforcement::SubjectKind::File,
@@ -844,6 +845,7 @@ async fn dispatch_session_side(
                 None,
                 "consultation_requested".to_string(),
                 None,
+                input.session_id.clone().or_else(|| input.agent_id.clone()),
             )
             .await;
 
@@ -1026,7 +1028,7 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         Command::Get(i) => ("get".into(), json!({ "key": i.key })),
         Command::HookEvaluate(i) => (
             "hook_evaluate".into(),
-            json!({ "file_key": i.file_key, "include_recent": i.include_recent }),
+            json!({ "file_key": i.file_key, "include_recent": i.include_recent, "actor": i.actor }),
         ),
         Command::ScanPrefix(i) => ("scan_prefix".into(), json!({ "prefix": i.prefix })),
         Command::History(i) => ("history".into(), json!({ "key": i.key, "limit": i.limit })),
@@ -1320,6 +1322,9 @@ mod tests {
         for key in ["file:a.rs", "file:b.rs"] {
             let req = make_request(Command::ConsultationHit(ConsultationHitInput {
                 key: key.into(),
+                actor: None,
+                session_id: None,
+                agent_id: None,
             }));
             assert!(matches!(
                 dispatch_v2(&graph, &ctx, req).await,
@@ -1402,6 +1407,9 @@ mod tests {
 
         let req = make_request(Command::ConsultationHit(ConsultationHitInput {
             key: "file:test".into(),
+            actor: None,
+            session_id: None,
+            agent_id: None,
         }));
         let request_id = req.id;
         let _ = dispatch_v2(&graph, &ctx, req).await;
@@ -1445,6 +1453,7 @@ mod tests {
             Command::HookEvaluate(HookEvaluateInput {
                 file_key: "file:k".into(),
                 include_recent: false,
+                actor: None,
             }),
             Command::ScanPrefix(ScanPrefixInput { prefix: "p".into() }),
             Command::History(HistoryInput {
@@ -1490,6 +1499,21 @@ mod tests {
                 cmd.kind()
             );
         }
+    }
+
+    #[test]
+    fn command_to_v1_hook_evaluate_carries_actor() {
+        // Regression: the v2->v1 bridge dropped `actor`, so the daemon ran an
+        // actor-blind consult lookup (subagents rode the global receipt).
+        // Live-E2E caught it; this locks it in.
+        let cmd = Command::HookEvaluate(HookEvaluateInput {
+            file_key: "file:x".into(),
+            include_recent: false,
+            actor: Some("agentZ".into()),
+        });
+        let (kind, args) = command_to_v1(&cmd);
+        assert_eq!(kind, "hook_evaluate");
+        assert_eq!(args.get("actor").and_then(|v| v.as_str()), Some("agentZ"));
     }
 
     #[test]
@@ -1546,7 +1570,12 @@ mod tests {
                 key: "k".into(),
                 session_id: None,
             }),
-            Command::ConsultationHit(ConsultationHitInput { key: "k".into() }),
+            Command::ConsultationHit(ConsultationHitInput {
+                key: "k".into(),
+                actor: None,
+                session_id: None,
+                agent_id: None,
+            }),
             Command::SessionFlush,
             Command::SessionHarvest,
             Command::SessionClearConsults,

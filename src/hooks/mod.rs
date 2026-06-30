@@ -12,6 +12,7 @@ pub mod decide;
 pub mod post_compact;
 pub mod post_compliance;
 pub mod post_edit;
+pub mod post_memget;
 pub mod pre_bash;
 pub mod pre_compact;
 pub mod pre_edit;

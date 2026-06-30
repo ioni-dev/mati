@@ -810,6 +810,7 @@ pub(crate) async fn socket_dispatch(
                 .get("include_recent")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let actor = req.args.get("actor").and_then(|v| v.as_str());
 
             let g = graph.read().await;
             let store = g.store();
@@ -937,11 +938,11 @@ pub(crate) async fn socket_dispatch(
             };
 
             // 3. Consultation status.
-            let consulted = sess::check_consulted(store, file_key)
+            let consulted = sess::check_consulted(store, file_key, actor)
                 .await
                 .unwrap_or(false);
             let consulted_recent = if include_recent {
-                sess::check_consulted_recent(store, file_key, 900)
+                sess::check_consulted_recent(store, file_key, 900, actor)
                     .await
                     .unwrap_or(false)
             } else {
@@ -1075,7 +1076,7 @@ pub(crate) async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.key"),
             };
             let g = graph.read().await;
-            match sess::check_consulted(g.store(), key).await {
+            match sess::check_consulted(g.store(), key, None).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -1092,7 +1093,7 @@ pub(crate) async fn socket_dispatch(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(900);
             let g = graph.read().await;
-            match sess::check_consulted_recent(g.store(), key, ttl_secs).await {
+            match sess::check_consulted_recent(g.store(), key, ttl_secs, None).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }

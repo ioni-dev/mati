@@ -33,6 +33,14 @@ pub enum HookVariant {
     /// (`run_apply_patch`) — parses the patch envelope and denies if any
     /// touched file has an unconsulted confirmed gotcha.
     CodexPreApplyPatch,
+    /// Claude PostToolUse(mcp__mati__mem_get): record actor-scoped consult receipt.
+    /// Payload carries session_id, agent_id (subagent), and tool_input.key.
+    ///
+    /// clap's default kebab derive would yield `claude-post-mem-get`; pin the CLI
+    /// value to `claude-post-memget` so it matches the installed hook script
+    /// (`post-memget.sh` → `mati hook-decide claude-post-memget`).
+    #[value(name = "claude-post-memget")]
+    ClaudePostMemGet,
 }
 
 #[derive(Args, Debug)]
@@ -81,6 +89,21 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     if args.variant == HookVariant::CodexPreApplyPatch {
         return run_apply_patch(&input).await;
     }
+
+    // claude-post-memget: records an actor-scoped consult receipt using
+    // tool_input.key directly — NOT a file path, so skip extract_path entirely.
+    if args.variant == HookVariant::ClaudePostMemGet {
+        return run_post_memget(&input).await;
+    }
+
+    // 1b. Parse agent_id: present only in subagent hook payloads.
+    // Gate actor = agent_id if present, else None (NO session_id fallback).
+    // - Subagent: actor = Some(agent_id) → reads actor-scoped receipt.
+    // - Main thread: actor = None → reads global receipt (unchanged path).
+    let agent_id = input
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
 
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
@@ -144,6 +167,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         serde_json::json!({
             "file_key": &file_key,
             "include_recent": include_recent,
+            "actor": agent_id,
         }),
     )
     .await
@@ -191,6 +215,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 serde_json::json!({
                     "file_key": &canon_key,
                     "include_recent": include_recent,
+                    "actor": agent_id,
                 }),
             )
             .await
@@ -242,6 +267,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                         serde_json::json!({
                             "file_key": &extra_key,
                             "include_recent": include_recent,
+                            "actor": agent_id,
                         }),
                     )
                     .await
@@ -316,6 +342,9 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
         // apply_patch is multi-file and handled by `run_apply_patch` before the
         // single-path pipeline; never reaches here.
         HookVariant::CodexPreApplyPatch => None,
+        // post-memget is handled by `run_post_memget` before extract_path is called;
+        // it uses tool_input.key directly, not a file path.
+        HookVariant::ClaudePostMemGet => None,
     }
 }
 
@@ -450,6 +479,57 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
     Ok(())
 }
 
+// ── claude-post-memget flow ─────────────────────────────────────────────────
+
+/// Record an actor-scoped consult receipt after a successful mem_get.
+///
+/// Fail-open at every step: if the key, session_id, or daemon is missing, exit 0.
+/// No stdout output (PostToolUse hooks are fire-and-forget).
+async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
+    let key = match input
+        .pointer("/tool_input/key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+
+    let agent_id = input
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let session_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let actor = agent_id.or(session_id);
+
+    let cwd = std::env::current_dir()?;
+    // Resolve the daemon slug the way the gate does (repo root, not cwd) so the
+    // actor-scoped receipt lands in the same store the gate will read.
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    if !ensure_daemon(&mati_root).await {
+        return Ok(());
+    }
+
+    let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
+        mati_core::mcp::protocol::ConsultationHitInput {
+            key: key.to_string(),
+            actor: actor.map(str::to_string),
+            session_id: session_id.map(str::to_string),
+            agent_id: agent_id.map(str::to_string),
+        },
+    );
+    let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
+    Ok(())
+}
+
 // ── codex-pre-apply-patch flow ──────────────────────────────────────────────
 
 /// Multi-file edit enforcement for Codex `apply_patch`.
@@ -510,6 +590,11 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     }
 
     // 4. Evaluate each touched path; collect the ones that must be consulted.
+    // agent_id is present in subagent hook payloads; None on the Codex path.
+    let agent_id = input
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
     let mut denied: Vec<String> = Vec::new();
     let mut events: Vec<HookEvent> = Vec::new();
     for raw in &raw_paths {
@@ -518,7 +603,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         let eval_data = match daemon_result(
             &mati_root,
             "hook_evaluate",
-            serde_json::json!({ "file_key": &file_key, "include_recent": true }),
+            serde_json::json!({ "file_key": &file_key, "include_recent": true, "actor": agent_id }),
         )
         .await
         {
@@ -639,8 +724,8 @@ fn platform_events(
                 _ => Some(e),
             })
             .collect(),
-        HookVariant::CodexPostBash => {
-            // Post-bash uses its own flow — should not reach here.
+        HookVariant::CodexPostBash | HookVariant::ClaudePostMemGet => {
+            // Post-bash and post-memget use their own flows — should not reach here.
             events
         }
         HookVariant::ClaudePreEdit => events
@@ -672,9 +757,12 @@ async fn fire_events(mati_root: &Path, events: &[HookEvent], session_id: Option<
     let sid = || session_id.map(str::to_string);
     for event in events {
         let cmd = match event {
-            HookEvent::Hit { key } => {
-                p::Command::ConsultationHit(p::ConsultationHitInput { key: key.clone() })
-            }
+            HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
+                key: key.clone(),
+                actor: None,
+                session_id: None,
+                agent_id: None,
+            }),
             HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::Miss,
                 key: key.clone(),
@@ -725,10 +813,12 @@ fn emit_allow(variant: HookVariant) {
         HookVariant::CodexPreBash
         | HookVariant::CodexPostBash
         | HookVariant::CodexPreApplyPatch
-        | HookVariant::ClaudePreEdit => {
+        | HookVariant::ClaudePreEdit
+        | HookVariant::ClaudePostMemGet => {
             // Silent exit 0 = defer to the normal permission flow. For edits this
             // is deliberate: emitting "allow" would suppress the user's edit
             // prompt on every non-gotcha file (edits are permission-required).
+            // ClaudePostMemGet is PostToolUse — no output needed.
         }
     }
 }
@@ -796,6 +886,7 @@ fn check_eval_data(
             | HookVariant::CodexPostBash
             | HookVariant::CodexPreApplyPatch
             | HookVariant::ClaudePreEdit
+            | HookVariant::ClaudePostMemGet
     );
     let already_consulted = if include_recent {
         eval_data
@@ -852,7 +943,7 @@ fn process_eval_response(
                 HookVariant::ClaudePreRead | HookVariant::ClaudePreBash => {
                     r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#.to_string()
                 }
-                _ => String::new(),
+                _ => String::new(), // ClaudePostMemGet: no output
             };
             return AdapterResult {
                 stdout,
@@ -914,7 +1005,9 @@ fn format_decision(
             }
             _ => (String::new(), String::new(), 0),
         },
-        HookVariant::CodexPostBash => (String::new(), String::new(), 0),
+        HookVariant::CodexPostBash | HookVariant::ClaudePostMemGet => {
+            (String::new(), String::new(), 0)
+        }
     }
 }
 

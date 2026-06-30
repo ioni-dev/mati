@@ -70,6 +70,12 @@ const SETTINGS_JSON: &str = r#"{
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "mcp__mati__mem_get",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/post-memget.sh" }
+        ]
       }
     ],
     "PreCompact": [
@@ -152,6 +158,7 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("session-end.sh", crate::hooks::session_end::SCRIPT),
     ("subagent-start.sh", crate::hooks::subagent_start::SCRIPT),
     ("stop.sh", crate::hooks::claude_stop::SCRIPT),
+    ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -408,7 +415,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 10),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 11),
             other => panic!("expected Installed, got {other:?}"),
         }
 
