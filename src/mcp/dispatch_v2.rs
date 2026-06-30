@@ -1331,7 +1331,11 @@ mod tests {
         let audit_before = {
             let g = graph.read().await;
             assert_eq!(
-                g.store().scan_keys("session:consulted:").await.unwrap().len(),
+                g.store()
+                    .scan_keys("session:consulted:")
+                    .await
+                    .unwrap()
+                    .len(),
                 2,
                 "two receipts should exist before clear"
             );
