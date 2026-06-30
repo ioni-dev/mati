@@ -56,7 +56,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/post-read-compliance.sh"
+            "command": ".claude/hooks/post-read-compliance.sh",
+            "async": true
           }
         ]
       },
@@ -65,7 +66,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/post-edit.sh"
+            "command": ".claude/hooks/post-edit.sh",
+            "async": true
           }
         ]
       }
