@@ -335,6 +335,20 @@ pub async fn session_flush(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// Clear all consult receipts for the session.
+///
+/// Mirrors the receipt-cleanup loop in `session_harvest`. Used by the PostCompact
+/// hook: compaction wipes the agent's memory of consulted gotchas, but receipts are
+/// time-based and survive, so PreToolUse would not re-block. Clearing them forces a
+/// fresh mem_get on next access.
+pub async fn session_clear_consults(store: &Store) -> Result<()> {
+    let consulted_keys = store.scan_keys("session:consulted:").await?;
+    for k in &consulted_keys {
+        store.delete(k).await?;
+    }
+    Ok(())
+}
+
 // ── session_harvest ───────────────────────────────────────────────────────────
 
 /// Archive session, run staleness analysis, auto-promote gotchas.
@@ -821,5 +835,32 @@ mod tests {
         assert!(check_consulted_recent(&store, key, 900)
             .await
             .expect("fresh receipt should be valid"));
+    }
+
+    #[tokio::test]
+    async fn session_clear_consults_deletes_all_receipts() {
+        let (_dir, store) = temp_store().await;
+        let key1 = "file:src/main.rs";
+        let key2 = "file:src/lib.rs";
+
+        log_hit(&store, key1).await.expect("log first hit");
+        log_hit(&store, key2).await.expect("log second hit");
+
+        // Verify receipts exist before clearing.
+        let before = store
+            .scan_keys("session:consulted:")
+            .await
+            .expect("scan before");
+        assert_eq!(before.len(), 2, "expected two receipts before clear");
+
+        session_clear_consults(&store)
+            .await
+            .expect("clear_consults should succeed");
+
+        let after = store
+            .scan_keys("session:consulted:")
+            .await
+            .expect("scan after");
+        assert!(after.is_empty(), "all receipts should be gone after clear");
     }
 }

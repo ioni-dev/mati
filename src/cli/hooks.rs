@@ -156,6 +156,10 @@ pub async fn run_session_harvest() -> Result<()> {
     hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest).await
 }
 
+pub async fn run_session_clear_consults() -> Result<()> {
+    hook_fire_v2(mati_core::mcp::protocol::Command::SessionClearConsults).await
+}
+
 /// Combined log-hit + reparse in a single daemon round-trip.
 /// Called by post-edit.sh hook to avoid two separate process spawns.
 pub async fn run_edit_hook(path: &str) -> Result<()> {

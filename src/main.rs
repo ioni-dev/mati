@@ -188,6 +188,8 @@ enum Commands {
     #[command(hide = true)]
     SessionHarvest,
     #[command(hide = true)]
+    SessionClearConsults,
+    #[command(hide = true)]
     EditHook {
         /// Repo-relative file path
         path: String,
@@ -395,6 +397,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Commands::SessionFlush => cli::hooks::run_session_flush().await,
         Commands::SessionHarvest => cli::hooks::run_session_harvest().await,
+        Commands::SessionClearConsults => cli::hooks::run_session_clear_consults().await,
         Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,
