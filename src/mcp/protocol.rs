@@ -598,6 +598,9 @@ pub enum SessionEvent {
     /// Claude edit gate: an edit was DENIED (stale or shell-evaded — no recent
     /// consult). Records `Deny` with an edit-specific reason code.
     EditBlocked,
+    /// Enterprise floor mandate: an unconsulted access to a consult-required path was DENIED.
+    /// Records `Deny` with reason `floor_consult_required` (distinct from gotcha denies).
+    FloorConsultMiss,
     CodexShellMiss,
     Bootstrap,
     PromptNudge,

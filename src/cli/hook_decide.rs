@@ -769,6 +769,10 @@ fn platform_events(
             // reason code. Drop the rest — the read gate owns Hit/Miss here.
             .filter_map(|e| match e {
                 HookEvent::BlockedUnconsultedRead { key } => Some(HookEvent::EditBlocked { key }),
+                // Keep the floor-mandate deny (its own reason code), don't fold into EditBlocked.
+                HookEvent::FloorConsultBlocked { key } => {
+                    Some(HookEvent::FloorConsultBlocked { key })
+                }
                 HookEvent::ComplianceHit { key } => Some(HookEvent::EditConsulted { key }),
                 _ => None,
             })
@@ -824,6 +828,11 @@ async fn fire_events(mati_root: &Path, events: &[HookEvent], session_id: Option<
             }),
             HookEvent::EditBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::EditBlocked,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::FloorConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::FloorConsultMiss,
                 key: key.clone(),
                 session_id: sid(),
             }),
@@ -968,7 +977,7 @@ fn apply_consult_mandate(
     let events = platform_events(
         variant,
         &decision,
-        vec![HookEvent::BlockedUnconsultedRead { key: file_key }],
+        vec![HookEvent::FloorConsultBlocked { key: file_key }],
     );
     let (stdout, stderr, exit_code) = format_decision(variant, &decision, rel_path);
     *adapter = AdapterResult {
@@ -1986,6 +1995,13 @@ mod tests {
         assert!(
             a.stdout.contains("deny"),
             "pre-read deny output must be emitted"
+        );
+        assert!(
+            matches!(
+                a.events.first(),
+                Some(HookEvent::FloorConsultBlocked { .. })
+            ),
+            "floor mandate deny must emit its own event (distinct audit reason code)"
         );
     }
 
