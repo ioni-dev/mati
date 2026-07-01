@@ -2264,6 +2264,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "git2",
+ "globset",
  "hex",
  "hf-hub",
  "ignore",

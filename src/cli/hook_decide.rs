@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -161,6 +162,11 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         HookVariant::CodexPreBash | HookVariant::ClaudePreEdit
     );
 
+    // Enterprise consult-mandate globs (env-supplied; see `apply_consult_mandate`), compiled
+    // once and applied at every evaluation site below — primary, canonical (symlink), and
+    // multi-file extras — for parity with gotcha enforcement.
+    let consult_globs = consult_globset();
+
     let eval_data = match daemon_result(
         &mati_root,
         "hook_evaluate",
@@ -182,6 +188,15 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     // 8–11. Process eval response through the adapter pipeline.
     let mut adapter = process_eval_response(args.variant, &rel_path, &eval_data);
+    // Consult mandate on the PRIMARY (lexical) file — before the escalation blocks so a
+    // mandated deny short-circuits the canonical/extra round-trips too.
+    apply_consult_mandate(
+        &mut adapter,
+        args.variant,
+        &rel_path,
+        consulted_flag(&eval_data, include_recent),
+        consult_globs.as_ref(),
+    );
 
     // Fail-open telemetry for store/gotcha errors on the LEXICAL evaluation.
     // This describes the lexical lookup that just ran; the canonical fallback
@@ -221,7 +236,16 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             .await
             {
                 let canon_eval = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
-                let canon_adapter = process_eval_response(args.variant, &canon_rel, &canon_eval);
+                let mut canon_adapter =
+                    process_eval_response(args.variant, &canon_rel, &canon_eval);
+                // Mandate the symlink's real target too (parity with the gotcha WI-20 close).
+                apply_consult_mandate(
+                    &mut canon_adapter,
+                    args.variant,
+                    &canon_rel,
+                    consulted_flag(&canon_eval, include_recent),
+                    consult_globs.as_ref(),
+                );
                 // Only ESCALATE: adopt the canonical result solely when it denies.
                 // A non-deny canonical outcome never downgrades the lexical
                 // decision (e.g. a lexical Advisory must survive). The canonical
@@ -274,8 +298,16 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                     {
                         let extra_eval =
                             resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
-                        let extra_adapter =
+                        let mut extra_adapter =
                             process_eval_response(args.variant, &extra_rel, &extra_eval);
+                        // Mandate non-primary bash args too (parity with gotcha extra-file gating).
+                        apply_consult_mandate(
+                            &mut extra_adapter,
+                            args.variant,
+                            &extra_rel,
+                            consulted_flag(&extra_eval, include_recent),
+                            consult_globs.as_ref(),
+                        );
                         if matches!(extra_adapter.decision, Decision::Deny { .. }) {
                             adapter = extra_adapter;
                             break;
@@ -864,6 +896,88 @@ struct AdapterResult {
     /// The semantic decision (used by tests via Debug).
     #[allow(dead_code)]
     decision: Decision,
+}
+
+// ── Floor consult mandate (enterprise governance overlay) ────────────────────
+
+/// Compile the enterprise floor's signed consult-required globs, supplied out-of-band via
+/// `MATI_CONSULT_GLOBS` (a JSON array of glob strings, e.g. `["phi/**","src/payments/**"]`).
+///
+/// A NEUTRAL primitive: OSS enforces per-actor consultation on whatever globs it is handed;
+/// verifying the signed floor that produced them is the caller's job (mati-cloud). Returns
+/// `None` (no mandate) when unset, empty, or unparseable — fail-open, matching the hook posture.
+fn consult_globset() -> Option<GlobSet> {
+    consult_globset_from(&std::env::var("MATI_CONSULT_GLOBS").ok()?)
+}
+
+/// The actor's consultation status from a `hook_evaluate` bundle: the recent-TTL flag for
+/// edit/shell gates, the persistent flag otherwise (mirrors `check_eval_data`).
+fn consulted_flag(eval_data: &serde_json::Value, include_recent: bool) -> bool {
+    let field = if include_recent {
+        "consulted_recent"
+    } else {
+        "consulted"
+    };
+    eval_data
+        .get(field)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Pure compile step for [`consult_globset`], split out for testing without env.
+fn consult_globset_from(raw: &str) -> Option<GlobSet> {
+    let globs: Vec<String> = serde_json::from_str(raw).ok()?;
+    if globs.is_empty() {
+        return None;
+    }
+    let mut builder = GlobSetBuilder::new();
+    for g in &globs {
+        if let Ok(glob) = Glob::new(g) {
+            builder.add(glob);
+        }
+    }
+    builder.build().ok().filter(|s| !s.is_empty())
+}
+
+/// Escalate the decision to a Deny when the accessed file matches a signed consult-required
+/// glob and this actor has not consulted it — a governance mandate to consult even absent a
+/// local gotcha. Never downgrades an existing Deny (deny > consult); no-op when there is no
+/// mandate or the actor already consulted (consultation satisfies it, like a gotcha'd file).
+/// The per-actor receipt is minted by the agent's own `mem_get` on the file.
+fn apply_consult_mandate(
+    adapter: &mut AdapterResult,
+    variant: HookVariant,
+    rel_path: &str,
+    consulted: bool,
+    globs: Option<&GlobSet>,
+) {
+    let Some(globs) = globs else {
+        return;
+    };
+    if consulted || matches!(adapter.decision, Decision::Deny { .. }) || !globs.is_match(rel_path) {
+        return;
+    }
+    let file_key = format!("file:{rel_path}");
+    let decision = Decision::Deny {
+        file_key: file_key.clone(),
+        reason: format!(
+            "[mati] Org policy requires consulting {rel_path} before access — \
+             call mem_get(\"{file_key}\") first."
+        ),
+    };
+    let events = platform_events(
+        variant,
+        &decision,
+        vec![HookEvent::BlockedUnconsultedRead { key: file_key }],
+    );
+    let (stdout, stderr, exit_code) = format_decision(variant, &decision, rel_path);
+    *adapter = AdapterResult {
+        stdout,
+        stderr,
+        exit_code,
+        events,
+        decision,
+    };
 }
 
 /// Special adapter outcome when the eval_data contains errors.
@@ -1832,5 +1946,121 @@ mod tests {
             "src/ghost.rs",
         );
         assert_eq!(got, None);
+    }
+
+    // ── Floor consult mandate overlay ────────────────────────────────────────
+
+    fn allow_adapter() -> AdapterResult {
+        AdapterResult {
+            stdout: "allow".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::Allow,
+        }
+    }
+
+    fn phi_globs() -> GlobSet {
+        consult_globset_from(r#"["phi/**"]"#).unwrap()
+    }
+
+    #[test]
+    fn consult_globset_from_parses_and_rejects() {
+        assert!(consult_globset_from(r#"["phi/**","src/pay/**"]"#).is_some());
+        assert!(consult_globset_from("[]").is_none());
+        assert!(consult_globset_from("not json").is_none());
+    }
+
+    #[test]
+    fn mandate_denies_unconsulted_match() {
+        let g = phi_globs();
+        let mut a = allow_adapter();
+        apply_consult_mandate(
+            &mut a,
+            HookVariant::ClaudePreRead,
+            "phi/records.rs",
+            false,
+            Some(&g),
+        );
+        assert!(matches!(a.decision, Decision::Deny { .. }));
+        assert!(
+            a.stdout.contains("deny"),
+            "pre-read deny output must be emitted"
+        );
+    }
+
+    #[test]
+    fn mandate_allows_when_consulted() {
+        let g = phi_globs();
+        let mut a = allow_adapter();
+        apply_consult_mandate(
+            &mut a,
+            HookVariant::ClaudePreRead,
+            "phi/records.rs",
+            true,
+            Some(&g),
+        );
+        assert!(
+            matches!(a.decision, Decision::Allow),
+            "consultation satisfies the mandate"
+        );
+    }
+
+    #[test]
+    fn mandate_noop_on_nonmatch_or_no_globs() {
+        let g = phi_globs();
+        let mut a = allow_adapter();
+        apply_consult_mandate(
+            &mut a,
+            HookVariant::ClaudePreRead,
+            "src/main.rs",
+            false,
+            Some(&g),
+        );
+        assert!(
+            matches!(a.decision, Decision::Allow),
+            "non-matching path is untouched"
+        );
+
+        let mut b = allow_adapter();
+        apply_consult_mandate(
+            &mut b,
+            HookVariant::ClaudePreRead,
+            "phi/records.rs",
+            false,
+            None,
+        );
+        assert!(
+            matches!(b.decision, Decision::Allow),
+            "no mandate -> no change"
+        );
+    }
+
+    #[test]
+    fn mandate_preserves_existing_deny() {
+        let g = phi_globs();
+        let mut a = AdapterResult {
+            stdout: "x".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::Deny {
+                file_key: "file:phi/x.rs".to_string(),
+                reason: "gotcha-deny".to_string(),
+            },
+        };
+        apply_consult_mandate(
+            &mut a,
+            HookVariant::ClaudePreRead,
+            "phi/x.rs",
+            false,
+            Some(&g),
+        );
+        match &a.decision {
+            Decision::Deny { reason, .. } => {
+                assert_eq!(reason, "gotcha-deny", "deny > consult; not overwritten")
+            }
+            _ => panic!("expected the pre-existing Deny to survive"),
+        }
     }
 }
