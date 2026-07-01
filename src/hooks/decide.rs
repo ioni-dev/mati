@@ -61,6 +61,10 @@ pub enum HookEvent {
     /// Claude edit gate: edit DENIED (no recent consult) — records `Deny` with
     /// reason `edit_blocked_unconsulted` (Plane 2).
     EditBlocked { key: String },
+    /// Enterprise floor mandate DENIED an unconsulted access to a consult-required path —
+    /// records `Deny` with reason `floor_consult_required`, distinct from a local-gotcha deny
+    /// so the audit/report can tell an org mandate from a repo rule.
+    FloorConsultBlocked { key: String },
 }
 
 /// Input to the enforcement decision engine.

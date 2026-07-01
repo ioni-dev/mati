@@ -616,6 +616,9 @@ async fn dispatch_session_side(
                 // decision_reason_code, not the daily aggregate.
                 protocol::SessionEvent::EditConsulted => "compliance:allow_after_receipt_",
                 protocol::SessionEvent::EditBlocked => "compliance:miss_",
+                // Floor-mandate deny shares the miss aggregate; the distinction lives in the
+                // event's decision_reason_code (floor_consult_required).
+                protocol::SessionEvent::FloorConsultMiss => "compliance:miss_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -746,6 +749,22 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "edit_blocked_unconsulted".to_string(),
+                        None,
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                // Enterprise floor mandate deny — distinct reason code so the audit/report can
+                // separate an org consultation mandate from a local gotcha.
+                protocol::SessionEvent::FloorConsultMiss => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "floor_consult_required".to_string(),
                         None,
                         input.session_id.clone(),
                     )
