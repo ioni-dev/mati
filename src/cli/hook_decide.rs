@@ -1105,13 +1105,11 @@ fn format_decision(
             (stdout, String::new(), 0)
         }
         HookVariant::ClaudePreEdit => match decision {
-            Decision::Deny { file_key, .. } => {
-                let path = file_key.strip_prefix("file:").unwrap_or(file_key);
-                let reason = format!(
-                    "[mati] Confirmed gotcha on {path} — call mem_get(\"{file_key}\") \
-                     and read the record before editing this file."
-                );
-                let escaped = escape_json_string(&reason);
+            // Use the decision's own reason (like the read gate) so the message reflects the
+            // actual cause — a local gotcha OR an org consultation mandate — instead of always
+            // claiming "Confirmed gotcha".
+            Decision::Deny { reason, .. } => {
+                let escaped = escape_json_string(reason);
                 let stdout = format!(
                     r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"{escaped}"}}}}"#
                 );
@@ -1763,12 +1761,15 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("deny")
         );
+        // The message now comes from the decision's own reason (like the read gate), so it
+        // instructs the agent to consult; the edit-vs-read distinction lives in the event below
+        // (EditBlocked → `edit_blocked_unconsulted`), not the message wording.
         assert!(
             json.pointer("/hookSpecificOutput/permissionDecisionReason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
-                .contains("before editing"),
-            "deny reason must be edit-flavored, got: {}",
+                .contains("mem_get"),
+            "deny reason must instruct the agent to consult, got: {}",
             result.stdout
         );
         // Plane 2: records an edit-attributed Deny enforcement event.
@@ -2002,6 +2003,25 @@ mod tests {
                 Some(HookEvent::FloorConsultBlocked { .. })
             ),
             "floor mandate deny must emit its own event (distinct audit reason code)"
+        );
+    }
+
+    #[test]
+    fn mandate_pre_edit_deny_uses_org_policy_message() {
+        let g = phi_globs();
+        let mut a = allow_adapter();
+        apply_consult_mandate(
+            &mut a,
+            HookVariant::ClaudePreEdit,
+            "phi/records.rs",
+            false,
+            Some(&g),
+        );
+        assert!(matches!(a.decision, Decision::Deny { .. }));
+        assert!(
+            a.stdout.contains("deny") && a.stdout.contains("Org policy"),
+            "pre-edit mandate deny must show the org-policy reason, not 'Confirmed gotcha'; got {}",
+            a.stdout
         );
     }
 
