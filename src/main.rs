@@ -342,9 +342,14 @@ async fn async_main(cli: Cli) -> Result<()> {
             // Try daemon socket first (avoids store open conflict when mati serve is running).
             let root = cli::daemon::mati_root_for(&cwd)?;
             match cli::daemon::daemon_result(&root, "ping", serde_json::json!({})).await {
-                cli::daemon::DaemonResult::Ok(_) => {
-                    println!("mati ok");
-                    return Ok(());
+                cli::daemon::DaemonResult::Ok(resp) => {
+                    // The transport can succeed while the command fails — the
+                    // client wraps daemon-side errors as `{"ok": false}`.
+                    if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        println!("mati ok");
+                        return Ok(());
+                    }
+                    anyhow::bail!("mati daemon reachable but ping returned an error");
                 }
                 cli::daemon::DaemonResult::Unresponsive => {
                     // Daemon alive but not responding — don't try to open store.
@@ -422,7 +427,7 @@ async fn run_note(text: &str) -> Result<()> {
     let slug = slugify!(text, max_length = 30);
     let key = format!("dev_note:{slug}-{now}");
 
-    let device_id = uuid::Uuid::new_v4();
+    let device_id = mati_core::store::stable_device_id();
     let mut record = Record {
         key: key.clone(),
         value: text.to_string(),

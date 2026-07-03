@@ -415,7 +415,7 @@ async fn finish_gotcha_add(
         format!("{rule} because {reason}")
     };
 
-    let device_id = uuid::Uuid::new_v4();
+    let device_id = mati_core::store::stable_device_id();
     let mut record = Record {
         key: key.clone(),
         value,

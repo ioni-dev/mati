@@ -115,7 +115,7 @@ pub async fn reparse_impl(
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: uuid::Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 1,
                 wall_clock: now,
             },
@@ -268,7 +268,7 @@ pub async fn reparse_staged(
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: uuid::Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 1,
                 wall_clock: now,
             },

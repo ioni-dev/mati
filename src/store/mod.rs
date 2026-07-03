@@ -7,6 +7,7 @@
 //! Path: `~/.mati/<slug>/knowledge.db` and `sessions.db`
 
 pub mod db;
+pub mod device;
 pub mod durability;
 pub mod enforcement;
 pub mod extraction;
@@ -18,6 +19,7 @@ pub mod repair;
 pub mod session;
 
 pub use db::{derive_slug, KnowledgeWriteOp, Store};
+pub use device::stable_device_id;
 pub use durability::Durability;
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{

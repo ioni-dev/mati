@@ -439,6 +439,8 @@ The pre-bash hook classifies shell commands before they run.
 - **GrepLike**: `grep`, `rg`, `sed`, `awk`. The file path is extracted from the last non-flag argument.
 - Anything else is not treated as a file-read operation and passes through unconditionally.
 
+On Claude Code, the Bash gate never emits `permissionDecision: "allow"`. Bash is a permission-required tool, so a force-allow would suppress the user's permission prompt for every command mati does not deny. Non-deny outcomes defer (empty stdout, exit 0); advisory/consulted context is injected via `additionalContext` *without* a `permissionDecision`, which Claude Code treats as "inject context, permission flow proceeds normally." Only the read gate (`Read`/`Glob`/`Grep` — no-permission tools) emits the no-op `allow`. This invariant is pinned by the `only_pre_read_force_allows` test in `cli::hook_decide`.
+
 Known limitation: `cat` with variable expansion, process substitution, or unusual quoting is not caught. The accepted miss rate is 2-5%. See §24.
 
 ### §10.3: Edit Gating (Codex `apply_patch`)
@@ -792,7 +794,7 @@ Each record carries a `RecordVersion`.
 
 ```rust
 pub struct RecordVersion {
-    pub device_id: DeviceId,  // UUID (currently v4 placeholder; v7 planned for mati init M-05)
+    pub device_id: DeviceId,  // UUID v7, stable per user+machine (~/.mati/device_id)
     pub logical_clock: u64,   // Lamport clock, incremented on every local write
     pub wall_clock: u64,      // Display only, never used for conflict ordering
 }
@@ -802,9 +804,7 @@ Wall clock is display-only. It is never used for conflict ordering. Ordering use
 
 The intended conflict-resolution rule is simple: when two writes conflict, meaning the same key from different devices, the higher `logical_clock` wins. That rule is not implemented in v0.1. There is no sync path and no `MergeEngine`, so conflict resolution does not run yet.
 
-`DeviceId` is intended to be generated once and stored in `~/.mati/config.toml`. It should stamp every record write for attribution and later conflict resolution. The current implementation does **not** persist it yet. Each command mints a fresh `Uuid::new_v4()` inline, which means it is not stable across invocations.
-
-Stable persistence in `~/.mati/config.toml`, plus v7 generation for time-ordered monotonic IDs, is deferred to `mati init` M-05.
+`DeviceId` is a UUID v7 generated once on first use and persisted at `~/.mati/device_id` (`store::device::stable_device_id`, first-writer-wins on concurrent creation, self-repairing on corruption, process-lifetime fallback if the home directory is unavailable). Every production record write stamps it. Records written by older binaries carry the historical per-record v4 placeholders; the `MergeEngine` (v0.2) must treat those as attribution-unknown rather than as distinct devices.
 
 ---
 
@@ -898,7 +898,7 @@ Peer credentials are checked through `SO_PEERCRED` on Linux and `LOCAL_PEERCRED`
 
 **In-repo symlink access resolves to the real target for enforcement (WI-20).**
 
-A gotcha is keyed by the lexical repo-relative path, so an agent could route around the gate by reading or editing a gotcha'd file through a symlink whose key differs. The read/edit decision path adds an escalate-only canonical-key fallback: when the lexical gate does not deny, it resolves the accessed path through symlinks (shared with the L3 sandbox's `canonicalize_lenient`), strips the canonicalized repo root, and evaluates the real target's key too — adopting that result only when it denies. It is fully fail-open (no repo root, a `canonicalize` failure, an out-of-repo target, or an identical key all leave the lexical decision intact) and costs one extra `realpath` plus one daemon round-trip, only on the non-deny path. This closes the in-repo symlink bypass at the hook level (L1). It does not change the lexical store key. Hardlink aliases (which `canonicalize` does not resolve) and out-of-tree targets remain out of scope for the hook tier; the L3 OS floor (`mati sandbox`) is what denies crown-jewel files across the shell and its subprocesses.
+A gotcha is keyed by the lexical repo-relative path, so an agent could route around the gate by reading or editing a gotcha'd file through a symlink whose key differs. The read/edit decision path — including Codex `apply_patch` patch targets — adds an escalate-only canonical-key fallback: when the lexical gate does not deny, it resolves the accessed path through symlinks (shared with the L3 sandbox's `canonicalize_lenient`), strips the canonicalized repo root, and evaluates the real target's key too — adopting that result only when it denies. It is fully fail-open (no repo root, a `canonicalize` failure, an out-of-repo target, or an identical key all leave the lexical decision intact) and costs one extra `realpath` plus one daemon round-trip, only on the non-deny path. This closes the in-repo symlink bypass at the hook level (L1). It does not change the lexical store key. Hardlink aliases (which `canonicalize` does not resolve) and out-of-tree targets remain out of scope for the hook tier; the L3 OS floor (`mati sandbox`) is what denies crown-jewel files across the shell and its subprocesses.
 
 **petgraph is in-memory only.**
 

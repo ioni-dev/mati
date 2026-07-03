@@ -403,7 +403,7 @@ fn ls_cache_record(key: &str, value: String) -> Record {
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id: uuid::Uuid::new_v4(),
+            device_id: mati_core::store::stable_device_id(),
             logical_clock: 1,
             wall_clock: now,
         },
@@ -960,7 +960,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
             println!("Imported {imported} records from JSON ({skipped} skipped).");
         }
         "md" => {
-            let device_id = uuid::Uuid::new_v4();
+            let device_id = mati_core::store::stable_device_id();
             let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
             let (imported, skipped) = import_records_resilient(&proxy, &import.records).await;
             println!("Imported {imported} records from CLAUDE.md ({skipped} skipped).");
@@ -973,7 +973,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
                 let (imported, skipped) = import_records_resilient(&proxy, &records).await;
                 println!("Imported {imported} records from JSON ({skipped} skipped).");
             } else {
-                let device_id = uuid::Uuid::new_v4();
+                let device_id = mati_core::store::stable_device_id();
                 let import = mati_core::analysis::import_claude_md(path, device_id, 1)?;
                 let (imported, skipped) = import_records_resilient(&proxy, &import.records).await;
                 println!("Imported {imported} records from CLAUDE.md ({skipped} skipped).");

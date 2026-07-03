@@ -28,12 +28,14 @@ use uuid::Uuid;
 // Primitive aliases
 // ─────────────────────────────────────────────
 
-/// UUID v7 generated once at `mati init`, stored in `~/.mati/config.toml`.
-/// Stamps every record write for Lamport-clock conflict resolution.
+/// UUID v7 generated once on first use, persisted at `~/.mati/device_id`
+/// (`store::device::stable_device_id`). Stamps every record write for
+/// Lamport-clock conflict resolution.
 ///
 /// Requires the `uuid` crate with `features = ["v4", "v7"]`.
-/// NOTE: v7 generation is deferred to M-05 (`mati init`). Until then,
-/// callers use `Uuid::new_v4()` as a placeholder.
+/// NOTE: records written by pre-device-id binaries carry per-record v4
+/// placeholders — the v0.2 `MergeEngine` must treat those as
+/// attribution-unknown, not as distinct devices.
 pub type DeviceId = Uuid;
 
 // ─────────────────────────────────────────────

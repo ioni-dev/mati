@@ -160,7 +160,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
                         staleness: mati_core::store::record::StalenessScore::fresh(),
                         lifecycle: mati_core::store::record::RecordLifecycle::Active,
                         version: mati_core::store::record::RecordVersion {
-                            device_id: uuid::Uuid::new_v4(),
+                            device_id: mati_core::store::stable_device_id(),
                             logical_clock: 1,
                             wall_clock: now_ts,
                         },
