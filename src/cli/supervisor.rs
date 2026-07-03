@@ -69,8 +69,7 @@ fn install(project: &Path, slug: &str, print_only: bool) -> Result<()> {
     // point inside this directory; if it's missing, launchd silently fails
     // to launch the job. Also runs the symlink-attack hardening check —
     // refuse if a hostile symlink is pre-staged at the runtime path.
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let mati_root = home.join(".mati").join(slug);
+    let mati_root = mati_core::store::mati_home()?.join(slug);
     mati_core::mcp::metadata::ensure_runtime_dir(&mati_root)
         .context("preparing mati runtime dir for supervisor logs")?;
 
@@ -204,9 +203,8 @@ fn deactivate_hint(slug: &str) -> String {
 #[cfg(target_os = "macos")]
 fn render_launchd(bin: &Path, project: &Path, slug: &str) -> RenderedUnit {
     let label = format!("com.mati.{slug}");
-    let log_dir = dirs::home_dir()
+    let log_dir = mati_core::store::mati_home_opt()
         .unwrap_or_default()
-        .join(".mati")
         .join(slug);
     let stdout_log = log_dir.join("supervisor.stdout.log");
     let stderr_log = log_dir.join("supervisor.stderr.log");

@@ -1074,6 +1074,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_mark_dirty_writes_marker_record() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let proxy = StoreProxy {

@@ -111,10 +111,64 @@ pub struct Store {
     index_needs_rebuild: bool,
 }
 
+/// Root directory for all mati on-disk state — every project store, the daemon
+/// socket, logs, and the device id live under it.
+///
+/// `~/.mati` by default. Overridable with the `MATI_HOME` environment variable,
+/// which relocates the entire footprint in one lever — used by CI, sandboxes,
+/// and users with a non-standard layout, and by the test harness to keep test
+/// state out of the developer's real home.
+///
+/// Every site that builds a `~/.mati/...` path MUST go through this (or
+/// [`mati_home_opt`]) so the override is honored uniformly; a stray
+/// `dirs::home_dir().join(".mati")` silently escapes it.
+pub fn mati_home() -> Result<PathBuf> {
+    mati_home_opt().context("cannot determine home directory (set MATI_HOME to override)")
+}
+
+/// Non-failing [`mati_home`] for the call sites that already tolerate a missing
+/// home (logging, best-effort cleanup) with their own fallback.
+pub fn mati_home_opt() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MATI_HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    // In this crate's own unit tests, never write into the developer's real
+    // `~/.mati`: redirect the whole footprint to a per-process temp dir. This
+    // is compiled only into the lib's `--test` build, so production and the
+    // `mati` binary are unaffected. The bin crate's tests set `MATI_HOME`
+    // explicitly (its `cfg(test)` is separate from the lib's); integration
+    // tests that spawn `mati` isolate via `HOME`/`MATI_HOME` on the child.
+    #[cfg(test)]
+    {
+        Some(test_home())
+    }
+    #[cfg(not(test))]
+    {
+        dirs::home_dir().map(|h| h.join(".mati"))
+    }
+}
+
+/// Per-process temp `MATI_HOME` for unit tests. Computed once and exported to
+/// the environment so any child `mati` process a test spawns inherits the same
+/// root instead of computing a divergent one.
+#[cfg(test)]
+fn test_home() -> PathBuf {
+    use std::sync::OnceLock;
+    static HOME: OnceLock<PathBuf> = OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("mati-unit-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("MATI_HOME", &dir);
+        dir
+    })
+    .clone()
+}
+
 impl Store {
     /// Open (or create) both trees for the project rooted at `repo_root`.
     ///
-    /// Creates `~/.mati/<slug>/` if it does not exist.
+    /// Creates `<mati_home>/<slug>/` (i.e. `~/.mati/<slug>/`, or under
+    /// `$MATI_HOME`) if it does not exist.
     ///
     /// If the search index is corrupt or schema-incompatible, it is wiped and
     /// replaced with a fresh empty index. [`Store::index_needs_rebuild`] will
@@ -123,8 +177,7 @@ impl Store {
     /// handles this automatically.
     pub async fn open(repo_root: &Path) -> Result<Self> {
         let slug = derive_slug(repo_root);
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-        let root = home.join(".mati").join(&slug);
+        let root = mati_home()?.join(&slug);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("cannot create mati dir at {}", root.display()))?;
 
@@ -1321,6 +1374,33 @@ fn now_micros() -> u64 {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Hygiene guard: unit tests must NEVER resolve `mati_home()` to the
+    /// developer's real `~/.mati`. Before this redirect, every `Store::open`
+    /// in the suite created a permanent `~/.mati/<slug>/` dir (thousands
+    /// accumulated). If this fails, the `cfg(test)` redirect in
+    /// `mati_home_opt` has regressed and the suite is polluting the real home.
+    #[test]
+    fn unit_tests_never_touch_real_mati_home() {
+        let resolved = mati_home().expect("mati_home resolves under test");
+        if let Some(real) = dirs::home_dir() {
+            let real_mati = real.join(".mati");
+            assert_ne!(
+                resolved,
+                real_mati,
+                "unit test resolved to the REAL ~/.mati ({}); the cfg(test) \
+                 redirect regressed — the suite is polluting the developer's home",
+                real_mati.display()
+            );
+        }
+        // An explicit MATI_HOME override must win over the auto-redirect.
+        assert_eq!(
+            std::env::var_os("MATI_HOME").map(PathBuf::from),
+            Some(resolved),
+            "under test, MATI_HOME is exported to the redirect dir so child \
+             `mati` processes inherit the same root"
+        );
+    }
 
     // Helper: open a store backed by a temp directory (no real git repo needed)
     fn temp_store() -> (Store, TempDir) {

@@ -813,8 +813,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
 
 fn log_fail_open(rel_path: &str, reason: &str) {
     eprintln!("[mati] WARNING: enforcement bypassed for {rel_path} — {reason}");
-    if let Some(home) = dirs::home_dir() {
-        let log_dir = home.join(".mati");
+    if let Some(log_dir) = mati_core::store::mati_home_opt() {
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join("fail_open.log");
         log_fail_open_at(&log_path, rel_path, reason);

@@ -92,8 +92,8 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
 
     // Resolve the daemon root so we can emit lifecycle events even before
     // the daemon is reachable.
-    let mati_root: PathBuf = dirs::home_dir()
-        .map(|h| h.join(".mati").join(crate::store::derive_slug(repo_root)))
+    let mati_root: PathBuf = crate::store::mati_home_opt()
+        .map(|h| h.join(crate::store::derive_slug(repo_root)))
         .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory for mati_root"))?;
 
     super::metadata::record_lifecycle_event(&mati_root, "startup", "phase=ensure_daemon");

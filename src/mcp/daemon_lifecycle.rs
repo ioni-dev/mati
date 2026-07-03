@@ -380,8 +380,8 @@ pub async fn ensure_daemon(mati_root: &Path) -> bool {
     };
 
     // Capture stderr to a log file so startup failures are diagnosable.
-    let stderr_target = dirs::home_dir()
-        .map(|h| h.join(".mati").join("daemon_start.log"))
+    let stderr_target = crate::store::mati_home_opt()
+        .map(|h| h.join("daemon_start.log"))
         .and_then(|p| {
             std::fs::OpenOptions::new()
                 .create(true)

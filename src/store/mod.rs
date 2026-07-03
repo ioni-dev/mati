@@ -18,7 +18,7 @@ pub mod record;
 pub mod repair;
 pub mod session;
 
-pub use db::{derive_slug, KnowledgeWriteOp, Store};
+pub use db::{derive_slug, mati_home, mati_home_opt, KnowledgeWriteOp, Store};
 pub use device::stable_device_id;
 pub use durability::Durability;
 pub use migrations::CURRENT_SCHEMA_VERSION;

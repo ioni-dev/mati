@@ -26,10 +26,12 @@ static DEVICE_ID: OnceLock<Uuid> = OnceLock::new();
 /// write paths must use this instead of a per-record `Uuid::new_v4()`.
 pub fn stable_device_id() -> Uuid {
     *DEVICE_ID.get_or_init(|| {
-        let Some(home) = dirs::home_dir() else {
+        // Honors `$MATI_HOME` (and the unit-test redirect) so the device id
+        // never lands in the developer's real `~/.mati` from a test.
+        let Some(home) = super::mati_home_opt() else {
             return Uuid::now_v7();
         };
-        load_or_create_at(&home.join(".mati").join("device_id"))
+        load_or_create_at(&home.join("device_id"))
     })
 }
 

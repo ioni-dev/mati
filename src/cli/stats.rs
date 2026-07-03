@@ -1203,8 +1203,8 @@ const FAIL_OPEN_SCAN_MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Scan `~/.mati/fail_open.log` for FAIL_OPEN entries in the last 7 days.
 fn scan_fail_open_log(now: u64) -> FailOpenStats {
-    let log_path = match dirs::home_dir() {
-        Some(h) => h.join(".mati").join("fail_open.log"),
+    let log_path = match mati_core::store::mati_home_opt() {
+        Some(h) => h.join("fail_open.log"),
         None => {
             return FailOpenStats {
                 count_7d: 0,
