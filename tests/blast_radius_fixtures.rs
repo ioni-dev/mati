@@ -12,6 +12,8 @@ use mati_core::graph::Graph;
 use mati_core::store::Store;
 use tempfile::TempDir;
 
+mod common;
+
 fn fixture_path(lang: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/resolver")
@@ -41,6 +43,7 @@ async fn build_graph_with_edges(
     analyses: &[mati_core::analysis::StaticFileAnalysis],
 ) -> (Graph, TempDir) {
     let edges = build_edges(files, analyses, &[]);
+    common::isolate_mati_home();
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let mut graph = Graph::empty(store);

@@ -14,7 +14,10 @@ use mati_core::store::enforcement::{
     SCHEMA_VERSION,
 };
 
+mod common;
+
 async fn temp_store() -> (TempDir, Store) {
+    common::isolate_mati_home();
     let dir = TempDir::new().expect("tempdir");
     let store = Store::open(dir.path()).await.expect("open store");
     (dir, store)
@@ -352,6 +355,7 @@ async fn strict_mode_blocks_on_write_failure() {
     //
     // Since we can't easily inject a store failure with the real store,
     // we verify the invariant differently: write to a closed/invalid store path.
+    common::isolate_mati_home();
     let dir = TempDir::new().expect("tempdir");
     let store = Store::open(dir.path()).await.expect("open store");
 

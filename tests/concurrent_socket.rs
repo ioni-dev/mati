@@ -19,6 +19,8 @@ use tempfile::TempDir;
 
 use mati_core::store::derive_slug;
 
+mod common;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(100);
 const CONCURRENT_CLIENTS: usize = 16;
@@ -36,6 +38,7 @@ impl Drop for ChildGuard {
 async fn daemon_socket_handles_concurrent_pings() {
     let project_temp = TempDir::new().expect("project tempdir");
     let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
+    common::isolate_mati_home(); // spawned children inherit; store stays out of ~/.mati
     let bin = env!("CARGO_BIN_EXE_mati");
 
     // ── 1. Spawn mati serve. ──────────────────────────────────────────────
@@ -53,7 +56,7 @@ async fn daemon_socket_handles_concurrent_pings() {
     let _guard = ChildGuard(child);
 
     let slug = derive_slug(&project);
-    let mati_root = dirs::home_dir().unwrap().join(".mati").join(&slug);
+    let mati_root = common::mati_home().join(&slug);
     wait_for_path(&mati_root.join("mati.sock"), READY_TIMEOUT).unwrap_or_else(|_| {
         let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
         panic!("daemon never came up; stderr:\n{stderr}");

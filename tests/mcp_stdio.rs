@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+mod common;
+
 // ── Guard type — kills child on drop ─────────────────────────────────────────
 
 struct ChildGuard(Child);
@@ -120,6 +122,7 @@ fn read_until_id(rx: &mpsc::Receiver<String>, expected_id: u64) -> serde_json::V
 fn mcp_stdio_all_four_tools() {
     // ── 1. Set up a fresh project directory ──────────────────────────────────
     let project_dir = TempDir::new().expect("failed to create tempdir for MCP test");
+    common::isolate_mati_home(); // keep the spawned server's store out of ~/.mati
 
     // ── 2. Spawn `mati serve` ─────────────────────────────────────────────────
     let bin = env!("CARGO_BIN_EXE_mati");
@@ -348,6 +351,7 @@ fn setup_mcp_server() -> (
     TempDir,
 ) {
     let project_dir = TempDir::new().expect("failed to create tempdir");
+    common::isolate_mati_home(); // keep the spawned server's store out of ~/.mati
     let bin = env!("CARGO_BIN_EXE_mati");
 
     let mut child = Command::new(bin)

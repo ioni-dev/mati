@@ -3,11 +3,16 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mati")
 }
 
 fn run_in(dir: &Path, args: &[&str]) -> std::process::Output {
+    // Redirect the store off the developer's real ~/.mati (inherited by the
+    // spawned `mati`). Set before the first spawn; idempotent thereafter.
+    common::isolate_mati_home();
     Command::new(bin())
         .args(args)
         .current_dir(dir)
