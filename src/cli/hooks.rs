@@ -271,6 +271,7 @@ mod tests {
     }
 
     async fn temp_store() -> (TempDir, Store) {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().expect("tempdir");
         let store = Store::open(dir.path()).await.expect("open store");
         (dir, store)

@@ -854,6 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_gotcha_links_adds_and_removes_exact_keys() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
 
@@ -902,6 +903,7 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_gotcha_key_available_rejects_existing_key() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let record = make_gotcha_record("gotcha:always-check");
@@ -915,6 +917,7 @@ mod tests {
 
     #[tokio::test]
     async fn choose_manual_gotcha_key_adds_suffix_on_collision() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let record = make_gotcha_record("gotcha:always-check-input");
@@ -944,6 +947,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_sets_confirmed_true() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let record = make_gotcha_record("gotcha:test-confirm");
@@ -960,6 +964,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_updates_source_to_developer_manual() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let record = make_gotcha_record("gotcha:test-source");
@@ -976,6 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_backfills_missing_file_links() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
 
@@ -1010,6 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_fails_on_nonexistent_key() {
+        crate::cli::ensure_test_home();
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         store.close().await.unwrap();

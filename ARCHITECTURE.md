@@ -318,6 +318,8 @@ enforcement:event:<seq_no>
 
 Each project gets two SurrealKV trees under `~/.mati/<slug>/`.
 
+The `~/.mati` root is overridable with the `MATI_HOME` environment variable — one lever that relocates every project store, the daemon socket, logs, and the device id. It is the single source of truth resolved by `store::mati_home()`; every path-building site goes through it (a stray `dirs::home_dir().join(".mati")` would silently escape the override). Used by CI, sandboxes, users with a non-standard layout, and the test harness (which points it at a per-process temp dir so unit tests never write into the developer's real `~/.mati`).
+
 Slug derivation uses the first 8 hex characters of `SHA-256(git remote URL)`. If the repo has no remote, it falls back to `SHA-256(canonicalized repo root path)`.
 
 | Tree        | Path           | Durability           | Retention                               |

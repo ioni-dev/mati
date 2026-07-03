@@ -1112,8 +1112,9 @@ fn check_starting_peer_active(mati_root: &Path) -> bool {
 /// duplicating the slug derivation logic.
 pub fn mati_root_for(cwd: &Path) -> Result<PathBuf> {
     let slug = derive_slug(cwd);
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    Ok(home.join(".mati").join(slug))
+    // Single source of truth for the mati root — honors `$MATI_HOME` so the
+    // daemon socket/root resolves to the same place `Store::open` writes.
+    Ok(mati_core::store::mati_home()?.join(slug))
 }
 
 /// Parse the PID file and return `(pid, owner)`.
