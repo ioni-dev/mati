@@ -7,7 +7,6 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -78,9 +77,13 @@ pub async fn run(args: HookDecideArgs) -> Result<()> {
 }
 
 async fn run_inner(args: HookDecideArgs) -> Result<()> {
-    // 1. Read stdin (tool input JSON from hook protocol).
+    // 1. Read stdin (tool input JSON from hook protocol). MUST be async: the
+    // outer HOOK_DEADLINE_MS timeout can only fire at an await point, so a
+    // blocking std::io read (e.g. a caller that never closes the pipe) would
+    // ride straight past the internal deadline to Claude Code's 3000ms
+    // SIGKILL — skipping the fail-open log entry the deadline exists to write.
     let mut input_str = String::new();
-    std::io::stdin().read_to_string(&mut input_str)?;
+    tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut input_str).await?;
     let input: serde_json::Value =
         serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
 
@@ -178,7 +181,17 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     )
     .await
     {
-        DaemonResult::Ok(resp) => resp.get("data").cloned().unwrap_or(serde_json::Value::Null),
+        // `daemon_data` rejects `{"ok": false}` envelopes — a daemon-side
+        // error must take the fail-open-and-record path below, not evaluate
+        // a Null bundle as "no record" (which would log a false Miss).
+        DaemonResult::Ok(resp) => match daemon_data(&resp) {
+            Some(d) => d,
+            None => {
+                log_fail_open(&rel_path, "hook_evaluate returned error");
+                emit_allow(args.variant);
+                return Ok(());
+            }
+        },
         _ => {
             log_fail_open(&rel_path, "hook_evaluate failed");
             emit_allow(args.variant);
@@ -224,7 +237,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             canonical_rel_path(&raw_path, &cwd, repo_root.as_deref(), &rel_path)
         {
             let canon_key = format!("file:{canon_rel}");
-            if let DaemonResult::Ok(resp) = daemon_result(
+            if let Some(canon_eval) = match daemon_result(
                 &mati_root,
                 "hook_evaluate",
                 serde_json::json!({
@@ -235,7 +248,17 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             )
             .await
             {
-                let canon_eval = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                DaemonResult::Ok(resp) => {
+                    let d = daemon_data(&resp);
+                    if d.is_none() {
+                        // Escalate-only path: the lexical decision stands, but
+                        // record the gap — the real target went ungated.
+                        log_fail_open(&canon_rel, "hook_evaluate returned error (canonical)");
+                    }
+                    d
+                }
+                _ => None,
+            } {
                 let mut canon_adapter =
                     process_eval_response(args.variant, &canon_rel, &canon_eval);
                 // Mandate the symlink's real target too (parity with the gotcha WI-20 close).
@@ -285,7 +308,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                         continue; // primary already evaluated above
                     }
                     let extra_key = format!("file:{extra_rel}");
-                    if let DaemonResult::Ok(resp) = daemon_result(
+                    match daemon_result(
                         &mati_root,
                         "hook_evaluate",
                         serde_json::json!({
@@ -296,46 +319,63 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                     )
                     .await
                     {
-                        let extra_eval =
-                            resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
-                        let mut extra_adapter =
-                            process_eval_response(args.variant, &extra_rel, &extra_eval);
-                        // Mandate non-primary bash args too (parity with gotcha extra-file gating).
-                        apply_consult_mandate(
-                            &mut extra_adapter,
-                            args.variant,
-                            &extra_rel,
-                            consulted_flag(&extra_eval, include_recent),
-                            consult_globs.as_ref(),
-                        );
-                        if matches!(extra_adapter.decision, Decision::Deny { .. }) {
-                            adapter = extra_adapter;
-                            break;
+                        DaemonResult::Ok(resp) => {
+                            let Some(extra_eval) = daemon_data(&resp) else {
+                                log_fail_open(
+                                    &extra_rel,
+                                    "hook_evaluate returned error (extra file)",
+                                );
+                                continue;
+                            };
+                            let mut extra_adapter =
+                                process_eval_response(args.variant, &extra_rel, &extra_eval);
+                            // Mandate non-primary bash args too (parity with gotcha extra-file gating).
+                            apply_consult_mandate(
+                                &mut extra_adapter,
+                                args.variant,
+                                &extra_rel,
+                                consulted_flag(&extra_eval, include_recent),
+                                consult_globs.as_ref(),
+                            );
+                            if matches!(extra_adapter.decision, Decision::Deny { .. }) {
+                                adapter = extra_adapter;
+                                break;
+                            }
                         }
+                        // Per-file fail-open, but RECORDED (gap-aware doctrine —
+                        // matches the apply_patch loop): the extra file simply
+                        // isn't gated this round, and the log says so.
+                        _ => log_fail_open(&extra_rel, "hook_evaluate failed (extra file)"),
                     }
                 }
             }
         }
     }
 
-    // Fire events (non-blocking).
-    // session_id (Claude Code provides it at the top level of the hook input)
-    // attributes these audit events to this agent session — per-actor audit.
-    let session_id = input.get("session_id").and_then(|v| v.as_str());
-    fire_events(&mati_root, &adapter.events, session_id).await;
-
-    // Emit the lexical fail-open telemetry captured before the fallback.
-    if let Some(reason) = lexical_fail_open {
-        log_fail_open(&rel_path, &reason);
-    }
-
-    // Platform-specific output.
+    // Platform-specific output FIRST, audit events second: the outer deadline
+    // can cancel this future between the two. A decision that was delivered
+    // but not recorded is an honest gap (fail-open doctrine); an event
+    // recorded for a decision that was never delivered would be a phantom
+    // entry in the hash-chained audit log. Missing beats false.
     if !adapter.stdout.is_empty() {
         println!("{}", adapter.stdout);
     }
     if !adapter.stderr.is_empty() {
         eprintln!("{}", adapter.stderr);
     }
+
+    // Fire audit events (sequential daemon round-trips, bounded by the outer
+    // deadline). session_id (Claude Code provides it at the top level of the
+    // hook input) and agent_id (present in subagent payloads) attribute these
+    // events to the agent session / actor — per-actor audit.
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
+    fire_events(&mati_root, &adapter.events, session_id, agent_id).await;
+
+    // Emit the lexical fail-open telemetry captured before the fallback.
+    if let Some(reason) = lexical_fail_open {
+        log_fail_open(&rel_path, &reason);
+    }
+
     if adapter.exit_code != 0 {
         let _ = std::io::Write::flush(&mut std::io::stderr());
         std::process::exit(adapter.exit_code);
@@ -392,12 +432,14 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
 /// vs `mati init`/`mati daemon`, causing daemon socket discovery to fail.
 fn discover_repo_root(cwd: &Path) -> Option<PathBuf> {
     git2::Repository::discover(cwd).ok().and_then(|repo| {
-        repo.workdir().map(|p| {
-            // Strip trailing separator that git2's workdir() sometimes adds.
-            let s = p.to_string_lossy();
-            let trimmed = s.trim_end_matches('/');
-            PathBuf::from(trimmed)
-        })
+        // Strip the trailing separator that git2's workdir() sometimes adds.
+        // `to_str` (NOT `to_string_lossy`): a non-UTF-8 root would be
+        // silently rewritten with U+FFFD — a valid-looking but WRONG path,
+        // producing a wrong slug and wrong store keys (a permanent, silent
+        // gate miss). Returning None instead falls back to cwd-based
+        // resolution, which is at least honest about not knowing the root.
+        let root = repo.workdir()?.to_str()?.trim_end_matches('/');
+        Some(PathBuf::from(root))
     })
 }
 
@@ -485,11 +527,20 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
     let consulted = match daemon_result(
         mati_root,
         "session_check_consulted_recent",
-        serde_json::json!({ "key": &file_key, "ttl_secs": 900 }),
+        serde_json::json!({
+            "key": &file_key,
+            "ttl_secs": mati_core::store::session::CONSULTED_RECENT_TTL_SECS,
+        }),
     )
     .await
     {
-        DaemonResult::Ok(resp) => resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false),
+        DaemonResult::Ok(resp) => match daemon_data(&resp) {
+            Some(d) => d.as_bool().unwrap_or(false),
+            // Daemon-side error: the consultation state is UNKNOWN. Recording
+            // a CodexShellMiss here would be a false "bypass detected" audit
+            // event (the daemon is reachable, so it WOULD be recorded).
+            None => return Ok(()),
+        },
         _ => false,
     };
 
@@ -518,6 +569,18 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
 /// Fail-open at every step: if the key, session_id, or daemon is missing, exit 0.
 /// No stdout output (PostToolUse hooks are fire-and-forget).
 async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
+    // A failed mem_get delivered no context — minting a receipt for it would
+    // wrongly downgrade a future deny (a receipt is proof the record was
+    // READ). MCP tool errors surface as `tool_response.isError: true`; an
+    // absent field means success, so this guard is a no-op on the happy path.
+    if input
+        .pointer("/tool_response/isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
     let key = match input
         .pointer("/tool_input/key")
         .and_then(|v| v.as_str())
@@ -627,6 +690,8 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         .get("agent_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    // Enterprise consult-mandate globs — parity with the single-path flow.
+    let consult_globs = consult_globset();
     let mut denied: Vec<String> = Vec::new();
     let mut events: Vec<HookEvent> = Vec::new();
     for raw in &raw_paths {
@@ -639,7 +704,15 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         )
         .await
         {
-            DaemonResult::Ok(resp) => resp.get("data").cloned().unwrap_or(serde_json::Value::Null),
+            DaemonResult::Ok(resp) => match daemon_data(&resp) {
+                Some(d) => d,
+                None => {
+                    // Per-file fail-open on a daemon-side error — recorded,
+                    // not evaluated as a false "no record".
+                    log_fail_open(&rel_path, "hook_evaluate returned error");
+                    continue;
+                }
+            },
             _ => {
                 // Per-file fail-open: don't block the whole edit on one bad lookup.
                 log_fail_open(&rel_path, "hook_evaluate failed");
@@ -647,19 +720,73 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
             }
         };
 
-        let adapter = process_eval_response(variant, &rel_path, &eval_data);
-        if matches!(adapter.decision, Decision::Deny { .. }) {
-            denied.push(file_key);
+        let mut adapter = process_eval_response(variant, &rel_path, &eval_data);
+        // Consult mandate on the patch target — parity with the read/edit
+        // gates (this path uses include_recent semantics, hence `true`).
+        apply_consult_mandate(
+            &mut adapter,
+            variant,
+            &rel_path,
+            consulted_flag(&eval_data, true),
+            consult_globs.as_ref(),
+        );
+        // WI-20 parity: a patch targeting an in-repo symlink would otherwise
+        // evaluate only the lexical key and write through to the real target
+        // ungated. Escalate-only, like the read/edit path: a non-deny
+        // canonical result never downgrades the lexical decision, and
+        // `canonical_rel_path` returns None (zero cost) for non-symlinks.
+        if !matches!(adapter.decision, Decision::Deny { .. }) {
+            if let Some(canon_rel) = canonical_rel_path(raw, &cwd, repo_root.as_deref(), &rel_path)
+            {
+                let canon_key = format!("file:{canon_rel}");
+                if let Some(canon_eval) = match daemon_result(
+                    &mati_root,
+                    "hook_evaluate",
+                    serde_json::json!({ "file_key": &canon_key, "include_recent": true, "actor": agent_id }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(resp) => {
+                        let d = daemon_data(&resp);
+                        if d.is_none() {
+                            log_fail_open(
+                                &canon_rel,
+                                "hook_evaluate returned error (canonical)",
+                            );
+                        }
+                        d
+                    }
+                    _ => None,
+                } {
+                    let mut canon_adapter =
+                        process_eval_response(variant, &canon_rel, &canon_eval);
+                    apply_consult_mandate(
+                        &mut canon_adapter,
+                        variant,
+                        &canon_rel,
+                        consulted_flag(&canon_eval, true),
+                        consult_globs.as_ref(),
+                    );
+                    if matches!(canon_adapter.decision, Decision::Deny { .. }) {
+                        adapter = canon_adapter;
+                    }
+                }
+            }
+        }
+        // The Deny carries its own file_key — the lexical key, the canonical
+        // (real-target) key, or the mandate key, whichever actually denied.
+        if let Decision::Deny {
+            file_key: denied_key,
+            ..
+        } = &adapter.decision
+        {
+            denied.push(denied_key.clone());
             events.extend(adapter.events);
         }
     }
 
-    // 5. Fire compliance events for the blocked files (fire-and-forget).
-    // Codex apply_patch: no Claude session_id in the input; attribution is via
-    // agent_type ("codex"). Per-actor session attribution is a Claude-path feature.
-    fire_events(&mati_root, &events, None).await;
-
-    // 6. Deny if any file needs consultation; otherwise allow.
+    // 5. Deny if any file needs consultation; otherwise allow. Output FIRST,
+    // audit events second (missing beats false — see run_inner).
     if denied.is_empty() {
         emit_allow(variant);
         return Ok(());
@@ -674,6 +801,11 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     };
     eprintln!("{msg}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
+
+    // 6. Fire compliance events for the blocked files (fire-and-forget).
+    // Codex apply_patch: no Claude session_id in the input; agent_id is
+    // present only in subagent payloads.
+    fire_events(&mati_root, &events, None, agent_id).await;
     std::process::exit(2);
 }
 
@@ -786,18 +918,29 @@ fn platform_events(
 
 // ── Event firing ────────────────────────────────────────────────────────────
 
-async fn fire_events(mati_root: &Path, events: &[HookEvent], session_id: Option<&str>) {
+async fn fire_events(
+    mati_root: &Path,
+    events: &[HookEvent],
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) {
     use mati_core::mcp::protocol as p;
     // Per-actor audit attribution (schema_version 2): tag each SessionLog with the
     // agent session that triggered it, when the platform provides one.
     let sid = || session_id.map(str::to_string);
     for event in events {
         let cmd = match event {
+            // Receipt scope must match the evaluation scope: the gate was
+            // queried with `actor = agent_id`, so the receipt minted here is
+            // scoped the same way. A subagent's Advisory hit must NOT mint a
+            // global receipt — receipts are strictly key-scoped in the store
+            // (no actor↔global fallback), and a global receipt would satisfy
+            // the main thread's gate for context only the subagent received.
             HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
                 key: key.clone(),
-                actor: None,
-                session_id: None,
-                agent_id: None,
+                actor: agent_id.map(str::to_string),
+                session_id: sid(),
+                agent_id: agent_id.map(str::to_string),
             }),
             HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::Miss,
@@ -844,23 +987,33 @@ async fn fire_events(mati_root: &Path, events: &[HookEvent], session_id: Option<
 
 // ── Platform output ─────────────────────────────────────────────────────────
 
-fn emit_allow(variant: HookVariant) {
+/// The force-allow JSON, emitted ONLY for the Claude read gate.
+///
+/// INVARIANT (do not widen): `permissionDecision:"allow"` bypasses Claude
+/// Code's permission system entirely. Read/Glob/Grep are no-permission tools,
+/// so the read gate's allow is a harmless no-op. Bash and Edit/Write are
+/// permission-REQUIRED tools — force-allowing them would silently suppress the
+/// user's permission prompt for every command/edit mati doesn't deny (i.e.
+/// installing mati would auto-approve arbitrary shell commands). Every variant
+/// other than `ClaudePreRead` must DEFER: empty stdout, exit 0. Covered by
+/// `only_pre_read_force_allows` in the test module.
+fn allow_output(variant: HookVariant) -> Option<&'static str> {
     match variant {
-        HookVariant::ClaudePreRead | HookVariant::ClaudePreBash => {
-            println!(
-                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-            );
-        }
-        HookVariant::CodexPreBash
+        HookVariant::ClaudePreRead => Some(
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#,
+        ),
+        HookVariant::ClaudePreBash
+        | HookVariant::CodexPreBash
         | HookVariant::CodexPostBash
         | HookVariant::CodexPreApplyPatch
         | HookVariant::ClaudePreEdit
-        | HookVariant::ClaudePostMemGet => {
-            // Silent exit 0 = defer to the normal permission flow. For edits this
-            // is deliberate: emitting "allow" would suppress the user's edit
-            // prompt on every non-gotcha file (edits are permission-required).
-            // ClaudePostMemGet is PostToolUse — no output needed.
-        }
+        | HookVariant::ClaudePostMemGet => None,
+    }
+}
+
+fn emit_allow(variant: HookVariant) {
+    if let Some(json) = allow_output(variant) {
+        println!("{json}");
     }
 }
 
@@ -869,6 +1022,24 @@ fn emit_allow(variant: HookVariant) {
 // testable adapter core above. The run() function now uses process_eval_response().
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Unwrap a daemon response envelope, treating `{"ok": false}` as a failure.
+///
+/// `send_v2_raw` maps a daemon-side ERROR (backpressure, session mismatch,
+/// handler failure) to `DaemonResult::Ok({"ok": false, ...})` — the transport
+/// succeeded, the command didn't. Reading `data` without checking `ok` would
+/// hand the gate a `Null` bundle that evaluates as NoRecord: the access is
+/// allowed (correct, fail-open) but the audit trail records a false Miss
+/// ("no knowledge about this file") instead of a gap, and `fail_open.log`
+/// stays silent. Returns `None` on `ok: false` so callers take their
+/// fail-open-and-record path instead.
+fn daemon_data(resp: &serde_json::Value) -> Option<serde_json::Value> {
+    if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        Some(resp.get("data").cloned().unwrap_or(serde_json::Value::Null))
+    } else {
+        None
+    }
+}
 
 fn extract_gotcha_map(eval_data: &serde_json::Value) -> HashMap<String, serde_json::Value> {
     eval_data
@@ -879,12 +1050,18 @@ fn extract_gotcha_map(eval_data: &serde_json::Value) -> HashMap<String, serde_js
 }
 
 /// Escape a string for inclusion inside a JSON string value.
+///
+/// Delegates to serde_json so ALL control characters (U+0000–U+001F) are
+/// escaped, not just `\n`/`\r`/`\t` — an unescaped control char anywhere in a
+/// deny reason would make the whole hook output unparseable, and an
+/// unparseable deny is a lost deny.
 fn escape_json_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut quoted =
+        serde_json::to_string(s).expect("serializing a &str to a JSON string cannot fail");
+    // Strip the surrounding quotes serde adds.
+    quoted.pop();
+    quoted.remove(0);
+    quoted
 }
 
 // ── Testable adapter core ───────────────────────────────────────────────────
@@ -941,8 +1118,16 @@ fn consult_globset_from(raw: &str) -> Option<GlobSet> {
     }
     let mut builder = GlobSetBuilder::new();
     for g in &globs {
-        if let Ok(glob) = Glob::new(g) {
-            builder.add(glob);
+        match Glob::new(g) {
+            Ok(glob) => {
+                builder.add(glob);
+            }
+            // Fail-open, but RECORDED: a typo'd org glob silently
+            // un-enforcing a path class would be an unrecorded blind spot.
+            Err(e) => log_fail_open(
+                g,
+                &format!("invalid consult-mandate glob, not enforced: {e}"),
+            ),
         }
     }
     builder.build().ok().filter(|s| !s.is_empty())
@@ -1062,12 +1247,11 @@ fn process_eval_response(
     let enforcement_input = match check_eval_data(variant, rel_path, eval_data) {
         EvalDataCheck::Ok(input) => input,
         EvalDataCheck::FailOpen(_reason) => {
-            let stdout = match variant {
-                HookVariant::ClaudePreRead | HookVariant::ClaudePreBash => {
-                    r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#.to_string()
-                }
-                _ => String::new(), // ClaudePostMemGet: no output
-            };
+            // Same rule as `allow_output`: only the read gate force-allows;
+            // every other variant defers on fail-open (empty stdout).
+            let stdout = allow_output(variant)
+                .map(str::to_string)
+                .unwrap_or_default();
             return AdapterResult {
                 stdout,
                 stderr: String::new(),
@@ -1100,21 +1284,35 @@ fn format_decision(
     _rel_path: &str,
 ) -> (String, String, i32) {
     match variant {
-        HookVariant::ClaudePreRead | HookVariant::ClaudePreBash => {
+        HookVariant::ClaudePreRead => {
             let stdout = format_claude_output(decision);
+            (stdout, String::new(), 0)
+        }
+        HookVariant::ClaudePreBash => {
+            // Bash is a permission-REQUIRED tool: a deny is a deny, but every
+            // non-deny outcome must DEFER to the normal permission flow —
+            // never `permissionDecision:"allow"`, which would suppress the
+            // user's prompt for the command (see `allow_output`). Context for
+            // advisory/consulted outcomes is injected via `additionalContext`
+            // WITHOUT a permissionDecision, which Claude Code treats as
+            // "inject context, permission flow proceeds normally".
+            let stdout = match decision {
+                Decision::Deny { reason, .. } => format_deny(reason),
+                Decision::AlreadyConsulted { context } => {
+                    format_context_only(&format!("[mati] Record already consulted. {context}"))
+                }
+                Decision::Advisory { context } | Decision::Liability { context, .. } => {
+                    format_context_only(&format!("[mati] {context}"))
+                }
+                _ => String::new(),
+            };
             (stdout, String::new(), 0)
         }
         HookVariant::ClaudePreEdit => match decision {
             // Use the decision's own reason (like the read gate) so the message reflects the
             // actual cause — a local gotcha OR an org consultation mandate — instead of always
             // claiming "Confirmed gotcha".
-            Decision::Deny { reason, .. } => {
-                let escaped = escape_json_string(reason);
-                let stdout = format!(
-                    r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"{escaped}"}}}}"#
-                );
-                (stdout, String::new(), 0)
-            }
+            Decision::Deny { reason, .. } => (format_deny(reason), String::new(), 0),
             // Non-deny: DEFER to the normal permission flow (empty stdout, exit 0).
             // Deliberately NOT permissionDecision:"allow" — see pre_edit.rs.
             _ => (String::new(), String::new(), 0),
@@ -1132,14 +1330,28 @@ fn format_decision(
     }
 }
 
+/// PreToolUse deny JSON — shared by the read, bash, and edit gates.
+fn format_deny(reason: &str) -> String {
+    let escaped = escape_json_string(reason);
+    format!(
+        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"{escaped}"}}}}"#
+    )
+}
+
+/// PreToolUse output that injects context WITHOUT a permissionDecision: the
+/// permission flow proceeds normally. Used by permission-required tool gates
+/// (Bash) for non-deny outcomes, where a force-allow would suppress the
+/// user's prompt.
+fn format_context_only(msg: &str) -> String {
+    let escaped = escape_json_string(msg);
+    format!(
+        r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","additionalContext":"{escaped}"}}}}"#
+    )
+}
+
 fn format_claude_output(decision: &Decision) -> String {
     match decision {
-        Decision::Deny { reason, .. } => {
-            let escaped = escape_json_string(reason);
-            format!(
-                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"{escaped}"}}}}"#
-            )
-        }
+        Decision::Deny { reason, .. } => format_deny(reason),
         Decision::AlreadyConsulted { context } => {
             let escaped =
                 escape_json_string(&format!("[mati] Record already consulted. {context}"));
@@ -1590,14 +1802,13 @@ mod tests {
         let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0, "gotcha error must fail open");
-        let json: serde_json::Value =
-            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
-        assert_eq!(
-            json.pointer("/hookSpecificOutput/permissionDecision")
-                .and_then(|v| v.as_str()),
-            Some("allow"),
-            "gotcha error must produce allow"
+        assert!(
+            result.stdout.is_empty(),
+            "Bash fail-open must DEFER (empty stdout), never force-allow — \
+             Bash is permission-required; got: {}",
+            result.stdout
         );
+        assert_eq!(result.decision, Decision::Allow);
     }
 
     // ── Outer deadline wrapper ──────────────────────────────────────────
@@ -1683,6 +1894,179 @@ mod tests {
             Some("allow"),
             "deadline path must produce permissionDecision=allow"
         );
+    }
+
+    #[test]
+    fn daemon_data_rejects_error_envelope() {
+        // The client wraps daemon-side errors (backpressure, session
+        // mismatch, handler failure) as DaemonResult::Ok({"ok": false}).
+        // The gate must treat those as eval failures — evaluating the
+        // missing `data` as Null would record a false Miss.
+        let ok = json!({"ok": true, "v": 2, "data": {"consulted": true}});
+        assert_eq!(
+            daemon_data(&ok),
+            Some(json!({"consulted": true})),
+            "ok envelope must yield its data"
+        );
+        let err = json!({"ok": false, "v": 2, "error": "backpressure", "code": "backpressure"});
+        assert!(
+            daemon_data(&err).is_none(),
+            "error envelope must not evaluate as data"
+        );
+        assert!(daemon_data(&json!({"v": 2})).is_none());
+    }
+
+    // ── Coverage-widening guard ─────────────────────────────────────────
+    //
+    // `permissionDecision:"allow"` bypasses Claude Code's permission system.
+    // Only the read gate (Read/Glob/Grep — no-permission tools) may ever emit
+    // it. If this test fails, a change has reintroduced the Bash/edit
+    // permission-prompt bypass.
+
+    #[test]
+    fn only_pre_read_force_allows() {
+        use HookVariant::*;
+        for variant in [
+            ClaudePreRead,
+            ClaudePreEdit,
+            ClaudePreBash,
+            CodexPreBash,
+            CodexPostBash,
+            CodexPreApplyPatch,
+            ClaudePostMemGet,
+        ] {
+            // 1. The fail-open / no-path allow output.
+            match variant {
+                ClaudePreRead => assert!(
+                    allow_output(variant).is_some(),
+                    "read gate keeps its no-op allow"
+                ),
+                _ => assert!(
+                    allow_output(variant).is_none(),
+                    "{variant:?} must DEFER on allow — force-allow would bypass \
+                     the user's permission prompt"
+                ),
+            }
+            // 2. Every non-deny decision outcome.
+            let non_deny_decisions = [
+                Decision::Allow,
+                Decision::NoRecord,
+                Decision::Tombstone,
+                Decision::AlreadyConsulted {
+                    context: "ctx".into(),
+                },
+                Decision::Advisory {
+                    context: "ctx".into(),
+                },
+                Decision::Liability {
+                    staleness: 0.9,
+                    context: "ctx".into(),
+                },
+            ];
+            for decision in &non_deny_decisions {
+                let (stdout, _, _) = format_decision(variant, decision, "src/x.rs");
+                if variant != ClaudePreRead {
+                    assert!(
+                        !stdout.contains(r#""permissionDecision":"allow""#),
+                        "{variant:?} emitted a force-allow for {decision:?}: {stdout}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_claude_pre_bash_defers_no_record() {
+        // A bash command touching a file with no record must DEFER — empty
+        // stdout, so the user's Bash permission prompt is preserved.
+        let data = json!({
+            "file_key": "file:src/new.rs",
+            "file_record": null,
+            "gotcha_records": {},
+            "consulted": false,
+            "consulted_recent": false,
+            "store_error": false,
+            "gotcha_error": false
+        });
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/new.rs", &data);
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            result.stdout.is_empty(),
+            "no-record bash read must defer, got: {}",
+            result.stdout
+        );
+        assert!(matches!(result.decision, Decision::NoRecord));
+    }
+
+    #[test]
+    fn e2e_claude_pre_bash_advisory_injects_context_without_permission_decision() {
+        // Advisory on the bash path: context is injected via additionalContext
+        // ONLY — no permissionDecision field at all, so the permission flow
+        // proceeds normally.
+        let data = json!({
+            "file_key": "file:src/lib.rs",
+            "file_record": {
+                "value": "Library root",
+                "confidence": { "value": 0.45 },
+                "quality": { "value": 0.5 },
+                "staleness": { "value": 0.1, "tier": "fresh" },
+                "payload": { "gotcha_keys": [] }
+            },
+            "gotcha_records": {},
+            "consulted": false,
+            "consulted_recent": false,
+            "store_error": false,
+            "gotcha_error": false
+        });
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/lib.rs", &data);
+
+        assert_eq!(result.exit_code, 0);
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
+        assert!(
+            json.pointer("/hookSpecificOutput/permissionDecision")
+                .is_none(),
+            "bash advisory must NOT carry a permissionDecision, got: {}",
+            result.stdout
+        );
+        assert!(
+            json.pointer("/hookSpecificOutput/additionalContext")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("[mati]"),
+            "bash advisory must inject context, got: {}",
+            result.stdout
+        );
+        assert!(matches!(result.decision, Decision::Advisory { .. }));
+    }
+
+    #[test]
+    fn e2e_claude_pre_bash_deny_still_denies() {
+        // The defer change must not weaken the deny: a confirmed unconsulted
+        // gotcha on the bash path still emits permissionDecision:"deny".
+        let data = deny_eligible_eval_data();
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
+        assert_eq!(
+            json.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|v| v.as_str()),
+            Some("deny")
+        );
+    }
+
+    #[test]
+    fn escape_json_string_escapes_control_chars() {
+        // All of U+0000–U+001F must be escaped, not just \n \r \t — an
+        // unescaped control char makes the deny JSON unparseable (lost deny).
+        let hostile = "a\u{08}b\u{0C}c\u{1B}d\"e\\f\ng";
+        let escaped = escape_json_string(hostile);
+        let wrapped = format!("{{\"v\":\"{escaped}\"}}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&wrapped).expect("escaped output must be valid inside JSON");
+        assert_eq!(parsed.pointer("/v").and_then(|v| v.as_str()), Some(hostile));
     }
 
     #[test]
@@ -2069,6 +2453,28 @@ mod tests {
         assert!(
             matches!(b.decision, Decision::Allow),
             "no mandate -> no change"
+        );
+    }
+
+    #[test]
+    fn mandate_applies_to_apply_patch_variant() {
+        // Parity: the enterprise consult mandate gates Codex apply_patch edits
+        // exactly like reads/edits — deny with exit 2 + mem_get instruction.
+        let g = phi_globs();
+        let mut a = allow_adapter();
+        apply_consult_mandate(
+            &mut a,
+            HookVariant::CodexPreApplyPatch,
+            "phi/records.rs",
+            false,
+            Some(&g),
+        );
+        assert!(matches!(a.decision, Decision::Deny { .. }));
+        assert_eq!(a.exit_code, 2, "apply_patch mandate deny must exit 2");
+        assert!(
+            a.stderr.contains("mem_get"),
+            "apply_patch mandate deny must instruct consultation, got: {}",
+            a.stderr
         );
     }
 

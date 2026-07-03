@@ -147,7 +147,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
 
     let total_start = Instant::now();
-    let device_id = Uuid::new_v4();
+    let device_id = mati_core::store::stable_device_id();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

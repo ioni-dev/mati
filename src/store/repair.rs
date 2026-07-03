@@ -193,7 +193,7 @@ pub async fn mark_dirty(store: &Store, gotcha_key: &str, cause: &str) {
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id: uuid::Uuid::new_v4(),
+            device_id: crate::store::stable_device_id(),
             logical_clock: 1,
             wall_clock: now,
         },
@@ -716,7 +716,7 @@ pub async fn clear_dirty_key_if_solo(store: &Store, gotcha_key: &str) {
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id: uuid::Uuid::new_v4(),
+            device_id: crate::store::stable_device_id(),
             logical_clock: 1,
             wall_clock: now,
         },
@@ -751,7 +751,7 @@ async fn clear_dirty_marker(store: &Store, now: u64) {
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: uuid::Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 1,
                 wall_clock: now,
             },

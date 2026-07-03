@@ -203,7 +203,7 @@ fn analytics_record_with_payload(
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id: uuid::Uuid::new_v4(),
+            device_id: crate::store::stable_device_id(),
             logical_clock: 1,
             wall_clock: now_ts,
         },

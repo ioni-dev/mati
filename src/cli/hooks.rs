@@ -40,8 +40,19 @@ async fn hook_query_bool(cmd: &str, args: serde_json::Value) -> Result<()> {
     let root = mati_root_for(&cwd)?;
     match daemon_result(&root, cmd, args).await {
         DaemonResult::Ok(resp) => {
-            let value = resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false);
-            println!("{value}");
+            if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let value = resp.get("data").and_then(|v| v.as_bool()).unwrap_or(false);
+                println!("{value}");
+            } else {
+                // Daemon-side error: consultation state is UNKNOWN, and the
+                // daemon is reachable — printing "false" here would make the
+                // compliance script record a false ComplianceMiss (and that
+                // event WOULD land, unlike the unreachable arm below where
+                // the follow-up log command fails too). Scripts compare
+                // against the literal "false", so "unknown" means no-op.
+                tracing::debug!("mati {cmd}: daemon error — consultation state unknown");
+                println!("unknown");
+            }
         }
         _ => {
             tracing::debug!("mati {cmd}: daemon unreachable — false");
@@ -63,6 +74,9 @@ pub async fn run_get(key: &str) -> Result<()> {
 
     match daemon_result(&root, "get", serde_json::json!({ "key": key })).await {
         DaemonResult::Ok(resp) => {
+            // An `{"ok": false}` error envelope also lands here and prints
+            // "null" — deliberate: get is a pure read whose script consumers
+            // treat null as "no record" (fail-open, no false audit event).
             let json = match resp.get("data") {
                 Some(d) if d.is_null() => "null".to_string(),
                 Some(d) => d.to_string(),

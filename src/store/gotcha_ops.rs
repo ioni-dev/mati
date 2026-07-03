@@ -531,8 +531,12 @@ async fn update_file_gotcha_key(
             // real analysis and preserve gotcha_keys (reparse.rs).
             if add {
                 let now = now_secs();
-                let mut stub =
-                    Record::layer0_file_stub(file_key.clone(), uuid::Uuid::new_v4(), 1, now);
+                let mut stub = Record::layer0_file_stub(
+                    file_key.clone(),
+                    crate::store::stable_device_id(),
+                    1,
+                    now,
+                );
                 let mut fr = FileRecord::layer0_stub(
                     file_path,
                     vec![],

@@ -56,7 +56,7 @@ pub async fn run(args: SuggestArgs) -> Result<()> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let device_id = uuid::Uuid::new_v4();
+    let device_id = mati_core::store::stable_device_id();
 
     let codeowners = read_codeowners(&root);
     let files = read_text_files(&root);

@@ -615,7 +615,7 @@ async fn write_snapshot_record(store: &StoreProxy, snap: &StatusSnapshot, now: u
         staleness: StalenessScore::fresh(),
         lifecycle: RecordLifecycle::Active,
         version: RecordVersion {
-            device_id: uuid::Uuid::new_v4(),
+            device_id: mati_core::store::stable_device_id(),
             logical_clock: 1,
             wall_clock: now,
         },

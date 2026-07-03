@@ -349,7 +349,7 @@ async fn upsert_commit_once(
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 1,
                 wall_clock: now,
             },
@@ -1063,7 +1063,7 @@ pub(crate) async fn handle_decision_upsert(
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 1,
                 wall_clock: now,
             },
@@ -1183,7 +1183,7 @@ pub(crate) async fn handle_dev_note_upsert(
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 1,
                 wall_clock: now,
             },
@@ -1806,8 +1806,12 @@ async fn compute_file_link_updates(
                 // until the next `mati init`. Mirrors the create-on-write
                 // fix in gotcha_ops::update_file_gotcha_key. init/reparse later
                 // merge real analysis and preserve gotcha_keys.
-                let mut stub =
-                    Record::layer0_file_stub(file_key.clone(), uuid::Uuid::new_v4(), 1, now);
+                let mut stub = Record::layer0_file_stub(
+                    file_key.clone(),
+                    crate::store::stable_device_id(),
+                    1,
+                    now,
+                );
                 let mut fr = FileRecord::layer0_stub(
                     *file_path,
                     vec![],
@@ -2247,7 +2251,7 @@ async fn apply_mem_set_write(
             staleness: StalenessScore::fresh(),
             lifecycle: RecordLifecycle::Active,
             version: RecordVersion {
-                device_id: uuid::Uuid::new_v4(),
+                device_id: crate::store::stable_device_id(),
                 logical_clock: 0,
                 wall_clock: now,
             },

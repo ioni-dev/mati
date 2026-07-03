@@ -535,7 +535,11 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
             };
         }
 
-        let safe_path = input.rel_path.replace('\\', "\\\\").replace('"', "\\\"");
+        // The reason is a SEMANTIC string — JSON escaping is the output
+        // layer's job (`escape_json_string` in the adapter). Pre-escaping
+        // here double-escapes: a path with a quote would render as `\"` in
+        // the message the agent sees.
+        let safe_path = &input.rel_path;
         let staleness_note = if staleness >= 0.4 {
             format!(" (staleness {staleness:.2} — verify critical details)")
         } else {
