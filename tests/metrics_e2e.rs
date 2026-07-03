@@ -30,6 +30,8 @@ use tempfile::TempDir;
 use mati_core::mcp::metrics::SNAPSHOT_VERSION;
 use mati_core::store::derive_slug;
 
+mod common;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(100);
 const PING_COUNT: u64 = 5;
@@ -53,6 +55,7 @@ impl Drop for ChildGuard {
 async fn metrics_snapshot_reflects_dispatch_traffic() {
     let project_temp = TempDir::new().expect("project tempdir");
     let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
+    common::isolate_mati_home(); // spawned children inherit; store stays out of ~/.mati
     let bin = env!("CARGO_BIN_EXE_mati");
 
     // ── 1. Spawn mati serve. ──────────────────────────────────────────────
@@ -70,10 +73,8 @@ async fn metrics_snapshot_reflects_dispatch_traffic() {
     let _guard = ChildGuard(child);
 
     let slug = derive_slug(&project);
-    let mati_root = dirs::home_dir()
-        .expect("home dir")
-        .join(".mati")
-        .join(&slug);
+    // Same root the spawned `mati serve` writes to (both honor MATI_HOME).
+    let mati_root = common::mati_home().join(&slug);
     wait_for_path(&mati_root.join("mati.sock"), READY_TIMEOUT).unwrap_or_else(|_| {
         let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
         panic!("daemon never came up; stderr:\n{stderr}");

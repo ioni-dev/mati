@@ -35,6 +35,8 @@ use mati_core::store::record::{
 };
 use mati_core::store::{derive_slug, repair, Store};
 
+mod common;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(100);
 
@@ -57,6 +59,7 @@ async fn crash_recovery_runs_auto_drain_on_serve_boot() {
     // (otherwise pre-staged data lives under a different `~/.mati/<slug>/`
     // than the daemon opens).
     let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project path");
+    common::isolate_mati_home(); // in-process Store::open + spawned child both honor MATI_HOME
 
     // ── 1. Pre-stage drift + dirty marker via direct Store access. ───────
     // Simulates the on-disk state left behind after an unclean shutdown
@@ -123,7 +126,7 @@ async fn crash_recovery_runs_auto_drain_on_serve_boot() {
 
     // ── 3. Compute the daemon root and wait for daemon-ready. ────────────
     let slug = derive_slug(&project);
-    let mati_root = dirs::home_dir().unwrap().join(".mati").join(&slug);
+    let mati_root = common::mati_home().join(&slug);
     let lifecycle_log = mati_root.join("lifecycle.log");
 
     if wait_for_path(&mati_root.join("mati.sock"), READY_TIMEOUT).is_err() {

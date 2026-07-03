@@ -26,6 +26,8 @@ use tokio::process::Command;
 
 use mati_core::store::derive_slug;
 
+mod common;
+
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(100);
@@ -45,6 +47,7 @@ async fn daemon_start_writes_lifecycle_events_and_exits_cleanly_on_sigterm() {
         .arg("start")
         .current_dir(&project)
         .env("RUST_LOG", "info")
+        .env("MATI_HOME", common::mati_home()) // isolate store off real ~/.mati
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
@@ -55,7 +58,7 @@ async fn daemon_start_writes_lifecycle_events_and_exits_cleanly_on_sigterm() {
 
     // ── 2. Wait for daemon-ready. ─────────────────────────────────────────
     let slug = derive_slug(&project);
-    let mati_root = dirs::home_dir().unwrap().join(".mati").join(&slug);
+    let mati_root = common::mati_home().join(&slug);
     let lifecycle_log = mati_root.join("lifecycle.log");
     let sock = mati_root.join("mati.sock");
 
@@ -163,6 +166,7 @@ async fn serve_exits_cleanly_on_sigterm_after_client_disconnect() {
         .arg("serve")
         .current_dir(&project)
         .env("RUST_LOG", "info")
+        .env("MATI_HOME", common::mati_home()) // isolate store off real ~/.mati
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
@@ -176,7 +180,7 @@ async fn serve_exits_cleanly_on_sigterm_after_client_disconnect() {
 
     // ── 2. Wait for mati.sock — confirms idle-wait + signal handler ready. ──
     let slug = derive_slug(&project);
-    let mati_root = dirs::home_dir().unwrap().join(".mati").join(&slug);
+    let mati_root = common::mati_home().join(&slug);
     let lifecycle_log = mati_root.join("lifecycle.log");
     let sock = mati_root.join("mati.sock");
 

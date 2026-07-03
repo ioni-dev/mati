@@ -43,11 +43,18 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 const VERIFICATION_DIR: &str = "/tmp/mati-verification";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn mati_bin() -> PathBuf {
+    // Every `mati` spawn goes through here, so this is the one choke point that
+    // guarantees MATI_HOME is set (store off the real ~/.mati) before the first
+    // child runs. Idempotent. `clean_store` resolves the same root via
+    // `common::mati_home()`.
+    common::isolate_mati_home();
     if let Ok(p) = std::env::var("CARGO_BIN_EXE_mati") {
         return PathBuf::from(p);
     }
@@ -105,10 +112,7 @@ fn clean_store(slug: &str) {
     if slug.is_empty() {
         return;
     }
-    let store_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".mati")
-        .join(slug);
+    let store_dir = common::mati_home().join(slug);
     if store_dir.exists() {
         let _ = std::fs::remove_dir_all(&store_dir);
     }

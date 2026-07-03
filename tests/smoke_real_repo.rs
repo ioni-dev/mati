@@ -17,6 +17,8 @@
 //! cargo test --test smoke_real_repo -- --ignored
 //! ```
 
+mod common;
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -47,6 +49,7 @@ mod tests {
     /// Returns both the store and the TempDir (caller must hold the TempDir
     /// to prevent cleanup while the store is in use).
     async fn temp_store() -> (Store, TempDir) {
+        super::common::isolate_mati_home();
         let dir = TempDir::new().expect("failed to create temp dir for store");
         let store = Store::open(dir.path())
             .await
