@@ -139,6 +139,32 @@ impl StoreProxy {
         }
     }
 
+    /// Scan raw keys under `prefix`, without deserializing values.
+    ///
+    /// Unlike `scan_prefix`, this also returns keys whose values are not
+    /// serialized `Record`s — e.g. `graph:edge:*` entries, which hold raw
+    /// timestamp bytes. Integrity checks that enumerate edges must use this,
+    /// not a keys-of-`scan_prefix` projection, or every edge looks missing.
+    pub async fn scan_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        match &self.inner {
+            ProxyInner::Direct(s) => s.scan_keys(prefix).await,
+            ProxyInner::Socket { root } => {
+                match daemon_result(root, "scan_keys", json!({ "prefix": prefix })).await {
+                    DaemonResult::Ok(v) => {
+                        let data = &v["data"];
+                        if data.is_null() {
+                            Ok(vec![])
+                        } else {
+                            Ok(serde_json::from_value(data.clone())
+                                .context("proxy scan_keys: failed to deserialize keys")?)
+                        }
+                    }
+                    other => Err(socket_read_error("scan_keys", other)),
+                }
+            }
+        }
+    }
+
     /// Read enforcement events. Routes through the daemon when running so the
     /// CLI does not require exclusive store access.
     pub async fn scan_enforcement_events(
@@ -959,8 +985,7 @@ impl StoreProxy {
 }
 
 /// `StoreProxy` exposes the read primitives `mati doctor`'s integrity checks
-/// need, so they run via the daemon socket when one holds the lock. `scan_keys`
-/// isn't a native proxy op — derive it from `scan_prefix` (keys only).
+/// need, so they run via the daemon socket when one holds the lock.
 impl mati_core::store::repair::RepairReader for StoreProxy {
     async fn get(&self, key: &str) -> Result<Option<Record>> {
         StoreProxy::get(self, key).await
@@ -969,8 +994,7 @@ impl mati_core::store::repair::RepairReader for StoreProxy {
         StoreProxy::scan_prefix(self, prefix).await
     }
     async fn scan_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let recs = StoreProxy::scan_prefix(self, prefix).await?;
-        Ok(recs.into_iter().map(|r| r.key).collect())
+        StoreProxy::scan_keys(self, prefix).await
     }
 }
 
@@ -1070,6 +1094,144 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("scan_prefix"));
         assert!(msg.contains("restarting the daemon"));
+    }
+
+    #[tokio::test]
+    async fn socket_scan_keys_errors_when_daemon_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Socket {
+                root: dir.path().to_path_buf(),
+            },
+        };
+
+        let err = proxy.scan_keys("graph:edge:").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("scan_keys"));
+        assert!(msg.contains("restarting the daemon"));
+    }
+
+    /// Regression: `graph:edge:*` values are raw timestamp bytes, not
+    /// serialized `Record`s. The old `RepairReader::scan_keys` shim projected
+    /// keys out of `scan_prefix`, which skips undeserializable values — so
+    /// every edge looked missing and `mati doctor` reported permanent drift
+    /// that `mati repair` (native `Store::scan_keys`) could never fix.
+    #[tokio::test]
+    async fn direct_scan_keys_sees_raw_edge_keys_and_doctor_reports_no_drift() {
+        use mati_core::graph::edges::{Edge, EdgeKind};
+        use mati_core::store::record::{
+            Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
+            RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+        };
+        use mati_core::store::repair::{check_gotcha_indexes, RepairReader};
+
+        fn base_record(key: &str, category: Category, payload: serde_json::Value) -> Record {
+            let source = RecordSource::DeveloperManual;
+            Record {
+                key: key.to_string(),
+                value: "test".into(),
+                payload: Some(payload),
+                category,
+                priority: Priority::Normal,
+                tags: vec![],
+                created_at: 1_000_000,
+                updated_at: 1_000_000,
+                ref_url: None,
+                staleness: StalenessScore::fresh(),
+                lifecycle: RecordLifecycle::Active,
+                version: RecordVersion {
+                    device_id: uuid::Uuid::new_v4(),
+                    logical_clock: 1,
+                    wall_clock: 1_000_000,
+                },
+                quality: QualityScore::layer0_default(),
+                access_count: 0,
+                last_accessed: 0,
+                confidence: ConfidenceScore::for_new_record(&source),
+                source,
+                gap_analysis_score: 0.0,
+            }
+        }
+
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let gotcha = GotchaRecord {
+            rule: "test".into(),
+            reason: "test".into(),
+            severity: Priority::High,
+            affected_files: vec!["src/a.rs".into()],
+            ref_url: None,
+            discovered_session: 1_000_000,
+            confirmed: true,
+        };
+        store
+            .put(
+                "gotcha:g1",
+                &base_record(
+                    "gotcha:g1",
+                    Category::Gotcha,
+                    serde_json::to_value(&gotcha).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let file = FileRecord {
+            path: "src/a.rs".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec!["gotcha:g1".into()],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
+        };
+        store
+            .put(
+                "file:src/a.rs",
+                &base_record(
+                    "file:src/a.rs",
+                    Category::File,
+                    serde_json::to_value(&file).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let edge = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:g1");
+        store
+            .put_raw(&edge.to_key(), &1_000_000u64.to_le_bytes())
+            .await
+            .unwrap();
+
+        let proxy = StoreProxy {
+            inner: ProxyInner::Direct(store),
+        };
+
+        // The raw edge key must be visible through the RepairReader.
+        let keys = RepairReader::scan_keys(&proxy, "graph:edge:").await.unwrap();
+        assert_eq!(keys, vec![edge.to_key()]);
+
+        // And the doctor-level check must see a consistent store.
+        let report = check_gotcha_indexes(&proxy).await.unwrap();
+        assert!(
+            !report.has_drift(),
+            "false drift through StoreProxy: {report:?}"
+        );
+
+        proxy.close().await.unwrap();
     }
 
     #[tokio::test]
