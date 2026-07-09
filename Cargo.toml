@@ -227,5 +227,8 @@ opt-level = 1
 
 [package.metadata.binstall]
 pkg-url  = "https://github.com/ioni-dev/mati/releases/download/v{ version }/mati-{ target }.tar.gz"
-bin-dir  = "mati"
+# The release tarball contains the bare binary at its root, so the template
+# is just the binary name. A literal like "mati" makes binstall reject the
+# config ("duplicate source path") and silently fall back to a source build.
+bin-dir  = "{ bin }{ binary-ext }"
 pkg-fmt  = "tgz"
