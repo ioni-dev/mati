@@ -19,7 +19,7 @@
 //! - **MemQuery**: native pure-read handler via `dispatch_mem_query`
 //!   (γ-C1.5). Centralizes mode dispatch so v1 (rmcp tool wrapper) and
 //!   v2 (typed Command::MemQuery) produce byte-identical responses.
-//! - **Pure reads** (8 commands): v1 bridge for read-only dispatch. No
+//! - **Pure reads** (9 commands): v1 bridge for read-only dispatch. No
 //!   mutations, no audit, no side effects. The v1 bridge CANNOT reach
 //!   `put` or `delete` — no `Command` variant maps to those strings.
 //!
@@ -134,7 +134,7 @@ pub(crate) async fn dispatch_v2(
         // 2. Dispatch based on command classification.
         //
         // All mutations and side-effecting reads have native handlers.
-        // Only pure reads (8 commands) use the v1 bridge, which cannot
+        // Only pure reads (9 commands) use the v1 bridge, which cannot
         // reach any mutation path.
         if is_side_effecting_read(&req.cmd) {
             // MemGet / MemBootstrap: native handler with sessions-tree
@@ -1050,6 +1050,7 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             json!({ "file_key": i.file_key, "include_recent": i.include_recent, "actor": i.actor }),
         ),
         Command::ScanPrefix(i) => ("scan_prefix".into(), json!({ "prefix": i.prefix })),
+        Command::ScanKeys(i) => ("scan_keys".into(), json!({ "prefix": i.prefix })),
         Command::History(i) => ("history".into(), json!({ "key": i.key, "limit": i.limit })),
         Command::HistorySince(i) => (
             "history_since".into(),

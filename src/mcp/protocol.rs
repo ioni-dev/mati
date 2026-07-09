@@ -179,6 +179,12 @@ pub enum Command {
     #[serde(rename = "scan_prefix")]
     ScanPrefix(ScanPrefixInput),
 
+    /// Scan raw keys under a prefix, without deserializing values.
+    /// Unlike `scan_prefix`, this also returns keys whose values are not
+    /// serialized `Record`s (e.g. `graph:edge:*` raw timestamps).
+    #[serde(rename = "scan_keys")]
+    ScanKeys(ScanKeysInput),
+
     /// Version history for a single key.
     #[serde(rename = "history")]
     History(HistoryInput),
@@ -329,6 +335,12 @@ pub struct HookEvaluateInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScanPrefixInput {
+    pub prefix: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanKeysInput {
     pub prefix: String,
 }
 
@@ -716,6 +728,7 @@ impl Command {
             Self::Get(_) => "get",
             Self::HookEvaluate(_) => "hook_evaluate",
             Self::ScanPrefix(_) => "scan_prefix",
+            Self::ScanKeys(_) => "scan_keys",
             Self::History(_) => "history",
             Self::HistorySince(_) => "history_since",
             Self::SessionCheckConsulted(_) => "session_check_consulted",
@@ -752,6 +765,7 @@ impl Command {
             Self::Get(i) => &i.key,
             Self::HookEvaluate(i) => &i.file_key,
             Self::ScanPrefix(i) => &i.prefix,
+            Self::ScanKeys(i) => &i.prefix,
             Self::History(i) => &i.key,
             Self::HistorySince(i) => &i.key,
             Self::SessionCheckConsulted(i) => &i.key,
@@ -879,6 +893,7 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "actor": args["actor"],
         }),
         "scan_prefix" => json!({"type": "scan_prefix", "prefix": args["prefix"]}),
+        "scan_keys" => json!({"type": "scan_keys", "prefix": args["prefix"]}),
         "history" => {
             json!({"type": "history", "key": args["key"], "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50)})
         }
@@ -1436,6 +1451,10 @@ mod tests {
                 Command::ScanPrefix(ScanPrefixInput { prefix: "p".into() }),
             ),
             (
+                "scan_keys",
+                Command::ScanKeys(ScanKeysInput { prefix: "p".into() }),
+            ),
+            (
                 "history",
                 Command::History(HistoryInput {
                     key: "k".into(),
@@ -1568,7 +1587,7 @@ mod tests {
             ("session_clear_consults", Command::SessionClearConsults),
         ];
 
-        assert_eq!(cases.len(), 26, "must cover all 26 command variants");
+        assert_eq!(cases.len(), 27, "must cover all 27 command variants");
         for (expected_kind, cmd) in &cases {
             assert_eq!(
                 cmd.kind(),
@@ -1585,6 +1604,7 @@ mod tests {
         assert!(!Command::Ping.is_mutation());
         assert!(!Command::Metrics.is_mutation());
         assert!(!Command::Get(GetInput { key: "k".into() }).is_mutation());
+        assert!(!Command::ScanKeys(ScanKeysInput { prefix: "p".into() }).is_mutation());
         assert!(!Command::MemQuery(MemQueryInput {
             query: "q".into(),
             mode: QueryMode::Text,

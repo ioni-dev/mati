@@ -1241,6 +1241,21 @@ pub(crate) async fn socket_dispatch(
             }
         }
 
+        "scan_keys" => {
+            let prefix = match req.args.get("prefix").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return SocketResponse::err("missing args.prefix"),
+            };
+            let g = graph.read().await;
+            match g.store().scan_keys(prefix).await {
+                Ok(keys) => match serde_json::to_value(&keys) {
+                    Ok(val) => SocketResponse::ok(val),
+                    Err(e) => SocketResponse::err(format!("serialize: {e}")),
+                },
+                Err(e) => SocketResponse::err(format!("store: {e}")),
+            }
+        }
+
         "scan_enforcement_events" => {
             let since_seq = req
                 .args
