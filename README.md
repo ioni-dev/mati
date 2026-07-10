@@ -142,6 +142,15 @@ mati status
 mati stats
 ```
 
+> **Trust the folder, or hooks won't run.** Claude Code only executes project
+> hooks (`.claude/settings.json`) after you accept its "Do you trust the files
+> in this folder?" prompt for the repo. Until then, enforcement is silently
+> inactive: the MCP server and CLAUDE.md instructions still load, so mati
+> *appears* to work, but a read that should be denied passes straight through.
+> After `mati init --claude`, open Claude Code in the repo once and accept the
+> trust prompt, then verify with a read of a gotcha-gated file — it should be
+> blocked until `mem_get` is called.
+
 ---
 
 ## CLI reference
