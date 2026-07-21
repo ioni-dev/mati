@@ -130,18 +130,23 @@ fn parse_mode(value: &str) -> Result<PolicyMode> {
     }
 }
 
-fn parse_priority(value: &str) -> Priority {
+fn parse_priority(value: &str) -> Result<Priority> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "low" => Priority::Low,
-        "high" => Priority::High,
-        "critical" | "crit" => Priority::Critical,
-        _ => Priority::Normal,
+        "low" => Ok(Priority::Low),
+        "normal" => Ok(Priority::Normal),
+        "high" => Ok(Priority::High),
+        "critical" | "crit" => Ok(Priority::Critical),
+        other => {
+            anyhow::bail!("invalid severity '{other}'; expected low, normal, high, or critical")
+        }
     }
 }
 
 fn direct_store(proxy: &StoreProxy) -> Result<&mati_core::store::Store> {
     proxy.direct_store().ok_or_else(|| anyhow::anyhow!(
-        "local policy mutations require direct store access; the frozen daemon protocol has no policy mutation command"
+        "local policy mutations need direct store access, but a daemon currently holds the store. \
+         Stop it first with `mati daemon stop`, then retry \
+         (daemon-mode policy authoring lands in a later milestone)."
     ))
 }
 
@@ -161,7 +166,7 @@ async fn add(args: AddArgs) -> Result<()> {
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
         enabled: true,
-        severity: parse_priority(&args.severity),
+        severity: parse_priority(&args.severity)?,
         created_by: args.created_by,
     };
     let key = format!("policy:{slug}");

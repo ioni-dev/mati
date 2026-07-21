@@ -87,10 +87,15 @@ pub fn record_for(key: &str, policy: &PolicyRecord) -> Result<Record> {
 }
 
 /// Create a policy. The canonical record write fails hard; the audit is best effort.
+///
+/// An existing *active* policy at this key is rejected. A *tombstoned* one is
+/// replaced by the fresh record, so a deleted slug can be recreated.
 pub async fn create(store: &Store, key: &str, policy: &PolicyRecord) -> Result<()> {
     let record = record_for(key, policy)?;
-    if store.get(key).await?.is_some() {
-        bail!("policy key '{key}' already exists; edit the existing record instead");
+    if let Some(existing) = store.get(key).await? {
+        if matches!(existing.lifecycle, RecordLifecycle::Active) {
+            bail!("policy key '{key}' already exists; edit the existing record instead");
+        }
     }
     store.put(key, &record).await?;
     audit(store, key, ControlChangeKind::Created).await;
@@ -248,5 +253,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn edit_updates_payload_and_bumps_clock() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "policy:query-safety";
+        create(&store, key, &sample()).await.unwrap();
+
+        let mut revised = sample();
+        revised.rule = "Always consult the schema before any write.".into();
+        revised.severity = super::super::record::Priority::Critical;
+        edit(&store, key, &revised).await.unwrap();
+
+        let record = store.get(key).await.unwrap().unwrap();
+        let policy = record.payload_as::<PolicyRecord>().unwrap();
+        assert_eq!(policy.rule, "Always consult the schema before any write.");
+        assert_eq!(record.priority, super::super::record::Priority::Critical);
+        assert_eq!(record.version.logical_clock, 2);
+
+        // editing a missing key fails hard
+        assert!(edit(&store, "policy:missing", &revised).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_active_duplicate_but_resurrects_tombstone() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "policy:dup";
+        create(&store, key, &sample()).await.unwrap();
+        // an active duplicate is rejected
+        assert!(create(&store, key, &sample()).await.is_err());
+        // after delete, the slug can be recreated
+        delete(&store, key).await.unwrap();
+        create(&store, key, &sample()).await.unwrap();
+        assert_eq!(list(&store).await.unwrap().len(), 1);
     }
 }
