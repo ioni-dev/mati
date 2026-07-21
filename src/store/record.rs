@@ -8,7 +8,7 @@
 //! ```text
 //! gotcha:<slug>          file:<path>          decision:<slug>
 //! stage:current          dep:<ecosystem>:<name> dev_note:<slug>
-//! session:<timestamp>    analytics:<type>_<date>
+//! session:<timestamp>    analytics:<type>_<date>  policy:<slug>
 //! graph:edge:<from>:<kind>:<to>
 //! ```
 //!
@@ -92,6 +92,7 @@ pub enum Category {
     DevNote,
     Session,
     Analytics,
+    Policy,
 }
 
 /// Severity / importance ranking.
@@ -809,6 +810,61 @@ pub struct GotchaRecord {
     pub confirmed: bool,
 }
 
+/// Declarative action predicate stored on a local policy.
+///
+/// Milestone 1 only persists this shape. Matching is intentionally deferred to
+/// the later policy-engine milestone.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyTrigger {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_glob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path_glob: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Steer,
+    Block,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptSource {
+    DbIntrospection,
+    MemGet,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PolicyFreshness {
+    pub ttl_secs: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRequires {
+    pub key: String,
+    pub via: Vec<ReceiptSource>,
+    pub freshness: PolicyFreshness,
+}
+
+/// A developer-authored local policy stored under `policy:<slug>`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRecord {
+    pub name: String,
+    pub rule: String,
+    pub reason: String,
+    pub scope: String,
+    pub mode: PolicyMode,
+    pub trigger: PolicyTrigger,
+    pub requires: PolicyRequires,
+    pub enabled: bool,
+    pub severity: Priority,
+    pub created_by: String,
+}
+
 // ─────────────────────────────────────────────
 // Stale review (M-13-C)
 // ─────────────────────────────────────────────
@@ -1128,6 +1184,59 @@ mod tests {
             confirmed: true,
         };
         assert_serde_roundtrip(&gotcha);
+    }
+
+    #[test]
+    fn policy_record_roundtrips_through_record_messagepack() {
+        let policy = PolicyRecord {
+            name: "Production query safety".into(),
+            rule: "Consult the production schema before querying it.".into(),
+            reason: "Queries can target incompatible production tables because schemas drift."
+                .into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Block,
+            trigger: PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: PolicyRequires {
+                key: "schema:orders_db".into(),
+                via: vec![ReceiptSource::DbIntrospection, ReceiptSource::MemGet],
+                freshness: PolicyFreshness { ttl_secs: 900 },
+            },
+            enabled: true,
+            severity: Priority::Critical,
+            created_by: "developer".into(),
+        };
+        let record = Record {
+            key: "policy:production-query-safety".into(),
+            value: policy.rule.clone(),
+            category: Category::Policy,
+            priority: policy.severity.clone(),
+            tags: vec![],
+            created_at: 1_710_520_800,
+            updated_at: 1_710_520_800,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: device_id(),
+                logical_clock: 1,
+                wall_clock: 1_710_520_800,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::DeveloperManual,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+            gap_analysis_score: 0.0,
+            payload: Some(serde_json::to_value(&policy).unwrap()),
+        };
+        let bytes = rmp_serde::to_vec_named(&record).unwrap();
+        let restored: Record = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.category, Category::Policy);
+        assert_eq!(restored.payload_as::<PolicyRecord>().unwrap(), policy);
     }
 
     #[test]

@@ -422,6 +422,7 @@ fn category_str(cat: &Category) -> &'static str {
         Category::DevNote => "dev_note",
         Category::Session => "session",
         Category::Analytics => "analytics",
+        Category::Policy => "policy",
     }
 }
 

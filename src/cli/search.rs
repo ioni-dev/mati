@@ -16,7 +16,14 @@ use crate::cli::proxy::StoreProxy;
 
 /// Record key prefixes that hold searchable knowledge (one tree each — see
 /// `store::db`). Hardcoded because they are a stable, frozen part of the schema.
-const RECORD_PREFIXES: &[&str] = &["gotcha:", "decision:", "dev_note:", "file:", "stage:"];
+const RECORD_PREFIXES: &[&str] = &[
+    "gotcha:",
+    "decision:",
+    "dev_note:",
+    "file:",
+    "stage:",
+    "policy:",
+];
 
 #[derive(Args)]
 pub struct SearchArgs {
@@ -169,6 +176,7 @@ fn category_label(c: &Category) -> &'static str {
         Category::DevNote => "note",
         Category::Session => "session",
         Category::Analytics => "analytics",
+        Category::Policy => "policy",
     }
 }
 

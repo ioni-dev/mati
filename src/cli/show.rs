@@ -1418,6 +1418,7 @@ pub(crate) fn category_label(cat: &Category) -> &'static str {
         Category::DevNote => "dev_note",
         Category::Session => "session",
         Category::Analytics => "analytics",
+        Category::Policy => "policy",
     }
 }
 
@@ -1430,6 +1431,7 @@ pub(crate) fn category_color(cat: &Category) -> &'static str {
         Category::Dependency => colors::YELLOW,
         Category::DevNote => colors::WHITE,
         Category::Session | Category::Analytics => colors::GRAY,
+        Category::Policy => colors::PURPLE,
     }
 }
 

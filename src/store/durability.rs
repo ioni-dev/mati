@@ -6,7 +6,7 @@
 //!
 //! Assignment by key prefix (from ARCHITECTURE.md §4):
 //! ```text
-//! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*
+//! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*   policy:*
 //! Eventual   session:*  analytics:*  hook_event:*  compliance:*  graph:edge:*
 //! ```
 //!
@@ -68,6 +68,10 @@ mod tests {
         assert_eq!(Durability::for_key("stage:current"), Durability::Immediate);
         assert_eq!(
             Durability::for_key("dev_note:dont-refactor"),
+            Durability::Immediate
+        );
+        assert_eq!(
+            Durability::for_key("policy:production-query-safety"),
             Durability::Immediate
         );
     }

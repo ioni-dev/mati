@@ -174,7 +174,7 @@ Write durability is assigned by key namespace. Do not mix the paths. `durability
 
 | Durability           | Namespaces                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Immediate (fsync)    | `gotcha:*` `decision:*` `file:*` `stage:*` `dev_note:*` `dep:*`                                               |
+| Immediate (fsync)    | `gotcha:*` `decision:*` `file:*` `stage:*` `dev_note:*` `dep:*` `policy:*`                                     |
 | Eventual (OS buffer) | `session:*` `analytics:*` `hook_event:*` `compliance:*` `graph:edge:*` `health:*` `parse:*` `audit:session:*` |
 
 Unknown prefixes default to Immediate. See §21 for the rationale.
@@ -193,7 +193,7 @@ All types live in `src/store/record.rs`. Do not redefine them somewhere else bec
 | -------------------- | ------------------- | ---------------------------------------------------------------------------------- |
 | `key`                | `String`            | Namespaced primary key and graph node key                                          |
 | `value`              | `String`            | Human-readable content: rule, purpose, body. Indexed by tantivy.                   |
-| `category`           | `Category`          | Gotcha, File, Decision, Stage, Dependency, DevNote, Session, Analytics             |
+| `category`           | `Category`          | Gotcha, File, Decision, Stage, Dependency, DevNote, Session, Analytics, Policy      |
 | `priority`           | `Priority`          | Low < Normal < High < Critical. Do not reorder variants because `Ord` is derived.  |
 | `tags`               | `Vec<String>`       | Free-form. Used for search and filtering.                                          |
 | `created_at`         | `u64`               | Unix seconds                                                                       |
@@ -247,6 +247,14 @@ Stored under `gotcha:<slug>`. Like `FileRecord`, it is attached to the base `Rec
 | `confirmed`      | `false` means Layer 0 candidate stub, never injected. `true` means developer-validated. |
 
 `confirmed: false` records exist as graph nodes and gap signals. They are not used in hook enforcement. A gotcha can trigger a deny only when `confirmed: true`, `confidence >= 0.6`, and `quality >= 0.4`.
+
+### §5.3a: PolicyRecord
+
+Stored under `policy:<slug>` as the typed payload on the universal `Record`.
+Milestone 1 persists the developer-authored fields `name`, `rule`, `reason`,
+`scope`, `mode`, structured `trigger`, structured `requires`, `enabled`,
+`severity`, and `created_by`. The trigger and receipt requirements are data only
+until the later policy-matching milestone.
 
 ### §5.4: Quality Score formula
 
