@@ -1,4 +1,4 @@
-//! `mati policy verify` — verify a signed policy-floor bundle (idea 1.3).
+//! `mati policy` — author local policies and verify signed policy-floor bundles.
 //!
 //! Verification only; authoring/signing bundles is mati-cloud's licensed
 //! feature. Like `cosign verify`, it checks a bundle against a trusted key:
@@ -12,8 +12,12 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Args, Subcommand};
+use slugify::slugify;
 
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
+use mati_core::store::{PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority};
+
+use crate::cli::proxy::StoreProxy;
 
 #[derive(Args)]
 pub struct PolicyArgs {
@@ -23,8 +27,65 @@ pub struct PolicyArgs {
 
 #[derive(Subcommand)]
 enum PolicyCommand {
+    /// Add a local repository policy (stored under policy:<slug>).
+    #[command(
+        long_about = "Add a local, developer-authored policy. This authors data in the local mati store; it does not verify a signed policy-floor bundle."
+    )]
+    Add(AddArgs),
+    /// List active local policies.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one local policy.
+    Show(PolicyKeyArgs),
+    /// Enable one local policy.
+    Enable(PolicyKeyArgs),
+    /// Disable one local policy.
+    Disable(PolicyKeyArgs),
+    /// Tombstone one local policy.
+    Delete(PolicyKeyArgs),
     /// Verify a signed policy-floor bundle's Ed25519 signature.
     Verify(VerifyArgs),
+}
+
+#[derive(Args)]
+struct PolicyKeyArgs {
+    /// Policy key (policy:<slug>) or slug.
+    key: String,
+}
+
+#[derive(Args)]
+struct AddArgs {
+    /// Slug used to form policy:<slug>.
+    slug: String,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    rule: String,
+    #[arg(long)]
+    reason: String,
+    /// Repo-relative glob(s), or "repo".
+    #[arg(long, default_value = "repo")]
+    scope: String,
+    /// steer or block.
+    #[arg(long, default_value = "steer")]
+    mode: String,
+    /// JSON object such as {"tool":"db_client","host_glob":"*prod*"}.
+    #[arg(long, default_value = "{}")]
+    trigger: String,
+    /// JSON object with key, via, and freshness.ttl_secs.
+    #[arg(
+        long,
+        default_value = "{\"key\":\"\",\"via\":[],\"freshness\":{\"ttl_secs\":900}}"
+    )]
+    requires: String,
+    /// low, normal, high, or critical.
+    #[arg(long, default_value = "normal")]
+    severity: String,
+    #[arg(long, default_value = "developer")]
+    created_by: String,
 }
 
 #[derive(Args)]
@@ -43,8 +104,149 @@ pub struct VerifyArgs {
 
 pub async fn run(args: PolicyArgs) -> Result<()> {
     match args.command {
+        PolicyCommand::Add(a) => add(a).await,
+        PolicyCommand::List { json } => list(json).await,
+        PolicyCommand::Show(a) => show(&normalize_key(&a.key)).await,
+        PolicyCommand::Enable(a) => set_enabled(&normalize_key(&a.key), true).await,
+        PolicyCommand::Disable(a) => set_enabled(&normalize_key(&a.key), false).await,
+        PolicyCommand::Delete(a) => delete(&normalize_key(&a.key)).await,
         PolicyCommand::Verify(a) => verify(a),
     }
+}
+
+fn normalize_key(key: &str) -> String {
+    if key.starts_with("policy:") {
+        key.to_string()
+    } else {
+        format!("policy:{key}")
+    }
+}
+
+fn parse_mode(value: &str) -> Result<PolicyMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "steer" => Ok(PolicyMode::Steer),
+        "block" => Ok(PolicyMode::Block),
+        other => anyhow::bail!("invalid policy mode '{other}'; expected steer or block"),
+    }
+}
+
+fn parse_priority(value: &str) -> Priority {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "low" => Priority::Low,
+        "high" => Priority::High,
+        "critical" | "crit" => Priority::Critical,
+        _ => Priority::Normal,
+    }
+}
+
+fn direct_store(proxy: &StoreProxy) -> Result<&mati_core::store::Store> {
+    proxy.direct_store().ok_or_else(|| anyhow::anyhow!(
+        "local policy mutations require direct store access; the frozen daemon protocol has no policy mutation command"
+    ))
+}
+
+async fn add(args: AddArgs) -> Result<()> {
+    let slug = slugify!(&args.slug);
+    if slug.is_empty() {
+        anyhow::bail!("policy slug cannot be empty");
+    }
+    let policy = PolicyRecord {
+        name: args.name,
+        rule: args.rule,
+        reason: args.reason,
+        scope: args.scope,
+        mode: parse_mode(&args.mode)?,
+        trigger: serde_json::from_str::<PolicyTrigger>(&args.trigger)
+            .context("parsing --trigger JSON")?,
+        requires: serde_json::from_str::<PolicyRequires>(&args.requires)
+            .context("parsing --requires JSON")?,
+        enabled: true,
+        severity: parse_priority(&args.severity),
+        created_by: args.created_by,
+    };
+    let key = format!("policy:{slug}");
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    // Keep all policy:* writes centralized in store::policy_ops.
+    let result = match direct_store(&proxy) {
+        Ok(store) => mati_core::store::policy_ops::create(store, &key, &policy).await,
+        Err(error) => Err(error),
+    };
+    proxy.close_with_result(result).await?;
+    println!("Created {key}");
+    Ok(())
+}
+
+async fn list(json_output: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let records = proxy
+        .scan_prefix("policy:")
+        .await?
+        .into_iter()
+        .filter(|record| matches!(record.lifecycle, mati_core::store::RecordLifecycle::Active))
+        .collect::<Vec<_>>();
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&records)?);
+    } else if records.is_empty() {
+        println!("No local policies found.");
+    } else {
+        for record in records {
+            let policy = record.payload_as::<PolicyRecord>().ok_or_else(|| {
+                anyhow::anyhow!("invalid PolicyRecord payload for {}", record.key)
+            })?;
+            println!(
+                "{}\t{}\t{}\t{:?}",
+                record.key,
+                if policy.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                policy.name,
+                policy.mode
+            );
+        }
+    }
+    proxy.close().await
+}
+
+async fn show(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let record = proxy
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no record found for '{key}'"))?;
+    let policy = record
+        .payload_as::<PolicyRecord>()
+        .ok_or_else(|| anyhow::anyhow!("'{key}' is not a policy record"))?;
+    println!("{}", serde_json::to_string_pretty(&policy)?);
+    proxy.close().await
+}
+
+async fn set_enabled(key: &str, enabled: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let result = match direct_store(&proxy) {
+        Ok(store) => mati_core::store::policy_ops::set_enabled(store, key, enabled).await,
+        Err(error) => Err(error),
+    };
+    proxy.close_with_result(result).await?;
+    println!("{} {}", if enabled { "Enabled" } else { "Disabled" }, key);
+    Ok(())
+}
+
+async fn delete(key: &str) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let result = match direct_store(&proxy) {
+        Ok(store) => mati_core::store::policy_ops::delete(store, key).await,
+        Err(error) => Err(error),
+    };
+    proxy.close_with_result(result).await?;
+    println!("Deleted {key} (tombstoned)");
+    Ok(())
 }
 
 fn verify(args: VerifyArgs) -> Result<()> {
@@ -103,4 +305,27 @@ fn verify(args: VerifyArgs) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_keys_accept_slugs_and_full_keys() {
+        assert_eq!(normalize_key("query-safety"), "policy:query-safety");
+        assert_eq!(normalize_key("policy:query-safety"), "policy:query-safety");
+    }
+
+    #[test]
+    fn policy_cli_parses_structured_authoring_fields() {
+        let trigger: PolicyTrigger =
+            serde_json::from_str(r#"{"tool":"db_client","host_glob":"*prod*"}"#).unwrap();
+        let requires: PolicyRequires = serde_json::from_str(
+            r#"{"key":"schema:orders","via":["mem_get"],"freshness":{"ttl_secs":900}}"#,
+        )
+        .unwrap();
+        assert_eq!(trigger.tool.as_deref(), Some("db_client"));
+        assert_eq!(requires.freshness.ttl_secs, 900);
+    }
 }
