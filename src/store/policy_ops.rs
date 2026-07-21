@@ -1,0 +1,252 @@
+//! Centralized mutations for developer-authored local policies.
+//!
+//! A policy record is the complete source of truth in Milestone 1. The record
+//! is committed before its best-effort audit event, and there is no derived
+//! index or repair path to maintain.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Result};
+
+use super::db::Store;
+use super::enforcement::{record_event, ControlChangeKind, EnforcementEventType, SubjectKind};
+use super::record::{
+    Category, ConfidenceScore, PolicyRecord, QualityScore, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StalenessScore, TombstoneReason,
+};
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn ensure_policy_key(key: &str) -> Result<()> {
+    if !key.starts_with("policy:") || key.len() == "policy:".len() {
+        bail!("invalid policy key '{key}'; expected policy:<slug>");
+    }
+    Ok(())
+}
+
+fn audit_kind(kind: ControlChangeKind) -> &'static str {
+    match kind {
+        ControlChangeKind::Created => "control_created",
+        ControlChangeKind::Updated => "control_updated",
+        ControlChangeKind::Deleted => "control_deleted",
+        ControlChangeKind::Confirmed => "control_updated",
+    }
+}
+
+async fn audit(store: &Store, key: &str, kind: ControlChangeKind) {
+    if let Err(error) = record_event(
+        store,
+        EnforcementEventType::ControlChanged { change_kind: kind },
+        SubjectKind::Control,
+        key.to_string(),
+        "developer".to_string(),
+        None,
+        audit_kind(kind).to_string(),
+        None,
+    )
+    .await
+    {
+        tracing::warn!("policy_ops: enforcement event recording failed for {key}: {error}");
+    }
+}
+
+/// Build the neutral universal-record envelope for a policy payload.
+pub fn record_for(key: &str, policy: &PolicyRecord) -> Result<Record> {
+    ensure_policy_key(key)?;
+    let now = now_secs();
+    let source = RecordSource::DeveloperManual;
+    Ok(Record {
+        key: key.to_string(),
+        value: policy.rule.clone(),
+        category: Category::Policy,
+        priority: policy.severity.clone(),
+        tags: vec![],
+        created_at: now,
+        updated_at: now,
+        ref_url: None,
+        staleness: StalenessScore::fresh(),
+        lifecycle: RecordLifecycle::Active,
+        version: RecordVersion {
+            device_id: crate::store::stable_device_id(),
+            logical_clock: 1,
+            wall_clock: now,
+        },
+        quality: QualityScore::developer_entry_default(),
+        access_count: 0,
+        last_accessed: 0,
+        source: source.clone(),
+        confidence: ConfidenceScore::for_new_record(&source),
+        gap_analysis_score: 0.0,
+        payload: Some(serde_json::to_value(policy)?),
+    })
+}
+
+/// Create a policy. The canonical record write fails hard; the audit is best effort.
+pub async fn create(store: &Store, key: &str, policy: &PolicyRecord) -> Result<()> {
+    let record = record_for(key, policy)?;
+    if store.get(key).await?.is_some() {
+        bail!("policy key '{key}' already exists; edit the existing record instead");
+    }
+    store.put(key, &record).await?;
+    audit(store, key, ControlChangeKind::Created).await;
+    Ok(())
+}
+
+/// Replace an existing active policy payload.
+pub async fn edit(store: &Store, key: &str, policy: &PolicyRecord) -> Result<()> {
+    ensure_policy_key(key)?;
+    let mut record = store
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+    if record.category != Category::Policy {
+        bail!("'{key}' is not a policy record");
+    }
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        bail!("policy '{key}' is not active");
+    }
+    record.value = policy.rule.clone();
+    record.priority = policy.severity.clone();
+    record.updated_at = now_secs();
+    record.version.logical_clock += 1;
+    record.version.wall_clock = record.updated_at;
+    record.payload = Some(serde_json::to_value(policy)?);
+    store.put(key, &record).await?;
+    audit(store, key, ControlChangeKind::Updated).await;
+    Ok(())
+}
+
+/// Enable or disable an active policy.
+pub async fn set_enabled(store: &Store, key: &str, enabled: bool) -> Result<()> {
+    ensure_policy_key(key)?;
+    let mut record = store
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+    let mut policy = record
+        .payload_as::<PolicyRecord>()
+        .ok_or_else(|| anyhow::anyhow!("'{key}' has no valid PolicyRecord payload"))?;
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        bail!("policy '{key}' is not active");
+    }
+    policy.enabled = enabled;
+    record.payload = Some(serde_json::to_value(&policy)?);
+    record.updated_at = now_secs();
+    record.version.logical_clock += 1;
+    record.version.wall_clock = record.updated_at;
+    store.put(key, &record).await?;
+    audit(store, key, ControlChangeKind::Updated).await;
+    Ok(())
+}
+
+/// Tombstone a policy. The tombstone write fails hard; its audit event is best effort.
+pub async fn delete(store: &Store, key: &str) -> Result<()> {
+    ensure_policy_key(key)?;
+    let mut record = store
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        bail!("policy '{key}' is not active");
+    }
+    let now = now_secs();
+    record.lifecycle = RecordLifecycle::Tombstoned {
+        reason: TombstoneReason::ManualDeletion,
+        at: now,
+    };
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+    store.put(key, &record).await?;
+    audit(store, key, ControlChangeKind::Deleted).await;
+    Ok(())
+}
+
+pub async fn list(store: &Store) -> Result<Vec<Record>> {
+    Ok(store
+        .scan_prefix("policy:")
+        .await?
+        .into_iter()
+        .filter(|record| matches!(record.lifecycle, RecordLifecycle::Active))
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn sample() -> PolicyRecord {
+        PolicyRecord {
+            name: "Query safety".into(),
+            rule: "Consult the schema first.".into(),
+            reason: "Schemas drift because production changes independently.".into(),
+            scope: "repo".into(),
+            mode: super::super::record::PolicyMode::Block,
+            trigger: Default::default(),
+            requires: super::super::record::PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![super::super::record::ReceiptSource::MemGet],
+                freshness: super::super::record::PolicyFreshness { ttl_secs: 900 },
+            },
+            enabled: true,
+            severity: super::super::record::Priority::High,
+            created_by: "developer".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_emits_control_events_and_tombstones() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "policy:query-safety";
+        create(&store, key, &sample()).await.unwrap();
+        assert_eq!(list(&store).await.unwrap().len(), 1);
+        set_enabled(&store, key, false).await.unwrap();
+        set_enabled(&store, key, true).await.unwrap();
+        delete(&store, key).await.unwrap();
+        assert!(list(&store).await.unwrap().is_empty());
+        let events = super::super::enforcement::scan_enforcement_events(&store, 0, u64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(events
+            .iter()
+            .all(|event| event.subject_kind == SubjectKind::Control && event.subject_key == key));
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.event_type {
+                EnforcementEventType::ControlChanged { change_kind } => Some(change_kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ControlChangeKind::Created,
+                ControlChangeKind::Updated,
+                ControlChangeKind::Updated,
+                ControlChangeKind::Deleted
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_failure_happens_before_event() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let error = delete(&store, "policy:missing").await.unwrap_err();
+        assert!(error.to_string().contains("record not found"));
+        assert!(
+            super::super::enforcement::scan_enforcement_events(&store, 0, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
