@@ -14,6 +14,8 @@ use base64::Engine;
 use clap::{Args, Subcommand};
 use slugify::slugify;
 
+use mati_core::hooks::decide::{normalize_action, Action};
+use mati_core::hooks::policy_match::{MatchedPolicy, PolicyMatcherSet};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
 use mati_core::store::{PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority};
 
@@ -46,6 +48,8 @@ enum PolicyCommand {
     Disable(PolicyKeyArgs),
     /// Tombstone one local policy.
     Delete(PolicyKeyArgs),
+    /// Test local policy predicates against a command or path without writing.
+    Test(TestArgs),
     /// Verify a signed policy-floor bundle's Ed25519 signature.
     Verify(VerifyArgs),
 }
@@ -89,6 +93,19 @@ struct AddArgs {
 }
 
 #[derive(Args)]
+struct TestArgs {
+    /// Bash command to normalize and test.
+    #[arg(long)]
+    command: Option<String>,
+    /// File path to normalize and test.
+    #[arg(long)]
+    path: Option<String>,
+    /// Emit JSON instead of human output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 pub struct VerifyArgs {
     /// Path to the bundle JSON file.
     bundle: PathBuf,
@@ -110,6 +127,7 @@ pub async fn run(args: PolicyArgs) -> Result<()> {
         PolicyCommand::Enable(a) => set_enabled(&normalize_key(&a.key), true).await,
         PolicyCommand::Disable(a) => set_enabled(&normalize_key(&a.key), false).await,
         PolicyCommand::Delete(a) => delete(&normalize_key(&a.key)).await,
+        PolicyCommand::Test(a) => test_policies(a).await,
         PolicyCommand::Verify(a) => verify(a),
     }
 }
@@ -143,11 +161,13 @@ fn parse_priority(value: &str) -> Result<Priority> {
 }
 
 fn direct_store(proxy: &StoreProxy) -> Result<&mati_core::store::Store> {
-    proxy.direct_store().ok_or_else(|| anyhow::anyhow!(
+    proxy.direct_store().ok_or_else(|| {
+        anyhow::anyhow!(
         "local policy mutations need direct store access, but a daemon currently holds the store. \
          Stop it first with `mati daemon stop`, then retry \
          (daemon-mode policy authoring lands in a later milestone)."
-    ))
+    )
+    })
 }
 
 async fn add(args: AddArgs) -> Result<()> {
@@ -254,6 +274,83 @@ async fn delete(key: &str) -> Result<()> {
     Ok(())
 }
 
+async fn test_policies(args: TestArgs) -> Result<()> {
+    if args.command.is_none() && args.path.is_none() {
+        anyhow::bail!("provide --command or --path");
+    }
+    let action = normalize_action(args.command.as_deref(), args.path.as_deref());
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let records = proxy
+        .scan_prefix("policy:")
+        .await?
+        .into_iter()
+        .filter(|record| {
+            matches!(record.lifecycle, mati_core::store::RecordLifecycle::Active)
+                && record
+                    .payload_as::<PolicyRecord>()
+                    .is_some_and(|policy| policy.enabled)
+        })
+        .collect::<Vec<_>>();
+    let matcher = PolicyMatcherSet::from_records(&records).context("compiling local policies")?;
+    let matches = matcher.matches(&action);
+    let output = render_test_output(&action, &matches, args.json)?;
+    proxy.close().await?;
+    println!("{output}");
+    Ok(())
+}
+
+fn render_test_output(
+    action: &Action,
+    matches: &[MatchedPolicy<'_>],
+    json_output: bool,
+) -> Result<String> {
+    if json_output {
+        let matched = matches
+            .iter()
+            .map(|matched| {
+                serde_json::json!({
+                    "key": matched.key,
+                    "name": matched.policy.name,
+                    "mode": matched.policy.mode,
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "action": action,
+            "matches": matched,
+        }))?);
+    }
+
+    let host = action.host.as_deref().unwrap_or("-");
+    let files = if action.files.is_empty() {
+        "-".to_string()
+    } else {
+        action.files.join(",")
+    };
+    let mut output = format!(
+        "Action: tool={} host={} files={}\n",
+        action.tool, host, files
+    );
+    if matches.is_empty() {
+        output.push_str("No matching policies.");
+    } else {
+        output.push_str("Matching policies:\n");
+        for matched in matches {
+            let mode = match matched.policy.mode {
+                PolicyMode::Steer => "steer",
+                PolicyMode::Block => "block",
+            };
+            output.push_str(&format!(
+                "  {} [{}] {}\n",
+                matched.key, mode, matched.policy.name
+            ));
+        }
+        output.pop();
+    }
+    Ok(output)
+}
+
 fn verify(args: VerifyArgs) -> Result<()> {
     let text = std::fs::read_to_string(&args.bundle)
         .with_context(|| format!("reading bundle {}", args.bundle.display()))?;
@@ -332,5 +429,43 @@ mod tests {
         .unwrap();
         assert_eq!(trigger.tool.as_deref(), Some("db_client"));
         assert_eq!(requires.freshness.ttl_secs, 900);
+    }
+
+    #[test]
+    fn policy_test_output_reports_human_match_and_mode() {
+        let policy = PolicyRecord {
+            name: "Production query safety".into(),
+            rule: "Consult the schema first.".into(),
+            reason: "Production schemas drift because deployments change.".into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Block,
+            trigger: PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: serde_json::from_str(
+                r#"{"key":"schema:orders","via":["mem_get"],"freshness":{"ttl_secs":900}}"#,
+            )
+            .unwrap(),
+            enabled: true,
+            severity: Priority::High,
+            created_by: "test".into(),
+        };
+        let set = PolicyMatcherSet::from_policies([("policy:prod".into(), policy)]).unwrap();
+        let action = normalize_action(Some("psql -h db.prod.internal -c select"), None);
+        let matches = set.matches(&action);
+        let output = render_test_output(&action, &matches, false).unwrap();
+        assert!(output.contains("policy:prod [block] Production query safety"));
+    }
+
+    #[test]
+    fn policy_test_output_json_contains_action_and_matches() {
+        let action = normalize_action(Some("ls -la"), None);
+        let set = PolicyMatcherSet::from_policies(Vec::<(String, PolicyRecord)>::new()).unwrap();
+        let output = render_test_output(&action, &set.matches(&action), true).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(json["action"]["tool"], "unknown");
+        assert!(json["matches"].as_array().unwrap().is_empty());
     }
 }
