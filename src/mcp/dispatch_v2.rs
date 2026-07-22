@@ -242,7 +242,7 @@ fn is_compound(cmd: &Command) -> bool {
 }
 
 /// Returns true for runtime configuration commands. These touch raw key/value
-/// pairs (`enforcement:mode`, `enforcement:retention_days`) and are routed
+/// pairs (`enforcement:mode`, `enforcement:retention_days`, `policy:mode`) and are routed
 /// through a dedicated dispatcher rather than the v1 bridge or the typical
 /// knowledge-mutation transactional audit path.
 fn is_config_command(cmd: &Command) -> bool {
@@ -260,8 +260,8 @@ fn is_config_command(cmd: &Command) -> bool {
 /// audit trail for config mutations.
 async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
     use crate::store::enforcement::{
-        get_enforcement_mode, get_retention_days, set_enforcement_mode, set_retention_days,
-        EnforcementMode,
+        get_enforcement_mode, get_policy_mode, get_retention_days, set_enforcement_mode,
+        set_policy_mode, set_retention_days, EnforcementMode,
     };
 
     let request_id = req.id;
@@ -279,12 +279,16 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                     }
                 }
                 "enforcement.retention" => get_retention_days(store).await.to_string(),
+                "policy.mode" => match get_policy_mode(store).await {
+                    EnforcementMode::Advisory => "advisory".to_string(),
+                    EnforcementMode::Strict => "strict".to_string(),
+                },
                 other => {
                     return Response::err(
                         request_id,
                         ErrorCode::ValidationFailed,
                         format!(
-                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention"
+                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode"
                         ),
                     );
                 }
@@ -343,11 +347,36 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                     Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
                 }
             }
+            "policy.mode" => {
+                let mode = match input.value.as_str() {
+                    "advisory" => EnforcementMode::Advisory,
+                    "strict" => EnforcementMode::Strict,
+                    other => {
+                        return Response::err(
+                            request_id,
+                            ErrorCode::ValidationFailed,
+                            format!(
+                                "invalid policy.mode: {other}; valid values: advisory, strict"
+                            ),
+                        );
+                    }
+                };
+                match set_policy_mode(store, mode).await {
+                    Ok(old) => {
+                        let old_label = match old {
+                            EnforcementMode::Advisory => "advisory",
+                            EnforcementMode::Strict => "strict",
+                        };
+                        Response::ok(request_id, serde_json::json!({ "old": old_label }))
+                    }
+                    Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
+                }
+            }
             other => Response::err(
                 request_id,
                 ErrorCode::ValidationFailed,
                 format!(
-                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention"
+                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode"
                 ),
             ),
         },
@@ -666,7 +695,7 @@ async fn dispatch_policy_evaluate(
     let g = graph.read().await;
     let store = g.store();
     let strict = matches!(
-        crate::store::enforcement::get_enforcement_mode(store).await,
+        crate::store::enforcement::get_policy_mode(store).await,
         crate::store::enforcement::EnforcementMode::Strict
     );
     let mut verdicts = Vec::with_capacity(matched.len());
@@ -1649,6 +1678,49 @@ mod tests {
         let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
         assert_eq!(verdicts.len(), 1);
         assert!(!verdicts[0].satisfied);
+        assert!(
+            verdicts[0].strict,
+            "fresh stores default policy.mode to strict"
+        );
+
+        let advisory = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "policy.mode".into(),
+            value: "advisory".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, advisory).await,
+            Response::Ok { .. }
+        ));
+        let Response::Ok { data, .. } = evaluate().await else {
+            panic!("policy evaluation should succeed in advisory mode")
+        };
+        let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+        assert!(!verdicts[0].strict);
+
+        let strict = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "policy.mode".into(),
+            value: "strict".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, strict).await,
+            Response::Ok { .. }
+        ));
+        let best_effort = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "audit.write_durability".into(),
+            value: "best_effort".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, best_effort).await,
+            Response::Ok { .. }
+        ));
+        let Response::Ok { data, .. } = evaluate().await else {
+            panic!("policy evaluation should remain available after audit mode change")
+        };
+        let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+        assert!(
+            verdicts[0].strict,
+            "audit write durability must not soften policies"
+        );
 
         {
             let g = graph.read().await;
@@ -2471,6 +2543,52 @@ mod tests {
             Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("best_effort")),
             Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
         }
+    }
+
+    #[tokio::test]
+    async fn policy_mode_defaults_strict_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let get = make_request(Command::ConfigGet(ConfigGetInput {
+            key: "policy.mode".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, get).await,
+            Response::Ok { data, .. } if data == "strict"
+        ));
+
+        let set = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "policy.mode".into(),
+            value: "advisory".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, set).await,
+            Response::Ok { data, .. } if data == serde_json::json!({"old": "strict"})
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_mode_rejects_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+        let req = make_request(Command::ConfigSet(ConfigSetInput {
+            key: "policy.mode".into(),
+            value: "best_effort".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, req).await,
+            Response::Err {
+                code: ErrorCode::ValidationFailed,
+                ..
+            }
+        ));
     }
 
     /// ConfigSet writes the value via the daemon path; the next ConfigGet

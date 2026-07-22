@@ -688,7 +688,7 @@ impl StoreProxy {
             ProxyInner::Direct(store) => {
                 let records = store.scan_prefix("policy:").await?;
                 let strict = matches!(
-                    mati_core::store::enforcement::get_enforcement_mode(store).await,
+                    mati_core::store::enforcement::get_policy_mode(store).await,
                     mati_core::store::enforcement::EnforcementMode::Strict
                 );
                 let matcher = PolicyMatcherSet::from_records_lenient(&records);
@@ -853,7 +853,7 @@ impl StoreProxy {
     pub async fn config_get(&self, key: &str) -> Result<String> {
         use mati_core::mcp::protocol as p;
         use mati_core::store::enforcement::{
-            get_enforcement_mode, get_retention_days, EnforcementMode,
+            get_enforcement_mode, get_policy_mode, get_retention_days, EnforcementMode,
         };
 
         match &self.inner {
@@ -863,9 +863,13 @@ impl StoreProxy {
                     EnforcementMode::Strict => "strict".to_string(),
                 }),
                 "enforcement.retention" => Ok(get_retention_days(store).await.to_string()),
+                "policy.mode" => Ok(match get_policy_mode(store).await {
+                    EnforcementMode::Advisory => "advisory".to_string(),
+                    EnforcementMode::Strict => "strict".to_string(),
+                }),
                 other => anyhow::bail!(
                     "unknown config key: {other}\n\
-                     Valid keys: audit.write_durability, enforcement.retention"
+                     Valid keys: audit.write_durability, enforcement.retention, policy.mode"
                 ),
             },
             ProxyInner::Socket { root } => {
@@ -898,7 +902,7 @@ impl StoreProxy {
     pub async fn config_set(&self, key: &str, value: &str) -> Result<String> {
         use mati_core::mcp::protocol as p;
         use mati_core::store::enforcement::{
-            set_enforcement_mode, set_retention_days, EnforcementMode,
+            set_enforcement_mode, set_policy_mode, set_retention_days, EnforcementMode,
         };
 
         match &self.inner {
@@ -928,9 +932,23 @@ impl StoreProxy {
                     set_retention_days(store, days).await?;
                     Ok(String::new())
                 }
+                "policy.mode" => {
+                    let mode = match value {
+                        "advisory" => EnforcementMode::Advisory,
+                        "strict" => EnforcementMode::Strict,
+                        other => anyhow::bail!(
+                            "invalid policy.mode: {other}\nValid values: advisory, strict"
+                        ),
+                    };
+                    let old = set_policy_mode(store, mode).await?;
+                    Ok(match old {
+                        EnforcementMode::Advisory => "advisory".to_string(),
+                        EnforcementMode::Strict => "strict".to_string(),
+                    })
+                }
                 other => anyhow::bail!(
                     "unknown config key: {other}\n\
-                     Valid keys: audit.write_durability, enforcement.retention"
+                     Valid keys: audit.write_durability, enforcement.retention, policy.mode"
                 ),
             },
             ProxyInner::Socket { root } => {
@@ -1324,6 +1342,10 @@ mod tests {
             files: vec![],
         };
         let verdicts = proxy.policy_evaluate(&action, None).await.unwrap();
+        assert!(
+            verdicts[0].strict,
+            "direct policy evaluation defaults to strict"
+        );
         assert_eq!(verdicts.len(), 1);
         assert!(!verdicts[0].satisfied);
     }
