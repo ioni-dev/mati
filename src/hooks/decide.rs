@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 /// Which class of file-reading command was detected.
@@ -15,6 +17,23 @@ pub enum CommandClass {
     CatLike,
     /// grep, rg, sed, awk — file path is last non-flag arg.
     GrepLike,
+    /// psql, mysql, redis-cli, mongosh, sqlite3, and other governed DB clients.
+    DbClientLike,
+}
+
+/// Normalized shape of an agent tool invocation for policy matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
+    /// Governable category, such as `db_client` or `path`.
+    pub tool: String,
+    /// Primary target path, when the invocation has one.
+    pub target_path: Option<String>,
+    /// Host extracted from a DB-client flag or environment assignment.
+    pub host: Option<String>,
+    /// Shell-normalized argument tokens.
+    pub argv: Vec<String>,
+    /// All normalized file targets in the invocation.
+    pub files: Vec<String>,
 }
 
 /// Semantic enforcement decision. Adapters map these to platform output.
@@ -89,6 +108,16 @@ pub struct EnforcementResult {
 
 const CAT_LIKE: &[&str] = &["cat", "less", "head", "tail", "bat"];
 const GREP_LIKE: &[&str] = &["grep", "egrep", "fgrep", "rg", "sed", "awk"];
+const DB_CLIENT_LIKE: &[&str] = &[
+    "psql",
+    "mysql",
+    "mariadb",
+    "redis-cli",
+    "mongosh",
+    "mongo",
+    "sqlite3",
+    "sqlcmd",
+];
 
 /// Returns true if `trimmed` starts with `word` followed by whitespace
 /// (or is exactly `word`). Prevents `"catch"` matching `"cat"`.
@@ -170,6 +199,11 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
             return Some(CommandClass::GrepLike);
         }
     }
+    for &word in DB_CLIENT_LIKE {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::DbClientLike);
+        }
+    }
     None
 }
 
@@ -183,6 +217,7 @@ pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
     match class {
         CommandClass::CatLike => paths.into_iter().next(),
         CommandClass::GrepLike => paths.into_iter().next_back(),
+        CommandClass::DbClientLike => paths.into_iter().next(),
     }
 }
 
@@ -217,7 +252,116 @@ pub fn extract_file_paths(cmd: &str, class: CommandClass) -> Vec<String> {
                 Vec::new()
             }
         }
+        CommandClass::DbClientLike => extract_db_file_paths(&shell_tokens(cmd_part)),
     }
+}
+
+/// Extract DB-client file arguments from `-f/--file` and their `=value` forms.
+fn extract_db_file_paths(tokens: &[String]) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut expects_file = false;
+    for token in tokens.iter().skip(1) {
+        if expects_file {
+            if !token.is_empty() {
+                files.push(token.clone());
+            }
+            expects_file = false;
+            continue;
+        }
+        if token == "-f" || token == "--file" {
+            expects_file = true;
+        } else if let Some(path) = token.strip_prefix("--file=") {
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        } else if let Some(path) = token.strip_prefix("-f=") {
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        }
+    }
+    files
+}
+
+/// Extract a DB host from `-h/--host` or a leading environment assignment.
+fn extract_db_host(command: &str) -> Option<String> {
+    let tokens = shell_tokens(split_at_shell_operator(command));
+    let mut expects_host = false;
+    for token in &tokens {
+        if expects_host {
+            return (!token.is_empty()).then(|| token.clone());
+        }
+        if token == "-h" || token == "--host" {
+            expects_host = true;
+        } else if let Some(host) = token.strip_prefix("--host=") {
+            return (!host.is_empty()).then(|| host.to_string());
+        } else if let Some(host) = token.strip_prefix("-h=") {
+            return (!host.is_empty()).then(|| host.to_string());
+        } else if let Some(value) = token.strip_prefix("PGHOST=") {
+            return (!value.is_empty()).then(|| value.to_string());
+        } else if let Some(value) = token.strip_prefix("DATABASE_URL=") {
+            return database_url_host(value);
+        }
+    }
+    None
+}
+
+/// Pull the authority host from a DATABASE_URL without introducing a URL
+/// parser into the pure command-normalization core.
+fn database_url_host(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(value)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Normalize a command and/or path into the pure policy-matching action shape.
+pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Action {
+    let mut action = Action {
+        tool: "unknown".to_string(),
+        target_path: target_path.map(str::to_string),
+        host: None,
+        argv: vec![],
+        files: target_path.into_iter().map(str::to_string).collect(),
+    };
+
+    let Some(command) = command else {
+        if action.target_path.is_some() {
+            action.tool = "path".to_string();
+        }
+        return action;
+    };
+
+    let effective = effective_command(split_at_shell_operator(command));
+    action.argv = shell_tokens(&effective);
+    if let Some(class) = classify_command(command) {
+        match class {
+            CommandClass::DbClientLike => {
+                action.tool = "db_client".to_string();
+                action.host = extract_db_host(command);
+                action.files.extend(extract_file_paths(command, class));
+            }
+            CommandClass::CatLike | CommandClass::GrepLike => {
+                action.tool = "file_read".to_string();
+                action.files.extend(extract_file_paths(command, class));
+            }
+        }
+    }
+    if action.target_path.is_none() {
+        action.target_path = action.files.first().cloned();
+    }
+    action
 }
 
 /// Split at the first shell operator (`|`, `;`, `&&`, `||`), returning the
@@ -1491,6 +1635,69 @@ mod tests {
         assert_eq!(
             extract_file_path("grep pat f1 f2", CommandClass::GrepLike).as_deref(),
             Some("f2")
+        );
+    }
+
+    // ── policy Action normalization ────────────────────────────────────
+
+    #[test]
+    fn classify_db_client_with_prefix_and_absolute_basename() {
+        assert_eq!(
+            classify_command("sudo /usr/bin/psql -h db.prod.internal"),
+            Some(CommandClass::DbClientLike)
+        );
+    }
+
+    #[test]
+    fn normalize_db_action_extracts_host_and_file_flag() {
+        let action = normalize_action(
+            Some("sudo psql -h db.prod.internal -f migrations/orders.sql -c select"),
+            None,
+        );
+        assert_eq!(action.tool, "db_client");
+        assert_eq!(action.host.as_deref(), Some("db.prod.internal"));
+        assert_eq!(action.files, vec!["migrations/orders.sql"]);
+        assert_eq!(action.target_path.as_deref(), Some("migrations/orders.sql"));
+        assert_eq!(action.argv.first().map(String::as_str), Some("psql"));
+    }
+
+    #[test]
+    fn normalize_db_action_extracts_host_from_environment_assignment() {
+        let action = normalize_action(Some("PGHOST=db.prod.internal psql -c \"select 1\""), None);
+        assert_eq!(action.tool, "db_client");
+        assert_eq!(action.host.as_deref(), Some("db.prod.internal"));
+        assert!(action.files.is_empty());
+
+        let url_action = normalize_action(
+            Some("DATABASE_URL=postgres://db.prod.internal/orders psql -c select"),
+            None,
+        );
+        assert_eq!(url_action.host.as_deref(), Some("db.prod.internal"));
+    }
+
+    #[test]
+    fn normalize_path_action_sets_target_path_without_command() {
+        let action = normalize_action(None, Some("migrations/orders.sql"));
+        assert_eq!(
+            action,
+            Action {
+                tool: "path".into(),
+                target_path: Some("migrations/orders.sql".into()),
+                host: None,
+                argv: vec![],
+                files: vec!["migrations/orders.sql".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn db_client_file_grammar_supports_attached_file_values() {
+        assert_eq!(
+            extract_file_paths(
+                "psql --file=migrations/a.sql -f migrations/b.sql",
+                CommandClass::DbClientLike
+            ),
+            vec!["migrations/a.sql", "migrations/b.sql"]
         );
     }
 }
