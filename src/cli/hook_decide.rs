@@ -878,8 +878,9 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     // Resolve the daemon slug the way the gate does (repo root, not cwd) so the
-    // The actor scope matches the gate: agent receipts are scoped, while the
-    // main thread (no agent_id) uses the global receipt.
+    // receipt lands in the store the gate will read. The actor scope matches the
+    // gate too: agent receipts are scoped, while the main thread (no agent_id)
+    // uses the global receipt.
     let repo_root = discover_repo_root(&cwd);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let mati_root = match mati_root_for(root_for_slug) {
@@ -1955,14 +1956,50 @@ mod tests {
         .unwrap());
     }
 
+    /// Both mint paths derive their actor identically, so one test covers
+    /// them. A session_id must not become receipt scope: the gate reads the
+    /// global receipt for the main thread, so scoping by session would mint a
+    /// receipt nothing ever checks and the policy would never unlock.
     #[tokio::test]
-    async fn main_thread_introspection_receipt_uses_global_gate_scope() {
+    async fn main_thread_receipt_uses_global_gate_scope() {
         assert_main_thread_receipt_is_global("schema:orders").await;
     }
 
+    /// The other half: an agent_id is real scope, and its receipt must not
+    /// satisfy the gate for anyone else.
     #[tokio::test]
-    async fn main_thread_memget_receipt_uses_global_gate_scope() {
-        assert_main_thread_receipt_is_global("schema:orders").await;
+    async fn subagent_receipt_stays_actor_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mati_core::store::Store::open(dir.path()).await.unwrap();
+        let key = "schema:orders";
+        let actor = receipt_actor(Some("agent-a"), Some("session-main"));
+        assert_eq!(actor, Some("agent-a"));
+
+        let (receipt_key, bytes) =
+            mati_core::store::session::consultation_receipt_staged_for_store(
+                &store, key, actor, false,
+            )
+            .await
+            .unwrap();
+        let receipt: mati_core::store::Record = rmp_serde::from_slice(&bytes).unwrap();
+        store.put(&receipt_key, &receipt).await.unwrap();
+        assert_eq!(receipt_key, format!("session:consulted:agent-a:{key}"));
+
+        assert!(
+            mati_core::store::session::check_consulted_recent(&store, key, 900, Some("agent-a"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !mati_core::store::session::check_consulted_recent(&store, key, 900, Some("agent-b"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !mati_core::store::session::check_consulted_recent(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
     }
 
     // ── extract_path ────────────────────────────────────────────────────
