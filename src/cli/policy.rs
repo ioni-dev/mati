@@ -469,6 +469,7 @@ mod tests {
                 reason: matched.policy.reason.clone(),
                 severity: matched.policy.severity.clone(),
                 requires_key: matched.policy.requires.key.clone(),
+                via: matched.policy.requires.via.clone(),
                 satisfied: false,
                 strict: false,
             })

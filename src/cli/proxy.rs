@@ -709,6 +709,7 @@ impl StoreProxy {
                         reason: policy.reason.clone(),
                         severity: policy.severity.clone(),
                         requires_key: policy.requires.key.clone(),
+                        via: policy.requires.via.clone(),
                         satisfied,
                         strict,
                     });

@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::hooks::decide::Action;
 use crate::store::{
     AgentKind, PolicyMode as StorePolicyMode, PolicyRecord, Priority as StorePriority,
+    ReceiptSource as StoreReceiptSource,
 };
 
 // ── Protocol constants ──────────────────────────────────────────────────────
@@ -359,6 +360,8 @@ pub struct PolicyVerdict {
     pub reason: String,
     pub severity: StorePriority,
     pub requires_key: String,
+    #[serde(default)]
+    pub via: Vec<StoreReceiptSource>,
     pub satisfied: bool,
     /// Snapshot of the global enforcement mode used for block degradation.
     #[serde(default)]

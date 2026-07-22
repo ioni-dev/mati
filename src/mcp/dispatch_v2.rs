@@ -600,6 +600,7 @@ async fn dispatch_policy_evaluate(
                     matched.policy.reason.clone(),
                     matched.policy.severity.clone(),
                     matched.policy.requires.key.clone(),
+                    matched.policy.requires.via.clone(),
                     matched.policy.requires.freshness.ttl_secs,
                 )
             })
@@ -613,7 +614,7 @@ async fn dispatch_policy_evaluate(
         crate::store::enforcement::EnforcementMode::Strict
     );
     let mut verdicts = Vec::with_capacity(matched.len());
-    for (key, mode, rule, reason, severity, requires_key, ttl_secs) in matched {
+    for (key, mode, rule, reason, severity, requires_key, via, ttl_secs) in matched {
         let satisfied = match mode {
             crate::store::PolicyMode::Steer => true,
             crate::store::PolicyMode::Block => {
@@ -639,6 +640,7 @@ async fn dispatch_policy_evaluate(
             reason,
             severity,
             requires_key,
+            via,
             satisfied,
             strict,
         });

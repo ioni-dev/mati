@@ -144,7 +144,9 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     };
 
     // 3. Resolve repo root via git2 (no subprocess).
-    let cwd = std::env::current_dir()?;
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
     let repo_root = discover_repo_root(&cwd);
     let repo_root_str = repo_root.as_ref().and_then(|p| p.to_str());
     // Platform limitation: bare relative paths in shell commands (e.g. `cat foo.rs`)
@@ -456,7 +458,9 @@ async fn run_fileless_policy(
     action: &decide::Action,
     agent_id: Option<&str>,
 ) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
     let repo_root = discover_repo_root(&cwd);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let mati_root = match mati_root_for(root_for_slug) {
@@ -519,6 +523,29 @@ async fn evaluate_governed_policy(
         log_fail_open(failure_path, "daemon not running after auto-start");
         return None;
     }
+    let verdicts = policy_verdicts_for_action(mati_root, action, agent_id, failure_path).await?;
+    let strict = verdicts.iter().any(|verdict| verdict.strict);
+    let core_verdicts = verdicts
+        .iter()
+        .map(|verdict| decide::PolicyVerdict {
+            key: verdict.key.clone(),
+            rule: verdict.rule.clone(),
+            requires_key: verdict.requires_key.clone(),
+            block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                && !introspection_exemption,
+            satisfied: verdict.satisfied,
+        })
+        .collect::<Vec<_>>();
+    let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
+    Some((result.decision, result.events))
+}
+
+async fn policy_verdicts_for_action(
+    mati_root: &Path,
+    action: &decide::Action,
+    agent_id: Option<&str>,
+    failure_path: &str,
+) -> Option<Vec<mati_core::mcp::protocol::PolicyVerdict>> {
     let response = daemon_v2(
         mati_root,
         mati_core::mcp::protocol::Command::PolicyEvaluate(
@@ -542,28 +569,13 @@ async fn evaluate_governed_policy(
             return None;
         }
     };
-    let verdicts: Vec<mati_core::mcp::protocol::PolicyVerdict> = match serde_json::from_value(data)
-    {
-        Ok(verdicts) => verdicts,
+    match serde_json::from_value(data) {
+        Ok(verdicts) => Some(verdicts),
         Err(_) => {
             log_fail_open(failure_path, "policy_evaluate returned invalid data");
-            return None;
+            None
         }
-    };
-    let strict = verdicts.iter().any(|verdict| verdict.strict);
-    let core_verdicts = verdicts
-        .iter()
-        .map(|verdict| decide::PolicyVerdict {
-            key: verdict.key.clone(),
-            rule: verdict.rule.clone(),
-            requires_key: verdict.requires_key.clone(),
-            block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
-                && !introspection_exemption,
-            satisfied: verdict.satisfied,
-        })
-        .collect::<Vec<_>>();
-    let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
-    Some((result.decision, result.events))
+    }
 }
 
 /// A successful schema inspection is the remedy for a DB policy, so the
@@ -880,7 +892,9 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
         return Ok(());
     }
 
-    let cwd = std::env::current_dir()?;
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
     let repo_root = discover_repo_root(&cwd);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let mati_root = match mati_root_for(root_for_slug) {
@@ -891,8 +905,43 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
         return Ok(());
     }
 
-    // Policy matching and receipt minting are added in the next adapter step.
-    let _ = (mati_root, action);
+    let Some(verdicts) = policy_verdicts_for_action(
+        &mati_root,
+        &action,
+        input.get("agent_id").and_then(|value| value.as_str()),
+        "<post-bash>",
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let agent_id = input
+        .get("agent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let session_id = input
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    for verdict in verdicts {
+        if !accepts_db_introspection(&verdict.via) {
+            continue;
+        }
+        let _ = daemon_v2(
+            &mati_root,
+            mati_core::mcp::protocol::Command::ConsultationHit(
+                mati_core::mcp::protocol::ConsultationHitInput {
+                    key: verdict.requires_key,
+                    actor: agent_id
+                        .map(str::to_string)
+                        .or_else(|| session_id.map(str::to_string)),
+                    session_id: session_id.map(str::to_string),
+                    agent_id: agent_id.map(str::to_string),
+                },
+            ),
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -918,6 +967,10 @@ fn post_bash_succeeded(input: &serde_json::Value) -> bool {
         }
     }
     true
+}
+
+fn accepts_db_introspection(via: &[mati_core::store::ReceiptSource]) -> bool {
+    via.contains(&mati_core::store::ReceiptSource::DbIntrospection)
 }
 
 // ── codex-pre-apply-patch flow ──────────────────────────────────────────────
@@ -1739,6 +1792,20 @@ mod tests {
                 "tool_response": response
             })));
         }
+    }
+
+    #[test]
+    fn post_bash_receipts_ignore_memget_only_policies() {
+        assert!(!accepts_db_introspection(&[
+            mati_core::store::ReceiptSource::MemGet
+        ]));
+        assert!(accepts_db_introspection(&[
+            mati_core::store::ReceiptSource::DbIntrospection
+        ]));
+        assert!(accepts_db_introspection(&[
+            mati_core::store::ReceiptSource::MemGet,
+            mati_core::store::ReceiptSource::DbIntrospection,
+        ]));
     }
 
     // ── extract_path ────────────────────────────────────────────────────
