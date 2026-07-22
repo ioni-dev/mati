@@ -46,8 +46,9 @@ CAPTURE TRIGGERS. Author a policy when the developer either:
 - asks explicitly: \"mati policy: ...\", \"make this a policy\", \"create a policy around this\", \"enforce this\", or \"add a guardrail for this\"; or
 - states a standing directive implicitly: \"from now on\", \"before you ever\", \"always X before Y\", \"never run X without Y\", or \"make it a rule that\".
 In both cases author it without asking for confirmation, matching the existing
-gotcha capture convention. It is created inert, so nothing enforces until the
-developer enables it.
+gotcha capture convention. Suggest `shadow` by default so the developer can
+review what it would catch. It is created off unless the developer requests
+shadow; promoting it to `enforce` is theirs to do.
 
 NOT EVERY DIRECTIVE IS A POLICY. A policy can only match a governable action
 category: `db_client`, `file_read`, or `path`. If the directive does not map to
@@ -55,12 +56,12 @@ one of those (for example \"always write better commit messages\"), do not autho
 a policy whose trigger can never match. Say plainly that it is not enforceable
 as a policy and offer to capture it as a gotcha or dev note instead.
 
-LIFECYCLE. To create, or refine a policy that is not yet active, use `mem_set`
-with a `policy:<slug>` key. It is created inert. When the developer asks to
-activate, update a live policy, disable, or delete, run the matching
-`mati policy enable|edit|disable|delete <slug>` command via Bash. The developer
-sees a permission prompt and approves it. Do this rather than telling the
-developer to open a terminal. Always dry-run a new or changed predicate with
+LIFECYCLE. To create, or refine a policy, use `mem_set` with a `policy:<slug>`
+key. Suggest `shadow` as the default rollout for a new policy. When the
+developer asks to stage, update, disable, or delete, run the matching
+`mati policy stage|edit|enable|disable|delete <slug>` command via Bash. The
+developer sees a permission prompt and approves it. Promoting a policy to
+`enforce` is the developer's decision. Always dry-run a new or changed predicate with
 `mati policy test --trigger`, against both a command that should match and one
 that should not, before writing. Never claim a policy is active unless it was
 actually enabled.
@@ -348,7 +349,8 @@ mod tests {
         assert!(content.contains("mati policy: ..."));
         assert!(content.contains("it is not enforceable"));
         assert!(content.contains("mati policy test --trigger"));
-        assert!(content.contains("mati policy enable|edit|disable|delete <slug>"));
+        assert!(content.contains("mati policy stage|edit|enable|disable|delete <slug>"));
+        assert!(content.contains("Suggest `shadow` as the default"));
     }
 
     #[test]

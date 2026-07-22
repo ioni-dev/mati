@@ -119,11 +119,17 @@ fi
 
 pass "store initialized, daemon auto-spawned, policy mode defaults strict"
 
-# ── 1. Inert until enabled, then blocks ──────────────────────────────────────
-step "1. Inert by default, enforcing after enable"
+# ── 1. Shadow observes, then enforce blocks ──────────────────────────────────
+step "1. Shadow observes without blocking, then enforce blocks"
 add_block_policy query-a '*prod-a*' 'schema:orders' 'mem_get'
 OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
 assert_lacks "not enforced before enable" "$OUT" 'permissionDecision":"deny"'
+
+mati_p policy stage query-a shadow >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
+assert_lacks "shadow does not block" "$OUT" 'permissionDecision":"deny"'
+OBS="$(mati_p policy observations query-a --json)"
+assert_has "shadow observation recorded" "$OBS" 'policy:query-a'
 
 mati_p policy enable query-a >/dev/null
 OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
@@ -250,10 +256,10 @@ assert_lacks "not denied when mati is down" "$OUT" 'permissionDecision":"deny"'
 
 # ── 13. Agent authoring boundary (MCP) ───────────────────────────────────────
 step "13. mem_set agent boundary"
-POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"enabled":true,"severity":"high","created_by":"agent"}'
+POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"stage":"enforce","severity":"high","created_by":"agent"}'
 OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:agent-authored\",\"value\":\"Consult first.\",\"category\":\"Policy\",\"payload\":$POLICY_JSON,\"tags\":[],\"priority\":\"High\"}")"
 if printf '%s' "$OUT" | grep -q 'jsonrpc'; then
-  assert_has "agent-authored policy is forced inert" "$OUT" 'enabled.":false'
+  assert_has "agent-authored policy is forced inert" "$OUT" 'stage":"off"'
   OUT2="$(mcp_call mem_set '{"action":"confirm","key":"policy:agent-authored","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
   assert_has "agent cannot enable a policy" "$OUT2" 'mati policy enable'
 else
