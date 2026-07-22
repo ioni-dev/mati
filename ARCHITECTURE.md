@@ -503,6 +503,8 @@ A policy is a `policy:<slug>` record carrying a `PolicyRecord` payload (section 
 
 Every create, edit, enable, disable, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
 
+The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
+
 Glob predicates are validated at author time. A malformed `host_glob` or `target_path_glob` is rejected before it can be persisted, so a broken pattern never reaches the daemon.
 
 ### 10a.2 Matching
