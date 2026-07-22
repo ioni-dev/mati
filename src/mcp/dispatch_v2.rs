@@ -591,7 +591,27 @@ async fn dispatch_policy_write(
                 Some(future) => future.await,
                 None => Vec::new(),
             };
-            Response::ok(req.id, serde_json::json!({"warnings": warnings}))
+            let enabled = if let Some(policy) = input.policy.as_ref() {
+                policy.enabled
+            } else {
+                store
+                    .get(&input.key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
+                    .map(|policy| policy.enabled)
+                    .unwrap_or(false)
+            };
+            Response::ok(
+                req.id,
+                serde_json::json!({
+                    "ok": true,
+                    "key": input.key,
+                    "enabled": enabled,
+                    "warnings": warnings
+                }),
+            )
         }
         Err(error) => {
             use crate::store::policy_ops::PolicyOpError;
@@ -1529,7 +1549,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: true,
+            enabled: false,
             severity: StorePriority::High,
             created_by: "test".into(),
         };
@@ -1540,10 +1560,13 @@ mod tests {
             key: key.into(),
             policy: Some(policy),
         }));
-        assert!(matches!(
-            dispatch_v2(&graph, &ctx, create).await,
-            Response::Ok { .. }
-        ));
+        let Response::Ok { data, .. } = dispatch_v2(&graph, &ctx, create).await else {
+            panic!("policy create should succeed")
+        };
+        assert_eq!(data["ok"], true);
+        assert_eq!(data["key"], key);
+        assert_eq!(data["enabled"], false);
+        assert!(data["warnings"].is_array());
 
         let disable = make_request(Command::PolicyWrite(PolicyWriteInput {
             op: PolicyWriteOp::Disable,

@@ -2446,6 +2446,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true, "policy create failed: {result}");
         assert_eq!(parsed["enabled"], false);
+        assert_eq!(parsed["key"], "policy:query-safety");
+        assert!(parsed["warnings"].is_array());
 
         let graph = graph_arc.read().await;
         let record = graph
