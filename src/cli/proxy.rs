@@ -681,6 +681,10 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(store) => {
                 let records = store.scan_prefix("policy:").await?;
+                let strict = matches!(
+                    mati_core::store::enforcement::get_enforcement_mode(store).await,
+                    mati_core::store::enforcement::EnforcementMode::Strict
+                );
                 let matcher = PolicyMatcherSet::from_records_lenient(&records);
                 let matched = matcher.matches(action);
                 let mut verdicts = Vec::with_capacity(matched.len());
@@ -706,6 +710,7 @@ impl StoreProxy {
                         severity: policy.severity.clone(),
                         requires_key: policy.requires.key.clone(),
                         satisfied,
+                        strict,
                     });
                 }
                 Ok(verdicts)
@@ -1443,7 +1448,9 @@ mod tests {
         };
 
         // The raw edge key must be visible through the RepairReader.
-        let keys = RepairReader::scan_keys(&proxy, "graph:edge:").await.unwrap();
+        let keys = RepairReader::scan_keys(&proxy, "graph:edge:")
+            .await
+            .unwrap();
         assert_eq!(keys, vec![edge.to_key()]);
 
         // And the doctor-level check must see a consistent store.

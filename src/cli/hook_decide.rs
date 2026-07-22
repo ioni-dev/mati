@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+use crate::cli::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
 use mati_core::hooks::decide::{self, Decision, EnforcementInput, HookEvent};
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -113,6 +113,16 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,
         None => {
+            if matches!(args.variant, HookVariant::ClaudePreBash) {
+                let command = input
+                    .pointer("/tool_input/command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let action = decide::normalize_action(Some(command), None);
+                if action.tool == "db_client" {
+                    return run_fileless_policy(&input, args.variant, &action, agent_id).await;
+                }
+            }
             emit_allow(args.variant);
             return Ok(());
         }
@@ -381,6 +391,96 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         std::process::exit(adapter.exit_code);
     }
 
+    Ok(())
+}
+
+/// Evaluate local policies for a governed, fileless Bash command.
+///
+/// This is deliberately separate from the file-gate path: file-bearing DB
+/// commands continue through the existing gotcha flow until policy/file-gate
+/// composition is specified.
+async fn run_fileless_policy(
+    input: &serde_json::Value,
+    variant: HookVariant,
+    action: &decide::Action,
+    agent_id: Option<&str>,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(root) => root,
+        Err(_) => {
+            log_fail_open("<fileless-bash>", "cannot determine mati root");
+            emit_allow(variant);
+            return Ok(());
+        }
+    };
+    if !ensure_daemon(&mati_root).await {
+        log_fail_open("<fileless-bash>", "daemon not running after auto-start");
+        emit_allow(variant);
+        return Ok(());
+    }
+
+    let response = daemon_v2(
+        &mati_root,
+        mati_core::mcp::protocol::Command::PolicyEvaluate(
+            mati_core::mcp::protocol::PolicyEvaluateInput {
+                action: action.clone(),
+                actor: agent_id.map(str::to_string),
+            },
+        ),
+    )
+    .await;
+    let data = match response {
+        DaemonResult::Ok(resp) => match daemon_data(&resp) {
+            Some(data) => data,
+            None => {
+                log_fail_open("<fileless-bash>", "policy_evaluate returned error");
+                emit_allow(variant);
+                return Ok(());
+            }
+        },
+        _ => {
+            log_fail_open("<fileless-bash>", "policy_evaluate failed");
+            emit_allow(variant);
+            return Ok(());
+        }
+    };
+    let verdicts: Vec<mati_core::mcp::protocol::PolicyVerdict> = match serde_json::from_value(data)
+    {
+        Ok(verdicts) => verdicts,
+        Err(_) => {
+            log_fail_open("<fileless-bash>", "policy_evaluate returned invalid data");
+            emit_allow(variant);
+            return Ok(());
+        }
+    };
+    let strict = verdicts.iter().any(|verdict| verdict.strict);
+    let core_verdicts = verdicts
+        .iter()
+        .map(|verdict| decide::PolicyVerdict {
+            key: verdict.key.clone(),
+            rule: verdict.rule.clone(),
+            requires_key: verdict.requires_key.clone(),
+            block: matches!(verdict.mode, mati_core::store::PolicyMode::Block),
+            satisfied: verdict.satisfied,
+        })
+        .collect::<Vec<_>>();
+    let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
+    let (stdout, stderr, exit_code) = format_decision(variant, &result.decision, "<policy>");
+    if !stdout.is_empty() {
+        println!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
+    fire_events(&mati_root, &result.events, session_id, agent_id).await;
+    if exit_code != 0 {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
     Ok(())
 }
 
@@ -904,6 +1004,10 @@ fn platform_events(
                 HookEvent::FloorConsultBlocked { key } => {
                     Some(HookEvent::FloorConsultBlocked { key })
                 }
+                HookEvent::PolicyConsultBlocked { key } => {
+                    Some(HookEvent::PolicyConsultBlocked { key })
+                }
+                HookEvent::PolicyConsulted { key } => Some(HookEvent::PolicyConsulted { key }),
                 HookEvent::ComplianceHit { key } => Some(HookEvent::EditConsulted { key }),
                 _ => None,
             })
@@ -975,6 +1079,16 @@ async fn fire_events(
             }),
             HookEvent::FloorConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::FloorConsultMiss,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::PolicyConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::PolicyConsultMiss,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::PolicyConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::PolicyConsultHit,
                 key: key.clone(),
                 session_id: sid(),
             }),
@@ -1972,6 +2086,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn policy_bash_output_denies_or_injects_without_force_allow() {
+        let deny = Decision::Deny {
+            file_key: "policy:prod-query".into(),
+            reason: "mati: policy policy:prod-query blocked this action. Consult first: mem_get(\"schema:orders\")".into(),
+        };
+        let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &deny, "<policy>");
+        assert!(stdout.contains(r#""permissionDecision":"deny""#));
+        assert!(stdout.contains("policy:prod-query"));
+        assert!(stdout.contains("schema:orders"));
+
+        let steer = Decision::Advisory {
+            context: "Consult the schema first.".into(),
+        };
+        let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &steer, "<policy>");
+        assert!(stdout.contains("additionalContext"));
+        assert!(!stdout.contains("permissionDecision"));
     }
 
     #[test]

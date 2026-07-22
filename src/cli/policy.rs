@@ -459,6 +459,7 @@ mod tests {
                 severity: matched.policy.severity.clone(),
                 requires_key: matched.policy.requires.key.clone(),
                 satisfied: false,
+                strict: false,
             })
             .collect::<Vec<_>>();
         let output = render_test_output(&action, &matches, false).unwrap();
