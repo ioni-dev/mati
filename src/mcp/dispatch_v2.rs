@@ -574,7 +574,6 @@ async fn dispatch_policy_write(
                             });
                         crate::store::policy_ops::author_warnings(policy, has_backing)
                     })
-                    .map(|future| future)
             } else {
                 None
             };

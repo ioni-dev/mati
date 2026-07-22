@@ -422,7 +422,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 11),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 12),
             other => panic!("expected Installed, got {other:?}"),
         }
 

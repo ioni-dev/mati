@@ -40,6 +40,23 @@ Call mem_set immediately. Do not ask for confirmation.
 Single gotcha from developer request: mem_set then `mati gotcha confirm <key>`.
 Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
 
+## mati Policy Capture
+
+When the developer says \"from now on\", \"before you ever\", \"always X before Y\",
+\"never run X without Y\", or \"make it a rule that\", consider authoring a local
+policy guardrail. A policy `trigger` is JSON with optional `tool`, `host_glob`,
+and `target_path_glob`. Governable tools are `db_client`, `file_read`, and
+`path`; an unknown `tool` value never matches. A policy `requires` object has
+`key`, `via` (`mem_get` or `db_introspection`), and `freshness` (including
+`ttl_secs` and optional `fingerprint`).
+
+First dry-run the predicate with `mati policy test --trigger '<json>'
+--command '<cmd>'` (or `--path '<path>'`), including both matching and
+innocuous examples. Then write it with `mem_set` using a `policy:<slug>` key.
+The policy is created inert: tell the user it was created but is not active and
+must be enabled by a human with `mati policy enable <slug>`. Never claim that
+an agent-authored policy is active; agents cannot enable, edit, or delete it.
+
 ## /mati-enrich
 
 Run /mati-enrich [path] to enrich a file or directory.
@@ -319,6 +336,9 @@ mod tests {
         assert!(content.contains(END_MARKER));
         assert!(content.contains("mem_get(\"file:<path>\")"));
         assert!(content.contains("PreToolUse hook enforces this"));
+        assert!(content.contains("## mati Policy Capture"));
+        assert!(content.contains("mati policy test --trigger"));
+        assert!(content.contains("mati policy enable <slug>"));
     }
 
     #[test]
