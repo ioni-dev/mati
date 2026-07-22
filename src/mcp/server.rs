@@ -2168,7 +2168,7 @@ mod tests {
                         "via": ["mem_get"],
                         "freshness": {"ttl_secs": 900}
                     },
-                    "enabled": true,
+                    "stage": "enforce",
                     "severity": "high",
                     "created_by": "test"
                 }

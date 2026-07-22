@@ -20,7 +20,6 @@
 //! semantically equal but bitwise distinct, making derived `==` a footgun for
 //! computed scores. Use field-level epsilon comparison in tests and comparators.
 
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
@@ -862,7 +861,7 @@ pub struct PolicyRequires {
 }
 
 /// A developer-authored local policy stored under `policy:<slug>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRecord {
     pub name: String,
     pub rule: String,
@@ -874,79 +873,6 @@ pub struct PolicyRecord {
     pub stage: PolicyStage,
     pub severity: Priority,
     pub created_by: String,
-}
-
-// Compatibility shim for one release: keep emitting `enabled` so an older
-// mati binary does not silently drop an enforcing policy. Remove once the
-// pre-stage format is no longer supported.
-impl Serialize for PolicyRecord {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut state = serializer.serialize_struct("PolicyRecord", 11)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("rule", &self.rule)?;
-        state.serialize_field("reason", &self.reason)?;
-        state.serialize_field("scope", &self.scope)?;
-        state.serialize_field("mode", &self.mode)?;
-        state.serialize_field("trigger", &self.trigger)?;
-        state.serialize_field("requires", &self.requires)?;
-        state.serialize_field("stage", &self.stage)?;
-        state.serialize_field("enabled", &matches!(self.stage, PolicyStage::Enforce))?;
-        state.serialize_field("severity", &self.severity)?;
-        state.serialize_field("created_by", &self.created_by)?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for PolicyRecord {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Wire {
-            name: String,
-            rule: String,
-            reason: String,
-            scope: String,
-            mode: PolicyMode,
-            trigger: PolicyTrigger,
-            requires: PolicyRequires,
-            #[serde(default)]
-            stage: Option<PolicyStage>,
-            #[serde(default)]
-            enabled: Option<bool>,
-            severity: Priority,
-            created_by: String,
-        }
-
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            name: wire.name,
-            rule: wire.rule,
-            reason: wire.reason,
-            scope: wire.scope,
-            mode: wire.mode,
-            trigger: wire.trigger,
-            requires: wire.requires,
-            stage: wire
-                .stage
-                .or_else(|| {
-                    wire.enabled.map(|enabled| {
-                        if enabled {
-                            PolicyStage::Enforce
-                        } else {
-                            PolicyStage::Off
-                        }
-                    })
-                })
-                .unwrap_or(PolicyStage::Off),
-            severity: wire.severity,
-            created_by: wire.created_by,
-        })
-    }
 }
 
 // ─────────────────────────────────────────────
@@ -1324,79 +1250,6 @@ mod tests {
         let restored: Record = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(restored.category, Category::Policy);
         assert_eq!(restored.payload_as::<PolicyRecord>().unwrap(), policy);
-    }
-
-    #[test]
-    fn legacy_policy_enabled_deserializes_to_stage() {
-        let mut value = serde_json::to_value(serde_json::json!({
-            "name": "legacy",
-            "rule": "Consult first.",
-            "reason": "Schemas drift because deployments change.",
-            "scope": "repo",
-            "mode": "block",
-            "trigger": {},
-            "requires": {"key": "schema:x", "via": [], "freshness": {"ttl_secs": 900}},
-            "enabled": true,
-            "severity": "high",
-            "created_by": "test"
-        }))
-        .unwrap();
-        let policy: PolicyRecord = serde_json::from_value(value.take()).unwrap();
-        assert_eq!(policy.stage, PolicyStage::Enforce);
-    }
-
-    #[test]
-    fn new_policy_serialization_keeps_legacy_enabled_field() {
-        let policy = PolicyRecord {
-            name: "compat".into(),
-            rule: "Consult first.".into(),
-            reason: "Schemas drift because deployments change.".into(),
-            scope: "repo".into(),
-            mode: PolicyMode::Block,
-            trigger: PolicyTrigger {
-                tool: None,
-                host_glob: None,
-                target_path_glob: None,
-            },
-            requires: PolicyRequires {
-                key: "schema:x".into(),
-                via: vec![],
-                freshness: PolicyFreshness {
-                    ttl_secs: 900,
-                    fingerprint: false,
-                },
-            },
-            stage: PolicyStage::Enforce,
-            severity: Priority::High,
-            created_by: "test".into(),
-        };
-        #[derive(Deserialize)]
-        struct LegacyPolicy {
-            name: String,
-            rule: String,
-            reason: String,
-            scope: String,
-            mode: PolicyMode,
-            trigger: PolicyTrigger,
-            requires: PolicyRequires,
-            enabled: bool,
-            severity: Priority,
-            created_by: String,
-        }
-        let value = serde_json::to_value(&policy).unwrap();
-        let legacy: LegacyPolicy = serde_json::from_value(value).unwrap();
-        assert!(legacy.enabled);
-        let _ = (
-            legacy.name,
-            legacy.rule,
-            legacy.reason,
-            legacy.scope,
-            legacy.mode,
-            legacy.trigger,
-            legacy.requires,
-            legacy.severity,
-            legacy.created_by,
-        );
     }
 
     #[test]
