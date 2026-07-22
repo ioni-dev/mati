@@ -532,7 +532,7 @@ async fn evaluate_governed_policy(
             rule: verdict.rule.clone(),
             requires_key: verdict.requires_key.clone(),
             block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
-                && !introspection_exemption,
+                && (!introspection_exemption || verdict.satisfied),
             satisfied: verdict.satisfied,
         })
         .collect::<Vec<_>>();
@@ -1782,6 +1782,27 @@ mod tests {
             true,
         );
         assert!(matches!(result.decision, Decision::Advisory { .. }));
+    }
+
+    #[test]
+    fn schema_introspection_exemption_preserves_satisfied_block() {
+        let result = decide::evaluate_policy_verdicts(
+            &[decide::PolicyVerdict {
+                key: "policy:prod-query".into(),
+                rule: "Inspect production schema first.".into(),
+                requires_key: "schema:orders".into(),
+                block: true,
+                satisfied: true,
+            }],
+            true,
+        );
+        assert_eq!(result.decision, Decision::Allow);
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsulted {
+                key: "policy:prod-query".into()
+            }]
+        );
     }
 
     #[test]
