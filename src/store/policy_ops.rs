@@ -6,7 +6,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use globset::Glob;
 
 use super::db::Store;
 use super::enforcement::{record_event, ControlChangeKind, EnforcementEventType, SubjectKind};
@@ -14,6 +15,50 @@ use super::record::{
     Category, ConfidenceScore, PolicyRecord, QualityScore, Record, RecordLifecycle, RecordSource,
     RecordVersion, StalenessScore, TombstoneReason,
 };
+
+/// Typed failure modes for policy mutations, so callers (e.g. the daemon
+/// dispatcher) can map them to protocol error codes without matching on the
+/// message text.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyOpError {
+    #[error("invalid policy key '{key}'; expected policy:<slug>")]
+    InvalidKey { key: String },
+    #[error("record not found: {key}")]
+    NotFound { key: String },
+    #[error("policy key '{key}' already exists; edit the existing record instead")]
+    AlreadyExists { key: String },
+    #[error("policy '{key}' is not active")]
+    NotActive { key: String },
+    #[error("'{key}' is not a policy record")]
+    NotAPolicy { key: String },
+    #[error("'{key}' has no valid PolicyRecord payload")]
+    InvalidPayload { key: String },
+    #[error("invalid {field} '{pattern}': {source}")]
+    InvalidGlob {
+        field: &'static str,
+        pattern: String,
+        source: globset::Error,
+    },
+}
+
+/// Validate the glob predicates before a policy can become durable state.
+pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
+    if let Some(pattern) = trigger.host_glob.as_deref() {
+        Glob::new(pattern).map_err(|source| PolicyOpError::InvalidGlob {
+            field: "host_glob",
+            pattern: pattern.to_string(),
+            source,
+        })?;
+    }
+    if let Some(pattern) = trigger.target_path_glob.as_deref() {
+        Glob::new(pattern).map_err(|source| PolicyOpError::InvalidGlob {
+            field: "target_path_glob",
+            pattern: pattern.to_string(),
+            source,
+        })?;
+    }
+    Ok(())
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -24,7 +69,10 @@ fn now_secs() -> u64 {
 
 fn ensure_policy_key(key: &str) -> Result<()> {
     if !key.starts_with("policy:") || key.len() == "policy:".len() {
-        bail!("invalid policy key '{key}'; expected policy:<slug>");
+        return Err(PolicyOpError::InvalidKey {
+            key: key.to_string(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -91,10 +139,14 @@ pub fn record_for(key: &str, policy: &PolicyRecord) -> Result<Record> {
 /// An existing *active* policy at this key is rejected. A *tombstoned* one is
 /// replaced by the fresh record, so a deleted slug can be recreated.
 pub async fn create(store: &Store, key: &str, policy: &PolicyRecord) -> Result<()> {
+    validate_trigger(&policy.trigger)?;
     let record = record_for(key, policy)?;
     if let Some(existing) = store.get(key).await? {
         if matches!(existing.lifecycle, RecordLifecycle::Active) {
-            bail!("policy key '{key}' already exists; edit the existing record instead");
+            return Err(PolicyOpError::AlreadyExists {
+                key: key.to_string(),
+            }
+            .into());
         }
     }
     store.put(key, &record).await?;
@@ -104,16 +156,25 @@ pub async fn create(store: &Store, key: &str, policy: &PolicyRecord) -> Result<(
 
 /// Replace an existing active policy payload.
 pub async fn edit(store: &Store, key: &str, policy: &PolicyRecord) -> Result<()> {
+    validate_trigger(&policy.trigger)?;
     ensure_policy_key(key)?;
     let mut record = store
         .get(key)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+        .ok_or_else(|| PolicyOpError::NotFound {
+            key: key.to_string(),
+        })?;
     if record.category != Category::Policy {
-        bail!("'{key}' is not a policy record");
+        return Err(PolicyOpError::NotAPolicy {
+            key: key.to_string(),
+        }
+        .into());
     }
     if !matches!(record.lifecycle, RecordLifecycle::Active) {
-        bail!("policy '{key}' is not active");
+        return Err(PolicyOpError::NotActive {
+            key: key.to_string(),
+        }
+        .into());
     }
     record.value = policy.rule.clone();
     record.priority = policy.severity.clone();
@@ -132,12 +193,19 @@ pub async fn set_enabled(store: &Store, key: &str, enabled: bool) -> Result<()> 
     let mut record = store
         .get(key)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+        .ok_or_else(|| PolicyOpError::NotFound {
+            key: key.to_string(),
+        })?;
     let mut policy = record
         .payload_as::<PolicyRecord>()
-        .ok_or_else(|| anyhow::anyhow!("'{key}' has no valid PolicyRecord payload"))?;
+        .ok_or_else(|| PolicyOpError::InvalidPayload {
+            key: key.to_string(),
+        })?;
     if !matches!(record.lifecycle, RecordLifecycle::Active) {
-        bail!("policy '{key}' is not active");
+        return Err(PolicyOpError::NotActive {
+            key: key.to_string(),
+        }
+        .into());
     }
     policy.enabled = enabled;
     record.payload = Some(serde_json::to_value(&policy)?);
@@ -155,9 +223,14 @@ pub async fn delete(store: &Store, key: &str) -> Result<()> {
     let mut record = store
         .get(key)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("record not found: {key}"))?;
+        .ok_or_else(|| PolicyOpError::NotFound {
+            key: key.to_string(),
+        })?;
     if !matches!(record.lifecycle, RecordLifecycle::Active) {
-        bail!("policy '{key}' is not active");
+        return Err(PolicyOpError::NotActive {
+            key: key.to_string(),
+        }
+        .into());
     }
     let now = now_secs();
     record.lifecycle = RecordLifecycle::Tombstoned {
@@ -289,5 +362,19 @@ mod tests {
         delete(&store, key).await.unwrap();
         create(&store, key, &sample()).await.unwrap();
         assert_eq!(list(&store).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_malformed_trigger_before_persisting() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "policy:invalid-glob";
+        let mut policy = sample();
+        policy.trigger.host_glob = Some("[".into());
+
+        let error = create(&store, key, &policy).await.unwrap_err();
+
+        assert!(error.to_string().contains("invalid host_glob"));
+        assert!(store.get(key).await.unwrap().is_none());
     }
 }

@@ -153,7 +153,11 @@ pub(crate) async fn dispatch_v2(
         } else if is_knowledge_mutation(&req.cmd) {
             // Knowledge-side mutations: native handler with atomic mutation+audit
             // in one transact_knowledge commit.
-            dispatch_knowledge_mutation(graph, ctx, &req).await
+            if matches!(&req.cmd, Command::PolicyWrite(_)) {
+                dispatch_policy_write(graph, &req).await
+            } else {
+                dispatch_knowledge_mutation(graph, ctx, &req).await
+            }
         } else if is_compound(&req.cmd) {
             // FileEditHook: compound (consultation hit in sessions + reparse in knowledge).
             // Each substep has its own audit in its respective tree.
@@ -205,6 +209,7 @@ fn is_knowledge_mutation(cmd: &Command) -> bool {
         Command::GotchaUpsert(_)
             | Command::GotchaConfirm(_)
             | Command::GotchaTombstone(_)
+            | Command::PolicyWrite(_)
             | Command::FileEnrich(_)
             | Command::FileReparse(_)
             | Command::DocCapture(_)
@@ -445,6 +450,9 @@ async fn dispatch_knowledge_mutation(
         Command::GotchaTombstone(input) => {
             handlers::handle_gotcha_tombstone(store, ctx, request_id, input).await
         }
+        Command::PolicyWrite(_) => {
+            unreachable!("PolicyWrite uses the policy_ops dispatcher")
+        }
         Command::FileEnrich(input) => {
             handlers::handle_file_enrich(store, ctx, request_id, input).await
         }
@@ -484,6 +492,55 @@ async fn dispatch_knowledge_mutation(
                 let _ = store.put_raw(&audit_key, &audit_bytes).await;
             }
             Response::err(request_id, code, message)
+        }
+    }
+}
+
+async fn dispatch_policy_write(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
+    let Command::PolicyWrite(input) = &req.cmd else {
+        unreachable!("dispatch_policy_write only accepts PolicyWrite")
+    };
+    let g = graph.read().await;
+    let store = g.store();
+    let result = match input.op {
+        protocol::PolicyWriteOp::Create => match input.policy.as_ref() {
+            Some(policy) => crate::store::policy_ops::create(store, &input.key, policy).await,
+            None => {
+                return Response::err(
+                    req.id,
+                    ErrorCode::ValidationFailed,
+                    "policy is required for create".to_string(),
+                );
+            }
+        },
+        protocol::PolicyWriteOp::Enable => {
+            crate::store::policy_ops::set_enabled(store, &input.key, true).await
+        }
+        protocol::PolicyWriteOp::Disable => {
+            crate::store::policy_ops::set_enabled(store, &input.key, false).await
+        }
+        protocol::PolicyWriteOp::Delete => {
+            crate::store::policy_ops::delete(store, &input.key).await
+        }
+    };
+    match result {
+        Ok(()) => Response::ok(req.id, serde_json::Value::Null),
+        Err(error) => {
+            use crate::store::policy_ops::PolicyOpError;
+            // Map typed policy errors to protocol codes; unknown errors (e.g. a
+            // raw store failure) fall through to StoreError.
+            let code = match error.downcast_ref::<PolicyOpError>() {
+                Some(PolicyOpError::NotFound { .. }) => ErrorCode::NotFound,
+                Some(PolicyOpError::AlreadyExists { .. }) => ErrorCode::Conflict,
+                Some(PolicyOpError::NotActive { .. }) => ErrorCode::InvalidStateTransition,
+                Some(
+                    PolicyOpError::InvalidKey { .. }
+                    | PolicyOpError::NotAPolicy { .. }
+                    | PolicyOpError::InvalidGlob { .. },
+                ) => ErrorCode::ValidationFailed,
+                Some(PolicyOpError::InvalidPayload { .. }) | None => ErrorCode::StoreError,
+            };
+            Response::err(req.id, code, error.to_string())
         }
     }
 }
@@ -1082,6 +1139,7 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         Command::GotchaUpsert(_)
         | Command::GotchaConfirm(_)
         | Command::GotchaTombstone(_)
+        | Command::PolicyWrite(_)
         | Command::FileEnrich(_)
         | Command::FileReparse(_)
         | Command::FileEditHook(_)
@@ -1197,7 +1255,10 @@ mod tests {
     use crate::graph::Graph;
     use crate::mcp::metadata::PeerContext;
     use crate::mcp::protocol::*;
-    use crate::store::Store;
+    use crate::store::{
+        PolicyFreshness, PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger,
+        Priority as StorePriority, ReceiptSource, Store,
+    };
 
     /// Explicit test PeerContext — makes it obvious that auth is bypassed
     /// for handler isolation testing.
@@ -1251,6 +1312,56 @@ mod tests {
             }
             Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
         }
+    }
+
+    #[tokio::test]
+    async fn policy_write_dispatches_against_daemon_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+        let policy = PolicyRecord {
+            name: "Daemon policy".into(),
+            rule: "Consult first.".into(),
+            reason: "The schema changes because production is live.".into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Block,
+            trigger: PolicyTrigger::default(),
+            requires: PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![ReceiptSource::MemGet],
+                freshness: PolicyFreshness { ttl_secs: 900 },
+            },
+            enabled: true,
+            severity: StorePriority::High,
+            created_by: "test".into(),
+        };
+        let key = "policy:daemon";
+
+        let create = make_request(Command::PolicyWrite(PolicyWriteInput {
+            op: PolicyWriteOp::Create,
+            key: key.into(),
+            policy: Some(policy),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, create).await,
+            Response::Ok { .. }
+        ));
+
+        let disable = make_request(Command::PolicyWrite(PolicyWriteInput {
+            op: PolicyWriteOp::Disable,
+            key: key.into(),
+            policy: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, disable).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        let stored = g.store().get(key).await.unwrap().unwrap();
+        assert!(!stored.payload_as::<PolicyRecord>().unwrap().enabled);
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::store::AgentKind;
+use crate::store::{AgentKind, PolicyRecord};
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
@@ -235,6 +235,10 @@ pub enum Command {
     /// Tombstone a gotcha and clean up file links + graph edges.
     #[serde(rename = "gotcha_tombstone")]
     GotchaTombstone(GotchaTombstoneInput),
+
+    /// Create, enable, disable, or tombstone a local policy.
+    #[serde(rename = "policy_write")]
+    PolicyWrite(PolicyWriteInput),
 
     /// Enrich a file record with LLM-derived purpose, entry points, etc.
     /// File record must already exist (created by init/reparse).
@@ -491,6 +495,24 @@ pub struct GotchaTombstoneInput {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyWriteOp {
+    Create,
+    Enable,
+    Disable,
+    Delete,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyWriteInput {
+    pub op: PolicyWriteOp,
+    pub key: String,
+    #[serde(default)]
+    pub policy: Option<PolicyRecord>,
+}
+
 /// File enrichment input from LLM analysis (e.g., /mati-enrich workflow).
 /// The file record must already exist (created by init/reparse).
 ///
@@ -743,6 +765,7 @@ impl Command {
             Self::GotchaUpsert(_) => "gotcha_upsert",
             Self::GotchaConfirm(_) => "gotcha_confirm",
             Self::GotchaTombstone(_) => "gotcha_tombstone",
+            Self::PolicyWrite(_) => "policy_write",
             Self::FileEnrich(_) => "file_enrich",
             Self::FileReparse(_) => "file_reparse",
             Self::FileEditHook(_) => "file_edit_hook",
@@ -775,6 +798,7 @@ impl Command {
             Self::GotchaUpsert(i) => &i.key,
             Self::GotchaConfirm(i) => &i.key,
             Self::GotchaTombstone(i) => &i.key,
+            Self::PolicyWrite(i) => &i.key,
             Self::FileEnrich(i) => &i.path,
             Self::FileReparse(i) => &i.path,
             Self::FileEditHook(i) => &i.path,
@@ -813,6 +837,7 @@ impl Command {
             | Self::GotchaUpsert(_)
             | Self::GotchaConfirm(_)
             | Self::GotchaTombstone(_)
+            | Self::PolicyWrite(_)
             | Self::FileEnrich(_)
             | Self::FileReparse(_)
             | Self::FileEditHook(_)

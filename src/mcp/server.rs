@@ -1756,7 +1756,7 @@ mod tests {
         Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
         RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
     };
-    use crate::store::Store;
+    use crate::store::{PolicyRecord, Store};
 
     fn make_gotcha_record(key: &str, files: &[&str]) -> Record {
         let gotcha = GotchaRecord {
@@ -2115,6 +2115,71 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
 
         assert_eq!(resp["status"], "ok", "ping should succeed, got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn policy_write_round_trips_over_socket_while_store_is_held() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = make_test_graph(store).await;
+        let (client, server) = UnixStream::pair().unwrap();
+        let request = serde_json::json!({
+            "v": 2,
+            "id": uuid::Uuid::new_v4(),
+            "session": uuid::Uuid::nil(),
+            "cmd": {
+                "type": "policy_write",
+                "op": "create",
+                "key": "policy:socket",
+                "policy": {
+                    "name": "Socket policy",
+                    "rule": "Consult first.",
+                    "reason": "The schema changes because production is live.",
+                    "scope": "repo",
+                    "mode": "block",
+                    "trigger": {"host_glob": "*prod*"},
+                    "requires": {
+                        "key": "schema:orders",
+                        "via": ["mem_get"],
+                        "freshness": {"ttl_secs": 900}
+                    },
+                    "enabled": true,
+                    "severity": "high",
+                    "created_by": "test"
+                }
+            }
+        });
+        let (client_read, mut client_write) = client.into_split();
+        client_write
+            .write_all(format!("{}\n", request).as_bytes())
+            .await
+            .unwrap();
+        client_write.shutdown().await.unwrap();
+        socket_handle_connection(
+            graph.clone(),
+            dir.path(),
+            server,
+            super::super::metadata::PeerContext {
+                uid: 501,
+                pid: None,
+            },
+            uuid::Uuid::nil(),
+        )
+        .await
+        .unwrap();
+
+        let mut reader = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(response["status"], "ok");
+
+        let g = graph.read().await;
+        let record = g.store().get("policy:socket").await.unwrap().unwrap();
+        let policy = record.payload_as::<PolicyRecord>().unwrap();
+        assert_eq!(policy.name, "Socket policy");
     }
 
     // ── Daemon-restart resilience ──────────────────────────────────────

@@ -630,6 +630,44 @@ impl StoreProxy {
         }
     }
 
+    /// Mutate a local policy through the canonical policy_ops path.
+    ///
+    /// Socket mode sends the operation to the daemon; direct mode calls the
+    /// same store operation locally when no daemon owns the store.
+    pub async fn policy_write(
+        &self,
+        op: mati_core::mcp::protocol::PolicyWriteOp,
+        key: &str,
+        policy: Option<&mati_core::store::PolicyRecord>,
+    ) -> Result<()> {
+        use mati_core::mcp::protocol as p;
+
+        match &self.inner {
+            ProxyInner::Direct(store) => match op {
+                p::PolicyWriteOp::Create => {
+                    let policy =
+                        policy.ok_or_else(|| anyhow::anyhow!("policy is required for create"))?;
+                    mati_core::store::policy_ops::create(store, key, policy).await
+                }
+                p::PolicyWriteOp::Enable => {
+                    mati_core::store::policy_ops::set_enabled(store, key, true).await
+                }
+                p::PolicyWriteOp::Disable => {
+                    mati_core::store::policy_ops::set_enabled(store, key, false).await
+                }
+                p::PolicyWriteOp::Delete => mati_core::store::policy_ops::delete(store, key).await,
+            },
+            ProxyInner::Socket { root } => {
+                let cmd = p::Command::PolicyWrite(p::PolicyWriteInput {
+                    op,
+                    key: key.to_string(),
+                    policy: policy.cloned(),
+                });
+                interpret_policy_write_ack(daemon_v2(root, cmd).await)
+            }
+        }
+    }
+
     /// Tombstone a gotcha and remove its graph edges.
     ///
     /// In direct mode, delegates to `apply_gotcha_tombstone`.
@@ -1059,9 +1097,84 @@ fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
     )
 }
 
+fn socket_write_error(op: &str, result: DaemonResult) -> anyhow::Error {
+    let detail = match result {
+        DaemonResult::NotRunning => "daemon stopped",
+        DaemonResult::StaleSocket => "daemon socket became stale",
+        DaemonResult::Unresponsive => "daemon did not respond",
+        DaemonResult::Ok(_) => {
+            unreachable!("socket_write_error only handles non-ok daemon results")
+        }
+    };
+    anyhow::anyhow!("mati daemon {detail} while handling '{op}'; retry after restarting the daemon")
+}
+
+/// Interpret a daemon `policy_write` response (as normalized by `daemon_v2` into
+/// `{"ok":bool,...}`) into a unit result, translating a version-skew rejection
+/// from an older daemon into an actionable hint.
+fn interpret_policy_write_ack(result: DaemonResult) -> Result<()> {
+    match result {
+        DaemonResult::Ok(resp) => {
+            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                Ok(())
+            } else {
+                let code = resp.get("code").and_then(|v| v.as_str());
+                let error = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if matches!(code, Some("malformed_request" | "version_mismatch")) {
+                    anyhow::bail!(
+                        "this daemon predates policy authoring; run `mati daemon stop` and retry"
+                    )
+                }
+                anyhow::bail!("daemon policy_write failed: {error}")
+            }
+        }
+        other => Err(socket_write_error("policy_write", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_write_ack_accepts_ok() {
+        let ack = interpret_policy_write_ack(DaemonResult::Ok(
+            serde_json::json!({"ok": true, "v": 2, "data": null}),
+        ));
+        assert!(ack.is_ok());
+    }
+
+    #[test]
+    fn policy_write_ack_maps_version_skew_to_hint() {
+        for code in ["malformed_request", "version_mismatch"] {
+            let err = interpret_policy_write_ack(DaemonResult::Ok(
+                serde_json::json!({"ok": false, "code": code, "error": "unknown command"}),
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("predates policy authoring"),
+                "code {code} should map to the version-skew hint, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_write_ack_surfaces_generic_daemon_error() {
+        let err = interpret_policy_write_ack(DaemonResult::Ok(
+            serde_json::json!({"ok": false, "code": "store_error", "error": "boom"}),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("daemon policy_write failed: boom"));
+    }
+
+    #[test]
+    fn policy_write_ack_reports_unreachable_daemon() {
+        let err = interpret_policy_write_ack(DaemonResult::NotRunning).unwrap_err();
+        assert!(err.to_string().contains("daemon"));
+    }
 
     use mati_core::store::repair::{DirtyMarker, DIRTY_MARKER_KEY};
     use tempfile::TempDir;

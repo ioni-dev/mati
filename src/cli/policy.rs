@@ -160,16 +160,6 @@ fn parse_priority(value: &str) -> Result<Priority> {
     }
 }
 
-fn direct_store(proxy: &StoreProxy) -> Result<&mati_core::store::Store> {
-    proxy.direct_store().ok_or_else(|| {
-        anyhow::anyhow!(
-        "local policy mutations need direct store access, but a daemon currently holds the store. \
-         Stop it first with `mati daemon stop`, then retry \
-         (daemon-mode policy authoring lands in a later milestone)."
-    )
-    })
-}
-
 async fn add(args: AddArgs) -> Result<()> {
     let slug = slugify!(&args.slug);
     if slug.is_empty() {
@@ -192,11 +182,13 @@ async fn add(args: AddArgs) -> Result<()> {
     let key = format!("policy:{slug}");
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    // Keep all policy:* writes centralized in store::policy_ops.
-    let result = match direct_store(&proxy) {
-        Ok(store) => mati_core::store::policy_ops::create(store, &key, &policy).await,
-        Err(error) => Err(error),
-    };
+    let result = proxy
+        .policy_write(
+            mati_core::mcp::protocol::PolicyWriteOp::Create,
+            &key,
+            Some(&policy),
+        )
+        .await;
     proxy.close_with_result(result).await?;
     println!("Created {key}");
     Ok(())
@@ -262,10 +254,17 @@ async fn show(key: &str) -> Result<()> {
 async fn set_enabled(key: &str, enabled: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    let result = match direct_store(&proxy) {
-        Ok(store) => mati_core::store::policy_ops::set_enabled(store, key, enabled).await,
-        Err(error) => Err(error),
-    };
+    let result = proxy
+        .policy_write(
+            if enabled {
+                mati_core::mcp::protocol::PolicyWriteOp::Enable
+            } else {
+                mati_core::mcp::protocol::PolicyWriteOp::Disable
+            },
+            key,
+            None,
+        )
+        .await;
     proxy.close_with_result(result).await?;
     println!("{} {}", if enabled { "Enabled" } else { "Disabled" }, key);
     Ok(())
@@ -274,10 +273,9 @@ async fn set_enabled(key: &str, enabled: bool) -> Result<()> {
 async fn delete(key: &str) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    let result = match direct_store(&proxy) {
-        Ok(store) => mati_core::store::policy_ops::delete(store, key).await,
-        Err(error) => Err(error),
-    };
+    let result = proxy
+        .policy_write(mati_core::mcp::protocol::PolicyWriteOp::Delete, key, None)
+        .await;
     proxy.close_with_result(result).await?;
     println!("Deleted {key} (tombstoned)");
     Ok(())
