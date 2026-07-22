@@ -11,6 +11,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use super::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
@@ -86,6 +87,37 @@ pub const CONSULTED_RECENT_TTL_SECS: u64 = 900;
 pub const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 /// Minimum access count before an unconfirmed gotcha is auto-promoted.
 pub const GOTCHA_PROMOTION_ACCESS_THRESHOLD: u32 = 3;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct ConsultationReceipt {
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+/// Hash the stable, knowledge-bearing content of a record. Mutable access and
+/// timestamp metadata are excluded so minting a receipt does not invalidate
+/// itself when `log_hit` updates access tracking.
+pub fn record_content_fingerprint(record: &Record) -> Option<String> {
+    let content = (
+        &record.key,
+        &record.value,
+        &record.category,
+        &record.priority,
+        &record.tags,
+        &record.ref_url,
+        &record.staleness,
+        &record.lifecycle,
+        &record.quality,
+        &record.source,
+        &record.confidence,
+        &record.gap_analysis_score,
+        &record.payload,
+    );
+    let bytes = rmp_serde::to_vec_named(&content).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
 
 pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
     let now = now_secs();
@@ -176,11 +208,41 @@ fn receipt_key(key: &str, actor: Option<&str>) -> String {
 /// When `actor` is `Some`, writes an actor-scoped key `session:consulted:<actor>:<key>`
 /// alongside the global key path. Pass `None` for all existing callers (global).
 pub fn consultation_receipt_staged(key: &str, actor: Option<&str>) -> Result<(String, Vec<u8>)> {
+    consultation_receipt_staged_with_fingerprint(key, actor, None)
+}
+
+pub fn consultation_receipt_staged_with_fingerprint(
+    key: &str,
+    actor: Option<&str>,
+    fingerprint: Option<String>,
+) -> Result<(String, Vec<u8>)> {
     let consulted_key = receipt_key(key, actor);
-    let record = session_record(&consulted_key, String::new());
+    let mut record = session_record(&consulted_key, String::new());
+    if fingerprint.is_some() {
+        record.payload = Some(serde_json::to_value(ConsultationReceipt { fingerprint })?);
+    }
     let bytes = rmp_serde::to_vec_named(&record)
         .with_context(|| format!("failed to serialize consulted receipt for {consulted_key}"))?;
     Ok((consulted_key, bytes))
+}
+
+pub async fn consultation_receipt_staged_for_store(
+    store: &Store,
+    key: &str,
+    actor: Option<&str>,
+    capture_fingerprint: bool,
+) -> Result<(String, Vec<u8>)> {
+    let fingerprint = if capture_fingerprint {
+        store
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record_content_fingerprint(&record))
+    } else {
+        None
+    };
+    consultation_receipt_staged_with_fingerprint(key, actor, fingerprint)
 }
 
 /// Compute the session:current flush record WITHOUT persisting.
@@ -219,13 +281,11 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     upsert_daily_agg(store, &agg_key, key).await?;
 
     // 2. Mark as consulted for session tracking
-    let consulted_key = receipt_key(key, None);
-    store
-        .put(
-            &consulted_key,
-            &session_record(&consulted_key, String::new()),
-        )
-        .await?;
+    let (consulted_key, receipt_bytes) =
+        consultation_receipt_staged_for_store(store, key, None, true).await?;
+    let receipt: Record = rmp_serde::from_slice(&receipt_bytes)
+        .context("failed to deserialize staged consultation receipt")?;
+    store.put(&consulted_key, &receipt).await?;
 
     // 3. Bump access_count and last_accessed on the target record
     if let Some(mut record) = store.get(key).await? {
@@ -329,6 +389,38 @@ pub async fn check_consulted_recent(
     };
     let age = now_secs().saturating_sub(record.updated_at);
     Ok(age <= ttl_secs)
+}
+
+/// Return true only when a recent receipt carries the current record's
+/// fingerprint. Read/hash failures are treated as unsatisfied, not errors, so
+/// fingerprinting never turns a hook fault into a hard enforcement failure.
+pub async fn check_consulted_recent_fingerprinted(
+    store: &Store,
+    key: &str,
+    ttl_secs: u64,
+    actor: Option<&str>,
+) -> Result<bool> {
+    let consulted_key = receipt_key(key, actor);
+    let Some(receipt) = (match store.get(&consulted_key).await {
+        Ok(record) => record,
+        Err(_) => return Ok(false),
+    }) else {
+        return Ok(false);
+    };
+    if now_secs().saturating_sub(receipt.updated_at) > ttl_secs {
+        return Ok(false);
+    }
+    let Some(stored) = receipt
+        .payload_as::<ConsultationReceipt>()
+        .and_then(|payload| payload.fingerprint)
+    else {
+        return Ok(false);
+    };
+    let current = match store.get(key).await {
+        Ok(Some(record)) => record_content_fingerprint(&record),
+        Ok(None) | Err(_) => None,
+    };
+    Ok(current.is_some_and(|current| current == stored))
 }
 
 // ── session_flush ─────────────────────────────────────────────────────────────

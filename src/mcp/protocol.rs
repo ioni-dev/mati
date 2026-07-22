@@ -680,6 +680,9 @@ pub enum SessionEvent {
 #[serde(deny_unknown_fields)]
 pub struct ConsultationHitInput {
     pub key: String,
+    /// Capture a content fingerprint when the target record exists.
+    #[serde(default = "default_capture_fingerprint")]
+    pub capture_fingerprint: bool,
     #[serde(default)]
     pub actor: Option<String>,
     /// Claude session_id (the session) — for ReceiptMinted audit attribution.
@@ -688,6 +691,10 @@ pub struct ConsultationHitInput {
     /// Subagent agent_id when present (fallback attribution).
     #[serde(default)]
     pub agent_id: Option<String>,
+}
+
+fn default_capture_fingerprint() -> bool {
+    true
 }
 
 /// Input for `Command::RecordImport`. Records are written verbatim into the
@@ -1640,6 +1647,7 @@ mod tests {
                 "consultation_hit",
                 Command::ConsultationHit(ConsultationHitInput {
                     key: "k".into(),
+                    capture_fingerprint: true,
                     actor: None,
                     session_id: None,
                     agent_id: None,

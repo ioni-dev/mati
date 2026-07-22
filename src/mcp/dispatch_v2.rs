@@ -601,6 +601,7 @@ async fn dispatch_policy_evaluate(
                     matched.policy.severity.clone(),
                     matched.policy.requires.key.clone(),
                     matched.policy.requires.via.clone(),
+                    matched.policy.requires.freshness.fingerprint,
                     matched.policy.requires.freshness.ttl_secs,
                 )
             })
@@ -614,18 +615,28 @@ async fn dispatch_policy_evaluate(
         crate::store::enforcement::EnforcementMode::Strict
     );
     let mut verdicts = Vec::with_capacity(matched.len());
-    for (key, mode, rule, reason, severity, requires_key, via, ttl_secs) in matched {
+    for (key, mode, rule, reason, severity, requires_key, via, fingerprint, ttl_secs) in matched {
         let satisfied = match mode {
             crate::store::PolicyMode::Steer => true,
             crate::store::PolicyMode::Block => {
-                match sess::check_consulted_recent(
-                    store,
-                    &requires_key,
-                    ttl_secs,
-                    input.actor.as_deref(),
-                )
-                .await
-                {
+                let check = if fingerprint {
+                    sess::check_consulted_recent_fingerprinted(
+                        store,
+                        &requires_key,
+                        ttl_secs,
+                        input.actor.as_deref(),
+                    )
+                    .await
+                } else {
+                    sess::check_consulted_recent(
+                        store,
+                        &requires_key,
+                        ttl_secs,
+                        input.actor.as_deref(),
+                    )
+                    .await
+                };
+                match check {
                     Ok(value) => value,
                     Err(error) => {
                         return Response::err(req.id, ErrorCode::StoreError, error.to_string())
@@ -989,22 +1000,28 @@ async fn dispatch_session_side(
                     return Response::err(request_id, ErrorCode::StoreError, e.to_string());
                 }
             };
-            let staged_receipt =
-                match sess::consultation_receipt_staged(&input.key, input.actor.as_deref()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let entry = build_audit_entry(
-                            ctx,
-                            request_id,
-                            &command_kind,
-                            &target_key,
-                            false,
-                            Some(ErrorCode::StoreError),
-                        );
-                        write_session_audit(store, &entry).await;
-                        return Response::err(request_id, ErrorCode::StoreError, e.to_string());
-                    }
-                };
+            let staged_receipt = match sess::consultation_receipt_staged_for_store(
+                store,
+                &input.key,
+                input.actor.as_deref(),
+                input.capture_fingerprint,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    let entry = build_audit_entry(
+                        ctx,
+                        request_id,
+                        &command_kind,
+                        &target_key,
+                        false,
+                        Some(ErrorCode::StoreError),
+                    );
+                    write_session_audit(store, &entry).await;
+                    return Response::err(request_id, ErrorCode::StoreError, e.to_string());
+                }
+            };
             let audit_entry =
                 build_audit_entry(ctx, request_id, &command_kind, &target_key, true, None);
             // Audit is required — fail closed if serialization fails.
@@ -1472,7 +1489,10 @@ mod tests {
             requires: PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![ReceiptSource::MemGet],
-                freshness: PolicyFreshness { ttl_secs: 900 },
+                freshness: PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
             },
             enabled: true,
             severity: StorePriority::High,
@@ -1526,7 +1546,10 @@ mod tests {
             requires: PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![ReceiptSource::MemGet],
-                freshness: PolicyFreshness { ttl_secs: 900 },
+                freshness: PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
             },
             enabled: true,
             severity: StorePriority::High,
@@ -1688,6 +1711,7 @@ mod tests {
         for key in ["file:a.rs", "file:b.rs"] {
             let req = make_request(Command::ConsultationHit(ConsultationHitInput {
                 key: key.into(),
+                capture_fingerprint: true,
                 actor: None,
                 session_id: None,
                 agent_id: None,
@@ -1774,6 +1798,7 @@ mod tests {
 
         let req = make_request(Command::ConsultationHit(ConsultationHitInput {
             key: "file:test".into(),
+            capture_fingerprint: true,
             actor: None,
             session_id: None,
             agent_id: None,
@@ -1939,6 +1964,7 @@ mod tests {
             }),
             Command::ConsultationHit(ConsultationHitInput {
                 key: "k".into(),
+                capture_fingerprint: true,
                 actor: None,
                 session_id: None,
                 agent_id: None,

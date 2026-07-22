@@ -392,6 +392,7 @@ impl StoreProxy {
                 let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
                     mati_core::mcp::protocol::ConsultationHitInput {
                         key: key.to_string(),
+                        capture_fingerprint: true,
                         actor: None,
                         session_id: None,
                         agent_id: None,
@@ -693,13 +694,23 @@ impl StoreProxy {
                     let satisfied = match policy.mode {
                         PolicyMode::Steer => true,
                         PolicyMode::Block => {
-                            mati_core::store::session::check_consulted_recent(
-                                store,
-                                &policy.requires.key,
-                                policy.requires.freshness.ttl_secs,
-                                actor,
-                            )
-                            .await?
+                            if policy.requires.freshness.fingerprint {
+                                mati_core::store::session::check_consulted_recent_fingerprinted(
+                                    store,
+                                    &policy.requires.key,
+                                    policy.requires.freshness.ttl_secs,
+                                    actor,
+                                )
+                                .await?
+                            } else {
+                                mati_core::store::session::check_consulted_recent(
+                                    store,
+                                    &policy.requires.key,
+                                    policy.requires.freshness.ttl_secs,
+                                    actor,
+                                )
+                                .await?
+                            }
                         }
                     };
                     verdicts.push(p::PolicyVerdict {
@@ -1285,7 +1296,10 @@ mod tests {
             requires: mati_core::store::PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![mati_core::store::ReceiptSource::MemGet],
-                freshness: mati_core::store::PolicyFreshness { ttl_secs: 900 },
+                freshness: mati_core::store::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
             },
             enabled: true,
             severity: mati_core::store::Priority::High,

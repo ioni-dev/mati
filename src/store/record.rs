@@ -840,6 +840,8 @@ pub enum ReceiptSource {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFreshness {
     pub ttl_secs: u64,
+    #[serde(default)]
+    pub fingerprint: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -1202,7 +1204,10 @@ mod tests {
             requires: PolicyRequires {
                 key: "schema:orders_db".into(),
                 via: vec![ReceiptSource::DbIntrospection, ReceiptSource::MemGet],
-                freshness: PolicyFreshness { ttl_secs: 900 },
+                freshness: PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
             },
             enabled: true,
             severity: Priority::Critical,

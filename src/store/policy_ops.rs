@@ -270,7 +270,10 @@ mod tests {
             requires: super::super::record::PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![super::super::record::ReceiptSource::MemGet],
-                freshness: super::super::record::PolicyFreshness { ttl_secs: 900 },
+                freshness: super::super::record::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
             },
             enabled: true,
             severity: super::super::record::Priority::High,

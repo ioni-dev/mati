@@ -171,7 +171,10 @@ mod tests {
             requires: PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![ReceiptSource::MemGet],
-                freshness: PolicyFreshness { ttl_secs: 900 },
+                freshness: PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
             },
             enabled: true,
             severity: Priority::High,

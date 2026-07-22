@@ -864,6 +864,7 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
     let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
         mati_core::mcp::protocol::ConsultationHitInput {
             key: key.to_string(),
+            capture_fingerprint: true,
             actor: actor.map(str::to_string),
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
@@ -932,6 +933,7 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
             mati_core::mcp::protocol::Command::ConsultationHit(
                 mati_core::mcp::protocol::ConsultationHitInput {
                     key: verdict.requires_key,
+                    capture_fingerprint: false,
                     actor: agent_id
                         .map(str::to_string)
                         .or_else(|| session_id.map(str::to_string)),
@@ -1301,6 +1303,7 @@ async fn fire_events(
             // the main thread's gate for context only the subagent received.
             HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
                 key: key.clone(),
+                capture_fingerprint: true,
                 actor: agent_id.map(str::to_string),
                 session_id: sid(),
                 agent_id: agent_id.map(str::to_string),
