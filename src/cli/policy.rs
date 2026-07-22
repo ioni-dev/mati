@@ -16,7 +16,9 @@ use slugify::slugify;
 
 use mati_core::hooks::decide::{is_known_action_tool, normalize_action, Action};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
-use mati_core::store::{PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority};
+use mati_core::store::{
+    PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority, RecordLifecycle,
+};
 
 use crate::cli::proxy::StoreProxy;
 
@@ -192,6 +194,14 @@ async fn add(args: AddArgs) -> Result<()> {
     let key = format!("policy:{slug}");
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
+    if policy
+        .requires
+        .via
+        .contains(&mati_core::store::ReceiptSource::MemGet)
+        && !has_backing_record(&proxy, &policy.requires.key).await?
+    {
+        eprintln!("{}", unbacked_requires_warning(&policy.requires.key));
+    }
     let result = proxy
         .policy_write(
             mati_core::mcp::protocol::PolicyWriteOp::Create,
@@ -299,7 +309,17 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
     let matches = proxy.policy_evaluate(&action, None).await?;
-    let output = render_test_output(&action, &matches, args.json)?;
+    let mut unbacked = Vec::new();
+    for matched in &matches {
+        if matched
+            .via
+            .contains(&mati_core::store::ReceiptSource::MemGet)
+            && !has_backing_record(&proxy, &matched.requires_key).await?
+        {
+            unbacked.push(matched.requires_key.clone());
+        }
+    }
+    let output = render_test_output_with_warnings(&action, &matches, &unbacked, args.json)?;
     proxy.close().await?;
     println!("{output}");
     Ok(())
@@ -310,10 +330,20 @@ fn render_test_output(
     matches: &[mati_core::mcp::protocol::PolicyVerdict],
     json_output: bool,
 ) -> Result<String> {
+    render_test_output_with_warnings(action, matches, &[], json_output)
+}
+
+fn render_test_output_with_warnings(
+    action: &Action,
+    matches: &[mati_core::mcp::protocol::PolicyVerdict],
+    unbacked_requires: &[String],
+    json_output: bool,
+) -> Result<String> {
     if json_output {
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "action": action,
             "matches": matches,
+            "unbacked_requires": unbacked_requires,
         }))?);
     }
 
@@ -349,10 +379,32 @@ fn render_test_output(
                 "  {} [{}; {}] {}\n",
                 matched.key, mode, status, matched.rule
             ));
+            if unbacked_requires
+                .iter()
+                .any(|key| key == &matched.requires_key)
+            {
+                output.push_str(&format!(
+                    "  {}\n",
+                    unbacked_requires_warning(&matched.requires_key)
+                ));
+            }
         }
         output.pop();
     }
     Ok(output)
+}
+
+async fn has_backing_record(proxy: &StoreProxy, key: &str) -> Result<bool> {
+    Ok(proxy
+        .get(key)
+        .await?
+        .is_some_and(|record| !matches!(record.lifecycle, RecordLifecycle::Tombstoned { .. })))
+}
+
+fn unbacked_requires_warning(key: &str) -> String {
+    format!(
+        "warning: requires.key '{key}' has no backing record; a mem_get on it would mint a receipt without the agent learning anything. Store a record at that key (e.g. the schema doc) so consultation is substantive."
+    )
 }
 
 fn verify(args: VerifyArgs) -> Result<()> {
@@ -485,5 +537,36 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(json["action"]["tool"], "unknown");
         assert!(json["matches"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn policy_test_output_surfaces_unbacked_memget_requirement() {
+        let action = normalize_action(Some("psql -h db.prod.internal -c select"), None);
+        let matched = mati_core::mcp::protocol::PolicyVerdict {
+            key: "policy:prod".into(),
+            mode: PolicyMode::Block,
+            rule: "Consult first.".into(),
+            reason: "Because production changes.".into(),
+            severity: Priority::High,
+            requires_key: "schema:missing".into(),
+            via: vec![mati_core::store::ReceiptSource::MemGet],
+            satisfied: false,
+            strict: true,
+        };
+        let output = render_test_output_with_warnings(
+            &action,
+            &[matched],
+            &["schema:missing".into()],
+            false,
+        )
+        .unwrap();
+        assert!(output.contains("warning: requires.key 'schema:missing'"));
+    }
+
+    #[test]
+    fn unbacked_requirement_warning_has_substantiveness_guidance() {
+        let warning = unbacked_requires_warning("schema:orders");
+        assert!(warning.contains("without the agent learning anything"));
+        assert!(warning.contains("Store a record at that key"));
     }
 }
