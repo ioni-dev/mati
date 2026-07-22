@@ -501,23 +501,13 @@ Both produce a consult-required deny at hook time. They stay distinguishable in 
 
 A policy is a `policy:<slug>` record carrying a `PolicyRecord` payload (section 5.3a). It is developer-authored source of truth, so it writes at `Immediate` durability (section 21).
 
-Each policy has exactly one rollout stage: `off` is not evaluated, `shadow`
-evaluates and records would-outcome observations without changing the decision,
-and `enforce` acts according to `mode` (`steer` or `block`). The global
-`policy.mode` kill switch still downgrades enforce-stage blocking to steering.
-New policies start off; a developer can review them with `mati policy stage
-<slug> shadow` before promoting them to enforce.
+A policy has one rollout stage. `off` is never evaluated. `shadow` is evaluated and recorded but changes no decision. `enforce` acts on `mode`, steering or blocking. The `policy.mode` kill switch applies at `enforce`, degrading a block to a steer. New policies start at `off`. Staging one to `shadow` first shows what it would catch before it can stop anything.
 
-Every create, edit, stage change, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. `mati policy enable` and `disable` are aliases that set the stage to `enforce` and `off` respectively; there is no separate enable path. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
+Every create, edit, stage change, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. `mati policy enable` and `disable` are aliases for setting the stage to `enforce` and `off`. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
 
 The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step and lets an agent run `mati policy stage <slug> enforce` directly. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
 
-The agent boundary is explicit: `off` is the draft, agent-writable stage;
-`shadow` and `enforce` are developer-controlled and agent-immutable. `mem_set`
-forces any non-off payload down to `off`, and refuses edits or deletion of
-non-off existing policies. An agent can therefore never cause an action to be
-blocked through `mem_set`; the Bash permission caveat above still applies to
-direct CLI promotion.
+`off` is the only stage an agent can write. `shadow` and `enforce` belong to the developer. `mem_set` forces any other stage in an agent payload down to `off`, and refuses to edit or delete a policy that is not already `off`. An agent can draft a policy but cannot make one act, and cannot quietly rewrite one the developer is midway through reviewing. That holds for `mem_set` only. The Bash caveat above still applies to the CLI.
 
 Glob predicates are validated at author time. A malformed `host_glob` or `target_path_glob` is rejected before it can be persisted, so a broken pattern never reaches the daemon.
 
@@ -546,20 +536,9 @@ daemon  match the Action, check receipts, return verdicts (no decision)
 hook    compute the decision, emit output, fire events
 ```
 
-Shadow would-outcome observations are bounded daily aggregates in the eventual
-`analytics:` session namespace, keyed per policy so a noisy policy cannot starve
-a quiet one out of its budget. Each entry carries the policy key, the normalized
-action, a timestamp, and whether the policy would have blocked or steered. They
-do not use the hash-chained enforcement log: a shadow result did not deny
-anything, so a `Deny` event would falsify the audit chain consumed by
-mati-cloud. `mati policy observations [<slug>]` reads them back, reporting a
-per-policy total alongside the retained sample.
+Shadow observations are bounded daily aggregates in the eventual `analytics:` namespace, capped per policy so a noisy one cannot crowd out a quiet one. Each entry records the policy key, the normalized action, a timestamp, and whether the policy would have blocked or steered. `mati policy observations` reads them back and prints the full count next to the retained sample, so a truncated sample is visible rather than silent. They stay out of the hash-chained enforcement log: a shadow policy denied nothing, so a `Deny` event would falsify the audit chain mati-cloud reads.
 
-An observation is recorded only where enforce would have acted. A shadow block
-whose receipt is already valid records nothing, because at `enforce` it would
-have allowed; a shadow block exempted as schema introspection (section 10a.5)
-records nothing either, for the same reason. Without that, the measurement would
-over-report the blocking a promotion to `enforce` actually causes.
+A policy is observed only where `enforce` would have acted on it. A shadow block holding a valid receipt records nothing, because at `enforce` it would have allowed. Neither does one exempted as schema introspection (section 10a.5). Without that, a policy would look more disruptive than promoting it would actually be.
 
 The gate is what keeps this cheap. A bash command that is not a database client makes no policy call at all, so the common path costs what it cost before. Only a governed action pays one local round trip, well inside `HOOK_DEADLINE_MS`.
 
@@ -603,7 +582,7 @@ Policy decisions reuse the event types in section 18. No new event type or subje
 
 Policy events carry `subject_kind = Control` and `subject_key = <policy key>`. That is what separates them from the file-subject gotcha and floor denies sharing the same log.
 
-Only `enforce`-stage policies reach this table. A `shadow` policy emits no enforcement event at all, neither a `Deny` nor an `AllowAfterReceipt` on a satisfied block, because it changed no decision. Its only trace is the `analytics:` observation in section 10a.3. A stage change is itself a lifecycle mutation and does write `ControlChanged`, so promoting a policy to `enforce` stays visible in the chain.
+Only `enforce` policies reach this table. A `shadow` policy writes no enforcement event, not a `Deny` and not an `AllowAfterReceipt`, because it decided nothing. Its only trace is the observation in section 10a.3. Changing a stage is a lifecycle mutation and still writes `ControlChanged`, so a promotion to `enforce` stays in the chain.
 
 ---
 
