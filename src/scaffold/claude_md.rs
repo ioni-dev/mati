@@ -46,9 +46,9 @@ CAPTURE TRIGGERS. Author a policy when the developer either:
 - asks explicitly: \"mati policy: ...\", \"make this a policy\", \"create a policy around this\", \"enforce this\", or \"add a guardrail for this\"; or
 - states a standing directive implicitly: \"from now on\", \"before you ever\", \"always X before Y\", \"never run X without Y\", or \"make it a rule that\".
 In both cases author it without asking for confirmation, matching the existing
-gotcha capture convention. Suggest `shadow` by default so the developer can
-review what it would catch. It is created off unless the developer requests
-shadow; promoting it to `enforce` is theirs to do.
+gotcha capture convention. Author policies at `off` and suggest that the
+developer run `mati policy stage <slug> shadow` to review what they would
+catch; promoting one to `enforce` is theirs to do.
 
 NOT EVERY DIRECTIVE IS A POLICY. A policy can only match a governable action
 category: `db_client`, `file_read`, or `path`. If the directive does not map to
@@ -57,11 +57,13 @@ a policy whose trigger can never match. Say plainly that it is not enforceable
 as a policy and offer to capture it as a gotcha or dev note instead.
 
 LIFECYCLE. To create, or refine a policy, use `mem_set` with a `policy:<slug>`
-key. Suggest `shadow` as the default rollout for a new policy. When the
-developer asks to stage, update, disable, or delete, run the matching
+key. Author it at `off` and suggest that the developer run
+`mati policy stage <slug> shadow` to begin review. When the developer asks to
+stage, update, disable, or delete, run the matching
 `mati policy stage|edit|enable|disable|delete <slug>` command via Bash. The
 developer sees a permission prompt and approves it. Promoting a policy to
-`enforce` is the developer's decision. Always dry-run a new or changed predicate with
+`enforce` is the developer's decision. Never claim a policy is live unless its
+stage is `enforce`. Always dry-run a new or changed predicate with
 `mati policy test --trigger`, against both a command that should match and one
 that should not, before writing. Never claim a policy is active unless it was
 actually enabled.
@@ -350,7 +352,7 @@ mod tests {
         assert!(content.contains("it is not enforceable"));
         assert!(content.contains("mati policy test --trigger"));
         assert!(content.contains("mati policy stage|edit|enable|disable|delete <slug>"));
-        assert!(content.contains("Suggest `shadow` as the default"));
+        assert!(content.contains("mati policy stage <slug> shadow"));
     }
 
     #[test]

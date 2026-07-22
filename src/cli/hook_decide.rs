@@ -525,20 +525,47 @@ async fn evaluate_governed_policy(
     }
     let verdicts = policy_verdicts_for_action(mati_root, action, agent_id, failure_path).await?;
     let strict = verdicts.iter().any(|verdict| verdict.strict);
-    let core_verdicts = verdicts
-        .iter()
-        .map(|verdict| decide::PolicyVerdict {
-            key: verdict.key.clone(),
-            rule: verdict.rule.clone(),
-            requires_key: verdict.requires_key.clone(),
-            block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
-                && (!introspection_exemption || verdict.satisfied),
-            satisfied: verdict.satisfied,
-            stage: verdict.stage,
-        })
-        .collect::<Vec<_>>();
+    let core_verdicts = policy_core_verdicts(&verdicts, introspection_exemption);
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
-    Some((result.decision, result.events))
+    let events = result
+        .events
+        .into_iter()
+        .map(|event| match event {
+            HookEvent::PolicyShadowObserved { key, would, .. } => HookEvent::PolicyShadowObserved {
+                key,
+                would,
+                action: Some(action.clone()),
+            },
+            event => event,
+        })
+        .collect();
+    Some((result.decision, events))
+}
+
+fn policy_core_verdicts(
+    verdicts: &[mati_core::mcp::protocol::PolicyVerdict],
+    introspection_exemption: bool,
+) -> Vec<decide::PolicyVerdict> {
+    verdicts
+        .iter()
+        .filter_map(|verdict| {
+            if introspection_exemption
+                && matches!(verdict.stage, mati_core::store::PolicyStage::Shadow)
+                && matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+            {
+                return None;
+            }
+            Some(decide::PolicyVerdict {
+                key: verdict.key.clone(),
+                rule: verdict.rule.clone(),
+                requires_key: verdict.requires_key.clone(),
+                block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                    && (!introspection_exemption || verdict.satisfied),
+                satisfied: verdict.satisfied,
+                stage: verdict.stage,
+            })
+        })
+        .collect()
 }
 
 async fn policy_verdicts_for_action(
@@ -1276,6 +1303,9 @@ fn platform_events(
                     Some(HookEvent::PolicyConsultBlocked { key })
                 }
                 HookEvent::PolicyConsulted { key } => Some(HookEvent::PolicyConsulted { key }),
+                HookEvent::PolicyShadowObserved { key, would, action } => {
+                    Some(HookEvent::PolicyShadowObserved { key, would, action })
+                }
                 HookEvent::ComplianceHit { key } => Some(HookEvent::EditConsulted { key }),
                 _ => None,
             })
@@ -1360,6 +1390,15 @@ async fn fire_events(
                 event: p::SessionEvent::PolicyConsultHit,
                 key: key.clone(),
                 session_id: sid(),
+            }),
+            HookEvent::PolicyShadowObserved {
+                key,
+                would,
+                action: Some(action),
+            } => p::Command::PolicyShadowObserve(p::PolicyShadowObserveInput {
+                policy_key: key.clone(),
+                action: action.clone(),
+                would: *would,
             }),
             HookEvent::PolicyShadowObserved { .. } => continue,
         };
@@ -1793,6 +1832,39 @@ mod tests {
             true,
         );
         assert!(matches!(result.decision, Decision::Advisory { .. }));
+    }
+
+    #[test]
+    fn schema_introspection_exemption_produces_no_shadow_observation() {
+        let input = json!({
+            "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
+        });
+        assert!(policy_block_exempt(HookVariant::ClaudePreBash, &input));
+        let verdicts = policy_core_verdicts(
+            &[mati_core::mcp::protocol::PolicyVerdict {
+                key: "policy:prod-query".into(),
+                stage: mati_core::store::PolicyStage::Shadow,
+                mode: mati_core::store::PolicyMode::Block,
+                rule: "Inspect production schema first.".into(),
+                reason: "Schema drift matters.".into(),
+                severity: mati_core::store::Priority::High,
+                requires_key: "schema:orders".into(),
+                satisfied: false,
+                via: vec![],
+                strict: true,
+            }],
+            true,
+        );
+        let result = decide::evaluate_policy_verdicts(&verdicts, true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, HookEvent::PolicyShadowObserved { .. })));
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, HookEvent::PolicyConsulted { .. })));
     }
 
     #[test]

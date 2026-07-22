@@ -735,17 +735,6 @@ impl StoreProxy {
                             }
                         }
                     };
-                    if matches!(policy.stage, mati_core::store::PolicyStage::Shadow)
-                        && matches!(policy.mode, PolicyMode::Block)
-                        && !satisfied
-                    {
-                        mati_core::store::session::record_shadow_observation(
-                            store,
-                            matched.key,
-                            action,
-                        )
-                        .await?;
-                    }
                     verdicts.push(p::PolicyVerdict {
                         key: matched.key.to_string(),
                         stage: policy.stage,

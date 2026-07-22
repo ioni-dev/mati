@@ -2195,18 +2195,19 @@ async fn apply_mem_set_write(
                 })
                 .to_string(),
             };
-        // Agents may create or edit off/shadow policies, but can never cause
-        // an action to be blocked: an enforce payload is forced down to off.
-        if matches!(policy.stage, crate::store::PolicyStage::Enforce) {
+        // Agents may create or edit only off policies. Shadow and enforce are
+        // developer-controlled and agent-immutable.
+        if !matches!(policy.stage, crate::store::PolicyStage::Off) {
             policy.stage = crate::store::PolicyStage::Off;
         }
         if let Some(existing) = existing_record.as_ref() {
             if let Some(existing_policy) = existing.payload_as::<PolicyRecord>() {
-                if matches!(existing_policy.stage, crate::store::PolicyStage::Enforce) {
+                if !matches!(existing_policy.stage, crate::store::PolicyStage::Off) {
                     let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
+                    let stage = format!("{:?}", existing_policy.stage).to_ascii_lowercase();
                     return serde_json::json!({
                         "error": format!(
-                            "policy {} is active; change it with `mati policy edit {slug}` so the change is approved.",
+                            "policy {} is {stage}; an agent cannot edit developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.",
                             params.key
                         )
                     })
@@ -2748,12 +2749,17 @@ async fn apply_mem_set_delete(
         };
         if record
             .payload_as::<PolicyRecord>()
-            .is_some_and(|policy| matches!(policy.stage, crate::store::PolicyStage::Enforce))
+            .map(|policy| policy.stage)
+            .is_some_and(|stage| !matches!(stage, crate::store::PolicyStage::Off))
         {
             let slug = key.strip_prefix("policy:").unwrap_or(key);
+            let stage = record
+                .payload_as::<PolicyRecord>()
+                .map(|policy| format!("{:?}", policy.stage).to_ascii_lowercase())
+                .unwrap_or_else(|| "non-off".into());
             return serde_json::json!({
                 "error": format!(
-                    "policy {key} is active; delete it with `mati policy delete {slug}` so the change is approved."
+                    "policy {key} is {stage}; an agent cannot delete developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent."
                 )
             })
             .to_string();

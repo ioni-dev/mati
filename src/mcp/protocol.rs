@@ -292,6 +292,10 @@ pub enum Command {
     #[serde(rename = "consultation_hit")]
     ConsultationHit(ConsultationHitInput),
 
+    /// Record a policy shadow observation in the eventual session store.
+    #[serde(rename = "policy_shadow_observe")]
+    PolicyShadowObserve(PolicyShadowObserveInput),
+
     /// Flush session data (collect consulted markers into session:current).
     #[serde(rename = "session_flush")]
     SessionFlush,
@@ -651,6 +655,14 @@ pub struct SessionLogInput {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyShadowObserveInput {
+    pub policy_key: String,
+    pub action: Action,
+    pub would: crate::hooks::decide::ShadowOutcome,
+}
+
 /// Session analytics event types. Each maps to a daily aggregation key prefix.
 ///
 /// `Hit` is NOT included — it has richer side effects and uses the separate
@@ -823,6 +835,7 @@ impl Command {
             Self::DevNoteUpsert(_) => "dev_note_upsert",
             Self::SessionLog(_) => "session_log",
             Self::ConsultationHit(_) => "consultation_hit",
+            Self::PolicyShadowObserve(_) => "policy_shadow_observe",
             Self::SessionFlush => "session_flush",
             Self::SessionHarvest => "session_harvest",
             Self::SessionClearConsults => "session_clear_consults",
@@ -857,6 +870,7 @@ impl Command {
             Self::DevNoteUpsert(i) => i.key.as_deref().unwrap_or(""),
             Self::SessionLog(i) => &i.key,
             Self::ConsultationHit(i) => &i.key,
+            Self::PolicyShadowObserve(i) => &i.policy_key,
             Self::ConfigGet(i) => &i.key,
             Self::ConfigSet(i) => &i.key,
             Self::SandboxAudit(i) => &i.setting,
@@ -896,6 +910,7 @@ impl Command {
             | Self::DevNoteUpsert(_)
             | Self::SessionLog(_)
             | Self::ConsultationHit(_)
+            | Self::PolicyShadowObserve(_)
             | Self::ConfigSet(_)
             | Self::SandboxAudit(_)
             | Self::SessionFlush

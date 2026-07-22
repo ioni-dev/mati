@@ -36,6 +36,13 @@ pub struct Action {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowOutcome {
+    Block,
+    Steer,
+}
+
 /// Semantic enforcement decision. Adapters map these to platform output.
 ///
 /// `FailOpen` is intentionally absent — it's a daemon-readiness outcome
@@ -89,7 +96,11 @@ pub enum HookEvent {
     /// Local policy allowed a governed action after its receipt was present.
     PolicyConsulted { key: String },
     /// A shadow policy would have blocked, but never changes the decision.
-    PolicyShadowObserved { key: String },
+    PolicyShadowObserved {
+        key: String,
+        would: ShadowOutcome,
+        action: Option<Action>,
+    },
 }
 
 /// The I/O-free subset of a daemon policy verdict needed by the hook adapter.
@@ -113,10 +124,23 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
     let mut denied = None;
 
     for verdict in verdicts {
+        // The matcher already excludes Off; this defensive no-op prevents an
+        // unexpected Off verdict from being treated as a steer policy.
+        if matches!(verdict.stage, crate::store::PolicyStage::Off) {
+            continue;
+        }
         if matches!(verdict.stage, crate::store::PolicyStage::Shadow) {
-            if verdict.block && !verdict.satisfied {
+            if !verdict.block {
                 events.push(HookEvent::PolicyShadowObserved {
                     key: verdict.key.clone(),
+                    would: ShadowOutcome::Steer,
+                    action: None,
+                });
+            } else if !verdict.satisfied {
+                events.push(HookEvent::PolicyShadowObserved {
+                    key: verdict.key.clone(),
+                    would: ShadowOutcome::Block,
+                    action: None,
                 });
             }
             continue;
@@ -1933,10 +1957,23 @@ mod tests {
         let shadow = evaluate_policy_verdicts(&[verdict], true);
         let none = evaluate_policy_verdicts(&[], true);
         assert_eq!(shadow.decision, none.decision);
-        assert!(matches!(
-            shadow.events.as_slice(),
-            [HookEvent::PolicyShadowObserved { .. }]
-        ));
+        assert_eq!(
+            shadow.events,
+            vec![HookEvent::PolicyShadowObserved {
+                key: "policy:prod-query".into(),
+                would: ShadowOutcome::Block,
+                action: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn shadow_satisfied_block_is_allowed_without_observation() {
+        let mut verdict = policy(true, true, "Consult first.");
+        verdict.stage = crate::store::PolicyStage::Shadow;
+        let result = evaluate_policy_verdicts(&[verdict], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(result.events.is_empty());
     }
 
     #[test]
@@ -1960,6 +1997,21 @@ mod tests {
                 context: "Consult first.".into()
             }
         );
+    }
+
+    #[test]
+    fn shadow_steer_records_observation_without_context() {
+        let mut verdict = policy(false, true, "Steer this action.");
+        verdict.stage = crate::store::PolicyStage::Shadow;
+        let result = evaluate_policy_verdicts(&[verdict], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(matches!(
+            result.events.as_slice(),
+            [HookEvent::PolicyShadowObserved {
+                would: ShadowOutcome::Steer,
+                ..
+            }]
+        ));
     }
 
     #[test]

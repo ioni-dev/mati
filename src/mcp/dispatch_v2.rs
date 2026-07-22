@@ -211,6 +211,7 @@ fn is_session_side(cmd: &Command) -> bool {
         cmd,
         Command::SessionLog(_)
             | Command::ConsultationHit(_)
+            | Command::PolicyShadowObserve(_)
             | Command::SessionFlush
             | Command::SessionHarvest
             | Command::SessionClearConsults
@@ -747,14 +748,6 @@ async fn dispatch_policy_evaluate(
                 }
             }
         };
-        if matches!(stage, crate::store::PolicyStage::Shadow)
-            && matches!(mode, crate::store::PolicyMode::Block)
-            && !satisfied
-        {
-            if let Err(error) = sess::record_shadow_observation(store, &key, &input.action).await {
-                tracing::warn!(policy = %key, error = %error, "shadow observation recording failed");
-            }
-        }
         verdicts.push(protocol::PolicyVerdict {
             key,
             stage,
@@ -890,6 +883,19 @@ async fn dispatch_session_side(
     let target_key = req.cmd.target_key().to_string();
 
     match &req.cmd {
+        Command::PolicyShadowObserve(input) => {
+            match sess::record_shadow_observation(
+                store,
+                &input.policy_key,
+                &input.action,
+                input.would,
+            )
+            .await
+            {
+                Ok(()) => Response::ok(request_id, serde_json::json!({"ok": true})),
+                Err(error) => Response::err(request_id, ErrorCode::StoreError, error.to_string()),
+            }
+        }
         Command::SessionLog(input) => {
             let agg_prefix = match input.event {
                 protocol::SessionEvent::Miss => "analytics:miss_",
@@ -1422,6 +1428,7 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         // Session-side commands are handled natively — should not reach here.
         Command::SessionLog(_)
         | Command::ConsultationHit(_)
+        | Command::PolicyShadowObserve(_)
         | Command::SessionFlush
         | Command::SessionHarvest
         | Command::SessionClearConsults => {

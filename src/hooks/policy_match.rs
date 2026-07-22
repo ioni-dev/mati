@@ -17,7 +17,7 @@ struct CompiledPolicy {
     target_path_glob: Option<GlobMatcher>,
 }
 
-/// A set of enabled, active policies with their glob predicates compiled.
+/// A set of staged, active policies with their glob predicates compiled.
 pub struct PolicyMatcherSet {
     policies: Vec<CompiledPolicy>,
 }
@@ -36,7 +36,7 @@ impl PolicyMatcherSet {
         }
     }
 
-    /// Compile active, enabled policy records from universal store records.
+    /// Compile active, non-off policy records from universal store records.
     pub fn from_records(records: &[Record]) -> Result<Self> {
         let policies = records.iter().filter_map(|record| {
             if record.category != crate::store::Category::Policy
@@ -50,7 +50,7 @@ impl PolicyMatcherSet {
         Self::from_policies(policies)
     }
 
-    /// Compile active, enabled policy records while isolating bad records.
+    /// Compile active, non-off policy records while isolating bad records.
     ///
     /// A malformed policy must not prevent the daemon from evaluating every
     /// other policy at boot or after a live refresh.

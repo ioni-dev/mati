@@ -305,11 +305,15 @@ impl MatiServer {
                 if existing
                     .as_ref()
                     .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
-                    .is_some_and(|policy| {
-                        matches!(policy.stage, crate::store::PolicyStage::Enforce)
-                    })
+                    .map(|policy| policy.stage)
+                    .is_some_and(|stage| !matches!(stage, crate::store::PolicyStage::Off))
                 {
-                    return json!({"error": format!("policy {} is active; delete it with `mati policy delete {slug}` so the change is approved.", params.key)}).to_string();
+                    let stage = existing
+                        .as_ref()
+                        .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
+                        .map(|policy| format!("{:?}", policy.stage).to_ascii_lowercase())
+                        .unwrap_or_else(|| "non-off".into());
+                    return json!({"error": format!("policy {} is {stage}; an agent cannot delete developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.", params.key)}).to_string();
                 }
                 return self
                     .socket_call_typed(Command::PolicyWrite(
@@ -326,11 +330,15 @@ impl MatiServer {
                 if existing
                     .as_ref()
                     .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
-                    .is_some_and(|policy| {
-                        matches!(policy.stage, crate::store::PolicyStage::Enforce)
-                    })
+                    .map(|policy| policy.stage)
+                    .is_some_and(|stage| !matches!(stage, crate::store::PolicyStage::Off))
                 {
-                    return json!({"error": format!("policy {} is active; change it with `mati policy edit {slug}` so the change is approved.", params.key)}).to_string();
+                    let stage = existing
+                        .as_ref()
+                        .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
+                        .map(|policy| format!("{:?}", policy.stage).to_ascii_lowercase())
+                        .unwrap_or_else(|| "non-off".into());
+                    return json!({"error": format!("policy {} is {stage}; an agent cannot edit developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.", params.key)}).to_string();
                 }
                 let payload = match &params.payload {
                     serde_json::Value::String(value) => {
@@ -342,9 +350,9 @@ impl MatiServer {
                     Ok(policy) => policy,
                     Err(error) => return json!({"error": format!("policy payload must deserialize into PolicyRecord: {error}")}).to_string(),
                 };
-                // Agents may create or edit off/shadow policies, but can never
-                // cause an action to be blocked.
-                if matches!(policy.stage, crate::store::PolicyStage::Enforce) {
+                // Agents may create or edit only off policies. Shadow and
+                // enforce are developer-controlled and agent-immutable.
+                if !matches!(policy.stage, crate::store::PolicyStage::Off) {
                     policy.stage = crate::store::PolicyStage::Off;
                 }
                 return self
@@ -446,7 +454,9 @@ fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String>
             serde_json::from_value(payload).map_err(|error| {
                 format!("policy payload must deserialize into PolicyRecord: {error}")
             })?;
-        if matches!(policy.stage, crate::store::PolicyStage::Enforce) {
+        // Agents may create or edit only off policies. Shadow and enforce are
+        // developer-controlled and agent-immutable.
+        if !matches!(policy.stage, crate::store::PolicyStage::Off) {
             policy.stage = crate::store::PolicyStage::Off;
         }
         return Ok(Command::PolicyWrite(
@@ -2544,11 +2554,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mem_set_rejects_delete_of_active_policy() {
+    async fn mem_set_rejects_delete_of_shadow_policy() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        policy.stage = crate::store::PolicyStage::Enforce;
+        policy.stage = crate::store::PolicyStage::Shadow;
         crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
             .await
             .unwrap();
@@ -2567,8 +2577,9 @@ mod tests {
             },
         )
         .await;
+        assert!(result.contains("policy:query-safety is shadow"), "{result}");
         assert!(
-            result.contains("mati policy delete query-safety"),
+            result.contains("mati policy stage query-safety off"),
             "{result}"
         );
     }
@@ -2613,11 +2624,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mem_set_rejects_existing_active_policy_write() {
+    async fn mem_set_rejects_existing_shadow_policy_write() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        policy.stage = crate::store::PolicyStage::Enforce;
+        policy.stage = crate::store::PolicyStage::Shadow;
         crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
             .await
             .unwrap();
@@ -2636,7 +2647,11 @@ mod tests {
             },
         )
         .await;
-        assert!(result.contains("mati policy edit query-safety"), "{result}");
+        assert!(result.contains("policy:query-safety is shadow"), "{result}");
+        assert!(
+            result.contains("mati policy stage query-safety off"),
+            "{result}"
+        );
     }
 
     // `mem_set_preserves_existing_layer0_data` was removed: file: writes

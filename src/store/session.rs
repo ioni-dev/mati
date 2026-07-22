@@ -7,6 +7,7 @@
 //! Having them here avoids code duplication and ensures both paths are
 //! behaviourally identical.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -83,10 +84,16 @@ pub struct ShadowObservation {
     pub policy_key: String,
     pub action: crate::hooks::decide::Action,
     pub timestamp: u64,
+    pub would: crate::hooks::decide::ShadowOutcome,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub struct ShadowObservationAgg {
+    pub policies: BTreeMap<String, PolicyShadowAgg>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct PolicyShadowAgg {
     pub count: u64,
     pub observations: Vec<ShadowObservation>,
 }
@@ -102,6 +109,7 @@ pub async fn record_shadow_observation(
     store: &Store,
     policy_key: &str,
     action: &crate::hooks::decide::Action,
+    would: crate::hooks::decide::ShadowOutcome,
 ) -> Result<()> {
     let key = shadow_observation_key();
     let now = now_secs();
@@ -110,13 +118,16 @@ pub async fn record_shadow_observation(
         .await?
         .unwrap_or_else(|| analytics_record(&key, String::new()));
     let mut agg: ShadowObservationAgg = record.payload_as().unwrap_or_default();
-    agg.count += 1;
-    if agg.observations.len() < MAX_SHADOW_OBSERVATIONS {
-        agg.observations.push(ShadowObservation {
-            policy_key: policy_key.to_string(),
-            action: action.clone(),
-            timestamp: now,
-        });
+    let policy = agg.policies.entry(policy_key.to_string()).or_default();
+    policy.count += 1;
+    policy.observations.push(ShadowObservation {
+        policy_key: policy_key.to_string(),
+        action: action.clone(),
+        timestamp: now,
+        would,
+    });
+    if policy.observations.len() > MAX_SHADOW_OBSERVATIONS {
+        policy.observations.remove(0);
     }
     record.payload = Some(serde_json::to_value(&agg)?);
     record.updated_at = now;
@@ -981,6 +992,47 @@ mod tests {
         let agg = record.payload_as::<DailyAgg>().expect("daily agg payload");
         assert_eq!(agg.count, 1);
         assert_eq!(agg.keys, vec!["__bootstrap__".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn shadow_observation_caps_are_isolated_and_keep_recent_entries() {
+        let (_dir, store) = temp_store().await;
+        let action = crate::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.example".into()),
+            argv: vec![],
+            files: vec![],
+        };
+        for index in 0..=MAX_SHADOW_OBSERVATIONS {
+            let mut action = action.clone();
+            action.argv = vec![index.to_string()];
+            record_shadow_observation(
+                &store,
+                "policy:noisy",
+                &action,
+                crate::hooks::decide::ShadowOutcome::Block,
+            )
+            .await
+            .unwrap();
+        }
+        record_shadow_observation(
+            &store,
+            "policy:quiet",
+            &action,
+            crate::hooks::decide::ShadowOutcome::Steer,
+        )
+        .await
+        .unwrap();
+
+        let record = store.get(&shadow_observation_key()).await.unwrap().unwrap();
+        let agg = record.payload_as::<ShadowObservationAgg>().unwrap();
+        let noisy = &agg.policies["policy:noisy"];
+        assert_eq!(noisy.count, (MAX_SHADOW_OBSERVATIONS + 1) as u64);
+        assert_eq!(noisy.observations.len(), MAX_SHADOW_OBSERVATIONS);
+        assert_eq!(noisy.observations[0].action.argv, vec!["1"]);
+        assert_eq!(agg.policies["policy:quiet"].count, 1);
+        assert_eq!(agg.policies["policy:quiet"].observations.len(), 1);
     }
 
     #[tokio::test]

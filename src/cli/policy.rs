@@ -6,6 +6,7 @@
 //! embedded trust anchor (empty in the OSS core, so a real bundle is rejected
 //! until an Enterprise build supplies a key). Pure + offline.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -406,28 +407,45 @@ async fn set_stage(key: &str, stage: PolicyStage) -> Result<()> {
 async fn observations(slug: Option<&str>, json_output: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    let mut observations = Vec::new();
+    let mut observations: BTreeMap<String, mati_core::store::session::PolicyShadowAgg> =
+        BTreeMap::new();
     for record in proxy.scan_prefix("analytics:policy_shadow_").await? {
-        if let Some(agg) = record.payload_as::<mati_core::store::session::ShadowObservationAgg>() {
-            observations.extend(agg.observations);
+        let agg = record
+            .payload_as::<mati_core::store::session::ShadowObservationAgg>()
+            .unwrap_or_default();
+        for (key, mut policy) in agg.policies {
+            let entry = observations.entry(key).or_default();
+            entry.count += policy.count;
+            entry.observations.append(&mut policy.observations);
+            entry
+                .observations
+                .sort_by_key(|observation| observation.timestamp);
+            if entry.observations.len() > mati_core::store::session::MAX_SHADOW_OBSERVATIONS {
+                let drop_count =
+                    entry.observations.len() - mati_core::store::session::MAX_SHADOW_OBSERVATIONS;
+                entry.observations.drain(..drop_count);
+            }
         }
     }
     if let Some(slug) = slug {
         let key = normalize_key(slug);
-        observations.retain(|observation| observation.policy_key == key);
+        observations.retain(|policy_key, _| policy_key == &key);
     }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&observations)?);
     } else if observations.is_empty() {
         println!("No shadow observations found.");
     } else {
-        for observation in observations {
-            println!(
-                "{}\t{}\t{}",
-                observation.timestamp,
-                observation.policy_key,
-                serde_json::to_string(&observation.action)?
-            );
+        for (policy_key, policy) in observations {
+            println!("{policy_key}\tcount={}", policy.count);
+            for observation in policy.observations {
+                println!(
+                    "  {}\twould={:?}\t{}",
+                    observation.timestamp,
+                    observation.would,
+                    serde_json::to_string(&observation.action)?
+                );
+            }
         }
     }
     proxy.close().await

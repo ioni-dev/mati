@@ -502,7 +502,7 @@ Both produce a consult-required deny at hook time. They stay distinguishable in 
 A policy is a `policy:<slug>` record carrying a `PolicyRecord` payload (section 5.3a). It is developer-authored source of truth, so it writes at `Immediate` durability (section 21).
 
 Each policy has exactly one rollout stage: `off` is not evaluated, `shadow`
-evaluates and records would-deny observations without changing the decision,
+evaluates and records would-outcome observations without changing the decision,
 and `enforce` acts according to `mode` (`steer` or `block`). The global
 `policy.mode` kill switch still downgrades enforce-stage blocking to steering.
 New policies start off; a developer can review them with `mati policy stage
@@ -510,12 +510,14 @@ New policies start off; a developer can review them with `mati policy stage
 
 Every create, edit, enable, disable, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
 
-The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
+The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step and lets an agent run `mati policy stage <slug> enforce` directly. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
 
-The agent boundary is explicit: `mem_set` may create or edit only `off` or
-`shadow` policies and forces an `enforce` payload down to `off`. It may not
-delete or edit an enforcing policy. An agent can therefore never cause an
-action to be blocked; only the developer can promote a policy with the CLI.
+The agent boundary is explicit: `off` is the draft, agent-writable stage;
+`shadow` and `enforce` are developer-controlled and agent-immutable. `mem_set`
+forces any non-off payload down to `off`, and refuses edits or deletion of
+non-off existing policies. An agent can therefore never cause an action to be
+blocked through `mem_set`; the Bash permission caveat above still applies to
+direct CLI promotion.
 
 Glob predicates are validated at author time. A malformed `host_glob` or `target_path_glob` is rejected before it can be persisted, so a broken pattern never reaches the daemon.
 
@@ -544,7 +546,7 @@ daemon  match the Action, check receipts, return verdicts (no decision)
 hook    compute the decision, emit output, fire events
 ```
 
-Shadow would-deny observations are bounded daily aggregates in the eventual
+Shadow would-outcome observations are bounded daily aggregates in the eventual
 `analytics:` session namespace. They contain the policy key, normalized action,
 and timestamp. They do not use the hash-chained enforcement log: a shadow
 result did not deny anything, so a `Deny` event would falsify the audit chain
@@ -556,7 +558,7 @@ The daemon returns data, not decisions. It reports which policies matched and wh
 
 ### 10a.4 Outcomes
 
-A policy is `steer` or `block`. `steer` injects the policy's rule as context. `block` denies until the required consultation receipt exists. Shadow policies never inject context or deny; an unsatisfied shadow block only records a bounded observation. Whether an enforce-stage block actually denies is controlled by the dedicated `policy.mode` setting: it defaults to `strict`, while explicit `advisory` is a global kill switch that degrades every block to a steer. A failure to read the setting also defaults to strict, so an unreadable setting never silently disables policy enforcement. `audit.write_durability` remains independent and controls only enforcement-event writes.
+A policy is `steer` or `block`. `steer` injects the policy's rule as context. `block` denies until the required consultation receipt exists. Shadow policies never inject context or deny; they record whether the matched policy would steer or block. Whether an enforce-stage block actually denies is controlled by the dedicated `policy.mode` setting: it defaults to `strict`, while explicit `advisory` is a global kill switch that degrades every block to a steer. A failure to read the setting also defaults to strict, so an unreadable setting never silently disables policy enforcement. `audit.write_durability` remains independent and controls only enforcement-event writes.
 
 Three paths enforce policies: a bash command with no file (`psql -c "..."`), a bash command carrying one (`psql -f x.sql`), and an edit to a matching path (`Edit`, `Write`, `NotebookEdit`). All three share one output shape. A deny sets `permissionDecision: "deny"`. A steer injects `additionalContext` with no `permissionDecision` field at all.
 

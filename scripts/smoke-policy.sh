@@ -131,6 +131,41 @@ assert_lacks "shadow does not block" "$OUT" 'permissionDecision":"deny"'
 OBS="$(mati_p policy observations query-a --json)"
 assert_has "shadow observation recorded" "$OBS" 'policy:query-a'
 
+add_block_policy shadow-introspection '*prod-introspection*' 'schema:introspection' 'mem_get'
+mati_p policy stage shadow-introspection shadow >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-introspection.internal -c \"\\d orders\""')")"
+assert_lacks "shadow introspection does not decide" "$OUT" 'permissionDecision'
+assert_lacks "shadow introspection adds no context" "$OUT" 'additionalContext'
+OBS="$(mati_p policy observations shadow-introspection --json)"
+assert_lacks "exempt shadow introspection is not observed" "$OBS" 'policy:shadow-introspection'
+
+add_block_policy shadow-satisfied '*prod-satisfied*' 'schema:shadow-satisfied' 'mem_get'
+mati_p policy stage shadow-satisfied shadow >/dev/null
+mcp_call mem_get '{"key":"schema:shadow-satisfied"}' >/dev/null
+hook claude-pre-bash "$(pre_bash '"psql -h db.prod-satisfied.internal -c \"select 1\""')" >/dev/null
+OBS="$(mati_p policy observations shadow-satisfied --json)"
+assert_lacks "satisfied shadow block is not observed" "$OBS" 'policy:shadow-satisfied'
+
+mati_p policy add steer-shadow \
+  --name "steer shadow" --rule "Review the action." \
+  --reason "Steering guidance matters because operators need visibility." \
+  --mode steer --trigger '{"tool":"db_client","host_glob":"*steer*"}' \
+  --requires '{"key":"","via":[],"freshness":{"ttl_secs":900}}' >/dev/null
+mati_p policy stage steer-shadow shadow >/dev/null
+hook claude-pre-bash "$(pre_bash '"psql -h db.steer.internal -c \"select 1\""')" >/dev/null
+OBS="$(mati_p policy observations steer-shadow --json)"
+assert_has "shadow steer observation recorded" "$OBS" '"would": "steer"'
+
+add_block_policy shadow-one '*shadow-one*' 'schema:shadow-one' 'mem_get'
+add_block_policy shadow-two '*shadow-two*' 'schema:shadow-two' 'mem_get'
+mati_p policy stage shadow-one shadow >/dev/null
+mati_p policy stage shadow-two shadow >/dev/null
+hook claude-pre-bash "$(pre_bash '"psql -h db.shadow-one.internal -c \"select 1\""')" >/dev/null
+hook claude-pre-bash "$(pre_bash '"psql -h db.shadow-two.internal -c \"select 1\""')" >/dev/null
+OBS="$(mati_p policy observations --json)"
+assert_has "first shadow policy remains visible" "$OBS" 'policy:shadow-one'
+assert_has "second shadow policy is visible" "$OBS" 'policy:shadow-two'
+
 mati_p policy enable query-a >/dev/null
 OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
 assert_has "denied after enable"   "$OUT" 'permissionDecision":"deny"'
@@ -259,12 +294,21 @@ step "13. mem_set agent boundary"
 POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"stage":"enforce","severity":"high","created_by":"agent"}'
 OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:agent-authored\",\"value\":\"Consult first.\",\"category\":\"Policy\",\"payload\":$POLICY_JSON,\"tags\":[],\"priority\":\"High\"}")"
 if printf '%s' "$OUT" | grep -q 'jsonrpc'; then
-  assert_has "agent-authored policy is forced inert" "$OUT" 'stage":"off"'
+  assert_has "agent-authored policy is forced inert" "$OUT" 'stage.":."off'
   OUT2="$(mcp_call mem_set '{"action":"confirm","key":"policy:agent-authored","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
   assert_has "agent cannot enable a policy" "$OUT2" 'mati policy enable'
 else
   skip "mem_set agent boundary" "MCP stdio handshake produced no response"
 fi
+
+mati_p policy add staged-delete \
+  --name "staged delete" --rule "Consult first." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*staged-delete*"}' \
+  --requires '{"key":"schema:staged-delete","via":["mem_get"],"freshness":{"ttl_secs":900}}' \
+  --shadow >/dev/null
+OUT2="$(mcp_call mem_set '{"action":"delete","key":"policy:staged-delete","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
+assert_has "agent cannot delete shadow policy" "$OUT2" 'mati policy stage staged-delete off'
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 printf '\n\033[1m== Summary ==\033[0m\n  passed: %d\n  failed: %d\n  skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
