@@ -22,9 +22,9 @@ pub enum HookVariant {
     /// `consulted_recent` (a recent-consultation TTL, matching the Codex
     /// `apply_patch` edit gate) — NOT the read gate's persistent `consulted` — so
     /// an edit must be preceded by a *recent* mem_get: read-then-edit flows within
-    /// the TTL, and blind or stale-consult edits deny. Non-deny outcomes DEFER to
-    /// the normal permission flow instead of emitting `allow` — edits are
-    /// permission-required, so force-allow would suppress the user's edit prompt.
+    /// the TTL, and blind or stale-consult edits deny. Context-bearing non-deny
+    /// outcomes inject context into the normal permission flow; edits never
+    /// emit `allow` because they are permission-required.
     ClaudePreEdit,
     ClaudePreBash,
     CodexPreBash,
@@ -1189,8 +1189,9 @@ async fn fire_events(
 /// permission-REQUIRED tools — force-allowing them would silently suppress the
 /// user's permission prompt for every command/edit mati doesn't deny (i.e.
 /// installing mati would auto-approve arbitrary shell commands). Every variant
-/// other than `ClaudePreRead` must DEFER: empty stdout, exit 0. Covered by
-/// `only_pre_read_force_allows` in the test module.
+/// other than `ClaudePreRead` must not force-allow; Bash and Edit may still
+/// emit context-only output. Covered by `only_pre_read_force_allows` and the
+/// ClaudePreEdit output tests.
 fn allow_output(variant: HookVariant) -> Option<&'static str> {
     match variant {
         HookVariant::ClaudePreRead => Some(
@@ -1507,8 +1508,17 @@ fn format_decision(
             // actual cause — a local gotcha OR an org consultation mandate — instead of always
             // claiming "Confirmed gotcha".
             Decision::Deny { reason, .. } => (format_deny(reason), String::new(), 0),
-            // Non-deny: DEFER to the normal permission flow (empty stdout, exit 0).
-            // Deliberately NOT permissionDecision:"allow" — see pre_edit.rs.
+            Decision::AlreadyConsulted { context } => (
+                format_context_only(&format!("[mati] Record already consulted. {context}")),
+                String::new(),
+                0,
+            ),
+            Decision::Advisory { context } | Decision::Liability { context, .. } => (
+                format_context_only(&format!("[mati] {context}")),
+                String::new(),
+                0,
+            ),
+            // All other non-deny outcomes defer with empty stdout; never force-allow an edit.
             _ => (String::new(), String::new(), 0),
         },
         HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => match decision {
@@ -2189,6 +2199,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_pre_edit_context_never_force_allows() {
+        let outcomes = [
+            Decision::AlreadyConsulted {
+                context: "Already consulted.".into(),
+            },
+            Decision::Advisory {
+                context: "Consult the schema first.".into(),
+            },
+            Decision::Liability {
+                staleness: 0.8,
+                context: "This record is stale.".into(),
+            },
+            Decision::Allow,
+            Decision::NoRecord,
+            Decision::Tombstone,
+            Decision::NotFileRead,
+        ];
+        for decision in outcomes {
+            let (stdout, _, _) = format_decision(HookVariant::ClaudePreEdit, &decision, "x.sql");
+            assert!(!stdout.contains(r#""permissionDecision":"allow""#));
+        }
+
+        let (stdout, _, _) = format_decision(
+            HookVariant::ClaudePreEdit,
+            &Decision::Advisory {
+                context: "Consult first.".into(),
+            },
+            "x.sql",
+        );
+        assert!(stdout.contains("additionalContext"));
+        assert!(!stdout.contains("permissionDecision"));
+    }
+
+    #[test]
     fn file_gate_and_policy_merge_escalate_only() {
         let mut adapter = AdapterResult {
             stdout: String::new(),
@@ -2371,6 +2415,14 @@ mod tests {
     }
 
     #[test]
+    fn edit_policy_actions_use_the_path_category_and_target() {
+        let action = decide::normalize_action(None, Some("migrations/prod.sql"));
+        assert_eq!(action.tool, "path");
+        assert_eq!(action.target_path.as_deref(), Some("migrations/prod.sql"));
+        assert_eq!(action.files, vec!["migrations/prod.sql"]);
+    }
+
+    #[test]
     fn extract_path_codex_pre_bash_egrep_and_fgrep() {
         // egrep/fgrep satisfy Claude's read-before-edit; mati now detects them so
         // they can't be used to satisfy the read requirement unconsulted.
@@ -2424,18 +2476,15 @@ mod tests {
     #[test]
     fn e2e_claude_pre_edit_defers_after_consult() {
         // With a RECENT consultation receipt (consulted_recent, matching the
-        // Codex apply_patch edit gate), the edit DEFERS to the normal permission
-        // flow (empty stdout, exit 0) — deliberately NOT a forced allow.
+        // Codex apply_patch edit gate), the edit keeps its normal permission
+        // flow and may inject context — deliberately NOT a forced allow.
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
         let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0);
-        assert!(
-            result.stdout.is_empty(),
-            "consulted edit must DEFER (empty stdout), not force-allow, got: {}",
-            result.stdout
-        );
+        assert!(result.stdout.contains("additionalContext"));
+        assert!(!result.stdout.contains("permissionDecision"));
         assert!(result.stderr.is_empty());
         assert!(matches!(result.decision, Decision::AlreadyConsulted { .. }));
         // Plane 2: a consulted edit records an EditConsulted event (→
