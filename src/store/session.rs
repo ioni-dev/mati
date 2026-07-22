@@ -392,8 +392,8 @@ pub async fn check_consulted_recent(
 }
 
 /// Return true only when a recent receipt carries the current record's
-/// fingerprint. Read/hash failures are treated as unsatisfied, not errors, so
-/// fingerprinting never turns a hook fault into a hard enforcement failure.
+/// fingerprint. Store faults propagate as errors so the caller can fail open;
+/// swallowing them into `false` would fail closed and deny on a mati outage.
 pub async fn check_consulted_recent_fingerprinted(
     store: &Store,
     key: &str,
@@ -401,10 +401,7 @@ pub async fn check_consulted_recent_fingerprinted(
     actor: Option<&str>,
 ) -> Result<bool> {
     let consulted_key = receipt_key(key, actor);
-    let Some(receipt) = (match store.get(&consulted_key).await {
-        Ok(record) => record,
-        Err(_) => return Ok(false),
-    }) else {
+    let Some(receipt) = store.get(&consulted_key).await? else {
         return Ok(false);
     };
     if now_secs().saturating_sub(receipt.updated_at) > ttl_secs {
@@ -416,10 +413,11 @@ pub async fn check_consulted_recent_fingerprinted(
     else {
         return Ok(false);
     };
-    let current = match store.get(key).await {
-        Ok(Some(record)) => record_content_fingerprint(&record),
-        Ok(None) | Err(_) => None,
-    };
+    // A store read fault must remain an Err so hook callers fail open, never Ok(false).
+    let current = store
+        .get(key)
+        .await?
+        .and_then(|record| record_content_fingerprint(&record));
     Ok(current.is_some_and(|current| current == stored))
 }
 
@@ -983,6 +981,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fingerprinted_check_rejects_missing_receipt() {
+        let (_dir, store) = temp_store().await;
+
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, "schema:orders", 900, None)
+                .await
+                .expect("missing receipt is a legitimate non-satisfaction")
+        );
+    }
+
+    #[tokio::test]
     async fn fingerprinted_check_rejects_legacy_or_introspection_receipts() {
         let (_dir, store) = temp_store().await;
         let key = "schema:orders";
@@ -1019,6 +1028,24 @@ mod tests {
             !check_consulted_recent_fingerprinted(&store, key, 900, None)
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_rejects_deleted_required_record() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        log_hit(&store, key).await.unwrap();
+        store.delete(key).await.unwrap();
+
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .expect("deleted record is a legitimate non-satisfaction")
         );
     }
 
