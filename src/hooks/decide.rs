@@ -1879,4 +1879,39 @@ mod tests {
         assert!(!is_known_action_tool("db-client"));
     }
 
+    #[test]
+    fn multi_policy_deny_only_records_the_blocking_policy() {
+        let verdicts = vec![
+            PolicyVerdict {
+                key: "policy:A".into(),
+                rule: "A was consulted.".into(),
+                requires_key: "schema:a".into(),
+                block: true,
+                satisfied: true,
+            },
+            PolicyVerdict {
+                key: "policy:S".into(),
+                rule: "Steer this action.".into(),
+                requires_key: "schema:s".into(),
+                block: false,
+                satisfied: true,
+            },
+            PolicyVerdict {
+                key: "policy:B".into(),
+                rule: "B must be consulted.".into(),
+                requires_key: "schema:b".into(),
+                block: true,
+                satisfied: false,
+            },
+        ];
+        let result = evaluate_policy_verdicts(&verdicts, true);
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        // An AllowAfterReceipt alongside Deny would be a false "allowed" record.
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsultBlocked {
+                key: "policy:B".into()
+            }]
+        );
+    }
 }
