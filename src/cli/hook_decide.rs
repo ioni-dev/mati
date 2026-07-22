@@ -372,14 +372,34 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // A file-bearing governed DB command gets the policy decision after the
     // existing file gate. A file-gate Deny is already final, so skip the
     // policy round-trip and its possible second event on that path.
-    if args.variant == HookVariant::ClaudePreBash
-        && !matches!(adapter.decision, Decision::Deny { .. })
+    if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::ClaudePreEdit
+    ) && !matches!(adapter.decision, Decision::Deny { .. })
     {
-        if let Some(action) = bash_action.as_ref() {
-            if let Some((policy_decision, policy_events)) =
-                evaluate_governed_policy(Some(&mati_root), action, agent_id, "<policy>").await
+        let policy_action = match args.variant {
+            HookVariant::ClaudePreBash => bash_action.as_ref().cloned(),
+            HookVariant::ClaudePreEdit => Some(decide::normalize_action(None, Some(&rel_path))),
+            _ => None,
+        };
+        let governed_tool = if args.variant == HookVariant::ClaudePreEdit {
+            "path"
+        } else {
+            "db_client"
+        };
+        if let Some(action) = policy_action.as_ref() {
+            // Edits already make one hook_evaluate round-trip. A future
+            // optimization could piggyback policy verdicts onto that response.
+            if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
+                Some(&mati_root),
+                action,
+                governed_tool,
+                agent_id,
+                "<policy>",
+            )
+            .await
             {
-                merge_policy_result(&mut adapter, policy_decision, policy_events);
+                merge_policy_result(&mut adapter, args.variant, policy_decision, policy_events);
             }
         }
     }
@@ -2285,6 +2305,41 @@ mod tests {
         );
         assert!(matches!(adapter.decision, Decision::Deny { .. }));
         assert!(adapter.stdout.contains(r#""permissionDecision":"deny""#));
+
+        let mut edit_adapter = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::NoRecord,
+        };
+        merge_policy_result(
+            &mut edit_adapter,
+            HookVariant::ClaudePreEdit,
+            Decision::Advisory {
+                context: "Edit policy guidance.".into(),
+            },
+            vec![],
+        );
+        assert!(edit_adapter.stdout.contains("additionalContext"));
+        assert!(!edit_adapter.stdout.contains("permissionDecision"));
+
+        edit_adapter.decision = Decision::Deny {
+            file_key: "file:x.sql".into(),
+            reason: "gotcha denied".into(),
+        };
+        merge_policy_result(
+            &mut edit_adapter,
+            HookVariant::ClaudePreEdit,
+            Decision::Advisory {
+                context: "Must not lower the edit deny.".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(edit_adapter.decision, Decision::Deny { .. }));
+        assert!(edit_adapter
+            .stdout
+            .contains(r#""permissionDecision":"deny""#));
     }
 
     #[test]
