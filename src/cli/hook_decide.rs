@@ -946,23 +946,33 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
 }
 
 /// Claude's PostToolUse payloads have used both camelCase and snake_case
-/// spellings. Missing fields mean success, matching the existing mem_get
-/// adapter's fail-open protocol.
+/// spellings. An unrecognized payload shape is not success: minting must stop
+/// until the hook understands the new shape.
 fn post_bash_succeeded(input: &serde_json::Value) -> bool {
-    let response = input.pointer("/tool_response");
-    if response
-        .and_then(|value| value.get("isError").or_else(|| value.get("is_error")))
+    let Some(response) = input.pointer("/tool_response") else {
+        tracing::warn!("Claude PostToolUse Bash payload is missing tool_response");
+        return false;
+    };
+    let Some(is_error) = response
+        .get("isError")
+        .or_else(|| response.get("is_error"))
         .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-    {
+    else {
+        tracing::warn!("Claude PostToolUse Bash payload is missing boolean tool_response.isError");
+        return false;
+    };
+    if is_error {
         return false;
     }
-    for key in ["exit_code", "exitCode", "code"] {
-        if response
-            .and_then(|value| value.get(key))
-            .and_then(|value| value.as_i64())
-            .is_some_and(|code| code != 0)
-        {
+    for key in ["exit_code", "exitCode"] {
+        let Some(value) = response.get(key) else {
+            continue;
+        };
+        let Some(code) = value.as_i64() else {
+            tracing::warn!("Claude PostToolUse Bash payload has non-numeric {key}");
+            return false;
+        };
+        if code != 0 {
             return false;
         }
     }
@@ -1779,19 +1789,23 @@ mod tests {
         let command = "psql -c \"\\d orders\"";
         assert!(post_bash_succeeded(&json!({
             "tool_input": {"command": command},
-            "tool_response": {"exit_code": 0}
+            "tool_response": {"isError": false, "exit_code": 0}
         })));
         for response in [
             json!({"isError": true}),
             json!({"is_error": true}),
             json!({"exit_code": 1}),
             json!({"exitCode": 2}),
+            json!({"exit_code": 0}),
         ] {
             assert!(!post_bash_succeeded(&json!({
                 "tool_input": {"command": command},
                 "tool_response": response
             })));
         }
+        assert!(!post_bash_succeeded(&json!({
+            "tool_input": {"command": command}
+        })));
     }
 
     #[test]
