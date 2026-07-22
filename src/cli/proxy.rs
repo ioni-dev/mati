@@ -668,6 +668,72 @@ impl StoreProxy {
         }
     }
 
+    /// Evaluate an action against local policies and check block receipts.
+    pub async fn policy_evaluate(
+        &self,
+        action: &mati_core::hooks::decide::Action,
+        actor: Option<&str>,
+    ) -> Result<Vec<mati_core::mcp::protocol::PolicyVerdict>> {
+        use mati_core::hooks::policy_match::PolicyMatcherSet;
+        use mati_core::mcp::protocol as p;
+        use mati_core::store::PolicyMode;
+
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                let records = store.scan_prefix("policy:").await?;
+                let matcher = PolicyMatcherSet::from_records_lenient(&records);
+                let matched = matcher.matches(action);
+                let mut verdicts = Vec::with_capacity(matched.len());
+                for matched in matched {
+                    let policy = matched.policy;
+                    let satisfied = match policy.mode {
+                        PolicyMode::Steer => true,
+                        PolicyMode::Block => {
+                            mati_core::store::session::check_consulted_recent(
+                                store,
+                                &policy.requires.key,
+                                policy.requires.freshness.ttl_secs,
+                                actor,
+                            )
+                            .await?
+                        }
+                    };
+                    verdicts.push(p::PolicyVerdict {
+                        key: matched.key.to_string(),
+                        mode: policy.mode,
+                        rule: policy.rule.clone(),
+                        reason: policy.reason.clone(),
+                        severity: policy.severity.clone(),
+                        requires_key: policy.requires.key.clone(),
+                        satisfied,
+                    });
+                }
+                Ok(verdicts)
+            }
+            ProxyInner::Socket { root } => {
+                let cmd = p::Command::PolicyEvaluate(p::PolicyEvaluateInput {
+                    action: action.clone(),
+                    actor: actor.map(str::to_string),
+                });
+                match daemon_v2(root, cmd).await {
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            serde_json::from_value(resp.get("data").cloned().unwrap_or_default())
+                                .context("daemon policy_evaluate returned invalid data")
+                        } else {
+                            let error = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("daemon policy_evaluate failed: {error}")
+                        }
+                    }
+                    other => Err(socket_read_error("policy_evaluate", other)),
+                }
+            }
+        }
+    }
+
     /// Tombstone a gotcha and remove its graph edges.
     ///
     /// In direct mode, delegates to `apply_gotcha_tombstone`.
@@ -1192,6 +1258,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("get"));
         assert!(msg.contains("restarting the daemon"));
+    }
+
+    #[tokio::test]
+    async fn direct_policy_evaluate_checks_receipts() {
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let policy = mati_core::store::PolicyRecord {
+            name: "Production query".into(),
+            rule: "Consult first.".into(),
+            reason: "Production changes because deployments happen.".into(),
+            scope: "repo".into(),
+            mode: mati_core::store::PolicyMode::Block,
+            trigger: mati_core::store::PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: mati_core::store::PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![mati_core::store::ReceiptSource::MemGet],
+                freshness: mati_core::store::PolicyFreshness { ttl_secs: 900 },
+            },
+            enabled: true,
+            severity: mati_core::store::Priority::High,
+            created_by: "test".into(),
+        };
+        mati_core::store::policy_ops::create(&store, "policy:direct", &policy)
+            .await
+            .unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Direct(store),
+        };
+        let action = mati_core::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.prod.internal".into()),
+            argv: vec!["psql".into()],
+            files: vec![],
+        };
+        let verdicts = proxy.policy_evaluate(&action, None).await.unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].satisfied);
     }
 
     #[tokio::test]

@@ -552,6 +552,7 @@ impl SocketResponse {
 
 pub async fn socket_handle_connection(
     graph: Arc<tokio::sync::RwLock<Graph>>,
+    policy_matcher: Arc<tokio::sync::RwLock<crate::hooks::policy_match::PolicyMatcherSet>>,
     repo_root: &Path,
     stream: UnixStream,
     peer: super::metadata::PeerContext,
@@ -617,6 +618,7 @@ pub async fn socket_handle_connection(
         peer,
         daemon_session,
         repo_root: repo_root.to_path_buf(),
+        policy_matcher,
     };
     let resp = super::dispatch_v2::dispatch_v2(&graph, &ctx, v2_req).await;
     let json = serde_json::to_string(&resp)?;
@@ -640,6 +642,9 @@ fn build_v1_dispatch_ctx(repo_root: &Path) -> super::dispatch_v2::RequestContext
         },
         daemon_session: uuid::Uuid::nil(),
         repo_root: repo_root.to_path_buf(),
+        policy_matcher: Arc::new(tokio::sync::RwLock::new(
+            crate::hooks::policy_match::PolicyMatcherSet::empty(),
+        )),
     }
 }
 
@@ -2043,8 +2048,17 @@ mod tests {
             w.shutdown().await.unwrap();
         });
 
-        let handle_result =
-            socket_handle_connection(graph, dir.path(), server, peer, uuid::Uuid::nil()).await;
+        let handle_result = socket_handle_connection(
+            graph,
+            Arc::new(tokio::sync::RwLock::new(
+                crate::hooks::policy_match::PolicyMatcherSet::empty(),
+            )),
+            dir.path(),
+            server,
+            peer,
+            uuid::Uuid::nil(),
+        )
+        .await;
         assert!(handle_result.is_ok());
 
         write_handle.await.unwrap();
@@ -2102,8 +2116,17 @@ mod tests {
             w.shutdown().await.unwrap();
         });
 
-        let handle_result =
-            socket_handle_connection(graph, dir.path(), server, peer, uuid::Uuid::nil()).await;
+        let handle_result = socket_handle_connection(
+            graph,
+            Arc::new(tokio::sync::RwLock::new(
+                crate::hooks::policy_match::PolicyMatcherSet::empty(),
+            )),
+            dir.path(),
+            server,
+            peer,
+            uuid::Uuid::nil(),
+        )
+        .await;
         assert!(handle_result.is_ok());
 
         write_handle.await.unwrap();
@@ -2159,6 +2182,9 @@ mod tests {
         client_write.shutdown().await.unwrap();
         socket_handle_connection(
             graph.clone(),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::hooks::policy_match::PolicyMatcherSet::empty(),
+            )),
             dir.path(),
             server,
             super::super::metadata::PeerContext {

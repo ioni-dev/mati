@@ -29,6 +29,13 @@ pub struct MatchedPolicy<'a> {
 }
 
 impl PolicyMatcherSet {
+    /// Create an empty matcher set.
+    pub fn empty() -> Self {
+        Self {
+            policies: Vec::new(),
+        }
+    }
+
     /// Compile active, enabled policy records from universal store records.
     pub fn from_records(records: &[Record]) -> Result<Self> {
         let policies = records.iter().filter_map(|record| {
@@ -41,6 +48,37 @@ impl PolicyMatcherSet {
             policy.enabled.then(|| (record.key.clone(), policy))
         });
         Self::from_policies(policies)
+    }
+
+    /// Compile active, enabled policy records while isolating bad records.
+    ///
+    /// A malformed policy must not prevent the daemon from evaluating every
+    /// other policy at boot or after a live refresh.
+    pub fn from_records_lenient(records: &[Record]) -> Self {
+        let mut matcher = Self::empty();
+        for record in records {
+            if record.category != crate::store::Category::Policy
+                || !matches!(record.lifecycle, RecordLifecycle::Active)
+            {
+                continue;
+            }
+            let Some(policy) = record.payload_as::<PolicyRecord>() else {
+                tracing::warn!(key = %record.key, "skipping policy with invalid payload");
+                continue;
+            };
+            if !policy.enabled {
+                continue;
+            }
+            match Self::from_policies([(record.key.clone(), policy)]) {
+                Ok(mut compiled) => matcher.policies.append(&mut compiled.policies),
+                Err(error) => tracing::warn!(
+                    key = %record.key,
+                    error = %error,
+                    "skipping policy that failed matcher compilation"
+                ),
+            }
+        }
+        matcher
     }
 
     /// Compile keyed policy payloads. This is useful to pure callers that have
@@ -238,5 +276,28 @@ mod tests {
         disabled_record.lifecycle = RecordLifecycle::Active;
         let set = PolicyMatcherSet::from_records(&[disabled_record, tombstone]).unwrap();
         assert!(set.matches(&action(None, &[])).is_empty());
+    }
+
+    #[test]
+    fn lenient_loader_skips_bad_glob_and_keeps_good_policy() {
+        let good = crate::store::policy_ops::record_for(
+            "policy:good",
+            &policy("Good", PolicyTrigger::default()),
+        )
+        .unwrap();
+        let mut bad_policy = policy(
+            "Bad",
+            PolicyTrigger {
+                host_glob: Some("[".into()),
+                ..Default::default()
+            },
+        );
+        bad_policy.enabled = true;
+        let bad = crate::store::policy_ops::record_for("policy:bad", &bad_policy).unwrap();
+
+        let matcher = PolicyMatcherSet::from_records_lenient(&[bad, good]);
+
+        assert_eq!(matcher.matches(&action(None, &[])).len(), 1);
+        assert_eq!(matcher.matches(&action(None, &[]))[0].key, "policy:good");
     }
 }

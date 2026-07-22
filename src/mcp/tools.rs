@@ -1040,6 +1040,9 @@ mod tests {
             },
             daemon_session: uuid::Uuid::nil(),
             repo_root: std::path::PathBuf::new(),
+            policy_matcher: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::hooks::policy_match::PolicyMatcherSet::empty(),
+            )),
         }
     }
 

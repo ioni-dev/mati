@@ -15,7 +15,6 @@ use clap::{Args, Subcommand};
 use slugify::slugify;
 
 use mati_core::hooks::decide::{normalize_action, Action};
-use mati_core::hooks::policy_match::{MatchedPolicy, PolicyMatcherSet};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
 use mati_core::store::{PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority};
 
@@ -288,24 +287,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     let action = normalize_action(args.command.as_deref(), args.path.as_deref());
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    let records = proxy
-        .scan_prefix("policy:")
-        .await?
-        .into_iter()
-        .filter(|record| {
-            if record.payload_as::<PolicyRecord>().is_none() {
-                eprintln!(
-                    "warning: skipping policy {} with invalid payload",
-                    record.key
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect::<Vec<_>>();
-    let matcher = PolicyMatcherSet::from_records(&records).context("compiling local policies")?;
-    let matches = matcher.matches(&action);
+    let matches = proxy.policy_evaluate(&action, None).await?;
     let output = render_test_output(&action, &matches, args.json)?;
     proxy.close().await?;
     println!("{output}");
@@ -314,23 +296,13 @@ async fn test_policies(args: TestArgs) -> Result<()> {
 
 fn render_test_output(
     action: &Action,
-    matches: &[MatchedPolicy<'_>],
+    matches: &[mati_core::mcp::protocol::PolicyVerdict],
     json_output: bool,
 ) -> Result<String> {
     if json_output {
-        let matched = matches
-            .iter()
-            .map(|matched| {
-                serde_json::json!({
-                    "key": matched.key,
-                    "name": matched.policy.name,
-                    "mode": matched.policy.mode,
-                })
-            })
-            .collect::<Vec<_>>();
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "action": action,
-            "matches": matched,
+            "matches": matches,
         }))?);
     }
 
@@ -349,13 +321,22 @@ fn render_test_output(
     } else {
         output.push_str("Matching policies:\n");
         for matched in matches {
-            let mode = match matched.policy.mode {
+            let mode = match matched.mode {
                 PolicyMode::Steer => "steer",
                 PolicyMode::Block => "block",
             };
+            let status = if matched.mode == PolicyMode::Block {
+                if matched.satisfied {
+                    "satisfied"
+                } else {
+                    "would-block"
+                }
+            } else {
+                "advisory"
+            };
             output.push_str(&format!(
-                "  {} [{}] {}\n",
-                matched.key, mode, matched.policy.name
+                "  {} [{}; {}] {}\n",
+                matched.key, mode, status, matched.rule
             ));
         }
         output.pop();
@@ -424,6 +405,7 @@ fn verify(args: VerifyArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mati_core::hooks::policy_match::PolicyMatcherSet;
 
     #[test]
     fn policy_keys_accept_slugs_and_full_keys() {
@@ -466,16 +448,27 @@ mod tests {
         };
         let set = PolicyMatcherSet::from_policies([("policy:prod".into(), policy)]).unwrap();
         let action = normalize_action(Some("psql -h db.prod.internal -c select"), None);
-        let matches = set.matches(&action);
+        let matches = set
+            .matches(&action)
+            .into_iter()
+            .map(|matched| mati_core::mcp::protocol::PolicyVerdict {
+                key: matched.key.to_string(),
+                mode: matched.policy.mode,
+                rule: matched.policy.rule.clone(),
+                reason: matched.policy.reason.clone(),
+                severity: matched.policy.severity.clone(),
+                requires_key: matched.policy.requires.key.clone(),
+                satisfied: false,
+            })
+            .collect::<Vec<_>>();
         let output = render_test_output(&action, &matches, false).unwrap();
-        assert!(output.contains("policy:prod [block] Production query safety"));
+        assert!(output.contains("policy:prod [block; would-block] Consult the schema first."));
     }
 
     #[test]
     fn policy_test_output_json_contains_action_and_matches() {
         let action = normalize_action(Some("ls -la"), None);
-        let set = PolicyMatcherSet::from_policies(Vec::<(String, PolicyRecord)>::new()).unwrap();
-        let output = render_test_output(&action, &set.matches(&action), true).unwrap();
+        let output = render_test_output(&action, &[], true).unwrap();
         let json: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(json["action"]["tool"], "unknown");
         assert!(json["matches"].as_array().unwrap().is_empty());

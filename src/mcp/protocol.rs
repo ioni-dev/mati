@@ -29,7 +29,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::store::{AgentKind, PolicyRecord};
+use crate::hooks::decide::Action;
+use crate::store::{
+    AgentKind, PolicyMode as StorePolicyMode, PolicyRecord, Priority as StorePriority,
+};
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
@@ -174,6 +177,10 @@ pub enum Command {
     /// Bulk lookup for hook decision: file record + linked gotchas + consultation status.
     #[serde(rename = "hook_evaluate")]
     HookEvaluate(HookEvaluateInput),
+
+    /// Evaluate a normalized action against the daemon-resident local policies.
+    #[serde(rename = "policy_evaluate")]
+    PolicyEvaluate(PolicyEvaluateInput),
 
     /// Scan all records whose key starts with a prefix.
     #[serde(rename = "scan_prefix")]
@@ -334,6 +341,25 @@ pub struct HookEvaluateInput {
     /// `None` (global) for the main thread. Drives per-actor enforcement.
     #[serde(default)]
     pub actor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyEvaluateInput {
+    pub action: Action,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyVerdict {
+    pub key: String,
+    pub mode: StorePolicyMode,
+    pub rule: String,
+    pub reason: String,
+    pub severity: StorePriority,
+    pub requires_key: String,
+    pub satisfied: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -749,6 +775,7 @@ impl Command {
             Self::Metrics => "metrics",
             Self::Get(_) => "get",
             Self::HookEvaluate(_) => "hook_evaluate",
+            Self::PolicyEvaluate(_) => "policy_evaluate",
             Self::ScanPrefix(_) => "scan_prefix",
             Self::ScanKeys(_) => "scan_keys",
             Self::History(_) => "history",
@@ -787,6 +814,7 @@ impl Command {
         match self {
             Self::Get(i) => &i.key,
             Self::HookEvaluate(i) => &i.file_key,
+            Self::PolicyEvaluate(_) => "",
             Self::ScanPrefix(i) => &i.prefix,
             Self::ScanKeys(i) => &i.prefix,
             Self::History(i) => &i.key,

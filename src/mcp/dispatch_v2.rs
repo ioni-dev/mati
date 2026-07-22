@@ -49,6 +49,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::graph::Graph;
+use crate::hooks::policy_match::PolicyMatcherSet;
 use crate::mcp::metadata::PeerContext;
 use crate::mcp::metrics;
 use crate::mcp::protocol::{self, AuditEntry, Command, ErrorCode, Request, Response};
@@ -67,6 +68,19 @@ pub(crate) struct RequestContext {
     pub daemon_session: Uuid,
     /// Repository root path (for commands needing filesystem access).
     pub repo_root: PathBuf,
+    /// Daemon-resident compiled local policies.
+    pub policy_matcher: Arc<tokio::sync::RwLock<PolicyMatcherSet>>,
+}
+
+/// Load the daemon's compiled policy set from the canonical policy records.
+pub async fn load_policy_matcher(store: &crate::store::Store) -> PolicyMatcherSet {
+    match store.scan_prefix("policy:").await {
+        Ok(records) => PolicyMatcherSet::from_records_lenient(&records),
+        Err(error) => {
+            tracing::warn!(error = %error, "daemon: policy matcher boot scan failed");
+            PolicyMatcherSet::empty()
+        }
+    }
 }
 
 // ── V2 dispatch entry point ─────────────────────────────────────────────────
@@ -147,6 +161,8 @@ pub(crate) async fn dispatch_v2(
             // drift. Pre-γ, this fell through to the v1 bridge which
             // serialized back to a string and re-entered `MatiServer::mem_query`.
             dispatch_mem_query(graph, &req).await
+        } else if matches!(&req.cmd, Command::PolicyEvaluate(_)) {
+            dispatch_policy_evaluate(graph, ctx, &req).await
         } else if is_session_side(&req.cmd) {
             // Session-side mutations: native handler with audit in sessions tree.
             dispatch_session_side(graph, ctx, &req).await
@@ -154,7 +170,7 @@ pub(crate) async fn dispatch_v2(
             // Knowledge-side mutations: native handler with atomic mutation+audit
             // in one transact_knowledge commit.
             if matches!(&req.cmd, Command::PolicyWrite(_)) {
-                dispatch_policy_write(graph, &req).await
+                dispatch_policy_write(graph, ctx, &req).await
             } else {
                 dispatch_knowledge_mutation(graph, ctx, &req).await
             }
@@ -496,7 +512,11 @@ async fn dispatch_knowledge_mutation(
     }
 }
 
-async fn dispatch_policy_write(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
+async fn dispatch_policy_write(
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
+    ctx: &RequestContext,
+    req: &Request,
+) -> Response {
     let Command::PolicyWrite(input) = &req.cmd else {
         unreachable!("dispatch_policy_write only accepts PolicyWrite")
     };
@@ -524,7 +544,20 @@ async fn dispatch_policy_write(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Re
         }
     };
     match result {
-        Ok(()) => Response::ok(req.id, serde_json::Value::Null),
+        Ok(()) => {
+            let records = store.scan_prefix("policy:").await;
+            match records {
+                Ok(records) => {
+                    let refreshed = PolicyMatcherSet::from_records_lenient(&records);
+                    *ctx.policy_matcher.write().await = refreshed;
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "daemon: policy matcher refresh failed; retaining previous set"
+                ),
+            }
+            Response::ok(req.id, serde_json::Value::Null)
+        }
         Err(error) => {
             use crate::store::policy_ops::PolicyOpError;
             // Map typed policy errors to protocol codes; unknown errors (e.g. a
@@ -543,6 +576,73 @@ async fn dispatch_policy_write(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Re
             Response::err(req.id, code, error.to_string())
         }
     }
+}
+
+async fn dispatch_policy_evaluate(
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
+    ctx: &RequestContext,
+    req: &Request,
+) -> Response {
+    let Command::PolicyEvaluate(input) = &req.cmd else {
+        unreachable!("dispatch_policy_evaluate only accepts PolicyEvaluate")
+    };
+
+    let matched = {
+        let matcher = ctx.policy_matcher.read().await;
+        matcher
+            .matches(&input.action)
+            .into_iter()
+            .map(|matched| {
+                (
+                    matched.key.to_string(),
+                    matched.policy.mode,
+                    matched.policy.rule.clone(),
+                    matched.policy.reason.clone(),
+                    matched.policy.severity.clone(),
+                    matched.policy.requires.key.clone(),
+                    matched.policy.requires.freshness.ttl_secs,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let g = graph.read().await;
+    let store = g.store();
+    let mut verdicts = Vec::with_capacity(matched.len());
+    for (key, mode, rule, reason, severity, requires_key, ttl_secs) in matched {
+        let satisfied = match mode {
+            crate::store::PolicyMode::Steer => true,
+            crate::store::PolicyMode::Block => {
+                match sess::check_consulted_recent(
+                    store,
+                    &requires_key,
+                    ttl_secs,
+                    input.actor.as_deref(),
+                )
+                .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Response::err(req.id, ErrorCode::StoreError, error.to_string())
+                    }
+                }
+            }
+        };
+        verdicts.push(protocol::PolicyVerdict {
+            key,
+            mode,
+            rule,
+            reason,
+            severity,
+            requires_key,
+            satisfied,
+        });
+    }
+
+    Response::ok(
+        req.id,
+        serde_json::to_value(verdicts).unwrap_or(serde_json::Value::Array(Vec::new())),
+    )
 }
 
 // ── FileEditHook — compound command ─────────────────────────────────────────
@@ -1106,6 +1206,9 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             "hook_evaluate".into(),
             json!({ "file_key": i.file_key, "include_recent": i.include_recent, "actor": i.actor }),
         ),
+        Command::PolicyEvaluate(_) => {
+            unreachable!("PolicyEvaluate is handled natively, not via v1 bridge")
+        }
         Command::ScanPrefix(i) => ("scan_prefix".into(), json!({ "prefix": i.prefix })),
         Command::ScanKeys(i) => ("scan_keys".into(), json!({ "prefix": i.prefix })),
         Command::History(i) => ("history".into(), json!({ "key": i.key, "limit": i.limit })),
@@ -1282,6 +1385,7 @@ mod tests {
             peer: test_peer(),
             daemon_session: test_session(),
             repo_root: repo_root.to_path_buf(),
+            policy_matcher: Arc::new(tokio::sync::RwLock::new(PolicyMatcherSet::empty())),
         }
     }
 
@@ -1362,6 +1466,100 @@ mod tests {
         let g = graph.read().await;
         let stored = g.store().get(key).await.unwrap().unwrap();
         assert!(!stored.payload_as::<PolicyRecord>().unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+        let policy = PolicyRecord {
+            name: "Production query safety".into(),
+            rule: "Consult the schema first.".into(),
+            reason: "Production schemas drift because deployments change.".into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Block,
+            trigger: PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![ReceiptSource::MemGet],
+                freshness: PolicyFreshness { ttl_secs: 900 },
+            },
+            enabled: true,
+            severity: StorePriority::High,
+            created_by: "test".into(),
+        };
+        let key = "policy:query-safety";
+        let create = make_request(Command::PolicyWrite(PolicyWriteInput {
+            op: PolicyWriteOp::Create,
+            key: key.into(),
+            policy: Some(policy),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, create).await,
+            Response::Ok { .. }
+        ));
+
+        let action = crate::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.prod.internal".into()),
+            argv: vec!["psql".into()],
+            files: vec![],
+        };
+        let evaluate = || {
+            dispatch_v2(
+                &graph,
+                &ctx,
+                make_request(Command::PolicyEvaluate(PolicyEvaluateInput {
+                    action: action.clone(),
+                    actor: None,
+                })),
+            )
+        };
+
+        let first = evaluate().await;
+        let Response::Ok { data, .. } = first else {
+            panic!("policy evaluation should succeed")
+        };
+        let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].satisfied);
+
+        {
+            let g = graph.read().await;
+            crate::store::session::log_hit(g.store(), "schema:orders")
+                .await
+                .unwrap();
+        }
+        let second = evaluate().await;
+        let Response::Ok { data, .. } = second else {
+            panic!("policy evaluation should succeed after receipt")
+        };
+        let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+        assert!(verdicts[0].satisfied);
+
+        let disable = make_request(Command::PolicyWrite(PolicyWriteInput {
+            op: PolicyWriteOp::Disable,
+            key: key.into(),
+            policy: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, disable).await,
+            Response::Ok { .. }
+        ));
+        let third = evaluate().await;
+        let Response::Ok { data, .. } = third else {
+            panic!("policy evaluation should succeed after refresh")
+        };
+        let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+        assert!(verdicts.is_empty());
     }
 
     #[tokio::test]
@@ -1534,6 +1732,7 @@ mod tests {
             peer,
             daemon_session,
             repo_root: dir.path().to_path_buf(),
+            policy_matcher: Arc::new(tokio::sync::RwLock::new(PolicyMatcherSet::empty())),
         };
 
         let req = make_request(Command::ConsultationHit(ConsultationHitInput {
