@@ -2195,10 +2195,14 @@ async fn apply_mem_set_write(
                 })
                 .to_string(),
             };
-        policy.enabled = false;
+        // Agents may create or edit off/shadow policies, but can never cause
+        // an action to be blocked: an enforce payload is forced down to off.
+        if matches!(policy.stage, crate::store::PolicyStage::Enforce) {
+            policy.stage = crate::store::PolicyStage::Off;
+        }
         if let Some(existing) = existing_record.as_ref() {
             if let Some(existing_policy) = existing.payload_as::<PolicyRecord>() {
-                if existing_policy.enabled {
+                if matches!(existing_policy.stage, crate::store::PolicyStage::Enforce) {
                     let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
                     return serde_json::json!({
                         "error": format!(
@@ -2227,7 +2231,7 @@ async fn apply_mem_set_write(
         return serde_json::json!({
             "ok": true,
             "key": params.key,
-            "enabled": false,
+            "stage": "off",
             "warnings": crate::store::policy_ops::author_warnings(&policy, has_backing_record),
         })
         .to_string();
@@ -2744,7 +2748,7 @@ async fn apply_mem_set_delete(
         };
         if record
             .payload_as::<PolicyRecord>()
-            .is_some_and(|policy| policy.enabled)
+            .is_some_and(|policy| matches!(policy.stage, crate::store::PolicyStage::Enforce))
         {
             let slug = key.strip_prefix("policy:").unwrap_or(key);
             return serde_json::json!({

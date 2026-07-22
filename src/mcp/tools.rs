@@ -305,7 +305,9 @@ impl MatiServer {
                 if existing
                     .as_ref()
                     .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
-                    .is_some_and(|policy| policy.enabled)
+                    .is_some_and(|policy| {
+                        matches!(policy.stage, crate::store::PolicyStage::Enforce)
+                    })
                 {
                     return json!({"error": format!("policy {} is active; delete it with `mati policy delete {slug}` so the change is approved.", params.key)}).to_string();
                 }
@@ -315,6 +317,7 @@ impl MatiServer {
                             op: crate::mcp::protocol::PolicyWriteOp::Delete,
                             key: params.key.clone(),
                             policy: None,
+                            stage: None,
                         },
                     ))
                     .await;
@@ -323,7 +326,9 @@ impl MatiServer {
                 if existing
                     .as_ref()
                     .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
-                    .is_some_and(|policy| policy.enabled)
+                    .is_some_and(|policy| {
+                        matches!(policy.stage, crate::store::PolicyStage::Enforce)
+                    })
                 {
                     return json!({"error": format!("policy {} is active; change it with `mati policy edit {slug}` so the change is approved.", params.key)}).to_string();
                 }
@@ -337,7 +342,11 @@ impl MatiServer {
                     Ok(policy) => policy,
                     Err(error) => return json!({"error": format!("policy payload must deserialize into PolicyRecord: {error}")}).to_string(),
                 };
-                policy.enabled = false;
+                // Agents may create or edit off/shadow policies, but can never
+                // cause an action to be blocked.
+                if matches!(policy.stage, crate::store::PolicyStage::Enforce) {
+                    policy.stage = crate::store::PolicyStage::Off;
+                }
                 return self
                     .socket_call_typed(Command::PolicyWrite(
                         crate::mcp::protocol::PolicyWriteInput {
@@ -348,6 +357,7 @@ impl MatiServer {
                             },
                             key: params.key.clone(),
                             policy: Some(policy),
+                            stage: None,
                         },
                     ))
                     .await;
@@ -436,12 +446,15 @@ fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String>
             serde_json::from_value(payload).map_err(|error| {
                 format!("policy payload must deserialize into PolicyRecord: {error}")
             })?;
-        policy.enabled = false;
+        if matches!(policy.stage, crate::store::PolicyStage::Enforce) {
+            policy.stage = crate::store::PolicyStage::Off;
+        }
         return Ok(Command::PolicyWrite(
             crate::mcp::protocol::PolicyWriteInput {
                 op: crate::mcp::protocol::PolicyWriteOp::Create,
                 key: params.key.clone(),
                 policy: Some(policy),
+                stage: None,
             },
         ));
     }
@@ -2417,7 +2430,7 @@ mod tests {
                 "via": ["mem_get"],
                 "freshness": {"ttl_secs": 900}
             },
-            "enabled": enabled,
+            "stage": if enabled { "enforce" } else { "off" },
             "severity": "high",
             "created_by": "agent"
         })
@@ -2445,7 +2458,7 @@ mod tests {
         .await;
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["ok"], true, "policy create failed: {result}");
-        assert_eq!(parsed["enabled"], false);
+        assert_eq!(parsed["stage"], "off");
         assert_eq!(parsed["key"], "policy:query-safety");
         assert!(parsed["warnings"].is_array());
 
@@ -2457,7 +2470,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let policy = record.payload_as::<PolicyRecord>().unwrap();
-        assert!(!policy.enabled);
+        assert!(matches!(policy.stage, crate::store::PolicyStage::Off));
         assert!(PolicyMatcherSet::from_records(&[record])
             .unwrap()
             .matches(&crate::hooks::decide::Action {
@@ -2535,7 +2548,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        policy.enabled = true;
+        policy.stage = crate::store::PolicyStage::Enforce;
         crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
             .await
             .unwrap();
@@ -2596,7 +2609,7 @@ mod tests {
             .unwrap();
         let policy = record.payload_as::<PolicyRecord>().unwrap();
         assert_eq!(policy.rule, "Consult the current schema first.");
-        assert!(!policy.enabled);
+        assert!(matches!(policy.stage, crate::store::PolicyStage::Off));
     }
 
     #[tokio::test]
@@ -2604,7 +2617,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        policy.enabled = true;
+        policy.stage = crate::store::PolicyStage::Enforce;
         crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
             .await
             .unwrap();
@@ -3887,7 +3900,10 @@ mod tests {
         match cmd {
             Command::PolicyWrite(input) => {
                 assert!(matches!(input.op, proto::PolicyWriteOp::Create));
-                assert!(!input.policy.unwrap().enabled);
+                assert!(matches!(
+                    input.policy.unwrap().stage,
+                    crate::store::PolicyStage::Off
+                ));
             }
             _ => panic!("expected PolicyWrite"),
         }
