@@ -531,6 +531,7 @@ pub struct GotchaTombstoneInput {
 #[serde(rename_all = "snake_case")]
 pub enum PolicyWriteOp {
     Create,
+    Edit,
     Enable,
     Disable,
     Delete,

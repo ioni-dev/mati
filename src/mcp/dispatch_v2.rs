@@ -533,6 +533,16 @@ async fn dispatch_policy_write(
                 );
             }
         },
+        protocol::PolicyWriteOp::Edit => match input.policy.as_ref() {
+            Some(policy) => crate::store::policy_ops::edit(store, &input.key, policy).await,
+            None => {
+                return Response::err(
+                    req.id,
+                    ErrorCode::ValidationFailed,
+                    "policy is required for edit".to_string(),
+                );
+            }
+        },
         protocol::PolicyWriteOp::Enable => {
             crate::store::policy_ops::set_enabled(store, &input.key, true).await
         }
@@ -556,24 +566,24 @@ async fn dispatch_policy_write(
                     "daemon: policy matcher refresh failed; retaining previous set"
                 ),
             }
-            let warnings = if matches!(input.op, protocol::PolicyWriteOp::Create) {
-                input
-                    .policy
-                    .as_ref()
-                    .map(|policy| async {
-                        let has_backing = store
-                            .get(&policy.requires.key)
-                            .await
-                            .ok()
-                            .flatten()
-                            .is_some_and(|record| {
-                                !matches!(
-                                    record.lifecycle,
-                                    crate::store::RecordLifecycle::Tombstoned { .. }
-                                )
-                            });
-                        crate::store::policy_ops::author_warnings(policy, has_backing)
-                    })
+            let warnings = if matches!(
+                input.op,
+                protocol::PolicyWriteOp::Create | protocol::PolicyWriteOp::Edit
+            ) {
+                input.policy.as_ref().map(|policy| async {
+                    let has_backing = store
+                        .get(&policy.requires.key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|record| {
+                            !matches!(
+                                record.lifecycle,
+                                crate::store::RecordLifecycle::Tombstoned { .. }
+                            )
+                        });
+                    crate::store::policy_ops::author_warnings(policy, has_backing)
+                })
             } else {
                 None
             };

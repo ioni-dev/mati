@@ -650,6 +650,11 @@ impl StoreProxy {
                         policy.ok_or_else(|| anyhow::anyhow!("policy is required for create"))?;
                     mati_core::store::policy_ops::create(store, key, policy).await
                 }
+                p::PolicyWriteOp::Edit => {
+                    let policy =
+                        policy.ok_or_else(|| anyhow::anyhow!("policy is required for edit"))?;
+                    mati_core::store::policy_ops::edit(store, key, policy).await
+                }
                 p::PolicyWriteOp::Enable => {
                     mati_core::store::policy_ops::set_enabled(store, key, true).await
                 }
