@@ -812,8 +812,7 @@ pub struct GotchaRecord {
 
 /// Declarative action predicate stored on a local policy.
 ///
-/// Milestone 1 only persists this shape. Matching is intentionally deferred to
-/// the later policy-engine milestone.
+/// This is the persisted shape consumed by the pure policy matcher.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct PolicyTrigger {
     #[serde(default, skip_serializing_if = "Option::is_none")]
