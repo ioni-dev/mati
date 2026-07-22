@@ -14,7 +14,7 @@ use base64::Engine;
 use clap::{Args, Subcommand};
 use slugify::slugify;
 
-use mati_core::hooks::decide::{is_known_action_tool, normalize_action, Action};
+use mati_core::hooks::decide::{normalize_action, Action};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
 use mati_core::store::{
     PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority, RecordLifecycle,
@@ -32,7 +32,7 @@ pub struct PolicyArgs {
 enum PolicyCommand {
     /// Add a local repository policy (stored under policy:<slug>).
     #[command(
-        long_about = "Add a local, developer-authored policy. This authors data in the local mati store; it does not verify a signed policy-floor bundle."
+        long_about = "Add a local, developer-authored policy. New policies are inert by default; pass --enable for the deliberate human one-shot activation. This authors data in the local mati store; it does not verify a signed policy-floor bundle."
     )]
     Add(AddArgs),
     /// List active local policies.
@@ -91,6 +91,9 @@ struct AddArgs {
     severity: String,
     #[arg(long, default_value = "developer")]
     created_by: String,
+    /// Enable immediately (otherwise the new policy is inert).
+    #[arg(long)]
+    enable: bool,
 }
 
 #[derive(Args)]
@@ -101,6 +104,9 @@ struct TestArgs {
     /// File path to normalize and test.
     #[arg(long)]
     path: Option<String>,
+    /// Ad-hoc trigger JSON to compile and test without reading or writing the store.
+    #[arg(long)]
+    trigger: Option<String>,
     /// Emit JSON instead of human output.
     #[arg(long)]
     json: bool,
@@ -176,41 +182,16 @@ async fn add(args: AddArgs) -> Result<()> {
             .context("parsing --trigger JSON")?,
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
-        enabled: true,
+        enabled: args.enable,
         severity: parse_priority(&args.severity)?,
         created_by: args.created_by,
     };
-    if let Some(tool) = policy
-        .trigger
-        .tool
-        .as_deref()
-        .filter(|t| !is_known_action_tool(t))
-    {
-        eprintln!("warning: policy trigger tool '{tool}' is not a recognized governable category");
-        eprintln!(
-            "(known: db_client, file_read, path); this policy will never match until such a category is supported."
-        );
-    }
     let key = format!("policy:{slug}");
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    if policy
-        .requires
-        .via
-        .contains(&mati_core::store::ReceiptSource::MemGet)
-        && !has_backing_record(&proxy, &policy.requires.key).await?
-    {
-        eprintln!("{}", unbacked_requires_warning(&policy.requires.key));
-    }
-    if policy.requires.freshness.fingerprint
-        && !policy
-            .requires
-            .via
-            .contains(&mati_core::store::ReceiptSource::MemGet)
-    {
-        eprintln!(
-            "warning: requires.freshness.fingerprint is unsatisfiable without MemGet; DbIntrospection receipts do not carry a content fingerprint."
-        );
+    let has_backing = has_backing_record(&proxy, &policy.requires.key).await?;
+    for warning in mati_core::store::policy_ops::author_warnings(&policy, has_backing) {
+        eprintln!("{warning}");
     }
     let result = proxy
         .policy_write(
@@ -316,6 +297,42 @@ async fn test_policies(args: TestArgs) -> Result<()> {
         anyhow::bail!("provide --command or --path");
     }
     let action = normalize_action(args.command.as_deref(), args.path.as_deref());
+    if let Some(trigger_json) = args.trigger {
+        let trigger = serde_json::from_str::<PolicyTrigger>(&trigger_json)
+            .context("parsing --trigger JSON")?;
+        let policy = PolicyRecord {
+            name: "ad-hoc".into(),
+            rule: "ad-hoc trigger".into(),
+            reason: "ad-hoc trigger evaluation".into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Steer,
+            trigger,
+            requires: serde_json::from_str(
+                r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#,
+            )?,
+            enabled: true,
+            severity: Priority::Normal,
+            created_by: "ad-hoc".into(),
+        };
+        let matcher = mati_core::hooks::policy_match::PolicyMatcherSet::from_policies([(
+            "policy:ad-hoc".into(),
+            policy,
+        )])?;
+        let matched = !matcher.matches(&action).is_empty();
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "action": action,
+                    "matched": matched,
+                    "persisted": false,
+                }))?
+            );
+        } else {
+            println!("Action: tool={} matched={matched} (persisted=false)", action.tool);
+        }
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
     let matches = proxy.policy_evaluate(&action, None).await?;
