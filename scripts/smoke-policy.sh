@@ -246,7 +246,7 @@ step "13. mem_set agent boundary"
 POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"enabled":true,"severity":"high","created_by":"agent"}'
 OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:agent-authored\",\"value\":\"Consult first.\",\"category\":\"Policy\",\"payload\":$POLICY_JSON,\"tags\":[],\"priority\":\"High\"}")"
 if printf '%s' "$OUT" | grep -q 'jsonrpc'; then
-  assert_has "agent-authored policy is forced inert" "$OUT" '"enabled":false'
+  assert_has "agent-authored policy is forced inert" "$OUT" 'enabled.":false'
   OUT2="$(mcp_call mem_set '{"action":"confirm","key":"policy:agent-authored","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
   assert_has "agent cannot enable a policy" "$OUT2" 'mati policy enable'
 else
