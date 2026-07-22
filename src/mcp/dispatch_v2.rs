@@ -243,7 +243,7 @@ fn is_compound(cmd: &Command) -> bool {
 }
 
 /// Returns true for runtime configuration commands. These touch raw key/value
-/// pairs (`enforcement:mode`, `enforcement:retention_days`, `policy:mode`) and are routed
+/// pairs (`enforcement:mode`, `enforcement:retention_days`, `enforcement:policy_mode`) and are routed
 /// through a dedicated dispatcher rather than the v1 bridge or the typical
 /// knowledge-mutation transactional audit path.
 fn is_config_command(cmd: &Command) -> bool {

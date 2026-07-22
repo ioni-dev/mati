@@ -905,7 +905,10 @@ pub async fn scan_enforcement_events(
 const ENFORCEMENT_MODE_KEY: &str = "enforcement:mode";
 
 /// Store key for the local policy posture kill switch.
-const POLICY_MODE_KEY: &str = "policy:mode";
+const POLICY_MODE_KEY: &str = "enforcement:policy_mode";
+
+/// Pre-rollout location retained only for reading and collision cleanup.
+const LEGACY_POLICY_MODE_KEY: &str = "policy:mode";
 
 /// Default retention period in days.
 const DEFAULT_RETENTION_DAYS: u64 = 365;
@@ -969,12 +972,17 @@ pub async fn set_enforcement_mode(store: &Store, mode: EnforcementMode) -> Resul
 /// Read the policy posture. Policies deny by default when this key is absent
 /// or unreadable; `advisory` is an explicit global kill switch.
 pub async fn get_policy_mode(store: &Store) -> EnforcementMode {
+    let parse = |bytes: Vec<u8>| match bytes.as_slice() {
+        b"advisory" => EnforcementMode::Advisory,
+        _ => EnforcementMode::Strict,
+    };
     match store.get_raw_bytes(POLICY_MODE_KEY).await {
-        Ok(Some(bytes)) => match std::str::from_utf8(&bytes) {
-            Ok("advisory") => EnforcementMode::Advisory,
+        Ok(Some(bytes)) => parse(bytes),
+        Ok(None) => match store.get_raw_bytes(LEGACY_POLICY_MODE_KEY).await {
+            Ok(Some(bytes)) => parse(bytes),
             _ => EnforcementMode::Strict,
         },
-        _ => EnforcementMode::Strict,
+        Err(_) => EnforcementMode::Strict,
     }
 }
 
@@ -986,6 +994,14 @@ pub async fn set_policy_mode(store: &Store, mode: EnforcementMode) -> Result<Enf
         EnforcementMode::Strict => "strict",
     };
     store.put_raw(POLICY_MODE_KEY, value.as_bytes()).await?;
+    if matches!(
+        store.get_raw_bytes(LEGACY_POLICY_MODE_KEY).await,
+        Ok(Some(ref bytes)) if bytes.as_slice() == b"strict" || bytes.as_slice() == b"advisory"
+    ) {
+        // Best-effort, like the ControlChanged event below: the posture change
+        // is already durable, so a failed cleanup must not report it as failed.
+        let _ = store.delete(LEGACY_POLICY_MODE_KEY).await;
+    }
     if old != mode {
         let label = |mode: EnforcementMode| match mode {
             EnforcementMode::Advisory => "advisory",
@@ -1485,6 +1501,98 @@ pub fn event_type_label(event_type: &EnforcementEventType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_policy() -> crate::store::PolicyRecord {
+        crate::store::PolicyRecord {
+            name: "Mode collision test".into(),
+            rule: "Consult the schema first.".into(),
+            reason: "Schemas drift because production changes independently.".into(),
+            scope: "repo".into(),
+            mode: crate::store::PolicyMode::Block,
+            trigger: Default::default(),
+            requires: crate::store::PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![crate::store::ReceiptSource::MemGet],
+                freshness: crate::store::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
+            },
+            stage: crate::store::PolicyStage::Enforce,
+            severity: crate::store::Priority::High,
+            created_by: "developer".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_mode_reads_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store.put_raw(POLICY_MODE_KEY, b"advisory").await.unwrap();
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Advisory);
+    }
+
+    #[tokio::test]
+    async fn policy_mode_falls_back_to_legacy_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put_raw(LEGACY_POLICY_MODE_KEY, b"advisory")
+            .await
+            .unwrap();
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Advisory);
+    }
+
+    #[tokio::test]
+    async fn policy_mode_new_key_wins_over_legacy_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put_raw(LEGACY_POLICY_MODE_KEY, b"advisory")
+            .await
+            .unwrap();
+        store.put_raw(POLICY_MODE_KEY, b"strict").await.unwrap();
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Strict);
+    }
+
+    #[tokio::test]
+    async fn set_policy_mode_removes_legacy_raw_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put_raw(LEGACY_POLICY_MODE_KEY, b"advisory")
+            .await
+            .unwrap();
+        set_policy_mode(&store, EnforcementMode::Strict)
+            .await
+            .unwrap();
+        assert!(store.scan_prefix("policy:").await.unwrap().is_empty());
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Strict);
+    }
+
+    #[tokio::test]
+    async fn set_policy_mode_preserves_a_policy_record_at_legacy_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        crate::store::policy_ops::create(&store, LEGACY_POLICY_MODE_KEY, &sample_policy())
+            .await
+            .unwrap();
+        set_policy_mode(&store, EnforcementMode::Advisory)
+            .await
+            .unwrap();
+        let records = store.scan_prefix("policy:").await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].key, LEGACY_POLICY_MODE_KEY);
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Advisory);
+    }
+
+    #[tokio::test]
+    async fn policy_mode_unrecognized_value_is_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store.put_raw(POLICY_MODE_KEY, b"not-a-mode").await.unwrap();
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Strict);
+    }
 
     /// Construct a deterministic event for hash testing.
     fn frozen_test_event() -> EnforcementEvent {

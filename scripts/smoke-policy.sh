@@ -119,6 +119,18 @@ fi
 
 pass "store initialized, daemon auto-spawned, policy mode defaults strict"
 
+# The policy slug is intentionally the old config key's suffix. The config
+# value must live elsewhere so this record remains listable and enforceable.
+step "0. Policy slug mode does not collide with policy.mode"
+add_block_policy mode '*prod-mode*' 'schema:mode' 'mem_get'
+mati_p policy enable mode >/dev/null
+mati_p config set policy.mode advisory >/dev/null
+LIST="$(mati_p policy list)"
+assert_has "mode policy survives advisory switch" "$LIST" 'policy:mode'
+mati_p config set policy.mode strict >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-mode.internal -c \"UPDATE orders SET s=1\""')")"
+assert_has "mode policy still enforces" "$OUT" 'permissionDecision":"deny"'
+
 # ── 1. Shadow observes, then enforce blocks ──────────────────────────────────
 step "1. Shadow observes without blocking, then enforce blocks"
 add_block_policy query-a '*prod-a*' 'schema:orders' 'mem_get'
