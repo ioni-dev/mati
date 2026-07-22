@@ -35,6 +35,8 @@ enum PolicyCommand {
         long_about = "Add a local, developer-authored policy. New policies are inert by default; pass --enable for the deliberate human one-shot activation. This authors data in the local mati store; it does not verify a signed policy-floor bundle."
     )]
     Add(AddArgs),
+    /// Edit selected fields of an existing local policy.
+    Edit(EditArgs),
     /// List active local policies.
     List {
         /// Emit JSON instead of a table.
@@ -97,6 +99,28 @@ struct AddArgs {
 }
 
 #[derive(Args)]
+struct EditArgs {
+    /// Policy key (policy:<slug>) or slug.
+    key: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    rule: Option<String>,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long)]
+    scope: Option<String>,
+    #[arg(long)]
+    mode: Option<String>,
+    #[arg(long)]
+    trigger: Option<String>,
+    #[arg(long)]
+    requires: Option<String>,
+    #[arg(long)]
+    severity: Option<String>,
+}
+
+#[derive(Args)]
 struct TestArgs {
     /// Bash command to normalize and test.
     #[arg(long)]
@@ -129,6 +153,7 @@ pub struct VerifyArgs {
 pub async fn run(args: PolicyArgs) -> Result<()> {
     match args.command {
         PolicyCommand::Add(a) => add(a).await,
+        PolicyCommand::Edit(a) => edit(a).await,
         PolicyCommand::List { json } => list(json).await,
         PolicyCommand::Show(a) => show(&normalize_key(&a.key)).await,
         PolicyCommand::Enable(a) => set_enabled(&normalize_key(&a.key), true).await,
@@ -202,6 +227,61 @@ async fn add(args: AddArgs) -> Result<()> {
         .await;
     proxy.close_with_result(result).await?;
     println!("Created {key}");
+    Ok(())
+}
+
+async fn edit(args: EditArgs) -> Result<()> {
+    let key = normalize_key(&args.key);
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let record = proxy
+        .get(&key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no record found for '{key}'"))?;
+    let mut policy = record
+        .payload_as::<PolicyRecord>()
+        .ok_or_else(|| anyhow::anyhow!("'{key}' is not a policy record"))?;
+
+    if let Some(value) = args.name {
+        policy.name = value;
+    }
+    if let Some(value) = args.rule {
+        policy.rule = value;
+    }
+    if let Some(value) = args.reason {
+        policy.reason = value;
+    }
+    if let Some(value) = args.scope {
+        policy.scope = value;
+    }
+    if let Some(value) = args.mode {
+        policy.mode = parse_mode(&value)?;
+    }
+    if let Some(value) = args.trigger {
+        policy.trigger =
+            serde_json::from_str::<PolicyTrigger>(&value).context("parsing --trigger JSON")?;
+    }
+    if let Some(value) = args.requires {
+        policy.requires =
+            serde_json::from_str::<PolicyRequires>(&value).context("parsing --requires JSON")?;
+    }
+    if let Some(value) = args.severity {
+        policy.severity = parse_priority(&value)?;
+    }
+
+    let has_backing = has_backing_record(&proxy, &policy.requires.key).await?;
+    for warning in mati_core::store::policy_ops::author_warnings(&policy, has_backing) {
+        eprintln!("{warning}");
+    }
+    let result = proxy
+        .policy_write(
+            mati_core::mcp::protocol::PolicyWriteOp::Edit,
+            &key,
+            Some(&policy),
+        )
+        .await;
+    proxy.close_with_result(result).await?;
+    println!("Edited {key}");
     Ok(())
 }
 
@@ -307,9 +387,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
             scope: "repo".into(),
             mode: PolicyMode::Steer,
             trigger,
-            requires: serde_json::from_str(
-                r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#,
-            )?,
+            requires: serde_json::from_str(r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#)?,
             enabled: true,
             severity: Priority::Normal,
             created_by: "ad-hoc".into(),
@@ -319,7 +397,10 @@ async fn test_policies(args: TestArgs) -> Result<()> {
             policy,
         )])?;
         let matched = !matcher.matches(&action).is_empty();
-        println!("{}", render_ad_hoc_test_output(&action, matched, args.json)?);
+        println!(
+            "{}",
+            render_ad_hoc_test_output(&action, matched, args.json)?
+        );
         return Ok(());
     }
     let cwd = std::env::current_dir()?;
