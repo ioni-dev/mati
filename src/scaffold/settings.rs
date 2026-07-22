@@ -76,6 +76,12 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           { "type": "command", "command": ".claude/hooks/post-memget.sh" }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/post-bash.sh", "async": true }
+        ]
       }
     ],
     "PreCompact": [
@@ -159,6 +165,7 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("subagent-start.sh", crate::hooks::subagent_start::SCRIPT),
     ("stop.sh", crate::hooks::claude_stop::SCRIPT),
     ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
+    ("post-bash.sh", crate::hooks::post_bash::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -564,6 +571,7 @@ mod tests {
         assert!(crate::hooks::pre_read::SCRIPT.contains("exec mati hook-decide claude-pre-read"));
         assert!(crate::hooks::pre_edit::SCRIPT.contains("exec mati hook-decide claude-pre-edit"));
         assert!(crate::hooks::pre_bash::SCRIPT.contains("exec mati hook-decide claude-pre-bash"));
+        assert!(crate::hooks::post_bash::SCRIPT.contains("exec mati hook-decide claude-post-bash"));
     }
 
     #[test]

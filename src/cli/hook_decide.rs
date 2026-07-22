@@ -41,6 +41,10 @@ pub enum HookVariant {
     /// (`post-memget.sh` → `mati hook-decide claude-post-memget`).
     #[value(name = "claude-post-memget")]
     ClaudePostMemGet,
+    /// Claude PostToolUse(Bash): mint schema consultation receipts after a
+    /// successful allowlisted database introspection.
+    #[value(name = "claude-post-bash")]
+    ClaudePostBash,
 }
 
 #[derive(Args, Debug)]
@@ -98,6 +102,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // tool_input.key directly — NOT a file path, so skip extract_path entirely.
     if args.variant == HookVariant::ClaudePostMemGet {
         return run_post_memget(&input).await;
+    }
+
+    if args.variant == HookVariant::ClaudePostBash {
+        return run_post_bash_introspection(&input).await;
     }
 
     // 1b. Parse agent_id: present only in subagent hook payloads.
@@ -644,6 +652,7 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
         // post-memget is handled by `run_post_memget` before extract_path is called;
         // it uses tool_input.key directly, not a file path.
         HookVariant::ClaudePostMemGet => None,
+        HookVariant::ClaudePostBash => None,
     }
 }
 
@@ -850,6 +859,65 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
     );
     let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
     Ok(())
+}
+
+/// Best-effort PostToolUse adapter for schema introspection. The policy
+/// evaluation and receipt minting are deliberately fire-and-forget: a
+/// PostToolUse hook must never disrupt the agent session.
+async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
+    if !post_bash_succeeded(input) {
+        return Ok(());
+    }
+    let Some(command) = input
+        .pointer("/tool_input/command")
+        .and_then(|value| value.as_str())
+        .filter(|command| decide::is_schema_introspection(command))
+    else {
+        return Ok(());
+    };
+    let action = decide::normalize_action(Some(command), None);
+    if action.tool != "db_client" {
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(root) => root,
+        Err(_) => return Ok(()),
+    };
+    if !ensure_daemon(&mati_root).await {
+        return Ok(());
+    }
+
+    // Policy matching and receipt minting are added in the next adapter step.
+    let _ = (mati_root, action);
+    Ok(())
+}
+
+/// Claude's PostToolUse payloads have used both camelCase and snake_case
+/// spellings. Missing fields mean success, matching the existing mem_get
+/// adapter's fail-open protocol.
+fn post_bash_succeeded(input: &serde_json::Value) -> bool {
+    let response = input.pointer("/tool_response");
+    if response
+        .and_then(|value| value.get("isError").or_else(|| value.get("is_error")))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    for key in ["exit_code", "exitCode", "code"] {
+        if response
+            .and_then(|value| value.get(key))
+            .and_then(|value| value.as_i64())
+            .is_some_and(|code| code != 0)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 // ── codex-pre-apply-patch flow ──────────────────────────────────────────────
@@ -1114,7 +1182,9 @@ fn platform_events(
                 _ => Some(e),
             })
             .collect(),
-        HookVariant::CodexPostBash | HookVariant::ClaudePostMemGet => {
+        HookVariant::CodexPostBash
+        | HookVariant::ClaudePostMemGet
+        | HookVariant::ClaudePostBash => {
             // Post-bash and post-memget use their own flows — should not reach here.
             events
         }
@@ -1248,7 +1318,8 @@ fn allow_output(variant: HookVariant) -> Option<&'static str> {
         | HookVariant::CodexPostBash
         | HookVariant::CodexPreApplyPatch
         | HookVariant::ClaudePreEdit
-        | HookVariant::ClaudePostMemGet => None,
+        | HookVariant::ClaudePostMemGet
+        | HookVariant::ClaudePostBash => None,
     }
 }
 
@@ -1569,9 +1640,9 @@ fn format_decision(
             }
             _ => (String::new(), String::new(), 0),
         },
-        HookVariant::CodexPostBash | HookVariant::ClaudePostMemGet => {
-            (String::new(), String::new(), 0)
-        }
+        HookVariant::CodexPostBash
+        | HookVariant::ClaudePostMemGet
+        | HookVariant::ClaudePostBash => (String::new(), String::new(), 0),
     }
 }
 
@@ -1648,6 +1719,26 @@ mod tests {
             true,
         );
         assert!(matches!(result.decision, Decision::Advisory { .. }));
+    }
+
+    #[test]
+    fn post_bash_success_gating_rejects_failures() {
+        let command = "psql -c \"\\d orders\"";
+        assert!(post_bash_succeeded(&json!({
+            "tool_input": {"command": command},
+            "tool_response": {"exit_code": 0}
+        })));
+        for response in [
+            json!({"isError": true}),
+            json!({"is_error": true}),
+            json!({"exit_code": 1}),
+            json!({"exitCode": 2}),
+        ] {
+            assert!(!post_bash_succeeded(&json!({
+                "tool_input": {"command": command},
+                "tool_response": response
+            })));
+        }
     }
 
     // ── extract_path ────────────────────────────────────────────────────
@@ -2199,6 +2290,7 @@ mod tests {
             CodexPostBash,
             CodexPreApplyPatch,
             ClaudePostMemGet,
+            ClaudePostBash,
         ] {
             // 1. The fail-open / no-path allow output.
             match variant {

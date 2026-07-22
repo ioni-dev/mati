@@ -10,6 +10,7 @@ pub mod codex_stop;
 pub mod codex_user_prompt;
 pub mod decide;
 pub mod policy_match;
+pub mod post_bash;
 pub mod post_compact;
 pub mod post_compliance;
 pub mod post_edit;
