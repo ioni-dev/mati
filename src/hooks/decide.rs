@@ -285,6 +285,51 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
     None
 }
 
+/// Return whether a command performs an allowlisted database schema
+/// introspection. This is deliberately lexical: it recognizes only bounded
+/// SQL/meta-command forms and never infers intent from natural language.
+pub fn is_schema_introspection(command: &str) -> bool {
+    let normalized = effective_command(split_at_shell_operator(command)).to_ascii_lowercase();
+    let tokens = shell_tokens(&normalized);
+
+    if tokens
+        .iter()
+        .any(|token| token.contains("information_schema"))
+    {
+        return true;
+    }
+
+    for token in &tokens {
+        let token = token.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\\');
+        if ["describe", "desc"]
+            .iter()
+            .any(|word| token == *word || token.starts_with(&format!("{word} ")))
+        {
+            return true;
+        }
+        if ["\\d", "\\dt", "\\d+", "\\l"].iter().any(|meta| {
+            token
+                .strip_prefix(meta)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        }) {
+            return true;
+        }
+    }
+
+    tokens.iter().any(|token| {
+        let token = token.trim_matches(|c: char| c.is_ascii_punctuation());
+        ["show tables", "show columns", "show schemas"]
+            .iter()
+            .any(|phrase| token == *phrase || token.starts_with(&format!("{phrase} ")))
+    }) || tokens.windows(2).any(|pair| {
+        pair[0] == "show"
+            && matches!(
+                pair[1].trim_matches(|c: char| c.is_ascii_punctuation()),
+                "tables" | "columns" | "schemas"
+            )
+    })
+}
+
 // ── File Path Extraction ────────────────────────────────────────────────────
 
 /// Extract the PRIMARY target file path from a classified command — the first
@@ -1736,6 +1781,46 @@ mod tests {
             classify_command("sudo /usr/bin/psql -h db.prod.internal"),
             Some(CommandClass::DbClientLike)
         );
+    }
+
+    #[test]
+    fn schema_introspection_allowlist_matches_supported_forms() {
+        for command in [
+            "psql -c \"SELECT * FROM information_schema.columns\"",
+            "psql -c \"\\d orders\"",
+            "psql -c \"\\dt\"",
+            "psql -c \"\\d+ orders\"",
+            "psql -c \"\\l\"",
+            "mysql -e 'DESCRIBE orders'",
+            "mysql -e 'DESC orders'",
+            "mysql -e 'SHOW TABLES'",
+            "mysql -e 'SHOW COLUMNS FROM orders'",
+            "mysql -e 'SHOW SCHEMAS'",
+        ] {
+            assert!(
+                is_schema_introspection(command),
+                "expected match: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_introspection_does_not_match_mutating_sql() {
+        assert!(!is_schema_introspection(
+            "psql -c \"UPDATE orders SET status = 'x'\""
+        ));
+        assert!(!is_schema_introspection("psql -c \"SELECT * FROM orders\""));
+    }
+
+    #[test]
+    fn schema_introspection_pins_bounded_parser_gaps() {
+        // The classifier intentionally does not interpret shell expansion or
+        // natural-language descriptions as schema inspection.
+        assert!(!is_schema_introspection("psql -c \"echo describe orders\""));
+        assert!(!is_schema_introspection("psql -c \"\\drop orders\""));
+        // Like the rest of the classifier, only the first shell segment is
+        // considered; pin that accepted residual behavior.
+        assert!(is_schema_introspection("psql -c \"SHOW TABLES\" | cat"));
     }
 
     #[test]
