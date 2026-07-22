@@ -42,20 +42,28 @@ Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
 
 ## mati Policy Capture
 
-When the developer says \"from now on\", \"before you ever\", \"always X before Y\",
-\"never run X without Y\", or \"make it a rule that\", consider authoring a local
-policy guardrail. A policy `trigger` is JSON with optional `tool`, `host_glob`,
-and `target_path_glob`. Governable tools are `db_client`, `file_read`, and
-`path`; an unknown `tool` value never matches. A policy `requires` object has
-`key`, `via` (`mem_get` or `db_introspection`), and `freshness` (including
-`ttl_secs` and optional `fingerprint`).
+CAPTURE TRIGGERS. Author a policy when the developer either:
+- asks explicitly: \"mati policy: ...\", \"make this a policy\", \"create a policy around this\", \"enforce this\", or \"add a guardrail for this\"; or
+- states a standing directive implicitly: \"from now on\", \"before you ever\", \"always X before Y\", \"never run X without Y\", or \"make it a rule that\".
+In both cases author it without asking for confirmation, matching the existing
+gotcha capture convention. It is created inert, so nothing enforces until the
+developer enables it.
 
-First dry-run the predicate with `mati policy test --trigger '<json>'
---command '<cmd>'` (or `--path '<path>'`), including both matching and
-innocuous examples. Then write it with `mem_set` using a `policy:<slug>` key.
-The policy is created inert: tell the user it was created but is not active and
-must be enabled by a human with `mati policy enable <slug>`. Never claim that
-an agent-authored policy is active; agents cannot enable, edit, or delete it.
+NOT EVERY DIRECTIVE IS A POLICY. A policy can only match a governable action
+category: `db_client`, `file_read`, or `path`. If the directive does not map to
+one of those (for example \"always write better commit messages\"), do not author
+a policy whose trigger can never match. Say plainly that it is not enforceable
+as a policy and offer to capture it as a gotcha or dev note instead.
+
+LIFECYCLE. To create, or refine a policy that is not yet active, use `mem_set`
+with a `policy:<slug>` key. It is created inert. When the developer asks to
+activate, update a live policy, disable, or delete, run the matching
+`mati policy enable|edit|disable|delete <slug>` command via Bash. The developer
+sees a permission prompt and approves it. Do this rather than telling the
+developer to open a terminal. Always dry-run a new or changed predicate with
+`mati policy test --trigger`, against both a command that should match and one
+that should not, before writing. Never claim a policy is active unless it was
+actually enabled.
 
 ## /mati-enrich
 
@@ -337,8 +345,10 @@ mod tests {
         assert!(content.contains("mem_get(\"file:<path>\")"));
         assert!(content.contains("PreToolUse hook enforces this"));
         assert!(content.contains("## mati Policy Capture"));
+        assert!(content.contains("mati policy: ..."));
+        assert!(content.contains("it is not enforceable"));
         assert!(content.contains("mati policy test --trigger"));
-        assert!(content.contains("mati policy enable <slug>"));
+        assert!(content.contains("mati policy enable|edit|disable|delete <slug>"));
     }
 
     #[test]
