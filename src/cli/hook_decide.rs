@@ -416,14 +416,51 @@ async fn run_fileless_policy(
             return Ok(());
         }
     };
-    if !ensure_daemon(&mati_root).await {
-        log_fail_open("<fileless-bash>", "daemon not running after auto-start");
+    let Some((decision, events)) =
+        evaluate_governed_policy(Some(&mati_root), action, agent_id, "<fileless-bash>").await
+    else {
         emit_allow(variant);
         return Ok(());
+    };
+    let (stdout, stderr, exit_code) = format_decision(variant, &decision, "<policy>");
+    if !stdout.is_empty() {
+        println!("{stdout}");
     }
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
+    fire_events(&mati_root, &events, session_id, agent_id).await;
+    if exit_code != 0 {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
 
+/// Evaluate a governed local policy without producing platform output.
+///
+/// `None` is both the non-governed result and the fail-open result. Callers
+/// must preserve their existing decision when it is returned for composition.
+async fn evaluate_governed_policy(
+    mati_root: Option<&Path>,
+    action: &decide::Action,
+    agent_id: Option<&str>,
+    failure_path: &str,
+) -> Option<(Decision, Vec<HookEvent>)> {
+    if action.tool != "db_client" {
+        return None;
+    }
+    let Some(mati_root) = mati_root else {
+        log_fail_open(failure_path, "cannot determine mati root");
+        return None;
+    };
+    if !ensure_daemon(mati_root).await {
+        log_fail_open(failure_path, "daemon not running after auto-start");
+        return None;
+    }
     let response = daemon_v2(
-        &mati_root,
+        mati_root,
         mati_core::mcp::protocol::Command::PolicyEvaluate(
             mati_core::mcp::protocol::PolicyEvaluateInput {
                 action: action.clone(),
@@ -436,24 +473,21 @@ async fn run_fileless_policy(
         DaemonResult::Ok(resp) => match daemon_data(&resp) {
             Some(data) => data,
             None => {
-                log_fail_open("<fileless-bash>", "policy_evaluate returned error");
-                emit_allow(variant);
-                return Ok(());
+                log_fail_open(failure_path, "policy_evaluate returned error");
+                return None;
             }
         },
         _ => {
-            log_fail_open("<fileless-bash>", "policy_evaluate failed");
-            emit_allow(variant);
-            return Ok(());
+            log_fail_open(failure_path, "policy_evaluate failed");
+            return None;
         }
     };
     let verdicts: Vec<mati_core::mcp::protocol::PolicyVerdict> = match serde_json::from_value(data)
     {
         Ok(verdicts) => verdicts,
         Err(_) => {
-            log_fail_open("<fileless-bash>", "policy_evaluate returned invalid data");
-            emit_allow(variant);
-            return Ok(());
+            log_fail_open(failure_path, "policy_evaluate returned invalid data");
+            return None;
         }
     };
     let strict = verdicts.iter().any(|verdict| verdict.strict);
@@ -468,20 +502,7 @@ async fn run_fileless_policy(
         })
         .collect::<Vec<_>>();
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
-    let (stdout, stderr, exit_code) = format_decision(variant, &result.decision, "<policy>");
-    if !stdout.is_empty() {
-        println!("{stdout}");
-    }
-    if !stderr.is_empty() {
-        eprintln!("{stderr}");
-    }
-    let session_id = input.get("session_id").and_then(|v| v.as_str());
-    fire_events(&mati_root, &result.events, session_id, agent_id).await;
-    if exit_code != 0 {
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        std::process::exit(exit_code);
-    }
-    Ok(())
+    Some((result.decision, result.events))
 }
 
 // ── Path extraction ─────────────────────────────────────────────────────────
