@@ -5,6 +5,8 @@
 //! mati config set audit.write_durability strict
 //! mati config get enforcement.retention
 //! mati config set enforcement.retention 365
+//! mati config get policy.mode
+//! mati config set policy.mode advisory
 //! ```
 
 use anyhow::Result;
@@ -19,18 +21,22 @@ pub struct ConfigArgs {
 }
 
 /// All known config keys (mirrors the set validated in `proxy::config_get`).
-const CONFIG_KEYS: &[&str] = &["audit.write_durability", "enforcement.retention"];
+const CONFIG_KEYS: &[&str] = &[
+    "audit.write_durability",
+    "enforcement.retention",
+    "policy.mode",
+];
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., audit.write_durability, enforcement.retention)
+        /// Configuration key (e.g., audit.write_durability, enforcement.retention, policy.mode)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., audit.write_durability, enforcement.retention)
+        /// Configuration key (e.g., audit.write_durability, enforcement.retention, policy.mode)
         key: String,
         /// Value to set
         value: String,
@@ -85,7 +91,20 @@ async fn run_set(proxy: &StoreProxy, key: &str, value: &str) -> Result<()> {
         "enforcement.retention" => {
             println!("enforcement.retention: {value} days");
         }
+        "policy.mode" => {
+            println!("policy.mode: {value}");
+        }
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONFIG_KEYS;
+
+    #[test]
+    fn config_dump_includes_policy_mode() {
+        assert!(CONFIG_KEYS.contains(&"policy.mode"));
+    }
 }

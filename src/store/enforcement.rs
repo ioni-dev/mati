@@ -904,6 +904,9 @@ pub async fn scan_enforcement_events(
 /// Store key for the enforcement mode setting.
 const ENFORCEMENT_MODE_KEY: &str = "enforcement:mode";
 
+/// Store key for the local policy posture kill switch.
+const POLICY_MODE_KEY: &str = "policy:mode";
+
 /// Default retention period in days.
 const DEFAULT_RETENTION_DAYS: u64 = 365;
 
@@ -953,6 +956,50 @@ pub async fn set_enforcement_mode(store: &Store, mode: EnforcementMode) -> Resul
             },
             SubjectKind::Config,
             "enforcement:mode".to_string(),
+            "developer".to_string(),
+            None,
+            "config_changed".to_string(),
+            None,
+        )
+        .await;
+    }
+    Ok(old)
+}
+
+/// Read the policy posture. Policies deny by default when this key is absent
+/// or unreadable; `advisory` is an explicit global kill switch.
+pub async fn get_policy_mode(store: &Store) -> EnforcementMode {
+    match store.get_raw_bytes(POLICY_MODE_KEY).await {
+        Ok(Some(bytes)) => match std::str::from_utf8(&bytes) {
+            Ok("advisory") => EnforcementMode::Advisory,
+            _ => EnforcementMode::Strict,
+        },
+        _ => EnforcementMode::Strict,
+    }
+}
+
+/// Persist the policy posture and return the previous value.
+pub async fn set_policy_mode(store: &Store, mode: EnforcementMode) -> Result<EnforcementMode> {
+    let old = get_policy_mode(store).await;
+    let value = match mode {
+        EnforcementMode::Advisory => "advisory",
+        EnforcementMode::Strict => "strict",
+    };
+    store.put_raw(POLICY_MODE_KEY, value.as_bytes()).await?;
+    if old != mode {
+        let label = |mode: EnforcementMode| match mode {
+            EnforcementMode::Advisory => "advisory",
+            EnforcementMode::Strict => "strict",
+        };
+        let _ = record_event(
+            store,
+            EnforcementEventType::EnforcementConfigChanged {
+                setting: "policy.mode".to_string(),
+                old_value: label(old).to_string(),
+                new_value: label(mode).to_string(),
+            },
+            SubjectKind::Config,
+            POLICY_MODE_KEY.to_string(),
             "developer".to_string(),
             None,
             "config_changed".to_string(),
