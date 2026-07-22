@@ -203,9 +203,10 @@ never block Claude on a mati outage — hooks fail open (P9).
   `NotebookEdit`) is a BACKSTOP, not the primary blocker: keyed on
   `consulted_recent` (TTL), it denies via `permissionDecision: deny` only an edit
   whose consultation has gone stale, or one that satisfied read-before-edit via a
-  shell read the best-effort pre-bash path missed. Context-bearing non-deny
-  outcomes inject `additionalContext` without a `permissionDecision`; other
-  non-deny outcomes defer with empty stdout. The adapter never emits
+  shell read the best-effort pre-bash path missed. `Advisory`/`Liability` and
+  policy steer context inject `additionalContext`
+  without a `permissionDecision`; `AlreadyConsulted` and other non-deny
+  outcomes defer with empty stdout. The adapter never emits
   `permissionDecision: allow` for edits because edits are permission-required
   and force-allow would suppress the user's edit prompt (reads are
   no-permission tools, so the read gate's `allow` is a harmless no-op there).

@@ -570,6 +570,11 @@ fn merge_policy_result(
             Decision::Advisory { context } => Decision::Advisory {
                 context: format!("{context}\n{policy_context}"),
             },
+            Decision::AlreadyConsulted { .. } if variant == HookVariant::ClaudePreEdit => {
+                Decision::Advisory {
+                    context: policy_context,
+                }
+            }
             Decision::AlreadyConsulted { context } => Decision::AlreadyConsulted {
                 context: format!("{context}\n{policy_context}"),
             },
@@ -1535,11 +1540,6 @@ fn format_decision(
             // actual cause — a local gotcha OR an org consultation mandate — instead of always
             // claiming "Confirmed gotcha".
             Decision::Deny { reason, .. } => (format_deny(reason), String::new(), 0),
-            Decision::AlreadyConsulted { context } => (
-                format_context_only(&format!("[mati] Record already consulted. {context}")),
-                String::new(),
-                0,
-            ),
             Decision::Advisory { context } | Decision::Liability { context, .. } => (
                 format_context_only(&format!("[mati] {context}")),
                 String::new(),
@@ -2340,6 +2340,59 @@ mod tests {
         assert!(edit_adapter
             .stdout
             .contains(r#""permissionDecision":"deny""#));
+
+        let mut edit_consulted = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::AlreadyConsulted {
+                context: "Record already consulted. Gotcha guidance.".into(),
+            },
+        };
+        merge_policy_result(
+            &mut edit_consulted,
+            HookVariant::ClaudePreEdit,
+            Decision::Advisory {
+                context: "Policy rule for this edit.".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(edit_consulted.decision, Decision::Advisory { .. }));
+        assert!(edit_consulted.stdout.contains("Policy rule for this edit."));
+        assert!(edit_consulted.stdout.contains("additionalContext"));
+        assert!(!edit_consulted.stdout.contains("permissionDecision"));
+        assert!(!edit_consulted.stdout.contains("Record already consulted"));
+
+        let mut bash_consulted = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::AlreadyConsulted {
+                context: "Record already consulted. Gotcha guidance.".into(),
+            },
+        };
+        merge_policy_result(
+            &mut bash_consulted,
+            HookVariant::ClaudePreBash,
+            Decision::Advisory {
+                context: "Policy rule for this command.".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(
+            bash_consulted.decision,
+            Decision::AlreadyConsulted { ref context }
+                if context.contains("Record already consulted")
+                    && context.contains("Policy rule for this command.")
+        ));
+        assert!(bash_consulted
+            .stdout
+            .contains("Record already consulted. Gotcha guidance."));
+        assert!(bash_consulted
+            .stdout
+            .contains("Policy rule for this command."));
     }
 
     #[test]
@@ -2541,14 +2594,13 @@ mod tests {
     fn e2e_claude_pre_edit_defers_after_consult() {
         // With a RECENT consultation receipt (consulted_recent, matching the
         // Codex apply_patch edit gate), the edit keeps its normal permission
-        // flow and may inject context — deliberately NOT a forced allow.
+        // flow and defers silently — deliberately NOT a forced allow.
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
         let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0);
-        assert!(result.stdout.contains("additionalContext"));
-        assert!(!result.stdout.contains("permissionDecision"));
+        assert!(result.stdout.is_empty());
         assert!(result.stderr.is_empty());
         assert!(matches!(result.decision, Decision::AlreadyConsulted { .. }));
         // Plane 2: a consulted edit records an EditConsulted event (→
