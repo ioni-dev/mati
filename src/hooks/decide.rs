@@ -241,18 +241,19 @@ pub fn extract_file_paths(cmd: &str, class: CommandClass) -> Vec<String> {
     // throw off extraction (`sudo cat foo` must extract `foo`, not `cat`).
     let eff = effective_command(cmd);
     let cmd_part = split_at_shell_operator(&eff);
-    let positionals = positional_args(&shell_tokens(cmd_part));
+    let tokens = shell_tokens(cmd_part);
 
     match class {
-        CommandClass::CatLike => positionals,
+        CommandClass::CatLike => positional_args(&tokens),
         CommandClass::GrepLike => {
+            let positionals = positional_args(&tokens);
             if positionals.len() >= 2 {
                 positionals[1..].to_vec()
             } else {
                 Vec::new()
             }
         }
-        CommandClass::DbClientLike => extract_db_file_paths(&shell_tokens(cmd_part)),
+        CommandClass::DbClientLike => extract_db_file_paths(&tokens),
     }
 }
 
@@ -287,6 +288,7 @@ fn extract_db_file_paths(tokens: &[String]) -> Vec<String> {
 fn extract_db_host(command: &str) -> Option<String> {
     let tokens = shell_tokens(split_at_shell_operator(command));
     let mut expects_host = false;
+    let mut env_host = None;
     for token in &tokens {
         if expects_host {
             return (!token.is_empty()).then(|| token.clone());
@@ -298,12 +300,14 @@ fn extract_db_host(command: &str) -> Option<String> {
         } else if let Some(host) = token.strip_prefix("-h=") {
             return (!host.is_empty()).then(|| host.to_string());
         } else if let Some(value) = token.strip_prefix("PGHOST=") {
-            return (!value.is_empty()).then(|| value.to_string());
+            if !value.is_empty() {
+                env_host = Some(value.to_string());
+            }
         } else if let Some(value) = token.strip_prefix("DATABASE_URL=") {
-            return database_url_host(value);
+            env_host = database_url_host(value);
         }
     }
-    None
+    env_host
 }
 
 /// Pull the authority host from a DATABASE_URL without introducing a URL
@@ -323,6 +327,11 @@ fn database_url_host(value: &str) -> Option<String> {
         .rsplit_once('@')
         .map(|(_, host)| host)
         .unwrap_or(authority);
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .unwrap_or(host);
     (!host.is_empty()).then(|| host.to_string())
 }
 
@@ -360,6 +369,9 @@ pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Act
     }
     if action.target_path.is_none() {
         action.target_path = action.files.first().cloned();
+    }
+    if action.tool == "unknown" && action.target_path.is_some() {
+        action.tool = "path".to_string();
     }
     action
 }
@@ -1663,16 +1675,31 @@ mod tests {
 
     #[test]
     fn normalize_db_action_extracts_host_from_environment_assignment() {
-        let action = normalize_action(Some("PGHOST=db.prod.internal psql -c \"select 1\""), None);
+        let action = normalize_action(Some("PGHOST=a psql -c \"select 1\""), None);
         assert_eq!(action.tool, "db_client");
-        assert_eq!(action.host.as_deref(), Some("db.prod.internal"));
+        assert_eq!(action.host.as_deref(), Some("a"));
         assert!(action.files.is_empty());
+
+        let explicit_action = normalize_action(Some("PGHOST=a psql -h b -c select"), None);
+        assert_eq!(explicit_action.host.as_deref(), Some("b"));
 
         let url_action = normalize_action(
             Some("DATABASE_URL=postgres://db.prod.internal/orders psql -c select"),
             None,
         );
         assert_eq!(url_action.host.as_deref(), Some("db.prod.internal"));
+
+        let port_action = normalize_action(
+            Some("DATABASE_URL=postgres://db.prod.internal:5432/orders psql -c select"),
+            None,
+        );
+        assert_eq!(port_action.host.as_deref(), Some("db.prod.internal"));
+
+        let ipv6_action = normalize_action(
+            Some("DATABASE_URL=postgres://[::1]/orders psql -c select"),
+            None,
+        );
+        assert_eq!(ipv6_action.host.as_deref(), Some("[::1]"));
     }
 
     #[test]
@@ -1688,6 +1715,7 @@ mod tests {
                 files: vec!["migrations/orders.sql".into()],
             }
         );
+        assert_eq!(normalize_action(Some("ls -la"), Some("x.sql")).tool, "path");
     }
 
     #[test]
