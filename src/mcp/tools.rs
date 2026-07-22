@@ -285,6 +285,74 @@ impl MatiServer {
         )
     )]
     pub(crate) async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
+        if params.key.starts_with("policy:") {
+            let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
+            if params.action == "confirm" {
+                return json!({"error": format!("policies are activated with `mati policy enable {slug}`")}).to_string();
+            }
+            let existing = match self
+                .socket_call("get", json!({"key": params.key}))
+                .await
+                .as_str()
+            {
+                "null" => None,
+                value => match serde_json::from_str::<crate::store::Record>(value) {
+                    Ok(record) => Some(record),
+                    Err(_) => return value.to_string(),
+                },
+            };
+            if params.action == "delete" {
+                if existing
+                    .as_ref()
+                    .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
+                    .is_some_and(|policy| policy.enabled)
+                {
+                    return json!({"error": format!("policy {} is active; delete it with `mati policy delete {slug}` so the change is approved.", params.key)}).to_string();
+                }
+                return self
+                    .socket_call_typed(Command::PolicyWrite(
+                        crate::mcp::protocol::PolicyWriteInput {
+                            op: crate::mcp::protocol::PolicyWriteOp::Delete,
+                            key: params.key.clone(),
+                            policy: None,
+                        },
+                    ))
+                    .await;
+            }
+            if matches!(params.action.as_str(), "write" | "") {
+                if existing
+                    .as_ref()
+                    .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
+                    .is_some_and(|policy| policy.enabled)
+                {
+                    return json!({"error": format!("policy {} is active; change it with `mati policy edit {slug}` so the change is approved.", params.key)}).to_string();
+                }
+                let payload = match &params.payload {
+                    serde_json::Value::String(value) => {
+                        serde_json::from_str(value).unwrap_or_else(|_| params.payload.clone())
+                    }
+                    value => value.clone(),
+                };
+                let mut policy: crate::store::PolicyRecord = match serde_json::from_value(payload) {
+                    Ok(policy) => policy,
+                    Err(error) => return json!({"error": format!("policy payload must deserialize into PolicyRecord: {error}")}).to_string(),
+                };
+                policy.enabled = false;
+                return self
+                    .socket_call_typed(Command::PolicyWrite(
+                        crate::mcp::protocol::PolicyWriteInput {
+                            op: if existing.is_some() {
+                                crate::mcp::protocol::PolicyWriteOp::Edit
+                            } else {
+                                crate::mcp::protocol::PolicyWriteOp::Create
+                            },
+                            key: params.key.clone(),
+                            policy: Some(policy),
+                        },
+                    ))
+                    .await;
+            }
+        }
         // Route mem_set through typed Commands via proxy_daemon_v2. The
         // legacy v1 mapper has no arms for gotcha_upsert / gotcha_confirm /
         // gotcha_tombstone / decision_upsert / dev_note_upsert / the bogus
@@ -364,14 +432,18 @@ fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String>
         if slug.is_empty() {
             return Err("policy key must not be just the prefix".into());
         }
-        let mut policy: crate::store::PolicyRecord = serde_json::from_value(payload)
-            .map_err(|error| format!("policy payload must deserialize into PolicyRecord: {error}"))?;
+        let mut policy: crate::store::PolicyRecord =
+            serde_json::from_value(payload).map_err(|error| {
+                format!("policy payload must deserialize into PolicyRecord: {error}")
+            })?;
         policy.enabled = false;
-        return Ok(Command::PolicyWrite(crate::mcp::protocol::PolicyWriteInput {
-            op: crate::mcp::protocol::PolicyWriteOp::Create,
-            key: params.key.clone(),
-            policy: Some(policy),
-        }));
+        return Ok(Command::PolicyWrite(
+            crate::mcp::protocol::PolicyWriteInput {
+                op: crate::mcp::protocol::PolicyWriteOp::Create,
+                key: params.key.clone(),
+                policy: Some(policy),
+            },
+        ));
     }
 
     if let Some(stripped) = params.key.strip_prefix("gotcha:") {
@@ -2376,7 +2448,12 @@ mod tests {
         assert_eq!(parsed["enabled"], false);
 
         let graph = graph_arc.read().await;
-        let record = graph.store().get("policy:query-safety").await.unwrap().unwrap();
+        let record = graph
+            .store()
+            .get("policy:query-safety")
+            .await
+            .unwrap()
+            .unwrap();
         let policy = record.payload_as::<PolicyRecord>().unwrap();
         assert!(!policy.enabled);
         assert!(PolicyMatcherSet::from_records(&[record])
@@ -2414,9 +2491,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mem_set_rejects_policy_delete_for_human_delete_path() {
+    async fn mem_set_deletes_inert_policy() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
+        let policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
+        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
+            .await
+            .unwrap();
         let graph = Graph::load(store).await.unwrap();
         let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
         let result = call_mem_set(
@@ -2432,7 +2513,88 @@ mod tests {
             },
         )
         .await;
-        assert!(result.contains("mati policy delete <slug>"), "{result}");
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true, "{result}");
+        let graph = graph_arc.read().await;
+        let record = graph
+            .store()
+            .get("policy:query-safety")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            record.lifecycle,
+            RecordLifecycle::Tombstoned { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_delete_of_active_policy() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
+        policy.enabled = true;
+        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
+            .await
+            .unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "delete".into(),
+                key: "policy:query-safety".into(),
+                value: String::new(),
+                category: "Policy".into(),
+                payload: serde_json::Value::Null,
+                tags: vec![],
+                priority: "Normal".into(),
+            },
+        )
+        .await;
+        assert!(
+            result.contains("mati policy delete query-safety"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_set_edits_existing_inert_policy_and_keeps_it_disabled() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
+        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
+            .await
+            .unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+        let mut revised = policy_payload(true);
+        revised["rule"] = serde_json::json!("Consult the current schema first.");
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "write".into(),
+                key: "policy:query-safety".into(),
+                value: String::new(),
+                category: "Policy".into(),
+                payload: revised,
+                tags: vec![],
+                priority: "High".into(),
+            },
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true, "{result}");
+        let graph = graph_arc.read().await;
+        let record = graph
+            .store()
+            .get("policy:query-safety")
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = record.payload_as::<PolicyRecord>().unwrap();
+        assert_eq!(policy.rule, "Consult the current schema first.");
+        assert!(!policy.enabled);
     }
 
     #[tokio::test]
@@ -2459,7 +2621,7 @@ mod tests {
             },
         )
         .await;
-        assert!(result.contains("already exists"), "{result}");
+        assert!(result.contains("mati policy edit query-safety"), "{result}");
     }
 
     // `mem_set_preserves_existing_layer0_data` was removed: file: writes

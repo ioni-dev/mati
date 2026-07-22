@@ -27,9 +27,9 @@ use crate::health::quality;
 use crate::mcp::protocol::{self, AuditEntry, ErrorCode};
 use crate::store::db::KnowledgeWriteOp;
 use crate::store::record::{
-    Category, ConfidenceScore, FileRecord, GotchaRecord, PolicyRecord,
-    Priority as StorePriority, QualityScore, Record, RecordLifecycle, RecordSource, RecordVersion,
-    StalenessScore, TombstoneReason,
+    Category, ConfidenceScore, FileRecord, GotchaRecord, PolicyRecord, Priority as StorePriority,
+    QualityScore, Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    TombstoneReason,
 };
 use crate::store::Store;
 
@@ -2182,27 +2182,46 @@ async fn apply_mem_set_write(
 
     if category == Category::Policy {
         let payload = match &params.payload {
-            serde_json::Value::String(s) => serde_json::from_str(s)
-                .unwrap_or_else(|_| params.payload.clone()),
+            serde_json::Value::String(s) => {
+                serde_json::from_str(s).unwrap_or_else(|_| params.payload.clone())
+            }
             other => other.clone(),
         };
-        let mut policy: PolicyRecord = match serde_json::from_value(payload) {
-            Ok(policy) => policy,
-            Err(error) => {
-                return serde_json::json!({
+        let mut policy: PolicyRecord =
+            match serde_json::from_value(payload) {
+                Ok(policy) => policy,
+                Err(error) => return serde_json::json!({
                     "error": format!("policy payload must deserialize into PolicyRecord: {error}")
                 })
-                .to_string()
-            }
-        };
+                .to_string(),
+            };
         policy.enabled = false;
+        if let Some(existing) = existing_record.as_ref() {
+            if let Some(existing_policy) = existing.payload_as::<PolicyRecord>() {
+                if existing_policy.enabled {
+                    let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
+                    return serde_json::json!({
+                        "error": format!(
+                            "policy {} is active; change it with `mati policy edit {slug}` so the change is approved.",
+                            params.key
+                        )
+                    })
+                    .to_string();
+                }
+            }
+        }
         let has_backing_record = match store.get(&policy.requires.key).await {
             Ok(record) => record.is_some_and(|record| {
                 !matches!(record.lifecycle, RecordLifecycle::Tombstoned { .. })
             }),
             Err(error) => return serde_json::json!({"error": error.to_string()}).to_string(),
         };
-        if let Err(error) = crate::store::policy_ops::create(store, &params.key, &policy).await {
+        let result = if existing_record.is_some() && !is_tombstoned {
+            crate::store::policy_ops::edit(store, &params.key, &policy).await
+        } else {
+            crate::store::policy_ops::create(store, &params.key, &policy).await
+        };
+        if let Err(error) = result {
             return serde_json::json!({"error": error.to_string()}).to_string();
         }
         return serde_json::json!({
@@ -2715,10 +2734,30 @@ async fn apply_mem_set_delete(
     key: &str,
 ) -> String {
     if key.starts_with("policy:") {
-        return serde_json::json!({
-            "error": "policies are removed with `mati policy delete <slug>`"
-        })
-        .to_string();
+        let graph = graph_arc.read().await;
+        let record = match graph.store().get(key).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return serde_json::json!({"error": format!("record not found: {key}")}).to_string()
+            }
+            Err(error) => return serde_json::json!({"error": error.to_string()}).to_string(),
+        };
+        if record
+            .payload_as::<PolicyRecord>()
+            .is_some_and(|policy| policy.enabled)
+        {
+            let slug = key.strip_prefix("policy:").unwrap_or(key);
+            return serde_json::json!({
+                "error": format!(
+                    "policy {key} is active; delete it with `mati policy delete {slug}` so the change is approved."
+                )
+            })
+            .to_string();
+        }
+        return match crate::store::policy_ops::delete(graph.store(), key).await {
+            Ok(()) => serde_json::json!({"ok": true, "key": key, "tombstoned": true}).to_string(),
+            Err(error) => serde_json::json!({"error": error.to_string()}).to_string(),
+        };
     }
     // Phase 1: read lock — validate and tombstone the record.
     let affected_files = {
