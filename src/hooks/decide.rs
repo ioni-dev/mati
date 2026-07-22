@@ -184,6 +184,19 @@ const DB_CLIENT_LIKE: &[&str] = &[
     "sqlcmd",
 ];
 
+const ACTION_TOOL_DB_CLIENT: &str = "db_client";
+const ACTION_TOOL_FILE_READ: &str = "file_read";
+const ACTION_TOOL_PATH: &str = "path";
+
+/// Return whether a policy trigger names an action category emitted by the
+/// normalizer. Unknown values remain valid authoring data, but cannot match.
+pub fn is_known_action_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        ACTION_TOOL_DB_CLIENT | ACTION_TOOL_FILE_READ | ACTION_TOOL_PATH
+    )
+}
+
 /// Returns true if `trimmed` starts with `word` followed by whitespace
 /// (or is exactly `word`). Prevents `"catch"` matching `"cat"`.
 fn matches_command_word(trimmed: &str, word: &str) -> bool {
@@ -422,12 +435,12 @@ pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Act
     if let Some(class) = classify_command(command) {
         match class {
             CommandClass::DbClientLike => {
-                action.tool = "db_client".to_string();
+                action.tool = ACTION_TOOL_DB_CLIENT.to_string();
                 action.host = extract_db_host(command);
                 action.files.extend(extract_file_paths(command, class));
             }
             CommandClass::CatLike | CommandClass::GrepLike => {
-                action.tool = "file_read".to_string();
+                action.tool = ACTION_TOOL_FILE_READ.to_string();
                 action.files.extend(extract_file_paths(command, class));
             }
         }
@@ -436,7 +449,7 @@ pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Act
         action.target_path = action.files.first().cloned();
     }
     if action.tool == "unknown" && action.target_path.is_some() {
-        action.tool = "path".to_string();
+        action.tool = ACTION_TOOL_PATH.to_string();
     }
     action
 }
@@ -1856,4 +1869,14 @@ mod tests {
         assert_eq!(result.decision, Decision::Allow);
         assert!(result.events.is_empty());
     }
+
+    #[test]
+    fn known_action_tools_are_distinguished_from_unknown_tools() {
+        assert!(is_known_action_tool("db_client"));
+        assert!(is_known_action_tool("file_read"));
+        assert!(is_known_action_tool("path"));
+        assert!(!is_known_action_tool("dbclient"));
+        assert!(!is_known_action_tool("db-client"));
+    }
+
 }

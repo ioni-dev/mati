@@ -14,7 +14,7 @@ use base64::Engine;
 use clap::{Args, Subcommand};
 use slugify::slugify;
 
-use mati_core::hooks::decide::{normalize_action, Action};
+use mati_core::hooks::decide::{is_known_action_tool, normalize_action, Action};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
 use mati_core::store::{PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority};
 
@@ -178,6 +178,17 @@ async fn add(args: AddArgs) -> Result<()> {
         severity: parse_priority(&args.severity)?,
         created_by: args.created_by,
     };
+    if let Some(tool) = policy
+        .trigger
+        .tool
+        .as_deref()
+        .filter(|t| !is_known_action_tool(t))
+    {
+        eprintln!("warning: policy trigger tool '{tool}' is not a recognized governable category");
+        eprintln!(
+            "(known: db_client, file_read, path); this policy will never match until such a category is supported."
+        );
+    }
     let key = format!("policy:{slug}");
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
