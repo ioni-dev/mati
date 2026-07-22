@@ -106,11 +106,7 @@ mati_p init >/dev/null
 hook claude-pre-bash "$(pre_bash '"psql -h db.warmup.internal -c \"select 1\""')" >/dev/null 2>&1
 sleep 2
 
-# Blocking is gated on the global enforcement mode, which currently lives behind
-# the confusingly named `audit.write_durability` key. When a dedicated
-# `policy.mode` key lands, this is the ONE line that changes.
-mati_p config set audit.write_durability strict >/dev/null
-pass "store initialized, daemon auto-spawned, strict mode set"
+pass "store initialized, daemon auto-spawned, policy mode defaults strict"
 
 # ── 1. Inert until enabled, then blocks ──────────────────────────────────────
 step "1. Inert by default, enforcing after enable"

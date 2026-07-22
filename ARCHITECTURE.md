@@ -538,7 +538,7 @@ The daemon returns data, not decisions. It reports which policies matched and wh
 
 ### 10a.4 Outcomes
 
-A policy is `steer` or `block`. `steer` injects the policy's rule as context. `block` denies until the required consultation receipt exists. Whether a block actually denies is gated by the global `enforcement:mode`: `strict` denies, `advisory` degrades the block to a steer. A failure to read the mode defaults to advisory, so an unreadable setting never escalates into a deny.
+A policy is `steer` or `block`. `steer` injects the policy's rule as context. `block` denies until the required consultation receipt exists. Whether a block actually denies is controlled by the dedicated `policy.mode` setting: it defaults to `strict`, while explicit `advisory` is a global kill switch that degrades every block to a steer. A failure to read the setting also defaults to strict, so an unreadable setting never silently disables policy enforcement. `audit.write_durability` remains independent and controls only enforcement-event writes.
 
 Three paths enforce policies: a bash command with no file (`psql -c "..."`), a bash command carrying one (`psql -f x.sql`), and an edit to a matching path (`Edit`, `Write`, `NotebookEdit`). All three share one output shape. A deny sets `permissionDecision: "deny"`. A steer injects `additionalContext` with no `permissionDecision` field at all.
 
