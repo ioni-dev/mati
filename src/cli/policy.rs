@@ -202,6 +202,16 @@ async fn add(args: AddArgs) -> Result<()> {
     {
         eprintln!("{}", unbacked_requires_warning(&policy.requires.key));
     }
+    if policy.requires.freshness.fingerprint
+        && !policy
+            .requires
+            .via
+            .contains(&mati_core::store::ReceiptSource::MemGet)
+    {
+        eprintln!(
+            "warning: requires.freshness.fingerprint is unsatisfiable without MemGet; DbIntrospection receipts do not carry a content fingerprint."
+        );
+    }
     let result = proxy
         .policy_write(
             mati_core::mcp::protocol::PolicyWriteOp::Create,
@@ -323,14 +333,6 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     proxy.close().await?;
     println!("{output}");
     Ok(())
-}
-
-fn render_test_output(
-    action: &Action,
-    matches: &[mati_core::mcp::protocol::PolicyVerdict],
-    json_output: bool,
-) -> Result<String> {
-    render_test_output_with_warnings(action, matches, &[], json_output)
 }
 
 fn render_test_output_with_warnings(
@@ -486,6 +488,7 @@ mod tests {
         .unwrap();
         assert_eq!(trigger.tool.as_deref(), Some("db_client"));
         assert_eq!(requires.freshness.ttl_secs, 900);
+        assert!(!requires.freshness.fingerprint);
     }
 
     #[test]
@@ -526,14 +529,14 @@ mod tests {
                 strict: false,
             })
             .collect::<Vec<_>>();
-        let output = render_test_output(&action, &matches, false).unwrap();
+        let output = render_test_output_with_warnings(&action, &matches, &[], false).unwrap();
         assert!(output.contains("policy:prod [block; would-block] Consult the schema first."));
     }
 
     #[test]
     fn policy_test_output_json_contains_action_and_matches() {
         let action = normalize_action(Some("ls -la"), None);
-        let output = render_test_output(&action, &[], true).unwrap();
+        let output = render_test_output_with_warnings(&action, &[], &[], true).unwrap();
         let json: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(json["action"]["tool"], "unknown");
         assert!(json["matches"].as_array().unwrap().is_empty());
@@ -568,5 +571,21 @@ mod tests {
         let warning = unbacked_requires_warning("schema:orders");
         assert!(warning.contains("without the agent learning anything"));
         assert!(warning.contains("Store a record at that key"));
+    }
+
+    #[test]
+    fn fingerprint_warning_requires_memget_source() {
+        let policy = PolicyRequires {
+            key: "schema:orders".into(),
+            via: vec![mati_core::store::ReceiptSource::DbIntrospection],
+            freshness: mati_core::store::PolicyFreshness {
+                ttl_secs: 900,
+                fingerprint: true,
+            },
+        };
+        assert!(!policy
+            .via
+            .contains(&mati_core::store::ReceiptSource::MemGet));
+        assert!(policy.freshness.fingerprint);
     }
 }

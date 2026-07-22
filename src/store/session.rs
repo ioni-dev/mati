@@ -954,6 +954,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fingerprinted_receipt_invalidates_after_content_drift() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        log_hit(&store, key).await.unwrap();
+
+        let receipt = store.get(&receipt_key(key, None)).await.unwrap().unwrap();
+        assert!(receipt
+            .payload_as::<ConsultationReceipt>()
+            .and_then(|payload| payload.fingerprint)
+            .is_some());
+        assert!(check_consulted_recent_fingerprinted(&store, key, 900, None)
+            .await
+            .unwrap());
+
+        let mut changed = store.get(key).await.unwrap().unwrap();
+        changed.value = "orders v2".into();
+        store.put(key, &changed).await.unwrap();
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_rejects_legacy_or_introspection_receipts() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        let (receipt_key_value, receipt_bytes) = consultation_receipt_staged(key, None).unwrap();
+        store
+            .transact_sessions_raw(&[(&receipt_key_value, &receipt_bytes)])
+            .await
+            .unwrap();
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_still_enforces_ttl() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        log_hit(&store, key).await.unwrap();
+        let receipt_key_value = receipt_key(key, None);
+        let mut receipt = store.get(&receipt_key_value).await.unwrap().unwrap();
+        receipt.updated_at = 0;
+        store.put(&receipt_key_value, &receipt).await.unwrap();
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn consult_receipt_is_actor_scoped_when_actor_present() {
         let (_dir, store) = temp_store().await;
 

@@ -1324,6 +1324,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_policy_evaluate_invalidates_fingerprinted_receipt_on_drift() {
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "schema:orders";
+        store
+            .put(
+                key,
+                &mati_core::store::session::session_record(key, "orders v1".into()),
+            )
+            .await
+            .unwrap();
+        mati_core::store::session::log_hit(&store, key)
+            .await
+            .unwrap();
+        let policy = mati_core::store::PolicyRecord {
+            name: "Fingerprint query".into(),
+            rule: "Consult current schema.".into(),
+            reason: "Schemas drift because deployments change.".into(),
+            scope: "repo".into(),
+            mode: mati_core::store::PolicyMode::Block,
+            trigger: mati_core::store::PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: mati_core::store::PolicyRequires {
+                key: key.into(),
+                via: vec![mati_core::store::ReceiptSource::MemGet],
+                freshness: mati_core::store::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: true,
+                },
+            },
+            enabled: true,
+            severity: mati_core::store::Priority::High,
+            created_by: "test".into(),
+        };
+        mati_core::store::policy_ops::create(&store, "policy:fingerprint", &policy)
+            .await
+            .unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Direct(store),
+        };
+        let action = mati_core::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.prod.internal".into()),
+            argv: vec!["psql".into()],
+            files: vec![],
+        };
+        assert!(proxy.policy_evaluate(&action, None).await.unwrap()[0].satisfied);
+
+        let mut changed = proxy.get(key).await.unwrap().unwrap();
+        changed.value = "orders v2".into();
+        proxy.put(key, &changed).await.unwrap();
+        assert!(!proxy.policy_evaluate(&action, None).await.unwrap()[0].satisfied);
+    }
+
+    #[tokio::test]
     async fn socket_scan_prefix_errors_when_daemon_is_missing() {
         let dir = TempDir::new().unwrap();
         let proxy = StoreProxy {
