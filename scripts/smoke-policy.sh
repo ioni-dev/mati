@@ -304,6 +304,28 @@ OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-adv.internal -c \"UPDA
 assert_lacks "advisory does not deny"      "$OUT" 'permissionDecision'
 assert_has   "advisory still injects"      "$OUT" 'additionalContext'
 assert_has   "advisory names the remedy"   "$OUT" 'schema:adv'
+
+# One setting, every policy: an operator flipping this during an incident must
+# not have to find and disable each rule.
+add_block_policy adv2 '*prod-adv2*' 'schema:adv2' 'mem_get'
+mati_p policy enable adv2 >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-adv2.internal -c \"select 1\""')")"
+assert_lacks "advisory is global, not per-policy" "$OUT" 'permissionDecision'
+
+# It is a stored setting, not daemon state, so a restart must not re-arm it.
+mati_p daemon stop >/dev/null; sleep 1
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-adv.internal -c \"select 1\""')")"
+assert_lacks "advisory survives a daemon restart" "$OUT" 'permissionDecision'
+
+# Blast radius: the switch governs policy only. A confirmed gotcha must keep
+# denying, or an operator silencing policy would silently drop the file gate too.
+echo "fn helper() {}" > "$PROJECT/gate.rs"
+( cd "$PROJECT" && git add gate.rs && git -c user.email=s@s -c user.name=s commit -qm gate ) >/dev/null 2>&1
+GK="$(mati_p gotcha add gate.rs -r "Never edit gate.rs blindly" -m "Because it breaks the build" -s critical | grep -o 'gotcha:[a-z0-9-]*' | head -1)"
+mati_p gotcha confirm "${GK#gotcha:}" >/dev/null 2>&1
+OUT="$(hook claude-pre-read "$(printf '{"session_id":"smoke","hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"%s/gate.rs"}}' "$PROJECT")")"
+assert_has "gotcha gate still denies under advisory" "$OUT" 'permissionDecision":"deny"'
+
 mati_p config set policy.mode strict >/dev/null
 OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-adv.internal -c \"UPDATE orders SET s=1\""')")"
 assert_has   "strict denies again"         "$OUT" 'permissionDecision":"deny"'
