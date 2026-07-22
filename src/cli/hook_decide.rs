@@ -534,6 +534,7 @@ async fn evaluate_governed_policy(
             block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
                 && (!introspection_exemption || verdict.satisfied),
             satisfied: verdict.satisfied,
+            stage: verdict.stage,
         })
         .collect::<Vec<_>>();
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
@@ -1360,6 +1361,7 @@ async fn fire_events(
                 key: key.clone(),
                 session_id: sid(),
             }),
+            HookEvent::PolicyShadowObserved { .. } => continue,
         };
         // Fire-and-forget — drop silently on failure (P9).
         let _ = super::daemon::daemon_v2(mati_root, cmd).await;
@@ -1786,6 +1788,7 @@ mod tests {
                 requires_key: "schema:orders".into(),
                 block: false,
                 satisfied: false,
+                stage: mati_core::store::PolicyStage::Enforce,
             }],
             true,
         );
@@ -1801,6 +1804,7 @@ mod tests {
                 requires_key: "schema:orders".into(),
                 block: true,
                 satisfied: true,
+                stage: mati_core::store::PolicyStage::Enforce,
             }],
             true,
         );

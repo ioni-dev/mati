@@ -88,6 +88,8 @@ pub enum HookEvent {
     PolicyConsultBlocked { key: String },
     /// Local policy allowed a governed action after its receipt was present.
     PolicyConsulted { key: String },
+    /// A shadow policy would have blocked, but never changes the decision.
+    PolicyShadowObserved { key: String },
 }
 
 /// The I/O-free subset of a daemon policy verdict needed by the hook adapter.
@@ -98,6 +100,7 @@ pub struct PolicyVerdict {
     pub requires_key: String,
     pub block: bool,
     pub satisfied: bool,
+    pub stage: crate::store::PolicyStage,
 }
 
 /// Apply local policy verdicts with escalate-only semantics.
@@ -110,6 +113,14 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
     let mut denied = None;
 
     for verdict in verdicts {
+        if matches!(verdict.stage, crate::store::PolicyStage::Shadow) {
+            if verdict.block && !verdict.satisfied {
+                events.push(HookEvent::PolicyShadowObserved {
+                    key: verdict.key.clone(),
+                });
+            }
+            continue;
+        }
         if verdict.block && !verdict.satisfied && strict {
             denied.get_or_insert_with(|| Decision::Deny {
                 file_key: verdict.key.clone(),
@@ -1899,6 +1910,7 @@ mod tests {
             requires_key: "schema:orders".into(),
             block,
             satisfied,
+            stage: crate::store::PolicyStage::Enforce,
         }
     }
 
@@ -1912,6 +1924,19 @@ mod tests {
                 key: "policy:prod-query".into()
             }]
         );
+    }
+
+    #[test]
+    fn shadow_would_block_is_observation_only() {
+        let mut verdict = policy(true, false, "Consult first.");
+        verdict.stage = crate::store::PolicyStage::Shadow;
+        let shadow = evaluate_policy_verdicts(&[verdict], true);
+        let none = evaluate_policy_verdicts(&[], true);
+        assert_eq!(shadow.decision, none.decision);
+        assert!(matches!(
+            shadow.events.as_slice(),
+            [HookEvent::PolicyShadowObserved { .. }]
+        ));
     }
 
     #[test]
@@ -1973,6 +1998,7 @@ mod tests {
                 requires_key: "schema:a".into(),
                 block: true,
                 satisfied: true,
+                stage: crate::store::PolicyStage::Enforce,
             },
             PolicyVerdict {
                 key: "policy:S".into(),
@@ -1980,6 +2006,7 @@ mod tests {
                 requires_key: "schema:s".into(),
                 block: false,
                 satisfied: true,
+                stage: crate::store::PolicyStage::Enforce,
             },
             PolicyVerdict {
                 key: "policy:B".into(),
@@ -1987,6 +2014,7 @@ mod tests {
                 requires_key: "schema:b".into(),
                 block: true,
                 satisfied: false,
+                stage: crate::store::PolicyStage::Enforce,
             },
         ];
         let result = evaluate_policy_verdicts(&verdicts, true);

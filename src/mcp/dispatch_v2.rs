@@ -573,10 +573,26 @@ async fn dispatch_policy_write(
             }
         },
         protocol::PolicyWriteOp::Enable => {
-            crate::store::policy_ops::set_enabled(store, &input.key, true).await
+            crate::store::policy_ops::set_stage(
+                store,
+                &input.key,
+                crate::store::PolicyStage::Enforce,
+            )
+            .await
         }
         protocol::PolicyWriteOp::Disable => {
-            crate::store::policy_ops::set_enabled(store, &input.key, false).await
+            crate::store::policy_ops::set_stage(store, &input.key, crate::store::PolicyStage::Off)
+                .await
+        }
+        protocol::PolicyWriteOp::Stage => {
+            let Some(stage) = input.stage else {
+                return Response::err(
+                    req.id,
+                    ErrorCode::ValidationFailed,
+                    "stage is required".to_string(),
+                );
+            };
+            crate::store::policy_ops::set_stage(store, &input.key, stage).await
         }
         protocol::PolicyWriteOp::Delete => {
             crate::store::policy_ops::delete(store, &input.key).await
@@ -620,8 +636,8 @@ async fn dispatch_policy_write(
                 Some(future) => future.await,
                 None => Vec::new(),
             };
-            let enabled = if let Some(policy) = input.policy.as_ref() {
-                policy.enabled
+            let stage = if let Some(policy) = input.policy.as_ref() {
+                policy.stage
             } else {
                 store
                     .get(&input.key)
@@ -629,15 +645,15 @@ async fn dispatch_policy_write(
                     .ok()
                     .flatten()
                     .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
-                    .map(|policy| policy.enabled)
-                    .unwrap_or(false)
+                    .map(|policy| policy.stage)
+                    .unwrap_or(crate::store::PolicyStage::Off)
             };
             Response::ok(
                 req.id,
                 serde_json::json!({
                     "ok": true,
                     "key": input.key,
-                    "enabled": enabled,
+                    "stage": stage,
                     "warnings": warnings
                 }),
             )
@@ -679,6 +695,7 @@ async fn dispatch_policy_evaluate(
             .map(|matched| {
                 (
                     matched.key.to_string(),
+                    matched.policy.stage,
                     matched.policy.mode,
                     matched.policy.rule.clone(),
                     matched.policy.reason.clone(),
@@ -699,7 +716,9 @@ async fn dispatch_policy_evaluate(
         crate::store::enforcement::EnforcementMode::Strict
     );
     let mut verdicts = Vec::with_capacity(matched.len());
-    for (key, mode, rule, reason, severity, requires_key, via, fingerprint, ttl_secs) in matched {
+    for (key, stage, mode, rule, reason, severity, requires_key, via, fingerprint, ttl_secs) in
+        matched
+    {
         let satisfied = match mode {
             crate::store::PolicyMode::Steer => true,
             crate::store::PolicyMode::Block => {
@@ -728,8 +747,17 @@ async fn dispatch_policy_evaluate(
                 }
             }
         };
+        if matches!(stage, crate::store::PolicyStage::Shadow)
+            && matches!(mode, crate::store::PolicyMode::Block)
+            && !satisfied
+        {
+            if let Err(error) = sess::record_shadow_observation(store, &key, &input.action).await {
+                tracing::warn!(policy = %key, error = %error, "shadow observation recording failed");
+            }
+        }
         verdicts.push(protocol::PolicyVerdict {
             key,
+            stage,
             mode,
             rule,
             reason,
@@ -1578,7 +1606,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: false,
+            stage: crate::store::PolicyStage::Off,
             severity: StorePriority::High,
             created_by: "test".into(),
         };
@@ -1588,19 +1616,21 @@ mod tests {
             op: PolicyWriteOp::Create,
             key: key.into(),
             policy: Some(policy),
+            stage: None,
         }));
         let Response::Ok { data, .. } = dispatch_v2(&graph, &ctx, create).await else {
             panic!("policy create should succeed")
         };
         assert_eq!(data["ok"], true);
         assert_eq!(data["key"], key);
-        assert_eq!(data["enabled"], false);
+        assert_eq!(data["stage"], "off");
         assert!(data["warnings"].is_array());
 
         let disable = make_request(Command::PolicyWrite(PolicyWriteInput {
             op: PolicyWriteOp::Disable,
             key: key.into(),
             policy: None,
+            stage: None,
         }));
         assert!(matches!(
             dispatch_v2(&graph, &ctx, disable).await,
@@ -1609,7 +1639,10 @@ mod tests {
 
         let g = graph.read().await;
         let stored = g.store().get(key).await.unwrap().unwrap();
-        assert!(!stored.payload_as::<PolicyRecord>().unwrap().enabled);
+        assert!(matches!(
+            stored.payload_as::<PolicyRecord>().unwrap().stage,
+            crate::store::PolicyStage::Off
+        ));
     }
 
     #[tokio::test]
@@ -1638,7 +1671,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: true,
+            stage: crate::store::PolicyStage::Enforce,
             severity: StorePriority::High,
             created_by: "test".into(),
         };
@@ -1647,6 +1680,7 @@ mod tests {
             op: PolicyWriteOp::Create,
             key: key.into(),
             policy: Some(policy),
+            stage: None,
         }));
         assert!(matches!(
             dispatch_v2(&graph, &ctx, create).await,
@@ -1739,6 +1773,7 @@ mod tests {
             op: PolicyWriteOp::Disable,
             key: key.into(),
             policy: None,
+            stage: None,
         }));
         assert!(matches!(
             dispatch_v2(&graph, &ctx, disable).await,

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
 
 use super::decide::{is_known_action_tool, Action};
-use crate::store::{PolicyRecord, Record, RecordLifecycle};
+use crate::store::{PolicyRecord, PolicyStage, Record, RecordLifecycle};
 
 struct CompiledPolicy {
     key: String,
@@ -45,7 +45,7 @@ impl PolicyMatcherSet {
                 return None;
             }
             let policy = record.payload_as::<PolicyRecord>()?;
-            policy.enabled.then(|| (record.key.clone(), policy))
+            (!matches!(policy.stage, PolicyStage::Off)).then(|| (record.key.clone(), policy))
         });
         Self::from_policies(policies)
     }
@@ -66,7 +66,7 @@ impl PolicyMatcherSet {
                 tracing::warn!(key = %record.key, "skipping policy with invalid payload");
                 continue;
             };
-            if !policy.enabled {
+            if matches!(policy.stage, PolicyStage::Off) {
                 continue;
             }
             match Self::from_policies([(record.key.clone(), policy)]) {
@@ -176,7 +176,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: true,
+            stage: PolicyStage::Enforce,
             severity: Priority::High,
             created_by: "test".into(),
         }
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn disabled_and_tombstoned_records_are_excluded() {
         let mut disabled = policy("Disabled", PolicyTrigger::default());
-        disabled.enabled = false;
+        disabled.stage = PolicyStage::Off;
         let mut disabled_record =
             crate::store::policy_ops::record_for("policy:disabled", &disabled).unwrap();
         let tombstone = crate::store::policy_ops::record_for(
@@ -311,7 +311,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        bad_policy.enabled = true;
+        bad_policy.stage = PolicyStage::Enforce;
         let bad = crate::store::policy_ops::record_for("policy:bad", &bad_policy).unwrap();
 
         let matcher = PolicyMatcherSet::from_records_lenient(&[bad, good]);

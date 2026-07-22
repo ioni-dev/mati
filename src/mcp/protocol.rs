@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 use crate::hooks::decide::Action;
 use crate::store::{
-    AgentKind, PolicyMode as StorePolicyMode, PolicyRecord, Priority as StorePriority,
-    ReceiptSource as StoreReceiptSource,
+    AgentKind, PolicyMode as StorePolicyMode, PolicyRecord, PolicyStage as StorePolicyStage,
+    Priority as StorePriority, ReceiptSource as StoreReceiptSource,
 };
 
 // ── Protocol constants ──────────────────────────────────────────────────────
@@ -355,6 +355,7 @@ pub struct PolicyEvaluateInput {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolicyVerdict {
     pub key: String,
+    pub stage: StorePolicyStage,
     pub mode: StorePolicyMode,
     pub rule: String,
     pub reason: String,
@@ -534,6 +535,7 @@ pub enum PolicyWriteOp {
     Edit,
     Enable,
     Disable,
+    Stage,
     Delete,
 }
 
@@ -544,6 +546,8 @@ pub struct PolicyWriteInput {
     pub key: String,
     #[serde(default)]
     pub policy: Option<PolicyRecord>,
+    #[serde(default)]
+    pub stage: Option<StorePolicyStage>,
 }
 
 /// File enrichment input from LLM analysis (e.g., /mati-enrich workflow).

@@ -656,10 +656,26 @@ impl StoreProxy {
                     mati_core::store::policy_ops::edit(store, key, policy).await
                 }
                 p::PolicyWriteOp::Enable => {
-                    mati_core::store::policy_ops::set_enabled(store, key, true).await
+                    mati_core::store::policy_ops::set_stage(
+                        store,
+                        key,
+                        mati_core::store::PolicyStage::Enforce,
+                    )
+                    .await
                 }
                 p::PolicyWriteOp::Disable => {
-                    mati_core::store::policy_ops::set_enabled(store, key, false).await
+                    mati_core::store::policy_ops::set_stage(
+                        store,
+                        key,
+                        mati_core::store::PolicyStage::Off,
+                    )
+                    .await
+                }
+                p::PolicyWriteOp::Stage => {
+                    let stage = policy
+                        .map(|policy| policy.stage)
+                        .ok_or_else(|| anyhow::anyhow!("stage is required"))?;
+                    mati_core::store::policy_ops::set_stage(store, key, stage).await
                 }
                 p::PolicyWriteOp::Delete => mati_core::store::policy_ops::delete(store, key).await,
             },
@@ -668,6 +684,7 @@ impl StoreProxy {
                     op,
                     key: key.to_string(),
                     policy: policy.cloned(),
+                    stage: policy.map(|policy| policy.stage),
                 });
                 interpret_policy_write_ack(daemon_v2(root, cmd).await)
             }
@@ -718,8 +735,20 @@ impl StoreProxy {
                             }
                         }
                     };
+                    if matches!(policy.stage, mati_core::store::PolicyStage::Shadow)
+                        && matches!(policy.mode, PolicyMode::Block)
+                        && !satisfied
+                    {
+                        mati_core::store::session::record_shadow_observation(
+                            store,
+                            matched.key,
+                            action,
+                        )
+                        .await?;
+                    }
                     verdicts.push(p::PolicyVerdict {
                         key: matched.key.to_string(),
+                        stage: policy.stage,
                         mode: policy.mode,
                         rule: policy.rule.clone(),
                         reason: policy.reason.clone(),
@@ -1324,7 +1353,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: true,
+            stage: mati_core::store::PolicyStage::Enforce,
             severity: mati_core::store::Priority::High,
             created_by: "test".into(),
         };
@@ -1385,7 +1414,7 @@ mod tests {
                     fingerprint: true,
                 },
             },
-            enabled: true,
+            stage: mati_core::store::PolicyStage::Enforce,
             severity: mati_core::store::Priority::High,
             created_by: "test".into(),
         };
