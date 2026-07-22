@@ -33,7 +33,7 @@ pub enum HookVariant {
     /// (`run_apply_patch`) — parses the patch envelope and denies if any
     /// touched file has an unconsulted confirmed gotcha.
     CodexPreApplyPatch,
-    /// Claude PostToolUse(mcp__mati__mem_get): record actor-scoped consult receipt.
+    /// Claude PostToolUse(mcp__mati__mem_get): record a consult receipt.
     /// Payload carries session_id, agent_id (subagent), and tool_input.key.
     ///
     /// clap's default kebab derive would yield `claude-post-mem-get`; pin the CLI
@@ -98,7 +98,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         return run_apply_patch(&input).await;
     }
 
-    // claude-post-memget: records an actor-scoped consult receipt using
+    // claude-post-memget: records a consult receipt using
     // tool_input.key directly — NOT a file path, so skip extract_path entirely.
     if args.variant == HookVariant::ClaudePostMemGet {
         return run_post_memget(&input).await;
@@ -846,11 +846,12 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
         .get("session_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let actor = agent_id.or(session_id);
+    let actor = receipt_actor(agent_id, session_id);
 
     let cwd = std::env::current_dir()?;
     // Resolve the daemon slug the way the gate does (repo root, not cwd) so the
-    // actor-scoped receipt lands in the same store the gate will read.
+    // The actor scope matches the gate: agent receipts are scoped, while the
+    // main thread (no agent_id) uses the global receipt.
     let repo_root = discover_repo_root(&cwd);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let mati_root = match mati_root_for(root_for_slug) {
@@ -934,9 +935,7 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
                 mati_core::mcp::protocol::ConsultationHitInput {
                     key: verdict.requires_key,
                     capture_fingerprint: false,
-                    actor: agent_id
-                        .map(str::to_string)
-                        .or_else(|| session_id.map(str::to_string)),
+                    actor: receipt_actor(agent_id, session_id).map(str::to_string),
                     session_id: session_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
                 },
@@ -945,6 +944,12 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
         .await;
     }
     Ok(())
+}
+
+/// Select the receipt scope shared by the gate and both post-tool mint paths.
+/// Session IDs remain consultation metadata, not receipt scope.
+fn receipt_actor<'a>(agent_id: Option<&'a str>, _session_id: Option<&str>) -> Option<&'a str> {
+    agent_id
 }
 
 /// Claude's PostToolUse payloads have used both camelCase and snake_case
@@ -1844,6 +1849,44 @@ mod tests {
             mati_core::store::ReceiptSource::MemGet,
             mati_core::store::ReceiptSource::DbIntrospection,
         ]));
+    }
+
+    async fn assert_main_thread_receipt_is_global(key: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mati_core::store::Store::open(dir.path()).await.unwrap();
+        let actor = receipt_actor(None, Some("session-main"));
+        let (receipt_key, bytes) =
+            mati_core::store::session::consultation_receipt_staged_for_store(
+                &store, key, actor, false,
+            )
+            .await
+            .unwrap();
+        let receipt: mati_core::store::Record = rmp_serde::from_slice(&bytes).unwrap();
+        store.put(&receipt_key, &receipt).await.unwrap();
+        assert_eq!(receipt_key, format!("session:consulted:{key}"));
+        assert!(
+            mati_core::store::session::check_consulted_recent(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+        assert!(!mati_core::store::session::check_consulted_recent(
+            &store,
+            key,
+            900,
+            Some("session-main")
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn main_thread_introspection_receipt_uses_global_gate_scope() {
+        assert_main_thread_receipt_is_global("schema:orders").await;
+    }
+
+    #[tokio::test]
+    async fn main_thread_memget_receipt_uses_global_gate_scope() {
+        assert_main_thread_receipt_is_global("schema:orders").await;
     }
 
     // ── extract_path ────────────────────────────────────────────────────
