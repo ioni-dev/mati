@@ -305,19 +305,24 @@ impl MatiServer {
 ///
 /// # Routing rules
 ///
-/// - `action = "confirm"` / `"delete"` → key MUST start with `gotcha:`.
+/// - `action = "confirm"` / `"delete"` → key MUST start with `gotcha:`;
+///   policy lifecycle changes use the human-only `mati policy` commands.
 ///   This mirrors the Direct path's `mem_set_confirm` / `mem_set_delete`
 ///   guards (tools.rs:~1058).
 /// - `action = "write"` (default) routes by key prefix:
 ///   - `gotcha:*`   → [`Command::GotchaUpsert`]
 ///   - `decision:*` → [`Command::DecisionUpsert`]
 ///   - `dev_note:*` → [`Command::DevNoteUpsert`]
+///   - `policy:*`   → [`Command::PolicyWrite`] (create only)
 ///   - other        → error (file: writes have no public typed Command —
 ///     file records are managed by the static-analysis pipeline +
 ///     `file_enrich` / `file_reparse`, not direct mem_set).
 fn build_mem_set_command(params: &MemSetParams) -> Result<Command, String> {
     match params.action.as_str() {
         "confirm" => {
+            if params.key.starts_with("policy:") {
+                return Err("policies are activated with `mati policy enable <slug>`".into());
+            }
             if !params.key.starts_with("gotcha:") {
                 return Err("confirm action only applies to gotcha: keys".into());
             }
@@ -326,6 +331,9 @@ fn build_mem_set_command(params: &MemSetParams) -> Result<Command, String> {
             }))
         }
         "delete" => {
+            if params.key.starts_with("policy:") {
+                return Err("policies are removed with `mati policy delete <slug>`".into());
+            }
             if !params.key.starts_with("gotcha:") {
                 return Err("delete action only applies to gotcha: keys".into());
             }
@@ -351,6 +359,20 @@ fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String>
     };
 
     let priority = parse_protocol_priority(&params.priority);
+
+    if let Some(slug) = params.key.strip_prefix("policy:") {
+        if slug.is_empty() {
+            return Err("policy key must not be just the prefix".into());
+        }
+        let mut policy: crate::store::PolicyRecord = serde_json::from_value(payload)
+            .map_err(|error| format!("policy payload must deserialize into PolicyRecord: {error}"))?;
+        policy.enabled = false;
+        return Ok(Command::PolicyWrite(crate::mcp::protocol::PolicyWriteInput {
+            op: crate::mcp::protocol::PolicyWriteOp::Create,
+            key: params.key.clone(),
+            policy: Some(policy),
+        }));
+    }
 
     if let Some(stripped) = params.key.strip_prefix("gotcha:") {
         if stripped.is_empty() {
@@ -413,7 +435,7 @@ fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String>
         }));
     }
 
-    Err("mem_set write requires key with gotcha:/decision:/dev_note: prefix".into())
+    Err("mem_set write requires key with gotcha:/decision:/dev_note:/policy: prefix".into())
 }
 
 fn field_string(payload: &serde_json::Value, field: &str) -> Option<String> {
@@ -959,6 +981,7 @@ pub async fn assemble_context_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::policy_match::PolicyMatcherSet;
     use crate::store::record::*;
     use crate::store::Store;
     use tempfile::TempDir;
@@ -2307,6 +2330,136 @@ mod tests {
             .unwrap();
         assert_eq!(record.priority, Priority::Critical);
         assert_eq!(record.source, RecordSource::ClaudeEnrich);
+    }
+
+    fn policy_payload(enabled: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": "Query safety",
+            "rule": "Consult the schema first.",
+            "reason": "Production schemas drift because deployments change.",
+            "scope": "repo",
+            "mode": "block",
+            "trigger": {"tool": "db_client"},
+            "requires": {
+                "key": "schema:orders",
+                "via": ["mem_get"],
+                "freshness": {"ttl_secs": 900}
+            },
+            "enabled": enabled,
+            "severity": "high",
+            "created_by": "agent"
+        })
+    }
+
+    #[tokio::test]
+    async fn mem_set_creates_policy_inert_even_when_payload_enables_it() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "write".into(),
+                key: "policy:query-safety".into(),
+                value: String::new(),
+                category: "Policy".into(),
+                payload: policy_payload(true),
+                tags: vec![],
+                priority: "High".into(),
+            },
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true, "policy create failed: {result}");
+        assert_eq!(parsed["enabled"], false);
+
+        let graph = graph_arc.read().await;
+        let record = graph.store().get("policy:query-safety").await.unwrap().unwrap();
+        let policy = record.payload_as::<PolicyRecord>().unwrap();
+        assert!(!policy.enabled);
+        assert!(PolicyMatcherSet::from_records(&[record])
+            .unwrap()
+            .matches(&crate::hooks::decide::Action {
+                tool: "db_client".into(),
+                target_path: None,
+                host: None,
+                argv: vec![],
+                files: vec![],
+            })
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_policy_confirm_for_human_enable_path() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "confirm".into(),
+                key: "policy:query-safety".into(),
+                value: String::new(),
+                category: "Policy".into(),
+                payload: serde_json::Value::Null,
+                tags: vec![],
+                priority: "Normal".into(),
+            },
+        )
+        .await;
+        assert!(result.contains("mati policy enable <slug>"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_policy_delete_for_human_delete_path() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "delete".into(),
+                key: "policy:query-safety".into(),
+                value: String::new(),
+                category: "Policy".into(),
+                payload: serde_json::Value::Null,
+                tags: vec![],
+                priority: "Normal".into(),
+            },
+        )
+        .await;
+        assert!(result.contains("mati policy delete <slug>"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn mem_set_rejects_existing_active_policy_write() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
+        policy.enabled = true;
+        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
+            .await
+            .unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "write".into(),
+                key: "policy:query-safety".into(),
+                value: String::new(),
+                category: "Policy".into(),
+                payload: policy_payload(true),
+                tags: vec![],
+                priority: "High".into(),
+            },
+        )
+        .await;
+        assert!(result.contains("already exists"), "{result}");
     }
 
     // `mem_set_preserves_existing_layer0_data` was removed: file: writes

@@ -60,6 +60,38 @@ pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
     Ok(())
 }
 
+/// Return author-time warnings without changing policy state.
+pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(tool) = policy
+        .trigger
+        .tool
+        .as_deref()
+        .filter(|tool| !matches!(*tool, "db_client" | "file_read" | "path"))
+    {
+        warnings.push(format!(
+            "warning: policy trigger tool '{tool}' is not a recognized governable category (known: db_client, file_read, path); this policy will never match until such a category is supported."
+        ));
+    }
+    if policy.requires.via.contains(&super::record::ReceiptSource::MemGet)
+        && !has_backing_record
+    {
+        warnings.push(format!(
+            "warning: requires.key '{}' has no backing record; a mem_get on it would mint a receipt without the agent learning anything. Store a record at that key (e.g. the schema doc) so consultation is substantive.",
+            policy.requires.key
+        ));
+    }
+    if policy.requires.freshness.fingerprint
+        && !policy.requires.via.contains(&super::record::ReceiptSource::MemGet)
+    {
+        warnings.push("warning: requires.freshness.fingerprint is unsatisfiable without MemGet; DbIntrospection receipts do not carry a content fingerprint.".into());
+    }
+    if policy.mode == super::record::PolicyMode::Block && policy.requires.key.is_empty() {
+        warnings.push("warning: block policy has an empty requires.key; nothing could ever unlock it.".into());
+    }
+    warnings
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

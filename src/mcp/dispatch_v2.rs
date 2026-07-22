@@ -556,7 +556,33 @@ async fn dispatch_policy_write(
                     "daemon: policy matcher refresh failed; retaining previous set"
                 ),
             }
-            Response::ok(req.id, serde_json::Value::Null)
+            let warnings = if matches!(input.op, protocol::PolicyWriteOp::Create) {
+                input
+                    .policy
+                    .as_ref()
+                    .map(|policy| async {
+                        let has_backing = store
+                            .get(&policy.requires.key)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|record| {
+                                !matches!(
+                                    record.lifecycle,
+                                    crate::store::RecordLifecycle::Tombstoned { .. }
+                                )
+                            });
+                        crate::store::policy_ops::author_warnings(policy, has_backing)
+                    })
+                    .map(|future| future)
+            } else {
+                None
+            };
+            let warnings = match warnings {
+                Some(future) => future.await,
+                None => Vec::new(),
+            };
+            Response::ok(req.id, serde_json::json!({"warnings": warnings}))
         }
         Err(error) => {
             use crate::store::policy_ops::PolicyOpError;
