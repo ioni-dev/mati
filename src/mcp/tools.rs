@@ -3716,6 +3716,29 @@ mod tests {
     }
 
     #[test]
+    fn mem_set_socket_routes_policy_create_inert() {
+        let mut p = make_params("write", "policy:query-safety");
+        p.payload = policy_payload(true);
+        let cmd = build_mem_set_command(&p).expect("must build");
+        match cmd {
+            Command::PolicyWrite(input) => {
+                assert!(matches!(input.op, proto::PolicyWriteOp::Create));
+                assert!(!input.policy.unwrap().enabled);
+            }
+            _ => panic!("expected PolicyWrite"),
+        }
+    }
+
+    #[test]
+    fn mem_set_socket_rejects_policy_lifecycle_actions() {
+        for action in ["confirm", "delete"] {
+            let p = make_params(action, "policy:query-safety");
+            let err = build_mem_set_command(&p).expect_err("must reject");
+            assert!(err.contains("mati policy"), "{action}: {err}");
+        }
+    }
+
+    #[test]
     fn mem_set_socket_rejects_write_with_unknown_prefix() {
         // file: writes are not supported via mem_set Socket path —
         // there is no public typed Command for them.
