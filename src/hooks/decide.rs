@@ -84,6 +84,71 @@ pub enum HookEvent {
     /// records `Deny` with reason `floor_consult_required`, distinct from a local-gotcha deny
     /// so the audit/report can tell an org mandate from a repo rule.
     FloorConsultBlocked { key: String },
+    /// Local policy denied an unconsulted governed action.
+    PolicyConsultBlocked { key: String },
+    /// Local policy allowed a governed action after its receipt was present.
+    PolicyConsulted { key: String },
+}
+
+/// The I/O-free subset of a daemon policy verdict needed by the hook adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVerdict {
+    pub key: String,
+    pub rule: String,
+    pub requires_key: String,
+    pub block: bool,
+    pub satisfied: bool,
+}
+
+/// Apply local policy verdicts with escalate-only semantics.
+///
+/// A non-strict block degrades to steering; a satisfied block records the
+/// receipt-backed allow. Existing decisions are never lowered by this layer.
+pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> EnforcementResult {
+    let mut context = Vec::new();
+    let mut events = Vec::new();
+    let mut denied = None;
+
+    for verdict in verdicts {
+        if verdict.block && !verdict.satisfied && strict {
+            denied.get_or_insert_with(|| Decision::Deny {
+                file_key: verdict.key.clone(),
+                reason: format!(
+                    "mati: policy {} blocked this action. Consult first: mem_get(\"{}\")",
+                    verdict.key, verdict.requires_key
+                ),
+            });
+        } else if verdict.block && verdict.satisfied {
+            events.push(HookEvent::PolicyConsulted {
+                key: verdict.key.clone(),
+            });
+        } else {
+            context.push(verdict.rule.clone());
+        }
+    }
+
+    if let Some(decision) = denied {
+        let denied_key = match &decision {
+            Decision::Deny { file_key, .. } => file_key.clone(),
+            _ => unreachable!(),
+        };
+        return EnforcementResult {
+            decision,
+            events: vec![HookEvent::PolicyConsultBlocked { key: denied_key }],
+        };
+    }
+    if !context.is_empty() {
+        return EnforcementResult {
+            decision: Decision::Advisory {
+                context: context.join("\n"),
+            },
+            events,
+        };
+    }
+    EnforcementResult {
+        decision: Decision::Allow,
+        events,
+    }
 }
 
 /// Input to the enforcement decision engine.
@@ -1727,5 +1792,68 @@ mod tests {
             ),
             vec!["migrations/a.sql", "migrations/b.sql"]
         );
+    }
+
+    fn policy(block: bool, satisfied: bool, rule: &str) -> PolicyVerdict {
+        PolicyVerdict {
+            key: "policy:prod-query".into(),
+            rule: rule.into(),
+            requires_key: "schema:orders".into(),
+            block,
+            satisfied,
+        }
+    }
+
+    #[test]
+    fn policy_block_unsatisfied_denies_in_strict_mode() {
+        let result = evaluate_policy_verdicts(&[policy(true, false, "Consult first.")], true);
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsultBlocked {
+                key: "policy:prod-query".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn policy_block_satisfied_allows_and_records_receipt() {
+        let result = evaluate_policy_verdicts(&[policy(true, true, "Consult first.")], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsulted {
+                key: "policy:prod-query".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn policy_steer_injects_context_without_denying() {
+        let result = evaluate_policy_verdicts(&[policy(false, true, "Consult first.")], true);
+        assert_eq!(
+            result.decision,
+            Decision::Advisory {
+                context: "Consult first.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn policy_block_degrades_to_steer_in_advisory_mode() {
+        let result = evaluate_policy_verdicts(&[policy(true, false, "Consult first.")], false);
+        assert_eq!(
+            result.decision,
+            Decision::Advisory {
+                context: "Consult first.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn no_policy_verdicts_allow() {
+        let result = evaluate_policy_verdicts(&[], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(result.events.is_empty());
     }
 }
