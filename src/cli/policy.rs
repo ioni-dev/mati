@@ -319,18 +319,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
             policy,
         )])?;
         let matched = !matcher.matches(&action).is_empty();
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "action": action,
-                    "matched": matched,
-                    "persisted": false,
-                }))?
-            );
-        } else {
-            println!("Action: tool={} matched={matched} (persisted=false)", action.tool);
-        }
+        println!("{}", render_ad_hoc_test_output(&action, matched, args.json)?);
         return Ok(());
     }
     let cwd = std::env::current_dir()?;
@@ -350,6 +339,20 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     proxy.close().await?;
     println!("{output}");
     Ok(())
+}
+
+fn render_ad_hoc_test_output(action: &Action, matched: bool, json_output: bool) -> Result<String> {
+    if json_output {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "action": action,
+            "matched": matched,
+            "persisted": false,
+        }))?);
+    }
+    Ok(format!(
+        "Action: tool={} matched={matched} (persisted=false)",
+        action.tool
+    ))
 }
 
 fn render_test_output_with_warnings(
@@ -604,5 +607,18 @@ mod tests {
             .via
             .contains(&mati_core::store::ReceiptSource::MemGet));
         assert!(policy.freshness.fingerprint);
+    }
+
+    #[test]
+    fn ad_hoc_test_output_is_explicitly_non_persistent() {
+        let action = normalize_action(Some("psql -c select"), None);
+        let output = render_ad_hoc_test_output(&action, true, false).unwrap();
+        assert!(output.contains("matched=true"));
+        assert!(output.contains("persisted=false"));
+
+        let json = render_ad_hoc_test_output(&action, false, true).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["matched"], false);
+        assert_eq!(value["persisted"], false);
     }
 }

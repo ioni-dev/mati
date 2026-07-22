@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use globset::{Glob, GlobMatcher};
 
-use super::decide::Action;
+use super::decide::{is_known_action_tool, Action};
 use crate::store::{PolicyRecord, Record, RecordLifecycle};
 
 struct CompiledPolicy {
@@ -128,7 +128,7 @@ impl PolicyMatcherSet {
                 let tool_matches = trigger
                     .tool
                     .as_deref()
-                    .is_none_or(|tool| tool == action.tool);
+                    .is_none_or(|tool| is_known_action_tool(tool) && tool == action.tool);
                 let host_matches = compiled.host_glob.as_ref().is_none_or(|glob| {
                     action
                         .host
@@ -278,6 +278,22 @@ mod tests {
         };
         disabled_record.lifecycle = RecordLifecycle::Active;
         let set = PolicyMatcherSet::from_records(&[disabled_record, tombstone]).unwrap();
+        assert!(set.matches(&action(None, &[])).is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_values_never_match() {
+        let set = PolicyMatcherSet::from_policies([(
+            "policy:unknown".into(),
+            policy(
+                "Unknown",
+                PolicyTrigger {
+                    tool: Some("future_tool".into()),
+                    ..Default::default()
+                },
+            ),
+        )])
+        .unwrap();
         assert!(set.matches(&action(None, &[])).is_empty());
     }
 
