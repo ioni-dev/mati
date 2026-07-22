@@ -508,7 +508,7 @@ and `enforce` acts according to `mode` (`steer` or `block`). The global
 New policies start off; a developer can review them with `mati policy stage
 <slug> shadow` before promoting them to enforce.
 
-Every create, edit, enable, disable, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
+Every create, edit, stage change, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. `mati policy enable` and `disable` are aliases that set the stage to `enforce` and `off` respectively; there is no separate enable path. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
 
 The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step and lets an agent run `mati policy stage <slug> enforce` directly. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
 
@@ -547,10 +547,19 @@ hook    compute the decision, emit output, fire events
 ```
 
 Shadow would-outcome observations are bounded daily aggregates in the eventual
-`analytics:` session namespace. They contain the policy key, normalized action,
-and timestamp. They do not use the hash-chained enforcement log: a shadow
-result did not deny anything, so a `Deny` event would falsify the audit chain
-consumed by mati-cloud.
+`analytics:` session namespace, keyed per policy so a noisy policy cannot starve
+a quiet one out of its budget. Each entry carries the policy key, the normalized
+action, a timestamp, and whether the policy would have blocked or steered. They
+do not use the hash-chained enforcement log: a shadow result did not deny
+anything, so a `Deny` event would falsify the audit chain consumed by
+mati-cloud. `mati policy observations [<slug>]` reads them back, reporting a
+per-policy total alongside the retained sample.
+
+An observation is recorded only where enforce would have acted. A shadow block
+whose receipt is already valid records nothing, because at `enforce` it would
+have allowed; a shadow block exempted as schema introspection (section 10a.5)
+records nothing either, for the same reason. Without that, the measurement would
+over-report the blocking a promotion to `enforce` actually causes.
 
 The gate is what keeps this cheap. A bash command that is not a database client makes no policy call at all, so the common path costs what it cost before. Only a governed action pays one local round trip, well inside `HOOK_DEADLINE_MS`.
 
@@ -590,9 +599,11 @@ Policy decisions reuse the event types in section 18. No new event type or subje
 | Blocked, no valid receipt | `Deny` | `policy_consult_required` |
 | Allowed on a valid receipt | `AllowAfterReceipt` | `policy_receipt_valid` |
 | Receipt minted | `ReceiptMinted` | `consultation_requested` |
-| Created, enabled, disabled, deleted | `ControlChanged` | `control_created` / `control_updated` / `control_deleted` |
+| Created, staged, deleted | `ControlChanged` | `control_created` / `control_updated` / `control_deleted` |
 
 Policy events carry `subject_kind = Control` and `subject_key = <policy key>`. That is what separates them from the file-subject gotcha and floor denies sharing the same log.
+
+Only `enforce`-stage policies reach this table. A `shadow` policy emits no enforcement event at all, neither a `Deny` nor an `AllowAfterReceipt` on a satisfied block, because it changed no decision. Its only trace is the `analytics:` observation in section 10a.3. A stage change is itself a lifecycle mutation and does write `ControlChanged`, so promoting a policy to `enforce` stays visible in the chain.
 
 ---
 
