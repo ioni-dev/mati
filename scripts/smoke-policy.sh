@@ -293,16 +293,98 @@ wait
 grep -q miss "$WORK/conc.out" && CONC_FAIL=1
 if [ "$CONC_FAIL" -eq 0 ]; then pass "5 parallel hooks all denied"; else fail "5 parallel hooks all denied" "$(cat "$WORK/conc.out")"; fi
 
-# ── 12. Fail-open ────────────────────────────────────────────────────────────
-step "12. A dead daemon fails open (P9)"
+# ── 12. Global kill switch ───────────────────────────────────────────────────
+# policy.mode=advisory must degrade every block to a steer without disabling the
+# match: the rule still reaches Claude, it just stops denying.
+step "12. Advisory mode degrades a block to a steer"
+add_block_policy adv '*prod-adv*' 'schema:adv' 'mem_get'
+mati_p policy enable adv >/dev/null
+mati_p config set policy.mode advisory >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-adv.internal -c \"UPDATE orders SET s=1\""')")"
+assert_lacks "advisory does not deny"      "$OUT" 'permissionDecision'
+assert_has   "advisory still injects"      "$OUT" 'additionalContext'
+assert_has   "advisory names the remedy"   "$OUT" 'schema:adv'
+mati_p config set policy.mode strict >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-adv.internal -c \"UPDATE orders SET s=1\""')")"
+assert_has   "strict denies again"         "$OUT" 'permissionDecision":"deny"'
+
+# ── 13. Steer at enforce ─────────────────────────────────────────────────────
+# A steer policy injects context and sets no permissionDecision at all, so the
+# user's own permission prompt still runs.
+step "13. Enforce-stage steer injects without deciding"
+mati_p policy add steer-live \
+  --name "steer live" --rule "Review the action." \
+  --reason "Operators need visibility because production is live." \
+  --mode steer --trigger '{"tool":"db_client","host_glob":"*prod-steer*"}' \
+  --requires '{"key":"","via":[],"freshness":{"ttl_secs":900}}' --enable >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-steer.internal -c \"select 1\""')")"
+assert_has   "steer injects the rule"   "$OUT" 'Review the action.'
+assert_lacks "steer never decides"      "$OUT" 'permissionDecision'
+
+# ── 14. Receipt sources ──────────────────────────────────────────────────────
+# The introspection exemption suppresses blocks but must not mint: a policy that
+# accepts only MemGet stays locked after the agent inspects the schema itself.
+step "14. Receipt sources are not interchangeable"
+add_block_policy viaonly '*prod-vo*' 'schema:vo' 'mem_get'
+mati_p policy enable viaonly >/dev/null
+hook claude-post-bash "$(post_bash '"psql -h db.prod-vo.internal -c \"\\d orders\""' false 0)" >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-vo.internal -c \"select 1\""')")"
+assert_has "introspection does not satisfy a mem_get policy" "$OUT" 'permissionDecision":"deny"'
+mcp_call mem_get '{"key":"schema:vo"}' >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-vo.internal -c \"select 1\""')")"
+assert_lacks "the declared source does satisfy it" "$OUT" 'permissionDecision":"deny"'
+
+# ── 15. Author-time validation ───────────────────────────────────────────────
+# A broken glob must never reach the daemon, and a MemGet requirement pointing
+# at nothing must say so: consulting an empty key teaches the agent nothing.
+step "15. Author-time validation"
+OUT="$(mati_p policy add badglob --name bad --rule "Consult first." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"[unclosed"}' \
+  --requires '{"key":"schema:bad","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+assert_has  "malformed host_glob is rejected" "$OUT" "invalid host_glob"
+assert_lacks "rejected policy is not persisted" "$(mati_p policy list)" 'policy:badglob'
+OUT="$(mati_p policy add unbacked --name unb --rule "Consult first." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*prod-unb*"}' \
+  --requires '{"key":"schema:nothing-here","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+assert_has "unbacked requires.key warns" "$OUT" 'has no backing record'
+
+# ── 16. Dry-run and stage parsing ────────────────────────────────────────────
+step "16. Dry-run and stage parsing"
+OUT="$(mati_p policy test --trigger '{"tool":"db_client","host_glob":"*prod*"}' \
+  --command 'psql -h db.prod.internal -c "select 1"')"
+assert_has "dry-run reports a match"       "$OUT" 'matched=true'
+assert_has "dry-run persists nothing"      "$OUT" 'persisted=false'
+OUT="$(mati_p policy test --trigger '{"tool":"db_client","host_glob":"*prod*"}' \
+  --command 'psql -h db.staging.internal -c "select 1"')"
+assert_has "dry-run reports a non-match"   "$OUT" 'matched=false'
+assert_has "an invalid stage is refused"   "$(mati_p policy stage adv bogus)" 'expected off, shadow, or enforce'
+
+# ── 17. Agent edits inside its own stage ─────────────────────────────────────
+# The boundary cuts both ways: an off policy is the agent's draft to refine.
+step "17. mem_set may edit an off policy"
+mati_p policy add draft --name draft --rule "Old rule." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*prod-draft*"}' \
+  --requires '{"key":"schema:draft","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+DRAFT_JSON='{"name":"draft","rule":"New rule.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*prod-draft*"},"requires":{"key":"schema:draft","via":["mem_get"],"freshness":{"ttl_secs":900}},"stage":"off","severity":"high","created_by":"agent"}'
+OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:draft\",\"value\":\"New rule.\",\"category\":\"Policy\",\"payload\":$DRAFT_JSON,\"tags\":[],\"priority\":\"High\"}")"
+assert_has "agent may edit an off policy" "$OUT" 'ok.":true'
+SHOW="$(mati_p policy show draft)"
+assert_has "the edit landed"              "$SHOW" 'New rule.'
+assert_has "and it stayed off"            "$SHOW" '"stage": "off"'
+
+# ── 18. Fail-open ────────────────────────────────────────────────────────────
+step "18. A dead daemon fails open (P9)"
 mati_p daemon stop >/dev/null; sleep 1
 PAYLOAD="$(pre_bash '"psql -h db.prod-f.internal -f migrations/prod.sql"')"
 OUT="$( cd "$PROJECT" && printf '%s' "$PAYLOAD" \
         | MATI_DISABLE_AUTO_SPAWN=1 "$MATI" hook-decide claude-pre-bash 2>/dev/null )"
 assert_lacks "not denied when mati is down" "$OUT" 'permissionDecision":"deny"'
 
-# ── 13. Agent authoring boundary (MCP) ───────────────────────────────────────
-step "13. mem_set agent boundary"
+# ── 19. Agent authoring boundary (MCP) ───────────────────────────────────────
+step "19. mem_set agent boundary"
 POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"stage":"enforce","severity":"high","created_by":"agent"}'
 OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:agent-authored\",\"value\":\"Consult first.\",\"category\":\"Policy\",\"payload\":$POLICY_JSON,\"tags\":[],\"priority\":\"High\"}")"
 if printf '%s' "$OUT" | grep -q 'jsonrpc'; then
