@@ -76,6 +76,54 @@ pub struct DailyAgg {
 }
 
 pub const MAX_AGG_KEYS: usize = 100;
+pub const MAX_SHADOW_OBSERVATIONS: usize = 100;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ShadowObservation {
+    pub policy_key: String,
+    pub action: crate::hooks::decide::Action,
+    pub timestamp: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct ShadowObservationAgg {
+    pub count: u64,
+    pub observations: Vec<ShadowObservation>,
+}
+
+pub fn shadow_observation_key() -> String {
+    today_key("analytics:policy_shadow_")
+}
+
+/// Record a bounded daily aggregate for a shadow policy that would have blocked.
+/// This deliberately stays in the eventual session/analytics tree: it is a
+/// review signal, not an enforcement fact and not part of the hash chain.
+pub async fn record_shadow_observation(
+    store: &Store,
+    policy_key: &str,
+    action: &crate::hooks::decide::Action,
+) -> Result<()> {
+    let key = shadow_observation_key();
+    let now = now_secs();
+    let mut record = store
+        .get(&key)
+        .await?
+        .unwrap_or_else(|| analytics_record(&key, String::new()));
+    let mut agg: ShadowObservationAgg = record.payload_as().unwrap_or_default();
+    agg.count += 1;
+    if agg.observations.len() < MAX_SHADOW_OBSERVATIONS {
+        agg.observations.push(ShadowObservation {
+            policy_key: policy_key.to_string(),
+            action: action.clone(),
+            timestamp: now,
+        });
+    }
+    record.payload = Some(serde_json::to_value(&agg)?);
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+    store.put(&key, &record).await
+}
 
 /// Minimum staleness value for stale review inclusion.
 const STALE_REVIEW_MIN: f32 = 0.4;
