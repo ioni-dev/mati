@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 const MARKER: &str = "<!-- mati:vector-c -->";
 const END_MARKER: &str = "<!-- /mati:vector-c -->";
 
-/// The Vector C injection text (from ARCHITECTURE.md §9).
+/// The Vector C injection text (from ARCHITECTURE.md section 9).
 ///
 /// Framing: "The PreToolUse hook enforces this" — environmental constraint,
 /// not a behavioral suggestion.

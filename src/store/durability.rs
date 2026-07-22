@@ -4,7 +4,7 @@
 //! - `Immediate`: fsync on every write — slow but crash-safe.
 //! - `Eventual`: OS write buffer — fast but may lose the last ~10ms on crash.
 //!
-//! Assignment by key prefix (from ARCHITECTURE.md §4):
+//! Assignment by key prefix (from ARCHITECTURE.md section 4):
 //! ```text
 //! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*   policy:*
 //! Eventual   session:*  analytics:*  hook_event:*  compliance:*  graph:edge:*
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn all_immediate_prefixes_from_architecture_doc() {
-        // Every Immediate prefix listed in ARCHITECTURE.md §4 must route correctly.
+        // Every Immediate prefix listed in ARCHITECTURE.md section 4 must route correctly.
         let cases = [
             "gotcha:inference-async",
             "decision:storage-engine",

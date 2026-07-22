@@ -1198,7 +1198,7 @@ fn open_sessions_tree(path: PathBuf) -> Result<Tree> {
 
 /// Derive a project slug from the repo root.
 ///
-/// Algorithm (matches ARCHITECTURE.md §22):
+/// Algorithm (matches ARCHITECTURE.md section 22):
 /// 1. Try to read the first `fetch` remote URL from `.git/config`.
 /// 2. Fall back to SHA-256 of the canonicalized repo root path.
 ///

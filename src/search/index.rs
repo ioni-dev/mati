@@ -1,6 +1,6 @@
 //! Tantivy full-text search index (M-05).
 //!
-//! Schema matches ARCHITECTURE.md §7 exactly:
+//! Schema matches ARCHITECTURE.md section 7 exactly:
 //! ```text
 //! key        TEXT | STORED        BM25-indexed, stored for retrieval
 //! value      TEXT | STORED        Primary search target (purpose, rule, body)
@@ -10,7 +10,7 @@
 //! updated_at u64  | STORED | FAST  Numeric filter / sort (Unix secs)
 //! ```
 //!
-//! **Do not add fields** without updating ARCHITECTURE.md §7 and bumping
+//! **Do not add fields** without updating ARCHITECTURE.md section 7 and bumping
 //! the schema. Adding fields silently invalidates existing indices — callers
 //! see an `IndexError` on open and must trigger a rebuild from SurrealKV (C4).
 

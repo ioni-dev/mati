@@ -1,7 +1,7 @@
 //! Knowledge gap analyzer (M-10-C + M-10-D).
 //!
 //! Scans the store for all 8 [`GapType`] variants and returns gaps sorted by
-//! descending `risk_score`. The severity formula follows ARCHITECTURE.md §13.2:
+//! descending `risk_score`. The severity formula follows ARCHITECTURE.md section 13.2:
 //!
 //! ```text
 //! risk_score = change_frequency * (1 - coverage_score)
@@ -14,7 +14,7 @@ use std::path::Path;
 
 use crate::store::{FileRecord, GapType, KnowledgeGap, Record, RecordSource};
 
-// ── Coverage constants (ARCHITECTURE.md §13.2) ─────────────────────────────
+// ── Coverage constants (ARCHITECTURE.md section 13.2) ─────────────────────────────
 
 const COVERAGE_HOT_FILE_NO_RECORD: f32 = 0.0;
 const COVERAGE_HOT_FILE_NO_PURPOSE: f32 = 0.3;
@@ -100,7 +100,7 @@ pub fn analyze(
 
 // ── Risk score computation ──────────────────────────────────────────────────
 
-/// Compute risk score per ARCHITECTURE.md §13.2.
+/// Compute risk score per ARCHITECTURE.md section 13.2.
 fn risk_score(change_frequency: f32, coverage: f32) -> f32 {
     change_frequency * (1.0 - coverage)
 }

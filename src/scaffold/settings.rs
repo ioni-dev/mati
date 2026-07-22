@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Hook and MCP server registration for `.claude/settings.json`.
 ///
 /// Contains two top-level keys:
-/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / Stop (ARCHITECTURE.md §10)
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / Stop (ARCHITECTURE.md section 10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 const SETTINGS_JSON: &str = r#"{
   "hooks": {

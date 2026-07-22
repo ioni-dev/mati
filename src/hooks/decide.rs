@@ -695,7 +695,7 @@ pub fn normalize_path(file_path: &str, repo_root: Option<&str>) -> String {
 /// Evaluate the enforcement decision for a file access.
 ///
 /// Pure function — all data comes from `input`, no I/O. The decision matrix
-/// matches ARCHITECTURE.md §10.1.
+/// matches ARCHITECTURE.md section 10.1.
 pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
     let file_key = format!("file:{}", input.rel_path);
 

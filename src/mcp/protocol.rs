@@ -72,7 +72,7 @@ pub struct Request {
     /// Client-declared agent identity for attribution (ADR-018).
     /// Optional and additive: pre-multi-agent clients omit this field;
     /// the daemon stamps `Unknown` server-side when absent. NOT verified —
-    /// same-UID processes are trusted (THREAT_MODEL.md §3.I).
+    /// same-UID processes are trusted (THREAT_MODEL.md section 3.I).
     #[serde(default)]
     pub agent: Option<AgentKind>,
     /// The command to execute.

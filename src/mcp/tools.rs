@@ -35,7 +35,7 @@ pub(crate) const VECTOR_B: &str =
     confidence<0.3 \u{2192} read file, consider mem_set to improve.\n\
     \"add gotcha\" \u{2192} mem_set(Gotcha) then mati gotcha confirm <key>.";
 
-/// Token budget for mem_bootstrap output (ARCHITECTURE.md §6).
+/// Token budget for mem_bootstrap output (ARCHITECTURE.md section 6).
 const TOKEN_BUDGET: usize = 2_000;
 
 /// Reserved tokens for Vector B suffix.

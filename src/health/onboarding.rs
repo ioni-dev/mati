@@ -3,7 +3,7 @@
 //! Estimates how many minutes a new developer needs to become productive,
 //! based on the knowledge coverage of the codebase.
 //!
-//! Formula (ARCHITECTURE.md §13.3):
+//! Formula (ARCHITECTURE.md section 13.3):
 //!
 //! ```text
 //! base_time = 22 minutes

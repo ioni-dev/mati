@@ -2,7 +2,7 @@
 ///
 /// Thin wrapper that delegates to `mati hook-decide claude-pre-bash`.
 /// All enforcement logic lives in Rust (`hooks::decide` + `cli::hook_decide`).
-/// 2-5% miss rate accepted (C9 in ARCHITECTURE.md §24).
+/// 2-5% miss rate accepted (C9 in ARCHITECTURE.md section 24).
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"

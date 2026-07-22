@@ -32,7 +32,7 @@ are v0.2 or out of scope:
 ## Repository layout
 
 Single binary (`mati`) + library (`mati_core`). Full annotated tree in
-ARCHITECTURE.md §3.
+ARCHITECTURE.md section 3.
 
 ```
 src/
@@ -141,7 +141,7 @@ adds signed evidence, license management, and governance at scale on top.
 
 Types (`Record`, `FileRecord`, `GotchaRecord`, `ConfidenceScore`, `QualityScore`,
 `StalenessScore`, `ContextPacket`) are defined in `src/store/record.rs` —
-canonical reference in ARCHITECTURE.md §5. Never redefine them elsewhere.
+canonical reference in ARCHITECTURE.md section 5. Never redefine them elsewhere.
 
 Key namespacing convention:
 
@@ -155,7 +155,7 @@ analytics:<type>_<date>   graph:edge:<from>:<kind>:<to>   enforcement:event:<seq
 
 ## Hook decision matrix
 
-Do not change these thresholds without updating ARCHITECTURE.md §10.1.
+Do not change these thresholds without updating ARCHITECTURE.md section 10.1.
 
 ```
 gotcha: confirmed=true + confidence >= 0.6 + quality >= 0.4  → deny, inject record
@@ -164,7 +164,7 @@ no record                                                     → allow, log mis
 confidence < 0.3 OR quality < 0.4                            → allow, no injection
 ```
 
-Design principles (full set in ARCHITECTURE.md §2): hook enforcement is primary
+Design principles (full set in ARCHITECTURE.md section 2): hook enforcement is primary
 (P1); inject nothing by default, pull on demand (P2); four MCP tools max (P3);
 never block Claude on a mati outage — hooks fail open (P9).
 
@@ -189,9 +189,9 @@ never block Claude on a mati outage — hooks fail open (P9).
   exceed it.
 - **The bash `cat` bypass is a known, accepted miss (~2–5%).** `pre-bash.sh`
   catches `cat <file>` but not variable expansion, process substitution, or
-  unusual quoting (C9 in ARCHITECTURE.md §24). Do not chase 100%.
+  unusual quoting (C9 in ARCHITECTURE.md section 24). Do not chase 100%.
 - **Codex `apply_patch` edits are gated** by the `codex-pre-apply-patch` hook
-  (ARCHITECTURE.md §10.3): editing a file with an unconsulted confirmed gotcha
+  (ARCHITECTURE.md section 10.3): editing a file with an unconsulted confirmed gotcha
   is denied (exit 2) until `mem_get`. It parses the patch envelope for exact
   paths, so unlike the `cat` path it is immune to the wrapper/quoting bypass
   above. Codex fires `PreToolUse` for `apply_patch` but not native reads.
@@ -228,7 +228,7 @@ CLI color palette is defined in `src/cli/colors.rs` (GitHub-style hex semantics)
 ## Runtime architecture
 
 After the γ process-split, mati runs as two processes (full diagram +
-`daemon stop` semantics in ARCHITECTURE.md §4):
+`daemon stop` semantics in ARCHITECTURE.md section 4):
 
 - **`mati serve`** — thin MCP-stdio↔UDS proxy (~80 lines). Does not open the
   store, bind a socket, or manage signals. Calls `ensure_daemon` on startup, then

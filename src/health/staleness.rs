@@ -241,7 +241,7 @@ pub struct StalenessReport {
 
 // ── StalenessAnalyzer ───────────────────────────────────────────────────────
 
-/// Full staleness analyzer using the 5-factor formula from ARCHITECTURE.md §17.
+/// Full staleness analyzer using the 5-factor formula from ARCHITECTURE.md section 17.
 ///
 /// Opened once per CLI invocation, reuses the git2 repo handle and cached HEAD.
 pub struct StalenessAnalyzer {

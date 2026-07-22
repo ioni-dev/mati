@@ -1,7 +1,7 @@
 //! Confidence score recomputation (M-10-A).
 //!
 //! Pure synchronous computation — no I/O, no async. Applies the formula from
-//! ARCHITECTURE.md §13.1:
+//! ARCHITECTURE.md section 13.1:
 //!
 //! ```text
 //! confidence = base_score
@@ -39,7 +39,7 @@ const REF_BOOST: f32 = 1.5;
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Recompute the confidence value for `record` using the formula from
-/// ARCHITECTURE.md §13.1.
+/// ARCHITECTURE.md section 13.1.
 ///
 /// Returns a new `ConfidenceScore` with the recomputed `value`. All other
 /// fields (`confirmation_count`, `contributor_count`, `last_challenged`,

@@ -64,7 +64,7 @@ pub struct StaticFileAnalysis {
     pub panic_count: u32,
     /// Control-flow branches: if, match/switch, loop, while, for, ternary, try.
     pub branch_count: u32,
-    /// Canonical module-level doc comment (language-specific — see ENRICHMENT.md §1.1).
+    /// Canonical module-level doc comment (language-specific — see ENRICHMENT.md section 1.1).
     pub module_doc: Option<String>,
     /// SHA-256 hex digest of file bytes at parse time. Used for content-change detection (P3).
     pub content_hash: Option<String>,
