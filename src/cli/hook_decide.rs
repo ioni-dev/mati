@@ -438,8 +438,14 @@ async fn run_fileless_policy(
             return Ok(());
         }
     };
-    let Some((decision, events)) =
-        evaluate_governed_policy(Some(&mati_root), action, agent_id, "<fileless-bash>").await
+    let Some((decision, events)) = evaluate_governed_policy(
+        Some(&mati_root),
+        action,
+        "db_client",
+        agent_id,
+        "<fileless-bash>",
+    )
+    .await
     else {
         emit_allow(variant);
         return Ok(());
@@ -467,10 +473,11 @@ async fn run_fileless_policy(
 async fn evaluate_governed_policy(
     mati_root: Option<&Path>,
     action: &decide::Action,
+    governed_tool: &str,
     agent_id: Option<&str>,
     failure_path: &str,
 ) -> Option<(Decision, Vec<HookEvent>)> {
-    if action.tool != "db_client" {
+    if action.tool != governed_tool {
         return None;
     }
     let Some(mati_root) = mati_root else {
@@ -530,6 +537,7 @@ async fn evaluate_governed_policy(
 /// Merge a policy result into the existing file-gate result without lowering it.
 fn merge_policy_result(
     adapter: &mut AdapterResult,
+    variant: HookVariant,
     policy_decision: Decision,
     policy_events: Vec<HookEvent>,
 ) {
@@ -558,8 +566,7 @@ fn merge_policy_result(
     };
     adapter.decision = merged_decision;
     adapter.events.extend(policy_events);
-    let (stdout, stderr, exit_code) =
-        format_decision(HookVariant::ClaudePreBash, &adapter.decision, "<policy>");
+    let (stdout, stderr, exit_code) = format_decision(variant, &adapter.decision, "<policy>");
     adapter.stdout = stdout;
     adapter.stderr = stderr;
     adapter.exit_code = exit_code;
@@ -2247,6 +2254,7 @@ mod tests {
         };
         merge_policy_result(
             &mut adapter,
+            HookVariant::ClaudePreBash,
             Decision::Advisory {
                 context: "Consult the schema first.".into(),
             },
@@ -2266,6 +2274,7 @@ mod tests {
 
         merge_policy_result(
             &mut adapter,
+            HookVariant::ClaudePreBash,
             Decision::Deny {
                 file_key: "policy:prod-query".into(),
                 reason: "policy denied".into(),
