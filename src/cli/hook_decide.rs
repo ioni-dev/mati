@@ -109,19 +109,26 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
+    // Normalize Claude Bash once so the same governed action drives both the
+    // fileless policy path and the file-gate composition path.
+    let bash_action = if args.variant == HookVariant::ClaudePreBash {
+        input
+            .pointer("/tool_input/command")
+            .and_then(|v| v.as_str())
+            .map(|command| decide::normalize_action(Some(command), None))
+    } else {
+        None
+    };
+
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,
         None => {
-            if matches!(args.variant, HookVariant::ClaudePreBash) {
-                let command = input
-                    .pointer("/tool_input/command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let action = decide::normalize_action(Some(command), None);
-                if action.tool == "db_client" {
-                    return run_fileless_policy(&input, args.variant, &action, agent_id).await;
-                }
+            if let Some(action) = bash_action
+                .as_ref()
+                .filter(|action| action.tool == "db_client")
+            {
+                return run_fileless_policy(&input, args.variant, action, agent_id).await;
             }
             emit_allow(args.variant);
             return Ok(());
@@ -362,6 +369,21 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         }
     }
 
+    // A file-bearing governed DB command gets the policy decision after the
+    // existing file gate. A file-gate Deny is already final, so skip the
+    // policy round-trip and its possible second event on that path.
+    if args.variant == HookVariant::ClaudePreBash
+        && !matches!(adapter.decision, Decision::Deny { .. })
+    {
+        if let Some(action) = bash_action.as_ref() {
+            if let Some((policy_decision, policy_events)) =
+                evaluate_governed_policy(Some(&mati_root), action, agent_id, "<policy>").await
+            {
+                merge_policy_result(&mut adapter, policy_decision, policy_events);
+            }
+        }
+    }
+
     // Platform-specific output FIRST, audit events second: the outer deadline
     // can cancel this future between the two. A decision that was delivered
     // but not recorded is an honest gap (fail-open doctrine); an event
@@ -503,6 +525,44 @@ async fn evaluate_governed_policy(
         .collect::<Vec<_>>();
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
     Some((result.decision, result.events))
+}
+
+/// Merge a policy result into the existing file-gate result without lowering it.
+fn merge_policy_result(
+    adapter: &mut AdapterResult,
+    policy_decision: Decision,
+    policy_events: Vec<HookEvent>,
+) {
+    let merged_decision = match policy_decision {
+        Decision::Deny { .. } => policy_decision,
+        Decision::Advisory {
+            context: policy_context,
+        } => match &adapter.decision {
+            Decision::Deny { .. } => adapter.decision.clone(),
+            Decision::Advisory { context } => Decision::Advisory {
+                context: format!("{context}\n{policy_context}"),
+            },
+            Decision::AlreadyConsulted { context } => Decision::AlreadyConsulted {
+                context: format!("{context}\n{policy_context}"),
+            },
+            Decision::Liability { staleness, context } => Decision::Liability {
+                staleness: *staleness,
+                context: format!("{context}\n{policy_context}"),
+            },
+            _ => Decision::Advisory {
+                context: policy_context,
+            },
+        },
+        Decision::Allow => adapter.decision.clone(),
+        _ => adapter.decision.clone(),
+    };
+    adapter.decision = merged_decision;
+    adapter.events.extend(policy_events);
+    let (stdout, stderr, exit_code) =
+        format_decision(HookVariant::ClaudePreBash, &adapter.decision, "<policy>");
+    adapter.stdout = stdout;
+    adapter.stderr = stderr;
+    adapter.exit_code = exit_code;
 }
 
 // ── Path extraction ─────────────────────────────────────────────────────────
@@ -2126,6 +2186,52 @@ mod tests {
         let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &steer, "<policy>");
         assert!(stdout.contains("additionalContext"));
         assert!(!stdout.contains("permissionDecision"));
+    }
+
+    #[test]
+    fn file_gate_and_policy_merge_escalate_only() {
+        let mut adapter = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![HookEvent::Hit {
+                key: "file:prod.sql".into(),
+            }],
+            decision: Decision::Advisory {
+                context: "File guidance.".into(),
+            },
+        };
+        merge_policy_result(
+            &mut adapter,
+            Decision::Advisory {
+                context: "Consult the schema first.".into(),
+            },
+            vec![HookEvent::PolicyConsulted {
+                key: "policy:prod-query".into(),
+            }],
+        );
+        assert_eq!(
+            adapter.decision,
+            Decision::Advisory {
+                context: "File guidance.\nConsult the schema first.".into(),
+            }
+        );
+        assert_eq!(adapter.events.len(), 2);
+        assert!(adapter.stdout.contains("additionalContext"));
+        assert!(!adapter.stdout.contains("permissionDecision"));
+
+        merge_policy_result(
+            &mut adapter,
+            Decision::Deny {
+                file_key: "policy:prod-query".into(),
+                reason: "policy denied".into(),
+            },
+            vec![HookEvent::PolicyConsultBlocked {
+                key: "policy:prod-query".into(),
+            }],
+        );
+        assert!(matches!(adapter.decision, Decision::Deny { .. }));
+        assert!(adapter.stdout.contains(r#""permissionDecision":"deny""#));
     }
 
     #[test]
