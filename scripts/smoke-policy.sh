@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+#
+# End-to-end test bed for the local policy engine.
+#
+# Drives the real binary, a real daemon, and the real hook subprocess protocol.
+# Unit tests cover the logic; this proves the wiring.
+#
+# Known limits of this script:
+#   - Payloads are constructed from the documented schema, not captured from a
+#     live Claude Code session. The `tool_response.isError` contract in
+#     particular is only confirmed by a real session.
+#   - Fingerprint drift and the bad-glob boot path are unit-tested only; both
+#     need store surgery that is awkward from a shell.
+#
+# Usage:  ./scripts/smoke-policy.sh
+# Exit:   0 all steps passed, 1 otherwise.
+
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="$(mktemp -d)"
+export MATI_HOME="$WORK/mati-home"   # isolate off the real ~/.mati
+PROJECT="$WORK/project"
+MATI="$REPO_ROOT/target/debug/mati"
+
+PASS=0; FAIL=0; SKIP=0
+
+cleanup() { "$MATI" daemon stop >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+trap cleanup EXIT
+
+step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
+pass() { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
+fail() { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; printf '       got: %s\n' "${2:-<empty>}"; }
+skip() { SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m %s (%s)\n' "$1" "$2"; }
+
+assert_has()   { if printf '%s' "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1" "$2"; fi; }
+assert_lacks() { if printf '%s' "$2" | grep -q -- "$3"; then fail "$1" "$2"; else pass "$1"; fi; }
+denied()       { printf '%s' "$1" | grep -q 'permissionDecision":"deny"'; }
+
+# ── Payload builders ─────────────────────────────────────────────────────────
+# agent_id is optional; when present the receipt is actor-scoped.
+pre_bash() {
+  local cmd="$1" agent="${2:-}"
+  if [ -n "$agent" ]; then
+    printf '{"session_id":"smoke","agent_id":"%s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":%s}}' "$agent" "$cmd"
+  else
+    printf '{"session_id":"smoke","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":%s}}' "$cmd"
+  fi
+}
+post_bash() {
+  local cmd="$1" iserr="$2" code="$3" agent="${4:-}"
+  if [ -n "$agent" ]; then
+    printf '{"session_id":"smoke","agent_id":"%s","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":%s},"tool_response":{"isError":%s,"exit_code":%s,"stdout":"Table","stderr":""}}' "$agent" "$cmd" "$iserr" "$code"
+  else
+    printf '{"session_id":"smoke","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":%s},"tool_response":{"isError":%s,"exit_code":%s,"stdout":"Table","stderr":""}}' "$cmd" "$iserr" "$code"
+  fi
+}
+post_memget() {
+  local key="$1" agent="${2:-}"
+  if [ -n "$agent" ]; then
+    printf '{"session_id":"smoke","agent_id":"%s","hook_event_name":"PostToolUse","tool_name":"mcp__mati__mem_get","tool_input":{"key":%s},"tool_response":{"isError":false}}' "$agent" "$key"
+  else
+    printf '{"session_id":"smoke","hook_event_name":"PostToolUse","tool_name":"mcp__mati__mem_get","tool_input":{"key":%s},"tool_response":{"isError":false}}' "$key"
+  fi
+}
+pre_edit() { printf '{"session_id":"smoke","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":%s,"old_string":"a","new_string":"b"}}' "$1"; }
+
+hook()  { ( cd "$PROJECT" && printf '%s' "$2" | "$MATI" hook-decide "$1" 2>/dev/null ); }
+mati_p(){ ( cd "$PROJECT" && "$MATI" "$@" 2>&1 ); }
+
+# Real MCP tool call over stdio. This matters: the MCP `mem_get` handler mints
+# the GLOBAL receipt (actor=None), which is what the main-thread gate reads. The
+# post-memget hook only mints an actor-scoped receipt, so firing the hook alone
+# does NOT reproduce a real consultation.
+mcp_call() { # $1 = tool name, $2 = arguments json
+  ( cd "$PROJECT" && printf '%s\n%s\n%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" \
+    | "$MATI" serve 2>/dev/null )
+}
+
+add_block_policy() { # slug host_glob requires_key via [extra...]
+  mati_p policy add "$1" \
+    --name "$1" --rule "Consult $3 first." \
+    --reason "Schemas drift because production changes independently." \
+    --mode block --severity high \
+    --trigger  "{\"tool\":\"db_client\",\"host_glob\":\"$2\"}" \
+    --requires "{\"key\":\"$3\",\"via\":[\"$4\"],\"freshness\":{\"ttl_secs\":${5:-900}}}" >/dev/null
+}
+
+# ── Setup ────────────────────────────────────────────────────────────────────
+step "Setup"
+cargo build --quiet --bin mati 2>&1 | tail -3
+[ -x "$MATI" ] || { echo "binary not found at $MATI"; exit 1; }
+
+mkdir -p "$PROJECT"
+( cd "$PROJECT" && git init --quiet && mkdir -p migrations && echo "fn main() {}" > main.rs \
+  && echo "select 1;" > migrations/prod.sql && git add -A \
+  && git -c user.email=s@s -c user.name=s commit -qm init )
+mati_p init >/dev/null
+
+# NOTE: `mati daemon start` runs in the FOREGROUND and blocks, so it is never
+# called here. The hook path auto-spawns the daemon via ensure_daemon, which is
+# also how it happens in a real session.
+hook claude-pre-bash "$(pre_bash '"psql -h db.warmup.internal -c \"select 1\""')" >/dev/null 2>&1
+sleep 2
+
+# Blocking is gated on the global enforcement mode, which currently lives behind
+# the confusingly named `audit.write_durability` key. When a dedicated
+# `policy.mode` key lands, this is the ONE line that changes.
+mati_p config set audit.write_durability strict >/dev/null
+pass "store initialized, daemon auto-spawned, strict mode set"
+
+# ── 1. Inert until enabled, then blocks ──────────────────────────────────────
+step "1. Inert by default, enforcing after enable"
+add_block_policy query-a '*prod-a*' 'schema:orders' 'mem_get'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
+assert_lacks "not enforced before enable" "$OUT" 'permissionDecision":"deny"'
+
+mati_p policy enable query-a >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
+assert_has "denied after enable"   "$OUT" 'permissionDecision":"deny"'
+assert_has "names the policy"      "$OUT" 'query-a'
+assert_has "names the remedy key"  "$OUT" 'schema:orders'
+
+# ── 2. The gate is narrow ────────────────────────────────────────────────────
+step "2. Unrelated commands untouched"
+OUT="$(hook claude-pre-bash "$(pre_bash '"ls -la"')")"
+assert_lacks "plain shell command" "$OUT" 'permissionDecision'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h localhost -c \"select 1\""')")"
+assert_lacks "non-prod host"       "$OUT" 'permissionDecision":"deny"'
+
+# ── 3. MemGet unlocks ────────────────────────────────────────────────────────
+step "3. mem_get mints a receipt and unlocks"
+mcp_call mem_get '{"key":"schema:orders"}' >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
+assert_lacks "allowed after consultation" "$OUT" 'permissionDecision":"deny"'
+
+# ── 4. Introspection: exempt, unlocks, failure mints nothing ─────────────────
+step "4. DbIntrospection source"
+add_block_policy query-b '*prod-b*' 'schema:billing' 'db_introspection'
+mati_p policy enable query-b >/dev/null
+
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-b.internal -c \"\\d orders\""')")"
+assert_lacks "introspection itself never blocked" "$OUT" 'permissionDecision":"deny"'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-b.internal -c \"UPDATE billing SET s=1\""')")"
+assert_has  "denied before introspection" "$OUT" 'permissionDecision":"deny"'
+
+hook claude-post-bash "$(post_bash '"psql -h db.prod-b.internal -c \"\\d orders\""' 'false' '0')" >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-b.internal -c \"UPDATE billing SET s=1\""')")"
+assert_lacks "allowed after introspection" "$OUT" 'permissionDecision":"deny"'
+
+add_block_policy query-c '*prod-c*' 'schema:ledger' 'db_introspection'
+mati_p policy enable query-c >/dev/null
+hook claude-post-bash "$(post_bash '"psql -h db.prod-c.internal -c \"\\d ledger\""' 'true' '1')" >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-c.internal -c \"UPDATE ledger SET s=1\""')")"
+assert_has "FAILED introspection mints nothing" "$OUT" 'permissionDecision":"deny"'
+
+# ── 5. Actor scoping ─────────────────────────────────────────────────────────
+step "5. Receipts are actor-scoped"
+add_block_policy query-d '*prod-d*' 'schema:actor' 'mem_get'
+mati_p policy enable query-d >/dev/null
+hook claude-post-memget "$(post_memget '"schema:actor"' 'agent-A')" >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-d.internal -c \"UPDATE t SET s=1\""' 'agent-A')")"
+assert_lacks "agent A allowed after its own consult" "$OUT" 'permissionDecision":"deny"'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-d.internal -c \"UPDATE t SET s=1\""' 'agent-B')")"
+assert_has  "agent B still denied (no receipt of its own)" "$OUT" 'permissionDecision":"deny"'
+
+# ── 6. TTL expiry ────────────────────────────────────────────────────────────
+step "6. Receipt expires and re-blocks"
+add_block_policy query-ttl '*prod-ttl*' 'schema:ttl' 'mem_get' 2
+mati_p policy enable query-ttl >/dev/null
+mcp_call mem_get '{"key":"schema:ttl"}' >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-ttl.internal -c \"UPDATE t SET s=1\""')")"
+assert_lacks "allowed inside TTL" "$OUT" 'permissionDecision":"deny"'
+sleep 3
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-ttl.internal -c \"UPDATE t SET s=1\""')")"
+assert_has "denied again after TTL expiry" "$OUT" 'permissionDecision":"deny"'
+
+# ── 7. File-bearing command (follow-up A) ────────────────────────────────────
+step "7. File-bearing db command composes with the file gate"
+add_block_policy query-f '*prod-f*' 'schema:file' 'mem_get'
+mati_p policy enable query-f >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-f.internal -f migrations/prod.sql"')")"
+assert_has "psql -f denied" "$OUT" 'permissionDecision":"deny"'
+
+# ── 8. Edit gate (follow-up B) ───────────────────────────────────────────────
+step "8. Policy on a path steers/blocks an Edit"
+mati_p policy add edit-sql \
+  --name "SQL edit guard" --rule "Consult the schema before editing SQL." \
+  --reason "Migrations drift because production changes independently." \
+  --mode block --severity high \
+  --trigger  '{"target_path_glob":"**/*.sql"}' \
+  --requires '{"key":"schema:migrations","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+mati_p policy enable edit-sql >/dev/null
+OUT="$(hook claude-pre-edit "$(pre_edit '"migrations/prod.sql"')")"
+assert_has  "sql edit denied"          "$OUT" 'permissionDecision":"deny"'
+OUT="$(hook claude-pre-edit "$(pre_edit '"main.rs"')")"
+assert_lacks "unrelated edit untouched" "$OUT" 'permissionDecision":"deny"'
+assert_lacks "edit never force-allows"  "$OUT" 'permissionDecision":"allow"'
+
+# ── 9. Lifecycle: disable, edit, delete ──────────────────────────────────────
+step "9. Lifecycle changes take effect immediately"
+mati_p policy disable query-a >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-a.internal -c \"UPDATE orders SET s=1\""')")"
+assert_lacks "disabled policy stops enforcing" "$OUT" 'permissionDecision":"deny"'
+
+mati_p policy edit query-c --trigger '{"tool":"db_client","host_glob":"*retargeted*"}' >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-c.internal -c \"UPDATE ledger SET s=1\""')")"
+assert_lacks "old host no longer matches after edit" "$OUT" 'permissionDecision":"deny"'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.retargeted.internal -c \"UPDATE ledger SET s=1\""')")"
+assert_has  "new host matches after edit" "$OUT" 'permissionDecision":"deny"'
+
+mati_p policy delete query-c >/dev/null
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.retargeted.internal -c \"UPDATE ledger SET s=1\""')")"
+assert_lacks "deleted policy stops enforcing" "$OUT" 'permissionDecision":"deny"'
+
+# ── 10. Daemon restart reloads the matcher ───────────────────────────────────
+step "10. Matcher survives a daemon restart"
+mati_p daemon stop >/dev/null; sleep 1
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-f.internal -f migrations/prod.sql"')")"
+assert_has "still enforcing after restart" "$OUT" 'permissionDecision":"deny"'
+
+# ── 11. Concurrency ──────────────────────────────────────────────────────────
+step "11. Concurrent hook invocations"
+CONC_FAIL=0
+for i in 1 2 3 4 5; do
+  ( OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-f.internal -f migrations/prod.sql"')")"
+    denied "$OUT" || echo "miss" ) &
+done > "$WORK/conc.out"
+wait
+grep -q miss "$WORK/conc.out" && CONC_FAIL=1
+if [ "$CONC_FAIL" -eq 0 ]; then pass "5 parallel hooks all denied"; else fail "5 parallel hooks all denied" "$(cat "$WORK/conc.out")"; fi
+
+# ── 12. Fail-open ────────────────────────────────────────────────────────────
+step "12. A dead daemon fails open (P9)"
+mati_p daemon stop >/dev/null; sleep 1
+PAYLOAD="$(pre_bash '"psql -h db.prod-f.internal -f migrations/prod.sql"')"
+OUT="$( cd "$PROJECT" && printf '%s' "$PAYLOAD" \
+        | MATI_DISABLE_AUTO_SPAWN=1 "$MATI" hook-decide claude-pre-bash 2>/dev/null )"
+assert_lacks "not denied when mati is down" "$OUT" 'permissionDecision":"deny"'
+
+# ── 13. Agent authoring boundary (MCP) ───────────────────────────────────────
+step "13. mem_set agent boundary"
+POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"enabled":true,"severity":"high","created_by":"agent"}'
+OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:agent-authored\",\"value\":\"Consult first.\",\"category\":\"Policy\",\"payload\":$POLICY_JSON,\"tags\":[],\"priority\":\"High\"}")"
+if printf '%s' "$OUT" | grep -q 'jsonrpc'; then
+  assert_has "agent-authored policy is forced inert" "$OUT" '"enabled":false'
+  OUT2="$(mcp_call mem_set '{"action":"confirm","key":"policy:agent-authored","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
+  assert_has "agent cannot enable a policy" "$OUT2" 'mati policy enable'
+else
+  skip "mem_set agent boundary" "MCP stdio handshake produced no response"
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+printf '\n\033[1m== Summary ==\033[0m\n  passed: %d\n  failed: %d\n  skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
+[ "$FAIL" -eq 0 ] || exit 1
+printf '\n\033[32mPolicy engine verified end to end.\033[0m\n'
