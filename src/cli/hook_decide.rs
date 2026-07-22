@@ -396,6 +396,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 governed_tool,
                 agent_id,
                 "<policy>",
+                policy_block_exempt(args.variant, &input),
             )
             .await
             {
@@ -464,6 +465,7 @@ async fn run_fileless_policy(
         "db_client",
         agent_id,
         "<fileless-bash>",
+        policy_block_exempt(variant, input),
     )
     .await
     else {
@@ -496,6 +498,7 @@ async fn evaluate_governed_policy(
     governed_tool: &str,
     agent_id: Option<&str>,
     failure_path: &str,
+    introspection_exemption: bool,
 ) -> Option<(Decision, Vec<HookEvent>)> {
     if action.tool != governed_tool {
         return None;
@@ -546,12 +549,23 @@ async fn evaluate_governed_policy(
             key: verdict.key.clone(),
             rule: verdict.rule.clone(),
             requires_key: verdict.requires_key.clone(),
-            block: matches!(verdict.mode, mati_core::store::PolicyMode::Block),
+            block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                && !introspection_exemption,
             satisfied: verdict.satisfied,
         })
         .collect::<Vec<_>>();
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
     Some((result.decision, result.events))
+}
+
+/// A successful schema inspection is the remedy for a DB policy, so the
+/// pre-Bash gate may steer it but must not block it.
+fn policy_block_exempt(variant: HookVariant, input: &serde_json::Value) -> bool {
+    variant == HookVariant::ClaudePreBash
+        && input
+            .pointer("/tool_input/command")
+            .and_then(|value| value.as_str())
+            .is_some_and(decide::is_schema_introspection)
 }
 
 /// Merge a policy result into the existing file-gate result without lowering it.
@@ -1615,6 +1629,26 @@ fn format_claude_output(decision: &Decision) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn schema_introspection_exempts_matching_strict_block() {
+        let input = json!({
+            "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
+        });
+        assert!(policy_block_exempt(HookVariant::ClaudePreBash, &input));
+
+        let result = decide::evaluate_policy_verdicts(
+            &[decide::PolicyVerdict {
+                key: "policy:prod-query".into(),
+                rule: "Inspect production schema first.".into(),
+                requires_key: "schema:orders".into(),
+                block: false,
+                satisfied: false,
+            }],
+            true,
+        );
+        assert!(matches!(result.decision, Decision::Advisory { .. }));
+    }
 
     // ── extract_path ────────────────────────────────────────────────────
 
