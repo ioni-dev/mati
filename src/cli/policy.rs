@@ -17,7 +17,7 @@ use slugify::slugify;
 use mati_core::hooks::decide::{normalize_action, Action};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
 use mati_core::store::{
-    PolicyMode, PolicyRecord, PolicyRequires, PolicyTrigger, Priority, RecordLifecycle,
+    PolicyMode, PolicyRecord, PolicyRequires, PolicyStage, PolicyTrigger, Priority, RecordLifecycle,
 };
 
 use crate::cli::proxy::StoreProxy;
@@ -32,7 +32,7 @@ pub struct PolicyArgs {
 enum PolicyCommand {
     /// Add a local repository policy (stored under policy:<slug>).
     #[command(
-        long_about = "Add a local, developer-authored policy. New policies are inert by default; pass --enable for the deliberate human one-shot activation. This authors data in the local mati store; it does not verify a signed policy-floor bundle."
+        long_about = "Add a local, developer-authored policy. New policies are off by default; pass --shadow to observe or --enable for deliberate human activation."
     )]
     Add(AddArgs),
     /// Edit selected fields of an existing local policy.
@@ -43,12 +43,20 @@ enum PolicyCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show bounded shadow observations, optionally for one policy.
+    Observations {
+        slug: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one local policy.
     Show(PolicyKeyArgs),
     /// Enable one local policy.
     Enable(PolicyKeyArgs),
     /// Disable one local policy.
     Disable(PolicyKeyArgs),
+    /// Set a policy rollout stage.
+    Stage { key: String, stage: String },
     /// Tombstone one local policy.
     Delete(PolicyKeyArgs),
     /// Test local policy predicates against a command or path without writing.
@@ -96,6 +104,9 @@ struct AddArgs {
     /// Enable immediately (otherwise the new policy is inert).
     #[arg(long)]
     enable: bool,
+    /// Create in shadow stage for safe observation.
+    #[arg(long, conflicts_with = "enable")]
+    shadow: bool,
 }
 
 #[derive(Args)]
@@ -155,9 +166,13 @@ pub async fn run(args: PolicyArgs) -> Result<()> {
         PolicyCommand::Add(a) => add(a).await,
         PolicyCommand::Edit(a) => edit(a).await,
         PolicyCommand::List { json } => list(json).await,
+        PolicyCommand::Observations { slug, json } => observations(slug.as_deref(), json).await,
         PolicyCommand::Show(a) => show(&normalize_key(&a.key)).await,
         PolicyCommand::Enable(a) => set_enabled(&normalize_key(&a.key), true).await,
         PolicyCommand::Disable(a) => set_enabled(&normalize_key(&a.key), false).await,
+        PolicyCommand::Stage { key, stage } => {
+            set_stage(&normalize_key(&key), parse_stage(&stage)?).await
+        }
         PolicyCommand::Delete(a) => delete(&normalize_key(&a.key)).await,
         PolicyCommand::Test(a) => test_policies(a).await,
         PolicyCommand::Verify(a) => verify(a),
@@ -207,7 +222,13 @@ async fn add(args: AddArgs) -> Result<()> {
             .context("parsing --trigger JSON")?,
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
-        enabled: args.enable,
+        stage: if args.enable {
+            PolicyStage::Enforce
+        } else if args.shadow {
+            PolicyStage::Shadow
+        } else {
+            PolicyStage::Off
+        },
         severity: parse_priority(&args.severity)?,
         created_by: args.created_by,
     };
@@ -315,11 +336,7 @@ async fn list(json_output: bool) -> Result<()> {
             println!(
                 "{}\t{}\t{}\t{:?}",
                 record.key,
-                if policy.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
+                format!("{:?}", policy.stage).to_ascii_lowercase(),
                 policy.name,
                 policy.mode
             );
@@ -343,22 +360,77 @@ async fn show(key: &str) -> Result<()> {
 }
 
 async fn set_enabled(key: &str, enabled: bool) -> Result<()> {
+    set_stage(
+        key,
+        if enabled {
+            PolicyStage::Enforce
+        } else {
+            PolicyStage::Off
+        },
+    )
+    .await
+}
+
+fn parse_stage(value: &str) -> Result<PolicyStage> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(PolicyStage::Off),
+        "shadow" => Ok(PolicyStage::Shadow),
+        "enforce" => Ok(PolicyStage::Enforce),
+        other => anyhow::bail!("invalid policy stage '{other}'; expected off, shadow, or enforce"),
+    }
+}
+
+async fn set_stage(key: &str, stage: PolicyStage) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
+    let record = proxy
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no record found for '{key}'"))?;
+    let mut policy = record
+        .payload_as::<PolicyRecord>()
+        .ok_or_else(|| anyhow::anyhow!("'{key}' is not a policy record"))?;
+    policy.stage = stage;
     let result = proxy
         .policy_write(
-            if enabled {
-                mati_core::mcp::protocol::PolicyWriteOp::Enable
-            } else {
-                mati_core::mcp::protocol::PolicyWriteOp::Disable
-            },
+            mati_core::mcp::protocol::PolicyWriteOp::Stage,
             key,
-            None,
+            Some(&policy),
         )
         .await;
     proxy.close_with_result(result).await?;
-    println!("{} {}", if enabled { "Enabled" } else { "Disabled" }, key);
+    println!("Set {} stage to {:?}", key, stage);
     Ok(())
+}
+
+async fn observations(slug: Option<&str>, json_output: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let mut observations = Vec::new();
+    for record in proxy.scan_prefix("analytics:policy_shadow_").await? {
+        if let Some(agg) = record.payload_as::<mati_core::store::session::ShadowObservationAgg>() {
+            observations.extend(agg.observations);
+        }
+    }
+    if let Some(slug) = slug {
+        let key = normalize_key(slug);
+        observations.retain(|observation| observation.policy_key == key);
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&observations)?);
+    } else if observations.is_empty() {
+        println!("No shadow observations found.");
+    } else {
+        for observation in observations {
+            println!(
+                "{}\t{}\t{}",
+                observation.timestamp,
+                observation.policy_key,
+                serde_json::to_string(&observation.action)?
+            );
+        }
+    }
+    proxy.close().await
 }
 
 async fn delete(key: &str) -> Result<()> {
@@ -388,7 +460,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
             mode: PolicyMode::Steer,
             trigger,
             requires: serde_json::from_str(r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#)?,
-            enabled: true,
+            stage: PolicyStage::Enforce,
             severity: Priority::Normal,
             created_by: "ad-hoc".into(),
         };
@@ -609,7 +681,7 @@ mod tests {
                 r#"{"key":"schema:orders","via":["mem_get"],"freshness":{"ttl_secs":900}}"#,
             )
             .unwrap(),
-            enabled: true,
+            stage: PolicyStage::Enforce,
             severity: Priority::High,
             created_by: "test".into(),
         };
@@ -620,6 +692,7 @@ mod tests {
             .into_iter()
             .map(|matched| mati_core::mcp::protocol::PolicyVerdict {
                 key: matched.key.to_string(),
+                stage: matched.policy.stage,
                 mode: matched.policy.mode,
                 rule: matched.policy.rule.clone(),
                 reason: matched.policy.reason.clone(),
@@ -648,6 +721,7 @@ mod tests {
         let action = normalize_action(Some("psql -h db.prod.internal -c select"), None);
         let matched = mati_core::mcp::protocol::PolicyVerdict {
             key: "policy:prod".into(),
+            stage: PolicyStage::Enforce,
             mode: PolicyMode::Block,
             rule: "Consult first.".into(),
             reason: "Because production changes.".into(),
