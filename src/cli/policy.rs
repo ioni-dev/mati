@@ -209,7 +209,16 @@ async fn list(json_output: bool) -> Result<()> {
         .scan_prefix("policy:")
         .await?
         .into_iter()
-        .filter(|record| matches!(record.lifecycle, mati_core::store::RecordLifecycle::Active))
+        .filter_map(|record| {
+            if record.payload_as::<PolicyRecord>().is_none() {
+                eprintln!(
+                    "warning: skipping policy {} with invalid payload",
+                    record.key
+                );
+                return None;
+            }
+            matches!(record.lifecycle, mati_core::store::RecordLifecycle::Active).then_some(record)
+        })
         .collect::<Vec<_>>();
     if json_output {
         println!("{}", serde_json::to_string_pretty(&records)?);
@@ -217,9 +226,9 @@ async fn list(json_output: bool) -> Result<()> {
         println!("No local policies found.");
     } else {
         for record in records {
-            let policy = record.payload_as::<PolicyRecord>().ok_or_else(|| {
-                anyhow::anyhow!("invalid PolicyRecord payload for {}", record.key)
-            })?;
+            let policy = record
+                .payload_as::<PolicyRecord>()
+                .expect("validated policy payload");
             println!(
                 "{}\t{}\t{}\t{:?}",
                 record.key,
@@ -286,10 +295,15 @@ async fn test_policies(args: TestArgs) -> Result<()> {
         .await?
         .into_iter()
         .filter(|record| {
-            matches!(record.lifecycle, mati_core::store::RecordLifecycle::Active)
-                && record
-                    .payload_as::<PolicyRecord>()
-                    .is_some_and(|policy| policy.enabled)
+            if record.payload_as::<PolicyRecord>().is_none() {
+                eprintln!(
+                    "warning: skipping policy {} with invalid payload",
+                    record.key
+                );
+                false
+            } else {
+                true
+            }
         })
         .collect::<Vec<_>>();
     let matcher = PolicyMatcherSet::from_records(&records).context("compiling local policies")?;
