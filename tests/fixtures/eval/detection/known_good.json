@@ -14,5 +14,6 @@
   {"id":"kg-rg","cmd":"rg pattern src/db.rs","label":"violation","expect_class":"grep_like","expect_paths":["src/db.rs"],"note":"ripgrep, last positional"},
   {"id":"kg-grep-quoted-path","cmd":"grep foo \"src/db.rs\"","label":"violation","expect_class":"grep_like","expect_paths":["src/db.rs"],"note":"grep, path is the last double-quoted token"},
   {"id":"kg-sed-np","cmd":"sed -n 1p src/db.rs","label":"violation","expect_class":"grep_like","expect_paths":["src/db.rs"],"note":"sed, path is last positional"},
-  {"id":"kg-awk-prog","cmd":"awk '{print $1}' src/db.rs","label":"violation","expect_class":"grep_like","expect_paths":["src/db.rs"],"note":"awk program then path; path is last positional"}
+  {"id":"kg-awk-prog","cmd":"awk '{print $1}' src/db.rs","label":"violation","expect_class":"grep_like","expect_paths":["src/db.rs"],"note":"awk program then path; path is last positional"},
+  {"id":"kg-psql-host","cmd":"psql -h db.prod.internal -c \"select 1\"","label":"violation","expect_class":"db_client_like","expect_paths":[],"note":"db client invocation is governed by normalized tool category"}
 ]

@@ -15,5 +15,6 @@
   {"id":"adv-cat-multifile","cmd":"cat src/a.rs src/secret.rs","label":"violation","expect_class":"cat_like","expect_paths":["src/a.rs","src/secret.rs"],"note":"hardened: multi-path gate checks every file, so a gotcha on the 2nd is caught"},
   {"id":"adv-grep-quoted-path-pattern","cmd":"grep foo \"src/db.rs\"","label":"violation","expect_class":"grep_like","expect_paths":["src/db.rs"],"note":"handled: last double-quoted is the path"},
   {"id":"adv-cat-spaces","cmd":"cat    src/db.rs","label":"violation","expect_class":"cat_like","expect_paths":["src/db.rs"],"note":"handled: runs of whitespace collapse"},
-  {"id":"adv-cat-semicolon","cmd":"cat src/db.rs ; echo done","label":"violation","expect_class":"cat_like","expect_paths":["src/db.rs"],"note":"handled: split at ; before the path search"}
+  {"id":"adv-cat-semicolon","cmd":"cat src/db.rs ; echo done","label":"violation","expect_class":"cat_like","expect_paths":["src/db.rs"],"note":"handled: split at ; before the path search"},
+  {"id":"adv-sudo-uroot-psql","cmd":"sudo -u root psql -h db.prod.internal -c \"select 1\"","label":"violation","expect_class":"db_client_like","expect_paths":[],"note":"GAP: sudo with flags (-u root) not parsed; wrapper-flag arity is ambiguous"}
 ]
