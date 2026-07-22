@@ -360,6 +360,9 @@ pub struct PolicyVerdict {
     pub severity: StorePriority,
     pub requires_key: String,
     pub satisfied: bool,
+    /// Snapshot of the global enforcement mode used for block degradation.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -661,6 +664,10 @@ pub enum SessionEvent {
     /// Enterprise floor mandate: an unconsulted access to a consult-required path was DENIED.
     /// Records `Deny` with reason `floor_consult_required` (distinct from gotcha denies).
     FloorConsultMiss,
+    /// Local policy denied an unconsulted governed action.
+    PolicyConsultMiss,
+    /// Local policy allowed an action after its receipt was present.
+    PolicyConsultHit,
     CodexShellMiss,
     Bootstrap,
     PromptNudge,

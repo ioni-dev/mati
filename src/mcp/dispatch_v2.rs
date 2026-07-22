@@ -608,6 +608,10 @@ async fn dispatch_policy_evaluate(
 
     let g = graph.read().await;
     let store = g.store();
+    let strict = matches!(
+        crate::store::enforcement::get_enforcement_mode(store).await,
+        crate::store::enforcement::EnforcementMode::Strict
+    );
     let mut verdicts = Vec::with_capacity(matched.len());
     for (key, mode, rule, reason, severity, requires_key, ttl_secs) in matched {
         let satisfied = match mode {
@@ -636,6 +640,7 @@ async fn dispatch_policy_evaluate(
             severity,
             requires_key,
             satisfied,
+            strict,
         });
     }
 
@@ -776,6 +781,8 @@ async fn dispatch_session_side(
                 // Floor-mandate deny shares the miss aggregate; the distinction lives in the
                 // event's decision_reason_code (floor_consult_required).
                 protocol::SessionEvent::FloorConsultMiss => "compliance:miss_",
+                protocol::SessionEvent::PolicyConsultMiss => "compliance:miss_",
+                protocol::SessionEvent::PolicyConsultHit => "compliance:allow_after_receipt_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -922,6 +929,34 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "floor_consult_required".to_string(),
+                        None,
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::PolicyConsultMiss => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::Control,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "policy_consult_required".to_string(),
+                        None,
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::PolicyConsultHit => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::AllowAfterReceipt,
+                        crate::store::enforcement::SubjectKind::Control,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "policy_receipt_valid".to_string(),
                         None,
                         input.session_id.clone(),
                     )
