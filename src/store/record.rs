@@ -830,6 +830,15 @@ pub enum PolicyMode {
     Block,
 }
 
+/// Rollout stage for a local policy.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyStage {
+    Off,
+    Shadow,
+    Enforce,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptSource {
@@ -852,7 +861,7 @@ pub struct PolicyRequires {
 }
 
 /// A developer-authored local policy stored under `policy:<slug>`.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRecord {
     pub name: String,
     pub rule: String,
@@ -861,9 +870,58 @@ pub struct PolicyRecord {
     pub mode: PolicyMode,
     pub trigger: PolicyTrigger,
     pub requires: PolicyRequires,
-    pub enabled: bool,
+    pub stage: PolicyStage,
     pub severity: Priority,
     pub created_by: String,
+}
+
+impl<'de> Deserialize<'de> for PolicyRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: String,
+            rule: String,
+            reason: String,
+            scope: String,
+            mode: PolicyMode,
+            trigger: PolicyTrigger,
+            requires: PolicyRequires,
+            #[serde(default)]
+            stage: Option<PolicyStage>,
+            #[serde(default)]
+            enabled: Option<bool>,
+            severity: Priority,
+            created_by: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            name: wire.name,
+            rule: wire.rule,
+            reason: wire.reason,
+            scope: wire.scope,
+            mode: wire.mode,
+            trigger: wire.trigger,
+            requires: wire.requires,
+            stage: wire
+                .stage
+                .or_else(|| {
+                    wire.enabled.map(|enabled| {
+                        if enabled {
+                            PolicyStage::Enforce
+                        } else {
+                            PolicyStage::Off
+                        }
+                    })
+                })
+                .unwrap_or(PolicyStage::Off),
+            severity: wire.severity,
+            created_by: wire.created_by,
+        })
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -1209,7 +1267,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: true,
+            stage: PolicyStage::Enforce,
             severity: Priority::Critical,
             created_by: "developer".into(),
         };
@@ -1241,6 +1299,25 @@ mod tests {
         let restored: Record = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(restored.category, Category::Policy);
         assert_eq!(restored.payload_as::<PolicyRecord>().unwrap(), policy);
+    }
+
+    #[test]
+    fn legacy_policy_enabled_deserializes_to_stage() {
+        let mut value = serde_json::to_value(serde_json::json!({
+            "name": "legacy",
+            "rule": "Consult first.",
+            "reason": "Schemas drift because deployments change.",
+            "scope": "repo",
+            "mode": "block",
+            "trigger": {},
+            "requires": {"key": "schema:x", "via": [], "freshness": {"ttl_secs": 900}},
+            "enabled": true,
+            "severity": "high",
+            "created_by": "test"
+        }))
+        .unwrap();
+        let policy: PolicyRecord = serde_json::from_value(value.take()).unwrap();
+        assert_eq!(policy.stage, PolicyStage::Enforce);
     }
 
     #[test]

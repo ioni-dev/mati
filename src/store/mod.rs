@@ -26,7 +26,7 @@ pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{
     AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,
     GotchaRecord, KnowledgeGap, OnboardingScore, PolicyFreshness, PolicyMode, PolicyRecord,
-    PolicyRequires, PolicyTrigger, Priority, QualityScore, QualitySignal, QualityTier,
+    PolicyRequires, PolicyStage, PolicyTrigger, Priority, QualityScore, QualitySignal, QualityTier,
     ReceiptSource, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry,
     StaleReviewPayload, StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind,
     TombstoneReason,

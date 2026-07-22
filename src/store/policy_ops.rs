@@ -12,8 +12,8 @@ use globset::Glob;
 use super::db::Store;
 use super::enforcement::{record_event, ControlChangeKind, EnforcementEventType, SubjectKind};
 use super::record::{
-    Category, ConfidenceScore, PolicyRecord, QualityScore, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StalenessScore, TombstoneReason,
+    Category, ConfidenceScore, PolicyRecord, PolicyStage, QualityScore, Record, RecordLifecycle,
+    RecordSource, RecordVersion, StalenessScore, TombstoneReason,
 };
 
 /// Typed failure modes for policy mutations, so callers (e.g. the daemon
@@ -73,7 +73,10 @@ pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<S
             "warning: policy trigger tool '{tool}' is not a recognized governable category (known: db_client, file_read, path); this policy will never match until such a category is supported."
         ));
     }
-    if policy.requires.via.contains(&super::record::ReceiptSource::MemGet)
+    if policy
+        .requires
+        .via
+        .contains(&super::record::ReceiptSource::MemGet)
         && !has_backing_record
     {
         warnings.push(format!(
@@ -82,12 +85,17 @@ pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<S
         ));
     }
     if policy.requires.freshness.fingerprint
-        && !policy.requires.via.contains(&super::record::ReceiptSource::MemGet)
+        && !policy
+            .requires
+            .via
+            .contains(&super::record::ReceiptSource::MemGet)
     {
         warnings.push("warning: requires.freshness.fingerprint is unsatisfiable without MemGet; DbIntrospection receipts do not carry a content fingerprint.".into());
     }
     if policy.mode == super::record::PolicyMode::Block && policy.requires.key.is_empty() {
-        warnings.push("warning: block policy has an empty requires.key; nothing could ever unlock it.".into());
+        warnings.push(
+            "warning: block policy has an empty requires.key; nothing could ever unlock it.".into(),
+        );
     }
     warnings
 }
@@ -220,7 +228,7 @@ pub async fn edit(store: &Store, key: &str, policy: &PolicyRecord) -> Result<()>
 }
 
 /// Enable or disable an active policy.
-pub async fn set_enabled(store: &Store, key: &str, enabled: bool) -> Result<()> {
+pub async fn set_stage(store: &Store, key: &str, stage: PolicyStage) -> Result<()> {
     ensure_policy_key(key)?;
     let mut record = store
         .get(key)
@@ -228,18 +236,19 @@ pub async fn set_enabled(store: &Store, key: &str, enabled: bool) -> Result<()> 
         .ok_or_else(|| PolicyOpError::NotFound {
             key: key.to_string(),
         })?;
-    let mut policy = record
-        .payload_as::<PolicyRecord>()
-        .ok_or_else(|| PolicyOpError::InvalidPayload {
-            key: key.to_string(),
-        })?;
+    let mut policy =
+        record
+            .payload_as::<PolicyRecord>()
+            .ok_or_else(|| PolicyOpError::InvalidPayload {
+                key: key.to_string(),
+            })?;
     if !matches!(record.lifecycle, RecordLifecycle::Active) {
         return Err(PolicyOpError::NotActive {
             key: key.to_string(),
         }
         .into());
     }
-    policy.enabled = enabled;
+    policy.stage = stage;
     record.payload = Some(serde_json::to_value(&policy)?);
     record.updated_at = now_secs();
     record.version.logical_clock += 1;
@@ -307,7 +316,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
-            enabled: true,
+            stage: PolicyStage::Enforce,
             severity: super::super::record::Priority::High,
             created_by: "developer".into(),
         }
@@ -320,8 +329,8 @@ mod tests {
         let key = "policy:query-safety";
         create(&store, key, &sample()).await.unwrap();
         assert_eq!(list(&store).await.unwrap().len(), 1);
-        set_enabled(&store, key, false).await.unwrap();
-        set_enabled(&store, key, true).await.unwrap();
+        set_stage(&store, key, PolicyStage::Off).await.unwrap();
+        set_stage(&store, key, PolicyStage::Enforce).await.unwrap();
         delete(&store, key).await.unwrap();
         assert!(list(&store).await.unwrap().is_empty());
         let events = super::super::enforcement::scan_enforcement_events(&store, 0, u64::MAX)
