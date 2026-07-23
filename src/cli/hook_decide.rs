@@ -999,10 +999,13 @@ fn post_bash_succeeded(input: &serde_json::Value) -> bool {
     // Observed alongside that: a Bash call that exits non-zero fires no
     // PostToolUse event at all, so this function never runs for a failed
     // command and cannot mint for one. That is what makes the absent-means-
-    // success default safe rather than merely convenient. The checks below stay
-    // as defense in depth, because the absence of an event is Claude Code's
-    // behavior to change, not a contract mati controls. Sampled in default
-    // permission mode only.
+    // success default safe rather than merely convenient. Confirmed in both
+    // `default` and `acceptEdits` permission modes; `bypassPermissions` is
+    // untested. The checks below stay as defense in depth, because the absence
+    // of an event is Claude Code's behavior to change, not a contract mati
+    // controls: if a failing command ever did reach this function it would
+    // carry no `isError` either, and the shape alone could not distinguish it
+    // from a success.
     if response
         .get("isError")
         .or_else(|| response.get("is_error"))
