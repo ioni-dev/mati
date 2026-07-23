@@ -872,7 +872,13 @@ pub async fn scan_enforcement_events(
     let keys = store.scan_keys(EVENT_PREFIX).await?;
     let mut events = Vec::new();
 
-    for key in &keys {
+    let start = keys.partition_point(|key| {
+        key.strip_prefix(EVENT_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|seq| seq < since_seq)
+            .unwrap_or(true)
+    });
+    for key in keys.iter().skip(start) {
         let seq = match key
             .strip_prefix(EVENT_PREFIX)
             .and_then(|s| s.parse::<u64>().ok())
@@ -880,7 +886,10 @@ pub async fn scan_enforcement_events(
             Some(s) => s,
             None => continue,
         };
-        if seq < since_seq || seq > until_seq {
+        if seq > until_seq {
+            break;
+        }
+        if seq < since_seq {
             continue;
         }
         if let Ok(Some(bytes)) = store.get_raw_bytes(key).await {
@@ -895,6 +904,81 @@ pub async fn scan_enforcement_events(
 
     events.sort_by_key(|e| e.seq_no);
     Ok(events)
+}
+
+/// Result of a time-bounded enforcement scan. The oldest timestamp is kept
+/// separate so callers can distinguish an empty retained window from history
+/// that predates the retention floor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnforcementEventScan {
+    pub events: Vec<EnforcementEvent>,
+    pub oldest_recorded_at_ms: Option<u64>,
+    pub scanned_keys: usize,
+}
+
+/// Scan events from the first sequence whose recorded time reaches `since_ms`.
+/// Event keys are zero-padded and sequence allocation is monotonic, so the
+/// timestamp boundary is found with O(log n) raw reads and the matching suffix
+/// is read forward. This keeps an activity report from loading a year's event
+/// payloads just to discard them.
+pub async fn scan_enforcement_events_since_ms(
+    store: &Store,
+    since_ms: u64,
+    until_ms: u64,
+) -> Result<EnforcementEventScan> {
+    let keys = store.scan_keys(EVENT_PREFIX).await?;
+    let valid_keys: Vec<&String> = keys
+        .iter()
+        .filter(|key| {
+            key.strip_prefix(EVENT_PREFIX)
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some()
+        })
+        .collect();
+
+    async fn read_event(store: &Store, key: &str) -> Option<EnforcementEvent> {
+        let bytes = store.get_raw_bytes(key).await.ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    let oldest_recorded_at_ms = match valid_keys.first() {
+        Some(key) => read_event(store, key)
+            .await
+            .map(|event| event.recorded_at_ms),
+        None => None,
+    };
+
+    let mut low = 0;
+    let mut high = valid_keys.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match read_event(store, valid_keys[mid]).await {
+            Some(event) if event.recorded_at_ms < since_ms => low = mid + 1,
+            Some(_) => high = mid,
+            None => low = mid + 1,
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut scanned_keys = 0;
+    for key in valid_keys.into_iter().skip(low) {
+        scanned_keys += 1;
+        let Some(event) = read_event(store, key).await else {
+            continue;
+        };
+        if event.recorded_at_ms > until_ms {
+            break;
+        }
+        if event.recorded_at_ms >= since_ms {
+            events.push(event);
+        }
+    }
+    events.sort_by_key(|event| event.seq_no);
+    Ok(EnforcementEventScan {
+        events,
+        oldest_recorded_at_ms,
+        scanned_keys,
+    })
 }
 
 // ─────────────────────────────────────────────

@@ -517,7 +517,27 @@ For a `policy:<slug>` key every staleness factor collapses. `git_factor` resolve
 
 The tiers also mean the wrong thing here. They carry injection semantics — warn in bootstrap, blocks injection, excluded entirely — while policy enforcement gates on `RecordLifecycle::Active` and `PolicyStage` and never reads staleness at all. A policy shown as "excluded entirely" while it still denies every matching action would be a false statement on the operator's dashboard.
 
-Matches are already recorded where they exist, so the signal is not missing in general. A `block` policy at `enforce` writes `enforcement:event:*` with `subject_kind: Control` and reason `policy_consult_required` or `policy_receipt_valid`. A `shadow` policy writes `analytics:policy_shadow_<date>`. The one gap is `steer` at `enforce`: it pushes context and emits no event, so "this policy never fired" is currently unanswerable for steer policies specifically. Recorded as a known gap; no counter is implemented.
+Matches are recorded in three eventual activity sources. A `block` policy at
+`enforce` writes `enforcement:event:*` with `subject_kind: Control` and reason
+`policy_consult_required` or `policy_receipt_valid`; a `shadow` policy writes
+`analytics:policy_shadow_<date>`; and an enforcing `steer` policy writes
+`analytics:policy_steer_<date>`. `mati policy activity` aggregates those traces
+on read, reports `fired`, `no activity in <N> days`, or `not measurable`, and
+states the 365-day enforcement retention bound. It deliberately keeps no
+derived per-policy index: `mati repair` can therefore continue to rebuild and
+verify every index this repository owns.
+
+The steer key is a normal `analytics:*` `Record`, not raw bytes, and therefore
+uses the existing `Eventual` durability class. No exact-key durability
+exception is needed; the keyspace encoding remains the invariant.
+
+Activity is a safe under-count. If a satisfied block policy and a different
+denying policy match the same action, the satisfied policy's
+`PolicyConsulted` event is dropped; writing `AllowAfterReceipt` for an action
+that was denied would falsify the hash-chained enforcement audit. The same
+decision suppresses a steer trace for that denied action. This can make a live
+policy look quieter, never make a dead policy look alive, so the activity help
+text points authors to `mati policy test` before deleting a quiet rule.
 
 `mem_bootstrap` also does not preload policies. This is intentional under P2:
 inject nothing by default and pull on demand. A policy deny names the required

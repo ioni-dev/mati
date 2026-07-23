@@ -420,6 +420,25 @@ OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-steer.internal -c \"se
 assert_has   "steer injects the rule"   "$OUT" 'Review the action.'
 assert_lacks "steer never decides"      "$OUT" 'permissionDecision'
 
+# Activity is aggregated across enforcement, shadow, and steer traces. JSON is
+# the machine-readable contract; jq parses it and the state/count assertions
+# keep an empty fail-open hook from satisfying the checks.
+step "13a. Policy activity reports all trace sources"
+ACTIVITY_JSON="$(mati_p policy activity --json --since 30)"
+printf '%s' "$ACTIVITY_JSON" | jq -e '.window_days == 30 and (.policies | type == "array")' >/dev/null \
+  && pass "activity JSON carries the window" || fail "activity JSON carries the window" "$ACTIVITY_JSON"
+assert_has "denied policy is fired" "$ACTIVITY_JSON" '"policy:query-f"'
+assert_has "shadow policy is fired" "$ACTIVITY_JSON" '"policy:query-a"'
+assert_has "steer policy is fired" "$ACTIVITY_JSON" '"policy:steer-live"'
+mati_p policy add activity-idle --name activity-idle --rule "Consult before idle test." \
+  --reason "The trigger can stop matching because repositories change." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*never-activity*"}' \
+  --requires '{"key":"decision:activity-idle","via":["mem_get"],"freshness":{"ttl_secs":900}}' \
+  --enable >/dev/null
+IDLE_ACTIVITY="$(mati_p policy activity activity-idle --since 30)"
+assert_has "idle policy names its window" "$IDLE_ACTIVITY" 'no activity in 30 days'
+assert_lacks "idle policy is not called fired" "$IDLE_ACTIVITY" $'\tfired\t'
+
 # ── 14. Receipt sources ──────────────────────────────────────────────────────
 # The introspection exemption suppresses blocks but must not mint: a policy that
 # accepts only MemGet stays locked after the agent inspects the schema itself.
@@ -507,7 +526,25 @@ mati_p policy add doctor-warn --name doctor-warn --rule "Consult first." \
   --trigger '{"tool":"db_client","host_glob":"*prod-dw*"}' \
   --requires '{"key":"decision:never-written","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
 mati_p policy enable doctor-warn >/dev/null
-assert_has "doctor flags an unbacked enforcing policy" "$(mati_p doctor)" 'has no backing record'
+DOC="$(mati_p doctor)"
+assert_has "doctor flags an unbacked enforcing policy" "$DOC" 'has no backing record'
+
+# Import a second copy with an old record creation time so the activity check
+# exercises its warning path. The just-authored idle policy is the grace-period
+# positive control and must not produce the same warning.
+mati_p policy add activity-old-source --name activity-old-source --rule "Consult before old test." \
+  --reason "The trigger can stop matching because repositories change." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*never-old-activity*"}' \
+  --requires '{"key":"decision:activity-old","via":["mem_get"],"freshness":{"ttl_secs":900}}' \
+  --enable >/dev/null
+mati_p export --format json | jq '[.[] | select(.key == "policy:activity-old-source") | .key = "policy:activity-old" | .created_at = ((now | floor) - 691200)]' > "$WORK/old-policy.json"
+mati_p import "$WORK/old-policy.json" >/dev/null
+mati_p policy stage activity-old enforce >/dev/null
+DOC="$(mati_p doctor)"
+assert_has "doctor warns on an old idle policy" "$DOC" 'policy:activity-old.*no activity in 30 days'
+assert_has "idle warning offers both readings" "$DOC" 'no longer needed or its trigger may have stopped matching'
+assert_has "idle warning points to policy test" "$DOC" 'mati policy test'
+assert_lacks "doctor exempts a newly authored idle policy" "$DOC" 'policy:activity-idle.*no activity in 30 days'
 
 # ── 17a. Author-time key advice ──────────────────────────────────────────────
 # The unbacked-key warning used to say "store a record at that key" even for a

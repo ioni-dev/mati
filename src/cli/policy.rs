@@ -6,19 +6,23 @@
 //! embedded trust anchor (empty in the OSS core, so a real bundle is rejected
 //! until an Enterprise build supplies a key). Pure + offline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::{Args, Subcommand};
+use serde::Serialize;
 use slugify::slugify;
 
 use mati_core::hooks::decide::{normalize_action, Action};
 use mati_core::policy::{self, PolicyBundle, TrustedKey};
 use mati_core::store::{
-    PolicyMode, PolicyRecord, PolicyRequires, PolicyStage, PolicyTrigger, Priority, RecordLifecycle,
+    enforcement::{EnforcementEventType, SubjectKind},
+    PolicyMode, PolicyRecord, PolicyRequires, PolicyStage, PolicyTrigger, Priority,
+    RecordLifecycle,
 };
 
 use crate::cli::proxy::StoreProxy;
@@ -54,6 +58,18 @@ enum PolicyCommand {
         slug: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    #[command(
+        long_about = "Report retained activity for active policies. Activity is an under-count by design: when a satisfied block policy co-occurs with a different deny, its allow-after-receipt trace is dropped to preserve the enforcement chain. A quiet result is therefore safe in direction, but use `mati policy test` before deleting a rule."
+    )]
+    /// Report retained activity for active policies.
+    Activity {
+        slug: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Look back this many days (enforcement retention bounds older claims).
+        #[arg(long, default_value_t = 30)]
+        since: u64,
     },
     /// Show one local policy.
     Show(PolicyKeyArgs),
@@ -174,6 +190,9 @@ pub async fn run(args: PolicyArgs) -> Result<()> {
         PolicyCommand::List { json } => list(json).await,
         PolicyCommand::Receipts { json } => receipts(json).await,
         PolicyCommand::Observations { slug, json } => observations(slug.as_deref(), json).await,
+        PolicyCommand::Activity { slug, json, since } => {
+            activity(slug.as_deref(), json, since).await
+        }
         PolicyCommand::Show(a) => show(&normalize_key(&a.key)).await,
         PolicyCommand::Enable(a) => set_enabled(&normalize_key(&a.key), true).await,
         PolicyCommand::Disable(a) => set_enabled(&normalize_key(&a.key), false).await,
@@ -632,6 +651,228 @@ async fn observations(slug: Option<&str>, json_output: bool) -> Result<()> {
                     serde_json::to_string(&observation.action)?
                 );
             }
+        }
+    }
+    proxy.close().await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActivityState {
+    Fired,
+    NoActivity,
+    NotMeasurable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PolicyActivity {
+    pub policy: String,
+    pub state: ActivityState,
+    pub window_days: u64,
+    pub window_start: u64,
+    pub count: u64,
+    pub last_fired_at: Option<u64>,
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ActivityReport {
+    pub window_days: u64,
+    pub window_start: u64,
+    pub window_end: u64,
+    pub retention_days: u64,
+    pub retention_limited: bool,
+    pub retention_note: Option<String>,
+    pub policies: Vec<PolicyActivity>,
+}
+
+const POLICY_ACTIVITY_RETENTION_DAYS: u64 = 365;
+pub(crate) const POLICY_ACTIVITY_DEFAULT_DAYS: u64 = 30;
+pub(crate) const POLICY_ACTIVITY_GRACE_DAYS: u64 = 7;
+
+/// Aggregate policy traces on read. There is intentionally no per-policy
+/// index: policy records remain rebuildable and `mati repair` stays complete.
+pub(crate) async fn collect_policy_activity(
+    proxy: &StoreProxy,
+    days: u64,
+) -> Result<ActivityReport> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let window_start = now.saturating_sub(days.saturating_mul(86_400));
+    let enforcement = proxy
+        .scan_enforcement_events_since_ms(
+            window_start.saturating_mul(1000),
+            now.saturating_mul(1000),
+        )
+        .await?;
+
+    let records = proxy.scan_prefix("policy:").await?;
+    let mut policies = BTreeMap::<String, PolicyRecord>::new();
+    for record in records {
+        if matches!(record.lifecycle, RecordLifecycle::Active) {
+            if let Some(policy) = record.payload_as::<PolicyRecord>() {
+                if !matches!(policy.stage, PolicyStage::Off) {
+                    policies.insert(record.key, policy);
+                }
+            }
+        }
+    }
+
+    let mut counts = BTreeMap::<String, u64>::new();
+    let mut last = BTreeMap::<String, u64>::new();
+    let mut sources = BTreeMap::<String, BTreeSet<String>>::new();
+    for event in enforcement.events {
+        if !matches!(event.subject_kind, SubjectKind::Control)
+            || !event.subject_key.starts_with("policy:")
+            || !matches!(
+                event.event_type,
+                EnforcementEventType::Deny | EnforcementEventType::AllowAfterReceipt
+            )
+        {
+            continue;
+        }
+        let key = event.subject_key;
+        *counts.entry(key.clone()).or_default() += 1;
+        last.entry(key.clone())
+            .and_modify(|value| *value = (*value).max(event.recorded_at_ms / 1000))
+            .or_insert(event.recorded_at_ms / 1000);
+        sources.entry(key).or_default().insert("enforcement".into());
+    }
+
+    for record in proxy.scan_prefix("analytics:policy_shadow_").await? {
+        if record.updated_at < window_start {
+            continue;
+        }
+        let agg = record
+            .payload_as::<mati_core::store::session::ShadowObservationAgg>()
+            .unwrap_or_default();
+        for (key, policy) in agg.policies {
+            if policy.count == 0 {
+                continue;
+            }
+            *counts.entry(key.clone()).or_default() += policy.count;
+            if let Some(timestamp) = policy.observations.iter().map(|o| o.timestamp).max() {
+                last.entry(key.clone())
+                    .and_modify(|value| *value = (*value).max(timestamp))
+                    .or_insert(timestamp);
+            }
+            sources.entry(key).or_default().insert("shadow".into());
+        }
+    }
+
+    for record in proxy.scan_prefix("analytics:policy_steer_").await? {
+        if record.updated_at < window_start {
+            continue;
+        }
+        let Some(agg) = record.payload_as::<mati_core::store::session::DailyAgg>() else {
+            continue;
+        };
+        for (key, count) in agg.key_counts {
+            if count == 0 {
+                continue;
+            }
+            *counts.entry(key.clone()).or_default() += count;
+            last.entry(key.clone())
+                .and_modify(|value| *value = (*value).max(record.updated_at))
+                .or_insert(record.updated_at);
+            sources.entry(key).or_default().insert("steer".into());
+        }
+    }
+
+    let retention_limited = enforcement
+        .oldest_recorded_at_ms
+        .is_some_and(|oldest| window_start.saturating_mul(1000) < oldest);
+    let mut report = ActivityReport {
+        window_days: days,
+        window_start,
+        window_end: now,
+        retention_days: POLICY_ACTIVITY_RETENTION_DAYS,
+        retention_limited,
+        retention_note: retention_limited.then(|| format!(
+            "requested window predates the oldest retained enforcement event; history is bounded to {} days",
+            POLICY_ACTIVITY_RETENTION_DAYS
+        )),
+        policies: Vec::new(),
+    };
+    for (key, policy) in policies {
+        // The matcher understands file_read, but no adapter routes that action
+        // through the policy gate. Unknown tool names have the same absence of
+        // a trace. Keep both as not-measurable rather than calling them dead.
+        let measurable = match policy.trigger.tool.as_deref() {
+            None | Some("db_client") | Some("path") => true,
+            Some(_) => false,
+        };
+        let count = counts.get(&key).copied().unwrap_or(0);
+        let state = if !measurable {
+            ActivityState::NotMeasurable
+        } else if count > 0 {
+            ActivityState::Fired
+        } else {
+            ActivityState::NoActivity
+        };
+        report.policies.push(PolicyActivity {
+            policy: key.clone(),
+            state,
+            window_days: days,
+            window_start,
+            count,
+            last_fired_at: last.get(&key).copied(),
+            sources: sources
+                .remove(&key)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        });
+    }
+    report.policies.sort_by(|a, b| a.policy.cmp(&b.policy));
+    Ok(report)
+}
+
+async fn activity(slug: Option<&str>, json_output: bool, days: u64) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let mut report = collect_policy_activity(&proxy, days).await?;
+    if let Some(slug) = slug {
+        let key = normalize_key(slug);
+        report.policies.retain(|policy| policy.policy == key);
+    }
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Policy activity — last {} days", report.window_days);
+        if report.retention_limited {
+            println!(
+                "  note: {}",
+                report
+                    .retention_note
+                    .as_deref()
+                    .unwrap_or("retained enforcement history may be incomplete")
+            );
+        }
+        for policy in &report.policies {
+            let sources = if policy.sources.is_empty() {
+                "-".to_string()
+            } else {
+                policy.sources.join(",")
+            };
+            match policy.state {
+                ActivityState::Fired => println!(
+                    "{}\tfired\tcount={}\tlast={}\tsources={}",
+                    policy.policy,
+                    policy.count,
+                    policy.last_fired_at.unwrap_or(0),
+                    sources
+                ),
+                ActivityState::NoActivity => println!(
+                    "{}\tno activity in {} days\tsources={}",
+                    policy.policy, policy.window_days, sources
+                ),
+                ActivityState::NotMeasurable => {
+                    println!("{}\tnot measurable\tno adapter trace", policy.policy)
+                }
+            }
+        }
+        if report.policies.is_empty() {
+            println!("No active policies found.");
         }
     }
     proxy.close().await

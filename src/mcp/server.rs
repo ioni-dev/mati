@@ -1288,6 +1288,33 @@ pub(crate) async fn socket_dispatch(
             }
         }
 
+        "scan_enforcement_events_since_ms" => {
+            let since_ms = req
+                .args
+                .get("since_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let until_ms = req
+                .args
+                .get("until_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX);
+            let g = graph.read().await;
+            match crate::store::enforcement::scan_enforcement_events_since_ms(
+                g.store(),
+                since_ms,
+                until_ms,
+            )
+            .await
+            {
+                Ok(scan) => match serde_json::to_value(&scan) {
+                    Ok(val) => SocketResponse::ok(val),
+                    Err(e) => SocketResponse::err(format!("serialize: {e}")),
+                },
+                Err(e) => SocketResponse::err(format!("store: {e}")),
+            }
+        }
+
         "put" => {
             use crate::store::Record;
             let key = match req.args.get("key").and_then(|v| v.as_str()) {

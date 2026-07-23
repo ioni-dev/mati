@@ -201,6 +201,37 @@ impl StoreProxy {
         }
     }
 
+    /// Read only retained enforcement events in a wall-clock window. The
+    /// daemon performs a sequence-boundary binary search before reading the
+    /// forward suffix.
+    pub async fn scan_enforcement_events_since_ms(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<mati_core::store::enforcement::EnforcementEventScan> {
+        match &self.inner {
+            ProxyInner::Direct(s) => {
+                mati_core::store::enforcement::scan_enforcement_events_since_ms(
+                    s, since_ms, until_ms,
+                )
+                .await
+            }
+            ProxyInner::Socket { root } => {
+                match daemon_result(
+                    root,
+                    "scan_enforcement_events_since_ms",
+                    json!({ "since_ms": since_ms, "until_ms": until_ms }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(v) => serde_json::from_value(v["data"].clone())
+                        .context("proxy scan_enforcement_events_since_ms: invalid result"),
+                    other => Err(socket_read_error("scan_enforcement_events_since_ms", other)),
+                }
+            }
+        }
+    }
+
     /// Write a record. In socket mode, dispatches to the appropriate typed
     /// v2 command based on key prefix. There is no raw `put` in the v2 protocol.
     pub async fn put(&self, key: &str, record: &Record) -> Result<()> {

@@ -664,6 +664,8 @@ async fn collect_policy_check(cwd: &Path) -> CheckResult {
     let (mut enforce, mut shadow, mut off) = (0usize, 0usize, 0usize);
     let mut broken: Vec<String> = Vec::new();
     let mut warned: Vec<String> = Vec::new();
+    let mut enforcing_keys = std::collections::BTreeSet::new();
+    let now = mati_core::store::session::now_secs();
 
     for record in &records {
         if !matches!(record.lifecycle, RecordLifecycle::Active) {
@@ -681,6 +683,9 @@ async fn collect_policy_check(cwd: &Path) -> CheckResult {
         if matches!(policy.stage, PolicyStage::Off) {
             continue;
         }
+        if matches!(policy.stage, PolicyStage::Enforce) {
+            enforcing_keys.insert((record.key.clone(), record.created_at));
+        }
         // A bad glob is a silent non-enforcement, not a style problem.
         if let Err(e) = mati_core::store::policy_ops::validate_trigger(&policy.trigger) {
             broken.push(format!("{} ({e})", record.key));
@@ -692,6 +697,32 @@ async fn collect_policy_check(cwd: &Path) -> CheckResult {
                 "{}: {}",
                 record.key,
                 w.trim_start_matches("warning: ")
+            ));
+        }
+    }
+    if let Ok(activity) = crate::cli::policy::collect_policy_activity(
+        &proxy,
+        crate::cli::policy::POLICY_ACTIVITY_DEFAULT_DAYS,
+    )
+    .await
+    {
+        for policy in activity.policies {
+            if !matches!(policy.state, crate::cli::policy::ActivityState::NoActivity) {
+                continue;
+            }
+            let Some((_, created_at)) =
+                enforcing_keys.iter().find(|(key, _)| key == &policy.policy)
+            else {
+                continue;
+            };
+            if now.saturating_sub(*created_at)
+                < crate::cli::policy::POLICY_ACTIVITY_GRACE_DAYS * 86_400
+            {
+                continue;
+            }
+            warned.push(format!(
+                "{}: no activity in {} days; the rule may no longer be needed or its trigger may have stopped matching — use `mati policy test` to tell which",
+                policy.policy, policy.window_days
             ));
         }
     }
