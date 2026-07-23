@@ -416,9 +416,13 @@ mati_p policy add steer-live \
   --reason "Operators need visibility because production is live." \
   --mode steer --trigger '{"tool":"db_client","host_glob":"*prod-steer*"}' \
   --requires '{"key":"","via":[],"freshness":{"ttl_secs":900}}' --enable >/dev/null
+STEER_START_NS="$(python3 -c 'import time; print(time.time_ns())')"
 OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.prod-steer.internal -c \"select 1\""')")"
+STEER_END_NS="$(python3 -c 'import time; print(time.time_ns())')"
+STEER_LATENCY_MS=$(( (STEER_END_NS - STEER_START_NS) / 1000000 ))
 assert_has   "steer injects the rule"   "$OUT" 'Review the action.'
 assert_lacks "steer never decides"      "$OUT" 'permissionDecision'
+pass "steer hook latency measured: ${STEER_LATENCY_MS}ms"
 
 # Activity is aggregated across enforcement, shadow, and steer traces. JSON is
 # the machine-readable contract; jq parses it and the state/count assertions
