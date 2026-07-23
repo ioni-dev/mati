@@ -66,6 +66,9 @@ pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
 /// would be advice they cannot follow.
 pub const WRITABLE_KEY_PREFIXES: &[&str] = &["gotcha:", "decision:", "dev_note:", "policy:"];
 
+/// Trigger tools that at least one installed policy adapter evaluates.
+pub const ADAPTER_POLICY_TOOLS: &[&str] = &["db_client", "path"];
+
 /// Can a record ever exist at this key?
 pub fn key_is_writable(key: &str) -> bool {
     WRITABLE_KEY_PREFIXES
@@ -75,11 +78,16 @@ pub fn key_is_writable(key: &str) -> bool {
 
 pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<String> {
     let mut warnings = Vec::new();
+    if policy.trigger.tool.as_deref() == Some("file_read") {
+        warnings.push(
+            "warning: policy trigger tool 'file_read' has no enforcing adapter; Bash file reads are governed by gotchas, so this policy will never be evaluated. Use a gotcha for reads or a db_client/path policy for an adapter-backed action.".into(),
+        );
+    }
     if let Some(tool) = policy
         .trigger
         .tool
         .as_deref()
-        .filter(|tool| !matches!(*tool, "db_client" | "file_read" | "path"))
+        .filter(|tool| !ADAPTER_POLICY_TOOLS.contains(tool))
     {
         warnings.push(format!(
             "warning: policy trigger tool '{tool}' is not a recognized governable category (known: db_client, file_read, path); this policy will never match until such a category is supported."

@@ -531,6 +531,13 @@ Event collection on this path is not conditional on denying. A patch that is all
 
 The path policy gate is symlink-safe. The canonical target is resolved once per path, before any gate runs, and both the gotcha gate and the policy gate evaluate the lexical key and the canonical one under the same escalate-only rule from section 24: the first deny wins and a non-deny canonical outcome never lowers the lexical decision. Editing or patching a symlink that points at a governed file therefore trips `target_path_glob` on the real target. Resolving once is the point — a gate that resolves symlinks running beside one that does not is the defect, and which glob missed is only the symptom. `canonical_rel_path` returns `None` for a non-symlink, so the common path costs nothing extra.
 
+The policy adapter scope is intentional: `db_client` actions on the Bash path
+and `path` actions on Claude edits and Codex `apply_patch` are policy-governed.
+`file_read` actions from `cat`/`grep`-class Bash commands are not policy-
+governed; the gotcha read gate already owns that surface under P1. A stored
+`file_read` policy therefore receives an author/doctor warning instead of
+silently pretending it can enforce.
+
 ### 10a.2 Matching
 
 Matching is two layers, and the split is deliberate.

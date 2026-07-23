@@ -255,7 +255,7 @@ mati_p policy add edit-sql \
   --name "SQL edit guard" --rule "Consult the schema before editing SQL." \
   --reason "Migrations drift because production changes independently." \
   --mode block --severity high \
-  --trigger  '{"target_path_glob":"**/*.sql"}' \
+  --trigger  '{"tool":"path","target_path_glob":"**/*.sql"}' \
   --requires '{"key":"schema:migrations","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
 mati_p policy enable edit-sql >/dev/null
 OUT="$(hook claude-pre-edit "$(pre_edit '"migrations/prod.sql"')")"
@@ -263,6 +263,29 @@ assert_has  "sql edit denied"          "$OUT" 'permissionDecision":"deny"'
 OUT="$(hook claude-pre-edit "$(pre_edit '"main.rs"')")"
 assert_lacks "unrelated edit untouched" "$OUT" 'permissionDecision":"deny"'
 assert_lacks "edit never force-allows"  "$OUT" 'permissionDecision":"allow"'
+
+# Bash db_client policies match both lexical and canonical file arguments. The
+# symlink case is the regression guard; the unrelated path is a positive
+# control with an explicit exit-code check so an assert_lacks cannot pass on a
+# hook that never ran.
+step "8a. Bash path policies follow symlink targets"
+mati_p policy add bash-path --name bash-path \
+  --rule "Consult the schema before running migration SQL." \
+  --reason "Migrations drift because production changes independently." \
+  --mode block --severity high \
+  --trigger '{"tool":"db_client","target_path_glob":"migrations/**"}' \
+  --requires '{"key":"decision:bash-path","via":["mem_get"],"freshness":{"ttl_secs":900}}' \
+  --enable >/dev/null
+echo 'select 1;' > "$PROJECT/unrelated.sql"
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -f migrations/prod.sql"')")"
+assert_has "direct Bash path is denied" "$OUT" 'policy:bash-path'
+ln -sf migrations/prod.sql "$PROJECT/bash-link.sql"
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -f bash-link.sql"')")"
+assert_has "Bash path through a symlink is denied" "$OUT" 'policy:bash-path'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -f unrelated.sql"')")"
+BASH_RC=$?
+[ "$BASH_RC" -eq 0 ] && pass "unrelated Bash path exits 0" || fail "unrelated Bash path exits 0" "rc=$BASH_RC"
+assert_lacks "unrelated Bash path is not denied" "$OUT" 'permissionDecision":"deny"'
 
 # Widening event collection to the allow path made apply_patch a miss-recording
 # surface: a touched file with no record now increments the daily aggregate,
@@ -425,6 +448,13 @@ OUT="$(mati_p policy add unbacked --name unb --rule "Consult first." \
   --trigger '{"tool":"db_client","host_glob":"*prod-unb*"}' \
   --requires '{"key":"decision:nothing-here","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
 assert_has "unbacked requires.key warns" "$OUT" 'has no backing record'
+OUT="$(mati_p policy add file-read-scoped --name file-read-scoped --rule "Consult before reading SQL." \
+  --reason "Read context changes because the repository evolves." --mode block \
+  --trigger '{"tool":"file_read","target_path_glob":"**/*.sql"}' \
+  --requires '{"key":"decision:file-read-scoped","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+assert_has "file_read policy warns about missing adapter" "$OUT" 'has no enforcing adapter'
+mati_p policy enable file-read-scoped >/dev/null
+assert_has "doctor repeats file_read adapter warning" "$(mati_p doctor)" 'file_read.*no enforcing adapter'
 
 # ── 16. Dry-run and stage parsing ────────────────────────────────────────────
 step "16. Dry-run and stage parsing"
