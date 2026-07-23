@@ -51,8 +51,14 @@ pub enum ShadowOutcome {
 pub enum Decision {
     /// No enforcement needed — allow unconditionally.
     Allow,
-    /// Confirmed gotcha, agent has NOT consulted — block the read.
-    Deny { file_key: String, reason: String },
+    /// A gate blocked the action. `origin` says which gate, so the message
+    /// shape and the audit reason code are chosen from the decision rather than
+    /// re-derived by sniffing `file_key`'s namespace at each call site.
+    Deny {
+        file_key: String,
+        reason: String,
+        origin: DenyOrigin,
+    },
     /// Confirmed gotcha, agent already consulted — allow with awareness.
     AlreadyConsulted { context: String },
     /// Medium confidence (0.3–0.6), quality >= 0.4 — advisory context.
@@ -65,6 +71,41 @@ pub enum Decision {
     NoRecord,
     /// Command is not a file-reading operation.
     NotFileRead,
+}
+
+/// Which gate produced a `Decision::Deny`.
+///
+/// Each origin already maps 1:1 to a distinct `decision_reason_code` in the
+/// enforcement log, so this is information the system requires downstream and
+/// used to drop between the decision and the message. Matching on it
+/// exhaustively means a new origin cannot silently inherit whatever branch its
+/// key prefix happens to land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyOrigin {
+    /// Confirmed gotcha above the enforcement threshold. `file_key` is the
+    /// record to consult.
+    Gotcha,
+    /// Inherited signed-floor consult mandate. `file_key` is the mandated file.
+    ConsultMandate,
+    /// Local policy. `file_key` is the POLICY key, which is not consultable —
+    /// the consultable key lives in `reason`.
+    Policy,
+}
+
+impl DenyOrigin {
+    /// The event that records this deny in the enforcement log.
+    ///
+    /// Origin and event are chosen together at every deny site, and each event
+    /// maps to a distinct `decision_reason_code` downstream. Deriving the event
+    /// here means the agent-facing message and the audit chain cannot disagree
+    /// about what denied, and a new origin cannot be added without choosing one.
+    pub fn deny_event(self, key: String) -> HookEvent {
+        match self {
+            DenyOrigin::Gotcha => HookEvent::BlockedUnconsultedRead { key },
+            DenyOrigin::ConsultMandate => HookEvent::FloorConsultBlocked { key },
+            DenyOrigin::Policy => HookEvent::PolicyConsultBlocked { key },
+        }
+    }
 }
 
 /// Side-effect events the adapter should fire after the decision.
@@ -152,6 +193,7 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
                     "mati: policy {} blocked this action. Consult first: mem_get(\"{}\")",
                     verdict.key, verdict.requires_key
                 ),
+                origin: DenyOrigin::Policy,
             });
         } else if verdict.block && verdict.satisfied {
             events.push(HookEvent::PolicyConsulted {
@@ -179,7 +221,7 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             .into_iter()
             .filter(|event| matches!(event, HookEvent::PolicyShadowObserved { .. }))
             .collect();
-        events.push(HookEvent::PolicyConsultBlocked { key: denied_key });
+        events.push(DenyOrigin::Policy.deny_event(denied_key));
         return EnforcementResult { decision, events };
     }
     if !context.is_empty() {
@@ -878,8 +920,9 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
                      call mem_get(\"file:{safe_path}\") and read the record \
                      before accessing this file.{staleness_note}"
                 ),
+                origin: DenyOrigin::Gotcha,
             },
-            events: vec![HookEvent::BlockedUnconsultedRead { key: file_key }],
+            events: vec![DenyOrigin::Gotcha.deny_event(file_key)],
         };
     }
 
