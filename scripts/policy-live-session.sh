@@ -135,6 +135,19 @@ add_policy live-killswitch '*prod-switch*'     'decision:audit-schema'     'mem_
   --requires '{"key":"decision:ledger-schema","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
 "$MATI" policy stage live-shadow shadow >/dev/null
 
+# Capture the raw PostToolUse Bash payload. smoke-policy.sh builds this payload
+# from the documented schema, so a mismatch with what Claude Code actually sends
+# is invisible to it. Tee it to a file so the real shape can be read directly.
+cat > .claude/hooks/post-bash.sh <<'SH'
+#!/usr/bin/env bash
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
+PAYLOAD="$(cat)"
+printf '%s\n' "$PAYLOAD" >> "${MATI_HOME:-/tmp}/post-bash-payloads.jsonl"
+command -v mati >/dev/null 2>&1 || exit 0
+printf '%s' "$PAYLOAD" | exec mati hook-decide claude-post-bash
+SH
+chmod +x .claude/hooks/post-bash.sh
+
 for f in .claude/settings.json .mcp.json; do
   [ -f "$DEST/$f" ] || { echo "fixture is not wired: $f missing" >&2; exit 1; }
 done
