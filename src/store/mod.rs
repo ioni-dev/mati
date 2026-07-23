@@ -21,7 +21,7 @@ pub mod session;
 
 pub use db::{derive_slug, mati_home, mati_home_opt, KnowledgeWriteOp, Store};
 pub use device::stable_device_id;
-pub use durability::Durability;
+pub use durability::{Durability, Encoding};
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{
     AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,

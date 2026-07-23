@@ -2021,16 +2021,22 @@ mod tests {
         store.put(&receipt_key, &receipt).await.unwrap();
         assert_eq!(receipt_key, format!("session:consulted:agent-a:{key}"));
 
-        assert!(
-            mati_core::store::session::check_consulted_recent(&store, key, 900, Some("agent-a"))
-                .await
-                .unwrap()
-        );
-        assert!(
-            !mati_core::store::session::check_consulted_recent(&store, key, 900, Some("agent-b"))
-                .await
-                .unwrap()
-        );
+        assert!(mati_core::store::session::check_consulted_recent(
+            &store,
+            key,
+            900,
+            Some("agent-a")
+        )
+        .await
+        .unwrap());
+        assert!(!mati_core::store::session::check_consulted_recent(
+            &store,
+            key,
+            900,
+            Some("agent-b")
+        )
+        .await
+        .unwrap());
         assert!(
             !mati_core::store::session::check_consulted_recent(&store, key, 900, None)
                 .await

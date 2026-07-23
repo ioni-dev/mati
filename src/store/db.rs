@@ -27,7 +27,7 @@ use surrealkv::{
 use serde::{Deserialize, Serialize};
 
 use super::record::Record;
-use super::Durability;
+use super::{Durability, Encoding};
 use crate::search::Search;
 
 // 90 days expressed as nanoseconds — retention period for sessions.db
@@ -378,6 +378,11 @@ impl Store {
     ///
     /// Durability is derived from the key prefix via [`Durability::for_key`].
     pub async fn put(&self, key: &str, record: &Record) -> Result<()> {
+        debug_assert_eq!(
+            Encoding::for_key(key),
+            Encoding::Record,
+            "put() writes a Record into {key}, which is a Raw namespace; see store::durability::Encoding"
+        );
         let durability = Durability::for_key(key);
         let tree = self.tree_for(key);
         let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
@@ -620,6 +625,11 @@ impl Store {
     ///
     /// Return order is not guaranteed. Callers that need a stable order must sort.
     pub async fn scan_prefix(&self, prefix: &str) -> Result<Vec<Record>> {
+        debug_assert_eq!(
+            Encoding::for_key(prefix),
+            Encoding::Record,
+            "scan_prefix() deserializes Records from {prefix}, which is a Raw namespace; use scan_keys instead"
+        );
         let tree = self.tree_for(prefix);
         let txn = tree.begin_with_mode(Mode::ReadOnly)?;
 
@@ -656,6 +666,11 @@ impl Store {
     where
         F: FnMut(Record),
     {
+        debug_assert_eq!(
+            Encoding::for_key(prefix),
+            Encoding::Record,
+            "scan_prefix_each() deserializes Records from {prefix}, which is a Raw namespace; use scan_keys instead"
+        );
         let tree = self.tree_for(prefix);
         let txn = tree.begin_with_mode(Mode::ReadOnly)?;
         let end = prefix_end(prefix);
@@ -747,6 +762,11 @@ impl Store {
     /// edges, etc.) where the value is not a [`Record`] and does not need to
     /// be deserialised on reads.
     pub async fn put_raw(&self, key: &str, value: &[u8]) -> Result<()> {
+        debug_assert_eq!(
+            Encoding::for_key(key),
+            Encoding::Raw,
+            "put_raw() writes bare bytes into {key}, which is a Record namespace; a prefix scan would skip it. See store::durability::Encoding"
+        );
         let durability = Durability::for_key(key);
         let tree = self.tree_for(key);
         let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
