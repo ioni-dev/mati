@@ -293,23 +293,31 @@ assert_lacks "unrelated Bash path is not denied" "$OUT" 'permissionDecision":"de
 step "8b. Codex Bash db_client policies"
 add_block_policy codex-bash '*prod-codex-smoke*' 'schema:codex-bash' 'mem_get'
 mati_p policy enable codex-bash >/dev/null
-OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.prod-codex-smoke.internal -c \\\"select 1\\\"\"')")"
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.prod-codex-smoke.internal -c \"select 1\""')")"
 CODEX_RC=$?
 [ "$CODEX_RC" -eq 2 ] && pass "Codex fileless db command exits 2" || fail "Codex fileless db command exits 2" "rc=$CODEX_RC output=$OUT"
 assert_has "Codex fileless deny names remedy key" "$OUT" 'schema:codex-bash'
-assert_lacks "Codex fileless deny does not name policy key" "$OUT" 'policy:codex-bash'
+# The bash deny names the policy as the subject ("policy policy:codex-bash
+# blocked ...") while directing the consult to the remedy. The invariant that
+# matters (79c8d79) is that the mem_get instruction points at the remedy, never
+# at the policy key, which mints a receipt that cannot clear the deny.
+assert_lacks "Codex fileless deny does not send you to the policy key" "$OUT" 'mem_get("policy:'
 
-OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.prod-codex-smoke.internal -f migrations/prod.sql\"')")"
+# A root-level file, not migrations/**: step 8a's bash-path db_client policy
+# matches migrations/** and would deny first (naming its own key), masking the
+# host policy this step means to exercise. That collision is itself proof the
+# fix works on Codex file-bearing bash, but it is not what this assertion tests.
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.prod-codex-smoke.internal -f query.sql"')")"
 CODEX_RC=$?
 [ "$CODEX_RC" -eq 2 ] && pass "Codex file-bearing db command exits 2" || fail "Codex file-bearing db command exits 2" "rc=$CODEX_RC output=$OUT"
 assert_has "Codex file-bearing deny names remedy key" "$OUT" 'schema:codex-bash'
 
-OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.nonmatching.internal -c \\\"select 1\\\"\"')")"
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.nonmatching.internal -c \"select 1\""')")"
 CODEX_RC=$?
 [ "$CODEX_RC" -eq 0 ] && pass "Codex non-matching host exits 0" || fail "Codex non-matching host exits 0" "rc=$CODEX_RC output=$OUT"
 assert_lacks "Codex non-matching host is not denied" "$OUT" 'mati:'
 
-OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.prod-codex-smoke.internal -c \\\"\\\\d inventory\\\"\"')")"
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.prod-codex-smoke.internal -c \"\\d inventory\""')")"
 CODEX_RC=$?
 [ "$CODEX_RC" -eq 0 ] && pass "Codex introspection exits 0" || fail "Codex introspection exits 0" "rc=$CODEX_RC output=$OUT"
 [ -z "$OUT" ] && pass "Codex introspection steer is silent" || fail "Codex introspection steer is silent" "output=$OUT"
