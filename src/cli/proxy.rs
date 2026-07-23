@@ -76,17 +76,61 @@ impl StoreProxy {
             });
         }
 
-        // The daemon could not be brought up: spawn is disabled (`cfg!(test)`
-        // or `MATI_DISABLE_AUTO_SPAWN=1`) or the spawn failed. Genuine last
-        // resort — open the store directly, serializing concurrent direct opens
-        // with a bounded lock-retry. Without this loop, 19 of 20 parallel
+        // ensure_daemon could not confirm a reachable daemon. Enforce the
+        // sole-owner invariant before the direct-open last resort: if a daemon
+        // PROCESS is alive, it holds the store's exclusive lock. Opening the
+        // store directly here cannot succeed (the lock is held) and would
+        // violate the invariant that nothing touches the store behind a live
+        // daemon. Under a busy session — e.g. Codex spawning a fresh `mati
+        // serve` per MCP call, each running ensure_daemon — a healthy daemon can
+        // briefly miss a ping; retry it rather than fall to a doomed direct open
+        // that surfaces a raw "LOCK is already locked".
+        if Self::daemon_pid_alive(&root) {
+            for backoff_ms in [50u64, 100, 200, 400, 800] {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                if let DaemonResult::Ok(_) = daemon_result(&root, "ping", json!({})).await {
+                    return Ok(Self {
+                        inner: ProxyInner::Socket { root },
+                    });
+                }
+                // The daemon exited mid-retry — no longer the lock holder, so
+                // the direct-open fallback below is now legitimate.
+                if !Self::daemon_pid_alive(&root) {
+                    break;
+                }
+            }
+            if Self::daemon_pid_alive(&root) {
+                // A live daemon that will not answer is wedged, not gone.
+                // ensure_daemon already attempted a kill + respawn; surface a
+                // retryable error instead of grabbing the lock behind it.
+                anyhow::bail!(
+                    "mati daemon is running but not responding after retries.\n\
+                     It may be busy — retry the command. If it persists: mati daemon stop"
+                );
+            }
+        }
+
+        // Genuinely no daemon: spawn is disabled (`cfg!(test)` or
+        // `MATI_DISABLE_AUTO_SPAWN=1`) or the spawn failed AND no daemon process
+        // is alive. Direct open is the only option — serialize concurrent direct
+        // opens with a bounded lock-retry. Without this loop, 19 of 20 parallel
         // invocations failed with "LOCK is already locked" (smoke step 131's
         // parallel-write probe); backoff totals ~620ms (20+40+80+160+320).
-        // The daemon path above remains the production route.
         let store = open_store_with_lock_retry(cwd).await?;
         Ok(Self {
             inner: ProxyInner::Direct(store),
         })
+    }
+
+    /// True when a daemon process for this store is alive (holds the lock).
+    ///
+    /// Reads the published daemon metadata and checks the PID with `kill(pid,0)`.
+    /// Used to enforce the sole-owner invariant: never open the store directly
+    /// while a daemon owns its exclusive lock.
+    fn daemon_pid_alive(root: &Path) -> bool {
+        mati_core::mcp::metadata::read_metadata(root)
+            .map(|m| mati_core::mcp::metadata::is_pid_alive(m.pid))
+            .unwrap_or(false)
     }
 
     /// Returns a reference to the direct store if in direct mode, or `None` if
