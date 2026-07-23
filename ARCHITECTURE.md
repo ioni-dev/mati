@@ -541,6 +541,15 @@ The four-tool MCP surface remains unchanged.
 
 Codex `codex-pre-apply-patch` is a policy enforcement path. Its patch envelope provides exact target paths, which are normalized into `Action { tool: "path" }` and evaluated with `target_path_glob` policies after the existing gotcha gate. As with other Codex gates, a policy deny is reported as exit 2 with a `mati:` stderr instruction; uncertainty still fails open.
 
+`scripts/policy-live-codex.sh` is the live-session fixture for this adapter. It
+captures raw Codex `apply_patch` PreToolUse and Bash PostToolUse payloads,
+verifies the Codex hook and MCP wiring, and prompts a session to exercise the
+apply-patch deny/consult path, symlink resolution, shadow observations, the
+fileless Bash deny, and the db-introspection receipt minting pair. The fixture
+exists, but these Codex paths remain unvalidated until a real Codex session
+has run it; the synthetic assertions in `scripts/smoke-policy.sh` do not close
+that gap.
+
 Event collection on this path is not conditional on denying. A patch that is allowed still fires whatever the gates produced: a shadow observation, a receipt-backed allow, and a `Miss` for any touched file with no record. That last one makes `codex-pre-apply-patch` a miss-recording surface, which it was not before — previously it fired nothing unless it denied, so multi-file patches under-counted misses. `fire_events` is one sequential daemon round trip per event and `MAX_APPLY_PATCH_FILES` is 50; a measured 50-file no-record patch costs ~105ms against the 2500ms `HOOK_DEADLINE_MS`, so the sequential shape stands. If that ever becomes material the fix is a batched command preserving order, not concurrency: enforcement events allocate a durable monotonic `seq_no` into a hash chain, and concurrent writes would make the order of a log whose purpose is replayable tamper-evidence non-deterministic.
 
 The path policy gate is symlink-safe. The canonical target is resolved once per path, before any gate runs, and both the gotcha gate and the policy gate evaluate the lexical key and the canonical one under the same escalate-only rule: the first deny wins and a non-deny canonical outcome never lowers the lexical decision. Editing or patching a symlink that points at a governed file therefore trips `target_path_glob` on the real target. Claude Code also refuses to write through a symlink after the policy deny has been cleared; that defense-in-depth behavior was verified against Claude Code in the live run, but it is vendor behavior that mati does not control. Codex `apply_patch` has no such guard and parses exact target paths, while the Bash path has no such guard either: a `psql -f` command naming a symlink into a governed directory is denied only because mati resolves the target. Resolving once is therefore load-bearing outside the Claude edit path and must remain there. `canonical_rel_path` returns `None` for a non-symlink, so the common path costs nothing extra.
