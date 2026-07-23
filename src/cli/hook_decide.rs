@@ -1108,7 +1108,9 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         .filter(|s| !s.is_empty());
     // Enterprise consult-mandate globs — parity with the single-path flow.
     let consult_globs = consult_globset();
-    let mut denied: Vec<String> = Vec::new();
+    // (deny key, deny reason). The reason matters for policy denies, whose key
+    // is the policy rather than something the agent can consult.
+    let mut denied: Vec<(String, String)> = Vec::new();
     let mut events: Vec<HookEvent> = Vec::new();
     for raw in &raw_paths {
         let rel_path = decide::normalize_path(raw, repo_root_str);
@@ -1146,6 +1148,33 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
             consulted_flag(&eval_data, true),
             consult_globs.as_ref(),
         );
+        // Codex apply_patch has the exact target path, so apply the same
+        // target_path_glob policy gate used by Claude edits. Keep the
+        // existing gotcha decision authoritative and merge policy outcomes
+        // escalate-only, matching the single-file path below.
+        //
+        // KNOWN GAP: this gate sees only the LEXICAL path. The canonical
+        // re-evaluation below covers the gotcha gate but not `target_path_glob`,
+        // so a patch targeting an in-repo symlink writes through to the real
+        // target without the path policy firing. Pre-existing on the Claude edit
+        // path too, and deliberately not fixed here. It is more surprising on
+        // this path, since CLAUDE.md advertises apply_patch as the one immune to
+        // the wrapper/quoting bypass precisely because it parses exact paths.
+        if !matches!(adapter.decision, Decision::Deny { .. }) {
+            let action = decide::normalize_action(None, Some(&rel_path));
+            if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
+                Some(&mati_root),
+                &action,
+                "path",
+                agent_id,
+                "<apply-patch-policy>",
+                policy_block_exempt(variant, input),
+            )
+            .await
+            {
+                merge_policy_result(&mut adapter, variant, policy_decision, policy_events);
+            }
+        }
         // WI-20 parity: a patch targeting an in-repo symlink would otherwise
         // evaluate only the lexical key and write through to the real target
         // ungated. Escalate-only, like the read/edit path: a non-deny
@@ -1193,28 +1222,57 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         // (real-target) key, or the mandate key, whichever actually denied.
         if let Decision::Deny {
             file_key: denied_key,
-            ..
+            reason,
         } = &adapter.decision
         {
-            denied.push(denied_key.clone());
-            events.extend(adapter.events);
+            denied.push((denied_key.clone(), reason.clone()));
         }
+        // Unconditionally: a non-denying policy still produces events. A shadow
+        // observation and a satisfied block's receipt must both be recorded, or
+        // `mati policy observations` reports zero matches for a policy that
+        // matched every time, and this adapter's audit trail diverges from the
+        // Claude edit gate's for the same action.
+        events.extend(adapter.events);
     }
 
     // 5. Deny if any file needs consultation; otherwise allow. Output FIRST,
     // audit events second (missing beats false — see run_inner).
     if denied.is_empty() {
+        // Output first, events second, matching the deny path below: a decision
+        // delivered but unrecorded is an honest gap, the reverse is a lie.
         emit_allow(variant);
+        // Firing here is what makes a non-denying policy observable at all. A
+        // shadow-stage match and a satisfied block both land on this path, and
+        // returning early dropped every one of them.
+        fire_events(&mati_root, &events, None, agent_id).await;
         return Ok(());
     }
-    let msg = if denied.len() == 1 {
-        format!("mati: call mem_get(\"{}\") before editing", denied[0])
-    } else {
-        format!(
+    // Policy denies carry their own actionable instruction; file denies keep the
+    // established consult-the-file shape. A patch can trip both at once, so both
+    // are reported rather than one shadowing the other.
+    let (policy_denies, file_denies): (Vec<_>, Vec<_>) = denied
+        .iter()
+        .partition(|(key, _)| key.starts_with("policy:"));
+    let mut lines: Vec<String> = policy_denies
+        .iter()
+        .map(|(_, reason)| reason.clone())
+        .collect();
+    if file_denies.len() == 1 {
+        lines.push(format!(
+            "mati: call mem_get(\"{}\") before editing",
+            file_denies[0].0
+        ));
+    } else if file_denies.len() > 1 {
+        lines.push(format!(
             "mati: consult these files before editing — call mem_get for each: {}",
-            denied.join(", ")
-        )
-    };
+            file_denies
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let msg = lines.join("\n");
     eprintln!("{msg}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
 
@@ -1769,8 +1827,18 @@ fn format_decision(
             _ => (String::new(), String::new(), 0),
         },
         HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => match decision {
-            Decision::Deny { file_key, .. } => {
-                let stderr = format!("mati: call mem_get(\"{file_key}\") first");
+            Decision::Deny { file_key, reason } => {
+                // A policy deny keys on the policy, which is not a consultable
+                // record: its `reason` names the key that actually clears it.
+                // Printing file_key here would tell the agent to mem_get the
+                // policy itself, minting a receipt that never matches
+                // requires.key, so the deny could not be cleared by following
+                // its own instruction.
+                let stderr = if file_key.starts_with("policy:") {
+                    reason.clone()
+                } else {
+                    format!("mati: call mem_get(\"{file_key}\") first")
+                };
                 (String::new(), stderr, 2)
             }
             _ => (String::new(), String::new(), 0),
