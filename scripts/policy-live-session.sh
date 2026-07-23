@@ -52,6 +52,21 @@ fn main() {
 }
 RS
 echo "select 1;" > migrations/prod.sql
+
+# A stub psql. Without a real client on PATH the command fails to spawn, Claude
+# reports tool_response.isError: true, and DbIntrospection correctly refuses to
+# mint — which looks identical to a broken minting contract. The stub exits 0 so
+# the receipt step actually exercises the contract instead of the error path.
+# Nothing connects anywhere; the hook decision is the whole point.
+mkdir -p bin
+cat > bin/psql <<'SH'
+#!/usr/bin/env bash
+# fixture stub: never connects, always succeeds
+echo "Table \"public.inventory\""
+echo " sku | warehouse | on_hand | reserved"
+exit 0
+SH
+chmod +x bin/psql
 git init --quiet
 git add -A
 git -c user.email=fixture@local -c user.name=fixture commit -qm "fixture" >/dev/null
@@ -138,7 +153,7 @@ Either mistake makes EVERY step pass without enforcing anything.
 
   cd $DEST
   export MATI_HOME=$DEST/.mati-home
-  export PATH=$REPO_ROOT/target/debug:\$PATH
+  export PATH=$DEST/bin:$REPO_ROOT/target/debug:\$PATH
   claude
 
 Claude Code will ask you to trust the folder. Hooks do not run until you do.
@@ -179,6 +194,10 @@ Each policy has its own consult key, so satisfying one does not satisfy another.
    PASS proves deny -> consult -> allow end to end.
 
 4. Run: psql -h db.prod-introspect.internal -c "\\d inventory"
+   Report the exit status of this command explicitly. The fixture ships a stub
+   psql on PATH that always exits 0. If this command fails to spawn, step 5
+   cannot mean anything, because minting is supposed to refuse after a failed
+   introspection.
    EXPECT: never blocked. Introspection is exempt from policy blocks. You may
    still be given the policy rule as context; that is expected. The exemption
    suppresses the block only, so the verdict falls through to steering.
@@ -187,8 +206,13 @@ Each policy has its own consult key, so satisfying one does not satisfy another.
    EXPECT: NOT blocked, because step 4 minted the receipt for
    decision:inventory-schema.
    This is the contract only a live session can prove: minting depends on Claude
-   reporting tool_response.isError as false. If you ARE blocked here, that
-   contract is broken. Quote the exact block message.
+   reporting tool_response.isError as false.
+   If you ARE blocked here, quote the exact block message, then say which of
+   these two it is:
+     (a) step 4 exited 0 and you were still blocked -> the minting contract is
+         broken, which is the finding this fixture exists to surface;
+     (b) step 4 did not exit 0 -> inconclusive, because refusing to mint after a
+         failed introspection is correct behavior.
 
 6. Run: psql -h db.prod-shadow.internal -c "UPDATE ledger SET amount_cents=1"
    EXPECT: NOT blocked, and no policy text injected. live-shadow is staged
