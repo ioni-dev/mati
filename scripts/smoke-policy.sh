@@ -397,6 +397,21 @@ SHOW="$(mati_p policy show draft)"
 assert_has "the edit landed"              "$SHOW" 'New rule.'
 assert_has "and it stayed off"            "$SHOW" '"stage": "off"'
 
+# ── 17b. Receipt visibility ──────────────────────────────────────────────────
+# Diagnosing "why is this still blocking" used to mean inferring receipt state
+# from whether a later command was denied.
+step "17b. Receipts report what each policy is waiting on"
+add_block_policy receipt-view '*prod-receipt*' 'schema:receipt-view' 'mem_get'
+mati_p policy enable receipt-view >/dev/null
+OUT="$(mati_p policy receipts)"
+assert_has "an unsatisfied policy reports blocking" "$OUT" 'receipt-view'
+assert_has "and names the key it waits on"          "$OUT" 'schema:receipt-view'
+assert_has "with no receipt yet"                    "$OUT" 'BLOCKS every actor'
+mcp_call mem_get '{"key":"schema:receipt-view"}' >/dev/null
+OUT="$(mati_p policy receipts)"
+assert_has "after consulting, scope is reported"    "$OUT" 'satisfied for: global'
+assert_has "json form carries the verdict"          "$(mati_p policy receipts --json)" 'satisfied_for'
+
 # ── 18. Fail-open ────────────────────────────────────────────────────────────
 step "18. A dead daemon fails open (P9)"
 mati_p daemon stop >/dev/null; sleep 1

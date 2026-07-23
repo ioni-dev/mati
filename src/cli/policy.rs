@@ -44,6 +44,11 @@ enum PolicyCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show consultation receipts and which policies they satisfy.
+    Receipts {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show bounded shadow observations, optionally for one policy.
     Observations {
         slug: Option<String>,
@@ -167,6 +172,7 @@ pub async fn run(args: PolicyArgs) -> Result<()> {
         PolicyCommand::Add(a) => add(a).await,
         PolicyCommand::Edit(a) => edit(a).await,
         PolicyCommand::List { json } => list(json).await,
+        PolicyCommand::Receipts { json } => receipts(json).await,
         PolicyCommand::Observations { slug, json } => observations(slug.as_deref(), json).await,
         PolicyCommand::Show(a) => show(&normalize_key(&a.key)).await,
         PolicyCommand::Enable(a) => set_enabled(&normalize_key(&a.key), true).await,
@@ -402,6 +408,186 @@ async fn set_stage(key: &str, stage: PolicyStage) -> Result<()> {
     proxy.close_with_result(result).await?;
     println!("Set {} stage to {:?}", key, stage);
     Ok(())
+}
+
+/// Answer "why is this policy still blocking?" without a store dump.
+///
+/// A block policy is unlocked by a `session:consulted:*` receipt, and nothing
+/// could read those: diagnosing a policy that would not unlock meant inferring
+/// receipt state from whether a later command was denied. This reports the
+/// receipt each policy is waiting on, its age against that policy's TTL, and
+/// the resulting verdict.
+///
+/// Receipt keys are `session:consulted:<key>` or `session:consulted:<actor>:<key>`
+/// and the consulted key contains colons of its own, so the actor cannot be
+/// split out reliably. Matching runs from the policy side instead: a receipt
+/// belongs to a policy when its key ends with the policy's `requires.key`.
+async fn receipts(json_output: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let proxy = StoreProxy::open(&cwd).await?;
+    let now = mati_core::store::session::now_secs();
+
+    let receipt_keys = proxy.scan_keys("session:consulted:").await?;
+    let mut ages: Vec<(String, u64, bool)> = Vec::new();
+    for key in &receipt_keys {
+        let Some(record) = proxy.get(key).await? else {
+            continue;
+        };
+        let fingerprinted = record
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("fingerprint"))
+            .is_some_and(|v| !v.is_null());
+        ages.push((
+            key.clone(),
+            now.saturating_sub(record.updated_at),
+            fingerprinted,
+        ));
+    }
+
+    let mut claimed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut report = Vec::new();
+    for record in proxy.scan_prefix("policy:").await? {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        let Some(policy) = record.payload_as::<PolicyRecord>() else {
+            continue;
+        };
+        if matches!(policy.stage, PolicyStage::Off) || policy.requires.key.is_empty() {
+            continue;
+        }
+        let ttl = policy.requires.freshness.ttl_secs;
+        let suffix = format!(":{}", policy.requires.key);
+        let mut found = Vec::new();
+        for (key, age, fingerprinted) in &ages {
+            if !key.ends_with(&suffix) {
+                continue;
+            }
+            claimed.insert(key.clone());
+            let scope = key
+                .strip_prefix("session:consulted:")
+                .and_then(|rest| rest.strip_suffix(&policy.requires.key))
+                .map(|actor| actor.trim_end_matches(':'))
+                .filter(|actor| !actor.is_empty())
+                .unwrap_or("global")
+                .to_string();
+            found.push(serde_json::json!({
+                "scope": scope,
+                "age_secs": age,
+                "valid": *age <= ttl,
+                "expires_in_secs": ttl.saturating_sub(*age),
+                "fingerprinted": fingerprinted,
+            }));
+        }
+        // A receipt is actor-scoped: the gate reads the global receipt for the
+        // main thread and an agent's own receipt for a subagent. So there is no
+        // single "satisfied" answer, only the set of scopes that currently pass.
+        let satisfied_for: Vec<String> = found
+            .iter()
+            .filter(|r| r["valid"] == serde_json::Value::Bool(true))
+            .filter_map(|r| r["scope"].as_str().map(str::to_string))
+            .collect();
+        report.push(serde_json::json!({
+            "policy": record.key,
+            "stage": format!("{:?}", policy.stage).to_ascii_lowercase(),
+            "mode": format!("{:?}", policy.mode).to_ascii_lowercase(),
+            "requires_key": policy.requires.key,
+            "ttl_secs": ttl,
+            // A fingerprinted policy also requires the consulted record's
+            // content to be unchanged, which this report does not compute, so
+            // its verdict is a TTL upper bound rather than the final answer.
+            "fingerprint_required": policy.requires.freshness.fingerprint,
+            "receipts": found,
+            "satisfied_for": satisfied_for,
+        }));
+    }
+
+    let orphans: Vec<_> = ages
+        .iter()
+        .filter(|(key, _, _)| !claimed.contains(key))
+        .map(|(key, age, _)| serde_json::json!({"key": key, "age_secs": age}))
+        .collect();
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "policies": report,
+                "unmatched_receipts": orphans,
+            }))?
+        );
+    } else if report.is_empty() && orphans.is_empty() {
+        println!("No receipts and no policies awaiting one.");
+    } else {
+        for entry in &report {
+            let scopes = entry["satisfied_for"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let verdict = if entry["mode"] == "steer" {
+                "steer (no receipt needed)".to_string()
+            } else if scopes.is_empty() {
+                "BLOCKS every actor".to_string()
+            } else {
+                format!("satisfied for: {scopes}")
+            };
+            println!(
+                "{}\t{}\t{}",
+                entry["policy"].as_str().unwrap_or(""),
+                entry["stage"].as_str().unwrap_or(""),
+                verdict
+            );
+            if entry["fingerprint_required"] == serde_json::Value::Bool(true) {
+                println!("  note     fingerprint required; verdict below is TTL only");
+            }
+            println!(
+                "  requires {} (ttl {}s)",
+                entry["requires_key"].as_str().unwrap_or(""),
+                entry["ttl_secs"]
+            );
+            let found = entry["receipts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if found.is_empty() {
+                println!("  receipt  none");
+            }
+            for r in found {
+                println!(
+                    "  receipt  {}\tage {}s\t{}{}",
+                    r["scope"].as_str().unwrap_or(""),
+                    r["age_secs"],
+                    if r["valid"] == serde_json::Value::Bool(true) {
+                        format!("valid, {}s left", r["expires_in_secs"])
+                    } else {
+                        "expired".to_string()
+                    },
+                    if r["fingerprinted"] == serde_json::Value::Bool(true) {
+                        "\tfingerprinted"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        if !orphans.is_empty() {
+            println!("\nReceipts no active policy requires:");
+            for o in &orphans {
+                println!(
+                    "  {}\tage {}s",
+                    o["key"].as_str().unwrap_or(""),
+                    o["age_secs"]
+                );
+            }
+        }
+    }
+    proxy.close().await
 }
 
 async fn observations(slug: Option<&str>, json_output: bool) -> Result<()> {
