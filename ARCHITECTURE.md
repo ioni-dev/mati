@@ -511,6 +511,26 @@ The approval control depends on Bash remaining permission-required; blanket-allo
 
 Glob predicates are validated at author time. A malformed `host_glob` or `target_path_glob` is rejected before it can be persisted, so a broken pattern never reaches the daemon.
 
+Policy records are deliberately excluded from `mati stale`, for a structural reason rather than a philosophical one.
+
+For a `policy:<slug>` key every staleness factor collapses. `git_factor` resolves a blob at the literal path `policy:<slug>` (the `strip_prefix("file:")` is a no-op) and the HEAD tree returns nothing, so 0.0. `dep_factor` needs a parsed `FileRecord`, so 0.0. `cascade_factor` matches on `record.category` and `Policy` falls to the `_ => 0.0` arm. `semantic_factor` is a v0.1 constant 0.0. Only `time_factor` survives, weighted `TIME_WEIGHT = 0.20`, so the score asymptotes at 0.20. `tier_from_value(0.20)` is `Aging`, and `mati stale` reports only `Stale`, `Liability`, and `Tombstone`. Adding `policy:` to `STALENESS_PREFIXES` would therefore produce a record that can never appear in the report it feeds, at the cost of a full scan against the 2s `ANALYZE_TIME_BUDGET_MS`.
+
+The tiers also mean the wrong thing here. They carry injection semantics — warn in bootstrap, blocks injection, excluded entirely — while policy enforcement gates on `RecordLifecycle::Active` and `PolicyStage` and never reads staleness at all. A policy shown as "excluded entirely" while it still denies every matching action would be a false statement on the operator's dashboard.
+
+Matches are already recorded where they exist, so the signal is not missing in general. A `block` policy at `enforce` writes `enforcement:event:*` with `subject_kind: Control` and reason `policy_consult_required` or `policy_receipt_valid`. A `shadow` policy writes `analytics:policy_shadow_<date>`. The one gap is `steer` at `enforce`: it pushes context and emits no event, so "this policy never fired" is currently unanswerable for steer policies specifically. Recorded as a known gap; no counter is implemented.
+
+`mem_bootstrap` also does not preload policies. This is intentional under P2:
+inject nothing by default and pull on demand. A policy deny names the required
+consultation key and closes the loop without adding a field to every
+`ContextPacket` or spending tokens on policies unrelated to the current task.
+The four-tool MCP surface remains unchanged.
+
+Codex `codex-pre-apply-patch` is a policy enforcement path. Its patch envelope
+provides exact target paths, which are normalized into `Action { tool: "path" }`
+and evaluated with `target_path_glob` policies after the existing gotcha gate.
+As with other Codex gates, a policy deny is reported as exit 2 with a `mati:`
+stderr instruction; uncertainty still fails open.
+
 ### 10a.2 Matching
 
 Matching is two layers, and the split is deliberate.
