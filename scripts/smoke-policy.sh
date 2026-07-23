@@ -64,8 +64,12 @@ post_memget() {
   fi
 }
 pre_edit() { printf '{"session_id":"smoke","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":%s,"old_string":"a","new_string":"b"}}' "$1"; }
+pre_apply_patch() {
+  printf '{"session_id":"smoke","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{"command":"*** Update File: %s\\n@@\\n-a\\n+b\\n"}}' "$1"
+}
 
 hook()  { ( cd "$PROJECT" && printf '%s' "$2" | "$MATI" hook-decide "$1" 2>/dev/null ); }
+codex_hook() { ( cd "$PROJECT" && printf '%s' "$2" | "$MATI" hook-decide "$1" 2>&1 ); }
 mati_p(){ ( cd "$PROJECT" && "$MATI" "$@" 2>&1 ); }
 
 # Real MCP tool call over stdio. This matters: the MCP `mem_get` handler mints
@@ -259,6 +263,36 @@ assert_has  "sql edit denied"          "$OUT" 'permissionDecision":"deny"'
 OUT="$(hook claude-pre-edit "$(pre_edit '"main.rs"')")"
 assert_lacks "unrelated edit untouched" "$OUT" 'permissionDecision":"deny"'
 assert_lacks "edit never force-allows"  "$OUT" 'permissionDecision":"allow"'
+
+# Codex apply_patch is a separate multi-file adapter with its own deny path.
+# Assert on the REQUIRED key, not the policy key: a deny naming the policy would
+# tell the agent to mem_get something that can never clear it.
+CODEX_OUT="$(codex_hook codex-pre-apply-patch "$(pre_apply_patch 'migrations/prod.sql')")"
+CODEX_RC=$?
+assert_has "Codex apply_patch denies on a matching path" "$CODEX_OUT" 'policy:edit-sql blocked'
+assert_has "and names the key that clears it"            "$CODEX_OUT" 'mem_get("schema:migrations")'
+[ "$CODEX_RC" -eq 2 ] && pass "Codex deny exits 2" || fail "Codex deny exits 2" "rc=$CODEX_RC"
+
+# Positive control: the unrelated path must reach the binary and exit 0 cleanly.
+# assert_lacks alone would pass identically if the hook never ran at all.
+CODEX_OUT="$(codex_hook codex-pre-apply-patch "$(pre_apply_patch 'main.rs')")"
+CODEX_RC=$?
+[ "$CODEX_RC" -eq 0 ] && pass "Codex allows an unrelated path" || fail "Codex allows an unrelated path" "rc=$CODEX_RC"
+assert_lacks "unrelated path is not denied" "$CODEX_OUT" 'blocked this action'
+
+# A non-denying policy still has to record. The apply_patch path collected its
+# events only inside the deny branch, so a shadow match reported nothing.
+mati_p policy add codex-shadow --name codex-shadow \
+  --rule "Consult decision:codex-shadow before editing SQL." \
+  --reason "Migrations drift because production changes." \
+  --mode block --severity high \
+  --trigger '{"target_path_glob":"**/*.sql"}' \
+  --requires '{"key":"decision:codex-shadow","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+mati_p policy stage codex-shadow shadow >/dev/null
+codex_hook codex-pre-apply-patch "$(pre_apply_patch 'migrations/prod.sql')" >/dev/null 2>&1
+assert_has "Codex apply_patch records a shadow observation" \
+  "$(mati_p policy observations codex-shadow --json)" '"would": "block"'
+mati_p policy delete codex-shadow >/dev/null
 
 # ── 9. Lifecycle: disable, edit, delete ──────────────────────────────────────
 step "9. Lifecycle changes take effect immediately"
