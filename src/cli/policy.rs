@@ -35,7 +35,7 @@ pub struct PolicyArgs {
 
 #[derive(Subcommand)]
 enum PolicyCommand {
-    /// Add a local repository policy (stored under policy:<slug>).
+    /// Add a local repository policy (stored under `policy:<slug>`).
     #[command(
         long_about = "Add a local, developer-authored policy. New policies are off by default; pass --shadow to observe or --enable for deliberate human activation."
     )]
@@ -89,13 +89,13 @@ enum PolicyCommand {
 
 #[derive(Args)]
 struct PolicyKeyArgs {
-    /// Policy key (policy:<slug>) or slug.
+    /// Policy key (`policy:<slug>`) or slug.
     key: String,
 }
 
 #[derive(Args)]
 struct AddArgs {
-    /// Slug used to form policy:<slug>.
+    /// Slug used to form `policy:<slug>`.
     slug: String,
     #[arg(long)]
     name: String,
@@ -133,7 +133,7 @@ struct AddArgs {
 
 #[derive(Args)]
 struct EditArgs {
-    /// Policy key (policy:<slug>) or slug.
+    /// Policy key (`policy:<slug>`) or slug.
     key: String,
     #[arg(long)]
     name: Option<String>,
