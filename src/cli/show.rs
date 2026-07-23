@@ -1165,7 +1165,7 @@ async fn run_enforcement_history(
             "{:>6}  {ts}  {color}{type_label:<16}{reset}  {:30}  {:24}  {}",
             event.seq_no,
             truncate_str(&event.subject_key, 30),
-            &event.decision_reason_code,
+            event.decision_reason_code,
             event.agent_session.as_deref().unwrap_or("-"),
         );
     }
