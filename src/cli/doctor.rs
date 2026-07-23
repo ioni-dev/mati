@@ -432,6 +432,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // the frozen-contract primitive `enforcement::verify_chain`.
     checks.push(collect_chain_check(cwd).await);
     checks.push(collect_freshness_check(cwd).await);
+    checks.push(collect_policy_check(cwd).await);
 
     // Network/telemetry posture — a compile-time attestation surfaced in-tool,
     // so an auditor sees mati's headline invariant by running `mati doctor`
@@ -624,6 +625,118 @@ async fn collect_chain_check(cwd: &Path) -> CheckResult {
 /// scan). `Info` when the cache is cold (run `mati stale`); `Warn` when records
 /// are stale — advisory, since stale knowledge degrades enforcement quality but
 /// doesn't break it, so this never fails the CI gate.
+/// Re-run the author-time checks against what is actually stored.
+///
+/// A policy can be authored before a check existed, or edited through a path
+/// that skipped one, and a stored policy with a malformed glob is skipped by
+/// `from_records_lenient` at daemon boot with only a log line. The operator sees
+/// an `enforce` policy in `mati policy list` and reasonably assumes it enforces.
+/// This is the surface that says otherwise.
+async fn collect_policy_check(cwd: &Path) -> CheckResult {
+    use mati_core::store::{PolicyRecord, PolicyStage, RecordLifecycle};
+
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult {
+                section: "enforcement",
+                name: "policy",
+                status: Status::Info,
+                detail: "skipped — no store initialized for this directory".to_string(),
+                fix: None,
+            };
+        }
+    };
+    let records = match proxy.scan_prefix("policy:").await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = proxy.close().await;
+            return CheckResult {
+                section: "enforcement",
+                name: "policy",
+                status: Status::Fail,
+                detail: format!("could not read policies: {e}"),
+                fix: Some("mati doctor"),
+            };
+        }
+    };
+
+    let (mut enforce, mut shadow, mut off) = (0usize, 0usize, 0usize);
+    let mut broken: Vec<String> = Vec::new();
+    let mut warned: Vec<String> = Vec::new();
+
+    for record in &records {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        let Some(policy) = record.payload_as::<PolicyRecord>() else {
+            broken.push(format!("{} (unreadable payload)", record.key));
+            continue;
+        };
+        match policy.stage {
+            PolicyStage::Enforce => enforce += 1,
+            PolicyStage::Shadow => shadow += 1,
+            PolicyStage::Off => off += 1,
+        }
+        if matches!(policy.stage, PolicyStage::Off) {
+            continue;
+        }
+        // A bad glob is a silent non-enforcement, not a style problem.
+        if let Err(e) = mati_core::store::policy_ops::validate_trigger(&policy.trigger) {
+            broken.push(format!("{} ({e})", record.key));
+            continue;
+        }
+        let backed = matches!(proxy.get(&policy.requires.key).await, Ok(Some(_)));
+        for w in mati_core::store::policy_ops::author_warnings(&policy, backed) {
+            warned.push(format!(
+                "{}: {}",
+                record.key,
+                w.trim_start_matches("warning: ")
+            ));
+        }
+    }
+    let _ = proxy.close().await;
+
+    let counts = format!("{enforce} enforcing, {shadow} shadow, {off} off");
+    if !broken.is_empty() {
+        return CheckResult {
+            section: "enforcement",
+            name: "policy",
+            status: Status::Fail,
+            detail: format!(
+                "{counts}; NOT enforcing despite their stage: {}",
+                broken.join("; ")
+            ),
+            fix: Some("mati policy edit <slug>"),
+        };
+    }
+    if !warned.is_empty() {
+        return CheckResult {
+            section: "enforcement",
+            name: "policy",
+            status: Status::Warn,
+            detail: format!("{counts}; {}", warned.join("; ")),
+            fix: Some("mati policy show <slug>"),
+        };
+    }
+    if records.is_empty() {
+        return CheckResult {
+            section: "enforcement",
+            name: "policy",
+            status: Status::Info,
+            detail: "no local policies authored".to_string(),
+            fix: None,
+        };
+    }
+    CheckResult {
+        section: "enforcement",
+        name: "policy",
+        status: Status::Pass,
+        detail: counts,
+        fix: None,
+    }
+}
+
 async fn collect_freshness_check(cwd: &Path) -> CheckResult {
     let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
         Ok(p) => p,

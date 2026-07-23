@@ -397,6 +397,26 @@ SHOW="$(mati_p policy show draft)"
 assert_has "the edit landed"              "$SHOW" 'New rule.'
 assert_has "and it stayed off"            "$SHOW" '"stage": "off"'
 
+# ── 16b. Operator surfaces ───────────────────────────────────────────────────
+# A rule that governs the repo but appears in neither the dashboard nor the
+# diagnostic report leaves the operator guessing what is live.
+step "16b. status and doctor report policy health"
+# The Runtime block only renders when an agent platform is configured, and the
+# fixture inits without one; install the Claude scaffold so the line is reachable.
+mati_p init --claude >/dev/null 2>&1 || true
+assert_has "status counts live policies"   "$(mati_p status)" 'Policies'
+DOC="$(mati_p doctor)"
+assert_has "doctor reports a policy line"  "$DOC" 'policy'
+assert_has "and counts them by stage"      "$DOC" 'enforcing'
+# doctor re-runs the author-time checks against what is stored, so a policy
+# authored around a check still surfaces.
+mati_p policy add doctor-warn --name doctor-warn --rule "Consult first." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*prod-dw*"}' \
+  --requires '{"key":"decision:never-written","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+mati_p policy enable doctor-warn >/dev/null
+assert_has "doctor flags an unbacked enforcing policy" "$(mati_p doctor)" 'has no backing record'
+
 # ── 17a. Author-time key advice ──────────────────────────────────────────────
 # The unbacked-key warning used to say "store a record at that key" even for a
 # namespace nothing can write, which reads as a skipped step rather than a key
