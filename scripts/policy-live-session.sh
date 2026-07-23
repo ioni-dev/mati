@@ -52,6 +52,7 @@ fn main() {
 }
 RS
 echo "select 1;" > migrations/prod.sql
+echo "// generated; do not edit by hand" > model.gen.rs
 
 # A stub psql. Without a real client on PATH the command fails to spawn, Claude
 # reports tool_response.isError: true, and DbIntrospection correctly refuses to
@@ -125,6 +126,7 @@ write_record decision:orders-schema    "orders(id bigint pk, customer_id bigint,
 write_record decision:inventory-schema "inventory(sku text pk, warehouse text, on_hand int, reserved int)."
 write_record decision:ledger-schema    "ledger(entry_id bigint pk, account text, amount_cents bigint, posted_at timestamptz)."
 write_record decision:audit-schema     "audit_log(id bigint pk, actor text, action text, at timestamptz)."
+write_record decision:migrations-schema "migrations are applied in filename order and are never edited after being applied to production."
 
 add_policy() { # slug host_glob requires_key via
   "$MATI" policy add "$1" \
@@ -149,6 +151,27 @@ add_policy live-killswitch '*prod-switch*'     'decision:audit-schema'     'mem_
   --trigger '{"tool":"db_client","host_glob":"*prod-shadow*"}' \
   --requires '{"key":"decision:ledger-schema","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
 "$MATI" policy stage live-shadow shadow >/dev/null
+
+# The edit gate is the third enforcement path and the one smoke has only ever
+# checked against payloads we wrote ourselves. A path policy matches
+# target_path_glob against Edit/Write/NotebookEdit instead of a bash command.
+"$MATI" policy add live-editblock \
+  --name live-editblock --rule "Consult decision:migrations-schema before editing SQL." \
+  --reason "Migrations drift because production changes independently." \
+  --mode block --severity high \
+  --trigger '{"target_path_glob":"**/*.sql"}' \
+  --requires '{"key":"decision:migrations-schema","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+"$MATI" policy enable live-editblock >/dev/null
+
+# A steer-mode path policy must inject context and set no permissionDecision at
+# all, so the user's own edit prompt still runs.
+"$MATI" policy add live-editsteer \
+  --name live-editsteer --rule "Prefer editing the generator, not the generated file." \
+  --reason "Hand edits are lost because the file is regenerated on build." \
+  --mode steer --severity normal \
+  --trigger '{"target_path_glob":"**/*.gen.rs"}' \
+  --requires '{"key":"","via":[],"freshness":{"ttl_secs":900}}' >/dev/null
+"$MATI" policy enable live-editsteer >/dev/null
 
 # Capture the raw PostToolUse Bash payload. smoke-policy.sh builds this payload
 # from the documented schema, so a mismatch with what Claude Code actually sends
@@ -277,6 +300,30 @@ Each policy has its own consult key, so satisfying one does not satisfy another.
 12. Use mem_set to delete key policy:live-shadow.
     EXPECT: refused, because live-shadow is staged and staged policies are
     developer-controlled.
+
+13. Read migrations/prod.sql with your Read tool, then use your Edit tool to
+    change "select 1;" to "select 2;".
+    Read it first: Claude Code's own read-before-edit rule would stop a blind
+    edit before any hook runs, and that is not what this step is testing.
+    EXPECT: the edit is DENIED by policy live-editblock, naming
+    decision:migrations-schema. Reading the file does not satisfy it; the
+    policy requires a mem_get on that key.
+
+14. Call the mem_get MCP tool with key "decision:migrations-schema", then retry
+    the same edit.
+    EXPECT: no longer denied.
+
+15. Read model.gen.rs, then use your Edit tool to change the comment text.
+    EXPECT: NOT denied. live-editsteer is a steer policy, so you should receive
+    "Prefer editing the generator, not the generated file." as context with no
+    permission decision attached.
+    Report whether you saw the rule text, and whether the edit was blocked.
+
+16. Read main.rs, then use your Edit tool to change "fixture" to "fixture2".
+    EXPECT: untouched by policy. No deny, and no policy rule injected.
+    Confirm specifically that mati did not force-allow it either: a forced
+    allow would suppress your own permission prompt, which mati must never do
+    for an edit.
 
 Report a table: step -> PASS/FAIL -> what you actually observed.
 Then state plainly whether step 5 passed, since that is the one contract this
