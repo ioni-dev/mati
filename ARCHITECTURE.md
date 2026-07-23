@@ -521,6 +521,8 @@ Matching is two layers, and the split is deliberate.
 
 Matching never inspects intent. It gates on the client invocation, not on whether the SQL is a `SELECT` or an `UPDATE`. The bash normalizer inherits the known gaps in section 10.2 and section 24 at the same accepted miss rate.
 
+One gap is worse than a miss and worth calling out separately. The pre- and post-bash hooks assume they see the same command text, and `effective_command` strips only a fixed wrapper list (`sudo`, `env`, `nice`, and peers). Another `PreToolUse` hook that rewrites the command breaks that assumption: the pre hook sees what the user typed and blocks on it, while the post hook sees the rewritten form, fails to recognize a database client, and never mints. The policy then demands a consultation that cannot be satisfied, which is a hard failure rather than the accepted miss the classifier gaps produce. This was observed live with a token-proxy hook that rewrote `psql …` to `rtk psql …`. Nothing detects the mismatch; the fix is to exclude database clients from the rewriting hook, or to add the wrapper to `PREFIX_WORDS` when it is genuinely a transparent proxy.
+
 ### 10a.3 Where evaluation runs
 
 The hook process is ephemeral and holds no policies. The daemon holds a compiled `PolicyMatcherSet`, loaded from a `policy:*` scan at boot and refreshed after each `policy_write`. A record with an invalid glob is skipped and logged rather than failing the whole set.
