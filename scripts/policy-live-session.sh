@@ -56,7 +56,10 @@ git init --quiet
 git add -A
 git -c user.email=fixture@local -c user.name=fixture commit -qm "fixture" >/dev/null
 
-"$MATI" init >/dev/null || exit 1
+# --claude is required on a fresh project: the integration is auto-detected only
+# when .claude/ already exists, so without it the fixture has no hooks and no MCP
+# server, and every step in the prompt below would pass without firing anything.
+"$MATI" init --claude >/dev/null || exit 1
 
 # `mati daemon start` blocks in the foreground, so the daemon is auto-spawned the
 # way a real session does it: fire one hook and wait for the socket. Without this
@@ -74,11 +77,7 @@ if [ -z "$(find "$MATI_HOME" -name 'mati.sock' 2>/dev/null | head -1)" ]; then
 fi
 
 # A substantive record behind requires.key, so the MemGet receipt is not hollow
-# (ARCHITECTURE section 10a.5). Note the key prefix: `mem_set` accepts only
-# gotcha:/decision:/dev_note:/policy:, and there is no CLI writer for an
-# arbitrary key, so the `schema:orders` used as an illustration elsewhere cannot
-# actually be created. A decision: key is the writable stand-in.
-# Each policy gets its OWN requires.key. Sharing one key would let the single
+# (ARCHITECTURE section 10a.5). Each policy gets its OWN requires.key. Sharing one key would let the single
 # mem_get in step 2 satisfy every policy at once, and the later steps would pass
 # without proving anything.
 write_record() { # key summary
@@ -121,6 +120,10 @@ add_policy live-killswitch '*prod-switch*'     'decision:audit-schema'     'mem_
   --requires '{"key":"decision:ledger-schema","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
 "$MATI" policy stage live-shadow shadow >/dev/null
 
+for f in .claude/settings.json .mcp.json; do
+  [ -f "$DEST/$f" ] || { echo "fixture is not wired: $f missing" >&2; exit 1; }
+done
+
 printf '\n\033[1mFixture ready:\033[0m %s\n' "$DEST"
 "$MATI" policy list
 printf '\nPolicy mode: %s\n' "$("$MATI" config get policy.mode 2>/dev/null || echo strict)"
@@ -129,13 +132,16 @@ cat <<EOF
 
 ────────────────────────────────────────────────────────────────────────────
 Open a Claude Code session in the fixture, then paste the prompt below.
-MATI_HOME must be exported before launching, or the session reads a different
-store and every policy step will silently pass.
+Both exports are required. Each hook checks for mati on PATH and exits silently
+if absent; without MATI_HOME the session reads a different store.
+Either mistake makes EVERY step pass without enforcing anything.
 
   cd $DEST
   export MATI_HOME=$DEST/.mati-home
   export PATH=$REPO_ROOT/target/debug:\$PATH
   claude
+
+Claude Code will ask you to trust the folder. Hooks do not run until you do.
 
 Nothing here touches a real database. Every command is against a hostname
 that does not resolve; only the hook decision matters, not the query result.
@@ -150,10 +156,16 @@ make it pass for the wrong reason.
 
 Each policy has its own consult key, so satisfying one does not satisfy another.
 
+0. Run in the terminal: command -v mati
+   EXPECT: a path ending in target/debug/mati. If it is anything else, or empty,
+   STOP and report it. The hooks exit silently when mati is not on PATH.
+
 1. Run: psql -h db.prod-memget.internal -c "UPDATE orders SET status='x'"
    EXPECT: blocked before it runs, naming policy live-memget and telling you to
    consult decision:orders-schema.
    PASS if you were blocked. FAIL if the command executed.
+   This step is the canary. If it does NOT block, STOP: the wiring is broken and
+   every later step would pass for the wrong reason. Report that instead.
 
 2. Call the mem_get MCP tool with key "decision:orders-schema".
    EXPECT: the orders schema summary comes back.
