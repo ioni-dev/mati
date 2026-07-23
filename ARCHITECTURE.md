@@ -562,11 +562,11 @@ Every policy failure path allows. An unreachable daemon, an error response, or a
 
 ### 10a.5 Consultation receipts
 
-A block policy names what unlocks it: `requires.key` (for example `schema:orders_db`), the sources that may satisfy it, and its freshness. The receipt is the existing `session:consulted:*` primitive from section 15, actor-scoped and TTL-bound.
+A block policy names what unlocks it: `requires.key` (for example `decision:orders-schema`), the sources that may satisfy it, and its freshness. The receipt is the existing `session:consulted:*` primitive from section 15, actor-scoped and TTL-bound.
 
 Two sources mint it:
 
-- **`MemGet`.** The agent calls `mem_get("schema:orders_db")` and the post-memget hook mints the receipt. Minting is key-agnostic, so a key with no stored record would mint a receipt for a consultation that taught the agent nothing. `mati policy add` warns when a `MemGet` requirement points at an unbacked key.
+- **`MemGet`.** The agent calls `mem_get("decision:orders-schema")` and the post-memget hook mints the receipt. Minting is key-agnostic, so a key with no stored record would mint a receipt for a consultation that taught the agent nothing. `mati policy add` warns when a `MemGet` requirement points at an unbacked key. The key must also be one `mem_set` can write, which is a `gotcha:`, `decision:`, `dev_note:`, or `policy:` prefix. Nothing writes an arbitrary namespace, so a requirement on something like `schema:orders` can never be backed and the warning says so rather than suggesting a step the author cannot take.
 - **`DbIntrospection`.** The agent's own schema inspection satisfies the policy. A `PostToolUse` bash hook recognizes an allowlisted inspection command (`information_schema`, `\d`, `DESCRIBE`, `SHOW TABLES`, and equivalents) and mints the receipt for each matched policy that accepts this source. It mints only when the command succeeded: `tool_response.isError` must be explicitly `false`. An unrecognized payload shape mints nothing and logs, so a future shape change stops minting rather than issuing receipts for failed commands.
 
 Introspection commands are exempt from policy blocks. Without that exemption, a policy triggering on `psql -h *prod*` would block the very `psql -h prod -c "\d orders"` that satisfies it, and the agent could never comply. The exemption suppresses blocks only. It does not touch the gotcha file gate, and it does not extend to minting: a policy that accepts only `MemGet` is still not satisfied by introspection.

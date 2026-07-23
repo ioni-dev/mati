@@ -369,7 +369,7 @@ assert_lacks "rejected policy is not persisted" "$(mati_p policy list)" 'policy:
 OUT="$(mati_p policy add unbacked --name unb --rule "Consult first." \
   --reason "Schemas drift because production changes." --mode block \
   --trigger '{"tool":"db_client","host_glob":"*prod-unb*"}' \
-  --requires '{"key":"schema:nothing-here","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+  --requires '{"key":"decision:nothing-here","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
 assert_has "unbacked requires.key warns" "$OUT" 'has no backing record'
 
 # ── 16. Dry-run and stage parsing ────────────────────────────────────────────
@@ -396,6 +396,24 @@ assert_has "agent may edit an off policy" "$OUT" 'ok.":true'
 SHOW="$(mati_p policy show draft)"
 assert_has "the edit landed"              "$SHOW" 'New rule.'
 assert_has "and it stayed off"            "$SHOW" '"stage": "off"'
+
+# ── 17a. Author-time key advice ──────────────────────────────────────────────
+# The unbacked-key warning used to say "store a record at that key" even for a
+# namespace nothing can write, which reads as a skipped step rather than a key
+# that must be renamed.
+step "17a. An unbackable requires.key says so"
+OUT="$(mati_p policy add unwritable --name unwritable --rule "Consult first." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*prod-unw*"}' \
+  --requires '{"key":"schema:orders","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+assert_has "an unwritable key is named as such" "$OUT" 'can never hold a record'
+assert_has "and a usable key is suggested"      "$OUT" "decision:orders"
+OUT="$(mati_p policy add writable-unbacked --name writable-unbacked --rule "Consult first." \
+  --reason "Schemas drift because production changes." --mode block \
+  --trigger '{"tool":"db_client","host_glob":"*prod-wu*"}' \
+  --requires '{"key":"decision:not-yet-written","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+assert_has "a writable but empty key still warns" "$OUT" 'has no backing record'
+assert_lacks "without claiming it is unwritable" "$OUT" 'can never hold a record'
 
 # ── 17b. Receipt visibility ──────────────────────────────────────────────────
 # Diagnosing "why is this still blocking" used to mean inferring receipt state

@@ -61,6 +61,18 @@ pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
 }
 
 /// Return author-time warnings without changing policy state.
+/// Key prefixes `mem_set` will write. A `requires.key` outside this set can
+/// never be backed by a record, so telling the author to "store a record there"
+/// would be advice they cannot follow.
+pub const WRITABLE_KEY_PREFIXES: &[&str] = &["gotcha:", "decision:", "dev_note:", "policy:"];
+
+/// Can a record ever exist at this key?
+pub fn key_is_writable(key: &str) -> bool {
+    WRITABLE_KEY_PREFIXES
+        .iter()
+        .any(|prefix| key.starts_with(prefix) && key.len() > prefix.len())
+}
+
 pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Some(tool) = policy
@@ -79,10 +91,21 @@ pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<S
         .contains(&super::record::ReceiptSource::MemGet)
         && !has_backing_record
     {
-        warnings.push(format!(
-            "warning: requires.key '{}' has no backing record; a mem_get on it would mint a receipt without the agent learning anything. Store a record at that key (e.g. the schema doc) so consultation is substantive.",
-            policy.requires.key
-        ));
+        let key = &policy.requires.key;
+        if key_is_writable(key) {
+            warnings.push(format!(
+                "warning: requires.key '{key}' has no backing record; a mem_get on it would mint a receipt without the agent learning anything. Store a record at that key (e.g. the schema doc) so consultation is substantive."
+            ));
+        } else {
+            // The old wording told the author to store a record at a key
+            // nothing can write to, which reads as a step they skipped rather
+            // than a key they must rename.
+            warnings.push(format!(
+                "warning: requires.key '{key}' can never hold a record: mem_set writes only {} prefixes. A mem_get on it mints a receipt that teaches the agent nothing. Use a writable key, such as 'decision:{}'.",
+                WRITABLE_KEY_PREFIXES.join(", "),
+                key.rsplit(':').next().unwrap_or("the-doc")
+            ));
+        }
     }
     if policy.requires.freshness.fingerprint
         && !policy
