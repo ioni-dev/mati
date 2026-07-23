@@ -167,10 +167,20 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             Decision::Deny { file_key, .. } => file_key.clone(),
             _ => unreachable!(),
         };
-        return EnforcementResult {
-            decision,
-            events: vec![HookEvent::PolicyConsultBlocked { key: denied_key }],
-        };
+        // Keep shadow observations recorded in this same pass. A developer can
+        // stage one policy to shadow while another enforces, and discarding the
+        // observation because something else denied would make the rollout
+        // measurement silently under-report every action the two both matched.
+        //
+        // Enforcement-claiming events are dropped instead: a PolicyConsulted
+        // from a satisfied block would write an AllowAfterReceipt for an action
+        // that was in fact denied, which would falsify the audit chain.
+        let mut events: Vec<HookEvent> = events
+            .into_iter()
+            .filter(|event| matches!(event, HookEvent::PolicyShadowObserved { .. }))
+            .collect();
+        events.push(HookEvent::PolicyConsultBlocked { key: denied_key });
+        return EnforcementResult { decision, events };
     }
     if !context.is_empty() {
         return EnforcementResult {
@@ -1964,6 +1974,58 @@ mod tests {
                 would: ShadowOutcome::Block,
                 action: None,
             }]
+        );
+    }
+
+    /// A deny must not erase a shadow observation gathered in the same pass:
+    /// staging one policy while another enforces is the normal rollout, and
+    /// dropping the observation makes the measurement under-report silently.
+    #[test]
+    fn a_deny_preserves_shadow_observations_from_the_same_pass() {
+        let mut shadowed = policy(true, false, "Observe only.");
+        shadowed.key = "policy:shadowed".into();
+        shadowed.stage = crate::store::PolicyStage::Shadow;
+        let mut blocking = policy(true, false, "Consult first.");
+        blocking.key = "policy:blocking".into();
+        let result = evaluate_policy_verdicts(&[shadowed, blocking], true);
+
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert!(
+            result.events.iter().any(|e| matches!(
+                e,
+                HookEvent::PolicyShadowObserved { key, .. } if key == "policy:shadowed"
+            )),
+            "shadow observation lost to the deny: {:?}",
+            result.events
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| matches!(e, HookEvent::PolicyConsultBlocked { .. })),
+            "deny must still record the block"
+        );
+    }
+
+    /// The other half: an enforcement-claiming event must NOT survive a deny,
+    /// or a satisfied block would write an AllowAfterReceipt for an action that
+    /// was denied.
+    #[test]
+    fn a_deny_drops_enforcement_events_from_the_same_pass() {
+        let mut satisfied = policy(true, true, "Already consulted.");
+        satisfied.key = "policy:satisfied".into();
+        let mut blocking = policy(true, false, "Consult first.");
+        blocking.key = "policy:blocking".into();
+        let result = evaluate_policy_verdicts(&[satisfied, blocking], true);
+
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|e| matches!(e, HookEvent::PolicyConsulted { .. })),
+            "a denied action must not also claim a receipt-backed allow: {:?}",
+            result.events
         );
     }
 
