@@ -111,10 +111,15 @@ git -c user.email=fixture@local -c user.name=fixture commit -qm "fixture" >/dev/
 # server, and every step in the prompt below would pass without firing anything.
 "$MATI" init --claude >/dev/null || exit 1
 
-# `mati daemon start` blocks in the foreground, so start it explicitly in the
-# background and poll for its socket. The warm-up must not depend on a hook path
-# reaching ensure_daemon.
-"$MATI" daemon start >/dev/null 2>&1 &
+# Warm the daemon the way a real session does — fire one hook, which brings up a
+# single detached daemon through ensure_daemon (flock-serialized, so it can't
+# race a concurrent spawn) and then poll for its socket. Do NOT background
+# `mati daemon start` here: that bypasses the ensure_daemon spawn lock, and a
+# foreground daemon tied to this shell can be left holding the store lock in an
+# unreachable state when the script exits, after which every session read spawns
+# a doomed competitor and falls back to a locked direct open.
+printf '%s' '{"session_id":"fixture","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"psql -h db.warmup.internal -c \"select 1\""}}' \
+  | "$MATI" hook-decide claude-pre-bash >/dev/null 2>&1
 for _ in $(seq 1 15); do
   [ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] && break
   sleep 1
