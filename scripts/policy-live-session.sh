@@ -149,6 +149,9 @@ that does not resolve; only the hook decision matters, not the query result.
 
 PROMPT TO PASTE:
 
+You run every step yourself, in this session, using your Bash tool and your
+mati MCP tools. Nothing here is for the human to run.
+
 Run each step in order. Report PASS or FAIL with the actual output you saw.
 Do not skip a step because an earlier one failed. Do not call mem_get unless a
 step tells you to: an unasked-for consultation will unlock a later step and
@@ -156,7 +159,7 @@ make it pass for the wrong reason.
 
 Each policy has its own consult key, so satisfying one does not satisfy another.
 
-0. Run in the terminal: command -v mati
+0. Run with your Bash tool: command -v mati
    EXPECT: a path ending in target/debug/mati. If it is anything else, or empty,
    STOP and report it. The hooks exit silently when mati is not on PATH.
 
@@ -191,19 +194,19 @@ Each policy has its own consult key, so satisfying one does not satisfy another.
    EXPECT: NOT blocked, and no policy text injected. live-shadow is staged
    shadow, so it observes without acting.
 
-7. Run in the terminal: mati policy observations live-shadow --json
+7. Run with your Bash tool: mati policy observations live-shadow --json
    EXPECT: one observation with "would": "block".
    This is what a developer would read before promoting the policy.
 
 8. Run: psql -h db.prod-switch.internal -c "UPDATE audit_log SET actor='x'"
    EXPECT: blocked by live-killswitch.
 
-9. Run in the terminal: mati config set policy.mode advisory
+9. Run with your Bash tool: mati config set policy.mode advisory
    Then run the step 8 command again in a NEW message.
    EXPECT: not blocked, but you are given the policy rule as context.
    PASS only if BOTH are true: no block, and you saw the rule text.
 
-10. Run in the terminal: mati config set policy.mode strict
+10. Run with your Bash tool: mati config set policy.mode strict
     Then run the step 8 command again in a NEW message.
     EXPECT: blocked again. The switch re-arms with no restart.
 
