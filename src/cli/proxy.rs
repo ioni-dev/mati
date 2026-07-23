@@ -39,39 +39,54 @@ impl StoreProxy {
     /// `mati ls`, etc. from non-mati paths.
     pub async fn open(cwd: &Path) -> Result<Self> {
         let root = mati_root_for(cwd)?;
-        match daemon_result(&root, "ping", json!({})).await {
-            DaemonResult::Ok(_) => Ok(Self {
+
+        // Fast path: a daemon already answers. All access proxies to it — the
+        // daemon is the sole owner of the store's exclusive lock.
+        if let DaemonResult::Ok(_) = daemon_result(&root, "ping", json!({})).await {
+            return Ok(Self {
                 inner: ProxyInner::Socket { root },
-            }),
-            DaemonResult::NotRunning | DaemonResult::StaleSocket => {
-                if !root.join("knowledge.db").exists() {
-                    anyhow::bail!(
-                        "no mati store initialized for this directory.\n\
-                         Run `mati init` to set up, or `cd` into a project that has been initialized."
-                    );
-                }
-                // Lock-contention retry: when N parallel CLI invocations hit
-                // direct-store mode (no daemon), only one can acquire the
-                // SurrealKV flock at a time. Without this loop, 19 of 20
-                // parallel invocations failed with "LOCK is already locked"
-                // — surfaced by the smoke test step 131 parallel-write probe.
-                // Backoff totals ~620ms (20+40+80+160+320), enough for a
-                // burst of ~20 writes to serialize without spurious failures.
-                // This is purely a safety net; the daemon path remains the
-                // recommended production configuration.
-                let store = open_store_with_lock_retry(cwd).await?;
-                Ok(Self {
-                    inner: ProxyInner::Direct(store),
-                })
-            }
-            DaemonResult::Unresponsive => {
-                anyhow::bail!(
-                    "mati daemon is running but not responding.\n\
-                     Cannot open the store while the daemon holds the lock.\n\
-                     Try: mati daemon stop"
-                )
-            }
+            });
         }
+
+        // No daemon answered. Refuse to create state on first run: only
+        // `mati init` and `mati daemon start` scaffold a store, and both bypass
+        // this proxy by calling `Store::open` directly. A missing store from
+        // `mati status`/`mati ls` in a non-mati path is a clean error rather
+        // than a silently-scattered empty `~/.mati/<slug>/` directory.
+        if !root.join("knowledge.db").exists() {
+            anyhow::bail!(
+                "no mati store initialized for this directory.\n\
+                 Run `mati init` to set up, or `cd` into a project that has been initialized."
+            );
+        }
+
+        // A store exists but no daemon answered. The daemon is the SOLE owner of
+        // the store's exclusive SurrealKV lock. Opening the store directly here
+        // races any daemon that is starting, restarting, or briefly unreachable
+        // — the failure mode where concurrent CLI + MCP `serve` + hook access
+        // lock-contended (already-locked errors, timeouts, and lost writes that
+        // read back as null). So bring the daemon up and proxy to it. This is
+        // the same recovery path the hook and `mati serve` code already take;
+        // `ensure_daemon` handles NotRunning, StaleSocket, and Unresponsive
+        // (300ms re-probe, then kill the stale PID and respawn) uniformly, so a
+        // wedged daemon self-heals rather than forcing a manual `mati daemon stop`.
+        if mati_core::mcp::daemon_lifecycle::ensure_daemon(&root).await {
+            return Ok(Self {
+                inner: ProxyInner::Socket { root },
+            });
+        }
+
+        // The daemon could not be brought up: spawn is disabled (`cfg!(test)`
+        // or `MATI_DISABLE_AUTO_SPAWN=1`) or the spawn failed. Genuine last
+        // resort — open the store directly, serializing concurrent direct opens
+        // with a bounded lock-retry. Without this loop, 19 of 20 parallel
+        // invocations failed with "LOCK is already locked" (smoke step 131's
+        // parallel-write probe); backoff totals ~620ms (20+40+80+160+320).
+        // The daemon path above remains the production route.
+        let store = open_store_with_lock_retry(cwd).await?;
+        Ok(Self {
+            inner: ProxyInner::Direct(store),
+        })
     }
 
     /// Returns a reference to the direct store if in direct mode, or `None` if
