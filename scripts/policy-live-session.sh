@@ -111,20 +111,16 @@ git -c user.email=fixture@local -c user.name=fixture commit -qm "fixture" >/dev/
 # server, and every step in the prompt below would pass without firing anything.
 "$MATI" init --claude >/dev/null || exit 1
 
-# `mati daemon start` blocks in the foreground, so the daemon is auto-spawned the
-# way a real session does it: fire one hook and wait for the socket. Without this
-# the first `mati serve` below reports the daemon unreachable and the write is
-# silently lost.
-printf '{"session_id":"fixture","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"psql -h db.warmup.internal -c \\"select 1\\""}}' \
-  | "$MATI" hook-decide claude-pre-bash >/dev/null 2>&1
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ -n "$(find "$MATI_HOME" -name 'mati.sock' 2>/dev/null | head -1)" ] && break
+# `mati daemon start` blocks in the foreground, so start it explicitly in the
+# background and poll for its socket. The warm-up must not depend on a hook path
+# reaching ensure_daemon.
+"$MATI" daemon start >/dev/null 2>&1 &
+for _ in $(seq 1 15); do
+  [ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] && break
   sleep 1
 done
-if [ -z "$(find "$MATI_HOME" -name 'mati.sock' 2>/dev/null | head -1)" ]; then
-  echo "daemon socket never appeared; this environment may block Unix domain sockets" >&2
-  exit 1
-fi
+[ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] || {
+  echo "daemon socket never appeared; Unix sockets may be blocked" >&2; exit 1; }
 
 # A substantive record behind requires.key, so the MemGet receipt is not hollow
 # (ARCHITECTURE section 10a.5). Each policy gets its OWN requires.key. Sharing one key would let the single

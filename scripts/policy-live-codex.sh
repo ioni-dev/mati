@@ -64,12 +64,16 @@ done
 grep -Eq '"Bash"|"apply_patch"' .codex/hooks.json || { echo "Codex matchers missing" >&2; exit 1; }
 grep -Eq 'mcp_servers\.mati|\[mcp_servers\.mati\]' .codex/config.toml || { echo "mati MCP server missing" >&2; exit 1; }
 
-# `mati daemon start` is foreground, so warm the daemon through a hook and poll
-# its socket before writing records. The direct CLI call is intentional: it
-# starts the daemon without fabricating a Codex hook payload in either capture.
-printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"psql -h db.warmup.internal -c \"select 1\""}}' | "$MATI" hook-decide codex-pre-bash >/dev/null 2>&1
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] && break; sleep 1; done
-[ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] || { echo "daemon socket never appeared; Unix sockets may be blocked" >&2; exit 1; }
+# `mati daemon start` blocks in the foreground, so start it explicitly in the
+# background and poll for its socket. The warm-up must not depend on a hook path
+# reaching ensure_daemon; this makes startup deterministic for a real Codex run.
+"$MATI" daemon start >/dev/null 2>&1 &
+for _ in $(seq 1 15); do
+  [ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] && break
+  sleep 1
+done
+[ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] || {
+  echo "daemon socket never appeared; Unix sockets may be blocked" >&2; exit 1; }
 
 write_record() {
   printf '%s\n%s\n%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mem_set\",\"arguments\":{\"action\":\"write\",\"key\":\"$1\",\"value\":\"$1\",\"category\":\"Decision\",\"payload\":{\"summary\":\"$2\",\"rationale\":\"Pinned so this live policy has substantive knowledge behind its receipt.\"},\"tags\":[\"schema\"],\"priority\":\"High\"}}}" | "$MATI" serve >/dev/null 2>&1
