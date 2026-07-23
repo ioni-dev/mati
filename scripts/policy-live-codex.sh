@@ -129,12 +129,14 @@ Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
    jq -c 'keys|sort' "\$MATI_HOME/codex-post-bash-payloads.jsonl" | tail -1
    jq -c '.["tool_input"]|keys|sort' "\$MATI_HOME/codex-pre-apply-patch-payloads.jsonl" | tail -1
    jq -c '.["tool_input"]|keys|sort' "\$MATI_HOME/codex-post-bash-payloads.jsonl" | tail -1
-   There must now be one line in each file. Report each top-level key set and
-   tool_input key set verbatim. If either is absent/empty, STOP. If the shape
-   differs from smoke-policy.sh's pre_apply_patch() payload, that finding
-   outranks every later result: without tool_input.command,
-   decide::extract_apply_patch_files returns nothing, run_apply_patch fails
-   open, and every patch is ungated.
+   Each file must have AT LEAST ONE line. The post-bash file will normally have
+   several, because every Bash command you run (including these report commands)
+   is captured — that is expected, NOT a failure; do not stop on the line count.
+   Report each top-level key set and tool_input key set verbatim. STOP ONLY if a
+   file is genuinely absent or empty, or if the shape differs from
+   smoke-policy.sh's pre_apply_patch() payload (no tool_input.command) — that
+   finding outranks every later result, since without it run_apply_patch fails
+   open and every patch is ungated. Otherwise CONTINUE to step 1.
 1. CANARY apply_patch migrations/prod.sql "select 1;" -> "select 2;". Expect exit 2, mati: naming decision:codex-migrations, and content unchanged; otherwise STOP.
 2. mem_get decision:codex-migrations. If Codex cannot call mati MCP mem_get, STOP: deny is unsatisfiable.
 3. Retry patch; expect success and "select 2;".
