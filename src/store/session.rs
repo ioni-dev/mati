@@ -74,6 +74,10 @@ pub fn analytics_record(key: &str, value: String) -> Record {
 pub struct DailyAgg {
     pub count: u64,
     pub keys: Vec<String>,
+    /// Per-target counts for surfaces that need activity by policy, while
+    /// preserving the original aggregate count and bounded key set.
+    #[serde(default)]
+    pub key_counts: BTreeMap<String, u64>,
 }
 
 pub const MAX_AGG_KEYS: usize = 100;
@@ -186,8 +190,10 @@ pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) ->
             let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
                 count: 0,
                 keys: vec![],
+                key_counts: BTreeMap::new(),
             });
             agg.count += 1;
+            *agg.key_counts.entry(target_key.to_string()).or_default() += 1;
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
             }
@@ -201,6 +207,7 @@ pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) ->
             let agg = DailyAgg {
                 count: 1,
                 keys: vec![target_key.to_string()],
+                key_counts: BTreeMap::from([(target_key.to_string(), 1)]),
             };
             let mut record = analytics_record(agg_key, String::new());
             record.payload = serde_json::to_value(&agg).ok();
@@ -228,8 +235,10 @@ pub async fn upsert_daily_agg_staged(
             let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
                 count: 0,
                 keys: vec![],
+                key_counts: BTreeMap::new(),
             });
             agg.count += 1;
+            *agg.key_counts.entry(target_key.to_string()).or_default() += 1;
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
             }
@@ -243,6 +252,7 @@ pub async fn upsert_daily_agg_staged(
             let agg = DailyAgg {
                 count: 1,
                 keys: vec![target_key.to_string()],
+                key_counts: BTreeMap::from([(target_key.to_string(), 1)]),
             };
             let mut record = analytics_record(agg_key, String::new());
             record.payload = serde_json::to_value(&agg).ok();

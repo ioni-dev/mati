@@ -136,6 +136,8 @@ pub enum HookEvent {
     PolicyConsultBlocked { key: String },
     /// Local policy allowed a governed action after its receipt was present.
     PolicyConsulted { key: String },
+    /// A steer policy injected guidance without changing the action decision.
+    PolicySteered { key: String },
     /// A shadow policy would have blocked, but never changes the decision.
     PolicyShadowObserved {
         key: String,
@@ -201,6 +203,9 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             });
         } else {
             context.push(verdict.rule.clone());
+            events.push(HookEvent::PolicySteered {
+                key: verdict.key.clone(),
+            });
         }
     }
 
@@ -214,9 +219,10 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
         // observation because something else denied would make the rollout
         // measurement silently under-report every action the two both matched.
         //
-        // Enforcement-claiming events are dropped instead: a PolicyConsulted
-        // from a satisfied block would write an AllowAfterReceipt for an action
-        // that was in fact denied, which would falsify the audit chain.
+        // Enforcement-claiming events are dropped instead: PolicyConsulted
+        // would write an AllowAfterReceipt for an action that was in fact
+        // denied, which would falsify the audit chain. PolicySteered is also
+        // dropped because the action did not proceed with that context.
         let mut events: Vec<HookEvent> = events
             .into_iter()
             .filter(|event| matches!(event, HookEvent::PolicyShadowObserved { .. }))
@@ -2106,6 +2112,12 @@ mod tests {
             Decision::Advisory {
                 context: "Consult first.".into()
             }
+        );
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicySteered {
+                key: "policy:prod-query".into()
+            }]
         );
     }
 

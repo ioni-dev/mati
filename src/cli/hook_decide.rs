@@ -1425,6 +1425,7 @@ fn platform_events(
                     Some(HookEvent::PolicyConsultBlocked { key })
                 }
                 HookEvent::PolicyConsulted { key } => Some(HookEvent::PolicyConsulted { key }),
+                HookEvent::PolicySteered { key } => Some(HookEvent::PolicySteered { key }),
                 HookEvent::PolicyShadowObserved { key, would, action } => {
                     Some(HookEvent::PolicyShadowObserved { key, would, action })
                 }
@@ -1510,6 +1511,11 @@ async fn fire_events(
             }),
             HookEvent::PolicyConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
                 event: p::SessionEvent::PolicyConsultHit,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::PolicySteered { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::PolicySteered,
                 key: key.clone(),
                 session_id: sid(),
             }),

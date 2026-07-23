@@ -914,6 +914,7 @@ async fn dispatch_session_side(
                 protocol::SessionEvent::FloorConsultMiss => "compliance:miss_",
                 protocol::SessionEvent::PolicyConsultMiss => "compliance:miss_",
                 protocol::SessionEvent::PolicyConsultHit => "compliance:allow_after_receipt_",
+                protocol::SessionEvent::PolicySteered => "analytics:policy_steer_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -1093,6 +1094,9 @@ async fn dispatch_session_side(
                     )
                     .await;
                 }
+                // Steering is context injection, not enforcement. Its trace
+                // belongs only in the eventual analytics tree.
+                protocol::SessionEvent::PolicySteered => {}
                 _ => {}
             }
 
@@ -2387,6 +2391,39 @@ mod tests {
         // Nothing in knowledge tree.
         let k_audit = g.store().scan_keys("audit:knowledge:").await.unwrap();
         assert!(k_audit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_log_policy_steered_is_analytics_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::SessionLog(SessionLogInput {
+            event: SessionEvent::PolicySteered,
+            key: "policy:steer-test".into(),
+            session_id: None,
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+        assert!(matches!(resp, Response::Ok { .. }));
+
+        let g = graph.read().await;
+        let key = sess::today_key("analytics:policy_steer_");
+        let record = g.store().get(&key).await.unwrap().expect("steer aggregate");
+        let agg = record
+            .payload_as::<sess::DailyAgg>()
+            .expect("steer aggregate is a DailyAgg Record");
+        assert_eq!(agg.count, 1);
+        assert_eq!(agg.key_counts.get("policy:steer-test"), Some(&1));
+        assert!(
+            crate::store::enforcement::scan_enforcement_events(g.store(), 0, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "steering must not enter the enforcement chain"
+        );
     }
 
     /// Regression: SessionLog with CodexShellMiss must produce a

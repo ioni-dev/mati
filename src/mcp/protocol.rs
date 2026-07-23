@@ -688,6 +688,8 @@ pub enum SessionEvent {
     PolicyConsultMiss,
     /// Local policy allowed an action after its receipt was present.
     PolicyConsultHit,
+    /// Local policy injected steering context without changing the decision.
+    PolicySteered,
     CodexShellMiss,
     Bootstrap,
     PromptNudge,
