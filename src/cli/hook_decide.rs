@@ -388,11 +388,37 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         HookVariant::ClaudePreBash | HookVariant::ClaudePreEdit
     ) && !matches!(adapter.decision, Decision::Deny { .. })
     {
-        // An edit is gated on its path, so it must be gated on the path the
-        // write actually lands on: editing a symlink to a .sql file writes
-        // through to the .sql file. A bash command has no such second identity.
+        // A bash file argument has the same second identity as an edit target:
+        // `psql -f link.sql` can read through to the real in-repo target. Keep
+        // one db_client action so host/tool matching survives the governed_tool
+        // filter; unlike edits, add canonical paths to action.files rather than
+        // building a separate path action. action.files is cloned into
+        // PolicyShadowObserved, so shadow observations now record resolved paths
+        // alongside lexical ones, showing what the command actually touched.
         let policy_actions: Vec<decide::Action> = match args.variant {
-            HookVariant::ClaudePreBash => bash_action.as_ref().cloned().into_iter().collect(),
+            HookVariant::ClaudePreBash => bash_action
+                .as_ref()
+                .cloned()
+                .map(|mut action| {
+                    let lexical_files: Vec<String> = action
+                        .files
+                        .iter()
+                        .take(decide::MAX_APPLY_PATCH_FILES)
+                        .cloned()
+                        .collect();
+                    for lexical in lexical_files {
+                        if let Some(canonical) =
+                            canonical_rel_path(&lexical, &cwd, repo_root.as_deref(), &lexical)
+                        {
+                            if !action.files.iter().any(|path| path == &canonical) {
+                                action.files.push(canonical);
+                            }
+                        }
+                    }
+                    action
+                })
+                .into_iter()
+                .collect(),
             HookVariant::ClaudePreEdit => std::iter::once(rel_path.as_str())
                 .chain(canon_rel.as_deref())
                 .map(|path| decide::normalize_action(None, Some(path)))
