@@ -989,15 +989,26 @@ fn post_bash_succeeded(input: &serde_json::Value) -> bool {
         tracing::warn!("Claude PostToolUse Bash payload is missing tool_response");
         return false;
     };
-    let Some(is_error) = response
+    // Claude Code omits `isError` entirely on a successful Bash command. A
+    // captured payload carries exactly `{stdout, stderr, interrupted, isImage,
+    // noOutputExpected}` and no exit status at all, so requiring the field made
+    // every introspection look like a failure and `DbIntrospection` could never
+    // mint. Absent means success, matching `run_post_memget`; only an explicit
+    // `true` is a failure.
+    if response
         .get("isError")
         .or_else(|| response.get("is_error"))
         .and_then(|value| value.as_bool())
-    else {
-        tracing::warn!("Claude PostToolUse Bash payload is missing boolean tool_response.isError");
+        .unwrap_or(false)
+    {
         return false;
-    };
-    if is_error {
+    }
+    // A cancelled command taught the agent nothing, so it must not mint.
+    if response
+        .get("interrupted")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
         return false;
     }
     for key in ["exit_code", "exitCode"] {
@@ -1897,12 +1908,26 @@ mod tests {
             "tool_input": {"command": command},
             "tool_response": {"isError": false, "exit_code": 0}
         })));
+        // The real Claude Code shape: no isError, no exit status.
+        assert!(post_bash_succeeded(&json!({
+            "tool_input": {"command": command},
+            "tool_response": {
+                "stdout": "Table \"public.inventory\"", "stderr": "",
+                "interrupted": false, "isImage": false, "noOutputExpected": false
+            }
+        })));
+        // exit_code alone is still honored when a payload carries it.
+        assert!(post_bash_succeeded(&json!({
+            "tool_input": {"command": command},
+            "tool_response": {"exit_code": 0}
+        })));
         for response in [
             json!({"isError": true}),
             json!({"is_error": true}),
             json!({"exit_code": 1}),
             json!({"exitCode": 2}),
-            json!({"exit_code": 0}),
+            json!({"interrupted": true}),
+            json!({"stdout": "x", "interrupted": true, "isImage": false}),
         ] {
             assert!(!post_bash_succeeded(&json!({
                 "tool_input": {"command": command},
