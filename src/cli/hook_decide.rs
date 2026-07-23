@@ -117,9 +117,12 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
-    // Normalize Claude Bash once so the same governed action drives both the
+    // Normalize Bash once so the same governed action drives both the
     // fileless policy path and the file-gate composition path.
-    let bash_action = if args.variant == HookVariant::ClaudePreBash {
+    let bash_action = if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) {
         input
             .pointer("/tool_input/command")
             .and_then(|v| v.as_str())
@@ -385,7 +388,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // policy round-trip and its possible second event on that path.
     if matches!(
         args.variant,
-        HookVariant::ClaudePreBash | HookVariant::ClaudePreEdit
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreEdit
     ) && !matches!(adapter.decision, Decision::Deny { .. })
     {
         // A bash file argument has the same second identity as an edit target:
@@ -396,7 +399,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         // PolicyShadowObserved, so shadow observations now record resolved paths
         // alongside lexical ones, showing what the command actually touched.
         let policy_actions: Vec<decide::Action> = match args.variant {
-            HookVariant::ClaudePreBash => bash_action
+            HookVariant::ClaudePreBash | HookVariant::CodexPreBash => bash_action
                 .as_ref()
                 .cloned()
                 .map(|mut action| {
@@ -647,11 +650,13 @@ async fn policy_verdicts_for_action(
 /// A successful schema inspection is the remedy for a DB policy, so the
 /// pre-Bash gate may steer it but must not block it.
 fn policy_block_exempt(variant: HookVariant, input: &serde_json::Value) -> bool {
-    variant == HookVariant::ClaudePreBash
-        && input
-            .pointer("/tool_input/command")
-            .and_then(|value| value.as_str())
-            .is_some_and(decide::is_schema_introspection)
+    matches!(
+        variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) && input
+        .pointer("/tool_input/command")
+        .and_then(|value| value.as_str())
+        .is_some_and(decide::is_schema_introspection)
 }
 
 /// Merge a policy result into the existing file-gate result without lowering it.
@@ -1963,6 +1968,7 @@ mod tests {
             "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
         });
         assert!(policy_block_exempt(HookVariant::ClaudePreBash, &input));
+        assert!(policy_block_exempt(HookVariant::CodexPreBash, &input));
 
         let result = decide::evaluate_policy_verdicts(
             &[decide::PolicyVerdict {
@@ -1984,6 +1990,7 @@ mod tests {
             "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
         });
         assert!(policy_block_exempt(HookVariant::ClaudePreBash, &input));
+        assert!(policy_block_exempt(HookVariant::CodexPreBash, &input));
         let verdicts = policy_core_verdicts(
             &[mati_core::mcp::protocol::PolicyVerdict {
                 key: "policy:prod-query".into(),
@@ -2776,6 +2783,56 @@ mod tests {
         let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &steer, "<policy>");
         assert!(stdout.contains("additionalContext"));
         assert!(!stdout.contains("permissionDecision"));
+    }
+
+    #[test]
+    fn codex_db_client_policy_gates_cover_fileless_file_bearing_and_introspection() {
+        let deny_verdict = decide::PolicyVerdict {
+            key: "policy:prod-query".into(),
+            rule: "Consult the schema first.".into(),
+            requires_key: "schema:orders".into(),
+            block: true,
+            satisfied: false,
+            stage: mati_core::store::PolicyStage::Enforce,
+        };
+
+        let fileless =
+            decide::normalize_action(Some("psql -h db.prod.internal -c \"select 1\""), None);
+        let file_bearing = decide::normalize_action(
+            Some("psql -h db.prod.internal -f migrations/prod.sql"),
+            None,
+        );
+        assert_eq!(fileless.tool, "db_client");
+        assert!(fileless.files.is_empty());
+        assert_eq!(file_bearing.tool, "db_client");
+        assert_eq!(file_bearing.files, vec!["migrations/prod.sql"]);
+
+        for action in [fileless, file_bearing] {
+            assert_eq!(action.host.as_deref(), Some("db.prod.internal"));
+            let result =
+                decide::evaluate_policy_verdicts(std::slice::from_ref(&deny_verdict), true);
+            let (stdout, stderr, exit_code) =
+                format_decision(HookVariant::CodexPreBash, &result.decision, "<policy>");
+            assert!(stdout.is_empty());
+            assert!(stderr.starts_with("mati:"));
+            assert_eq!(exit_code, 2);
+        }
+
+        let introspection_input = json!({
+            "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
+        });
+        assert!(policy_block_exempt(
+            HookVariant::CodexPreBash,
+            &introspection_input
+        ));
+        let mut exempt_verdict = deny_verdict;
+        exempt_verdict.block = false;
+        let steered = decide::evaluate_policy_verdicts(std::slice::from_ref(&exempt_verdict), true);
+        let (stdout, stderr, exit_code) =
+            format_decision(HookVariant::CodexPreBash, &steered.decision, "<policy>");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0);
     }
 
     #[test]
