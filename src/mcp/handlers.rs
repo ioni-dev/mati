@@ -2004,6 +2004,10 @@ pub(crate) async fn handle_record_import(
         "file:",
         "stage:",
         "dep:",
+        // Policies are user-authored source of truth and belong in a
+        // backup. show::deactivate_imported_policies lands them at stage
+        // off, so a restore never silently starts enforcing.
+        "policy:",
     ];
 
     // First pass: filter records into knowledge-tree-only buckets and skip

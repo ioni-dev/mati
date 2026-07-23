@@ -479,6 +479,26 @@ mati_p policy add staged-delete \
 OUT2="$(mcp_call mem_set '{"action":"delete","key":"policy:staged-delete","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
 assert_has "agent cannot delete shadow policy" "$OUT2" 'mati policy stage staged-delete off'
 
+# ── 20. Backup round trip ───────────────────────────────────────────────────
+# Export skipped policy: entirely and both import allowlists rejected it, so an
+# export was not a backup: a restore came back with every rule gone.
+#
+# Runs last: the export carries every policy, so importing it back correctly
+# demotes them all to off, which would strand any enforcement step after it.
+step "20. Policies survive export and restore"
+add_block_policy backup-me '*prod-backup*' 'decision:backup' 'mem_get'
+mati_p policy enable backup-me >/dev/null
+EXPORT="$(mati_p export --format json)"
+assert_has "export carries the policy"   "$EXPORT" 'policy:backup-me'
+assert_has "markdown export lists them"  "$(mati_p export --format md)" 'Policies'
+printf '%s' "$EXPORT" > "$WORK/backup.json"
+mati_p policy delete backup-me >/dev/null
+OUT="$(mati_p import "$WORK/backup.json")"
+# The tombstone is newer than the exported record, so version resolution keeps
+# the delete. What matters here is that import accepts the prefix at all.
+assert_lacks "import no longer rejects policies" "$OUT" '(1 skipped)'
+assert_has   "and lands them inert"              "$OUT" 'stage off'
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 printf '\n\033[1m== Summary ==\033[0m\n  passed: %d\n  failed: %d\n  skipped: %d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || exit 1

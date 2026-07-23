@@ -428,6 +428,10 @@ impl StoreProxy {
                     "file:",
                     "stage:",
                     "dep:",
+                    // Policies are user-authored source of truth and belong in a
+                    // backup. show::deactivate_imported_policies lands them at stage
+                    // off, so a restore never silently starts enforcing.
+                    "policy:",
                 ];
                 let mut accepted: Vec<(&str, &Record)> = Vec::with_capacity(records.len());
                 let mut skipped: u64 = 0;

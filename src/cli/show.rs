@@ -904,6 +904,9 @@ async fn export_json(store: &StoreProxy) -> Result<String> {
         "stage:",
         "dev_note:",
         "dep:",
+        // Policies are user-authored source of truth. Omitting them meant an
+        // export was not a backup: a restore came back with every rule gone.
+        "policy:",
     ] {
         all.extend(store.scan_prefix(prefix).await?);
     }
@@ -919,6 +922,7 @@ async fn export_md(store: &StoreProxy) -> Result<String> {
         ("file:", "Files"),
         ("dev_note:", "Notes"),
         ("dep:", "Dependencies"),
+        ("policy:", "Policies"),
     ];
 
     for &(prefix, heading) in sections {
@@ -992,10 +996,52 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
 /// user-authored knowledge.
 ///
 /// Returns `(imported, skipped)` counts.
+/// Land imported policies inert.
+///
+/// `mati policy enable <slug>` promotes one named rule the developer is looking
+/// at. An import can carry many, from a file they may not have read, so
+/// preserving `enforce` would let a single command start enforcing rules nobody
+/// reviewed. Content round-trips; the stage does not, matching the `mem_set`
+/// boundary where only a deliberate per-policy act promotes.
+fn deactivate_imported_policies(records: &[Record]) -> (Vec<Record>, usize) {
+    use mati_core::store::{PolicyRecord, PolicyStage};
+    let mut demoted = 0usize;
+    let out = records
+        .iter()
+        .map(|record| {
+            if !record.key.starts_with("policy:") {
+                return record.clone();
+            }
+            let Some(mut policy) = record.payload_as::<PolicyRecord>() else {
+                return record.clone();
+            };
+            if matches!(policy.stage, PolicyStage::Off) {
+                return record.clone();
+            }
+            policy.stage = PolicyStage::Off;
+            let mut record = record.clone();
+            if let Ok(payload) = serde_json::to_value(&policy) {
+                record.payload = Some(payload);
+                demoted += 1;
+            }
+            record
+        })
+        .collect();
+    (out, demoted)
+}
+
 async fn import_records_resilient(
     proxy: &super::proxy::StoreProxy,
     records: &[Record],
 ) -> (usize, usize) {
+    let (records, demoted) = deactivate_imported_policies(records);
+    if demoted > 0 {
+        println!(
+            "  {demoted} imported polic{} set to stage off; promote with `mati policy stage <slug> enforce`.",
+            if demoted == 1 { "y" } else { "ies" }
+        );
+    }
+    let records = &records;
     match proxy.import_records(records).await {
         Ok((imported, skipped)) => (imported as usize, skipped as usize),
         Err(e) => {
