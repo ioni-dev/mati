@@ -3,14 +3,23 @@
 # Set up a throwaway project wired for a REAL Claude Code session.
 #
 # smoke-policy.sh proves the wiring against payloads we construct from the
-# documented schema. It cannot prove the two contracts that only Claude Code
-# itself produces:
+# documented schema. It cannot prove the contracts that only Claude Code itself
+# produces:
 #
 #   1. `tool_response.isError` on PostToolUse — gates DbIntrospection minting.
 #      If Claude changes the field name or shape, minting stops silently and a
 #      policy never unlocks.
 #   2. That `permissionDecision: "deny"` and `additionalContext` actually reach
 #      the model, rather than being emitted into a shape Claude ignores.
+#   3. That a symlinked target resolves BEFORE the policy gate runs, against the
+#      real paths a session sends. This is new enforcement behavior — mati now
+#      denies edits and commands it previously allowed — and a synthetic payload
+#      cannot prove the resolution happens on the path Claude actually reports.
+#
+# NOT covered here: the Codex `apply_patch` policy surfaces (deny wording,
+# symlink resolution, miss recording). This fixture drives Claude Code, which
+# never emits `apply_patch`, so those stay smoke-only until a Codex fixture
+# exists. Stated so the gap is known rather than assumed closed.
 #
 # This script only builds the fixture. The checks are run by pasting the prompt
 # printed at the end into a Claude Code session opened in the fixture directory.
@@ -43,7 +52,7 @@ if [ -d "$DEST" ]; then
   ( cd "$DEST" && "$MATI" daemon stop >/dev/null 2>&1 )
 fi
 rm -rf "$DEST"
-mkdir -p "$DEST/migrations"
+mkdir -p "$DEST/migrations" "$DEST/vault"
 cd "$DEST" || exit 1
 
 cat > main.rs <<'RS'
@@ -53,6 +62,16 @@ fn main() {
 RS
 echo "select 1;" > migrations/prod.sql
 echo "// generated; do not edit by hand" > model.gen.rs
+
+# Symlink bypass fixtures. The governed files live under vault/; the symlinks
+# sit at the repo root with names no policy glob matches. Only the RESOLVED
+# target matches, so a gate that reads the lexical path lets the write through
+# to a governed file. Both are committed with everything else, so the fixture
+# reproduces from a clean checkout.
+echo "api_key = REDACTED" > vault/keys.txt
+echo "select * from vault_audit;" > vault/query.sql
+ln -s vault/keys.txt notes.txt
+ln -s vault/query.sql report.sql
 
 # A stub psql. Without a real client on PATH the command fails to spawn, Claude
 # reports tool_response.isError: true, and DbIntrospection correctly refuses to
@@ -127,6 +146,8 @@ write_record decision:inventory-schema "inventory(sku text pk, warehouse text, o
 write_record decision:ledger-schema    "ledger(entry_id bigint pk, account text, amount_cents bigint, posted_at timestamptz)."
 write_record decision:audit-schema     "audit_log(id bigint pk, actor text, action text, at timestamptz)."
 write_record decision:migrations-schema "migrations are applied in filename order and are never edited after being applied to production."
+write_record decision:vault-edit       "vault/keys.txt holds credentials; rotate through the secrets pipeline, never by hand."
+write_record decision:vault-query      "vault/query.sql reads the credential audit table and is reviewed before every change."
 
 add_policy() { # slug host_glob requires_key via
   "$MATI" policy add "$1" \
@@ -172,6 +193,38 @@ add_policy live-killswitch '*prod-switch*'     'decision:audit-schema'     'mem_
   --trigger '{"target_path_glob":"**/*.gen.rs"}' \
   --requires '{"key":"","via":[],"freshness":{"ttl_secs":900}}' >/dev/null
 "$MATI" policy enable live-editsteer >/dev/null
+
+# Symlink resolution, one policy per enforcement path. `tool` is pinned on each
+# so they cannot cross-fire: the edit policy must not match the `psql -f` action
+# and vice versa, or a pass would not say which gate resolved the target.
+# Neither glob touches migrations/prod.sql, model.gen.rs, or main.rs, so the
+# earlier steps are unaffected.
+#
+# `vault/**`, not `**/vault/**`: the leading `**/` would have to match ZERO
+# directories for a root-level vault/ to match, and nothing in the suite proves
+# globset does that. A glob that quietly fails to match makes both symlink steps
+# report a false pass — the exact failure this fixture exists to catch.
+# `migrations/**` is already proven against a real command in smoke-policy.sh.
+#
+# These get their OWN requires keys rather than reusing live-editblock's. By the
+# time the symlink steps run, the edit-gate step has already consulted
+# decision:migrations-schema and left a 900s receipt — a shared key would make
+# these pass without the symlink ever being resolved.
+"$MATI" policy add live-editsymlink \
+  --name live-editsymlink --rule "Consult decision:vault-edit before editing vault files." \
+  --reason "Credentials rotate out of band because the secrets pipeline owns them." \
+  --mode block --severity high \
+  --trigger  '{"tool":"path","target_path_glob":"vault/**"}' \
+  --requires '{"key":"decision:vault-edit","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+"$MATI" policy enable live-editsymlink >/dev/null
+
+"$MATI" policy add live-bashsymlink \
+  --name live-bashsymlink --rule "Consult decision:vault-query before running vault SQL." \
+  --reason "The credential audit table changes because rotation writes to it." \
+  --mode block --severity high \
+  --trigger  '{"tool":"db_client","target_path_glob":"vault/**"}' \
+  --requires '{"key":"decision:vault-query","via":["mem_get"],"freshness":{"ttl_secs":900}}' >/dev/null
+"$MATI" policy enable live-bashsymlink >/dev/null
 
 # Capture the raw PostToolUse Bash payload. smoke-policy.sh builds this payload
 # from the documented schema, so a mismatch with what Claude Code actually sends
@@ -325,7 +378,37 @@ Each policy has its own consult key, so satisfying one does not satisfy another.
     allow would suppress your own permission prompt, which mati must never do
     for an edit.
 
+17. Read notes.txt with your Read tool, then use your Edit tool to change
+    REDACTED to ROTATED.
+    notes.txt is a symlink to vault/keys.txt. No policy glob matches the name
+    "notes.txt"; only the resolved target matches. So this step passes ONLY if
+    the gate resolved the symlink before deciding.
+    EXPECT: DENIED by live-editsymlink, naming decision:vault-edit.
+    If the edit went through, the write landed on a governed file through a
+    name nothing was watching — report that as the finding, not as a skip.
+
+18. Call the mem_get MCP tool with key "decision:vault-edit", then retry the
+    same edit to notes.txt.
+    EXPECT: no longer denied. A deny that cannot be cleared by the key it names
+    is worse than no deny at all, so this half matters as much as step 17.
+
+19. Run: psql -f report.sql
+    report.sql is a symlink to vault/query.sql — the same bypass on the bash
+    path instead of the edit path.
+    EXPECT: DENIED by live-bashsymlink, naming decision:vault-query.
+    The fixture's stub psql ignores -f and exits 0, so if the gate did not fire
+    the command SUCCEEDS. A success here is a real FAIL, not an inconclusive
+    result — say which you saw.
+
+20. Run with your Bash tool: mati policy activity live-editsteer --json
+    EXPECT: "state": "fired", with "steer" among "sources".
+    Step 15 steered a real edit; this checks the trace survived the live hook
+    path rather than only the synthetic one. Other policies may also show steer
+    activity — step 9 set policy.mode advisory, which degrades a block to a
+    steer — so that is expected, not a failure. Only live-editsteer matters.
+
 Report a table: step -> PASS/FAIL -> what you actually observed.
-Then state plainly whether step 5 passed, since that is the one contract this
-fixture exists to test.
+Then state plainly whether step 5 and step 17 passed. Step 5 is the minting
+contract this fixture was built for; step 17 is the newest enforcement behavior
+and the one no live session has ever exercised.
 EOF
