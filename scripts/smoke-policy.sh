@@ -264,6 +264,26 @@ OUT="$(hook claude-pre-edit "$(pre_edit '"main.rs"')")"
 assert_lacks "unrelated edit untouched" "$OUT" 'permissionDecision":"deny"'
 assert_lacks "edit never force-allows"  "$OUT" 'permissionDecision":"allow"'
 
+# Widening event collection to the allow path made apply_patch a miss-recording
+# surface: a touched file with no record now increments the daily aggregate,
+# where before this adapter fired nothing unless it denied.
+MISS_KEY="analytics:miss_$(date -u +%Y-%m-%d)"
+codex_hook codex-pre-apply-patch "$(pre_apply_patch 'never/indexed/file.txt')" >/dev/null 2>&1
+sleep 1
+assert_has "apply_patch records a miss for an unrecorded file" \
+  "$(mati_p show "$MISS_KEY" 2>&1)" "$MISS_KEY"
+
+# A symlink to a governed target must not slip past target_path_glob: the write
+# lands on the real file. Both gates resolve the same canonical target.
+ln -sf migrations/prod.sql "$PROJECT/sneaky.txt"
+OUT="$(hook claude-pre-edit "$(pre_edit "\"$PROJECT/sneaky.txt\"")")"
+assert_has "edit through a symlink is denied" "$OUT" 'permissionDecision":"deny"'
+assert_has "and names the policy"             "$OUT" 'policy:edit-sql'
+SYM_OUT="$(codex_hook codex-pre-apply-patch "$(pre_apply_patch 'sneaky.txt')")"
+SYM_RC=$?
+assert_has "patch through a symlink is denied" "$SYM_OUT" 'policy:edit-sql blocked'
+[ "$SYM_RC" -eq 2 ] && pass "symlink patch deny exits 2" || fail "symlink patch deny exits 2" "rc=$SYM_RC"
+
 # Codex apply_patch is a separate multi-file adapter with its own deny path.
 # Assert on the REQUIRED key, not the policy key: a deny naming the policy would
 # tell the agent to mem_get something that can never clear it.
