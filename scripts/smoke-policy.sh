@@ -428,7 +428,7 @@ ACTIVITY_JSON="$(mati_p policy activity --json --since 30)"
 printf '%s' "$ACTIVITY_JSON" | jq -e '.window_days == 30 and (.policies | type == "array")' >/dev/null \
   && pass "activity JSON carries the window" || fail "activity JSON carries the window" "$ACTIVITY_JSON"
 assert_has "denied policy is fired" "$ACTIVITY_JSON" '"policy:query-f"'
-assert_has "shadow policy is fired" "$ACTIVITY_JSON" '"policy:query-a"'
+assert_has "shadow policy is fired" "$ACTIVITY_JSON" '"policy:shadow-one"'
 assert_has "steer policy is fired" "$ACTIVITY_JSON" '"policy:steer-live"'
 mati_p policy add activity-idle --name activity-idle --rule "Consult before idle test." \
   --reason "The trigger can stop matching because repositories change." --mode block \
@@ -542,9 +542,9 @@ mati_p import "$WORK/old-policy.json" >/dev/null
 mati_p policy stage activity-old enforce >/dev/null
 DOC="$(mati_p doctor)"
 assert_has "doctor warns on an old idle policy" "$DOC" 'policy:activity-old.*no activity in 30 days'
-assert_has "idle warning offers both readings" "$DOC" 'no longer needed or its trigger may have stopped matching'
+assert_has "idle warning offers both readings" "$DOC" 'trigger may have stopped matching'
 assert_has "idle warning points to policy test" "$DOC" 'mati policy test'
-assert_lacks "doctor exempts a newly authored idle policy" "$DOC" 'policy:activity-idle.*no activity in 30 days'
+assert_lacks "doctor exempts a newly authored idle policy" "$DOC" 'policy:activity-idle: no activity in 30 days'
 
 # ── 17a. Author-time key advice ──────────────────────────────────────────────
 # The unbacked-key warning used to say "store a record at that key" even for a

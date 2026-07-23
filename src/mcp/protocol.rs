@@ -217,6 +217,10 @@ pub enum Command {
     #[serde(rename = "scan_enforcement_events")]
     ScanEnforcementEvents(ScanEnforcementEventsInput),
 
+    /// Time-bounded enforcement scan used by policy activity reporting.
+    #[serde(rename = "scan_enforcement_events_since_ms")]
+    ScanEnforcementEventsSinceMs(ScanEnforcementEventsSinceMsInput),
+
     /// Read a runtime configuration value (e.g. audit.write_durability).
     /// Pure read — no audit, no side effects.
     #[serde(rename = "config_get")]
@@ -392,6 +396,19 @@ pub struct ScanEnforcementEventsInput {
     pub since_seq: u64,
     #[serde(default = "default_until_seq")]
     pub until_seq: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanEnforcementEventsSinceMsInput {
+    #[serde(default)]
+    pub since_ms: u64,
+    #[serde(default = "default_until_ms")]
+    pub until_ms: u64,
+}
+
+fn default_until_ms() -> u64 {
+    u64::MAX
 }
 
 fn default_until_seq() -> u64 {
@@ -820,6 +837,7 @@ impl Command {
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
             Self::MemQuery(_) => "mem_query",
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
+            Self::ScanEnforcementEventsSinceMs(_) => "scan_enforcement_events_since_ms",
             Self::ConfigGet(_) => "config_get",
             Self::ConfigSet(_) => "config_set",
             Self::SandboxAudit(_) => "sandbox_audit",
@@ -880,6 +898,7 @@ impl Command {
             | Self::Metrics
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
+            | Self::ScanEnforcementEventsSinceMs(_)
             | Self::SessionFlush
             | Self::SessionHarvest
             | Self::SessionClearConsults
@@ -1011,6 +1030,11 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "type": "scan_enforcement_events",
             "since_seq": args.get("since_seq").and_then(|v| v.as_u64()).unwrap_or(0),
             "until_seq": args.get("until_seq").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+        }),
+        "scan_enforcement_events_since_ms" => json!({
+            "type": "scan_enforcement_events_since_ms",
+            "since_ms": args.get("since_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            "until_ms": args.get("until_ms").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
         }),
         // Side-effecting reads — pure read shape on the wire, sessions-tree
         // side effects (consultation receipt, audit) live entirely on the

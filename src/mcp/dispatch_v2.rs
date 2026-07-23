@@ -1408,6 +1408,10 @@ fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             "scan_enforcement_events".into(),
             json!({ "since_seq": i.since_seq, "until_seq": i.until_seq }),
         ),
+        Command::ScanEnforcementEventsSinceMs(i) => (
+            "scan_enforcement_events_since_ms".into(),
+            json!({ "since_ms": i.since_ms, "until_ms": i.until_ms }),
+        ),
 
         // B. Reads with side effects — handled natively, not via v1 bridge.
         Command::MemGet(_) | Command::MemBootstrap(_) => {
