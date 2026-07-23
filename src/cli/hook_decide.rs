@@ -259,10 +259,12 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // canonicalize error, target outside the repo, identical key) leaves the
     // lexical-only decision untouched. Perf: one extra realpath + one daemon
     // round-trip, and only on the non-deny path, so the common case is zero-cost.
+    // Resolved once and shared by both gates below. A gate that knows about
+    // symlinks alongside one that does not is the defect; which glob missed is
+    // only the symptom. `canonical_rel_path` returns None for a non-symlink.
+    let canon_rel = canonical_rel_path(&raw_path, &cwd, repo_root.as_deref(), &rel_path);
     if !matches!(adapter.decision, Decision::Deny { .. }) {
-        if let Some(canon_rel) =
-            canonical_rel_path(&raw_path, &cwd, repo_root.as_deref(), &rel_path)
-        {
+        if let Some(canon_rel) = canon_rel.as_deref() {
             let canon_key = format!("file:{canon_rel}");
             if let Some(canon_eval) = match daemon_result(
                 &mati_root,
@@ -280,19 +282,18 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                     if d.is_none() {
                         // Escalate-only path: the lexical decision stands, but
                         // record the gap — the real target went ungated.
-                        log_fail_open(&canon_rel, "hook_evaluate returned error (canonical)");
+                        log_fail_open(canon_rel, "hook_evaluate returned error (canonical)");
                     }
                     d
                 }
                 _ => None,
             } {
-                let mut canon_adapter =
-                    process_eval_response(args.variant, &canon_rel, &canon_eval);
+                let mut canon_adapter = process_eval_response(args.variant, canon_rel, &canon_eval);
                 // Mandate the symlink's real target too (parity with the gotcha WI-20 close).
                 apply_consult_mandate(
                     &mut canon_adapter,
                     args.variant,
-                    &canon_rel,
+                    canon_rel,
                     consulted_flag(&canon_eval, include_recent),
                     consult_globs.as_ref(),
                 );
@@ -387,19 +388,30 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         HookVariant::ClaudePreBash | HookVariant::ClaudePreEdit
     ) && !matches!(adapter.decision, Decision::Deny { .. })
     {
-        let policy_action = match args.variant {
-            HookVariant::ClaudePreBash => bash_action.as_ref().cloned(),
-            HookVariant::ClaudePreEdit => Some(decide::normalize_action(None, Some(&rel_path))),
-            _ => None,
+        // An edit is gated on its path, so it must be gated on the path the
+        // write actually lands on: editing a symlink to a .sql file writes
+        // through to the .sql file. A bash command has no such second identity.
+        let policy_actions: Vec<decide::Action> = match args.variant {
+            HookVariant::ClaudePreBash => bash_action.as_ref().cloned().into_iter().collect(),
+            HookVariant::ClaudePreEdit => std::iter::once(rel_path.as_str())
+                .chain(canon_rel.as_deref())
+                .map(|path| decide::normalize_action(None, Some(path)))
+                .collect(),
+            _ => Vec::new(),
         };
         let governed_tool = if args.variant == HookVariant::ClaudePreEdit {
             "path"
         } else {
             "db_client"
         };
-        if let Some(action) = policy_action.as_ref() {
-            // Edits already make one hook_evaluate round-trip. A future
-            // optimization could piggyback policy verdicts onto that response.
+        for action in &policy_actions {
+            // Escalate-only: stop at the first deny, and never lower an
+            // existing decision. Edits already make one hook_evaluate round
+            // trip; a future optimization could piggyback policy verdicts onto
+            // that response.
+            if matches!(adapter.decision, Decision::Deny { .. }) {
+                break;
+            }
             if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
                 Some(&mati_root),
                 action,
@@ -1108,9 +1120,9 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         .filter(|s| !s.is_empty());
     // Enterprise consult-mandate globs — parity with the single-path flow.
     let consult_globs = consult_globset();
-    // (deny key, deny reason). The reason matters for policy denies, whose key
-    // is the policy rather than something the agent can consult.
-    let mut denied: Vec<(String, String)> = Vec::new();
+    // (deny key, deny reason, origin). The origin selects the message shape: a
+    // policy deny's key is the policy, not something the agent can consult.
+    let mut denied: Vec<(String, String, decide::DenyOrigin)> = Vec::new();
     let mut events: Vec<HookEvent> = Vec::new();
     for raw in &raw_paths {
         let rel_path = decide::normalize_path(raw, repo_root_str);
@@ -1148,20 +1160,23 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
             consulted_flag(&eval_data, true),
             consult_globs.as_ref(),
         );
+        // Resolve the symlink target ONCE, before any gate runs. Both the
+        // gotcha gate and the policy gate need it: one gate knowing about
+        // symlinks while its sibling does not was the actual defect, and a
+        // path policy that misses a symlinked target is only the symptom.
+        // `canonical_rel_path` returns None for a non-symlink, so the common
+        // case costs nothing.
+        let canon_rel = canonical_rel_path(raw, &cwd, repo_root.as_deref(), &rel_path);
+
         // Codex apply_patch has the exact target path, so apply the same
-        // target_path_glob policy gate used by Claude edits. Keep the
-        // existing gotcha decision authoritative and merge policy outcomes
-        // escalate-only, matching the single-file path below.
-        //
-        // KNOWN GAP: this gate sees only the LEXICAL path. The canonical
-        // re-evaluation below covers the gotcha gate but not `target_path_glob`,
-        // so a patch targeting an in-repo symlink writes through to the real
-        // target without the path policy firing. Pre-existing on the Claude edit
-        // path too, and deliberately not fixed here. It is more surprising on
-        // this path, since CLAUDE.md advertises apply_patch as the one immune to
-        // the wrapper/quoting bypass precisely because it parses exact paths.
-        if !matches!(adapter.decision, Decision::Deny { .. }) {
-            let action = decide::normalize_action(None, Some(&rel_path));
+        // target_path_glob policy gate used by Claude edits, over the lexical
+        // key and the canonical one. Escalate-only: the loop stops at the first
+        // deny and a non-deny outcome never lowers an existing decision.
+        for policy_path in std::iter::once(rel_path.as_str()).chain(canon_rel.as_deref()) {
+            if matches!(adapter.decision, Decision::Deny { .. }) {
+                break;
+            }
+            let action = decide::normalize_action(None, Some(policy_path));
             if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
                 Some(&mati_root),
                 &action,
@@ -1181,8 +1196,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         // canonical result never downgrades the lexical decision, and
         // `canonical_rel_path` returns None (zero cost) for non-symlinks.
         if !matches!(adapter.decision, Decision::Deny { .. }) {
-            if let Some(canon_rel) = canonical_rel_path(raw, &cwd, repo_root.as_deref(), &rel_path)
-            {
+            if let Some(canon_rel) = canon_rel.as_deref() {
                 let canon_key = format!("file:{canon_rel}");
                 if let Some(canon_eval) = match daemon_result(
                     &mati_root,
@@ -1195,7 +1209,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                         let d = daemon_data(&resp);
                         if d.is_none() {
                             log_fail_open(
-                                &canon_rel,
+                                canon_rel,
                                 "hook_evaluate returned error (canonical)",
                             );
                         }
@@ -1204,11 +1218,11 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                     _ => None,
                 } {
                     let mut canon_adapter =
-                        process_eval_response(variant, &canon_rel, &canon_eval);
+                        process_eval_response(variant, canon_rel, &canon_eval);
                     apply_consult_mandate(
                         &mut canon_adapter,
                         variant,
-                        &canon_rel,
+                        canon_rel,
                         consulted_flag(&canon_eval, true),
                         consult_globs.as_ref(),
                     );
@@ -1223,9 +1237,10 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         if let Decision::Deny {
             file_key: denied_key,
             reason,
+            origin,
         } = &adapter.decision
         {
-            denied.push((denied_key.clone(), reason.clone()));
+            denied.push((denied_key.clone(), reason.clone(), *origin));
         }
         // Unconditionally: a non-denying policy still produces events. A shadow
         // observation and a satisfied block's receipt must both be recorded, or
@@ -1252,10 +1267,10 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     // are reported rather than one shadowing the other.
     let (policy_denies, file_denies): (Vec<_>, Vec<_>) = denied
         .iter()
-        .partition(|(key, _)| key.starts_with("policy:"));
+        .partition(|(_, _, origin)| matches!(origin, decide::DenyOrigin::Policy));
     let mut lines: Vec<String> = policy_denies
         .iter()
-        .map(|(_, reason)| reason.clone())
+        .map(|(_, reason, _)| reason.clone())
         .collect();
     if file_denies.len() == 1 {
         lines.push(format!(
@@ -1267,7 +1282,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
             "mati: consult these files before editing — call mem_get for each: {}",
             file_denies
                 .iter()
-                .map(|(key, _)| key.as_str())
+                .map(|(key, _, _)| key.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -1663,11 +1678,12 @@ fn apply_consult_mandate(
             "[mati] Org policy requires consulting {rel_path} before access — \
              call mem_get(\"{file_key}\") first."
         ),
+        origin: decide::DenyOrigin::ConsultMandate,
     };
     let events = platform_events(
         variant,
         &decision,
-        vec![HookEvent::FloorConsultBlocked { key: file_key }],
+        vec![decide::DenyOrigin::ConsultMandate.deny_event(file_key)],
     );
     let (stdout, stderr, exit_code) = format_decision(variant, &decision, rel_path);
     *adapter = AdapterResult {
@@ -1827,17 +1843,22 @@ fn format_decision(
             _ => (String::new(), String::new(), 0),
         },
         HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => match decision {
-            Decision::Deny { file_key, reason } => {
+            Decision::Deny {
+                file_key,
+                reason,
+                origin,
+            } => {
                 // A policy deny keys on the policy, which is not a consultable
                 // record: its `reason` names the key that actually clears it.
-                // Printing file_key here would tell the agent to mem_get the
+                // Printing file_key there would tell the agent to mem_get the
                 // policy itself, minting a receipt that never matches
-                // requires.key, so the deny could not be cleared by following
-                // its own instruction.
-                let stderr = if file_key.starts_with("policy:") {
-                    reason.clone()
-                } else {
-                    format!("mati: call mem_get(\"{file_key}\") first")
+                // requires.key. Matched exhaustively so a new origin has to
+                // choose a shape rather than inherit one.
+                let stderr = match origin {
+                    decide::DenyOrigin::Policy => reason.clone(),
+                    decide::DenyOrigin::Gotcha | decide::DenyOrigin::ConsultMandate => {
+                        format!("mati: call mem_get(\"{file_key}\") first")
+                    }
                 };
                 (String::new(), stderr, 2)
             }
@@ -2179,6 +2200,7 @@ mod tests {
         let decision = Decision::Deny {
             file_key: "file:src/main.rs".into(),
             reason: "test".into(),
+            origin: decide::DenyOrigin::Gotcha,
         };
         let result = platform_events(HookVariant::CodexPreBash, &decision, events);
         assert_eq!(result.len(), 1);
@@ -2265,6 +2287,7 @@ mod tests {
         let decision = Decision::Deny {
             file_key: "file:src/main.rs".into(),
             reason: "test".into(),
+            origin: decide::DenyOrigin::Gotcha,
         };
         let result = platform_events(HookVariant::ClaudePreBash, &decision, events);
         assert_eq!(result.len(), 1);
@@ -2708,6 +2731,7 @@ mod tests {
         let deny = Decision::Deny {
             file_key: "policy:prod-query".into(),
             reason: "mati: policy policy:prod-query blocked this action. Consult first: mem_get(\"schema:orders\")".into(),
+            origin: decide::DenyOrigin::Policy,
         };
         let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &deny, "<policy>");
         assert!(stdout.contains(r#""permissionDecision":"deny""#));
@@ -2795,6 +2819,7 @@ mod tests {
             Decision::Deny {
                 file_key: "policy:prod-query".into(),
                 reason: "policy denied".into(),
+                origin: decide::DenyOrigin::Policy,
             },
             vec![HookEvent::PolicyConsultBlocked {
                 key: "policy:prod-query".into(),
@@ -2824,6 +2849,7 @@ mod tests {
         edit_adapter.decision = Decision::Deny {
             file_key: "file:x.sql".into(),
             reason: "gotcha denied".into(),
+            origin: decide::DenyOrigin::Gotcha,
         };
         merge_policy_result(
             &mut edit_adapter,
@@ -3410,6 +3436,7 @@ mod tests {
             decision: Decision::Deny {
                 file_key: "file:phi/x.rs".to_string(),
                 reason: "gotcha-deny".to_string(),
+                origin: decide::DenyOrigin::Gotcha,
             },
         };
         apply_consult_mandate(
