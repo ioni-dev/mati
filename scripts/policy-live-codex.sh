@@ -9,12 +9,17 @@ if [ $# -gt 0 ]; then DEST="$1"; else DEST="$TMPBASE/mati-policy-live-codex"; fi
 MATI="$REPO_ROOT/target/debug/mati"
 cargo build --quiet --bin mati || exit 1
 [ -x "$MATI" ] || { echo "binary not found at $MATI" >&2; exit 1; }
+# The store must live beside the fixture, not in the project: removing the
+# project otherwise leaves policies/receipts behind and breaks reproducibility.
 MATI_HOME="$DEST/.mati-home"; export MATI_HOME
 if [ -d "$DEST" ]; then ( cd "$DEST" && "$MATI" daemon stop >/dev/null 2>&1 ); fi
 rm -rf "$DEST"; mkdir -p "$DEST/migrations" "$DEST/vault" "$DEST/bin"; cd "$DEST" || exit 1
 echo "select 1;" > migrations/prod.sql; echo "fixture" > main.rs
 echo "api_key = REDACTED" > vault/keys.txt; ln -s vault/keys.txt governed.txt
+echo "probe" > probe.txt
 
+# A successful stub is required: a missing client makes introspection fail and
+# correctly refuse to mint. This stub never connects to a real database.
 cat > bin/psql <<'SH'
 #!/usr/bin/env bash
 QUERY=""
@@ -24,36 +29,18 @@ exit 0
 SH
 chmod +x bin/psql
 
-# Codex has no safe transcript_path equivalent. Capture every raw payload first.
-mkdir -p .codex/hooks
-cat > .codex/hooks/pre-apply-patch.sh <<'SH'
-#!/usr/bin/env bash
-set -uo pipefail
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-PAYLOAD="$(cat)"; printf '%s\n' "$PAYLOAD" >> "$MATI_HOME/codex-pre-apply-patch-payloads.jsonl"
-command -v mati >/dev/null 2>&1 || exit 0
-out="$(printf '%s' "$PAYLOAD" | mati hook-decide codex-pre-apply-patch 2>&1)"; rc=$?
-if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '^mati:'; then printf '%s\n' "$out" >&2; exit 2; fi
-exit 0
-SH
-cat > .codex/hooks/post-bash.sh <<'SH'
-#!/usr/bin/env bash
-set -uo pipefail
-HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-PAYLOAD="$(cat)"; printf '%s\n' "$PAYLOAD" >> "$MATI_HOME/codex-post-bash-payloads.jsonl"
-command -v mati >/dev/null 2>&1 || exit 0
-printf '%s' "$PAYLOAD" | exec mati hook-decide codex-post-bash
-SH
-chmod +x .codex/hooks/pre-apply-patch.sh .codex/hooks/post-bash.sh
-
 "$MATI" init --codex >/dev/null || exit 1
-# init owns the generated wrappers, so install the unconditional capture
-# adapters after it has finished writing them.
+# init owns the generated wrappers, so install the capture adapters after it
+# finishes writing them. Codex has no safe transcript_path equivalent: every
+# line is captured, and step 0 creates the first lines through real tools.
 cat > .codex/hooks/pre-apply-patch.sh <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-PAYLOAD="$(cat)"; printf '%s\n' "$PAYLOAD" >> "$MATI_HOME/codex-pre-apply-patch-payloads.jsonl"
+PAYLOAD="$(cat)"
+if [ -n "${MATI_HOME:-}" ]; then
+  printf '%s\n' "$PAYLOAD" >> "$MATI_HOME/codex-pre-apply-patch-payloads.jsonl"
+fi
 command -v mati >/dev/null 2>&1 || exit 0
 out="$(printf '%s' "$PAYLOAD" | mati hook-decide codex-pre-apply-patch 2>&1)"; rc=$?
 if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '^mati:'; then printf '%s\n' "$out" >&2; exit 2; fi
@@ -63,7 +50,10 @@ cat > .codex/hooks/post-bash.sh <<'SH'
 #!/usr/bin/env bash
 set -uo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-PAYLOAD="$(cat)"; printf '%s\n' "$PAYLOAD" >> "$MATI_HOME/codex-post-bash-payloads.jsonl"
+PAYLOAD="$(cat)"
+if [ -n "${MATI_HOME:-}" ]; then
+  printf '%s\n' "$PAYLOAD" >> "$MATI_HOME/codex-post-bash-payloads.jsonl"
+fi
 command -v mati >/dev/null 2>&1 || exit 0
 printf '%s' "$PAYLOAD" | exec mati hook-decide codex-post-bash
 SH
@@ -71,10 +61,12 @@ chmod +x .codex/hooks/pre-apply-patch.sh .codex/hooks/post-bash.sh
 for f in .codex/hooks.json .codex/config.toml .codex/hooks/session-start.sh .codex/hooks/user-prompt-submit.sh .codex/hooks/pre-bash.sh .codex/hooks/pre-apply-patch.sh .codex/hooks/post-bash.sh .codex/hooks/stop.sh; do
   [ -f "$f" ] || { echo "fixture is not wired: $f missing" >&2; exit 1; }
 done
-rg -q '"Bash"|"apply_patch"' .codex/hooks.json || { echo "Codex matchers missing" >&2; exit 1; }
-rg -q 'mcp_servers\.mati|\[mcp_servers\.mati\]' .codex/config.toml || { echo "mati MCP server missing" >&2; exit 1; }
+grep -Eq '"Bash"|"apply_patch"' .codex/hooks.json || { echo "Codex matchers missing" >&2; exit 1; }
+grep -Eq 'mcp_servers\.mati|\[mcp_servers\.mati\]' .codex/config.toml || { echo "mati MCP server missing" >&2; exit 1; }
 
-# daemon start is foreground; warm it through a hook and poll its socket.
+# `mati daemon start` is foreground, so warm the daemon through a hook and poll
+# its socket before writing records. The direct CLI call is intentional: it
+# starts the daemon without fabricating a Codex hook payload in either capture.
 printf '%s' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"psql -h db.warmup.internal -c \"select 1\""}}' | "$MATI" hook-decide codex-pre-bash >/dev/null 2>&1
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] && break; sleep 1; done
 [ -n "$(find "$MATI_HOME" -name mati.sock 2>/dev/null | head -1)" ] || { echo "daemon socket never appeared; Unix sockets may be blocked" >&2; exit 1; }
@@ -82,6 +74,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n "$(find "$MATI_HOME" -name mati.sock 2>/d
 write_record() {
   printf '%s\n%s\n%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mem_set\",\"arguments\":{\"action\":\"write\",\"key\":\"$1\",\"value\":\"$1\",\"category\":\"Decision\",\"payload\":{\"summary\":\"$2\",\"rationale\":\"Pinned so this live policy has substantive knowledge behind its receipt.\"},\"tags\":[\"schema\"],\"priority\":\"High\"}}}" | "$MATI" serve >/dev/null 2>&1
 }
+# Each policy gets a distinct requires key. Sharing one key would let an early
+# mem_get satisfy later policies and make a false pass look like enforcement.
 write_record decision:codex-migrations "migrations/prod.sql is production-controlled and requires review."
 write_record decision:codex-vault "vault/keys.txt holds credentials; rotate through the secrets pipeline."
 write_record decision:codex-shadow "migrations require review before production changes."
@@ -89,7 +83,9 @@ write_record decision:codex-inventory "inventory(sku text pk, warehouse text, on
 
 add_policy() {
   "$MATI" policy add "$1" --name "$1" --rule "$2" --reason "$3" --mode block --severity high --trigger "$4" --requires "$5" >/dev/null
-  [ "$6" = enable ] && "$MATI" policy enable "$1" >/dev/null
+  if [ "$6" = enable ]; then
+    "$MATI" policy enable "$1" >/dev/null
+  fi
 }
 add_policy codex-apply-block "Consult decision:codex-migrations before editing migrations." "Migrations drift because production changes independently." '{"tool":"path","target_path_glob":"migrations/**"}' '{"key":"decision:codex-migrations","via":["mem_get"],"freshness":{"ttl_secs":900}}' enable
 add_policy codex-symlink "Consult decision:codex-vault before editing vault files." "Credentials rotate out of band because the secrets pipeline owns them." '{"tool":"path","target_path_glob":"vault/**"}' '{"key":"decision:codex-vault","via":["mem_get"],"freshness":{"ttl_secs":900}}' enable
@@ -109,15 +105,27 @@ Open a REAL Codex session; both exports are mandatory:
   export PATH=$DEST/bin:$REPO_ROOT/target/debug:\$PATH
   codex
 
+Hooks run `command -v mati` and silently exit if it is absent; without both
+exports, the session can use a different store or fail open without mati.
+
 PROMPT TO PASTE:
 You run every step yourself using Bash, apply_patch, and mati MCP tools.
 Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
-0. FIRST report exact captured key sets:
+0. FIRST, perform exactly these two ungoverned probes, then report the captures:
+   use apply_patch to change probe.txt from "probe" to "probe2". It matches no
+   policy glob, so it must succeed. Then use Bash to run: printf 'codex-live\n'
+   These real tool calls create the first capture lines; the fixture never
+   seeds them. Now report exact key sets:
    jq -c 'keys|sort' "\$MATI_HOME/codex-pre-apply-patch-payloads.jsonl" | tail -1
    jq -c 'keys|sort' "\$MATI_HOME/codex-post-bash-payloads.jsonl" | tail -1
    jq -c '.["tool_input"]|keys|sort' "\$MATI_HOME/codex-pre-apply-patch-payloads.jsonl" | tail -1
    jq -c '.["tool_input"]|keys|sort' "\$MATI_HOME/codex-post-bash-payloads.jsonl" | tail -1
-   Report each verbatim; if absent/empty, STOP. Observed shapes outrank expectations.
+   There must now be one line in each file. Report each top-level key set and
+   tool_input key set verbatim. If either is absent/empty, STOP. If the shape
+   differs from smoke-policy.sh's pre_apply_patch() payload, that finding
+   outranks every later result: without tool_input.command,
+   decide::extract_apply_patch_files returns nothing, run_apply_patch fails
+   open, and every patch is ungated.
 1. CANARY apply_patch migrations/prod.sql "select 1;" -> "select 2;". Expect exit 2, mati: naming decision:codex-migrations, and content unchanged; otherwise STOP.
 2. mem_get decision:codex-migrations. If Codex cannot call mati MCP mem_get, STOP: deny is unsatisfiable.
 3. Retry patch; expect success and "select 2;".
@@ -125,8 +133,13 @@ Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
 5. mem_get decision:codex-vault; retry; confirm ROTATED.
 6. apply_patch migrations/prod.sql -> "select 3;"; expect no deny from shadow; run mati policy observations codex-shadow --json and report "would": "block".
 7. apply_patch main.rs "fixture" -> "control"; expect success and content changed (positive control).
-8. Bash psql -h db.prod-codex.internal -c "SELECT * FROM inventory". Expect exit 2, mati: decision:codex-inventory; stub must not run.
-9. Bash psql -h db.prod-codex.internal -c "\d inventory"; report status. Expect 0/no block; introspection must mint.
-10. In a new message rerun step 8. Expect allowed/stub output, proving introspect-then-query.
+8. With Bash, record the current value of mati show
+   analytics:miss_$(date -u +%F), then use apply_patch to add unindexed.txt
+   with content "miss". It matches no policy and has no record. Read the same
+   daily aggregate again. Expect its count to increase, proving
+   codex-pre-apply-patch records a Miss for an allowed unrecorded target.
+9. Bash psql -h db.prod-codex.internal -c "SELECT * FROM inventory". Expect exit 2, mati: decision:codex-inventory; stub must not run.
+10. Bash psql -h db.prod-codex.internal -c "\d inventory"; report status. Expect 0/no block; introspection must mint.
+11. In a new message rerun step 9. Expect allowed/stub output, proving introspect-then-query.
 Report a table and state whether payload shapes, apply_patch deny, symlink deny, shadow observation, mem_get, fileless deny, and minting pair were live-validated.
 EOF
