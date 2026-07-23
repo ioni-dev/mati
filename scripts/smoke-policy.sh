@@ -37,6 +37,16 @@ assert_has()   { if printf '%s' "$2" | grep -q -- "$3"; then pass "$1"; else fai
 assert_lacks() { if printf '%s' "$2" | grep -q -- "$3"; then fail "$1" "$2"; else pass "$1"; fi; }
 denied()       { printf '%s' "$1" | grep -q 'permissionDecision":"deny"'; }
 
+# Preflight: named dependencies. Later steps use jq (JSON assertions) and
+# python3 (nanosecond latency timing); a missing one otherwise fails mid-run
+# with a confusing error. Fail fast with the actual reason instead.
+for dep in jq python3; do
+  command -v "$dep" >/dev/null 2>&1 || {
+    echo "smoke-policy: required dependency '$dep' not found on PATH" >&2
+    exit 1
+  }
+done
+
 # ── Payload builders ─────────────────────────────────────────────────────────
 # agent_id is optional; when present the receipt is actor-scoped.
 pre_bash() {
@@ -457,7 +467,13 @@ STEER_END_NS="$(python3 -c 'import time; print(time.time_ns())')"
 STEER_LATENCY_MS=$(( (STEER_END_NS - STEER_START_NS) / 1000000 ))
 assert_has   "steer injects the rule"   "$OUT" 'Review the action.'
 assert_lacks "steer never decides"      "$OUT" 'permissionDecision'
-pass "steer hook latency measured: ${STEER_LATENCY_MS}ms"
+# A real bound, not a bare measurement: the hook must finish well under Claude
+# Code's 3000ms SIGKILL / the 2500ms internal deadline, or enforcement is at risk.
+if [ "$STEER_LATENCY_MS" -lt 2500 ]; then
+  pass "steer hook latency ${STEER_LATENCY_MS}ms is under the 2500ms deadline"
+else
+  fail "steer hook latency exceeds the 2500ms deadline" "${STEER_LATENCY_MS}ms"
+fi
 
 # Activity is aggregated across enforcement, shadow, and steer traces. JSON is
 # the machine-readable contract; jq parses it and the state/count assertions
