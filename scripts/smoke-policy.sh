@@ -453,8 +453,16 @@ OUT="$(mati_p policy add file-read-scoped --name file-read-scoped --rule "Consul
   --trigger '{"tool":"file_read","target_path_glob":"**/*.sql"}' \
   --requires '{"key":"decision:file-read-scoped","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
 assert_has "file_read policy warns about missing adapter" "$OUT" 'has no enforcing adapter'
+assert_lacks "file_read policy is a recognized category" "$OUT" 'not a recognized governable category'
 mati_p policy enable file-read-scoped >/dev/null
 assert_has "doctor repeats file_read adapter warning" "$(mati_p doctor)" 'file_read.*no enforcing adapter'
+assert_lacks "doctor does not call file_read unknown" "$(mati_p doctor)" 'file_read.*not a recognized governable category'
+OUT="$(mati_p policy add unknown-tool --name unknown-tool --rule "Consult first." \
+  --reason "Context changes because the repository evolves." --mode block \
+  --trigger '{"tool":"http"}' \
+  --requires '{"key":"decision:unknown-tool","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
+assert_has "unknown tool warns about matcher category" "$OUT" 'not a recognized governable category'
+assert_lacks "unknown tool does not call it adapter scope" "$OUT" 'no enforcing adapter'
 
 # ── 16. Dry-run and stage parsing ────────────────────────────────────────────
 step "16. Dry-run and stage parsing"

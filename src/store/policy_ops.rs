@@ -87,10 +87,11 @@ pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<S
         .trigger
         .tool
         .as_deref()
-        .filter(|tool| !ADAPTER_POLICY_TOOLS.contains(tool))
+        .filter(|tool| !crate::hooks::decide::is_known_action_tool(tool))
     {
         warnings.push(format!(
-            "warning: policy trigger tool '{tool}' is not a recognized governable category (known: db_client, file_read, path); this policy will never match until such a category is supported."
+            "warning: policy trigger tool '{tool}' is not a recognized governable category (known: {}); this policy will never match until such a category is supported.",
+            crate::hooks::decide::KNOWN_ACTION_TOOLS.join(", ")
         ));
     }
     if policy

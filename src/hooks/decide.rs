@@ -275,13 +275,18 @@ const ACTION_TOOL_DB_CLIENT: &str = "db_client";
 const ACTION_TOOL_FILE_READ: &str = "file_read";
 const ACTION_TOOL_PATH: &str = "path";
 
+/// The action categories emitted by the normalizer and accepted by policy
+/// matching. Keep this as the single source for author-time recognition too.
+pub const KNOWN_ACTION_TOOLS: &[&str] = &[
+    ACTION_TOOL_DB_CLIENT,
+    ACTION_TOOL_FILE_READ,
+    ACTION_TOOL_PATH,
+];
+
 /// Return whether a policy trigger names an action category emitted by the
 /// normalizer. Unknown values remain valid authoring data, but cannot match.
 pub fn is_known_action_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        ACTION_TOOL_DB_CLIENT | ACTION_TOOL_FILE_READ | ACTION_TOOL_PATH
-    )
+    KNOWN_ACTION_TOOLS.contains(&tool)
 }
 
 /// Returns true if `trimmed` starts with `word` followed by whitespace
