@@ -556,10 +556,18 @@ The path policy gate is symlink-safe. The canonical target is resolved once per 
 
 The policy adapter scope is intentional: `db_client` actions on the Bash path
 and `path` actions on Claude edits and Codex `apply_patch` are policy-governed.
+`db_client` policies enforce on both Claude and Codex Bash, for fileless and
+file-bearing commands; schema introspection is exempt so it can steer toward
+the consultation that remedies the policy. Codex denies exit 2 with a `mati:`
+instruction on stderr, while Claude denies remain `permissionDecision` JSON.
 `file_read` actions from `cat`/`grep`-class Bash commands are not policy-
 governed; the gotcha read gate already owns that surface under P1. A stored
 `file_read` policy therefore receives an author/doctor warning instead of
 silently pretending it can enforce.
+
+This closes the Codex asymmetry in which `codex-post-bash` could mint
+db-introspection receipts for a `db_client` policy category that
+`codex-pre-bash` did not previously enforce.
 
 ### 10a.2 Matching
 

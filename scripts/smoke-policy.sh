@@ -287,6 +287,33 @@ BASH_RC=$?
 [ "$BASH_RC" -eq 0 ] && pass "unrelated Bash path exits 0" || fail "unrelated Bash path exits 0" "rc=$BASH_RC"
 assert_lacks "unrelated Bash path is not denied" "$OUT" 'permissionDecision":"deny"'
 
+# ── 8b. Codex Bash db_client parity ─────────────────────────────────────────
+# Codex policy denies are exit 2 with a remedy on stderr, while a steer is
+# silent. Keep explicit status checks so empty output cannot mask a skipped hook.
+step "8b. Codex Bash db_client policies"
+add_block_policy codex-bash '*prod-codex-smoke*' 'schema:codex-bash' 'mem_get'
+mati_p policy enable codex-bash >/dev/null
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.prod-codex-smoke.internal -c \\\"select 1\\\"\"')")"
+CODEX_RC=$?
+[ "$CODEX_RC" -eq 2 ] && pass "Codex fileless db command exits 2" || fail "Codex fileless db command exits 2" "rc=$CODEX_RC output=$OUT"
+assert_has "Codex fileless deny names remedy key" "$OUT" 'schema:codex-bash'
+assert_lacks "Codex fileless deny does not name policy key" "$OUT" 'policy:codex-bash'
+
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.prod-codex-smoke.internal -f migrations/prod.sql\"')")"
+CODEX_RC=$?
+[ "$CODEX_RC" -eq 2 ] && pass "Codex file-bearing db command exits 2" || fail "Codex file-bearing db command exits 2" "rc=$CODEX_RC output=$OUT"
+assert_has "Codex file-bearing deny names remedy key" "$OUT" 'schema:codex-bash'
+
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.nonmatching.internal -c \\\"select 1\\\"\"')")"
+CODEX_RC=$?
+[ "$CODEX_RC" -eq 0 ] && pass "Codex non-matching host exits 0" || fail "Codex non-matching host exits 0" "rc=$CODEX_RC output=$OUT"
+assert_lacks "Codex non-matching host is not denied" "$OUT" 'mati:'
+
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '\"psql -h db.prod-codex-smoke.internal -c \\\"\\\\d inventory\\\"\"')")"
+CODEX_RC=$?
+[ "$CODEX_RC" -eq 0 ] && pass "Codex introspection exits 0" || fail "Codex introspection exits 0" "rc=$CODEX_RC output=$OUT"
+[ -z "$OUT" ] && pass "Codex introspection steer is silent" || fail "Codex introspection steer is silent" "output=$OUT"
+
 # Widening event collection to the allow path made apply_patch a miss-recording
 # surface: a touched file with no record now increments the daily aggregate,
 # where before this adapter fired nothing unless it denied.
