@@ -68,8 +68,9 @@ impl StoreProxy {
         // read back as null). So bring the daemon up and proxy to it. This is
         // the same recovery path the hook and `mati serve` code already take;
         // `ensure_daemon` handles NotRunning, StaleSocket, and Unresponsive
-        // (300ms re-probe, then kill the stale PID and respawn) uniformly, so a
-        // wedged daemon self-heals rather than forcing a manual `mati daemon stop`.
+        // (300ms re-probe, then kill the stale PID and respawn) uniformly. When
+        // it still cannot confirm a reachable daemon, the invariant guard below
+        // takes over rather than falling straight to a direct open.
         if mati_core::mcp::daemon_lifecycle::ensure_daemon(&root).await {
             return Ok(Self {
                 inner: ProxyInner::Socket { root },

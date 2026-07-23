@@ -224,6 +224,27 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
     })
 }
 
+/// Build the mati MCP server registration (`{command, args[, env]}`).
+///
+/// When MATI_HOME is set in the environment at init time, capture it into the
+/// server's `env` so the MCP server opens the same store the hooks do. Claude
+/// Code normally inherits the session env (unlike Codex, which spawns MCP
+/// servers with a clean environment), so for Claude this is belt-and-suspenders
+/// — but it makes a non-default MATI_HOME robust regardless of how the client
+/// launches the server, instead of silently reading ~/.mati while the hooks use
+/// MATI_HOME. A default install (no MATI_HOME) writes no env and stays on
+/// ~/.mati.
+fn mati_server_json() -> Value {
+    let mut server = serde_json::json!({
+        "command": "mati",
+        "args": ["serve"],
+    });
+    if let Some(mati_home) = std::env::var_os("MATI_HOME") {
+        server["env"] = serde_json::json!({ "MATI_HOME": mati_home.to_string_lossy() });
+    }
+    server
+}
+
 /// Merge mati's hook and MCP server registration into an existing settings.json.
 ///
 /// If the file doesn't exist, writes the full settings. If it exists,
@@ -231,8 +252,9 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
 /// back — preserving all other user settings.
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
-    // Use bare command name — portable across machines.
-    mati_settings["mcpServers"]["mati"]["command"] = serde_json::Value::String("mati".to_owned());
+    // Bare command name (portable across machines) plus a captured MATI_HOME
+    // env when set — see `mati_server_json`.
+    mati_settings["mcpServers"]["mati"] = mati_server_json();
 
     let merged = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
@@ -329,10 +351,7 @@ fn entry_contains_owned_command(entry: &Value, owned_commands: &[String]) -> boo
 /// across machines. Claude Code sets cwd to the project root when spawning
 /// MCP servers, so `mati serve` detects the project automatically.
 fn write_mcp_json(path: &Path, _project_root: &Path) -> Result<()> {
-    let mati_server = serde_json::json!({
-        "command": "mati",
-        "args": ["serve"]
-    });
+    let mati_server = mati_server_json();
 
     let mut mcp_config = if path.exists() {
         let existing_str = std::fs::read_to_string(path)?;
