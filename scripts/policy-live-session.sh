@@ -61,9 +61,24 @@ echo "select 1;" > migrations/prod.sql
 mkdir -p bin
 cat > bin/psql <<'SH'
 #!/usr/bin/env bash
-# fixture stub: never connects, always succeeds
-echo "Table \"public.inventory\""
-echo " sku | warehouse | on_hand | reserved"
+# fixture stub: never connects, always succeeds. Echo the query back so two
+# different commands produce different output; a canned response makes a payload
+# log useless for telling one command's result from another.
+QUERY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--command) QUERY="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$QUERY" in
+  *'\d'*|*DESCRIBE*|*describe*)
+    echo "Table \"public.inventory\""
+    echo " sku | warehouse | on_hand | reserved" ;;
+  "") echo "psql (fixture stub)" ;;
+  *)  echo "query: $QUERY"
+      echo " sku-001 | west | 42 | 3" ;;
+esac
 exit 0
 SH
 chmod +x bin/psql
