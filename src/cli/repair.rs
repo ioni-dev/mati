@@ -47,7 +47,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     // Repair (write) requires exclusive direct store access.
     let root = mati_root_for(&cwd)?;
     match daemon_result(&root, "ping", serde_json::json!({})).await {
-        DaemonResult::Ok(_) | DaemonResult::Unresponsive => {
+        DaemonResult::Ok(_) | DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
             anyhow::bail!(
                 "mati repair requires direct store access, which is unavailable while the daemon is running.\n\
                  Run `mati daemon stop` and retry."

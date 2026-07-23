@@ -355,6 +355,14 @@ async fn async_main(cli: Cli) -> Result<()> {
                     // Daemon alive but not responding — don't try to open store.
                     anyhow::bail!("mati daemon unresponsive");
                 }
+                cli::daemon::DaemonResult::PermissionDenied => {
+                    // Socket connect denied — sandbox blocking Unix sockets.
+                    // Don't try to open the store; it would fail the same way.
+                    anyhow::bail!(
+                        "cannot connect to the mati daemon socket: permission denied \
+                         (a sandbox may be blocking Unix domain sockets)"
+                    );
+                }
                 cli::daemon::DaemonResult::NotRunning | cli::daemon::DaemonResult::StaleSocket => {
                     if daemon_only {
                         // Hook scripts use --daemon-only to check daemon liveness

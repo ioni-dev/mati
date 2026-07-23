@@ -100,7 +100,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
                     );
                 }
             }
-            DaemonResult::Unresponsive => {
+            DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
                 if claude_installed || codex_installed {
                     println!("  Hook scaffold updated successfully.");
                     println!();

@@ -531,7 +531,7 @@ async fn check_daemon(mati_root_opt: Option<PathBuf>) -> CheckItem {
             "stale socket detected",
             Some("run: mati daemon stop  to clean up".to_string()),
         ),
-        DaemonResult::Unresponsive => CheckItem::fail(
+        DaemonResult::Unresponsive | DaemonResult::PermissionDenied => CheckItem::fail(
             "daemon",
             "daemon unresponsive — may hold store lock",
             Some("fix: mati daemon stop && mati daemon start".to_string()),

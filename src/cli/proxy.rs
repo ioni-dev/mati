@@ -42,10 +42,26 @@ impl StoreProxy {
 
         // Fast path: a daemon already answers. All access proxies to it — the
         // daemon is the sole owner of the store's exclusive lock.
-        if let DaemonResult::Ok(_) = daemon_result(&root, "ping", json!({})).await {
-            return Ok(Self {
-                inner: ProxyInner::Socket { root },
-            });
+        match daemon_result(&root, "ping", json!({})).await {
+            DaemonResult::Ok(_) => {
+                return Ok(Self {
+                    inner: ProxyInner::Socket { root },
+                });
+            }
+            // The socket exists but this process is forbidden from connecting —
+            // a sandbox is blocking Unix sockets. Spawning, retrying, and direct
+            // store access would all fail the same way, so fail fast with an
+            // accurate, actionable message instead of "daemon busy, retry".
+            DaemonResult::PermissionDenied => {
+                anyhow::bail!(
+                    "cannot connect to the mati daemon socket: permission denied.\n\
+                     This command appears to be running inside a sandbox that blocks Unix \
+                     domain sockets (for example, an AI agent's shell tool). The daemon, hooks, \
+                     and the mati MCP tools are unaffected — use the MCP tools for reads, or run \
+                     this command in an unsandboxed shell."
+                );
+            }
+            _ => {}
         }
 
         // No daemon answered. Refuse to create state on first run: only
@@ -1112,6 +1128,9 @@ fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
         DaemonResult::NotRunning => "daemon stopped",
         DaemonResult::StaleSocket => "daemon socket became stale",
         DaemonResult::Unresponsive => "daemon did not respond",
+        DaemonResult::PermissionDenied => {
+            "connection was denied (a sandbox may be blocking the daemon socket)"
+        }
         DaemonResult::Ok(_) => unreachable!("socket_read_error only handles non-ok daemon results"),
     };
     anyhow::anyhow!(
