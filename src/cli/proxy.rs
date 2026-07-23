@@ -1300,7 +1300,9 @@ mod tests {
         };
 
         // The raw edge key must be visible through the RepairReader.
-        let keys = RepairReader::scan_keys(&proxy, "graph:edge:").await.unwrap();
+        let keys = RepairReader::scan_keys(&proxy, "graph:edge:")
+            .await
+            .unwrap();
         assert_eq!(keys, vec![edge.to_key()]);
 
         // And the doctor-level check must see a consistent store.
