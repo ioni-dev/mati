@@ -142,7 +142,13 @@ cat > .claude/hooks/post-bash.sh <<'SH'
 #!/usr/bin/env bash
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
 PAYLOAD="$(cat)"
-printf '%s\n' "$PAYLOAD" >> "${MATI_HOME:-/tmp}/post-bash-payloads.jsonl"
+# Only record payloads from a real session. transcript_path is present on every
+# Claude Code payload and absent from a hand-authored one, so a local probe
+# piping into this script cannot pollute the capture and be mistaken for
+# evidence later.
+case "$PAYLOAD" in
+  *'"transcript_path"'*) printf '%s\n' "$PAYLOAD" >> "${MATI_HOME:-/tmp}/post-bash-payloads.jsonl" ;;
+esac
 command -v mati >/dev/null 2>&1 || exit 0
 printf '%s' "$PAYLOAD" | exec mati hook-decide claude-post-bash
 SH
