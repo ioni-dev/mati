@@ -554,6 +554,8 @@ Three paths enforce policies: a bash command with no file (`psql -c "..."`), a b
 
 The permission invariant from section 10.2 holds throughout. Neither the bash gate nor the edit gate ever emits `permissionDecision: "allow"`, because both tools are permission-required and a force-allow would suppress the user's prompt for everything mati does not deny.
 
+That invariant is also what bounds a steer on an edit. Because a steer sets no decision, the rule text arrives alongside the tool's normal permission flow, so it reaches the developer before the write only when that flow actually prompts. Under an auto-approving permission mode the edit lands first and the rule reads as an after-the-fact note. A steer is guidance, not a gate, and on edits it is only a pre-write signal when edits are not auto-approved. A rule that must stop a write has to be `block`.
+
 A file-bearing database command runs through the gotcha file gate and the policy engine both. The two decisions merge escalate-only: a policy can raise an outcome to deny or add context, and can never lower a gotcha deny. When the file gate already denies, the policy round trip is skipped, since deny is already the maximum.
 
 Every policy failure path allows. An unreachable daemon, an error response, or an unparseable payload leaves the pre-existing decision untouched and never denies. A policy must not block because mati itself failed (P9).
