@@ -183,6 +183,14 @@ pub enum DaemonResult {
     /// **Not safe** to use `Store::open` — daemon likely holds the SurrealKV lock.
     /// Callers must degrade gracefully (P9) rather than attempt direct store access.
     Unresponsive,
+    /// Connecting to the daemon socket was denied (`EACCES`/`EPERM`). The socket
+    /// exists, so a daemon made it, but this process is forbidden from connecting
+    /// — typically because it runs inside a sandbox (e.g. an AI agent's shell
+    /// tool under macOS Seatbelt) that blocks Unix-domain-socket connects.
+    /// **Not safe** to use `Store::open`, and retrying will not help: it is a
+    /// permission wall, not a busy daemon. Hooks and the MCP server run outside
+    /// the sandbox and are unaffected.
+    PermissionDenied,
 }
 
 // ── Connection timeout ───────────────────────────────────────────────────────
@@ -929,6 +937,13 @@ async fn send_v2_raw(
     let stream = match UnixStream::connect(&sock_path).await {
         Ok(s) => s,
         Err(e) => {
+            // Denied by permission (EACCES/EPERM): the socket exists but this
+            // process cannot connect — almost always a sandbox blocking UDS.
+            // Distinct from NotRunning so callers can give an accurate,
+            // non-retryable error instead of "daemon busy".
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                return DaemonResult::PermissionDenied;
+            }
             let is_refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
             if is_refused {
                 use mati_core::mcp::metadata::{self as meta, StaleCheckResult};
@@ -1034,7 +1049,7 @@ pub async fn daemon_get(root: &Path, key: &str) -> Option<String> {
             }
         }
         DaemonResult::NotRunning | DaemonResult::StaleSocket => None,
-        DaemonResult::Unresponsive => None,
+        DaemonResult::Unresponsive | DaemonResult::PermissionDenied => None,
     }
 }
 
@@ -1271,7 +1286,9 @@ async fn classify_daemon(root: &Path, force: bool) -> DaemonState {
             if has_sock {
                 match daemon_result(root, "ping", serde_json::json!({})).await {
                     DaemonResult::Ok(_) => DaemonState::LiveOwnerDaemon { pid },
-                    DaemonResult::Unresponsive => DaemonState::Unresponsive { pid },
+                    DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
+                        DaemonState::Unresponsive { pid }
+                    }
                     DaemonResult::NotRunning | DaemonResult::StaleSocket => DaemonState::StaleFiles,
                 }
             } else {
@@ -1303,7 +1320,7 @@ async fn classify_daemon(root: &Path, force: bool) -> DaemonState {
                     }
                 }
                 DaemonResult::StaleSocket | DaemonResult::NotRunning => DaemonState::StaleFiles,
-                DaemonResult::Unresponsive => {
+                DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
                     let pid = mati_core::mcp::metadata::read_metadata(root).map(|m| m.pid);
                     match pid {
                         Some(pid) => DaemonState::Unresponsive { pid },

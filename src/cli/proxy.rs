@@ -39,39 +39,115 @@ impl StoreProxy {
     /// `mati ls`, etc. from non-mati paths.
     pub async fn open(cwd: &Path) -> Result<Self> {
         let root = mati_root_for(cwd)?;
+
+        // Fast path: a daemon already answers. All access proxies to it — the
+        // daemon is the sole owner of the store's exclusive lock.
         match daemon_result(&root, "ping", json!({})).await {
-            DaemonResult::Ok(_) => Ok(Self {
-                inner: ProxyInner::Socket { root },
-            }),
-            DaemonResult::NotRunning | DaemonResult::StaleSocket => {
-                if !root.join("knowledge.db").exists() {
-                    anyhow::bail!(
-                        "no mati store initialized for this directory.\n\
-                         Run `mati init` to set up, or `cd` into a project that has been initialized."
-                    );
-                }
-                // Lock-contention retry: when N parallel CLI invocations hit
-                // direct-store mode (no daemon), only one can acquire the
-                // SurrealKV flock at a time. Without this loop, 19 of 20
-                // parallel invocations failed with "LOCK is already locked"
-                // — surfaced by the smoke test step 131 parallel-write probe.
-                // Backoff totals ~620ms (20+40+80+160+320), enough for a
-                // burst of ~20 writes to serialize without spurious failures.
-                // This is purely a safety net; the daemon path remains the
-                // recommended production configuration.
-                let store = open_store_with_lock_retry(cwd).await?;
-                Ok(Self {
-                    inner: ProxyInner::Direct(store),
-                })
+            DaemonResult::Ok(_) => {
+                return Ok(Self {
+                    inner: ProxyInner::Socket { root },
+                });
             }
-            DaemonResult::Unresponsive => {
+            // The socket exists but this process is forbidden from connecting —
+            // a sandbox is blocking Unix sockets. Spawning, retrying, and direct
+            // store access would all fail the same way, so fail fast with an
+            // accurate, actionable message instead of "daemon busy, retry".
+            DaemonResult::PermissionDenied => {
                 anyhow::bail!(
-                    "mati daemon is running but not responding.\n\
-                     Cannot open the store while the daemon holds the lock.\n\
-                     Try: mati daemon stop"
-                )
+                    "cannot connect to the mati daemon socket: permission denied.\n\
+                     This command appears to be running inside a sandbox that blocks Unix \
+                     domain sockets (for example, an AI agent's shell tool). The daemon, hooks, \
+                     and the mati MCP tools are unaffected — use the MCP tools for reads, or run \
+                     this command in an unsandboxed shell."
+                );
+            }
+            _ => {}
+        }
+
+        // No daemon answered. Refuse to create state on first run: only
+        // `mati init` and `mati daemon start` scaffold a store, and both bypass
+        // this proxy by calling `Store::open` directly. A missing store from
+        // `mati status`/`mati ls` in a non-mati path is a clean error rather
+        // than a silently-scattered empty `~/.mati/<slug>/` directory.
+        if !root.join("knowledge.db").exists() {
+            anyhow::bail!(
+                "no mati store initialized for this directory.\n\
+                 Run `mati init` to set up, or `cd` into a project that has been initialized."
+            );
+        }
+
+        // A store exists but no daemon answered. The daemon is the SOLE owner of
+        // the store's exclusive SurrealKV lock. Opening the store directly here
+        // races any daemon that is starting, restarting, or briefly unreachable
+        // — the failure mode where concurrent CLI + MCP `serve` + hook access
+        // lock-contended (already-locked errors, timeouts, and lost writes that
+        // read back as null). So bring the daemon up and proxy to it. This is
+        // the same recovery path the hook and `mati serve` code already take;
+        // `ensure_daemon` handles NotRunning, StaleSocket, and Unresponsive
+        // (300ms re-probe, then kill the stale PID and respawn) uniformly. When
+        // it still cannot confirm a reachable daemon, the invariant guard below
+        // takes over rather than falling straight to a direct open.
+        if mati_core::mcp::daemon_lifecycle::ensure_daemon(&root).await {
+            return Ok(Self {
+                inner: ProxyInner::Socket { root },
+            });
+        }
+
+        // ensure_daemon could not confirm a reachable daemon. Enforce the
+        // sole-owner invariant before the direct-open last resort: if a daemon
+        // PROCESS is alive, it holds the store's exclusive lock. Opening the
+        // store directly here cannot succeed (the lock is held) and would
+        // violate the invariant that nothing touches the store behind a live
+        // daemon. Under a busy session — e.g. Codex spawning a fresh `mati
+        // serve` per MCP call, each running ensure_daemon — a healthy daemon can
+        // briefly miss a ping; retry it rather than fall to a doomed direct open
+        // that surfaces a raw "LOCK is already locked".
+        if Self::daemon_pid_alive(&root) {
+            for backoff_ms in [50u64, 100, 200, 400, 800] {
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                if let DaemonResult::Ok(_) = daemon_result(&root, "ping", json!({})).await {
+                    return Ok(Self {
+                        inner: ProxyInner::Socket { root },
+                    });
+                }
+                // The daemon exited mid-retry — no longer the lock holder, so
+                // the direct-open fallback below is now legitimate.
+                if !Self::daemon_pid_alive(&root) {
+                    break;
+                }
+            }
+            if Self::daemon_pid_alive(&root) {
+                // A live daemon that will not answer is wedged, not gone.
+                // ensure_daemon already attempted a kill + respawn; surface a
+                // retryable error instead of grabbing the lock behind it.
+                anyhow::bail!(
+                    "mati daemon is running but not responding after retries.\n\
+                     It may be busy — retry the command. If it persists: mati daemon stop"
+                );
             }
         }
+
+        // Genuinely no daemon: spawn is disabled (`cfg!(test)` or
+        // `MATI_DISABLE_AUTO_SPAWN=1`) or the spawn failed AND no daemon process
+        // is alive. Direct open is the only option — serialize concurrent direct
+        // opens with a bounded lock-retry. Without this loop, 19 of 20 parallel
+        // invocations failed with "LOCK is already locked" (smoke step 131's
+        // parallel-write probe); backoff totals ~620ms (20+40+80+160+320).
+        let store = open_store_with_lock_retry(cwd).await?;
+        Ok(Self {
+            inner: ProxyInner::Direct(store),
+        })
+    }
+
+    /// True when a daemon process for this store is alive (holds the lock).
+    ///
+    /// Reads the published daemon metadata and checks the PID with `kill(pid,0)`.
+    /// Used to enforce the sole-owner invariant: never open the store directly
+    /// while a daemon owns its exclusive lock.
+    fn daemon_pid_alive(root: &Path) -> bool {
+        mati_core::mcp::metadata::read_metadata(root)
+            .map(|m| mati_core::mcp::metadata::is_pid_alive(m.pid))
+            .unwrap_or(false)
     }
 
     /// Returns a reference to the direct store if in direct mode, or `None` if
@@ -1052,6 +1128,9 @@ fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
         DaemonResult::NotRunning => "daemon stopped",
         DaemonResult::StaleSocket => "daemon socket became stale",
         DaemonResult::Unresponsive => "daemon did not respond",
+        DaemonResult::PermissionDenied => {
+            "connection was denied (a sandbox may be blocking the daemon socket)"
+        }
         DaemonResult::Ok(_) => unreachable!("socket_read_error only handles non-ok daemon results"),
     };
     anyhow::anyhow!(
@@ -1221,7 +1300,9 @@ mod tests {
         };
 
         // The raw edge key must be visible through the RepairReader.
-        let keys = RepairReader::scan_keys(&proxy, "graph:edge:").await.unwrap();
+        let keys = RepairReader::scan_keys(&proxy, "graph:edge:")
+            .await
+            .unwrap();
         assert_eq!(keys, vec![edge.to_key()]);
 
         // And the doctor-level check must see a consistent store.

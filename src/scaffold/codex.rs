@@ -482,6 +482,25 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     doc["mcp_servers"]["mati"]["cwd"] = value(canonical.to_string_lossy().as_ref());
 
+    // Codex spawns MCP servers with a clean environment (see the CWD=/ note
+    // above), so a non-default MATI_HOME set at init time is NOT inherited by
+    // `mati serve`. Capture it into the server's env so the MCP server opens the
+    // same store the hooks do. Without this, serve falls back to ~/.mati while
+    // hooks (which inherit the session env) use MATI_HOME, and every mem_get
+    // reads an empty store — the deny it was meant to clear can never satisfy.
+    // Only written when MATI_HOME is actually set, so a default install stays
+    // on ~/.mati; an existing env table's other keys are preserved.
+    if let Some(mati_home) = std::env::var_os("MATI_HOME") {
+        if !doc["mcp_servers"]["mati"]
+            .get("env")
+            .is_some_and(|e| e.is_table())
+        {
+            doc["mcp_servers"]["mati"]["env"] = Item::Table(Table::new());
+        }
+        doc["mcp_servers"]["mati"]["env"]["MATI_HOME"] =
+            value(mati_home.to_string_lossy().as_ref());
+    }
+
     if doc.get("skills").is_none() || !doc["skills"].is_table() {
         doc["skills"] = Item::Table(Table::new());
     }

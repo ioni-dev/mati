@@ -198,6 +198,55 @@ impl LifecycleTail {
     }
 }
 
+/// Outcome of trying to become the process that spawns the daemon.
+enum SpawnLock {
+    /// We hold the exclusive spawn lock. Keep the `File` alive to hold it —
+    /// dropping it releases the `flock` (the lock is tied to the open fd).
+    Acquired(std::fs::File),
+    /// Another process holds the spawn lock and is bringing the daemon up.
+    Contended,
+    /// The lock file could not be used (open/flock failed for a reason other
+    /// than contention). Caller degrades to an unguarded spawn.
+    Unavailable,
+}
+
+/// Try to become the sole spawner via a non-blocking OS advisory lock on
+/// `spawn.lock`.
+///
+/// The `mati.starting` sentinel alone has a check-then-write window: two
+/// callers cold-starting at the same instant (a session's SessionStart hook
+/// and its MCP `serve`, say) both see no sentinel, both spawn a daemon, and the
+/// loser fails the exclusive `Store::open` and wedges — after which a read
+/// routed to the loser comes back null. A `flock` acquired BEFORE the spawn
+/// decision closes that window: exactly one caller spawns, the rest wait for
+/// readiness. Advisory `flock` is released automatically if the holder dies, so
+/// a crashed spawner cannot deadlock the others.
+fn try_acquire_spawn_lock(mati_root: &Path) -> SpawnLock {
+    use std::os::unix::io::AsRawFd;
+    let path = mati_root.join("spawn.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return SpawnLock::Unavailable,
+    };
+    // SAFETY: `file` owns the fd for the duration of the call, and the returned
+    // `File` keeps it open (and the lock held) as long as the caller holds the
+    // guard. `LOCK_NB` makes this non-blocking: contention returns EWOULDBLOCK
+    // rather than parking the thread.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        SpawnLock::Acquired(file)
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+        SpawnLock::Contended
+    } else {
+        SpawnLock::Unavailable
+    }
+}
+
 /// State-aware readiness wait. Tails `lifecycle.log` and applies the
 /// state machine documented at module top.
 ///
@@ -372,6 +421,35 @@ pub async fn ensure_daemon(mati_root: &Path) -> bool {
     if cfg!(test) || std::env::var_os("MATI_DISABLE_AUTO_SPAWN").is_some() {
         return false;
     }
+
+    // Phase 2.5: serialize concurrent spawners with an OS advisory lock so a
+    // session's SessionStart hook and its MCP `serve` (both cold-starting the
+    // daemon at once) don't each spawn a competitor that loses the store-lock
+    // race and wedges — the failure that made a first `mem_get` come back null.
+    // Held across Phase 3+4 and released when `_spawn_guard` drops.
+    let _spawn_guard = match try_acquire_spawn_lock(mati_root) {
+        SpawnLock::Acquired(file) => {
+            // A peer may have finished bringing the daemon up in the moment
+            // between our probe and winning the lock. Re-probe before spawning.
+            if let ProxyDaemonResult::Ok(_) =
+                proxy_daemon_result_no_spawn(mati_root, "ping", &serde_json::json!({})).await
+            {
+                return true;
+            }
+            Some(file)
+        }
+        SpawnLock::Contended => {
+            // A peer holds the spawn lock and is bringing the daemon up. Wait
+            // for readiness instead of racing it to the store lock.
+            return matches!(
+                wait_for_ready(mati_root, READINESS_HARD_CAP, READINESS_WEDGE_THRESHOLD).await,
+                ReadinessOutcome::Ready
+            );
+        }
+        // Lock unusable (e.g. read-only fs): degrade to the previous unguarded
+        // spawn rather than refuse to start.
+        SpawnLock::Unavailable => None,
+    };
 
     // Phase 3: spawn daemon.
     let exe = match std::env::current_exe() {
