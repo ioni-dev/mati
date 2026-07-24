@@ -17,7 +17,9 @@ use serde::Serialize;
 
 use crate::store::enforcement::{EnforcementEventScan, EnforcementEventType, SubjectKind};
 use crate::store::record::{PolicyRecord, PolicyStage, Record, RecordLifecycle};
-use crate::store::session::{DailyAgg, PolicyShadowAgg, ShadowObservationAgg, MAX_SHADOW_OBSERVATIONS};
+use crate::store::session::{
+    DailyAgg, PolicyShadowAgg, ShadowObservationAgg, MAX_SHADOW_OBSERVATIONS,
+};
 
 /// Enforcement events are retained for a bounded window; activity claims older
 /// than this cannot be made.
@@ -389,10 +391,18 @@ mod tests {
         let old_ms = (now - 10 * 86_400) * 1000;
         let scan = scan_of(vec![deny_event("policy:p", old_ms, 1)], Some(old_ms));
         // Shadow record predating the window: assemble MUST drop it.
-        let stale = shadow_record("analytics:policy_shadow_old", now - 10 * 86_400, "policy:p", 5);
+        let stale = shadow_record(
+            "analytics:policy_shadow_old",
+            now - 10 * 86_400,
+            "policy:p",
+            5,
+        );
         let report = assemble_activity_report(now, days, &[policy], &scan, &[stale], &[], None);
         let p = &report.policies[0];
-        assert_eq!(p.count, 1, "enforcement counted despite predating the window");
+        assert_eq!(
+            p.count, 1,
+            "enforcement counted despite predating the window"
+        );
         assert!(matches!(p.state, ActivityState::Fired));
         assert_eq!(
             p.sources,
@@ -404,7 +414,10 @@ mod tests {
     #[test]
     fn measurable_state_is_a_pure_function_of_trigger_tool() {
         let now = 2_000_000_000u64;
-        let scan = scan_of(vec![deny_event("policy:bash", now * 1000, 1)], Some(now * 1000));
+        let scan = scan_of(
+            vec![deny_event("policy:bash", now * 1000, 1)],
+            Some(now * 1000),
+        );
         let policies = vec![
             policy_record("policy:bash", Some("bash"), PolicyStage::Enforce),
             policy_record("policy:db", Some("db_client"), PolicyStage::Enforce),
@@ -430,7 +443,12 @@ mod tests {
     #[test]
     fn stale_shadow_shows_in_observations_but_not_in_activity() {
         let now = 3_000_000_000u64;
-        let stale = shadow_record("analytics:policy_shadow_old", now - 60 * 86_400, "policy:p", 3);
+        let stale = shadow_record(
+            "analytics:policy_shadow_old",
+            now - 60 * 86_400,
+            "policy:p",
+            3,
+        );
         // observations: no window filter — the count survives.
         let obs = assemble_shadow_observations(std::slice::from_ref(&stale), None);
         assert_eq!(obs["policy:p"].count, 3);
@@ -438,7 +456,11 @@ mod tests {
         let report = assemble_activity_report(
             now,
             30,
-            &[policy_record("policy:p", Some("path"), PolicyStage::Enforce)],
+            &[policy_record(
+                "policy:p",
+                Some("path"),
+                PolicyStage::Enforce,
+            )],
             &scan_of(vec![], None),
             &[stale],
             &[],

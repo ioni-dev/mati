@@ -1630,7 +1630,10 @@ mod tests {
         let value = crate::mcp::handlers::handle_mem_query(g.store(), &g, &input)
             .await
             .unwrap();
-        assert_eq!(value["window_days"], 30, "since:0 must fall back to default");
+        assert_eq!(
+            value["window_days"], 30,
+            "since:0 must fall back to default"
+        );
     }
 
     #[tokio::test]
@@ -1673,8 +1676,17 @@ mod tests {
         let graph = Graph::load(store).await.unwrap();
         let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
-        let out = call_mem_query(&graph_arc, "", crate::mcp::protocol::QueryMode::Analytics, 20).await;
-        assert_eq!(out, "[]", "empty analytics query must return nothing, got: {out}");
+        let out = call_mem_query(
+            &graph_arc,
+            "",
+            crate::mcp::protocol::QueryMode::Analytics,
+            20,
+        )
+        .await;
+        assert_eq!(
+            out, "[]",
+            "empty analytics query must return nothing, got: {out}"
+        );
     }
 
     #[tokio::test]
