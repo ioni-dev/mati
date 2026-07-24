@@ -82,7 +82,7 @@ async fn run_internal(root: &Path, json: bool) -> Result<()> {
             eprintln!("daemon is not running — start it with `mati daemon start`");
             std::process::exit(1);
         }
-        DaemonResult::Unresponsive => {
+        DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
             eprintln!("daemon socket exists but is unresponsive");
             eprintln!("  hint: mati daemon stop && mati daemon start");
             std::process::exit(1);
@@ -297,7 +297,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
             detail: "ok".into(),
             fix: None,
         }),
-        DaemonResult::Unresponsive => checks.push(CheckResult {
+        DaemonResult::Unresponsive | DaemonResult::PermissionDenied => checks.push(CheckResult {
             section: "daemon",
             name: "ping",
             status: Status::Fail,
