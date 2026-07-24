@@ -602,7 +602,7 @@ daemon  match the Action, check receipts, return verdicts (no decision)
 hook    compute the decision, emit output, fire events
 ```
 
-Shadow observations are bounded daily aggregates in the eventual `analytics:` namespace, capped per policy so a noisy one cannot crowd out a quiet one. Each entry records the policy key, the normalized action, a timestamp, and whether the policy would have blocked or steered. `mati policy observations` reads them back and prints the full count next to the retained sample, so a truncated sample is visible rather than silent. They stay out of the hash-chained enforcement log: a shadow policy denied nothing, so a `Deny` event would falsify the audit chain mati-cloud reads.
+Shadow observations are bounded daily aggregates in the eventual `analytics:` namespace, capped per policy so a noisy one cannot crowd out a quiet one. Each entry records the policy key, the normalized action, a timestamp, and whether the policy would have blocked or steered. `mati policy observations` reads them back and prints the full count next to the retained sample, so a truncated sample is visible rather than silent. The same read is exposed over MCP as `mem_query mode="policy_observations"` (with `policy_activity` and `analytics` alongside), because an agent's sandboxed shell cannot reach the daemon socket the CLI proxies through, while `mati serve` runs outside that sandbox. They stay out of the hash-chained enforcement log: a shadow policy denied nothing, so a `Deny` event would falsify the audit chain mati-cloud reads.
 
 A policy is observed only where `enforce` would have acted on it. A shadow block holding a valid receipt records nothing, because at `enforce` it would have allowed. Neither does one exempted as schema introspection (section 10a.5). Without that, a policy would look more disruptive than promoting it would actually be.
 
@@ -664,7 +664,7 @@ Exactly four tools are exposed. This is a hard constraint from P3. Every tool de
 | --------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `mem_bootstrap` | Returns a `ContextPacket` for the current session. Token-budgeted to 2,000 tokens.                                 |
 | `mem_get`       | Looks up a single record by key. Returns the full `Record` JSON. Mints a consultation receipt.                     |
-| `mem_query`     | Text search, using BM25 through tantivy, plus optional graph traversal. Supports `mode="text"` and `mode="graph"`. |
+| `mem_query`     | Read tool. Knowledge modes: `text` (BM25 through tantivy), `tag`, `graph` (1-hop traversal); `semantic` is gated behind `--features semantic`. Enforcement-telemetry modes: `policy_observations`, `policy_activity`, `analytics`. All pure reads, no receipt. |
 | `mem_set`       | Writes a record. Triggers quality recomputation, graph edge updates, and search index update.                      |
 
 `mati serve` runs the rmcp stdio loop and proxies every tool call to `mati daemon` over a Unix domain socket. The daemon handles the call and returns the result.
@@ -831,7 +831,7 @@ It is rebuilt from the `knowledge.db` key scan in three cases:
 - Startup when the `search_stale` marker is present
 - Startup when the `search_sync_pending` marker is present, for crash recovery
 
-`mem_query mode="text"` runs a BM25 query and returns ranked records. `mem_query mode="graph"` traverses the petgraph edges from a starting node.
+`mem_query mode="text"` runs a BM25 query and returns ranked records; `mode="tag"` filters by tag; `mode="graph"` traverses the petgraph edges from a starting node; `mode="semantic"` is gated behind `--features semantic`. The enforcement-telemetry modes (`policy_observations`, `policy_activity`, `analytics`) do not touch the index — they scan the store directly and are covered with the policy engine in section 10a.
 
 ---
 
