@@ -102,6 +102,178 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+// ── affected_files normalization ─────────────────────────────────────────────
+
+/// Normalize one `affected_files` entry to the repo-relative form the read
+/// gate keys on.
+///
+/// `GotchaRecord.affected_files` is joined to `file:<rel_path>` records by
+/// exact string equality. The read gate normalizes its side
+/// ([`crate::hooks::decide::normalize_path`], called from `cli::hook_decide`);
+/// the write paths used to store whatever the user or agent typed. A gotcha
+/// added as `./src/foo.rs` or as an absolute path therefore never matched
+/// `file:src/foo.rs` and was silently inert — no denial, no warning.
+///
+/// This is deliberately the *same* function the gate calls, with the repo root
+/// resolved the *same* way (see [`discover_repo_root`]). Agreeing with the read
+/// side is the whole point; a second, "smarter" normalizer here would
+/// reintroduce the mismatch from the other direction.
+///
+/// Globs survive unchanged (`src/payments/**`, minted by the CODEOWNERS
+/// candidates in `analysis::onboarding`): `normalize_path` only ever drops
+/// empty, `.` and `..` components, and `*` is an ordinary component.
+pub fn normalize_affected_file(path: &str, repo_root: Option<&str>) -> String {
+    // Match the producers of `file:*` keys — `analysis::walker::make_rel_path`
+    // and `analysis::git::normalize_git_path` both rewrite `\` to `/`
+    // unconditionally, so a backslash can never appear in a `file:*` key and an
+    // entry carrying one could not match regardless of platform.
+    crate::hooks::decide::normalize_path(&path.replace('\\', "/"), repo_root)
+}
+
+/// Normalize a whole `affected_files` list against an explicit repo root.
+///
+/// Purely lexical — no filesystem access. Empty entries are dropped and
+/// duplicates collapsed (two spellings of one path, `./src/a.rs` and
+/// `src/a.rs`, normalize to the same string). First-seen order is preserved.
+pub fn normalize_affected_files_with_root(
+    files: &[String],
+    repo_root: Option<&str>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(files.len());
+    for raw in files {
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = normalize_affected_file(raw, repo_root);
+        if normalized.is_empty() || out.contains(&normalized) {
+            continue;
+        }
+        out.push(normalized);
+    }
+    out
+}
+
+/// [`normalize_affected_files_with_root`] with the repo root discovered from
+/// the process cwd, and absolute entries resolved through symlinks first.
+///
+/// Both only happen when at least one entry is absolute, so the common
+/// all-relative case does no filesystem work at all.
+///
+/// Symlink resolution is what makes the prefix strip inside `normalize_path`
+/// actually match. The gate never needs it — the agent hands it a path already
+/// resolved against its own cwd — but a human running
+/// `mati gotcha add /tmp/repo/src/a.rs` on macOS supplies `/tmp/...` while the
+/// git workdir is `/private/tmp/...`, and the entry would otherwise become the
+/// nonsense relative key `tmp/repo/src/a.rs`. Resolving an already-canonical
+/// path is a no-op, so this only ever removes a mismatch.
+pub fn normalize_affected_files(files: &[String]) -> Vec<String> {
+    if !files.iter().any(|f| looks_absolute(f)) {
+        return normalize_affected_files_with_root(files, None);
+    }
+
+    let repo_root = discover_repo_root();
+    let resolved: Vec<String> = files
+        .iter()
+        .map(|f| match looks_absolute(f) {
+            true => resolve_lenient(f).unwrap_or_else(|| f.clone()),
+            false => f.clone(),
+        })
+        .collect();
+    normalize_affected_files_with_root(&resolved, repo_root.as_deref())
+}
+
+/// Resolve the repo root the way the read gate does.
+///
+/// Mirrors `cli::hook_decide::discover_repo_root`: `git2::Repository::discover`
+/// on the process cwd, with git2's occasional trailing separator stripped so
+/// the prefix match inside `normalize_path` lines up. Every process that writes
+/// gotchas (CLI, `mati daemon`, `mati serve`) runs with its cwd inside the
+/// repo, so cwd discovery gets the same answer the gate gets.
+///
+/// The result is then resolved through symlinks to match the entries, which
+/// [`normalize_affected_files`] resolves for the same reason. On Unix this is
+/// already a no-op — `current_dir()` returns a resolved path, so git2's workdir
+/// is resolved too — but relying on that is not worth the silent failure mode.
+///
+/// `None` (bare repo, not a repo, non-UTF-8 root) leaves absolute entries to
+/// `normalize_path`'s repo-root-less branch, which is exactly what the gate
+/// falls back to as well.
+fn discover_repo_root() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let repo = git2::Repository::discover(&cwd).ok()?;
+    let root = repo.workdir()?.to_str()?.trim_end_matches('/');
+    Some(resolve_lenient(root).unwrap_or_else(|| root.to_string()))
+}
+
+/// Whether an entry needs a repo root to normalize. Checked before paying for
+/// git discovery or symlink resolution.
+fn looks_absolute(path: &str) -> bool {
+    path.starts_with('/') || std::path::Path::new(path).is_absolute()
+}
+
+/// Resolve `path` through symlinks, tolerating a leaf that does not exist yet.
+///
+/// Mirrors `cli::sandbox::canonicalize_lenient` (which the read gate's
+/// symlink-bypass fallback uses): canonicalize; on failure, canonicalize the
+/// nearest existing ancestor and re-append the tail. `None` when nothing on the
+/// path resolves or the result is not UTF-8, in which case the caller falls
+/// back to the entry as typed.
+fn resolve_lenient(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c.to_str().map(str::to_string);
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path;
+    loop {
+        let parent = cur.parent()?;
+        tail.push(cur.file_name()?.to_os_string());
+        if let Ok(cp) = std::fs::canonicalize(parent) {
+            let mut out = cp;
+            for comp in tail.iter().rev() {
+                out.push(comp);
+            }
+            return out.to_str().map(str::to_string);
+        }
+        cur = parent;
+    }
+}
+
+/// Return a copy of `record` with the `affected_files` field of its gotcha
+/// payload replaced by `files`, or `None` when the payload already carries
+/// exactly those paths.
+///
+/// Patches the JSON object in place rather than re-serializing a
+/// [`crate::store::GotchaRecord`]: the MCP `mem_set` path merges caller-supplied
+/// payloads, so a gotcha payload may legitimately carry fields beyond the
+/// struct and re-serializing would drop them. Returning `None` keeps the
+/// already-normalized path clone-free.
+fn with_normalized_affected_files(record: &Record, files: &[String]) -> Option<Record> {
+    let current = record.payload.as_ref()?.get("affected_files")?.as_array()?;
+    let unchanged = current.len() == files.len()
+        && current
+            .iter()
+            .zip(files)
+            .all(|(v, f)| v.as_str() == Some(f.as_str()));
+    if unchanged {
+        return None;
+    }
+
+    let mut out = record.clone();
+    let obj = out.payload.as_mut()?.as_object_mut()?;
+    obj.insert(
+        "affected_files".into(),
+        serde_json::Value::Array(
+            files
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    Some(out)
+}
+
 // ── Key collision ────────────────────────────────────────────────────────────
 
 /// Bail if `key` already exists as an active record.
@@ -127,6 +299,12 @@ pub async fn ensure_gotcha_key_available(store: &Store, key: &str) -> Result<()>
 ///
 /// Steps 1–2 fail hard (the caller sees an error). Steps 3–5 are
 /// best-effort: failures are logged but do not roll back the record write.
+///
+/// `new_files` and the record's payload `affected_files` are normalized first
+/// (see [`normalize_affected_files`]) so the stored paths are the ones the read
+/// gate looks up. `old_files` is deliberately left verbatim: it describes what
+/// the derived indexes actually contain — possibly an unnormalized legacy
+/// spelling — and [`sync_gotcha_file_links`] needs the real key to unlink.
 pub async fn apply_gotcha_write(
     store: &Store,
     record: &Record,
@@ -134,6 +312,9 @@ pub async fn apply_gotcha_write(
     new_files: &[String],
     is_new: bool,
 ) -> Result<()> {
+    let new_files = &normalize_affected_files(new_files);
+    let normalized = with_normalized_affected_files(record, new_files);
+    let record = normalized.as_ref().unwrap_or(record);
     let key = &record.key;
 
     // 1. Collision guard — fail hard
@@ -406,11 +587,20 @@ pub async fn apply_gotcha_tombstone(
 /// so the enforcement audit distinguishes user confirmation from edits.
 /// Used by the CLI `mati gotcha confirm` direct-mode path and by the legacy
 /// socket `gotcha_confirm` command.
+///
+/// Confirming a legacy record written before path normalization existed also
+/// rewrites its `affected_files` into normalized form. The link sync below is
+/// additive (`old` is empty), so a link left behind at the old spelling stays
+/// until `mati repair` — which now reports it as a stale file link and clears
+/// it, per the derived-index model in [`super::repair`].
 pub async fn apply_gotcha_confirm(
     store: &Store,
     record: &Record,
     affected_files: &[String],
 ) -> Result<()> {
+    let affected_files = &normalize_affected_files(affected_files);
+    let normalized = with_normalized_affected_files(record, affected_files);
+    let record = normalized.as_ref().unwrap_or(record);
     let key = &record.key;
 
     // Persist the confirmed record — fail hard.
@@ -1131,6 +1321,182 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        store.close().await.unwrap();
+    }
+
+    // ── affected_files normalization ─────────────────────────────────────
+    //
+    // The write side has to produce exactly the string the read gate looks up
+    // (`hooks::decide::normalize_path`, via `cli::hook_decide`). Anything else
+    // and the `file:<rel_path>` join silently misses and the gotcha never
+    // fires.
+
+    fn norm(files: &[&str], root: Option<&str>) -> Vec<String> {
+        let owned: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+        normalize_affected_files_with_root(&owned, root)
+    }
+
+    #[test]
+    fn normalize_strips_dot_slash_prefix() {
+        assert_eq!(norm(&["./src/foo.rs"], None), vec!["src/foo.rs"]);
+        assert_eq!(norm(&["././src/foo.rs"], None), vec!["src/foo.rs"]);
+        assert_eq!(norm(&["src/./foo.rs"], None), vec!["src/foo.rs"]);
+        assert_eq!(norm(&["src/bar/../foo.rs"], None), vec!["src/foo.rs"]);
+        assert_eq!(norm(&["src//foo.rs"], None), vec!["src/foo.rs"]);
+    }
+
+    #[test]
+    fn normalize_strips_repo_root_from_absolute_path() {
+        assert_eq!(
+            norm(&["/home/dev/repo/src/foo.rs"], Some("/home/dev/repo")),
+            vec!["src/foo.rs"]
+        );
+        // Trailing slash on the entry's root prefix, and a `.` mid-path.
+        assert_eq!(
+            norm(&["/home/dev/repo/./src/foo.rs"], Some("/home/dev/repo")),
+            vec!["src/foo.rs"]
+        );
+    }
+
+    /// `normalize_affected_files` (the filesystem-aware wrapper) has to resolve
+    /// an absolute entry through symlinks before the repo-root strip, or the
+    /// macOS `/tmp` → `/private/tmp` split turns a valid absolute path into the
+    /// nonsense relative key `tmp/.../src/a.rs`. Exercised with a real symlink
+    /// so it fails on any platform where the resolution is skipped.
+    #[test]
+    fn normalize_resolves_symlinked_absolute_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/a.rs"), "fn main() {}\n").unwrap();
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Root canonicalizes to `.../real`; the entry comes in via `.../link`.
+        let root = std::fs::canonicalize(&real).unwrap();
+        let entry = link.join("src/a.rs").to_string_lossy().into_owned();
+        let resolved = resolve_lenient(&entry).expect("symlink must resolve");
+        assert_eq!(
+            normalize_affected_files_with_root(&[resolved], Some(root.to_str().unwrap())),
+            vec!["src/a.rs"]
+        );
+    }
+
+    /// Resolution must not require the file to exist — `mati gotcha add` on a
+    /// path that has not been created yet is a real flow (the create-on-write
+    /// stub in `update_file_gotcha_key` exists for exactly that).
+    #[test]
+    fn resolve_lenient_tolerates_a_missing_leaf() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let missing = dir.path().join("does_not_exist.rs");
+        let resolved = resolve_lenient(missing.to_str().unwrap()).expect("parent resolves");
+        assert_eq!(
+            normalize_affected_files_with_root(&[resolved], Some(root.to_str().unwrap())),
+            vec!["does_not_exist.rs"]
+        );
+    }
+
+    /// Without a repo root there is nothing to strip. The gate behaves the
+    /// same way (`normalize_path(path, None)`), so both sides still agree —
+    /// which is the property that matters, even though neither can produce a
+    /// useful key here.
+    #[test]
+    fn normalize_absolute_path_without_root_matches_read_side() {
+        let expected = crate::hooks::decide::normalize_path("/elsewhere/foo.rs", None);
+        assert_eq!(norm(&["/elsewhere/foo.rs"], None), vec![expected]);
+    }
+
+    /// Globs (`analysis::onboarding`'s CODEOWNERS candidates) must survive
+    /// untouched — `*` is an ordinary path component to `normalize_path`.
+    #[test]
+    fn normalize_preserves_globs() {
+        assert_eq!(norm(&["src/payments/**"], None), vec!["src/payments/**"]);
+        assert_eq!(norm(&["src/*.rs"], None), vec!["src/*.rs"]);
+        assert_eq!(norm(&["**/*.rs"], None), vec!["**/*.rs"]);
+        // A glob still gets the `./` treatment, and nothing else.
+        assert_eq!(norm(&["./src/payments/**"], None), vec!["src/payments/**"]);
+    }
+
+    #[test]
+    fn normalize_is_a_no_op_for_already_normalized_paths() {
+        let files = &["src/a.rs", "src/nested/b.rs", "Cargo.toml"];
+        assert_eq!(norm(files, Some("/home/dev/repo")), files.to_vec());
+    }
+
+    /// Two spellings of one path collapse to a single entry, so the gotcha
+    /// does not end up double-linked to the same file record.
+    #[test]
+    fn normalize_dedupes_and_drops_empties() {
+        assert_eq!(
+            norm(&["./src/a.rs", "src/a.rs", "", "src/b.rs"], None),
+            vec!["src/a.rs", "src/b.rs"]
+        );
+    }
+
+    /// `analysis::walker` and `analysis::git` rewrite `\` to `/` before a
+    /// `file:*` key is ever minted, so an entry carrying a backslash could
+    /// never match. Match the producers.
+    #[test]
+    fn normalize_rewrites_backslashes_like_the_key_producers() {
+        assert_eq!(norm(&["src\\foo.rs"], None), vec!["src/foo.rs"]);
+        assert_eq!(norm(&[".\\src\\foo.rs"], None), vec!["src/foo.rs"]);
+    }
+
+    /// End-to-end: a gotcha written with `./src/a.rs` must link `file:src/a.rs`
+    /// — the key the read gate looks up — and must store the corrected path in
+    /// its own payload, since `mati repair` rebuilds the indexes from there.
+    #[tokio::test]
+    async fn apply_write_normalizes_affected_files_before_linking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("file:src/a.rs", &make_file_record("src/a.rs"))
+            .await
+            .unwrap();
+
+        let record = make_gotcha_record("gotcha:dotslash", &["./src/a.rs"]);
+        apply_gotcha_write(&store, &record, &[], &["./src/a.rs".into()], true)
+            .await
+            .unwrap();
+
+        let a = store.get("file:src/a.rs").await.unwrap().unwrap();
+        assert!(file_gotcha_keys(&a).contains(&"gotcha:dotslash".to_string()));
+        assert!(
+            store.get("file:./src/a.rs").await.unwrap().is_none(),
+            "the raw spelling must not be linked or stubbed"
+        );
+
+        let stored = store.get("gotcha:dotslash").await.unwrap().unwrap();
+        let gotcha = stored.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(gotcha.affected_files, vec!["src/a.rs".to_string()]);
+
+        let edge_keys = store.scan_keys("graph:edge:").await.unwrap();
+        let edge = Edge::new("file:src/a.rs", EdgeKind::HasGotcha, "gotcha:dotslash").to_key();
+        assert!(edge_keys.contains(&edge));
+
+        store.close().await.unwrap();
+    }
+
+    /// An already-correct path must round-trip byte-for-byte: the payload is
+    /// not rewritten and no clone is taken.
+    #[tokio::test]
+    async fn apply_write_leaves_normalized_affected_files_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let record = make_gotcha_record("gotcha:clean", &["src/a.rs", "src/payments/**"]);
+        let files = vec!["src/a.rs".to_string(), "src/payments/**".to_string()];
+        apply_gotcha_write(&store, &record, &[], &files, true)
+            .await
+            .unwrap();
+
+        let stored = store.get("gotcha:clean").await.unwrap().unwrap();
+        let gotcha = stored.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(gotcha.affected_files, files);
 
         store.close().await.unwrap();
     }

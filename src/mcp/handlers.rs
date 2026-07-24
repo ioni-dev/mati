@@ -214,17 +214,26 @@ pub(crate) async fn handle_gotcha_upsert(
         return Err((ErrorCode::ValidationFailed, "rule must not be empty".into()));
     }
 
+    // Normalize `affected_files` to the repo-relative form the read gate keys
+    // on. This handler has its own atomic transaction loop and does NOT go
+    // through `gotcha_ops::apply_gotcha_write`, so the normalization there does
+    // not cover it — same reason the extraction-tracking hook below is
+    // duplicated. Everything downstream uses this list, never `input`'s.
+    let affected_files = crate::store::gotcha_ops::normalize_affected_files(&input.affected_files);
+
     // Read-modify-commit under bounded write-conflict retry. The daemon serves
     // writes concurrently, so a sibling enforcement-event / receipt write can
     // collide with this commit (see `retry_on_write_conflict`).
-    let (record, is_new, old_affected_files) =
-        retry_on_write_conflict(|| upsert_commit_once(store, ctx, request_id, input, now)).await?;
+    let (record, is_new, old_affected_files) = retry_on_write_conflict(|| {
+        upsert_commit_once(store, ctx, request_id, input, &affected_files, now)
+    })
+    .await?;
 
     let quality_val = record.quality.value;
     let tier_label = format!("{:?}", record.quality.tier);
 
     // Best-effort: sync HasGotcha graph edges (cross-tree, outside transaction).
-    sync_has_gotcha_edges(store, key, &old_affected_files, &input.affected_files).await;
+    sync_has_gotcha_edges(store, key, &old_affected_files, &affected_files).await;
 
     // Best-effort: record ControlChanged enforcement event.
     let change_kind = if is_new {
@@ -261,13 +270,9 @@ pub(crate) async fn handle_gotcha_upsert(
     // the hook is duplicated here. Best-effort; failure logs but doesn't
     // propagate (analytics, not correctness).
     if is_new {
-        let _ = crate::store::extraction::write_on_extraction(
-            store,
-            key,
-            &input.tags,
-            &input.affected_files,
-        )
-        .await;
+        let _ =
+            crate::store::extraction::write_on_extraction(store, key, &input.tags, &affected_files)
+                .await;
     }
 
     Ok(serde_json::json!({
@@ -283,11 +288,15 @@ pub(crate) async fn handle_gotcha_upsert(
 /// `retry_on_write_conflict`; re-reads `existing` each call so a retry rebuilds
 /// `is_new` / `old_affected_files` / file-link updates against fresh state.
 /// Returns the committed record plus the post-commit inputs the caller needs.
+///
+/// `affected_files` is the caller's already-normalized list; `input`'s own
+/// `affected_files` must not be used past this point.
 async fn upsert_commit_once(
     store: &Store,
     ctx: &RequestContext,
     request_id: Uuid,
     input: &protocol::GotchaDraftInput,
+    affected_files: &[String],
     now: u64,
 ) -> Result<(Record, bool, Vec<String>), (ErrorCode, String)> {
     let key = &input.key;
@@ -317,7 +326,7 @@ async fn upsert_commit_once(
         rule: input.rule.clone(),
         reason: input.reason.clone(),
         severity: map_severity(&input.severity),
-        affected_files: input.affected_files.clone(),
+        affected_files: affected_files.to_vec(),
         ref_url: input.ref_url.clone(),
         discovered_session: if is_new {
             now
@@ -385,7 +394,7 @@ async fn upsert_commit_once(
 
     // Compute file-link updates for the same transaction.
     let file_link_updates =
-        compute_file_link_updates(store, key, &old_affected_files, &input.affected_files).await;
+        compute_file_link_updates(store, key, &old_affected_files, affected_files).await;
 
     // Build atomic write: gotcha record + file-link updates + audit.
     // Audit is required — fail closed if serialization fails.
@@ -2509,6 +2518,29 @@ async fn apply_mem_set_write(
                     .map(|s| s.to_lowercase())
                 {
                     obj.insert("severity".to_string(), serde_json::Value::String(sev));
+                }
+
+                // Normalize affected_files to the repo-relative form the read
+                // gate keys on. Like `handle_gotcha_upsert`, this path writes
+                // the record itself instead of going through
+                // `gotcha_ops::apply_gotcha_write`, so it needs its own call.
+                // Done before the payload is read back below for link sync and
+                // edge maintenance, so every consumer sees the corrected paths.
+                if let Some(files) = obj.get("affected_files").and_then(|v| v.as_array()) {
+                    let raw: Vec<String> = files
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect();
+                    let normalized = crate::store::gotcha_ops::normalize_affected_files(&raw);
+                    obj.insert(
+                        "affected_files".to_string(),
+                        serde_json::Value::Array(
+                            normalized
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
                 }
             }
         }

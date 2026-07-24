@@ -292,6 +292,19 @@ fn print_drift_summary(report: &RepairReport, use_color: bool) {
         ("", "", "")
     };
 
+    if !report.unnormalized_paths.is_empty() {
+        println!(
+            "  {yellow}Unnormalized paths:{reset}  {white}{}{reset}",
+            report.unnormalized_paths.len()
+        );
+        for entry in report.unnormalized_paths.iter().take(5) {
+            println!("    {entry}", entry = format_drift(entry));
+        }
+        if report.unnormalized_paths.len() > 5 {
+            println!("    ... and {} more", report.unnormalized_paths.len() - 5);
+        }
+    }
+
     if !report.missing_file_links.is_empty() {
         println!(
             "  {yellow}Missing file links:{reset}  {white}{}{reset}",

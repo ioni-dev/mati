@@ -359,20 +359,25 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
                 Ok(report) => {
                     if report.has_drift() {
                         let detail = format!(
-                            "missing_file={}, stale_file={}, missing_edge={}, stale_edge={}",
+                            "missing_file={}, stale_file={}, missing_edge={}, stale_edge={}, unnormalized_path={}",
                             report.missing_file_links.len(),
                             report.stale_file_links.len(),
                             report.missing_edges.len(),
                             report.stale_edges.len(),
+                            report.unnormalized_paths.len(),
                         );
-                        // `mati repair` reconciles derived indexes against
-                        // existing records but cannot CREATE a missing
-                        // file:<path> record — that needs a `mati init`
-                        // re-index. So when the drift includes missing_file
-                        // links, point at init first; otherwise plain repair
-                        // fixes stale links and graph edges.
-                        let fix = if !report.missing_file_links.is_empty() {
-                            "mati init  (re-index missing files), then mati repair"
+                        // `mati repair` re-keys gotchas whose affected_files
+                        // were stored in a spelling the read gate never
+                        // produces, and links the corrected path — creating a
+                        // Layer 0 file stub if that path was never indexed.
+                        // What it still cannot do is materialize a file:<path>
+                        // record for an already-correct path that init never
+                        // saw; that needs a re-index. So repair always comes
+                        // first, and init only if links remain missing after.
+                        let fix = if !report.unnormalized_paths.is_empty() {
+                            "mati repair  (re-keys unnormalized gotcha paths)"
+                        } else if !report.missing_file_links.is_empty() {
+                            "mati repair, then mati init if links are still missing"
                         } else {
                             "mati repair"
                         };

@@ -1402,11 +1402,15 @@ pub(crate) async fn socket_dispatch(
                 Some(r) => r,
                 None => return SocketResponse::err("missing or invalid args.record"),
             };
-            let new_files: Vec<String> = req
-                .args
-                .get("new_files")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default();
+            // Normalize up front, not just inside `apply_gotcha_write`: the
+            // in-memory graph sync below keys its edges off this list, and a
+            // raw spelling here would diverge from the edges just persisted.
+            let new_files: Vec<String> = crate::store::gotcha_ops::normalize_affected_files(
+                &req.args
+                    .get("new_files")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                    .unwrap_or_default(),
+            );
             let old_files: Vec<String> = req
                 .args
                 .get("old_files")

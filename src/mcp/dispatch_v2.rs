@@ -2199,6 +2199,66 @@ mod tests {
         );
     }
 
+    /// `handle_gotcha_upsert` commits through its own `transact_knowledge`
+    /// loop and never touches `gotcha_ops::apply_gotcha_write`, so the
+    /// normalization there does not cover the MCP write path. It has to do its
+    /// own — otherwise a `mem_set` with `./src/a.rs` stores a path that joins
+    /// to no `file:*` record and the gotcha is silently inert.
+    #[tokio::test]
+    async fn gotcha_upsert_normalizes_affected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::GotchaUpsert(GotchaDraftInput {
+            key: "gotcha:mcp-dotslash".into(),
+            rule: "never call foo() directly".into(),
+            reason: "it bypasses the retry wrapper".into(),
+            severity: Severity::High,
+            affected_files: vec!["./src/a.rs".into(), "src/payments/**".into()],
+            ref_url: None,
+            tags: vec![],
+            priority: Priority::Normal,
+            source: None,
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+        assert!(matches!(resp, Response::Ok { .. }), "upsert must succeed");
+
+        let g = graph.read().await;
+        let stored = g
+            .store()
+            .get("gotcha:mcp-dotslash")
+            .await
+            .unwrap()
+            .expect("record written");
+        let gotcha = stored
+            .payload_as::<crate::store::GotchaRecord>()
+            .expect("gotcha payload");
+        assert_eq!(
+            gotcha.affected_files,
+            vec!["src/a.rs".to_string(), "src/payments/**".to_string()],
+            "`./` stripped, glob left alone"
+        );
+
+        // The file link must land on the key the read gate looks up.
+        let linked = g
+            .store()
+            .get("file:src/a.rs")
+            .await
+            .unwrap()
+            .expect("corrected path linked");
+        let keys: Vec<String> = linked
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("gotcha_keys"))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        assert_eq!(keys, vec!["gotcha:mcp-dotslash".to_string()]);
+        assert!(g.store().get("file:./src/a.rs").await.unwrap().is_none());
+    }
+
     // ── Native MemGet / MemBootstrap tests ──────────────────────────────
 
     #[tokio::test]

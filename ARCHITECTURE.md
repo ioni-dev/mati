@@ -1035,11 +1035,17 @@ All gotcha create, edit, and tombstone paths go through `store::gotcha_ops`. A d
 
 The canonical `gotcha:*` record is the source of truth. `file:*` `gotcha_keys` and `HasGotcha` graph edges are derived indexes.
 
+The daemon's v2 protocol handlers (`mcp::handlers`) are the exception to the rule above: they stage the gotcha record, the file-link updates, and the audit entry in a single atomic `transact_knowledge` call rather than calling `gotcha_ops`. Anything `gotcha_ops` enforces at write time has to be mirrored there — `handle_gotcha_upsert` and `apply_mem_set_write` both carry their own copy.
+
+**Path normalization:**
+
+`affected_files` joins to `file:<rel_path>` by exact string equality, and the read gate normalizes its side with `hooks::decide::normalize_path`. Every write path normalizes with the same function and the same repo-root resolution (`git2::Repository::discover` on the process cwd, uncanonicalized), so `./src/a.rs`, an absolute path inside the repo, and `src//a.rs` all store as `src/a.rs`. Globs such as `src/payments/**` pass through untouched. A write that stores a path the gate would never produce is a silent non-enforcement bug, not a cosmetic one.
+
 **Recovery:**
 
-- `mati repair` rebuilds derived state from canonical records and verifies consistency.
+- `mati repair` re-keys `affected_files` that are not in normalized form, then rebuilds derived state from canonical records and verifies consistency.
 - `mati repair --check` detects drift without writing. It is CI-ready and exits non-zero on drift.
-- `mati repair --fast` drains only the dirty-marker queue. It is not a full integrity proof.
+- `mati repair --fast` drains only the dirty-marker queue. It is not a full integrity proof, and it does not scan for unnormalized paths.
 - `mati status` surfaces dirty-state warnings when drift is detected.
 
 If `gotcha_keys` and `HasGotcha` graph edges disagree with the canonical `gotcha:*` record’s `affected_files`, the gotcha record wins.

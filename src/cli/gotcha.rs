@@ -398,6 +398,12 @@ async fn finish_gotcha_add(
     let now = now_secs();
     let slug = slugify!(&rule, max_length = 40);
 
+    // Normalize before the record is built. `gotcha_write` normalizes again on
+    // both sides of the proxy, but doing it here means the duplicate check in
+    // `choose_manual_gotcha_key` and the `-> file:<path>` lines printed below
+    // report the paths that were actually stored.
+    let affected_files = mati_core::store::gotcha_ops::normalize_affected_files(&affected_files);
+
     let gotcha = GotchaRecord {
         rule: rule.to_string(),
         reason: reason.to_string(),
@@ -557,6 +563,10 @@ async fn run_gotcha_edit_inner(proxy: &StoreProxy, key: &str) -> Result<()> {
             .filter(|s| !s.is_empty())
             .collect()
     };
+    // Normalized here as well as in `gotcha_write`, so that keeping the current
+    // value on a legacy record re-keys it to the form the read gate looks up.
+    let new_affected_files =
+        mati_core::store::gotcha_ops::normalize_affected_files(&new_affected_files);
 
     let ref_display = old_gotcha.ref_url.as_deref().unwrap_or("none");
     eprint_prompt(&format!("Reference URL [{ref_display}]: "), use_color);
