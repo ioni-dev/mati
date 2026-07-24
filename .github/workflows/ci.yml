@@ -274,7 +274,7 @@ jobs:
     name: Security audit
     runs-on: ubuntu-latest
     # Fail fast on RUSTSEC vulnerabilities (default cargo-audit behavior:
-    # exit non-zero on Vulnerability entries, warnings allowed). Five
+    # exit non-zero on Vulnerability entries, warnings allowed). Seven
     # accepted unmaintained/unsound advisories are documented in
     # DECISIONS.md; new entries should be triaged before silencing here.
     steps:
