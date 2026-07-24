@@ -463,7 +463,7 @@ pub struct MemQueryInput {
     #[serde(default = "default_query_limit")]
     pub limit: u32,
     /// Look-back window in days for time-scoped modes (`policy_activity`).
-    /// Ignored by other modes; `None` falls back to the mode's own default.
+    /// Ignored by other modes; `None` or `0` falls back to the mode's own default.
     #[serde(default)]
     pub since: Option<u64>,
 }

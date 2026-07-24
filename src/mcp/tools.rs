@@ -1610,6 +1610,58 @@ mod tests {
         assert!(value["policies"].as_array().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn mem_query_policy_activity_since_zero_falls_back_to_default() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        // since:0 is a footgun (zero-width window → every policy NoActivity);
+        // the handler coerces it to the default window. call_mem_query hardcodes
+        // since:None, so drive the handler directly.
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: String::new(),
+            mode: crate::mcp::protocol::QueryMode::PolicyActivity,
+            limit: 20,
+            since: Some(0),
+        };
+        let g = graph_arc.read().await;
+        let value = crate::mcp::handlers::handle_mem_query(g.store(), &g, &input)
+            .await
+            .unwrap();
+        assert_eq!(value["window_days"], 30, "since:0 must fall back to default");
+    }
+
+    #[tokio::test]
+    async fn mem_query_analytics_filters_before_take_limit() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // Three non-matching analytics records sort BEFORE the one we want
+        // ("hit_" < "miss_"); with limit=1 the substring filter must still
+        // surface the match, proving the filter runs before take(limit).
+        for d in ["2026-07-01", "2026-07-02", "2026-07-03"] {
+            let r = make_record(&format!("analytics:hit_{d}"), "h", Category::Analytics, 0.5);
+            store.put(&r.key, &r).await.unwrap();
+        }
+        let want = make_record("analytics:miss_2026-07-04", "m", Category::Analytics, 0.5);
+        store.put(&want.key, &want).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let out = call_mem_query(
+            &graph_arc,
+            "miss_",
+            crate::mcp::protocol::QueryMode::Analytics,
+            1,
+        )
+        .await;
+        assert!(
+            out.contains("analytics:miss_2026-07-04"),
+            "substring filter must run before take(limit): {out}"
+        );
+    }
+
     // ── mem_bootstrap tests ──────────────────────────────────────────────────
 
     #[tokio::test]

@@ -148,14 +148,16 @@ Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
    "block". Do NOT use the 'mati policy observations' CLI here: your sandboxed
    shell cannot reach the daemon socket, but the MCP tool runs outside it.
 7. apply_patch main.rs "fixture" -> "control"; expect success and content changed (positive control).
-8. Call the mati MCP tool mem_query with {"mode":"analytics","query":"miss_"}
-   and record the current miss aggregate's payload.count (treat an empty result
-   as 0). Then use apply_patch to add unindexed.txt with content "miss". It
-   matches no policy and has no record. Call mem_query
-   {"mode":"analytics","query":"miss_"} again. Expect payload.count to increase,
-   proving codex-pre-apply-patch records a Miss for an allowed unrecorded
-   target. Do NOT use 'mati show' here: your sandboxed shell cannot reach the
-   daemon socket; read the aggregate through the MCP tool, which runs outside it.
+8. First run this Bash command for today's date: date -u +%F. Then call the mati
+   MCP tool mem_query with {"mode":"analytics","query":"miss_<TODAY>"} (substitute
+   that date, e.g. "miss_2026-07-24") so you read exactly today's aggregate, not
+   an older day's frozen count. Record that record's payload.count (treat an empty
+   result as 0). Then use apply_patch to add unindexed.txt with content "miss". It
+   matches no policy and has no record. Call the same mem_query again. Expect
+   payload.count to increase, proving codex-pre-apply-patch records a Miss for an
+   allowed unrecorded target. Do NOT use 'mati show' here: your sandboxed shell
+   cannot reach the daemon socket; read the aggregate through the MCP tool, which
+   runs outside it.
 9. Bash psql -h db.prod-codex.internal -c "SELECT * FROM inventory". Expect exit 2, mati: decision:codex-inventory; stub must not run.
 10. Bash psql -h db.prod-codex.internal -c "\d inventory"; report status. Expect 0/no block; introspection must mint.
 11. In a new message rerun step 9. Expect allowed/stub output, proving introspect-then-query.

@@ -114,9 +114,13 @@ pub fn assemble_shadow_observations(
 ///
 /// `policy_records` is the `policy:*` scan, `enforcement` a time-bounded
 /// enforcement scan over `[window_start, now]`, and the shadow/steer slices are
-/// the `analytics:policy_shadow_*` / `analytics:policy_steer_*` scans. Callers
-/// must scan enforcement over the same window `window_start_secs(now_secs,
-/// days)` produces, or the retention accounting will not line up.
+/// the `analytics:policy_shadow_*` / `analytics:policy_steer_*` scans.
+///
+/// The shadow and steer records are window-filtered here (`updated_at <
+/// window_start`), but the enforcement events are counted VERBATIM — windowing
+/// them is the caller's job, done by scanning only `[window_start_secs(now_secs,
+/// days), now]`. Hand this a wider enforcement scan and `count`, `state`, and
+/// `last_fired_at` inflate past the window, not just the retention note.
 pub fn assemble_activity_report(
     now_secs: u64,
     days: u64,
@@ -256,6 +260,91 @@ pub fn assemble_activity_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::enforcement::EnforcementEvent;
+    use crate::store::record::{
+        PolicyFreshness, PolicyMode, PolicyRequires, PolicyTrigger, Priority, TombstoneReason,
+    };
+
+    /// Build an `analytics:*`-style record with a payload and `updated_at`,
+    /// reusing the production analytics-record constructor for field fidelity.
+    fn agg_record(key: &str, updated_at: u64, payload: serde_json::Value) -> Record {
+        let mut r = crate::store::session::analytics_record(key, String::new());
+        r.updated_at = updated_at;
+        r.payload = Some(payload);
+        r
+    }
+
+    fn policy_record(key: &str, tool: Option<&str>, stage: PolicyStage) -> Record {
+        let policy = PolicyRecord {
+            name: "n".into(),
+            rule: "r".into(),
+            reason: "why".into(),
+            scope: "s".into(),
+            mode: PolicyMode::Block,
+            trigger: PolicyTrigger {
+                tool: tool.map(String::from),
+                ..Default::default()
+            },
+            requires: PolicyRequires {
+                key: "gotcha:x".into(),
+                via: vec![],
+                freshness: PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
+            },
+            stage,
+            severity: Priority::High,
+            created_by: "test".into(),
+        };
+        agg_record(key, 0, serde_json::to_value(policy).unwrap())
+    }
+
+    fn deny_event(subject_key: &str, recorded_at_ms: u64, seq_no: u64) -> EnforcementEvent {
+        EnforcementEvent {
+            event_id: format!("evt-{seq_no}"),
+            schema_version: 1,
+            seq_no,
+            recorded_at_ms,
+            event_type: EnforcementEventType::Deny,
+            event_hash: String::new(),
+            prev_hash: String::new(),
+            installation_id: "test".into(),
+            actor_local: None,
+            agent_type: "codex".into(),
+            subject_kind: SubjectKind::Control,
+            subject_key: subject_key.into(),
+            canonical_subject_hash: None,
+            receipt_id: None,
+            decision_reason_code: "policy_deny".into(),
+            decision_basis_hash: None,
+            agent_session: None,
+        }
+    }
+
+    fn scan_of(events: Vec<EnforcementEvent>, oldest: Option<u64>) -> EnforcementEventScan {
+        EnforcementEventScan {
+            events,
+            oldest_recorded_at_ms: oldest,
+            scanned_keys: 0,
+        }
+    }
+
+    fn shadow_record(key: &str, updated_at: u64, policy_key: &str, count: u64) -> Record {
+        let mut policies = BTreeMap::new();
+        policies.insert(
+            policy_key.to_string(),
+            PolicyShadowAgg {
+                count,
+                observations: vec![],
+            },
+        );
+        agg_record(
+            key,
+            updated_at,
+            serde_json::to_value(ShadowObservationAgg { policies }).unwrap(),
+        )
+    }
 
     #[test]
     fn window_start_saturates_at_epoch() {
@@ -288,5 +377,95 @@ mod tests {
     fn observations_of_empty_scan_are_empty() {
         assert!(assemble_shadow_observations(&[], None).is_empty());
         assert!(assemble_shadow_observations(&[], Some("anything")).is_empty());
+    }
+
+    #[test]
+    fn enforcement_counted_regardless_of_window_but_shadow_is_gated() {
+        let now = 1_000_000_000u64;
+        let days = 1; // window_start = now - 86_400
+        let policy = policy_record("policy:p", Some("db_client"), PolicyStage::Enforce);
+        // Enforcement event recorded long before the window: assemble counts it
+        // verbatim — windowing is the caller's scan responsibility.
+        let old_ms = (now - 10 * 86_400) * 1000;
+        let scan = scan_of(vec![deny_event("policy:p", old_ms, 1)], Some(old_ms));
+        // Shadow record predating the window: assemble MUST drop it.
+        let stale = shadow_record("analytics:policy_shadow_old", now - 10 * 86_400, "policy:p", 5);
+        let report = assemble_activity_report(now, days, &[policy], &scan, &[stale], &[], None);
+        let p = &report.policies[0];
+        assert_eq!(p.count, 1, "enforcement counted despite predating the window");
+        assert!(matches!(p.state, ActivityState::Fired));
+        assert_eq!(
+            p.sources,
+            vec!["enforcement".to_string()],
+            "the stale shadow record must not add a 'shadow' source"
+        );
+    }
+
+    #[test]
+    fn measurable_state_is_a_pure_function_of_trigger_tool() {
+        let now = 2_000_000_000u64;
+        let scan = scan_of(vec![deny_event("policy:bash", now * 1000, 1)], Some(now * 1000));
+        let policies = vec![
+            policy_record("policy:bash", Some("bash"), PolicyStage::Enforce),
+            policy_record("policy:db", Some("db_client"), PolicyStage::Enforce),
+            policy_record("policy:none", None, PolicyStage::Enforce),
+        ];
+        let report = assemble_activity_report(now, 30, &policies, &scan, &[], &[], None);
+        let state = |k: &str| {
+            report
+                .policies
+                .iter()
+                .find(|p| p.policy == k)
+                .unwrap()
+                .state
+                .clone()
+        };
+        // Even with a matching Deny, an unmeasurable tool is NotMeasurable —
+        // never Fired. This is the one derived field, and it stays mechanical.
+        assert!(matches!(state("policy:bash"), ActivityState::NotMeasurable));
+        assert!(matches!(state("policy:db"), ActivityState::NoActivity));
+        assert!(matches!(state("policy:none"), ActivityState::NoActivity));
+    }
+
+    #[test]
+    fn stale_shadow_shows_in_observations_but_not_in_activity() {
+        let now = 3_000_000_000u64;
+        let stale = shadow_record("analytics:policy_shadow_old", now - 60 * 86_400, "policy:p", 3);
+        // observations: no window filter — the count survives.
+        let obs = assemble_shadow_observations(std::slice::from_ref(&stale), None);
+        assert_eq!(obs["policy:p"].count, 3);
+        // activity (30d): the record predates the window — contributes nothing.
+        let report = assemble_activity_report(
+            now,
+            30,
+            &[policy_record("policy:p", Some("path"), PolicyStage::Enforce)],
+            &scan_of(vec![], None),
+            &[stale],
+            &[],
+            None,
+        );
+        assert_eq!(report.policies[0].count, 0);
+        assert!(report.policies[0].sources.is_empty());
+    }
+
+    #[test]
+    fn off_and_tombstoned_policies_excluded_and_retention_flagged() {
+        let now = 4_000_000_000u64;
+        let off = policy_record("policy:off", None, PolicyStage::Off);
+        let mut dead = policy_record("policy:dead", None, PolicyStage::Enforce);
+        dead.lifecycle = RecordLifecycle::Tombstoned {
+            reason: TombstoneReason::ManualDeletion,
+            at: now,
+        };
+        let live = policy_record("policy:live", None, PolicyStage::Enforce);
+        // A 400-day window starts before the oldest retained event (10 days
+        // old) → the requested history predates retention → retention_limited.
+        let old_ms = (now - 10 * 86_400) * 1000;
+        let scan = scan_of(vec![deny_event("policy:live", old_ms, 1)], Some(old_ms));
+        let report = assemble_activity_report(now, 400, &[off, dead, live], &scan, &[], &[], None);
+        assert_eq!(report.policies.len(), 1);
+        assert_eq!(report.policies[0].policy, "policy:live");
+        assert!(report.retention_limited);
+        assert!(report.retention_note.is_some());
     }
 }

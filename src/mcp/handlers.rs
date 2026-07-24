@@ -1683,8 +1683,12 @@ pub(crate) async fn handle_mem_query(
         }
         protocol::QueryMode::PolicyActivity => {
             use crate::store::{enforcement, observability};
+            // Treat since:0 as unset: a zero-width window reports every policy
+            // as NoActivity, which an agent could misread as "these rules are
+            // dead." Fall back to the default look-back instead.
             let days = input
                 .since
+                .filter(|&d| d > 0)
                 .unwrap_or(observability::POLICY_ACTIVITY_DEFAULT_DAYS);
             let slug = (!input.query.is_empty()).then_some(input.query.as_str());
             let now = std::time::SystemTime::now()

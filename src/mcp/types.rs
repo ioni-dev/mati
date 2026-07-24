@@ -34,7 +34,7 @@ pub struct MemQueryParams {
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Look-back window in days for the "policy_activity" mode (default: 30).
-    /// Ignored by other modes.
+    /// 0 is treated as unset and uses the default. Ignored by other modes.
     #[serde(default)]
     pub since: Option<u64>,
 }
