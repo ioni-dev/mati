@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+use crate::cli::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
 use mati_core::hooks::decide::{self, Decision, EnforcementInput, HookEvent};
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -22,9 +22,9 @@ pub enum HookVariant {
     /// `consulted_recent` (a recent-consultation TTL, matching the Codex
     /// `apply_patch` edit gate) — NOT the read gate's persistent `consulted` — so
     /// an edit must be preceded by a *recent* mem_get: read-then-edit flows within
-    /// the TTL, and blind or stale-consult edits deny. Non-deny outcomes DEFER to
-    /// the normal permission flow instead of emitting `allow` — edits are
-    /// permission-required, so force-allow would suppress the user's edit prompt.
+    /// the TTL, and blind or stale-consult edits deny. Context-bearing non-deny
+    /// outcomes inject context into the normal permission flow; edits never
+    /// emit `allow` because they are permission-required.
     ClaudePreEdit,
     ClaudePreBash,
     CodexPreBash,
@@ -33,7 +33,7 @@ pub enum HookVariant {
     /// (`run_apply_patch`) — parses the patch envelope and denies if any
     /// touched file has an unconsulted confirmed gotcha.
     CodexPreApplyPatch,
-    /// Claude PostToolUse(mcp__mati__mem_get): record actor-scoped consult receipt.
+    /// Claude PostToolUse(mcp__mati__mem_get): record a consult receipt.
     /// Payload carries session_id, agent_id (subagent), and tool_input.key.
     ///
     /// clap's default kebab derive would yield `claude-post-mem-get`; pin the CLI
@@ -41,6 +41,10 @@ pub enum HookVariant {
     /// (`post-memget.sh` → `mati hook-decide claude-post-memget`).
     #[value(name = "claude-post-memget")]
     ClaudePostMemGet,
+    /// Claude PostToolUse(Bash): mint schema consultation receipts after a
+    /// successful allowlisted database introspection.
+    #[value(name = "claude-post-bash")]
+    ClaudePostBash,
 }
 
 #[derive(Args, Debug)]
@@ -94,10 +98,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         return run_apply_patch(&input).await;
     }
 
-    // claude-post-memget: records an actor-scoped consult receipt using
+    // claude-post-memget: records a consult receipt using
     // tool_input.key directly — NOT a file path, so skip extract_path entirely.
     if args.variant == HookVariant::ClaudePostMemGet {
         return run_post_memget(&input).await;
+    }
+
+    if args.variant == HookVariant::ClaudePostBash {
+        return run_post_bash_introspection(&input).await;
     }
 
     // 1b. Parse agent_id: present only in subagent hook payloads.
@@ -109,17 +117,39 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
+    // Normalize Bash once so the same governed action drives both the
+    // fileless policy path and the file-gate composition path.
+    let bash_action = if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) {
+        input
+            .pointer("/tool_input/command")
+            .and_then(|v| v.as_str())
+            .map(|command| decide::normalize_action(Some(command), None))
+    } else {
+        None
+    };
+
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,
         None => {
+            if let Some(action) = bash_action
+                .as_ref()
+                .filter(|action| action.tool == "db_client")
+            {
+                return run_fileless_policy(&input, args.variant, action, agent_id).await;
+            }
             emit_allow(args.variant);
             return Ok(());
         }
     };
 
     // 3. Resolve repo root via git2 (no subprocess).
-    let cwd = std::env::current_dir()?;
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
     let repo_root = discover_repo_root(&cwd);
     let repo_root_str = repo_root.as_ref().and_then(|p| p.to_str());
     // Platform limitation: bare relative paths in shell commands (e.g. `cat foo.rs`)
@@ -232,10 +262,12 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // canonicalize error, target outside the repo, identical key) leaves the
     // lexical-only decision untouched. Perf: one extra realpath + one daemon
     // round-trip, and only on the non-deny path, so the common case is zero-cost.
+    // Resolved once and shared by both gates below. A gate that knows about
+    // symlinks alongside one that does not is the defect; which glob missed is
+    // only the symptom. `canonical_rel_path` returns None for a non-symlink.
+    let canon_rel = canonical_rel_path(&raw_path, &cwd, repo_root.as_deref(), &rel_path);
     if !matches!(adapter.decision, Decision::Deny { .. }) {
-        if let Some(canon_rel) =
-            canonical_rel_path(&raw_path, &cwd, repo_root.as_deref(), &rel_path)
-        {
+        if let Some(canon_rel) = canon_rel.as_deref() {
             let canon_key = format!("file:{canon_rel}");
             if let Some(canon_eval) = match daemon_result(
                 &mati_root,
@@ -253,19 +285,18 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                     if d.is_none() {
                         // Escalate-only path: the lexical decision stands, but
                         // record the gap — the real target went ungated.
-                        log_fail_open(&canon_rel, "hook_evaluate returned error (canonical)");
+                        log_fail_open(canon_rel, "hook_evaluate returned error (canonical)");
                     }
                     d
                 }
                 _ => None,
             } {
-                let mut canon_adapter =
-                    process_eval_response(args.variant, &canon_rel, &canon_eval);
+                let mut canon_adapter = process_eval_response(args.variant, canon_rel, &canon_eval);
                 // Mandate the symlink's real target too (parity with the gotcha WI-20 close).
                 apply_consult_mandate(
                     &mut canon_adapter,
                     args.variant,
-                    &canon_rel,
+                    canon_rel,
                     consulted_flag(&canon_eval, include_recent),
                     consult_globs.as_ref(),
                 );
@@ -352,6 +383,79 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         }
     }
 
+    // A file-bearing governed DB command gets the policy decision after the
+    // existing file gate. A file-gate Deny is already final, so skip the
+    // policy round-trip and its possible second event on that path.
+    if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreEdit
+    ) && !matches!(adapter.decision, Decision::Deny { .. })
+    {
+        // A bash file argument has the same second identity as an edit target:
+        // `psql -f link.sql` can read through to the real in-repo target. Keep
+        // one db_client action so host/tool matching survives the governed_tool
+        // filter; unlike edits, add canonical paths to action.files rather than
+        // building a separate path action. action.files is cloned into
+        // PolicyShadowObserved, so shadow observations now record resolved paths
+        // alongside lexical ones, showing what the command actually touched.
+        let policy_actions: Vec<decide::Action> = match args.variant {
+            HookVariant::ClaudePreBash | HookVariant::CodexPreBash => bash_action
+                .as_ref()
+                .cloned()
+                .map(|mut action| {
+                    let lexical_files: Vec<String> = action
+                        .files
+                        .iter()
+                        .take(decide::MAX_APPLY_PATCH_FILES)
+                        .cloned()
+                        .collect();
+                    for lexical in lexical_files {
+                        if let Some(canonical) =
+                            canonical_rel_path(&lexical, &cwd, repo_root.as_deref(), &lexical)
+                        {
+                            if !action.files.iter().any(|path| path == &canonical) {
+                                action.files.push(canonical);
+                            }
+                        }
+                    }
+                    action
+                })
+                .into_iter()
+                .collect(),
+            HookVariant::ClaudePreEdit => std::iter::once(rel_path.as_str())
+                .chain(canon_rel.as_deref())
+                .map(|path| decide::normalize_action(None, Some(path)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let governed_tool = if args.variant == HookVariant::ClaudePreEdit {
+            "path"
+        } else {
+            "db_client"
+        };
+        for action in &policy_actions {
+            // Escalate-only: stop at the first deny, and never lower an
+            // existing decision. Edits already make one hook_evaluate round
+            // trip; a future optimization could piggyback policy verdicts onto
+            // that response.
+            if matches!(adapter.decision, Decision::Deny { .. }) {
+                break;
+            }
+            if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
+                Some(&mati_root),
+                action,
+                governed_tool,
+                agent_id,
+                "<policy>",
+                policy_block_exempt(args.variant, &input),
+            )
+            .await
+            {
+                merge_policy_result(&mut adapter, args.variant, policy_decision, policy_events);
+            }
+        }
+    }
+
     // Platform-specific output FIRST, audit events second: the outer deadline
     // can cancel this future between the two. A decision that was delivered
     // but not recorded is an honest gap (fail-open doctrine); an event
@@ -382,6 +486,220 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Evaluate local policies for a governed, fileless Bash command.
+///
+/// This is deliberately separate from the file-gate path: file-bearing DB
+/// commands continue through the existing gotcha flow until policy/file-gate
+/// composition is specified.
+async fn run_fileless_policy(
+    input: &serde_json::Value,
+    variant: HookVariant,
+    action: &decide::Action,
+    agent_id: Option<&str>,
+) -> Result<()> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(root) => root,
+        Err(_) => {
+            log_fail_open("<fileless-bash>", "cannot determine mati root");
+            emit_allow(variant);
+            return Ok(());
+        }
+    };
+    let Some((decision, events)) = evaluate_governed_policy(
+        Some(&mati_root),
+        action,
+        "db_client",
+        agent_id,
+        "<fileless-bash>",
+        policy_block_exempt(variant, input),
+    )
+    .await
+    else {
+        emit_allow(variant);
+        return Ok(());
+    };
+    let (stdout, stderr, exit_code) = format_decision(variant, &decision, "<policy>");
+    if !stdout.is_empty() {
+        println!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+    let session_id = input.get("session_id").and_then(|v| v.as_str());
+    fire_events(&mati_root, &events, session_id, agent_id).await;
+    if exit_code != 0 {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// Evaluate a governed local policy without producing platform output.
+///
+/// `None` is both the non-governed result and the fail-open result. Callers
+/// must preserve their existing decision when it is returned for composition.
+async fn evaluate_governed_policy(
+    mati_root: Option<&Path>,
+    action: &decide::Action,
+    governed_tool: &str,
+    agent_id: Option<&str>,
+    failure_path: &str,
+    introspection_exemption: bool,
+) -> Option<(Decision, Vec<HookEvent>)> {
+    if action.tool != governed_tool {
+        return None;
+    }
+    let Some(mati_root) = mati_root else {
+        log_fail_open(failure_path, "cannot determine mati root");
+        return None;
+    };
+    if !ensure_daemon(mati_root).await {
+        log_fail_open(failure_path, "daemon not running after auto-start");
+        return None;
+    }
+    let verdicts = policy_verdicts_for_action(mati_root, action, agent_id, failure_path).await?;
+    let strict = verdicts.iter().any(|verdict| verdict.strict);
+    let core_verdicts = policy_core_verdicts(&verdicts, introspection_exemption);
+    let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
+    let events = result
+        .events
+        .into_iter()
+        .map(|event| match event {
+            HookEvent::PolicyShadowObserved { key, would, .. } => HookEvent::PolicyShadowObserved {
+                key,
+                would,
+                action: Some(action.clone()),
+            },
+            event => event,
+        })
+        .collect();
+    Some((result.decision, events))
+}
+
+fn policy_core_verdicts(
+    verdicts: &[mati_core::mcp::protocol::PolicyVerdict],
+    introspection_exemption: bool,
+) -> Vec<decide::PolicyVerdict> {
+    verdicts
+        .iter()
+        .filter_map(|verdict| {
+            if introspection_exemption
+                && matches!(verdict.stage, mati_core::store::PolicyStage::Shadow)
+                && matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+            {
+                return None;
+            }
+            Some(decide::PolicyVerdict {
+                key: verdict.key.clone(),
+                rule: verdict.rule.clone(),
+                requires_key: verdict.requires_key.clone(),
+                block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                    && (!introspection_exemption || verdict.satisfied),
+                satisfied: verdict.satisfied,
+                stage: verdict.stage,
+            })
+        })
+        .collect()
+}
+
+async fn policy_verdicts_for_action(
+    mati_root: &Path,
+    action: &decide::Action,
+    agent_id: Option<&str>,
+    failure_path: &str,
+) -> Option<Vec<mati_core::mcp::protocol::PolicyVerdict>> {
+    let response = daemon_v2(
+        mati_root,
+        mati_core::mcp::protocol::Command::PolicyEvaluate(
+            mati_core::mcp::protocol::PolicyEvaluateInput {
+                action: action.clone(),
+                actor: agent_id.map(str::to_string),
+            },
+        ),
+    )
+    .await;
+    let data = match response {
+        DaemonResult::Ok(resp) => match daemon_data(&resp) {
+            Some(data) => data,
+            None => {
+                log_fail_open(failure_path, "policy_evaluate returned error");
+                return None;
+            }
+        },
+        _ => {
+            log_fail_open(failure_path, "policy_evaluate failed");
+            return None;
+        }
+    };
+    match serde_json::from_value(data) {
+        Ok(verdicts) => Some(verdicts),
+        Err(_) => {
+            log_fail_open(failure_path, "policy_evaluate returned invalid data");
+            None
+        }
+    }
+}
+
+/// A successful schema inspection is the remedy for a DB policy, so the
+/// pre-Bash gate may steer it but must not block it.
+fn policy_block_exempt(variant: HookVariant, input: &serde_json::Value) -> bool {
+    matches!(
+        variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) && input
+        .pointer("/tool_input/command")
+        .and_then(|value| value.as_str())
+        .is_some_and(decide::is_schema_introspection)
+}
+
+/// Merge a policy result into the existing file-gate result without lowering it.
+fn merge_policy_result(
+    adapter: &mut AdapterResult,
+    variant: HookVariant,
+    policy_decision: Decision,
+    policy_events: Vec<HookEvent>,
+) {
+    let merged_decision = match policy_decision {
+        Decision::Deny { .. } => policy_decision,
+        Decision::Advisory {
+            context: policy_context,
+        } => match &adapter.decision {
+            Decision::Deny { .. } => adapter.decision.clone(),
+            Decision::Advisory { context } => Decision::Advisory {
+                context: format!("{context}\n{policy_context}"),
+            },
+            Decision::AlreadyConsulted { .. } if variant == HookVariant::ClaudePreEdit => {
+                Decision::Advisory {
+                    context: policy_context,
+                }
+            }
+            Decision::AlreadyConsulted { context } => Decision::AlreadyConsulted {
+                context: format!("{context}\n{policy_context}"),
+            },
+            Decision::Liability { staleness, context } => Decision::Liability {
+                staleness: *staleness,
+                context: format!("{context}\n{policy_context}"),
+            },
+            _ => Decision::Advisory {
+                context: policy_context,
+            },
+        },
+        Decision::Allow => adapter.decision.clone(),
+        _ => adapter.decision.clone(),
+    };
+    adapter.decision = merged_decision;
+    adapter.events.extend(policy_events);
+    let (stdout, stderr, exit_code) = format_decision(variant, &adapter.decision, "<policy>");
+    adapter.stdout = stdout;
+    adapter.stderr = stderr;
+    adapter.exit_code = exit_code;
 }
 
 // ── Path extraction ─────────────────────────────────────────────────────────
@@ -417,6 +735,7 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
         // post-memget is handled by `run_post_memget` before extract_path is called;
         // it uses tool_input.key directly, not a file path.
         HookVariant::ClaudePostMemGet => None,
+        HookVariant::ClaudePostBash => None,
     }
 }
 
@@ -598,11 +917,13 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
         .get("session_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let actor = agent_id.or(session_id);
+    let actor = receipt_actor(agent_id, session_id);
 
     let cwd = std::env::current_dir()?;
     // Resolve the daemon slug the way the gate does (repo root, not cwd) so the
-    // actor-scoped receipt lands in the same store the gate will read.
+    // receipt lands in the store the gate will read. The actor scope matches the
+    // gate too: agent receipts are scoped, while the main thread (no agent_id)
+    // uses the global receipt.
     let repo_root = discover_repo_root(&cwd);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let mati_root = match mati_root_for(root_for_slug) {
@@ -616,6 +937,7 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
     let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
         mati_core::mcp::protocol::ConsultationHitInput {
             key: key.to_string(),
+            capture_fingerprint: true,
             actor: actor.map(str::to_string),
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
@@ -623,6 +945,143 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
     );
     let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
     Ok(())
+}
+
+/// Best-effort PostToolUse adapter for schema introspection. The policy
+/// evaluation and receipt minting are deliberately fire-and-forget: a
+/// PostToolUse hook must never disrupt the agent session.
+async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
+    if !post_bash_succeeded(input) {
+        return Ok(());
+    }
+    let Some(command) = input
+        .pointer("/tool_input/command")
+        .and_then(|value| value.as_str())
+        .filter(|command| decide::is_schema_introspection(command))
+    else {
+        return Ok(());
+    };
+    let action = decide::normalize_action(Some(command), None);
+    if action.tool != "db_client" {
+        return Ok(());
+    }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(root) => root,
+        Err(_) => return Ok(()),
+    };
+    if !ensure_daemon(&mati_root).await {
+        return Ok(());
+    }
+
+    let Some(verdicts) = policy_verdicts_for_action(
+        &mati_root,
+        &action,
+        input.get("agent_id").and_then(|value| value.as_str()),
+        "<post-bash>",
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    let agent_id = input
+        .get("agent_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let session_id = input
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    for verdict in verdicts {
+        if !accepts_db_introspection(&verdict.via) {
+            continue;
+        }
+        let _ = daemon_v2(
+            &mati_root,
+            mati_core::mcp::protocol::Command::ConsultationHit(
+                mati_core::mcp::protocol::ConsultationHitInput {
+                    key: verdict.requires_key,
+                    capture_fingerprint: false,
+                    actor: receipt_actor(agent_id, session_id).map(str::to_string),
+                    session_id: session_id.map(str::to_string),
+                    agent_id: agent_id.map(str::to_string),
+                },
+            ),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Select the receipt scope shared by the gate and both post-tool mint paths.
+/// Session IDs remain consultation metadata, not receipt scope.
+fn receipt_actor<'a>(agent_id: Option<&'a str>, _session_id: Option<&str>) -> Option<&'a str> {
+    agent_id
+}
+
+/// Claude's PostToolUse payloads have used both camelCase and snake_case
+/// spellings. An unrecognized payload shape is not success: minting must stop
+/// until the hook understands the new shape.
+fn post_bash_succeeded(input: &serde_json::Value) -> bool {
+    let Some(response) = input.pointer("/tool_response") else {
+        tracing::warn!("Claude PostToolUse Bash payload is missing tool_response");
+        return false;
+    };
+    // Claude Code omits `isError` entirely on a successful Bash command. A
+    // captured payload carries exactly `{stdout, stderr, interrupted, isImage,
+    // noOutputExpected}` and no exit status at all, so requiring the field made
+    // every introspection look like a failure and `DbIntrospection` could never
+    // mint. Absent means success, matching `run_post_memget`; only an explicit
+    // `true` is a failure.
+    //
+    // Observed alongside that: a Bash call that exits non-zero fires no
+    // PostToolUse event at all, so this function never runs for a failed
+    // command and cannot mint for one. That is what makes the absent-means-
+    // success default safe rather than merely convenient. Confirmed in both
+    // `default` and `acceptEdits` permission modes; `bypassPermissions` is
+    // untested. The checks below stay as defense in depth, because the absence
+    // of an event is Claude Code's behavior to change, not a contract mati
+    // controls: if a failing command ever did reach this function it would
+    // carry no `isError` either, and the shape alone could not distinguish it
+    // from a success.
+    if response
+        .get("isError")
+        .or_else(|| response.get("is_error"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // A cancelled command taught the agent nothing, so it must not mint.
+    if response
+        .get("interrupted")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    for key in ["exit_code", "exitCode"] {
+        let Some(value) = response.get(key) else {
+            continue;
+        };
+        let Some(code) = value.as_i64() else {
+            tracing::warn!("Claude PostToolUse Bash payload has non-numeric {key}");
+            return false;
+        };
+        if code != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn accepts_db_introspection(via: &[mati_core::store::ReceiptSource]) -> bool {
+    via.contains(&mati_core::store::ReceiptSource::DbIntrospection)
 }
 
 // ── codex-pre-apply-patch flow ──────────────────────────────────────────────
@@ -692,7 +1151,9 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         .filter(|s| !s.is_empty());
     // Enterprise consult-mandate globs — parity with the single-path flow.
     let consult_globs = consult_globset();
-    let mut denied: Vec<String> = Vec::new();
+    // (deny key, deny reason, origin). The origin selects the message shape: a
+    // policy deny's key is the policy, not something the agent can consult.
+    let mut denied: Vec<(String, String, decide::DenyOrigin)> = Vec::new();
     let mut events: Vec<HookEvent> = Vec::new();
     for raw in &raw_paths {
         let rel_path = decide::normalize_path(raw, repo_root_str);
@@ -730,14 +1191,43 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
             consulted_flag(&eval_data, true),
             consult_globs.as_ref(),
         );
+        // Resolve the symlink target ONCE, before any gate runs. Both the
+        // gotcha gate and the policy gate need it: one gate knowing about
+        // symlinks while its sibling does not was the actual defect, and a
+        // path policy that misses a symlinked target is only the symptom.
+        // `canonical_rel_path` returns None for a non-symlink, so the common
+        // case costs nothing.
+        let canon_rel = canonical_rel_path(raw, &cwd, repo_root.as_deref(), &rel_path);
+
+        // Codex apply_patch has the exact target path, so apply the same
+        // target_path_glob policy gate used by Claude edits, over the lexical
+        // key and the canonical one. Escalate-only: the loop stops at the first
+        // deny and a non-deny outcome never lowers an existing decision.
+        for policy_path in std::iter::once(rel_path.as_str()).chain(canon_rel.as_deref()) {
+            if matches!(adapter.decision, Decision::Deny { .. }) {
+                break;
+            }
+            let action = decide::normalize_action(None, Some(policy_path));
+            if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
+                Some(&mati_root),
+                &action,
+                "path",
+                agent_id,
+                "<apply-patch-policy>",
+                policy_block_exempt(variant, input),
+            )
+            .await
+            {
+                merge_policy_result(&mut adapter, variant, policy_decision, policy_events);
+            }
+        }
         // WI-20 parity: a patch targeting an in-repo symlink would otherwise
         // evaluate only the lexical key and write through to the real target
         // ungated. Escalate-only, like the read/edit path: a non-deny
         // canonical result never downgrades the lexical decision, and
         // `canonical_rel_path` returns None (zero cost) for non-symlinks.
         if !matches!(adapter.decision, Decision::Deny { .. }) {
-            if let Some(canon_rel) = canonical_rel_path(raw, &cwd, repo_root.as_deref(), &rel_path)
-            {
+            if let Some(canon_rel) = canon_rel.as_deref() {
                 let canon_key = format!("file:{canon_rel}");
                 if let Some(canon_eval) = match daemon_result(
                     &mati_root,
@@ -750,7 +1240,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                         let d = daemon_data(&resp);
                         if d.is_none() {
                             log_fail_open(
-                                &canon_rel,
+                                canon_rel,
                                 "hook_evaluate returned error (canonical)",
                             );
                         }
@@ -759,11 +1249,11 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                     _ => None,
                 } {
                     let mut canon_adapter =
-                        process_eval_response(variant, &canon_rel, &canon_eval);
+                        process_eval_response(variant, canon_rel, &canon_eval);
                     apply_consult_mandate(
                         &mut canon_adapter,
                         variant,
-                        &canon_rel,
+                        canon_rel,
                         consulted_flag(&canon_eval, true),
                         consult_globs.as_ref(),
                     );
@@ -777,28 +1267,58 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         // (real-target) key, or the mandate key, whichever actually denied.
         if let Decision::Deny {
             file_key: denied_key,
-            ..
+            reason,
+            origin,
         } = &adapter.decision
         {
-            denied.push(denied_key.clone());
-            events.extend(adapter.events);
+            denied.push((denied_key.clone(), reason.clone(), *origin));
         }
+        // Unconditionally: a non-denying policy still produces events. A shadow
+        // observation and a satisfied block's receipt must both be recorded, or
+        // `mati policy observations` reports zero matches for a policy that
+        // matched every time, and this adapter's audit trail diverges from the
+        // Claude edit gate's for the same action.
+        events.extend(adapter.events);
     }
 
     // 5. Deny if any file needs consultation; otherwise allow. Output FIRST,
     // audit events second (missing beats false — see run_inner).
     if denied.is_empty() {
+        // Output first, events second, matching the deny path below: a decision
+        // delivered but unrecorded is an honest gap, the reverse is a lie.
         emit_allow(variant);
+        // Firing here is what makes a non-denying policy observable at all. A
+        // shadow-stage match and a satisfied block both land on this path, and
+        // returning early dropped every one of them.
+        fire_events(&mati_root, &events, None, agent_id).await;
         return Ok(());
     }
-    let msg = if denied.len() == 1 {
-        format!("mati: call mem_get(\"{}\") before editing", denied[0])
-    } else {
-        format!(
+    // Policy denies carry their own actionable instruction; file denies keep the
+    // established consult-the-file shape. A patch can trip both at once, so both
+    // are reported rather than one shadowing the other.
+    let (policy_denies, file_denies): (Vec<_>, Vec<_>) = denied
+        .iter()
+        .partition(|(_, _, origin)| matches!(origin, decide::DenyOrigin::Policy));
+    let mut lines: Vec<String> = policy_denies
+        .iter()
+        .map(|(_, reason, _)| reason.clone())
+        .collect();
+    if file_denies.len() == 1 {
+        lines.push(format!(
+            "mati: call mem_get(\"{}\") before editing",
+            file_denies[0].0
+        ));
+    } else if file_denies.len() > 1 {
+        lines.push(format!(
             "mati: consult these files before editing — call mem_get for each: {}",
-            denied.join(", ")
-        )
-    };
+            file_denies
+                .iter()
+                .map(|(key, _, _)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let msg = lines.join("\n");
     eprintln!("{msg}");
     let _ = std::io::Write::flush(&mut std::io::stderr());
 
@@ -887,7 +1407,9 @@ fn platform_events(
                 _ => Some(e),
             })
             .collect(),
-        HookVariant::CodexPostBash | HookVariant::ClaudePostMemGet => {
+        HookVariant::CodexPostBash
+        | HookVariant::ClaudePostMemGet
+        | HookVariant::ClaudePostBash => {
             // Post-bash and post-memget use their own flows — should not reach here.
             events
         }
@@ -903,6 +1425,14 @@ fn platform_events(
                 // Keep the floor-mandate deny (its own reason code), don't fold into EditBlocked.
                 HookEvent::FloorConsultBlocked { key } => {
                     Some(HookEvent::FloorConsultBlocked { key })
+                }
+                HookEvent::PolicyConsultBlocked { key } => {
+                    Some(HookEvent::PolicyConsultBlocked { key })
+                }
+                HookEvent::PolicyConsulted { key } => Some(HookEvent::PolicyConsulted { key }),
+                HookEvent::PolicySteered { key } => Some(HookEvent::PolicySteered { key }),
+                HookEvent::PolicyShadowObserved { key, would, action } => {
+                    Some(HookEvent::PolicyShadowObserved { key, would, action })
                 }
                 HookEvent::ComplianceHit { key } => Some(HookEvent::EditConsulted { key }),
                 _ => None,
@@ -937,6 +1467,7 @@ async fn fire_events(
             // the main thread's gate for context only the subagent received.
             HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
                 key: key.clone(),
+                capture_fingerprint: true,
                 actor: agent_id.map(str::to_string),
                 session_id: sid(),
                 agent_id: agent_id.map(str::to_string),
@@ -978,6 +1509,31 @@ async fn fire_events(
                 key: key.clone(),
                 session_id: sid(),
             }),
+            HookEvent::PolicyConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::PolicyConsultMiss,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::PolicyConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::PolicyConsultHit,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::PolicySteered { key } => p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::PolicySteered,
+                key: key.clone(),
+                session_id: sid(),
+            }),
+            HookEvent::PolicyShadowObserved {
+                key,
+                would,
+                action: Some(action),
+            } => p::Command::PolicyShadowObserve(p::PolicyShadowObserveInput {
+                policy_key: key.clone(),
+                action: action.clone(),
+                would: *would,
+            }),
+            HookEvent::PolicyShadowObserved { .. } => continue,
         };
         // Fire-and-forget — drop silently on failure (P9).
         let _ = super::daemon::daemon_v2(mati_root, cmd).await;
@@ -994,8 +1550,9 @@ async fn fire_events(
 /// permission-REQUIRED tools — force-allowing them would silently suppress the
 /// user's permission prompt for every command/edit mati doesn't deny (i.e.
 /// installing mati would auto-approve arbitrary shell commands). Every variant
-/// other than `ClaudePreRead` must DEFER: empty stdout, exit 0. Covered by
-/// `only_pre_read_force_allows` in the test module.
+/// other than `ClaudePreRead` must not force-allow; Bash and Edit may still
+/// emit context-only output. Covered by `only_pre_read_force_allows` and the
+/// ClaudePreEdit output tests.
 fn allow_output(variant: HookVariant) -> Option<&'static str> {
     match variant {
         HookVariant::ClaudePreRead => Some(
@@ -1006,7 +1563,8 @@ fn allow_output(variant: HookVariant) -> Option<&'static str> {
         | HookVariant::CodexPostBash
         | HookVariant::CodexPreApplyPatch
         | HookVariant::ClaudePreEdit
-        | HookVariant::ClaudePostMemGet => None,
+        | HookVariant::ClaudePostMemGet
+        | HookVariant::ClaudePostBash => None,
     }
 }
 
@@ -1157,11 +1715,12 @@ fn apply_consult_mandate(
             "[mati] Org policy requires consulting {rel_path} before access — \
              call mem_get(\"{file_key}\") first."
         ),
+        origin: decide::DenyOrigin::ConsultMandate,
     };
     let events = platform_events(
         variant,
         &decision,
-        vec![HookEvent::FloorConsultBlocked { key: file_key }],
+        vec![decide::DenyOrigin::ConsultMandate.deny_event(file_key)],
     );
     let (stdout, stderr, exit_code) = format_decision(variant, &decision, rel_path);
     *adapter = AdapterResult {
@@ -1312,20 +1871,39 @@ fn format_decision(
             // actual cause — a local gotcha OR an org consultation mandate — instead of always
             // claiming "Confirmed gotcha".
             Decision::Deny { reason, .. } => (format_deny(reason), String::new(), 0),
-            // Non-deny: DEFER to the normal permission flow (empty stdout, exit 0).
-            // Deliberately NOT permissionDecision:"allow" — see pre_edit.rs.
+            Decision::Advisory { context } | Decision::Liability { context, .. } => (
+                format_context_only(&format!("[mati] {context}")),
+                String::new(),
+                0,
+            ),
+            // All other non-deny outcomes defer with empty stdout; never force-allow an edit.
             _ => (String::new(), String::new(), 0),
         },
         HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => match decision {
-            Decision::Deny { file_key, .. } => {
-                let stderr = format!("mati: call mem_get(\"{file_key}\") first");
+            Decision::Deny {
+                file_key,
+                reason,
+                origin,
+            } => {
+                // A policy deny keys on the policy, which is not a consultable
+                // record: its `reason` names the key that actually clears it.
+                // Printing file_key there would tell the agent to mem_get the
+                // policy itself, minting a receipt that never matches
+                // requires.key. Matched exhaustively so a new origin has to
+                // choose a shape rather than inherit one.
+                let stderr = match origin {
+                    decide::DenyOrigin::Policy => reason.clone(),
+                    decide::DenyOrigin::Gotcha | decide::DenyOrigin::ConsultMandate => {
+                        format!("mati: call mem_get(\"{file_key}\") first")
+                    }
+                };
                 (String::new(), stderr, 2)
             }
             _ => (String::new(), String::new(), 0),
         },
-        HookVariant::CodexPostBash | HookVariant::ClaudePostMemGet => {
-            (String::new(), String::new(), 0)
-        }
+        HookVariant::CodexPostBash
+        | HookVariant::ClaudePostMemGet
+        | HookVariant::ClaudePostBash => (String::new(), String::new(), 0),
     }
 }
 
@@ -1383,6 +1961,216 @@ fn format_claude_output(decision: &Decision) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn schema_introspection_exempts_matching_strict_block() {
+        let input = json!({
+            "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
+        });
+        assert!(policy_block_exempt(HookVariant::ClaudePreBash, &input));
+        assert!(policy_block_exempt(HookVariant::CodexPreBash, &input));
+
+        let result = decide::evaluate_policy_verdicts(
+            &[decide::PolicyVerdict {
+                key: "policy:prod-query".into(),
+                rule: "Inspect production schema first.".into(),
+                requires_key: "schema:orders".into(),
+                block: false,
+                satisfied: false,
+                stage: mati_core::store::PolicyStage::Enforce,
+            }],
+            true,
+        );
+        assert!(matches!(result.decision, Decision::Advisory { .. }));
+    }
+
+    #[test]
+    fn schema_introspection_exemption_produces_no_shadow_observation() {
+        let input = json!({
+            "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
+        });
+        assert!(policy_block_exempt(HookVariant::ClaudePreBash, &input));
+        assert!(policy_block_exempt(HookVariant::CodexPreBash, &input));
+        let verdicts = policy_core_verdicts(
+            &[mati_core::mcp::protocol::PolicyVerdict {
+                key: "policy:prod-query".into(),
+                stage: mati_core::store::PolicyStage::Shadow,
+                mode: mati_core::store::PolicyMode::Block,
+                rule: "Inspect production schema first.".into(),
+                reason: "Schema drift matters.".into(),
+                severity: mati_core::store::Priority::High,
+                requires_key: "schema:orders".into(),
+                satisfied: false,
+                via: vec![],
+                strict: true,
+            }],
+            true,
+        );
+        let result = decide::evaluate_policy_verdicts(&verdicts, true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, HookEvent::PolicyShadowObserved { .. })));
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, HookEvent::PolicyConsulted { .. })));
+    }
+
+    #[test]
+    fn schema_introspection_exemption_preserves_satisfied_block() {
+        let result = decide::evaluate_policy_verdicts(
+            &[decide::PolicyVerdict {
+                key: "policy:prod-query".into(),
+                rule: "Inspect production schema first.".into(),
+                requires_key: "schema:orders".into(),
+                block: true,
+                satisfied: true,
+                stage: mati_core::store::PolicyStage::Enforce,
+            }],
+            true,
+        );
+        assert_eq!(result.decision, Decision::Allow);
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsulted {
+                key: "policy:prod-query".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn post_bash_success_gating_rejects_failures() {
+        let command = "psql -c \"\\d orders\"";
+        assert!(post_bash_succeeded(&json!({
+            "tool_input": {"command": command},
+            "tool_response": {"isError": false, "exit_code": 0}
+        })));
+        // The real Claude Code shape: no isError, no exit status.
+        assert!(post_bash_succeeded(&json!({
+            "tool_input": {"command": command},
+            "tool_response": {
+                "stdout": "Table \"public.inventory\"", "stderr": "",
+                "interrupted": false, "isImage": false, "noOutputExpected": false
+            }
+        })));
+        // exit_code alone is still honored when a payload carries it.
+        assert!(post_bash_succeeded(&json!({
+            "tool_input": {"command": command},
+            "tool_response": {"exit_code": 0}
+        })));
+        for response in [
+            json!({"isError": true}),
+            json!({"is_error": true}),
+            json!({"exit_code": 1}),
+            json!({"exitCode": 2}),
+            json!({"interrupted": true}),
+            json!({"stdout": "x", "interrupted": true, "isImage": false}),
+        ] {
+            assert!(!post_bash_succeeded(&json!({
+                "tool_input": {"command": command},
+                "tool_response": response
+            })));
+        }
+        assert!(!post_bash_succeeded(&json!({
+            "tool_input": {"command": command}
+        })));
+    }
+
+    #[test]
+    fn post_bash_receipts_ignore_memget_only_policies() {
+        assert!(!accepts_db_introspection(&[
+            mati_core::store::ReceiptSource::MemGet
+        ]));
+        assert!(accepts_db_introspection(&[
+            mati_core::store::ReceiptSource::DbIntrospection
+        ]));
+        assert!(accepts_db_introspection(&[
+            mati_core::store::ReceiptSource::MemGet,
+            mati_core::store::ReceiptSource::DbIntrospection,
+        ]));
+    }
+
+    async fn assert_main_thread_receipt_is_global(key: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mati_core::store::Store::open(dir.path()).await.unwrap();
+        let actor = receipt_actor(None, Some("session-main"));
+        let (receipt_key, bytes) =
+            mati_core::store::session::consultation_receipt_staged_for_store(
+                &store, key, actor, false,
+            )
+            .await
+            .unwrap();
+        let receipt: mati_core::store::Record = rmp_serde::from_slice(&bytes).unwrap();
+        store.put(&receipt_key, &receipt).await.unwrap();
+        assert_eq!(receipt_key, format!("session:consulted:{key}"));
+        assert!(
+            mati_core::store::session::check_consulted_recent(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+        assert!(!mati_core::store::session::check_consulted_recent(
+            &store,
+            key,
+            900,
+            Some("session-main")
+        )
+        .await
+        .unwrap());
+    }
+
+    /// Both mint paths derive their actor identically, so one test covers
+    /// them. A session_id must not become receipt scope: the gate reads the
+    /// global receipt for the main thread, so scoping by session would mint a
+    /// receipt nothing ever checks and the policy would never unlock.
+    #[tokio::test]
+    async fn main_thread_receipt_uses_global_gate_scope() {
+        assert_main_thread_receipt_is_global("schema:orders").await;
+    }
+
+    /// The other half: an agent_id is real scope, and its receipt must not
+    /// satisfy the gate for anyone else.
+    #[tokio::test]
+    async fn subagent_receipt_stays_actor_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mati_core::store::Store::open(dir.path()).await.unwrap();
+        let key = "schema:orders";
+        let actor = receipt_actor(Some("agent-a"), Some("session-main"));
+        assert_eq!(actor, Some("agent-a"));
+
+        let (receipt_key, bytes) =
+            mati_core::store::session::consultation_receipt_staged_for_store(
+                &store, key, actor, false,
+            )
+            .await
+            .unwrap();
+        let receipt: mati_core::store::Record = rmp_serde::from_slice(&bytes).unwrap();
+        store.put(&receipt_key, &receipt).await.unwrap();
+        assert_eq!(receipt_key, format!("session:consulted:agent-a:{key}"));
+
+        assert!(mati_core::store::session::check_consulted_recent(
+            &store,
+            key,
+            900,
+            Some("agent-a")
+        )
+        .await
+        .unwrap());
+        assert!(!mati_core::store::session::check_consulted_recent(
+            &store,
+            key,
+            900,
+            Some("agent-b")
+        )
+        .await
+        .unwrap());
+        assert!(
+            !mati_core::store::session::check_consulted_recent(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
 
     // ── extract_path ────────────────────────────────────────────────────
 
@@ -1451,6 +2239,7 @@ mod tests {
         let decision = Decision::Deny {
             file_key: "file:src/main.rs".into(),
             reason: "test".into(),
+            origin: decide::DenyOrigin::Gotcha,
         };
         let result = platform_events(HookVariant::CodexPreBash, &decision, events);
         assert_eq!(result.len(), 1);
@@ -1537,6 +2326,7 @@ mod tests {
         let decision = Decision::Deny {
             file_key: "file:src/main.rs".into(),
             reason: "test".into(),
+            origin: decide::DenyOrigin::Gotcha,
         };
         let result = platform_events(HookVariant::ClaudePreBash, &decision, events);
         assert_eq!(result.len(), 1);
@@ -1933,6 +2723,7 @@ mod tests {
             CodexPostBash,
             CodexPreApplyPatch,
             ClaudePostMemGet,
+            ClaudePostBash,
         ] {
             // 1. The fail-open / no-path allow output.
             match variant {
@@ -1972,6 +2763,248 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn policy_bash_output_denies_or_injects_without_force_allow() {
+        let deny = Decision::Deny {
+            file_key: "policy:prod-query".into(),
+            reason: "mati: policy policy:prod-query blocked this action. Consult first: mem_get(\"schema:orders\")".into(),
+            origin: decide::DenyOrigin::Policy,
+        };
+        let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &deny, "<policy>");
+        assert!(stdout.contains(r#""permissionDecision":"deny""#));
+        assert!(stdout.contains("policy:prod-query"));
+        assert!(stdout.contains("schema:orders"));
+
+        let steer = Decision::Advisory {
+            context: "Consult the schema first.".into(),
+        };
+        let (stdout, _, _) = format_decision(HookVariant::ClaudePreBash, &steer, "<policy>");
+        assert!(stdout.contains("additionalContext"));
+        assert!(!stdout.contains("permissionDecision"));
+    }
+
+    #[test]
+    fn codex_db_client_policy_gates_cover_fileless_file_bearing_and_introspection() {
+        let deny_verdict = decide::PolicyVerdict {
+            key: "policy:prod-query".into(),
+            rule: "Consult the schema first.".into(),
+            requires_key: "schema:orders".into(),
+            block: true,
+            satisfied: false,
+            stage: mati_core::store::PolicyStage::Enforce,
+        };
+
+        let fileless =
+            decide::normalize_action(Some("psql -h db.prod.internal -c \"select 1\""), None);
+        let file_bearing = decide::normalize_action(
+            Some("psql -h db.prod.internal -f migrations/prod.sql"),
+            None,
+        );
+        assert_eq!(fileless.tool, "db_client");
+        assert!(fileless.files.is_empty());
+        assert_eq!(file_bearing.tool, "db_client");
+        assert_eq!(file_bearing.files, vec!["migrations/prod.sql"]);
+
+        for action in [fileless, file_bearing] {
+            assert_eq!(action.host.as_deref(), Some("db.prod.internal"));
+            let result =
+                decide::evaluate_policy_verdicts(std::slice::from_ref(&deny_verdict), true);
+            let (stdout, stderr, exit_code) =
+                format_decision(HookVariant::CodexPreBash, &result.decision, "<policy>");
+            assert!(stdout.is_empty());
+            assert!(stderr.starts_with("mati:"));
+            assert_eq!(exit_code, 2);
+        }
+
+        let introspection_input = json!({
+            "tool_input": {"command": "psql -h db.prod.internal -c \"\\d orders\""}
+        });
+        assert!(policy_block_exempt(
+            HookVariant::CodexPreBash,
+            &introspection_input
+        ));
+        let mut exempt_verdict = deny_verdict;
+        exempt_verdict.block = false;
+        let steered = decide::evaluate_policy_verdicts(std::slice::from_ref(&exempt_verdict), true);
+        let (stdout, stderr, exit_code) =
+            format_decision(HookVariant::CodexPreBash, &steered.decision, "<policy>");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn claude_pre_edit_context_never_force_allows() {
+        let outcomes = [
+            Decision::AlreadyConsulted {
+                context: "Already consulted.".into(),
+            },
+            Decision::Advisory {
+                context: "Consult the schema first.".into(),
+            },
+            Decision::Liability {
+                staleness: 0.8,
+                context: "This record is stale.".into(),
+            },
+            Decision::Allow,
+            Decision::NoRecord,
+            Decision::Tombstone,
+            Decision::NotFileRead,
+        ];
+        for decision in outcomes {
+            let (stdout, _, _) = format_decision(HookVariant::ClaudePreEdit, &decision, "x.sql");
+            assert!(!stdout.contains(r#""permissionDecision":"allow""#));
+        }
+
+        let (stdout, _, _) = format_decision(
+            HookVariant::ClaudePreEdit,
+            &Decision::Advisory {
+                context: "Consult first.".into(),
+            },
+            "x.sql",
+        );
+        assert!(stdout.contains("additionalContext"));
+        assert!(!stdout.contains("permissionDecision"));
+    }
+
+    #[test]
+    fn file_gate_and_policy_merge_escalate_only() {
+        let mut adapter = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![HookEvent::Hit {
+                key: "file:prod.sql".into(),
+            }],
+            decision: Decision::Advisory {
+                context: "File guidance.".into(),
+            },
+        };
+        merge_policy_result(
+            &mut adapter,
+            HookVariant::ClaudePreBash,
+            Decision::Advisory {
+                context: "Consult the schema first.".into(),
+            },
+            vec![HookEvent::PolicyConsulted {
+                key: "policy:prod-query".into(),
+            }],
+        );
+        assert_eq!(
+            adapter.decision,
+            Decision::Advisory {
+                context: "File guidance.\nConsult the schema first.".into(),
+            }
+        );
+        assert_eq!(adapter.events.len(), 2);
+        assert!(adapter.stdout.contains("additionalContext"));
+        assert!(!adapter.stdout.contains("permissionDecision"));
+
+        merge_policy_result(
+            &mut adapter,
+            HookVariant::ClaudePreBash,
+            Decision::Deny {
+                file_key: "policy:prod-query".into(),
+                reason: "policy denied".into(),
+                origin: decide::DenyOrigin::Policy,
+            },
+            vec![HookEvent::PolicyConsultBlocked {
+                key: "policy:prod-query".into(),
+            }],
+        );
+        assert!(matches!(adapter.decision, Decision::Deny { .. }));
+        assert!(adapter.stdout.contains(r#""permissionDecision":"deny""#));
+
+        let mut edit_adapter = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::NoRecord,
+        };
+        merge_policy_result(
+            &mut edit_adapter,
+            HookVariant::ClaudePreEdit,
+            Decision::Advisory {
+                context: "Edit policy guidance.".into(),
+            },
+            vec![],
+        );
+        assert!(edit_adapter.stdout.contains("additionalContext"));
+        assert!(!edit_adapter.stdout.contains("permissionDecision"));
+
+        edit_adapter.decision = Decision::Deny {
+            file_key: "file:x.sql".into(),
+            reason: "gotcha denied".into(),
+            origin: decide::DenyOrigin::Gotcha,
+        };
+        merge_policy_result(
+            &mut edit_adapter,
+            HookVariant::ClaudePreEdit,
+            Decision::Advisory {
+                context: "Must not lower the edit deny.".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(edit_adapter.decision, Decision::Deny { .. }));
+        assert!(edit_adapter
+            .stdout
+            .contains(r#""permissionDecision":"deny""#));
+
+        let mut edit_consulted = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::AlreadyConsulted {
+                context: "Record already consulted. Gotcha guidance.".into(),
+            },
+        };
+        merge_policy_result(
+            &mut edit_consulted,
+            HookVariant::ClaudePreEdit,
+            Decision::Advisory {
+                context: "Policy rule for this edit.".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(edit_consulted.decision, Decision::Advisory { .. }));
+        assert!(edit_consulted.stdout.contains("Policy rule for this edit."));
+        assert!(edit_consulted.stdout.contains("additionalContext"));
+        assert!(!edit_consulted.stdout.contains("permissionDecision"));
+        assert!(!edit_consulted.stdout.contains("Record already consulted"));
+
+        let mut bash_consulted = AdapterResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            events: vec![],
+            decision: Decision::AlreadyConsulted {
+                context: "Record already consulted. Gotcha guidance.".into(),
+            },
+        };
+        merge_policy_result(
+            &mut bash_consulted,
+            HookVariant::ClaudePreBash,
+            Decision::Advisory {
+                context: "Policy rule for this command.".into(),
+            },
+            vec![],
+        );
+        assert!(matches!(
+            bash_consulted.decision,
+            Decision::AlreadyConsulted { ref context }
+                if context.contains("Record already consulted")
+                    && context.contains("Policy rule for this command.")
+        ));
+        assert!(bash_consulted
+            .stdout
+            .contains("Record already consulted. Gotcha guidance."));
+        assert!(bash_consulted
+            .stdout
+            .contains("Policy rule for this command."));
     }
 
     #[test]
@@ -2111,6 +3144,14 @@ mod tests {
     }
 
     #[test]
+    fn edit_policy_actions_use_the_path_category_and_target() {
+        let action = decide::normalize_action(None, Some("migrations/prod.sql"));
+        assert_eq!(action.tool, "path");
+        assert_eq!(action.target_path.as_deref(), Some("migrations/prod.sql"));
+        assert_eq!(action.files, vec!["migrations/prod.sql"]);
+    }
+
+    #[test]
     fn extract_path_codex_pre_bash_egrep_and_fgrep() {
         // egrep/fgrep satisfy Claude's read-before-edit; mati now detects them so
         // they can't be used to satisfy the read requirement unconsulted.
@@ -2164,18 +3205,14 @@ mod tests {
     #[test]
     fn e2e_claude_pre_edit_defers_after_consult() {
         // With a RECENT consultation receipt (consulted_recent, matching the
-        // Codex apply_patch edit gate), the edit DEFERS to the normal permission
-        // flow (empty stdout, exit 0) — deliberately NOT a forced allow.
+        // Codex apply_patch edit gate), the edit keeps its normal permission
+        // flow and defers silently — deliberately NOT a forced allow.
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
         let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
 
         assert_eq!(result.exit_code, 0);
-        assert!(
-            result.stdout.is_empty(),
-            "consulted edit must DEFER (empty stdout), not force-allow, got: {}",
-            result.stdout
-        );
+        assert!(result.stdout.is_empty());
         assert!(result.stderr.is_empty());
         assert!(matches!(result.decision, Decision::AlreadyConsulted { .. }));
         // Plane 2: a consulted edit records an EditConsulted event (→
@@ -2488,6 +3525,7 @@ mod tests {
             decision: Decision::Deny {
                 file_key: "file:phi/x.rs".to_string(),
                 reason: "gotcha-deny".to_string(),
+                origin: decide::DenyOrigin::Gotcha,
             },
         };
         apply_consult_mandate(

@@ -527,7 +527,7 @@ async fn update_file_gotcha_key(
             // gotcha key so the read gate — which keys on
             // `file_record.payload.gotcha_keys` (hooks/decide.rs) — enforces
             // IMMEDIATELY. Without this the gotcha is silently inert until the
-            // next `mati init` §8c back-fill. init/reparse later merge
+            // next `mati init` section 8c back-fill. init/reparse later merge
             // real analysis and preserve gotcha_keys (reparse.rs).
             if add {
                 let now = now_secs();

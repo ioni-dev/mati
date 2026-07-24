@@ -65,6 +65,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use mati_core::graph::Graph;
+use mati_core::hooks::policy_match::PolicyMatcherSet;
 use mati_core::store::{derive_slug, Store};
 
 // ── CLI subcommand types ──────────────────────────────────────────────────────
@@ -392,6 +393,9 @@ pub async fn run_daemon_start() -> Result<()> {
     }
 
     let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let policy_matcher = Arc::new(tokio::sync::RwLock::new(
+        mati_core::mcp::dispatch_v2::load_policy_matcher(graph.read().await.store()).await,
+    ));
 
     let (sock_path, pid_path) = {
         let g = graph.read().await;
@@ -572,6 +576,7 @@ pub async fn run_daemon_start() -> Result<()> {
     tokio::join!(
         serve_loop_graceful(
             Arc::clone(&graph),
+            Arc::clone(&policy_matcher),
             &repo_root,
             &listener,
             &last_wall,
@@ -713,6 +718,7 @@ pub async fn run_daemon_start() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn serve_loop_graceful(
     graph: Arc<tokio::sync::RwLock<Graph>>,
+    policy_matcher: Arc<tokio::sync::RwLock<PolicyMatcherSet>>,
     repo_root: &Path,
     listener: &UnixListener,
     last_wall: &AtomicU64,
@@ -790,6 +796,7 @@ async fn serve_loop_graceful(
         // the active-connection counter and arm an RAII guard so the
         // count decrements on any task exit (clean, error, or panic).
         let graph_clone = Arc::clone(&graph);
+        let policy_matcher_clone = Arc::clone(&policy_matcher);
         let repo_root_clone = Arc::clone(&repo_root_arc);
         active_connections.fetch_add(1, Ordering::Relaxed);
         let conn_guard = ConnGuard(Arc::clone(active_connections));
@@ -798,6 +805,7 @@ async fn serve_loop_graceful(
             let _conn_guard = conn_guard;
             if let Err(e) = mati_core::mcp::server::socket_handle_connection(
                 graph_clone,
+                policy_matcher_clone,
                 &repo_root_clone,
                 stream,
                 peer,

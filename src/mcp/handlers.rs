@@ -27,8 +27,9 @@ use crate::health::quality;
 use crate::mcp::protocol::{self, AuditEntry, ErrorCode};
 use crate::store::db::KnowledgeWriteOp;
 use crate::store::record::{
-    Category, ConfidenceScore, FileRecord, GotchaRecord, Priority as StorePriority, QualityScore,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, TombstoneReason,
+    Category, ConfidenceScore, FileRecord, GotchaRecord, PolicyRecord, Priority as StorePriority,
+    QualityScore, Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    TombstoneReason,
 };
 use crate::store::Store;
 
@@ -1351,7 +1352,13 @@ pub(crate) async fn handle_mem_get(
     };
 
     // 3. Sessions-tree transaction: consultation receipt + audit.
-    let receipt = match crate::store::session::consultation_receipt_staged(&input.key, None) {
+    let receipt = match crate::store::session::consultation_receipt_staged_with_fingerprint(
+        &input.key,
+        None,
+        record
+            .as_ref()
+            .and_then(crate::store::session::record_content_fingerprint),
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
@@ -1997,6 +2004,10 @@ pub(crate) async fn handle_record_import(
         "file:",
         "stage:",
         "dep:",
+        // Policies are user-authored source of truth and belong in a
+        // backup. show::deactivate_imported_policies lands them at stage
+        // off, so a restore never silently starts enforcing.
+        "policy:",
     ];
 
     // First pass: filter records into knowledge-tree-only buckets and skip
@@ -2105,12 +2116,12 @@ async fn apply_mem_set_write(
     // The Socket path enforces the same restriction in
     // `build_mem_set_command`; both backends now accept and
     // reject identical key prefixes.
-    let valid_prefix = ["gotcha:", "decision:", "dev_note:"]
+    let valid_prefix = ["gotcha:", "decision:", "dev_note:", "policy:"]
         .iter()
         .any(|p| params.key.starts_with(p));
     if !valid_prefix {
         return serde_json::json!({
-            "error": "key must start with gotcha:, decision:, or dev_note:"
+            "error": "key must start with gotcha:, decision:, dev_note:, or policy:"
         })
         .to_string();
     }
@@ -2122,9 +2133,10 @@ async fn apply_mem_set_write(
         "Gotcha" => Category::Gotcha,
         "Decision" => Category::Decision,
         "DevNote" => Category::DevNote,
+        "Policy" => Category::Policy,
         other => {
             return serde_json::json!({
-                "error": format!("unknown category: {other}. Valid: Gotcha, Decision, DevNote")
+                "error": format!("unknown category: {other}. Valid: Gotcha, Decision, DevNote, Policy")
             })
             .to_string();
         }
@@ -2160,6 +2172,7 @@ async fn apply_mem_set_write(
         "gotcha" => Category::Gotcha,
         "decision" => Category::Decision,
         "dev_note" => Category::DevNote,
+        "policy" => Category::Policy,
         _ => unreachable!("key prefix already validated"),
     };
     if category != expected_category {
@@ -2167,6 +2180,64 @@ async fn apply_mem_set_write(
             "error": format!(
                 "key prefix requires category {expected_category:?}, got {category:?}"
             )
+        })
+        .to_string();
+    }
+
+    if category == Category::Policy {
+        let payload = match &params.payload {
+            serde_json::Value::String(s) => {
+                serde_json::from_str(s).unwrap_or_else(|_| params.payload.clone())
+            }
+            other => other.clone(),
+        };
+        let mut policy: PolicyRecord =
+            match serde_json::from_value(payload) {
+                Ok(policy) => policy,
+                Err(error) => return serde_json::json!({
+                    "error": format!("policy payload must deserialize into PolicyRecord: {error}")
+                })
+                .to_string(),
+            };
+        // Agents may create or edit only off policies. Shadow and enforce are
+        // developer-controlled and agent-immutable.
+        if !matches!(policy.stage, crate::store::PolicyStage::Off) {
+            policy.stage = crate::store::PolicyStage::Off;
+        }
+        if let Some(existing) = existing_record.as_ref() {
+            if let Some(existing_policy) = existing.payload_as::<PolicyRecord>() {
+                if !matches!(existing_policy.stage, crate::store::PolicyStage::Off) {
+                    let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
+                    let stage = format!("{:?}", existing_policy.stage).to_ascii_lowercase();
+                    return serde_json::json!({
+                        "error": format!(
+                            "policy {} is {stage}; an agent cannot edit developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.",
+                            params.key
+                        )
+                    })
+                    .to_string();
+                }
+            }
+        }
+        let has_backing_record = match store.get(&policy.requires.key).await {
+            Ok(record) => record.is_some_and(|record| {
+                !matches!(record.lifecycle, RecordLifecycle::Tombstoned { .. })
+            }),
+            Err(error) => return serde_json::json!({"error": error.to_string()}).to_string(),
+        };
+        let result = if existing_record.is_some() && !is_tombstoned {
+            crate::store::policy_ops::edit(store, &params.key, &policy).await
+        } else {
+            crate::store::policy_ops::create(store, &params.key, &policy).await
+        };
+        if let Err(error) = result {
+            return serde_json::json!({"error": error.to_string()}).to_string();
+        }
+        return serde_json::json!({
+            "ok": true,
+            "key": params.key,
+            "stage": "off",
+            "warnings": crate::store::policy_ops::author_warnings(&policy, has_backing_record),
         })
         .to_string();
     }
@@ -2468,6 +2539,12 @@ async fn apply_mem_set_confirm(
     graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
     key: &str,
 ) -> String {
+    if key.starts_with("policy:") {
+        return serde_json::json!({
+            "error": "policies are activated with `mati policy enable <slug>`"
+        })
+        .to_string();
+    }
     if !key.starts_with("gotcha:") {
         return serde_json::json!({"error": "confirm action only applies to gotcha: keys"})
             .to_string();
@@ -2665,6 +2742,37 @@ async fn apply_mem_set_delete(
     graph_arc: &Arc<tokio::sync::RwLock<crate::graph::Graph>>,
     key: &str,
 ) -> String {
+    if key.starts_with("policy:") {
+        let graph = graph_arc.read().await;
+        let record = match graph.store().get(key).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return serde_json::json!({"error": format!("record not found: {key}")}).to_string()
+            }
+            Err(error) => return serde_json::json!({"error": error.to_string()}).to_string(),
+        };
+        if record
+            .payload_as::<PolicyRecord>()
+            .map(|policy| policy.stage)
+            .is_some_and(|stage| !matches!(stage, crate::store::PolicyStage::Off))
+        {
+            let slug = key.strip_prefix("policy:").unwrap_or(key);
+            let stage = record
+                .payload_as::<PolicyRecord>()
+                .map(|policy| format!("{:?}", policy.stage).to_ascii_lowercase())
+                .unwrap_or_else(|| "non-off".into());
+            return serde_json::json!({
+                "error": format!(
+                    "policy {key} is {stage}; an agent cannot delete developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent."
+                )
+            })
+            .to_string();
+        }
+        return match crate::store::policy_ops::delete(graph.store(), key).await {
+            Ok(()) => serde_json::json!({"ok": true, "key": key, "tombstoned": true}).to_string(),
+            Err(error) => serde_json::json!({"error": error.to_string()}).to_string(),
+        };
+    }
     // Phase 1: read lock — validate and tombstone the record.
     let affected_files = {
         let graph = graph_arc.read().await;

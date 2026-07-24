@@ -1,7 +1,8 @@
 {
   "_comment": "Per-layer eval baseline (idea 4). `detection`/`decision` list case ids whose CURRENT output does not match ground truth \u2014 the honest, version-controlled 'here is exactly what we miss' disclosure, surfaced by `mati eval`. The gate asserts each layer's failing set equals its list exactly: a NEW miss fails CI, a FIXED gap forces a baseline update (ratcheting recall up). The grep pattern-vs-path and multi-file-cat gaps were closed (quote-aware tokenizer + multi-path gate); the remaining detection gap is sudo-with-flags (ambiguous wrapper-flag arity). The decision layer is exact.",
   "detection": [
-    "adv-sudo-uroot-cat"
+    "adv-sudo-uroot-cat",
+    "adv-sudo-uroot-psql"
   ],
   "decision": []
 }

@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 const MARKER: &str = "<!-- mati:vector-c -->";
 const END_MARKER: &str = "<!-- /mati:vector-c -->";
 
-/// The Vector C injection text (from ARCHITECTURE.md §9).
+/// The Vector C injection text (from ARCHITECTURE.md section 9).
 ///
 /// Framing: "The PreToolUse hook enforces this" — environmental constraint,
 /// not a behavioral suggestion.
@@ -39,6 +39,34 @@ When the developer says any of these:
 Call mem_set immediately. Do not ask for confirmation.
 Single gotcha from developer request: mem_set then `mati gotcha confirm <key>`.
 Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
+
+## mati Policy Capture
+
+CAPTURE TRIGGERS. Author a policy when the developer either:
+- asks explicitly: \"mati policy: ...\", \"make this a policy\", \"create a policy around this\", \"enforce this\", or \"add a guardrail for this\"; or
+- states a standing directive implicitly: \"from now on\", \"before you ever\", \"always X before Y\", \"never run X without Y\", or \"make it a rule that\".
+In both cases author it without asking for confirmation, matching the existing
+gotcha capture convention. Author policies at `off` and suggest that the
+developer run `mati policy stage <slug> shadow` to review what they would
+catch; promoting one to `enforce` is theirs to do.
+
+NOT EVERY DIRECTIVE IS A POLICY. A policy can only match a governable action
+category: `db_client`, `file_read`, or `path`. If the directive does not map to
+one of those (for example \"always write better commit messages\"), do not author
+a policy whose trigger can never match. Say plainly that it is not enforceable
+as a policy and offer to capture it as a gotcha or dev note instead.
+
+LIFECYCLE. To create, or refine a policy, use `mem_set` with a `policy:<slug>`
+key. Author it at `off` and suggest that the developer run
+`mati policy stage <slug> shadow` to begin review. When the developer asks to
+stage, update, disable, or delete, run the matching
+`mati policy stage|edit|enable|disable|delete <slug>` command via Bash. The
+developer sees a permission prompt and approves it. Promoting a policy to
+`enforce` is the developer's decision. Never claim a policy is live unless its
+stage is `enforce`. Always dry-run a new or changed predicate with
+`mati policy test --trigger`, against both a command that should match and one
+that should not, before writing. Never claim a policy is active unless it was
+actually enabled.
 
 ## /mati-enrich
 
@@ -319,6 +347,12 @@ mod tests {
         assert!(content.contains(END_MARKER));
         assert!(content.contains("mem_get(\"file:<path>\")"));
         assert!(content.contains("PreToolUse hook enforces this"));
+        assert!(content.contains("## mati Policy Capture"));
+        assert!(content.contains("mati policy: ..."));
+        assert!(content.contains("it is not enforceable"));
+        assert!(content.contains("mati policy test --trigger"));
+        assert!(content.contains("mati policy stage|edit|enable|disable|delete <slug>"));
+        assert!(content.contains("mati policy stage <slug> shadow"));
     }
 
     #[test]

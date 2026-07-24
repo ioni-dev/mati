@@ -7,10 +7,12 @@
 //! Having them here avoids code duplication and ensures both paths are
 //! behaviourally identical.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use super::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
@@ -72,9 +74,71 @@ pub fn analytics_record(key: &str, value: String) -> Record {
 pub struct DailyAgg {
     pub count: u64,
     pub keys: Vec<String>,
+    /// Per-target counts for surfaces that need activity by policy, while
+    /// preserving the original aggregate count and bounded key set.
+    #[serde(default)]
+    pub key_counts: BTreeMap<String, u64>,
 }
 
 pub const MAX_AGG_KEYS: usize = 100;
+pub const MAX_SHADOW_OBSERVATIONS: usize = 100;
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ShadowObservation {
+    pub policy_key: String,
+    pub action: crate::hooks::decide::Action,
+    pub timestamp: u64,
+    pub would: crate::hooks::decide::ShadowOutcome,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct ShadowObservationAgg {
+    pub policies: BTreeMap<String, PolicyShadowAgg>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct PolicyShadowAgg {
+    pub count: u64,
+    pub observations: Vec<ShadowObservation>,
+}
+
+pub fn shadow_observation_key() -> String {
+    today_key("analytics:policy_shadow_")
+}
+
+/// Record a bounded daily aggregate for a shadow policy that would have blocked.
+/// This deliberately stays in the eventual session/analytics tree: it is a
+/// review signal, not an enforcement fact and not part of the hash chain.
+pub async fn record_shadow_observation(
+    store: &Store,
+    policy_key: &str,
+    action: &crate::hooks::decide::Action,
+    would: crate::hooks::decide::ShadowOutcome,
+) -> Result<()> {
+    let key = shadow_observation_key();
+    let now = now_secs();
+    let mut record = store
+        .get(&key)
+        .await?
+        .unwrap_or_else(|| analytics_record(&key, String::new()));
+    let mut agg: ShadowObservationAgg = record.payload_as().unwrap_or_default();
+    let policy = agg.policies.entry(policy_key.to_string()).or_default();
+    policy.count += 1;
+    policy.observations.push(ShadowObservation {
+        policy_key: policy_key.to_string(),
+        action: action.clone(),
+        timestamp: now,
+        would,
+    });
+    if policy.observations.len() > MAX_SHADOW_OBSERVATIONS {
+        policy.observations.remove(0);
+    }
+    record.payload = Some(serde_json::to_value(&agg)?);
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+    store.put(&key, &record).await
+}
 
 /// Minimum staleness value for stale review inclusion.
 const STALE_REVIEW_MIN: f32 = 0.4;
@@ -87,6 +151,37 @@ pub const MAX_STALE_REVIEW_ENTRIES: usize = 20;
 /// Minimum access count before an unconfirmed gotcha is auto-promoted.
 pub const GOTCHA_PROMOTION_ACCESS_THRESHOLD: u32 = 3;
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct ConsultationReceipt {
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+/// Hash the stable, knowledge-bearing content of a record. Mutable access and
+/// timestamp metadata are excluded so minting a receipt does not invalidate
+/// itself when `log_hit` updates access tracking.
+pub fn record_content_fingerprint(record: &Record) -> Option<String> {
+    let content = (
+        &record.key,
+        &record.value,
+        &record.category,
+        &record.priority,
+        &record.tags,
+        &record.ref_url,
+        &record.staleness,
+        &record.lifecycle,
+        &record.quality,
+        &record.source,
+        &record.confidence,
+        &record.gap_analysis_score,
+        &record.payload,
+    );
+    let bytes = rmp_serde::to_vec_named(&content).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
     let now = now_secs();
 
@@ -95,8 +190,10 @@ pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) ->
             let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
                 count: 0,
                 keys: vec![],
+                key_counts: BTreeMap::new(),
             });
             agg.count += 1;
+            *agg.key_counts.entry(target_key.to_string()).or_default() += 1;
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
             }
@@ -110,6 +207,7 @@ pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) ->
             let agg = DailyAgg {
                 count: 1,
                 keys: vec![target_key.to_string()],
+                key_counts: BTreeMap::from([(target_key.to_string(), 1)]),
             };
             let mut record = analytics_record(agg_key, String::new());
             record.payload = serde_json::to_value(&agg).ok();
@@ -137,8 +235,10 @@ pub async fn upsert_daily_agg_staged(
             let mut agg: DailyAgg = record.payload_as::<DailyAgg>().unwrap_or(DailyAgg {
                 count: 0,
                 keys: vec![],
+                key_counts: BTreeMap::new(),
             });
             agg.count += 1;
+            *agg.key_counts.entry(target_key.to_string()).or_default() += 1;
             if agg.keys.len() < MAX_AGG_KEYS && !agg.keys.iter().any(|k| k == target_key) {
                 agg.keys.push(target_key.to_string());
             }
@@ -152,6 +252,7 @@ pub async fn upsert_daily_agg_staged(
             let agg = DailyAgg {
                 count: 1,
                 keys: vec![target_key.to_string()],
+                key_counts: BTreeMap::from([(target_key.to_string(), 1)]),
             };
             let mut record = analytics_record(agg_key, String::new());
             record.payload = serde_json::to_value(&agg).ok();
@@ -176,11 +277,41 @@ fn receipt_key(key: &str, actor: Option<&str>) -> String {
 /// When `actor` is `Some`, writes an actor-scoped key `session:consulted:<actor>:<key>`
 /// alongside the global key path. Pass `None` for all existing callers (global).
 pub fn consultation_receipt_staged(key: &str, actor: Option<&str>) -> Result<(String, Vec<u8>)> {
+    consultation_receipt_staged_with_fingerprint(key, actor, None)
+}
+
+pub fn consultation_receipt_staged_with_fingerprint(
+    key: &str,
+    actor: Option<&str>,
+    fingerprint: Option<String>,
+) -> Result<(String, Vec<u8>)> {
     let consulted_key = receipt_key(key, actor);
-    let record = session_record(&consulted_key, String::new());
+    let mut record = session_record(&consulted_key, String::new());
+    if fingerprint.is_some() {
+        record.payload = Some(serde_json::to_value(ConsultationReceipt { fingerprint })?);
+    }
     let bytes = rmp_serde::to_vec_named(&record)
         .with_context(|| format!("failed to serialize consulted receipt for {consulted_key}"))?;
     Ok((consulted_key, bytes))
+}
+
+pub async fn consultation_receipt_staged_for_store(
+    store: &Store,
+    key: &str,
+    actor: Option<&str>,
+    capture_fingerprint: bool,
+) -> Result<(String, Vec<u8>)> {
+    let fingerprint = if capture_fingerprint {
+        store
+            .get(key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|record| record_content_fingerprint(&record))
+    } else {
+        None
+    };
+    consultation_receipt_staged_with_fingerprint(key, actor, fingerprint)
 }
 
 /// Compute the session:current flush record WITHOUT persisting.
@@ -219,13 +350,11 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     upsert_daily_agg(store, &agg_key, key).await?;
 
     // 2. Mark as consulted for session tracking
-    let consulted_key = receipt_key(key, None);
-    store
-        .put(
-            &consulted_key,
-            &session_record(&consulted_key, String::new()),
-        )
-        .await?;
+    let (consulted_key, receipt_bytes) =
+        consultation_receipt_staged_for_store(store, key, None, true).await?;
+    let receipt: Record = rmp_serde::from_slice(&receipt_bytes)
+        .context("failed to deserialize staged consultation receipt")?;
+    store.put(&consulted_key, &receipt).await?;
 
     // 3. Bump access_count and last_accessed on the target record
     if let Some(mut record) = store.get(key).await? {
@@ -329,6 +458,36 @@ pub async fn check_consulted_recent(
     };
     let age = now_secs().saturating_sub(record.updated_at);
     Ok(age <= ttl_secs)
+}
+
+/// Return true only when a recent receipt carries the current record's
+/// fingerprint. Store faults propagate as errors so the caller can fail open;
+/// swallowing them into `false` would fail closed and deny on a mati outage.
+pub async fn check_consulted_recent_fingerprinted(
+    store: &Store,
+    key: &str,
+    ttl_secs: u64,
+    actor: Option<&str>,
+) -> Result<bool> {
+    let consulted_key = receipt_key(key, actor);
+    let Some(receipt) = store.get(&consulted_key).await? else {
+        return Ok(false);
+    };
+    if now_secs().saturating_sub(receipt.updated_at) > ttl_secs {
+        return Ok(false);
+    }
+    let Some(stored) = receipt
+        .payload_as::<ConsultationReceipt>()
+        .and_then(|payload| payload.fingerprint)
+    else {
+        return Ok(false);
+    };
+    // A store read fault must remain an Err so hook callers fail open, never Ok(false).
+    let current = store
+        .get(key)
+        .await?
+        .and_then(|record| record_content_fingerprint(&record));
+    Ok(current.is_some_and(|current| current == stored))
 }
 
 // ── session_flush ─────────────────────────────────────────────────────────────
@@ -846,6 +1005,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shadow_observation_caps_are_isolated_and_keep_recent_entries() {
+        let (_dir, store) = temp_store().await;
+        let action = crate::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.example".into()),
+            argv: vec![],
+            files: vec![],
+        };
+        for index in 0..=MAX_SHADOW_OBSERVATIONS {
+            let mut action = action.clone();
+            action.argv = vec![index.to_string()];
+            record_shadow_observation(
+                &store,
+                "policy:noisy",
+                &action,
+                crate::hooks::decide::ShadowOutcome::Block,
+            )
+            .await
+            .unwrap();
+        }
+        record_shadow_observation(
+            &store,
+            "policy:quiet",
+            &action,
+            crate::hooks::decide::ShadowOutcome::Steer,
+        )
+        .await
+        .unwrap();
+
+        let record = store.get(&shadow_observation_key()).await.unwrap().unwrap();
+        let agg = record.payload_as::<ShadowObservationAgg>().unwrap();
+        let noisy = &agg.policies["policy:noisy"];
+        assert_eq!(noisy.count, (MAX_SHADOW_OBSERVATIONS + 1) as u64);
+        assert_eq!(noisy.observations.len(), MAX_SHADOW_OBSERVATIONS);
+        assert_eq!(noisy.observations[0].action.argv, vec!["1"]);
+        assert_eq!(agg.policies["policy:quiet"].count, 1);
+        assert_eq!(agg.policies["policy:quiet"].observations.len(), 1);
+    }
+
+    #[tokio::test]
     async fn check_consulted_recent_uses_receipt_ttl() {
         let (_dir, store) = temp_store().await;
         let key = "file:src/main.rs";
@@ -859,6 +1059,104 @@ mod tests {
         assert!(check_consulted_recent(&store, key, 900, None)
             .await
             .expect("fresh receipt should be valid"));
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_receipt_invalidates_after_content_drift() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        log_hit(&store, key).await.unwrap();
+
+        let receipt = store.get(&receipt_key(key, None)).await.unwrap().unwrap();
+        assert!(receipt
+            .payload_as::<ConsultationReceipt>()
+            .and_then(|payload| payload.fingerprint)
+            .is_some());
+        assert!(check_consulted_recent_fingerprinted(&store, key, 900, None)
+            .await
+            .unwrap());
+
+        let mut changed = store.get(key).await.unwrap().unwrap();
+        changed.value = "orders v2".into();
+        store.put(key, &changed).await.unwrap();
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_rejects_missing_receipt() {
+        let (_dir, store) = temp_store().await;
+
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, "schema:orders", 900, None)
+                .await
+                .expect("missing receipt is a legitimate non-satisfaction")
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_rejects_legacy_or_introspection_receipts() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        let (receipt_key_value, receipt_bytes) = consultation_receipt_staged(key, None).unwrap();
+        store
+            .transact_sessions_raw(&[(&receipt_key_value, &receipt_bytes)])
+            .await
+            .unwrap();
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_still_enforces_ttl() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        log_hit(&store, key).await.unwrap();
+        let receipt_key_value = receipt_key(key, None);
+        let mut receipt = store.get(&receipt_key_value).await.unwrap().unwrap();
+        receipt.updated_at = 0;
+        store.put(&receipt_key_value, &receipt).await.unwrap();
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprinted_check_rejects_deleted_required_record() {
+        let (_dir, store) = temp_store().await;
+        let key = "schema:orders";
+        store
+            .put(key, &session_record(key, "orders v1".into()))
+            .await
+            .unwrap();
+        log_hit(&store, key).await.unwrap();
+        store.delete(key).await.unwrap();
+
+        assert!(
+            !check_consulted_recent_fingerprinted(&store, key, 900, None)
+                .await
+                .expect("deleted record is a legitimate non-satisfaction")
+        );
     }
 
     #[tokio::test]

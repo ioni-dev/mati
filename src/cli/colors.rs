@@ -1,4 +1,4 @@
-/// ANSI 24-bit colour constants — spec: CLAUDE.md §CLI Color Semantics.
+/// ANSI 24-bit colour constants — spec: CLAUDE.md, CLI Color Semantics.
 ///
 /// Import with `use super::colors;` and reference as `colors::RED` etc., or
 /// glob-import inside a function to enable conditional-color rebinding:

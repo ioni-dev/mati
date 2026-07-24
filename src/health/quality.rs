@@ -1,7 +1,7 @@
 //! Record quality analyzer (M-08-G).
 //!
 //! Pure synchronous quality scoring — no I/O, no async. Formula matches
-//! ARCHITECTURE.md §5 exactly.
+//! ARCHITECTURE.md section 5 exactly.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -97,7 +97,7 @@ const VAGUE_PHRASES: &[&str] = &[
     "not sure",
 ];
 
-// ── Quality formula weights (ARCHITECTURE.md §5) ────────────────────────────
+// ── Quality formula weights (ARCHITECTURE.md section 5) ────────────────────────────
 
 const W_IMPERATIVE: f32 = 0.20;
 const W_CAUSALITY: f32 = 0.25;
@@ -113,7 +113,7 @@ const PENALTY_TOO_SHORT: f32 = 0.4;
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /// Compute a `QualityScore` for a record using the formula from
-/// ARCHITECTURE.md §5.
+/// ARCHITECTURE.md section 5.
 pub fn analyze(record: &Record) -> QualityScore {
     let text = &record.value;
     let lower = text.to_lowercase();

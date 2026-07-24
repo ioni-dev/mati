@@ -8,7 +8,7 @@
 //! ```text
 //! gotcha:<slug>          file:<path>          decision:<slug>
 //! stage:current          dep:<ecosystem>:<name> dev_note:<slug>
-//! session:<timestamp>    analytics:<type>_<date>
+//! session:<timestamp>    analytics:<type>_<date>  policy:<slug>
 //! graph:edge:<from>:<kind>:<to>
 //! ```
 //!
@@ -62,7 +62,7 @@ pub enum RecordSource {
 /// `MutationEvent` and `Record.created_by` / `Record.last_modified_by`.
 ///
 /// Client-declared, not server-verified — same-UID processes are trusted
-/// (THREAT_MODEL.md §3.C, §3.I; ADR-018). The daemon stamps `pid` from
+/// (THREAT_MODEL.md section 3.C, section 3.I; ADR-018). The daemon stamps `pid` from
 /// `SO_PEERCRED` separately; this enum is the human/tool side of attribution.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +92,7 @@ pub enum Category {
     DevNote,
     Session,
     Analytics,
+    Policy,
 }
 
 /// Severity / importance ranking.
@@ -155,7 +156,7 @@ pub enum QualitySignal {
 
 /// Composite quality score for a [`Record`].
 ///
-/// Formula (ARCHITECTURE.md §5):
+/// Formula (ARCHITECTURE.md section 5):
 /// ```text
 /// quality =
 ///   has_imperative_verb  × 0.20
@@ -288,7 +289,7 @@ impl QualityScore {
 ///
 /// At `Tombstone`: PreToolUse allows file reads through unconditionally.
 /// Record excluded from injection entirely. Trusting a wrong record is a
-/// worse failure mode than a cache miss (ARCHITECTURE.md §17).
+/// worse failure mode than a cache miss (ARCHITECTURE.md section 17).
 ///
 /// Sync merge rule: `Tombstone > Liability > Stale > Aging > Fresh`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -364,7 +365,7 @@ impl std::fmt::Display for StalenessSignal {
 
 /// Replaces the flat `stale: bool` with a scored, tiered system.
 ///
-/// Formula (ARCHITECTURE.md §17):
+/// Formula (ARCHITECTURE.md section 17):
 /// ```text
 /// staleness =
 ///   time_factor       × 0.20
@@ -437,7 +438,7 @@ impl StalenessScore {
 
 /// How much the system trusts this record's accuracy.
 ///
-/// Formula (ARCHITECTURE.md §13.1):
+/// Formula (ARCHITECTURE.md section 13.1):
 /// ```text
 /// base_score:
 ///   DeveloperManual → 0.80
@@ -535,7 +536,7 @@ pub enum RecordLifecycle {
 /// Lamport clock + wall clock per record write.
 ///
 /// Wall clock is **never** used for conflict ordering — only for display.
-/// All ordering uses `logical_clock` (see ARCHITECTURE.md §20).
+/// All ordering uses `logical_clock` (see ARCHITECTURE.md section 20).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RecordVersion {
     /// UUID v7, generated once per device at `mati init`.
@@ -809,6 +810,71 @@ pub struct GotchaRecord {
     pub confirmed: bool,
 }
 
+/// Declarative action predicate stored on a local policy.
+///
+/// This is the persisted shape consumed by the pure policy matcher.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyTrigger {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_glob: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path_glob: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    Steer,
+    Block,
+}
+
+/// Rollout stage for a local policy.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyStage {
+    Off,
+    Shadow,
+    Enforce,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptSource {
+    DbIntrospection,
+    MemGet,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PolicyFreshness {
+    pub ttl_secs: u64,
+    #[serde(default)]
+    pub fingerprint: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRequires {
+    pub key: String,
+    pub via: Vec<ReceiptSource>,
+    pub freshness: PolicyFreshness,
+}
+
+/// A developer-authored local policy stored under `policy:<slug>`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRecord {
+    pub name: String,
+    pub rule: String,
+    pub reason: String,
+    pub scope: String,
+    pub mode: PolicyMode,
+    pub trigger: PolicyTrigger,
+    pub requires: PolicyRequires,
+    pub stage: PolicyStage,
+    pub severity: Priority,
+    pub created_by: String,
+}
+
 // ─────────────────────────────────────────────
 // Stale review (M-13-C)
 // ─────────────────────────────────────────────
@@ -887,7 +953,7 @@ pub struct KnowledgeGap {
 
 /// What `mem_bootstrap()` returns to Claude. Token-budgeted to 2,000 tokens.
 ///
-/// Assembly order (ARCHITECTURE.md §6):
+/// Assembly order (ARCHITECTURE.md section 6):
 /// 1. Resolve `context_files` to graph nodes
 /// 2. Traverse `HasGotcha` edges — direct gotchas for each file
 /// 3. Traverse `Imports` one hop — gotchas for imported files
@@ -934,7 +1000,7 @@ pub struct ContextPacket {
 
 /// Onboarding time estimate based on current knowledge coverage.
 ///
-/// Formula (ARCHITECTURE.md §13.3):
+/// Formula (ARCHITECTURE.md section 13.3):
 /// ```text
 /// base_time = 22 minutes
 ///
@@ -1128,6 +1194,62 @@ mod tests {
             confirmed: true,
         };
         assert_serde_roundtrip(&gotcha);
+    }
+
+    #[test]
+    fn policy_record_roundtrips_through_record_messagepack() {
+        let policy = PolicyRecord {
+            name: "Production query safety".into(),
+            rule: "Consult the production schema before querying it.".into(),
+            reason: "Queries can target incompatible production tables because schemas drift."
+                .into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Block,
+            trigger: PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: PolicyRequires {
+                key: "schema:orders_db".into(),
+                via: vec![ReceiptSource::DbIntrospection, ReceiptSource::MemGet],
+                freshness: PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
+            },
+            stage: PolicyStage::Enforce,
+            severity: Priority::Critical,
+            created_by: "developer".into(),
+        };
+        let record = Record {
+            key: "policy:production-query-safety".into(),
+            value: policy.rule.clone(),
+            category: Category::Policy,
+            priority: policy.severity.clone(),
+            tags: vec![],
+            created_at: 1_710_520_800,
+            updated_at: 1_710_520_800,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle: RecordLifecycle::Active,
+            version: RecordVersion {
+                device_id: device_id(),
+                logical_clock: 1,
+                wall_clock: 1_710_520_800,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::DeveloperManual,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+            gap_analysis_score: 0.0,
+            payload: Some(serde_json::to_value(&policy).unwrap()),
+        };
+        let bytes = rmp_serde::to_vec_named(&record).unwrap();
+        let restored: Record = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(restored.category, Category::Policy);
+        assert_eq!(restored.payload_as::<PolicyRecord>().unwrap(), policy);
     }
 
     #[test]

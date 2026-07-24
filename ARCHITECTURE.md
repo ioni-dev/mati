@@ -1,10 +1,10 @@
 # ARCHITECTURE.md: mati
 
-Code comments and other docs use the `§N` shorthand for cross-references, for example `§10.1`. Those numbers point to the section headings in this document.
+Code comments and other docs cross-reference these sections by number, for example `section 10.1`. Those numbers point to the section headings in this document.
 
 ---
 
-## §1: Overview
+## 1. Overview
 
 mati is an enforcement layer for what a team knows about its own codebase. Not just a passive memory store that an agent might consult if it happens to ask.
 
@@ -26,7 +26,7 @@ There is a side benefit: a high-confidence record can sometimes replace a full f
 
 ---
 
-## §2: Design Principles
+## 2. Design Principles
 
 **P1: Hook enforcement comes first. Prompt injection is secondary.**
 
@@ -46,9 +46,9 @@ Every tool definition costs tokens on every Claude call. If a fifth tool feels n
 
 **P4: Memory must reflect developer intent.**
 
-Unconfirmed gotcha records never influence hook enforcement. They exist in the graph and can show up in `mem_bootstrap` as review candidates, but they cannot trigger Deny, and they cannot trigger the gotcha-based context injection path in §10.1 step 4.
+Unconfirmed gotcha records never influence hook enforcement. They exist in the graph and can show up in `mem_bootstrap` as review candidates, but they cannot trigger Deny, and they cannot trigger the gotcha-based context injection path in section 10.1 step 4.
 
-The Advisory path in §10.1 step 5 is separate. It uses the file record’s own confidence and quality scores. Those are not tied to any gotcha’s confirmation state.
+The Advisory path in section 10.1 step 5 is separate. It uses the file record’s own confidence and quality scores. Those are not tied to any gotcha’s confirmation state.
 
 _(P5 and P6 are intentionally unassigned. They were removed during the v0.1 scope reduction. The gaps remain so existing code-comment cross-references do not break.)_
 
@@ -70,7 +70,7 @@ Error messages should say what went wrong first. Tool names, module names, and i
 
 ---
 
-## §3: Repository Layout
+## 3. Repository Layout
 
 ```text
 mati/
@@ -85,7 +85,7 @@ mati/
 │   │   ├── protocol.rs      # v2 typed Request/Response/Command + v1/v2 mapper
 │   │   ├── dispatch_v2.rs   # v2 typed Command to handler dispatch
 │   │   ├── handlers.rs      # handler bodies
-│   │   ├── daemon_lifecycle.rs # ensure_daemon, lifecycle.log readiness (§4.2)
+│   │   ├── daemon_lifecycle.rs # ensure_daemon, lifecycle.log readiness (section 4.2)
 │   │   └── metadata.rs      # DaemonMetadata, panic hook, peer cred, lifecycle log
 │   ├── store/               # SurrealKV layer
 │   │   ├── db.rs            # knowledge.db + sessions.db init
@@ -124,7 +124,7 @@ mati/
 
 ---
 
-## §4: Runtime Architecture
+## 4. Runtime Architecture
 
 After the gamma refactor, mati runs as two separate processes.
 
@@ -152,7 +152,7 @@ After the gamma refactor, mati runs as two separate processes.
 
 **Sandboxed shells cannot reach the socket, and that is not a mati fault.** An AI agent's shell tool may run inside an OS sandbox (macOS Seatbelt) that blocks connecting to Unix domain sockets. Hooks and `mati serve` run outside that sandbox and are unaffected, but `mati` CLI commands invoked from the sandboxed shell get `EACCES` on the socket connect. The store, daemon, and MCP tools all work; only the sandboxed CLI is blocked, and it says so (`DaemonResult::PermissionDenied` surfaces an accurate message rather than a spurious lock or busy error). An agent should read through the MCP tools, or run the command in an unsandboxed shell.
 
-### §4.1: `mati daemon stop` semantics
+### 4.1 `mati daemon stop` semantics
 
 | Flag                    | Effect                                                                                         |
 | ----------------------- | ---------------------------------------------------------------------------------------------- |
@@ -161,7 +161,7 @@ After the gamma refactor, mati runs as two separate processes.
 | `--include-mcp`         | Also kills all `mati serve` processes. MCP sessions die.                                       |
 | `--force --include-mcp` | Sends SIGKILL to the daemon, then SIGKILL to all serves.                                       |
 
-### §4.2: State-aware daemon readiness
+### 4.2 State-aware daemon readiness
 
 `ensure_daemon`, in `src/mcp/daemon_lifecycle.rs`, checks daemon readiness by polling `lifecycle.log` for startup events. It does not rely on timer-based polling.
 
@@ -174,24 +174,24 @@ The public function returns a `bool`. Internally, it calls `wait_for_ready`, whi
 | `Wedged`           | No new event for 15 seconds                            |
 | `HardCap`          | Absolute 60-second budget elapsed                      |
 
-### §4.3: Durability split
+### 4.3 Durability split
 
 Write durability is assigned by key namespace. Do not mix the paths. `durability.rs` treats this table as canonical.
 
 | Durability           | Namespaces                                                                                                    |
 | -------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Immediate (fsync)    | `gotcha:*` `decision:*` `file:*` `stage:*` `dev_note:*` `dep:*`                                               |
+| Immediate (fsync)    | `gotcha:*` `decision:*` `file:*` `stage:*` `dev_note:*` `dep:*` `policy:*`                                     |
 | Eventual (OS buffer) | `session:*` `analytics:*` `hook_event:*` `compliance:*` `graph:edge:*` `health:*` `parse:*` `audit:session:*` |
 
-Unknown prefixes default to Immediate. See §21 for the rationale.
+Unknown prefixes default to Immediate. See section 21 for the rationale.
 
 ---
 
-## §5: Data Model
+## 5. Data Model
 
 All types live in `src/store/record.rs`. Do not redefine them somewhere else because they look “simple enough.” That drift gets expensive.
 
-### §5.1: Record
+### 5.1 Record
 
 `Record` is the universal store entry. Every category uses this struct.
 
@@ -199,24 +199,24 @@ All types live in `src/store/record.rs`. Do not redefine them somewhere else bec
 | -------------------- | ------------------- | ---------------------------------------------------------------------------------- |
 | `key`                | `String`            | Namespaced primary key and graph node key                                          |
 | `value`              | `String`            | Human-readable content: rule, purpose, body. Indexed by tantivy.                   |
-| `category`           | `Category`          | Gotcha, File, Decision, Stage, Dependency, DevNote, Session, Analytics             |
+| `category`           | `Category`          | Gotcha, File, Decision, Stage, Dependency, DevNote, Session, Analytics, Policy      |
 | `priority`           | `Priority`          | Low < Normal < High < Critical. Do not reorder variants because `Ord` is derived.  |
 | `tags`               | `Vec<String>`       | Free-form. Used for search and filtering.                                          |
 | `created_at`         | `u64`               | Unix seconds                                                                       |
 | `updated_at`         | `u64`               | Unix seconds                                                                       |
 | `ref_url`            | `Option<String>`    | PR, issue, doc, or incident link. Boosts confidence 1.5x when set.                 |
-| `staleness`          | `StalenessScore`    | See §17                                                                            |
+| `staleness`          | `StalenessScore`    | See section 17                                                                            |
 | `lifecycle`          | `RecordLifecycle`   | Active, Tombstoned, Superseded                                                     |
-| `version`            | `RecordVersion`     | Lamport clock + device ID. See §20.                                                |
-| `quality`            | `QualityScore`      | See §13.2                                                                          |
+| `version`            | `RecordVersion`     | Lamport clock + device ID. See section 20.                                                |
+| `quality`            | `QualityScore`      | See section 13.2                                                                          |
 | `access_count`       | `u32`               | Total reads through `mem_get` or hooks                                             |
 | `last_accessed`      | `u64`               | Unix seconds                                                                       |
 | `source`             | `RecordSource`      | StaticAnalysis, ClaudeEnrich, SessionHook, DeveloperManual, Import                 |
-| `confidence`         | `ConfidenceScore`   | See §13.1                                                                          |
+| `confidence`         | `ConfidenceScore`   | See section 13.1                                                                          |
 | `gap_analysis_score` | `f32`               | `change_frequency * (1 - coverage_score)`                                          |
 | `payload`            | `Option<JsonValue>` | Typed per-category data, such as FileRecord or GotchaRecord, stored as MessagePack |
 
-### §5.2: FileRecord
+### 5.2 FileRecord
 
 Stored under `file:<path>`. The `FileRecord` is attached to the base `Record` through `payload`.
 
@@ -226,7 +226,7 @@ Stored under `file:<path>`. The `FileRecord` is attached to the base `Record` th
 | `purpose`              | One-sentence summary. Empty at Layer 0, filled by Layer 1 enrichment.                     |
 | `entry_points`         | Public functions and types visible from other modules                                     |
 | `imports`              | Import/use paths found by tree-sitter                                                     |
-| `gotcha_keys`          | Keys of associated `gotcha:*` records. Derived index; see §22.                            |
+| `gotcha_keys`          | Keys of associated `gotcha:*` records. Derived index; see section 22.                            |
 | `decision_keys`        | Keys of associated `decision:*` records                                                   |
 | `todos`                | TodoComment structs: text, line, kind (Todo/Fixme/Hack/Note/Deprecated)                   |
 | `unsafe_count`         | Count of `unsafe` blocks                                                                  |
@@ -239,7 +239,7 @@ Stored under `file:<path>`. The `FileRecord` is attached to the base `Record` th
 | `propagated_staleness` | Staleness inherited from upstream stale sources through Imports edges                     |
 | `content_hash`         | SHA-256 of file content at the last Layer 0 scan                                          |
 
-### §5.3: GotchaRecord
+### 5.3 GotchaRecord
 
 Stored under `gotcha:<slug>`. Like `FileRecord`, it is attached to the base `Record` through `payload`.
 
@@ -254,7 +254,15 @@ Stored under `gotcha:<slug>`. Like `FileRecord`, it is attached to the base `Rec
 
 `confirmed: false` records exist as graph nodes and gap signals. They are not used in hook enforcement. A gotcha can trigger a deny only when `confirmed: true`, `confidence >= 0.6`, and `quality >= 0.4`.
 
-### §5.4: Quality Score formula
+### 5.3a PolicyRecord
+
+Stored under `policy:<slug>` as the typed payload on the universal `Record`.
+Milestone 1 persists the developer-authored fields `name`, `rule`, `reason`,
+`scope`, `mode`, structured `trigger`, structured `requires`, `stage`,
+`severity`, and `created_by`. The trigger and receipt requirements are data only
+until the later policy-matching milestone.
+
+### 5.4 Quality Score formula
 
 ```text
 quality =
@@ -275,7 +283,7 @@ Layer 0 `StaticAnalysis` records default to `0.10`, which puts them in the Suppr
 
 ---
 
-## §6: Context Packet (`mem_bootstrap`)
+## 6. Context Packet (`mem_bootstrap`)
 
 `ContextPacket` is the struct returned by `mem_bootstrap`. The assembled packet is budgeted to 2,000 tokens.
 
@@ -306,7 +314,7 @@ Returned fields:
 
 ---
 
-## §7: Key Namespacing
+## 7. Key Namespacing
 
 Store keys follow this convention:
 
@@ -318,11 +326,11 @@ graph:edge:<from>:<kind>:<to>
 enforcement:event:<seq_no>
 ```
 
-`file:<path>` uses repo-relative paths, normalized lexically. The store key itself does not resolve symlinks; on case-insensitive filesystems, case-folding is applied. Enforcement adds a canonical-key fallback (§24) so a read or edit routed through an in-repo symlink to a gotcha'd file still trips the gate.
+`file:<path>` uses repo-relative paths, normalized lexically. The store key itself does not resolve symlinks; on case-insensitive filesystems, case-folding is applied. Enforcement adds a canonical-key fallback (section 24) so a read or edit routed through an in-repo symlink to a gotcha'd file still trips the gate.
 
 ---
 
-## §8: Storage Layer
+## 8. Storage Layer
 
 Each project gets two SurrealKV trees under `~/.mati/<slug>/`.
 
@@ -369,7 +377,7 @@ After a crash, startup checks for `search_sync_pending` and `search_stale` marke
 
 ---
 
-## §9: Graph Layer
+## 9. Graph Layer
 
 petgraph is the in-memory graph. Edges are persisted in SurrealKV as keys shaped like this:
 
@@ -398,7 +406,7 @@ Edge keys use the slugified kind name: `has_gotcha`, `imports`, `affected_by`, a
 
 ---
 
-## §10: Hook Pipeline
+## 10. Hook Pipeline
 
 Hooks are shell scripts installed by `mati hooks` into the project’s `.claude/settings.json`. The command writes files under `.claude/` inside the repository root. Hooks run on `PreToolUse`, before Claude reads a file or runs a bash command, and on `PostToolUse`, after the tool call.
 
@@ -407,11 +415,11 @@ The decision engine in `src/hooks/decide.rs` is pure. No I/O, no daemon calls. T
 - JSON for Claude Code, which runs the hook as a shell subprocess and reads stdout
 - exit codes for environments that support the Codex hook protocol
 
-Hook-based enforcement, meaning the Deny/Advisory path in §10.1, requires the host environment to install and execute the hook scripts. Claude Code does this natively.
+Hook-based enforcement, meaning the Deny/Advisory path in section 10.1, requires the host environment to install and execute the hook scripts. Claude Code does this natively.
 
 Codex hook execution depends on the agent configuration. If hooks are not running, enforcement falls back to MCP-only behavior: `mem_get` still mints consultation receipts, but no file reads are blocked. Other MCP-compatible agents that do not run hooks get tool access only.
 
-### §10.1: Decision Matrix
+### 10.1 Decision Matrix
 
 Decisions are evaluated in this order:
 
@@ -441,7 +449,7 @@ Decisions are evaluated in this order:
 
 `confidence < 0.3` or `quality < 0.4` always allows without injection, no matter what the `confirmed` state says.
 
-### §10.2: Command Classification (pre-bash)
+### 10.2 Command Classification (pre-bash)
 
 The pre-bash hook classifies shell commands before they run.
 
@@ -451,9 +459,9 @@ The pre-bash hook classifies shell commands before they run.
 
 On Claude Code, the Bash gate never emits `permissionDecision: "allow"`. Bash is a permission-required tool, so a force-allow would suppress the user's permission prompt for every command mati does not deny. Non-deny outcomes defer (empty stdout, exit 0); advisory/consulted context is injected via `additionalContext` *without* a `permissionDecision`, which Claude Code treats as "inject context, permission flow proceeds normally." Only the read gate (`Read`/`Glob`/`Grep` — no-permission tools) emits the no-op `allow`. This invariant is pinned by the `only_pre_read_force_allows` test in `cli::hook_decide`.
 
-Known limitation: `cat` with variable expansion, process substitution, or unusual quoting is not caught. The accepted miss rate is 2-5%. See §24.
+Known limitation: `cat` with variable expansion, process substitution, or unusual quoting is not caught. The accepted miss rate is 2-5%. See section 24.
 
-### §10.3: Edit Gating (Codex `apply_patch`)
+### 10.3 Edit Gating (Codex `apply_patch`)
 
 On Codex, the `apply_patch` `PreToolUse` hook (`codex-pre-apply-patch`) gates file edits the same way pre-bash gates reads.
 
@@ -466,9 +474,9 @@ The payload is the raw patch envelope in `tool_input.command`. `decide::extract_
 *** Move to:
 ```
 
-Those markers become the touched paths. Each path is then run through the same §10.1 decision matrix. If any touched file has an unconsulted confirmed gotcha, the edit is denied with exit 2 and stderr. A `mem_get` consultation receipt clears it, just like reads.
+Those markers become the touched paths. Each path is then run through the same section 10.1 decision matrix. If any touched file has an unconsulted confirmed gotcha, the edit is denied with exit 2 and stderr. A `mem_get` consultation receipt clears it, just like reads.
 
-Because the envelope gives mati the exact target path, edit gating is not affected by the shell-wrapper obfuscation that limits pre-bash read detection in §10.2 and §24. There is no command string to misparse.
+Because the envelope gives mati the exact target path, edit gating is not affected by the shell-wrapper obfuscation that limits pre-bash read detection in section 10.2 and section 24. There is no command string to misparse.
 
 It fails open on every uncertainty: unparseable patch, unreachable daemon, per-file lookup error, more than `MAX_APPLY_PATCH_FILES = 50` touched files, or an older binary that does not recognize the variant. Blocking all edits by mistake would be worse than missing one gotcha. The wrapper script in `codex_pre_apply_patch.rs` enforces that bias by treating only `exit 2` with a `mati:` message as a real deny.
 
@@ -482,7 +490,171 @@ Design invariants (each verified — see `MATI-SOTA-ARCHITECTURE.md` L3): explic
 
 ---
 
-## §11: MCP Server
+## 10a. Local Policy Engine
+
+A gotcha attaches knowledge to a file. A local policy attaches a rule to an *action*: "before running a production query, consult the schema first." Policies are developer-authored, repository-scoped, and enforced in the same hook path as gotchas.
+
+"Policy" in mati means one concept at two levels of authority.
+
+| Layer | Authored by | Signed | Distributed | Weakenable |
+| ------------- | ------------------- | ------------- | ------------------- | ------------------------------------------ |
+| Local policy | the local developer | no | no | yes, the author edits or disables it freely |
+| Signed floor | the org | yes (Ed25519) | yes, by mati Enterprise | no, a repo may strengthen it but never weaken it |
+
+Both produce a consult-required deny at hook time. They stay distinguishable in the audit log by reason code: `policy_consult_required` for a local policy, `floor_consult_required` for the signed floor. `mati policy verify` checks an inherited signed bundle; `mati policy add` authors a local rule. The two layers share receipts but not matchers.
+
+### 10a.1 Records and mutations
+
+A policy is a `policy:<slug>` record carrying a `PolicyRecord` payload (section 5.3a). It is developer-authored source of truth, so it writes at `Immediate` durability (section 21).
+
+A policy has one rollout stage. `off` is never evaluated. `shadow` is evaluated and recorded but changes no decision. `enforce` acts on `mode`, steering or blocking. The `policy.mode` kill switch applies at `enforce`, degrading a block to a steer. New policies start at `off`. Staging one to `shadow` first shows what it would catch before it can stop anything.
+
+Every create, edit, stage change, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. `mati policy enable` and `disable` are aliases for setting the stage to `enforce` and `off`. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
+
+The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step and lets an agent run `mati policy stage <slug> enforce` directly. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
+
+`off` is the only stage an agent can write. `shadow` and `enforce` belong to the developer. `mem_set` forces any other stage in an agent payload down to `off`, and refuses to edit or delete a policy that is not already `off`. An agent can draft a policy but cannot make one act, and cannot quietly rewrite one the developer is midway through reviewing. That holds for `mem_set` only. The Bash caveat above still applies to the CLI.
+
+Glob predicates are validated at author time. A malformed `host_glob` or `target_path_glob` is rejected before it can be persisted, so a broken pattern never reaches the daemon.
+
+Policy records are deliberately excluded from `mati stale`, for a structural reason rather than a philosophical one.
+
+For a `policy:<slug>` key every staleness factor collapses. `git_factor` resolves a blob at the literal path `policy:<slug>` (the `strip_prefix("file:")` is a no-op) and the HEAD tree returns nothing, so 0.0. `dep_factor` needs a parsed `FileRecord`, so 0.0. `cascade_factor` matches on `record.category` and `Policy` falls to the `_ => 0.0` arm. `semantic_factor` is a v0.1 constant 0.0. Only `time_factor` survives, weighted `TIME_WEIGHT = 0.20`, so the score asymptotes at 0.20. `tier_from_value(0.20)` is `Aging`, and `mati stale` reports only `Stale`, `Liability`, and `Tombstone`. Adding `policy:` to `STALENESS_PREFIXES` would therefore produce a record that can never appear in the report it feeds, at the cost of a full scan against the 2s `ANALYZE_TIME_BUDGET_MS`.
+
+The tiers also mean the wrong thing here. They carry injection semantics — warn in bootstrap, blocks injection, excluded entirely — while policy enforcement gates on `RecordLifecycle::Active` and `PolicyStage` and never reads staleness at all. A policy shown as "excluded entirely" while it still denies every matching action would be a false statement on the operator's dashboard.
+
+Matches are recorded in three eventual activity sources. A `block` policy at
+`enforce` writes `enforcement:event:*` with `subject_kind: Control` and reason
+`policy_consult_required` or `policy_receipt_valid`; a `shadow` policy writes
+`analytics:policy_shadow_<date>`; and an enforcing `steer` policy writes
+`analytics:policy_steer_<date>`. `mati policy activity` aggregates those traces
+on read, reports `fired`, `no activity in <N> days`, or `not measurable`, and
+states the 365-day enforcement retention bound. It deliberately keeps no
+derived per-policy index: `mati repair` can therefore continue to rebuild and
+verify every index this repository owns.
+
+The steer key is a normal `analytics:*` `Record`, not raw bytes, and therefore
+uses the existing `Eventual` durability class. No exact-key durability
+exception is needed; the keyspace encoding remains the invariant.
+
+Activity is an under-count when a satisfied block policy and a different denying policy match the same action: the satisfied policy's `PolicyConsulted` event is dropped because writing `AllowAfterReceipt` for an action that was denied would falsify the hash-chained enforcement audit, and the same decision suppresses a steer trace for that denied action. It can also over-report. Manual hook invocations send real `SessionLog` events through the daemon and inflate the aggregate; the live run reported three steering matches for `live-editsteer` when exactly one steering edit occurred, because the agent replayed hooks while inspecting raw decisions. `scripts/policy-live-session.sh` filters its post-bash tee on `transcript_path` for this reason, but the analytics path has no equivalent guard, so a count is evidence of liveness only when the author has not been replaying hooks. A steer policy's `last_fired_at` is only day-granular because it comes from the daily aggregate's `updated_at`; its per-key `count` is exact. Shadow timestamps use the maximum of per-observation timestamps and enforcement timestamps come from each event, so those sources are precise. The activity help text therefore points authors to `mati policy test`: the count is the load-bearing activity signal, a steer-only last timestamp is a hint, and the test answers whether the rule would still fire.
+
+`mem_bootstrap` also does not preload policies. This is intentional under P2:
+inject nothing by default and pull on demand. A policy deny names the required
+consultation key and closes the loop without adding a field to every
+`ContextPacket` or spending tokens on policies unrelated to the current task.
+The four-tool MCP surface remains unchanged.
+
+Codex `codex-pre-apply-patch` is a policy enforcement path. Its patch envelope provides exact target paths, which are normalized into `Action { tool: "path" }` and evaluated with `target_path_glob` policies after the existing gotcha gate. As with other Codex gates, a policy deny is reported as exit 2 with a `mati:` stderr instruction; uncertainty still fails open.
+
+`scripts/policy-live-codex.sh` is the live-session fixture for this adapter. It
+captures raw Codex `apply_patch` PreToolUse and Bash PostToolUse payloads,
+verifies the Codex hook and MCP wiring, and prompts a session to exercise the
+apply-patch deny/consult path, symlink resolution, shadow observations, the
+fileless Bash deny, and the db-introspection receipt minting pair. The fixture
+exists, but these Codex paths remain unvalidated until a real Codex session
+has run it; the synthetic assertions in `scripts/smoke-policy.sh` do not close
+that gap.
+
+Event collection on this path is not conditional on denying. A patch that is allowed still fires whatever the gates produced: a shadow observation, a receipt-backed allow, and a `Miss` for any touched file with no record. That last one makes `codex-pre-apply-patch` a miss-recording surface, which it was not before — previously it fired nothing unless it denied, so multi-file patches under-counted misses. `fire_events` is one sequential daemon round trip per event and `MAX_APPLY_PATCH_FILES` is 50; a measured 50-file no-record patch costs ~105ms against the 2500ms `HOOK_DEADLINE_MS`, so the sequential shape stands. If that ever becomes material the fix is a batched command preserving order, not concurrency: enforcement events allocate a durable monotonic `seq_no` into a hash chain, and concurrent writes would make the order of a log whose purpose is replayable tamper-evidence non-deterministic.
+
+The path policy gate is symlink-safe. The canonical target is resolved once per path, before any gate runs, and both the gotcha gate and the policy gate evaluate the lexical key and the canonical one under the same escalate-only rule: the first deny wins and a non-deny canonical outcome never lowers the lexical decision. Editing or patching a symlink that points at a governed file therefore trips `target_path_glob` on the real target. Claude Code also refuses to write through a symlink after the policy deny has been cleared; that defense-in-depth behavior was verified against Claude Code in the live run, but it is vendor behavior that mati does not control. Codex `apply_patch` has no such guard and parses exact target paths, while the Bash path has no such guard either: a `psql -f` command naming a symlink into a governed directory is denied only because mati resolves the target. Resolving once is therefore load-bearing outside the Claude edit path and must remain there. `canonical_rel_path` returns `None` for a non-symlink, so the common path costs nothing extra.
+
+The policy adapter scope is intentional: `db_client` actions on the Bash path
+and `path` actions on Claude edits and Codex `apply_patch` are policy-governed.
+`db_client` policies enforce on both Claude and Codex Bash, for fileless and
+file-bearing commands; schema introspection is exempt so it can steer toward
+the consultation that remedies the policy. Codex denies exit 2 with a `mati:`
+instruction on stderr, while Claude denies remain `permissionDecision` JSON.
+`file_read` actions from `cat`/`grep`-class Bash commands are not policy-
+governed; the gotcha read gate already owns that surface under P1. A stored
+`file_read` policy therefore receives an author/doctor warning instead of
+silently pretending it can enforce.
+
+This closes the Codex asymmetry in which `codex-post-bash` could mint
+db-introspection receipts for a `db_client` policy category that
+`codex-pre-bash` did not previously enforce.
+
+### 10a.2 Matching
+
+Matching is two layers, and the split is deliberate.
+
+**Normalization is code.** `decide::normalize_action` turns a raw invocation into an `Action`: `{ tool, target_path, host, argv, files }`. For bash this extends the classifier in section 10.2 with a `DbClientLike` class (`psql`, `mysql`, `redis-cli`, `mongosh`, `sqlite3`, and peers), reusing the same prefix stripping and basename reduction, so `sudo /usr/bin/psql` normalizes like `psql`. The host comes from `-h`/`--host` or a `PGHOST=`/`DATABASE_URL=` assignment. Files come from a `-f`/`--file` grammar arm. The governable categories (`db_client`, `file_read`, `path`) are a bounded set in code, guarded by `is_known_action_tool`. Adding a category is a reviewed change.
+
+**Matching is data.** A policy's `trigger` is a declarative predicate over the `Action`, for example `{ tool: "db_client", host_glob: "*prod*" }` or `{ target_path_glob: "**/*.sql" }`. Absent fields are wildcards; present fields must all match. Adding or tuning a policy never touches the decision core. That is what keeps the engine from growing a match arm per rule.
+
+Matching never inspects intent. It gates on the client invocation, not on whether the SQL is a `SELECT` or an `UPDATE`. The bash normalizer inherits the known gaps in section 10.2 and section 24 at the same accepted miss rate.
+
+One gap is worse than a miss and worth calling out separately. The pre- and post-bash hooks assume they see the same command text, and `effective_command` strips only a fixed wrapper list (`sudo`, `env`, `nice`, and peers). Another `PreToolUse` hook that rewrites the command breaks that assumption: the pre hook sees what the user typed and blocks on it, while the post hook sees the rewritten form, fails to recognize a database client, and never mints. The policy then demands a consultation that cannot be satisfied, which is a hard failure rather than the accepted miss the classifier gaps produce. This was observed live with a token-proxy hook that rewrote `psql …` to `rtk psql …`. Nothing detects the mismatch; the fix is to exclude database clients from the rewriting hook, or to add the wrapper to `PREFIX_WORDS` when it is genuinely a transparent proxy.
+
+### 10a.3 Where evaluation runs
+
+The hook process is ephemeral and holds no policies. The daemon holds a compiled `PolicyMatcherSet`, loaded from a `policy:*` scan at boot and refreshed after each `policy_write`. A record with an invalid glob is skipped and logged rather than failing the whole set.
+
+Evaluation splits across the two processes:
+
+```text
+hook    normalize the invocation into an Action          (no I/O)
+hook    is the action in a governed category?            (gate, no I/O)
+          no  -> prior behavior, zero round trips
+          yes -> one policy_evaluate call over the socket
+daemon  match the Action, check receipts, return verdicts (no decision)
+hook    compute the decision, emit output, fire events
+```
+
+Shadow observations are bounded daily aggregates in the eventual `analytics:` namespace, capped per policy so a noisy one cannot crowd out a quiet one. Each entry records the policy key, the normalized action, a timestamp, and whether the policy would have blocked or steered. `mati policy observations` reads them back and prints the full count next to the retained sample, so a truncated sample is visible rather than silent. They stay out of the hash-chained enforcement log: a shadow policy denied nothing, so a `Deny` event would falsify the audit chain mati-cloud reads.
+
+A policy is observed only where `enforce` would have acted on it. A shadow block holding a valid receipt records nothing, because at `enforce` it would have allowed. Neither does one exempted as schema introspection (section 10a.5). Without that, a policy would look more disruptive than promoting it would actually be.
+
+The gate is what keeps this cheap. A bash command that is not a database client makes no policy call at all, so the common path costs what it cost before. Only a governed action pays one local round trip, well inside `HOOK_DEADLINE_MS`.
+
+The daemon returns data, not decisions. It reports which policies matched and whether each blocking policy's receipt is currently valid. The hook computes the outcome, preserving the same "daemon serves records, the ephemeral process decides" split used elsewhere in the enforcement path.
+
+### 10a.4 Outcomes
+
+A policy is `steer` or `block`. `steer` injects the policy's rule as context. `block` denies until the required consultation receipt exists. Shadow policies never inject context or deny; they record whether the matched policy would steer or block. Whether an enforce-stage block actually denies is controlled by the dedicated `policy.mode` setting: it defaults to `strict`, while explicit `advisory` is a global kill switch that degrades every block to a steer. A failure to read the setting also defaults to strict, so an unreadable setting never silently disables policy enforcement. `audit.write_durability` remains independent and controls only enforcement-event writes.
+
+Three paths enforce policies: a bash command with no file (`psql -c "..."`), a bash command carrying one (`psql -f x.sql`), and an edit to a matching path (`Edit`, `Write`, `NotebookEdit`). All three share one output shape. A deny sets `permissionDecision: "deny"`. A steer injects `additionalContext` with no `permissionDecision` field at all.
+
+The permission invariant from section 10.2 holds throughout. Neither the bash gate nor the edit gate ever emits `permissionDecision: "allow"`, because both tools are permission-required and a force-allow would suppress the user's prompt for everything mati does not deny.
+
+That invariant is also what bounds a steer on an edit. Because a steer sets no decision, the rule text arrives alongside the tool's normal permission flow, so it reaches the developer before the write only when that flow actually prompts. Under an auto-approving permission mode the edit lands first and the rule reads as an after-the-fact note. A steer is guidance, not a gate, and on edits it is only a pre-write signal when edits are not auto-approved. A rule that must stop a write has to be `block`.
+
+A file-bearing database command runs through the gotcha file gate and the policy engine both. The two decisions merge escalate-only: a policy can raise an outcome to deny or add context, and can never lower a gotcha deny. When the file gate already denies, the policy round trip is skipped, since deny is already the maximum.
+
+Every policy failure path allows. An unreachable daemon, an error response, or an unparseable payload leaves the pre-existing decision untouched and never denies. A policy must not block because mati itself failed (P9).
+
+### 10a.5 Consultation receipts
+
+A block policy names what unlocks it: `requires.key` (for example `decision:orders-schema`), the sources that may satisfy it, and its freshness. The receipt is the existing `session:consulted:*` primitive from section 15, actor-scoped and TTL-bound.
+
+Two sources mint it:
+
+- **`MemGet`.** The agent calls `mem_get("decision:orders-schema")` and the post-memget hook mints the receipt. Minting is key-agnostic, so a key with no stored record would mint a receipt for a consultation that taught the agent nothing. `mati policy add` warns when a `MemGet` requirement points at an unbacked key. The key must also be one `mem_set` can write, which is a `gotcha:`, `decision:`, `dev_note:`, or `policy:` prefix. Nothing writes an arbitrary namespace, so a requirement on something like `schema:orders` can never be backed and the warning says so rather than suggesting a step the author cannot take.
+- **`DbIntrospection`.** The agent's own schema inspection satisfies the policy. A `PostToolUse` bash hook recognizes an allowlisted inspection command (`information_schema`, `\d`, `DESCRIBE`, `SHOW TABLES`, and equivalents) and mints the receipt for each matched policy that accepts this source. It mints only when the command succeeded: `tool_response.isError` must be explicitly `false`. An unrecognized payload shape mints nothing and logs, so a future shape change stops minting rather than issuing receipts for failed commands.
+
+Introspection commands are exempt from policy blocks. Without that exemption, a policy triggering on `psql -h *prod*` would block the very `psql -h prod -c "\d orders"` that satisfies it, and the agent could never comply. The exemption suppresses blocks only. It does not touch the gotcha file gate, and it does not extend to minting: a policy that accepts only `MemGet` is still not satisfied by introspection.
+
+Freshness is a TTL by default. Setting `freshness.fingerprint` also binds the receipt to the content of the consulted record, so a schema that drifts between the consultation and the governed action invalidates the receipt inside its TTL window and the action is blocked again. The fingerprint covers the record's knowledge-bearing fields and excludes access counters and timestamps. Including them would make a receipt invalidate itself, since minting bumps the record's own access metadata.
+
+### 10a.6 Audit trail
+
+Policy decisions reuse the event types in section 18. No new event type or subject kind was introduced.
+
+| Outcome | Event | Reason code |
+| ------------------------------------ | -------------------- | ---------------------------------------------------- |
+| Blocked, no valid receipt | `Deny` | `policy_consult_required` |
+| Allowed on a valid receipt | `AllowAfterReceipt` | `policy_receipt_valid` |
+| Receipt minted | `ReceiptMinted` | `consultation_requested` |
+| Created, staged, deleted | `ControlChanged` | `control_created` / `control_updated` / `control_deleted` |
+
+Policy events carry `subject_kind = Control` and `subject_key = <policy key>`. That is what separates them from the file-subject gotcha and floor denies sharing the same log.
+
+Only `enforce` policies reach this table. A `shadow` policy writes no enforcement event, not a `Deny` and not an `AllowAfterReceipt`, because it decided nothing. Its only trace is the observation in section 10a.3. Changing a stage is a lifecycle mutation and still writes `ControlChanged`, so a promotion to `enforce` stays in the chain.
+
+---
+
+## 11. MCP Server
 
 The MCP server lives in `src/mcp/`. It uses the `rmcp` crate, the Rust MCP SDK, for stdio transport.
 
@@ -499,7 +671,7 @@ Exactly four tools are exposed. This is a hard constraint from P3. Every tool de
 
 ---
 
-## §12: Static Analysis (Layer 0)
+## 12. Static Analysis (Layer 0)
 
 `mati init` runs a Layer 0 scan with no LLM calls. It produces `file:*` record stubs and graph edges from source code only.
 
@@ -528,9 +700,9 @@ Layer 0 file records start with `quality = 0.10`, which is Suppressed tier, and 
 
 ---
 
-## §13: Health System
+## 13. Health System
 
-### §13.1: Confidence Score
+### 13.1 Confidence Score
 
 Confidence measures how much the system trusts a record’s accuracy.
 
@@ -553,15 +725,15 @@ Recomputation is implemented as a pure function, `health::confidence::recompute`
 
 One small but important note: `file:*` records are written on the Immediate path, not the Eventual path.
 
-Confidence feeds into two different paths in §10.1.
+Confidence feeds into two different paths in section 10.1.
 
 | Path                    | Condition                                                                                | Behavior                                           |
 | ----------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| Deny (§10.1 step 4)     | attached gotcha: `confirmed = true`, `confidence >= 0.6`, `quality >= 0.4`               | Block file read; require `mem_get` consultation    |
-| Advisory (§10.1 step 5) | file record: `confidence >= 0.3`, `quality >= 0.4`, with no gotcha confirmation required | Allow read + attach context as `additionalContext` |
+| Deny (section 10.1 step 4)     | attached gotcha: `confirmed = true`, `confidence >= 0.6`, `quality >= 0.4`               | Block file read; require `mem_get` consultation    |
+| Advisory (section 10.1 step 5) | file record: `confidence >= 0.3`, `quality >= 0.4`, with no gotcha confirmation required | Allow read + attach context as `additionalContext` |
 | No injection            | file record: `confidence < 0.3` or `quality < 0.4`                                       | Allow read unconditionally                         |
 
-### §13.2: Quality Score
+### 13.2 Quality Score
 
 Quality tiers use half-open intervals.
 
@@ -573,9 +745,9 @@ Quality tiers use half-open intervals.
 | Good       | [0.7, 0.9) | Prioritized in `mem_bootstrap`                              |
 | Excellent  | [0.9, 1.0] | Prioritized for template reuse, planned under `mati garden` |
 
-See §5.4 for the formula.
+See section 5.4 for the formula.
 
-### §13.3: Onboarding Score
+### 13.3 Onboarding Score
 
 This estimates how long a new developer would need to reach productive understanding, given the current knowledge coverage. The base time and weights are design targets. They are not universal measurements.
 
@@ -595,7 +767,7 @@ estimated_minutes = base_time x (1 - weighted_reduction)
 
 ---
 
-## §14: Enrichment (Layer 1)
+## 14. Enrichment (Layer 1)
 
 `mati enrich [path]` runs a four-stage per-file pipeline using Claude.
 
@@ -625,7 +797,7 @@ After batch enrichment, run `mati review` to confirm candidates and activate enf
 
 ---
 
-## §15: Session Model
+## 15. Session Model
 
 Sessions use three layers of state in `sessions.db`, with Eventual durability.
 
@@ -633,7 +805,7 @@ Sessions use three layers of state in `sessions.db`, with Eventual durability.
 
 Each `mem_get` call writes `session:consulted:<key>`. This is the consultation receipt proving Claude read the record for that file. The TTL is 15 minutes, set by `CONSULTED_RECENT_TTL_SECS = 900`.
 
-The hook decision engine checks for that key before choosing between Deny and AlreadyConsulted. See §10.1.
+The hook decision engine checks for that key before choosing between Deny and AlreadyConsulted. See section 10.1.
 
 **On session flush:**
 
@@ -643,11 +815,11 @@ The hook decision engine checks for that key before choosing between Deny and Al
 
 The harvester reads `session:current`, then writes a final `session:<timestamp>` record summarizing files touched, gotchas encountered, and compliance rate. It also cleans up all `session:consulted:*` markers and runs staleness re-scoring on touched files.
 
-The most recent session summary is meant to appear in the `ContextPacket` returned by `mem_bootstrap` as `recent_session`. Right now that field is always `None` because the assembler is not wired yet. See §6.
+The most recent session summary is meant to appear in the `ContextPacket` returned by `mem_bootstrap` as `recent_session`. Right now that field is always `None` because the assembler is not wired yet. See section 6.
 
 ---
 
-## §16: Search Layer
+## 16. Search Layer
 
 tantivy provides BM25 full-text search over the `value` field of all knowledge records. That field is the human-readable content: rule, purpose, body, and similar text.
 
@@ -663,7 +835,7 @@ It is rebuilt from the `knowledge.db` key scan in three cases:
 
 ---
 
-## §17: Staleness
+## 17. Staleness
 
 Staleness is scored with this formula:
 
@@ -701,7 +873,7 @@ Staleness propagation happens during `mati init`. Staleness scores are propagate
 
 ---
 
-## §18: Enforcement Event Log
+## 18. Enforcement Event Log
 
 Every hook decision is recorded in a hash-chained, monotonically sequenced event log. The log is persisted in `knowledge.db` under keys like this:
 
@@ -748,7 +920,7 @@ The enforcement event log is local and owned by the developer. The enterprise ti
 
 ---
 
-## §19: CLI
+## 19. CLI
 
 All CLI commands write to stdout using `comfy-table` for structured output. There is no TUI framework.
 
@@ -798,7 +970,7 @@ Color semantics:
 
 ---
 
-## §20: Versioning (Lamport Clock)
+## 20. Versioning (Lamport Clock)
 
 Each record carries a `RecordVersion`.
 
@@ -818,7 +990,7 @@ The intended conflict-resolution rule is simple: when two writes conflict, meani
 
 ---
 
-## §21: Durability
+## 21. Durability
 
 Write durability is split by key namespace. Do not mix the paths.
 
@@ -851,7 +1023,7 @@ The rationale is practical. Knowledge records, such as gotchas, files, and decis
 
 ---
 
-## §22: Gotcha Mutations
+## 22. Gotcha Mutations
 
 All gotcha create, edit, and tombstone paths go through `store::gotcha_ops`. A direct write to a gotcha record that bypasses this module is a bug.
 
@@ -874,7 +1046,7 @@ If `gotcha_keys` and `HasGotcha` graph edges disagree with the canonical `gotcha
 
 ---
 
-## §23: Daemon Lifecycle
+## 23. Daemon Lifecycle
 
 The daemon writes structured events to `lifecycle.log` throughout its lifetime. `ensure_daemon`, in `src/mcp/daemon_lifecycle.rs`, reads that log to determine readiness. It does not use timer-based polling.
 
@@ -900,7 +1072,7 @@ Peer credentials are checked through `SO_PEERCRED` on Linux and `LOCAL_PEERCRED`
 
 ---
 
-## §24: Known Limitations
+## 24. Known Limitations
 
 **C9: bash `cat` bypass, around 2-5% miss rate.**
 

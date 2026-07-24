@@ -310,7 +310,6 @@ async fn persist_edge(store: &Store, edge: &Edge) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Record;
     use tempfile::TempDir;
 
     async fn temp_graph() -> (Graph, TempDir) {
@@ -318,46 +317,6 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
         (graph, dir)
-    }
-
-    fn make_edge_stub_record(key: &str) -> Record {
-        use crate::store::record::*;
-        let now = 0u64;
-        Record {
-            key: key.to_owned(),
-            value: String::new(),
-            category: Category::Stage,
-            priority: Priority::Normal,
-            tags: vec![],
-            created_at: now,
-            updated_at: now,
-            ref_url: None,
-            staleness: StalenessScore::fresh(),
-            lifecycle: RecordLifecycle::Active,
-            version: RecordVersion {
-                device_id: uuid::Uuid::nil(),
-                logical_clock: 0,
-                wall_clock: now,
-            },
-            quality: QualityScore {
-                value: 1.0,
-                tier: QualityTier::Good,
-                signals: vec![],
-                computed_at: now,
-            },
-            access_count: 0,
-            last_accessed: 0,
-            source: RecordSource::StaticAnalysis,
-            confidence: ConfidenceScore {
-                value: 1.0,
-                confirmation_count: 0,
-                contributor_count: 0,
-                last_challenged: None,
-                challenge_count: 0,
-            },
-            gap_analysis_score: 0.0,
-            payload: None,
-        }
     }
 
     #[tokio::test]
@@ -818,9 +777,13 @@ mod tests {
 
             // Manually insert a record whose key has the graph:edge: prefix
             // but is not a valid edge key (no parseable from/kind/to triple).
+            // graph:edge:* holds a raw timestamp, not a Record, so a corrupt
+            // entry is written the same way a real edge is.
             let corrupt_key = "graph:edge:this_is_not_parseable";
-            let record = make_edge_stub_record(corrupt_key);
-            g.store.put(corrupt_key, &record).await.unwrap();
+            g.store
+                .put_raw(corrupt_key, &0u64.to_le_bytes())
+                .await
+                .unwrap();
 
             g.close().await.unwrap();
         }
@@ -845,8 +808,10 @@ mod tests {
                 .unwrap();
 
             let corrupt_key = "graph:edge:file:a:imports:unknown_ns:target";
-            let record = make_edge_stub_record(corrupt_key);
-            g.store.put(corrupt_key, &record).await.unwrap();
+            g.store
+                .put_raw(corrupt_key, &0u64.to_le_bytes())
+                .await
+                .unwrap();
 
             g.close().await.unwrap();
         }

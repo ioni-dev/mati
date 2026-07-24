@@ -780,6 +780,7 @@ fn bench_record_to_doc(record: &Record, f: &BenchFields) -> TantivyDocument {
             Category::DevNote => "dev_note",
             Category::Session => "session",
             Category::Analytics => "analytics",
+            Category::Policy => "policy",
         },
     );
     doc.add_text(f.tags, record.tags.join(" "));

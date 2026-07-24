@@ -86,15 +86,46 @@ async fn check_daemon_health(cwd: &std::path::Path) -> DaemonHealth {
 
 /// Print the Runtime section showing daemon health.
 #[allow(clippy::too_many_arguments)]
+/// Count active policies by stage for the Runtime line.
+///
+/// A policy governs what the agent may do in this repo, so a dashboard that
+/// reports daemon health and enforcement posture but not how many rules are
+/// live leaves the operator guessing.
+async fn policy_stage_counts(store: &StoreProxy) -> Option<String> {
+    use mati_core::store::{PolicyRecord, PolicyStage, RecordLifecycle};
+    let records = store.scan_prefix("policy:").await.ok()?;
+    let (mut enforce, mut shadow) = (0usize, 0usize);
+    for record in &records {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        match record.payload_as::<PolicyRecord>().map(|p| p.stage) {
+            Some(PolicyStage::Enforce) => enforce += 1,
+            Some(PolicyStage::Shadow) => shadow += 1,
+            _ => {}
+        }
+    }
+    if enforce == 0 && shadow == 0 {
+        return None;
+    }
+    let mut out = format!("{enforce} enforcing");
+    if shadow > 0 {
+        out.push_str(&format!(", {shadow} shadow"));
+    }
+    Some(out)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn print_runtime_section(
     health: &DaemonHealth,
     red: &str,
     green: &str,
     yellow: &str,
     gray: &str,
-    _white: &str,
+    white: &str,
     blue: &str,
     reset: &str,
+    policies: Option<&str>,
 ) {
     println!("  {blue}Runtime{reset}");
     match health {
@@ -116,6 +147,9 @@ fn print_runtime_section(
                 "    Enforcement          {red}degraded{reset} {gray}— hooks fail open without daemon{reset}"
             );
         }
+    }
+    if let Some(summary) = policies {
+        println!("    Policies             {white}{summary}{reset}");
     }
     println!();
 }
@@ -206,6 +240,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
 
     // ── Daemon health (real-time, never cached) ──────────────────────────
     let daemon_health = check_daemon_health(&cwd).await;
+    let policy_summary = policy_stage_counts(&store).await;
 
     // ── Load cluster index (shared by cached and live paths) ───────────────
     let cluster_index: Option<mati_core::analysis::clusters::ClusterIndex> = store
@@ -294,7 +329,17 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
 
     // ── Runtime (daemon health) ──────────────────────────────────────────
     if claude_mode || codex_mode {
-        print_runtime_section(&daemon_health, red, green, yellow, gray, white, blue, reset);
+        print_runtime_section(
+            &daemon_health,
+            red,
+            green,
+            yellow,
+            gray,
+            white,
+            blue,
+            reset,
+            policy_summary.as_deref(),
+        );
     }
 
     if claude_mode || codex_mode {
@@ -671,7 +716,17 @@ fn display_cached_status(
 
     // ── Runtime (daemon health — always real-time, never cached) ─────────
     if claude_mode || codex_mode {
-        print_runtime_section(daemon_health, red, green, yellow, gray, white, blue, reset);
+        print_runtime_section(
+            daemon_health,
+            red,
+            green,
+            yellow,
+            gray,
+            white,
+            blue,
+            reset,
+            None,
+        );
     }
 
     if claude_mode || codex_mode {

@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Hook and MCP server registration for `.claude/settings.json`.
 ///
 /// Contains two top-level keys:
-/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / Stop (ARCHITECTURE.md §10)
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / Stop (ARCHITECTURE.md section 10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 const SETTINGS_JSON: &str = r#"{
   "hooks": {
@@ -75,6 +75,12 @@ const SETTINGS_JSON: &str = r#"{
         "matcher": "mcp__mati__mem_get",
         "hooks": [
           { "type": "command", "command": ".claude/hooks/post-memget.sh" }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/post-bash.sh", "async": true }
         ]
       }
     ],
@@ -159,6 +165,7 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("subagent-start.sh", crate::hooks::subagent_start::SCRIPT),
     ("stop.sh", crate::hooks::claude_stop::SCRIPT),
     ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
+    ("post-bash.sh", crate::hooks::post_bash::SCRIPT),
 ];
 
 /// Outcome of the hook installation.
@@ -434,7 +441,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 11),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 12),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -583,6 +590,7 @@ mod tests {
         assert!(crate::hooks::pre_read::SCRIPT.contains("exec mati hook-decide claude-pre-read"));
         assert!(crate::hooks::pre_edit::SCRIPT.contains("exec mati hook-decide claude-pre-edit"));
         assert!(crate::hooks::pre_bash::SCRIPT.contains("exec mati hook-decide claude-pre-bash"));
+        assert!(crate::hooks::post_bash::SCRIPT.contains("exec mati hook-decide claude-post-bash"));
     }
 
     #[test]

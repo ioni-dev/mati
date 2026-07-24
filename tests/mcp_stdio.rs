@@ -285,7 +285,7 @@ fn mcp_stdio_all_four_tools() {
         "mem_bootstrap result missing 'content' field: {bootstrap_result}"
     );
 
-    // The content must include the [mati] Vector B marker (ARCHITECTURE.md §6).
+    // The content must include the [mati] Vector B marker (ARCHITECTURE.md section 6).
     let bootstrap_text = bootstrap_result["content"]
         .as_array()
         .and_then(|arr| arr.first())

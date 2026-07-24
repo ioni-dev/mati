@@ -29,7 +29,11 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::store::AgentKind;
+use crate::hooks::decide::Action;
+use crate::store::{
+    AgentKind, PolicyMode as StorePolicyMode, PolicyRecord, PolicyStage as StorePolicyStage,
+    Priority as StorePriority, ReceiptSource as StoreReceiptSource,
+};
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
@@ -68,7 +72,7 @@ pub struct Request {
     /// Client-declared agent identity for attribution (ADR-018).
     /// Optional and additive: pre-multi-agent clients omit this field;
     /// the daemon stamps `Unknown` server-side when absent. NOT verified —
-    /// same-UID processes are trusted (THREAT_MODEL.md §3.I).
+    /// same-UID processes are trusted (THREAT_MODEL.md section 3.I).
     #[serde(default)]
     pub agent: Option<AgentKind>,
     /// The command to execute.
@@ -175,6 +179,10 @@ pub enum Command {
     #[serde(rename = "hook_evaluate")]
     HookEvaluate(HookEvaluateInput),
 
+    /// Evaluate a normalized action against the daemon-resident local policies.
+    #[serde(rename = "policy_evaluate")]
+    PolicyEvaluate(PolicyEvaluateInput),
+
     /// Scan all records whose key starts with a prefix.
     #[serde(rename = "scan_prefix")]
     ScanPrefix(ScanPrefixInput),
@@ -209,6 +217,10 @@ pub enum Command {
     #[serde(rename = "scan_enforcement_events")]
     ScanEnforcementEvents(ScanEnforcementEventsInput),
 
+    /// Time-bounded enforcement scan used by policy activity reporting.
+    #[serde(rename = "scan_enforcement_events_since_ms")]
+    ScanEnforcementEventsSinceMs(ScanEnforcementEventsSinceMsInput),
+
     /// Read a runtime configuration value (e.g. audit.write_durability).
     /// Pure read — no audit, no side effects.
     #[serde(rename = "config_get")]
@@ -235,6 +247,10 @@ pub enum Command {
     /// Tombstone a gotcha and clean up file links + graph edges.
     #[serde(rename = "gotcha_tombstone")]
     GotchaTombstone(GotchaTombstoneInput),
+
+    /// Create, enable, disable, or tombstone a local policy.
+    #[serde(rename = "policy_write")]
+    PolicyWrite(PolicyWriteInput),
 
     /// Enrich a file record with LLM-derived purpose, entry points, etc.
     /// File record must already exist (created by init/reparse).
@@ -279,6 +295,10 @@ pub enum Command {
     /// Record a consultation hit: receipt + access metrics + daily agg.
     #[serde(rename = "consultation_hit")]
     ConsultationHit(ConsultationHitInput),
+
+    /// Record a policy shadow observation in the eventual session store.
+    #[serde(rename = "policy_shadow_observe")]
+    PolicyShadowObserve(PolicyShadowObserveInput),
 
     /// Flush session data (collect consulted markers into session:current).
     #[serde(rename = "session_flush")]
@@ -334,6 +354,31 @@ pub struct HookEvaluateInput {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct PolicyEvaluateInput {
+    pub action: Action,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyVerdict {
+    pub key: String,
+    pub stage: StorePolicyStage,
+    pub mode: StorePolicyMode,
+    pub rule: String,
+    pub reason: String,
+    pub severity: StorePriority,
+    pub requires_key: String,
+    #[serde(default)]
+    pub via: Vec<StoreReceiptSource>,
+    pub satisfied: bool,
+    /// Snapshot of the global enforcement mode used for block degradation.
+    #[serde(default)]
+    pub strict: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanPrefixInput {
     pub prefix: String,
 }
@@ -351,6 +396,19 @@ pub struct ScanEnforcementEventsInput {
     pub since_seq: u64,
     #[serde(default = "default_until_seq")]
     pub until_seq: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanEnforcementEventsSinceMsInput {
+    #[serde(default)]
+    pub since_ms: u64,
+    #[serde(default = "default_until_ms")]
+    pub until_ms: u64,
+}
+
+fn default_until_ms() -> u64 {
+    u64::MAX
 }
 
 fn default_until_seq() -> u64 {
@@ -491,6 +549,28 @@ pub struct GotchaTombstoneInput {
     pub key: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyWriteOp {
+    Create,
+    Edit,
+    Enable,
+    Disable,
+    Stage,
+    Delete,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyWriteInput {
+    pub op: PolicyWriteOp,
+    pub key: String,
+    #[serde(default)]
+    pub policy: Option<PolicyRecord>,
+    #[serde(default)]
+    pub stage: Option<StorePolicyStage>,
+}
+
 /// File enrichment input from LLM analysis (e.g., /mati-enrich workflow).
 /// The file record must already exist (created by init/reparse).
 ///
@@ -592,6 +672,14 @@ pub struct SessionLogInput {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyShadowObserveInput {
+    pub policy_key: String,
+    pub action: Action,
+    pub would: crate::hooks::decide::ShadowOutcome,
+}
+
 /// Session analytics event types. Each maps to a daily aggregation key prefix.
 ///
 /// `Hit` is NOT included — it has richer side effects and uses the separate
@@ -613,6 +701,12 @@ pub enum SessionEvent {
     /// Enterprise floor mandate: an unconsulted access to a consult-required path was DENIED.
     /// Records `Deny` with reason `floor_consult_required` (distinct from gotcha denies).
     FloorConsultMiss,
+    /// Local policy denied an unconsulted governed action.
+    PolicyConsultMiss,
+    /// Local policy allowed an action after its receipt was present.
+    PolicyConsultHit,
+    /// Local policy injected steering context without changing the decision.
+    PolicySteered,
     CodexShellMiss,
     Bootstrap,
     PromptNudge,
@@ -622,6 +716,9 @@ pub enum SessionEvent {
 #[serde(deny_unknown_fields)]
 pub struct ConsultationHitInput {
     pub key: String,
+    /// Capture a content fingerprint when the target record exists.
+    #[serde(default = "default_capture_fingerprint")]
+    pub capture_fingerprint: bool,
     #[serde(default)]
     pub actor: Option<String>,
     /// Claude session_id (the session) — for ReceiptMinted audit attribution.
@@ -630,6 +727,10 @@ pub struct ConsultationHitInput {
     /// Subagent agent_id when present (fallback attribution).
     #[serde(default)]
     pub agent_id: Option<String>,
+}
+
+fn default_capture_fingerprint() -> bool {
+    true
 }
 
 /// Input for `Command::RecordImport`. Records are written verbatim into the
@@ -727,6 +828,7 @@ impl Command {
             Self::Metrics => "metrics",
             Self::Get(_) => "get",
             Self::HookEvaluate(_) => "hook_evaluate",
+            Self::PolicyEvaluate(_) => "policy_evaluate",
             Self::ScanPrefix(_) => "scan_prefix",
             Self::ScanKeys(_) => "scan_keys",
             Self::History(_) => "history",
@@ -735,6 +837,7 @@ impl Command {
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
             Self::MemQuery(_) => "mem_query",
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
+            Self::ScanEnforcementEventsSinceMs(_) => "scan_enforcement_events_since_ms",
             Self::ConfigGet(_) => "config_get",
             Self::ConfigSet(_) => "config_set",
             Self::SandboxAudit(_) => "sandbox_audit",
@@ -743,6 +846,7 @@ impl Command {
             Self::GotchaUpsert(_) => "gotcha_upsert",
             Self::GotchaConfirm(_) => "gotcha_confirm",
             Self::GotchaTombstone(_) => "gotcha_tombstone",
+            Self::PolicyWrite(_) => "policy_write",
             Self::FileEnrich(_) => "file_enrich",
             Self::FileReparse(_) => "file_reparse",
             Self::FileEditHook(_) => "file_edit_hook",
@@ -751,6 +855,7 @@ impl Command {
             Self::DevNoteUpsert(_) => "dev_note_upsert",
             Self::SessionLog(_) => "session_log",
             Self::ConsultationHit(_) => "consultation_hit",
+            Self::PolicyShadowObserve(_) => "policy_shadow_observe",
             Self::SessionFlush => "session_flush",
             Self::SessionHarvest => "session_harvest",
             Self::SessionClearConsults => "session_clear_consults",
@@ -764,6 +869,7 @@ impl Command {
         match self {
             Self::Get(i) => &i.key,
             Self::HookEvaluate(i) => &i.file_key,
+            Self::PolicyEvaluate(_) => "",
             Self::ScanPrefix(i) => &i.prefix,
             Self::ScanKeys(i) => &i.prefix,
             Self::History(i) => &i.key,
@@ -775,6 +881,7 @@ impl Command {
             Self::GotchaUpsert(i) => &i.key,
             Self::GotchaConfirm(i) => &i.key,
             Self::GotchaTombstone(i) => &i.key,
+            Self::PolicyWrite(i) => &i.key,
             Self::FileEnrich(i) => &i.path,
             Self::FileReparse(i) => &i.path,
             Self::FileEditHook(i) => &i.path,
@@ -783,6 +890,7 @@ impl Command {
             Self::DevNoteUpsert(i) => i.key.as_deref().unwrap_or(""),
             Self::SessionLog(i) => &i.key,
             Self::ConsultationHit(i) => &i.key,
+            Self::PolicyShadowObserve(i) => &i.policy_key,
             Self::ConfigGet(i) => &i.key,
             Self::ConfigSet(i) => &i.key,
             Self::SandboxAudit(i) => &i.setting,
@@ -790,6 +898,7 @@ impl Command {
             | Self::Metrics
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
+            | Self::ScanEnforcementEventsSinceMs(_)
             | Self::SessionFlush
             | Self::SessionHarvest
             | Self::SessionClearConsults
@@ -813,6 +922,7 @@ impl Command {
             | Self::GotchaUpsert(_)
             | Self::GotchaConfirm(_)
             | Self::GotchaTombstone(_)
+            | Self::PolicyWrite(_)
             | Self::FileEnrich(_)
             | Self::FileReparse(_)
             | Self::FileEditHook(_)
@@ -821,6 +931,7 @@ impl Command {
             | Self::DevNoteUpsert(_)
             | Self::SessionLog(_)
             | Self::ConsultationHit(_)
+            | Self::PolicyShadowObserve(_)
             | Self::ConfigSet(_)
             | Self::SandboxAudit(_)
             | Self::SessionFlush
@@ -919,6 +1030,11 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "type": "scan_enforcement_events",
             "since_seq": args.get("since_seq").and_then(|v| v.as_u64()).unwrap_or(0),
             "until_seq": args.get("until_seq").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+        }),
+        "scan_enforcement_events_since_ms" => json!({
+            "type": "scan_enforcement_events_since_ms",
+            "since_ms": args.get("since_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            "until_ms": args.get("until_ms").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
         }),
         // Side-effecting reads — pure read shape on the wire, sessions-tree
         // side effects (consultation receipt, audit) live entirely on the
@@ -1577,6 +1693,7 @@ mod tests {
                 "consultation_hit",
                 Command::ConsultationHit(ConsultationHitInput {
                     key: "k".into(),
+                    capture_fingerprint: true,
                     actor: None,
                     session_id: None,
                     agent_id: None,

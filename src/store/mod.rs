@@ -14,18 +14,20 @@ pub mod extraction;
 pub mod gotcha_ops;
 pub mod migrations;
 pub mod negative_exemplar;
+pub mod policy_ops;
 pub mod record;
 pub mod repair;
 pub mod session;
 
 pub use db::{derive_slug, mati_home, mati_home_opt, KnowledgeWriteOp, Store};
 pub use device::stable_device_id;
-pub use durability::Durability;
+pub use durability::{Durability, Encoding};
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{
     AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,
-    GotchaRecord, KnowledgeGap, OnboardingScore, Priority, QualityScore, QualitySignal,
-    QualityTier, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry,
+    GotchaRecord, KnowledgeGap, OnboardingScore, PolicyFreshness, PolicyMode, PolicyRecord,
+    PolicyRequires, PolicyStage, PolicyTrigger, Priority, QualityScore, QualitySignal, QualityTier,
+    ReceiptSource, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry,
     StaleReviewPayload, StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind,
     TombstoneReason,
 };

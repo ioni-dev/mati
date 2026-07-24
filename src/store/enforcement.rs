@@ -872,7 +872,13 @@ pub async fn scan_enforcement_events(
     let keys = store.scan_keys(EVENT_PREFIX).await?;
     let mut events = Vec::new();
 
-    for key in &keys {
+    let start = keys.partition_point(|key| {
+        key.strip_prefix(EVENT_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|seq| seq < since_seq)
+            .unwrap_or(true)
+    });
+    for key in keys.iter().skip(start) {
         let seq = match key
             .strip_prefix(EVENT_PREFIX)
             .and_then(|s| s.parse::<u64>().ok())
@@ -880,7 +886,10 @@ pub async fn scan_enforcement_events(
             Some(s) => s,
             None => continue,
         };
-        if seq < since_seq || seq > until_seq {
+        if seq > until_seq {
+            break;
+        }
+        if seq < since_seq {
             continue;
         }
         if let Ok(Some(bytes)) = store.get_raw_bytes(key).await {
@@ -897,12 +906,90 @@ pub async fn scan_enforcement_events(
     Ok(events)
 }
 
+/// Result of a time-bounded enforcement scan. The oldest timestamp is kept
+/// separate so callers can distinguish an empty retained window from history
+/// that predates the retention floor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnforcementEventScan {
+    pub events: Vec<EnforcementEvent>,
+    pub oldest_recorded_at_ms: Option<u64>,
+    pub scanned_keys: usize,
+}
+
+/// Scan events from the first sequence whose recorded time reaches `since_ms`.
+/// Event keys are zero-padded and sequence allocation is monotonic, so the
+/// timestamp boundary is found with O(log n) raw reads and the matching suffix
+/// is read forward. This keeps an activity report from loading a year's event
+/// payloads just to discard them.
+pub async fn scan_enforcement_events_since_ms(
+    store: &Store,
+    since_ms: u64,
+    until_ms: u64,
+) -> Result<EnforcementEventScan> {
+    let keys = store.scan_keys(EVENT_PREFIX).await?;
+    let valid_keys: Vec<&String> = keys
+        .iter()
+        .filter(|key| {
+            key.strip_prefix(EVENT_PREFIX)
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some()
+        })
+        .collect();
+
+    async fn read_event(store: &Store, key: &str) -> Option<EnforcementEvent> {
+        let bytes = store.get_raw_bytes(key).await.ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    let oldest_recorded_at_ms = match valid_keys.first() {
+        Some(key) => read_event(store, key)
+            .await
+            .map(|event| event.recorded_at_ms),
+        None => None,
+    };
+
+    let mut low = 0;
+    let mut high = valid_keys.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match read_event(store, valid_keys[mid]).await {
+            Some(event) if event.recorded_at_ms < since_ms => low = mid + 1,
+            Some(_) => high = mid,
+            None => low = mid + 1,
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut scanned_keys = 0;
+    for key in valid_keys.into_iter().skip(low) {
+        scanned_keys += 1;
+        let Some(event) = read_event(store, key).await else {
+            continue;
+        };
+        if event.recorded_at_ms > until_ms {
+            break;
+        }
+        if event.recorded_at_ms >= since_ms {
+            events.push(event);
+        }
+    }
+    events.sort_by_key(|event| event.seq_no);
+    Ok(EnforcementEventScan {
+        events,
+        oldest_recorded_at_ms,
+        scanned_keys,
+    })
+}
+
 // ─────────────────────────────────────────────
 // Enforcement Mode
 // ─────────────────────────────────────────────
 
 /// Store key for the enforcement mode setting.
 const ENFORCEMENT_MODE_KEY: &str = "enforcement:mode";
+
+/// Store key for the local policy posture kill switch.
+const POLICY_MODE_KEY: &str = "enforcement:policy_mode";
 
 /// Default retention period in days.
 const DEFAULT_RETENTION_DAYS: u64 = 365;
@@ -953,6 +1040,47 @@ pub async fn set_enforcement_mode(store: &Store, mode: EnforcementMode) -> Resul
             },
             SubjectKind::Config,
             "enforcement:mode".to_string(),
+            "developer".to_string(),
+            None,
+            "config_changed".to_string(),
+            None,
+        )
+        .await;
+    }
+    Ok(old)
+}
+
+/// Read the policy posture. Policies deny by default when this key is absent
+/// or unreadable; `advisory` is an explicit global kill switch.
+pub async fn get_policy_mode(store: &Store) -> EnforcementMode {
+    match store.get_raw_bytes(POLICY_MODE_KEY).await {
+        Ok(Some(bytes)) if bytes.as_slice() == b"advisory" => EnforcementMode::Advisory,
+        _ => EnforcementMode::Strict,
+    }
+}
+
+/// Persist the policy posture and return the previous value.
+pub async fn set_policy_mode(store: &Store, mode: EnforcementMode) -> Result<EnforcementMode> {
+    let old = get_policy_mode(store).await;
+    let value = match mode {
+        EnforcementMode::Advisory => "advisory",
+        EnforcementMode::Strict => "strict",
+    };
+    store.put_raw(POLICY_MODE_KEY, value.as_bytes()).await?;
+    if old != mode {
+        let label = |mode: EnforcementMode| match mode {
+            EnforcementMode::Advisory => "advisory",
+            EnforcementMode::Strict => "strict",
+        };
+        let _ = record_event(
+            store,
+            EnforcementEventType::EnforcementConfigChanged {
+                setting: "policy.mode".to_string(),
+                old_value: label(old).to_string(),
+                new_value: label(mode).to_string(),
+            },
+            SubjectKind::Config,
+            POLICY_MODE_KEY.to_string(),
             "developer".to_string(),
             None,
             "config_changed".to_string(),
@@ -1438,6 +1566,62 @@ pub fn event_type_label(event_type: &EnforcementEventType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_policy() -> crate::store::PolicyRecord {
+        crate::store::PolicyRecord {
+            name: "Mode collision test".into(),
+            rule: "Consult the schema first.".into(),
+            reason: "Schemas drift because production changes independently.".into(),
+            scope: "repo".into(),
+            mode: crate::store::PolicyMode::Block,
+            trigger: Default::default(),
+            requires: crate::store::PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![crate::store::ReceiptSource::MemGet],
+                freshness: crate::store::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
+            },
+            stage: crate::store::PolicyStage::Enforce,
+            severity: crate::store::Priority::High,
+            created_by: "developer".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_mode_reads_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store.put_raw(POLICY_MODE_KEY, b"advisory").await.unwrap();
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Advisory);
+    }
+
+    /// The posture key must stay out of the `policy:` record namespace, or
+    /// writing it destroys a policy slugged `mode` and vice versa.
+    #[tokio::test]
+    async fn policy_mode_does_not_collide_with_a_policy_slugged_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        crate::store::policy_ops::create(&store, "policy:mode", &sample_policy())
+            .await
+            .unwrap();
+        set_policy_mode(&store, EnforcementMode::Advisory)
+            .await
+            .unwrap();
+        let records = store.scan_prefix("policy:").await.unwrap();
+        assert_eq!(records.len(), 1, "the policy record must survive");
+        assert_eq!(records[0].key, "policy:mode");
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Advisory);
+    }
+
+    #[tokio::test]
+    async fn policy_mode_unrecognized_value_is_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store.put_raw(POLICY_MODE_KEY, b"not-a-mode").await.unwrap();
+        assert_eq!(get_policy_mode(&store).await, EnforcementMode::Strict);
+    }
 
     /// Construct a deterministic event for hash testing.
     fn frozen_test_event() -> EnforcementEvent {

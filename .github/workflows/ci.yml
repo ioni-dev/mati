@@ -96,6 +96,26 @@ jobs:
       - name: cargo test --doc
         run: cargo test --locked --doc
 
+      # End-to-end policy engine smoke. Unit tests cover the logic; this drives
+      # the real binary, a real daemon, and the hook subprocess protocol, which
+      # is the only way to catch mint/check scope mismatches and config gating
+      # bugs that a same-actor unit test cannot express.
+      #
+      # Exit 77 means the environment cannot bind a Unix domain socket, so the
+      # daemon never starts and every hook correctly fails open. That is a skip,
+      # not a failure.
+      - name: policy engine smoke
+        run: |
+          set +e
+          ./scripts/smoke-policy.sh
+          rc=$?
+          set -e
+          if [ "$rc" -eq 77 ]; then
+            echo "::notice::policy engine smoke skipped (no Unix domain socket available)"
+            exit 0
+          fi
+          exit "$rc"
+
   ignored-tests:
     # The `#[ignore]`d integration tests cover subprocess lifecycle,
     # crash recovery, concurrent socket dispatch, and the panic-hook

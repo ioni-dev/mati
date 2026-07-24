@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 // ── Types ───────────────────────────────────────────────────────────────────
 
 /// Which class of file-reading command was detected.
@@ -15,6 +17,30 @@ pub enum CommandClass {
     CatLike,
     /// grep, rg, sed, awk — file path is last non-flag arg.
     GrepLike,
+    /// psql, mysql, redis-cli, mongosh, sqlite3, and other governed DB clients.
+    DbClientLike,
+}
+
+/// Normalized shape of an agent tool invocation for policy matching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Action {
+    /// Governable category, such as `db_client` or `path`.
+    pub tool: String,
+    /// Primary target path, when the invocation has one.
+    pub target_path: Option<String>,
+    /// Host extracted from a DB-client flag or environment assignment.
+    pub host: Option<String>,
+    /// Shell-normalized argument tokens.
+    pub argv: Vec<String>,
+    /// All normalized file targets in the invocation.
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShadowOutcome {
+    Block,
+    Steer,
 }
 
 /// Semantic enforcement decision. Adapters map these to platform output.
@@ -25,8 +51,14 @@ pub enum CommandClass {
 pub enum Decision {
     /// No enforcement needed — allow unconditionally.
     Allow,
-    /// Confirmed gotcha, agent has NOT consulted — block the read.
-    Deny { file_key: String, reason: String },
+    /// A gate blocked the action. `origin` says which gate, so the message
+    /// shape and the audit reason code are chosen from the decision rather than
+    /// re-derived by sniffing `file_key`'s namespace at each call site.
+    Deny {
+        file_key: String,
+        reason: String,
+        origin: DenyOrigin,
+    },
     /// Confirmed gotcha, agent already consulted — allow with awareness.
     AlreadyConsulted { context: String },
     /// Medium confidence (0.3–0.6), quality >= 0.4 — advisory context.
@@ -39,6 +71,41 @@ pub enum Decision {
     NoRecord,
     /// Command is not a file-reading operation.
     NotFileRead,
+}
+
+/// Which gate produced a `Decision::Deny`.
+///
+/// Each origin already maps 1:1 to a distinct `decision_reason_code` in the
+/// enforcement log, so this is information the system requires downstream and
+/// used to drop between the decision and the message. Matching on it
+/// exhaustively means a new origin cannot silently inherit whatever branch its
+/// key prefix happens to land in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyOrigin {
+    /// Confirmed gotcha above the enforcement threshold. `file_key` is the
+    /// record to consult.
+    Gotcha,
+    /// Inherited signed-floor consult mandate. `file_key` is the mandated file.
+    ConsultMandate,
+    /// Local policy. `file_key` is the POLICY key, which is not consultable —
+    /// the consultable key lives in `reason`.
+    Policy,
+}
+
+impl DenyOrigin {
+    /// The event that records this deny in the enforcement log.
+    ///
+    /// Origin and event are chosen together at every deny site, and each event
+    /// maps to a distinct `decision_reason_code` downstream. Deriving the event
+    /// here means the agent-facing message and the audit chain cannot disagree
+    /// about what denied, and a new origin cannot be added without choosing one.
+    pub fn deny_event(self, key: String) -> HookEvent {
+        match self {
+            DenyOrigin::Gotcha => HookEvent::BlockedUnconsultedRead { key },
+            DenyOrigin::ConsultMandate => HookEvent::FloorConsultBlocked { key },
+            DenyOrigin::Policy => HookEvent::PolicyConsultBlocked { key },
+        }
+    }
 }
 
 /// Side-effect events the adapter should fire after the decision.
@@ -65,6 +132,116 @@ pub enum HookEvent {
     /// records `Deny` with reason `floor_consult_required`, distinct from a local-gotcha deny
     /// so the audit/report can tell an org mandate from a repo rule.
     FloorConsultBlocked { key: String },
+    /// Local policy denied an unconsulted governed action.
+    PolicyConsultBlocked { key: String },
+    /// Local policy allowed a governed action after its receipt was present.
+    PolicyConsulted { key: String },
+    /// A steer policy injected guidance without changing the action decision.
+    PolicySteered { key: String },
+    /// A shadow policy would have blocked, but never changes the decision.
+    PolicyShadowObserved {
+        key: String,
+        would: ShadowOutcome,
+        action: Option<Action>,
+    },
+}
+
+/// The I/O-free subset of a daemon policy verdict needed by the hook adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyVerdict {
+    pub key: String,
+    pub rule: String,
+    pub requires_key: String,
+    pub block: bool,
+    pub satisfied: bool,
+    pub stage: crate::store::PolicyStage,
+}
+
+/// Apply local policy verdicts with escalate-only semantics.
+///
+/// A non-strict block degrades to steering; a satisfied block records the
+/// receipt-backed allow. Existing decisions are never lowered by this layer.
+pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> EnforcementResult {
+    let mut context = Vec::new();
+    let mut events = Vec::new();
+    let mut denied = None;
+
+    for verdict in verdicts {
+        // The matcher already excludes Off; this defensive no-op prevents an
+        // unexpected Off verdict from being treated as a steer policy.
+        if matches!(verdict.stage, crate::store::PolicyStage::Off) {
+            continue;
+        }
+        if matches!(verdict.stage, crate::store::PolicyStage::Shadow) {
+            if !verdict.block {
+                events.push(HookEvent::PolicyShadowObserved {
+                    key: verdict.key.clone(),
+                    would: ShadowOutcome::Steer,
+                    action: None,
+                });
+            } else if !verdict.satisfied {
+                events.push(HookEvent::PolicyShadowObserved {
+                    key: verdict.key.clone(),
+                    would: ShadowOutcome::Block,
+                    action: None,
+                });
+            }
+            continue;
+        }
+        if verdict.block && !verdict.satisfied && strict {
+            denied.get_or_insert_with(|| Decision::Deny {
+                file_key: verdict.key.clone(),
+                reason: format!(
+                    "mati: policy {} blocked this action. Consult first: mem_get(\"{}\")",
+                    verdict.key, verdict.requires_key
+                ),
+                origin: DenyOrigin::Policy,
+            });
+        } else if verdict.block && verdict.satisfied {
+            events.push(HookEvent::PolicyConsulted {
+                key: verdict.key.clone(),
+            });
+        } else {
+            context.push(verdict.rule.clone());
+            events.push(HookEvent::PolicySteered {
+                key: verdict.key.clone(),
+            });
+        }
+    }
+
+    if let Some(decision) = denied {
+        let denied_key = match &decision {
+            Decision::Deny { file_key, .. } => file_key.clone(),
+            _ => unreachable!(),
+        };
+        // Keep shadow observations recorded in this same pass. A developer can
+        // stage one policy to shadow while another enforces, and discarding the
+        // observation because something else denied would make the rollout
+        // measurement silently under-report every action the two both matched.
+        //
+        // Enforcement-claiming events are dropped instead: PolicyConsulted
+        // would write an AllowAfterReceipt for an action that was in fact
+        // denied, which would falsify the audit chain. PolicySteered is also
+        // dropped because the action did not proceed with that context.
+        let mut events: Vec<HookEvent> = events
+            .into_iter()
+            .filter(|event| matches!(event, HookEvent::PolicyShadowObserved { .. }))
+            .collect();
+        events.push(DenyOrigin::Policy.deny_event(denied_key));
+        return EnforcementResult { decision, events };
+    }
+    if !context.is_empty() {
+        return EnforcementResult {
+            decision: Decision::Advisory {
+                context: context.join("\n"),
+            },
+            events,
+        };
+    }
+    EnforcementResult {
+        decision: Decision::Allow,
+        events,
+    }
 }
 
 /// Input to the enforcement decision engine.
@@ -89,6 +266,34 @@ pub struct EnforcementResult {
 
 const CAT_LIKE: &[&str] = &["cat", "less", "head", "tail", "bat"];
 const GREP_LIKE: &[&str] = &["grep", "egrep", "fgrep", "rg", "sed", "awk"];
+const DB_CLIENT_LIKE: &[&str] = &[
+    "psql",
+    "mysql",
+    "mariadb",
+    "redis-cli",
+    "mongosh",
+    "mongo",
+    "sqlite3",
+    "sqlcmd",
+];
+
+const ACTION_TOOL_DB_CLIENT: &str = "db_client";
+const ACTION_TOOL_FILE_READ: &str = "file_read";
+const ACTION_TOOL_PATH: &str = "path";
+
+/// The action categories emitted by the normalizer and accepted by policy
+/// matching. Keep this as the single source for author-time recognition too.
+pub const KNOWN_ACTION_TOOLS: &[&str] = &[
+    ACTION_TOOL_DB_CLIENT,
+    ACTION_TOOL_FILE_READ,
+    ACTION_TOOL_PATH,
+];
+
+/// Return whether a policy trigger names an action category emitted by the
+/// normalizer. Unknown values remain valid authoring data, but cannot match.
+pub fn is_known_action_tool(tool: &str) -> bool {
+    KNOWN_ACTION_TOOLS.contains(&tool)
+}
 
 /// Returns true if `trimmed` starts with `word` followed by whitespace
 /// (or is exactly `word`). Prevents `"catch"` matching `"cat"`.
@@ -170,7 +375,57 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
             return Some(CommandClass::GrepLike);
         }
     }
+    for &word in DB_CLIENT_LIKE {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::DbClientLike);
+        }
+    }
     None
+}
+
+/// Return whether a command performs an allowlisted database schema
+/// introspection. This is deliberately lexical: it recognizes only bounded
+/// SQL/meta-command forms and never infers intent from natural language.
+pub fn is_schema_introspection(command: &str) -> bool {
+    let normalized = effective_command(split_at_shell_operator(command)).to_ascii_lowercase();
+    let tokens = shell_tokens(&normalized);
+
+    if tokens
+        .iter()
+        .any(|token| token.contains("information_schema"))
+    {
+        return true;
+    }
+
+    for token in &tokens {
+        let token = token.trim_matches(|c: char| c.is_ascii_punctuation() && c != '\\');
+        if ["describe", "desc"]
+            .iter()
+            .any(|word| token == *word || token.starts_with(&format!("{word} ")))
+        {
+            return true;
+        }
+        if ["\\d", "\\dt", "\\d+", "\\l"].iter().any(|meta| {
+            token
+                .strip_prefix(meta)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        }) {
+            return true;
+        }
+    }
+
+    tokens.iter().any(|token| {
+        let token = token.trim_matches(|c: char| c.is_ascii_punctuation());
+        ["show tables", "show columns", "show schemas"]
+            .iter()
+            .any(|phrase| token == *phrase || token.starts_with(&format!("{phrase} ")))
+    }) || tokens.windows(2).any(|pair| {
+        pair[0] == "show"
+            && matches!(
+                pair[1].trim_matches(|c: char| c.is_ascii_punctuation()),
+                "tables" | "columns" | "schemas"
+            )
+    })
 }
 
 // ── File Path Extraction ────────────────────────────────────────────────────
@@ -183,6 +438,7 @@ pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
     match class {
         CommandClass::CatLike => paths.into_iter().next(),
         CommandClass::GrepLike => paths.into_iter().next_back(),
+        CommandClass::DbClientLike => paths.into_iter().next(),
     }
 }
 
@@ -206,18 +462,139 @@ pub fn extract_file_paths(cmd: &str, class: CommandClass) -> Vec<String> {
     // throw off extraction (`sudo cat foo` must extract `foo`, not `cat`).
     let eff = effective_command(cmd);
     let cmd_part = split_at_shell_operator(&eff);
-    let positionals = positional_args(&shell_tokens(cmd_part));
+    let tokens = shell_tokens(cmd_part);
 
     match class {
-        CommandClass::CatLike => positionals,
+        CommandClass::CatLike => positional_args(&tokens),
         CommandClass::GrepLike => {
+            let positionals = positional_args(&tokens);
             if positionals.len() >= 2 {
                 positionals[1..].to_vec()
             } else {
                 Vec::new()
             }
         }
+        CommandClass::DbClientLike => extract_db_file_paths(&tokens),
     }
+}
+
+/// Extract DB-client file arguments from `-f/--file` and their `=value` forms.
+fn extract_db_file_paths(tokens: &[String]) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut expects_file = false;
+    for token in tokens.iter().skip(1) {
+        if expects_file {
+            if !token.is_empty() {
+                files.push(token.clone());
+            }
+            expects_file = false;
+            continue;
+        }
+        if token == "-f" || token == "--file" {
+            expects_file = true;
+        } else if let Some(path) = token.strip_prefix("--file=") {
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        } else if let Some(path) = token.strip_prefix("-f=") {
+            if !path.is_empty() {
+                files.push(path.to_string());
+            }
+        }
+    }
+    files
+}
+
+/// Extract a DB host from `-h/--host` or a leading environment assignment.
+fn extract_db_host(command: &str) -> Option<String> {
+    let tokens = shell_tokens(split_at_shell_operator(command));
+    let mut expects_host = false;
+    let mut env_host = None;
+    for token in &tokens {
+        if expects_host {
+            return (!token.is_empty()).then(|| token.clone());
+        }
+        if token == "-h" || token == "--host" {
+            expects_host = true;
+        } else if let Some(host) = token.strip_prefix("--host=") {
+            return (!host.is_empty()).then(|| host.to_string());
+        } else if let Some(host) = token.strip_prefix("-h=") {
+            return (!host.is_empty()).then(|| host.to_string());
+        } else if let Some(value) = token.strip_prefix("PGHOST=") {
+            if !value.is_empty() {
+                env_host = Some(value.to_string());
+            }
+        } else if let Some(value) = token.strip_prefix("DATABASE_URL=") {
+            env_host = database_url_host(value);
+        }
+    }
+    env_host
+}
+
+/// Pull the authority host from a DATABASE_URL without introducing a URL
+/// parser into the pure command-normalization core.
+fn database_url_host(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let authority = value
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(value)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let host = host
+        .rsplit_once(':')
+        .filter(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Normalize a command and/or path into the pure policy-matching action shape.
+pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Action {
+    let mut action = Action {
+        tool: "unknown".to_string(),
+        target_path: target_path.map(str::to_string),
+        host: None,
+        argv: vec![],
+        files: target_path.into_iter().map(str::to_string).collect(),
+    };
+
+    let Some(command) = command else {
+        if action.target_path.is_some() {
+            action.tool = "path".to_string();
+        }
+        return action;
+    };
+
+    let effective = effective_command(split_at_shell_operator(command));
+    action.argv = shell_tokens(&effective);
+    if let Some(class) = classify_command(command) {
+        match class {
+            CommandClass::DbClientLike => {
+                action.tool = ACTION_TOOL_DB_CLIENT.to_string();
+                action.host = extract_db_host(command);
+                action.files.extend(extract_file_paths(command, class));
+            }
+            CommandClass::CatLike | CommandClass::GrepLike => {
+                action.tool = ACTION_TOOL_FILE_READ.to_string();
+                action.files.extend(extract_file_paths(command, class));
+            }
+        }
+    }
+    if action.target_path.is_none() {
+        action.target_path = action.files.first().cloned();
+    }
+    if action.tool == "unknown" && action.target_path.is_some() {
+        action.tool = ACTION_TOOL_PATH.to_string();
+    }
+    action
 }
 
 /// Split at the first shell operator (`|`, `;`, `&&`, `||`), returning the
@@ -416,7 +793,7 @@ pub fn normalize_path(file_path: &str, repo_root: Option<&str>) -> String {
 /// Evaluate the enforcement decision for a file access.
 ///
 /// Pure function — all data comes from `input`, no I/O. The decision matrix
-/// matches ARCHITECTURE.md §10.1.
+/// matches ARCHITECTURE.md section 10.1.
 pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
     let file_key = format!("file:{}", input.rel_path);
 
@@ -554,8 +931,9 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
                      call mem_get(\"file:{safe_path}\") and read the record \
                      before accessing this file.{staleness_note}"
                 ),
+                origin: DenyOrigin::Gotcha,
             },
-            events: vec![HookEvent::BlockedUnconsultedRead { key: file_key }],
+            events: vec![DenyOrigin::Gotcha.deny_event(file_key)],
         };
     }
 
@@ -1491,6 +1869,336 @@ mod tests {
         assert_eq!(
             extract_file_path("grep pat f1 f2", CommandClass::GrepLike).as_deref(),
             Some("f2")
+        );
+    }
+
+    // ── policy Action normalization ────────────────────────────────────
+
+    #[test]
+    fn classify_db_client_with_prefix_and_absolute_basename() {
+        assert_eq!(
+            classify_command("sudo /usr/bin/psql -h db.prod.internal"),
+            Some(CommandClass::DbClientLike)
+        );
+    }
+
+    #[test]
+    fn schema_introspection_allowlist_matches_supported_forms() {
+        for command in [
+            "psql -c \"SELECT * FROM information_schema.columns\"",
+            "psql -c \"\\d orders\"",
+            "psql -c \"\\dt\"",
+            "psql -c \"\\d+ orders\"",
+            "psql -c \"\\l\"",
+            "mysql -e 'DESCRIBE orders'",
+            "mysql -e 'DESC orders'",
+            "mysql -e 'SHOW TABLES'",
+            "mysql -e 'SHOW COLUMNS FROM orders'",
+            "mysql -e 'SHOW SCHEMAS'",
+        ] {
+            assert!(
+                is_schema_introspection(command),
+                "expected match: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_introspection_does_not_match_mutating_sql() {
+        assert!(!is_schema_introspection(
+            "psql -c \"UPDATE orders SET status = 'x'\""
+        ));
+        assert!(!is_schema_introspection("psql -c \"SELECT * FROM orders\""));
+    }
+
+    #[test]
+    fn schema_introspection_pins_bounded_parser_gaps() {
+        // The classifier intentionally does not interpret shell expansion or
+        // natural-language descriptions as schema inspection.
+        assert!(!is_schema_introspection("psql -c \"echo describe orders\""));
+        assert!(!is_schema_introspection("psql -c \"\\drop orders\""));
+        // Like the rest of the classifier, only the first shell segment is
+        // considered; pin that accepted residual behavior.
+        assert!(is_schema_introspection("psql -c \"SHOW TABLES\" | cat"));
+    }
+
+    #[test]
+    fn normalize_db_action_extracts_host_and_file_flag() {
+        let action = normalize_action(
+            Some("sudo psql -h db.prod.internal -f migrations/orders.sql -c select"),
+            None,
+        );
+        assert_eq!(action.tool, "db_client");
+        assert_eq!(action.host.as_deref(), Some("db.prod.internal"));
+        assert_eq!(action.files, vec!["migrations/orders.sql"]);
+        assert_eq!(action.target_path.as_deref(), Some("migrations/orders.sql"));
+        assert_eq!(action.argv.first().map(String::as_str), Some("psql"));
+    }
+
+    #[test]
+    fn normalize_db_action_extracts_host_from_environment_assignment() {
+        let action = normalize_action(Some("PGHOST=a psql -c \"select 1\""), None);
+        assert_eq!(action.tool, "db_client");
+        assert_eq!(action.host.as_deref(), Some("a"));
+        assert!(action.files.is_empty());
+
+        let explicit_action = normalize_action(Some("PGHOST=a psql -h b -c select"), None);
+        assert_eq!(explicit_action.host.as_deref(), Some("b"));
+
+        let url_action = normalize_action(
+            Some("DATABASE_URL=postgres://db.prod.internal/orders psql -c select"),
+            None,
+        );
+        assert_eq!(url_action.host.as_deref(), Some("db.prod.internal"));
+
+        let port_action = normalize_action(
+            Some("DATABASE_URL=postgres://db.prod.internal:5432/orders psql -c select"),
+            None,
+        );
+        assert_eq!(port_action.host.as_deref(), Some("db.prod.internal"));
+
+        let ipv6_action = normalize_action(
+            Some("DATABASE_URL=postgres://[::1]/orders psql -c select"),
+            None,
+        );
+        assert_eq!(ipv6_action.host.as_deref(), Some("[::1]"));
+    }
+
+    #[test]
+    fn normalize_path_action_sets_target_path_without_command() {
+        let action = normalize_action(None, Some("migrations/orders.sql"));
+        assert_eq!(
+            action,
+            Action {
+                tool: "path".into(),
+                target_path: Some("migrations/orders.sql".into()),
+                host: None,
+                argv: vec![],
+                files: vec!["migrations/orders.sql".into()],
+            }
+        );
+        assert_eq!(normalize_action(Some("ls -la"), Some("x.sql")).tool, "path");
+    }
+
+    #[test]
+    fn db_client_file_grammar_supports_attached_file_values() {
+        assert_eq!(
+            extract_file_paths(
+                "psql --file=migrations/a.sql -f migrations/b.sql",
+                CommandClass::DbClientLike
+            ),
+            vec!["migrations/a.sql", "migrations/b.sql"]
+        );
+    }
+
+    fn policy(block: bool, satisfied: bool, rule: &str) -> PolicyVerdict {
+        PolicyVerdict {
+            key: "policy:prod-query".into(),
+            rule: rule.into(),
+            requires_key: "schema:orders".into(),
+            block,
+            satisfied,
+            stage: crate::store::PolicyStage::Enforce,
+        }
+    }
+
+    #[test]
+    fn policy_block_unsatisfied_denies_in_strict_mode() {
+        let result = evaluate_policy_verdicts(&[policy(true, false, "Consult first.")], true);
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsultBlocked {
+                key: "policy:prod-query".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn shadow_would_block_is_observation_only() {
+        let mut verdict = policy(true, false, "Consult first.");
+        verdict.stage = crate::store::PolicyStage::Shadow;
+        let shadow = evaluate_policy_verdicts(&[verdict], true);
+        let none = evaluate_policy_verdicts(&[], true);
+        assert_eq!(shadow.decision, none.decision);
+        assert_eq!(
+            shadow.events,
+            vec![HookEvent::PolicyShadowObserved {
+                key: "policy:prod-query".into(),
+                would: ShadowOutcome::Block,
+                action: None,
+            }]
+        );
+    }
+
+    /// A deny must not erase a shadow observation gathered in the same pass:
+    /// staging one policy while another enforces is the normal rollout, and
+    /// dropping the observation makes the measurement under-report silently.
+    #[test]
+    fn a_deny_preserves_shadow_observations_from_the_same_pass() {
+        let mut shadowed = policy(true, false, "Observe only.");
+        shadowed.key = "policy:shadowed".into();
+        shadowed.stage = crate::store::PolicyStage::Shadow;
+        let mut blocking = policy(true, false, "Consult first.");
+        blocking.key = "policy:blocking".into();
+        let result = evaluate_policy_verdicts(&[shadowed, blocking], true);
+
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert!(
+            result.events.iter().any(|e| matches!(
+                e,
+                HookEvent::PolicyShadowObserved { key, .. } if key == "policy:shadowed"
+            )),
+            "shadow observation lost to the deny: {:?}",
+            result.events
+        );
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|e| matches!(e, HookEvent::PolicyConsultBlocked { .. })),
+            "deny must still record the block"
+        );
+    }
+
+    /// The other half: an enforcement-claiming event must NOT survive a deny,
+    /// or a satisfied block would write an AllowAfterReceipt for an action that
+    /// was denied.
+    #[test]
+    fn a_deny_drops_enforcement_events_from_the_same_pass() {
+        let mut satisfied = policy(true, true, "Already consulted.");
+        satisfied.key = "policy:satisfied".into();
+        let mut blocking = policy(true, false, "Consult first.");
+        blocking.key = "policy:blocking".into();
+        let result = evaluate_policy_verdicts(&[satisfied, blocking], true);
+
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|e| matches!(e, HookEvent::PolicyConsulted { .. })),
+            "a denied action must not also claim a receipt-backed allow: {:?}",
+            result.events
+        );
+    }
+
+    #[test]
+    fn shadow_satisfied_block_is_allowed_without_observation() {
+        let mut verdict = policy(true, true, "Consult first.");
+        verdict.stage = crate::store::PolicyStage::Shadow;
+        let result = evaluate_policy_verdicts(&[verdict], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(result.events.is_empty());
+    }
+
+    #[test]
+    fn policy_block_satisfied_allows_and_records_receipt() {
+        let result = evaluate_policy_verdicts(&[policy(true, true, "Consult first.")], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsulted {
+                key: "policy:prod-query".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn policy_steer_injects_context_without_denying() {
+        let result = evaluate_policy_verdicts(&[policy(false, true, "Consult first.")], true);
+        assert_eq!(
+            result.decision,
+            Decision::Advisory {
+                context: "Consult first.".into()
+            }
+        );
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicySteered {
+                key: "policy:prod-query".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn shadow_steer_records_observation_without_context() {
+        let mut verdict = policy(false, true, "Steer this action.");
+        verdict.stage = crate::store::PolicyStage::Shadow;
+        let result = evaluate_policy_verdicts(&[verdict], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(matches!(
+            result.events.as_slice(),
+            [HookEvent::PolicyShadowObserved {
+                would: ShadowOutcome::Steer,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn policy_block_degrades_to_steer_in_advisory_mode() {
+        let result = evaluate_policy_verdicts(&[policy(true, false, "Consult first.")], false);
+        assert_eq!(
+            result.decision,
+            Decision::Advisory {
+                context: "Consult first.".into()
+            }
+        );
+    }
+
+    #[test]
+    fn no_policy_verdicts_allow() {
+        let result = evaluate_policy_verdicts(&[], true);
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(result.events.is_empty());
+    }
+
+    #[test]
+    fn known_action_tools_are_distinguished_from_unknown_tools() {
+        assert!(is_known_action_tool("db_client"));
+        assert!(is_known_action_tool("file_read"));
+        assert!(is_known_action_tool("path"));
+        assert!(!is_known_action_tool("dbclient"));
+        assert!(!is_known_action_tool("db-client"));
+    }
+
+    #[test]
+    fn multi_policy_deny_only_records_the_blocking_policy() {
+        let verdicts = vec![
+            PolicyVerdict {
+                key: "policy:A".into(),
+                rule: "A was consulted.".into(),
+                requires_key: "schema:a".into(),
+                block: true,
+                satisfied: true,
+                stage: crate::store::PolicyStage::Enforce,
+            },
+            PolicyVerdict {
+                key: "policy:S".into(),
+                rule: "Steer this action.".into(),
+                requires_key: "schema:s".into(),
+                block: false,
+                satisfied: true,
+                stage: crate::store::PolicyStage::Enforce,
+            },
+            PolicyVerdict {
+                key: "policy:B".into(),
+                rule: "B must be consulted.".into(),
+                requires_key: "schema:b".into(),
+                block: true,
+                satisfied: false,
+                stage: crate::store::PolicyStage::Enforce,
+            },
+        ];
+        let result = evaluate_policy_verdicts(&verdicts, true);
+        assert!(matches!(result.decision, Decision::Deny { .. }));
+        // An AllowAfterReceipt alongside Deny would be a false "allowed" record.
+        assert_eq!(
+            result.events,
+            vec![HookEvent::PolicyConsultBlocked {
+                key: "policy:B".into()
+            }]
         );
     }
 }

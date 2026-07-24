@@ -4,15 +4,64 @@
 //! - `Immediate`: fsync on every write — slow but crash-safe.
 //! - `Eventual`: OS write buffer — fast but may lose the last ~10ms on crash.
 //!
-//! Assignment by key prefix (from ARCHITECTURE.md §4):
+//! Assignment by key prefix (from ARCHITECTURE.md section 4):
 //! ```text
-//! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*
+//! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*   policy:*
 //! Eventual   session:*  analytics:*  hook_event:*  compliance:*  graph:edge:*
 //! ```
 //!
 //! `graph:edge:*` is Eventual because edges are derived data (re-computed from
 //! source on `mati init`) — they are not irreplaceable like user-authored records.
 //! Losing a few edges on an OS crash costs one `mati init` re-run, not lost knowledge.
+
+/// How a key's value is encoded on disk.
+///
+/// The store keeps two encodings in one flat keyspace and distinguishes them by
+/// prefix alone. Mixing them is not a type error, it is a silent one: a raw
+/// scalar written into a `Record` namespace is skipped by `scan_prefix` with a
+/// warning, and a `Record` written over a raw scalar is unreadable by the
+/// getter that expects bytes. `policy:mode` did exactly this, colliding with
+/// `policy:<slug>` records so that setting the posture destroyed a policy.
+///
+/// This table is the invariant. `Store` debug-asserts against it, so a new key
+/// in the wrong namespace fails a test run rather than corrupting a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    /// msgpack-serialized `Record`. Written by `put`, read by `get`/`scan_prefix`.
+    Record,
+    /// Bare bytes whose meaning is prefix-specific: a timestamp, a counter, a
+    /// config scalar, or a JSON blob. Written by `put_raw`, read by
+    /// `get_raw_bytes`/`scan_keys`.
+    Raw,
+}
+
+impl Encoding {
+    /// Infer a key's value encoding from its prefix.
+    ///
+    /// Unknown prefixes default to `Record`, which matches `for_key` defaulting
+    /// to `Immediate`: a new knowledge namespace is the common case, and the
+    /// assertion below turns a wrong guess into a failing test.
+    pub fn for_key(key: &str) -> Self {
+        // `system:` is mixed and cannot be classified by prefix:
+        // `system:schema_version` is a Record while `system:installation_id` is
+        // a raw string. That is the same hazard `policy:mode` had, and it only
+        // stays harmless because nothing scans a bare `system:` prefix. The
+        // exact-key exception below is the honest encoding of that; splitting
+        // the namespace would be cleaner but installation_id shipped in v0.1.3
+        // and moving it needs a migration, not a rename.
+        if key == "system:installation_id" {
+            return Self::Raw;
+        }
+        if key.starts_with("graph:edge:")
+            || key.starts_with("audit:")
+            || key.starts_with("enforcement:")
+        {
+            Self::Raw
+        } else {
+            Self::Record
+        }
+    }
+}
 
 /// Controls whether a `Store::put` call fsyncs before returning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +97,67 @@ impl Durability {
 }
 
 #[cfg(test)]
+mod encoding_tests {
+    use super::Encoding;
+
+    #[test]
+    fn record_namespaces_are_record_encoded() {
+        for key in [
+            "gotcha:x",
+            "file:src/main.rs",
+            "decision:y",
+            "dev_note:z",
+            "dep:cargo:serde",
+            "stage:current",
+            "policy:production-query-safety",
+            "policy:mode",
+            "session:consulted:schema:x",
+            "analytics:hit_2026-07-22",
+            "health:score",
+            "parse:src/main.rs",
+            "compliance:miss_2026-07-22",
+            "system:schema_version",
+        ] {
+            assert_eq!(Encoding::for_key(key), Encoding::Record, "{key}");
+        }
+    }
+
+    #[test]
+    fn raw_namespaces_are_raw_encoded() {
+        for key in [
+            "graph:edge:file:a:imports:file:b",
+            "audit:knowledge:1",
+            "audit:session:1",
+            "enforcement:seq",
+            "enforcement:event:00000000000000000001",
+            "enforcement:mode",
+            "enforcement:policy_mode",
+            "enforcement:retention_days",
+            "system:installation_id",
+        ] {
+            assert_eq!(Encoding::for_key(key), Encoding::Raw, "{key}");
+        }
+    }
+
+    /// The bug this table exists to prevent: a config scalar named into the
+    /// policy record namespace. `policy:mode` must read as Record, so writing a
+    /// raw posture value there trips the assertion in `Store::put_raw` instead
+    /// of silently destroying the policy slugged `mode`.
+    #[test]
+    fn a_config_scalar_may_not_hide_in_a_record_namespace() {
+        assert_eq!(Encoding::for_key("policy:mode"), Encoding::Record);
+        assert_eq!(Encoding::for_key("enforcement:policy_mode"), Encoding::Raw);
+    }
+
+    /// `system:` is mixed, so it must not be classified by prefix alone.
+    #[test]
+    fn system_namespace_is_split_by_exact_key() {
+        assert_eq!(Encoding::for_key("system:installation_id"), Encoding::Raw);
+        assert_eq!(Encoding::for_key("system:schema_version"), Encoding::Record);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -68,6 +178,10 @@ mod tests {
         assert_eq!(Durability::for_key("stage:current"), Durability::Immediate);
         assert_eq!(
             Durability::for_key("dev_note:dont-refactor"),
+            Durability::Immediate
+        );
+        assert_eq!(
+            Durability::for_key("policy:production-query-safety"),
             Durability::Immediate
         );
     }
@@ -135,7 +249,7 @@ mod tests {
 
     #[test]
     fn all_immediate_prefixes_from_architecture_doc() {
-        // Every Immediate prefix listed in ARCHITECTURE.md §4 must route correctly.
+        // Every Immediate prefix listed in ARCHITECTURE.md section 4 must route correctly.
         let cases = [
             "gotcha:inference-async",
             "decision:storage-engine",

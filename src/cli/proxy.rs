@@ -277,6 +277,37 @@ impl StoreProxy {
         }
     }
 
+    /// Read only retained enforcement events in a wall-clock window. The
+    /// daemon performs a sequence-boundary binary search before reading the
+    /// forward suffix.
+    pub async fn scan_enforcement_events_since_ms(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<mati_core::store::enforcement::EnforcementEventScan> {
+        match &self.inner {
+            ProxyInner::Direct(s) => {
+                mati_core::store::enforcement::scan_enforcement_events_since_ms(
+                    s, since_ms, until_ms,
+                )
+                .await
+            }
+            ProxyInner::Socket { root } => {
+                match daemon_result(
+                    root,
+                    "scan_enforcement_events_since_ms",
+                    json!({ "since_ms": since_ms, "until_ms": until_ms }),
+                )
+                .await
+                {
+                    DaemonResult::Ok(v) => serde_json::from_value(v["data"].clone())
+                        .context("proxy scan_enforcement_events_since_ms: invalid result"),
+                    other => Err(socket_read_error("scan_enforcement_events_since_ms", other)),
+                }
+            }
+        }
+    }
+
     /// Write a record. In socket mode, dispatches to the appropriate typed
     /// v2 command based on key prefix. There is no raw `put` in the v2 protocol.
     pub async fn put(&self, key: &str, record: &Record) -> Result<()> {
@@ -468,6 +499,7 @@ impl StoreProxy {
                 let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
                     mati_core::mcp::protocol::ConsultationHitInput {
                         key: key.to_string(),
+                        capture_fingerprint: true,
                         actor: None,
                         session_id: None,
                         agent_id: None,
@@ -503,6 +535,10 @@ impl StoreProxy {
                     "file:",
                     "stage:",
                     "dep:",
+                    // Policies are user-authored source of truth and belong in a
+                    // backup. show::deactivate_imported_policies lands them at stage
+                    // off, so a restore never silently starts enforcing.
+                    "policy:",
                 ];
                 let mut accepted: Vec<(&str, &Record)> = Vec::with_capacity(records.len());
                 let mut skipped: u64 = 0;
@@ -706,6 +742,149 @@ impl StoreProxy {
         }
     }
 
+    /// Mutate a local policy through the canonical policy_ops path.
+    ///
+    /// Socket mode sends the operation to the daemon; direct mode calls the
+    /// same store operation locally when no daemon owns the store.
+    pub async fn policy_write(
+        &self,
+        op: mati_core::mcp::protocol::PolicyWriteOp,
+        key: &str,
+        policy: Option<&mati_core::store::PolicyRecord>,
+    ) -> Result<()> {
+        use mati_core::mcp::protocol as p;
+
+        match &self.inner {
+            ProxyInner::Direct(store) => match op {
+                p::PolicyWriteOp::Create => {
+                    let policy =
+                        policy.ok_or_else(|| anyhow::anyhow!("policy is required for create"))?;
+                    mati_core::store::policy_ops::create(store, key, policy).await
+                }
+                p::PolicyWriteOp::Edit => {
+                    let policy =
+                        policy.ok_or_else(|| anyhow::anyhow!("policy is required for edit"))?;
+                    mati_core::store::policy_ops::edit(store, key, policy).await
+                }
+                p::PolicyWriteOp::Enable => {
+                    mati_core::store::policy_ops::set_stage(
+                        store,
+                        key,
+                        mati_core::store::PolicyStage::Enforce,
+                    )
+                    .await
+                }
+                p::PolicyWriteOp::Disable => {
+                    mati_core::store::policy_ops::set_stage(
+                        store,
+                        key,
+                        mati_core::store::PolicyStage::Off,
+                    )
+                    .await
+                }
+                p::PolicyWriteOp::Stage => {
+                    let stage = policy
+                        .map(|policy| policy.stage)
+                        .ok_or_else(|| anyhow::anyhow!("stage is required"))?;
+                    mati_core::store::policy_ops::set_stage(store, key, stage).await
+                }
+                p::PolicyWriteOp::Delete => mati_core::store::policy_ops::delete(store, key).await,
+            },
+            ProxyInner::Socket { root } => {
+                let cmd = p::Command::PolicyWrite(p::PolicyWriteInput {
+                    op,
+                    key: key.to_string(),
+                    policy: policy.cloned(),
+                    stage: policy.map(|policy| policy.stage),
+                });
+                interpret_policy_write_ack(daemon_v2(root, cmd).await)
+            }
+        }
+    }
+
+    /// Evaluate an action against local policies and check block receipts.
+    pub async fn policy_evaluate(
+        &self,
+        action: &mati_core::hooks::decide::Action,
+        actor: Option<&str>,
+    ) -> Result<Vec<mati_core::mcp::protocol::PolicyVerdict>> {
+        use mati_core::hooks::policy_match::PolicyMatcherSet;
+        use mati_core::mcp::protocol as p;
+        use mati_core::store::PolicyMode;
+
+        match &self.inner {
+            ProxyInner::Direct(store) => {
+                let records = store.scan_prefix("policy:").await?;
+                let strict = matches!(
+                    mati_core::store::enforcement::get_policy_mode(store).await,
+                    mati_core::store::enforcement::EnforcementMode::Strict
+                );
+                let matcher = PolicyMatcherSet::from_records_lenient(&records);
+                let matched = matcher.matches(action);
+                let mut verdicts = Vec::with_capacity(matched.len());
+                for matched in matched {
+                    let policy = matched.policy;
+                    let satisfied = match policy.mode {
+                        PolicyMode::Steer => true,
+                        PolicyMode::Block => {
+                            if policy.requires.freshness.fingerprint {
+                                mati_core::store::session::check_consulted_recent_fingerprinted(
+                                    store,
+                                    &policy.requires.key,
+                                    policy.requires.freshness.ttl_secs,
+                                    actor,
+                                )
+                                .await?
+                            } else {
+                                mati_core::store::session::check_consulted_recent(
+                                    store,
+                                    &policy.requires.key,
+                                    policy.requires.freshness.ttl_secs,
+                                    actor,
+                                )
+                                .await?
+                            }
+                        }
+                    };
+                    verdicts.push(p::PolicyVerdict {
+                        key: matched.key.to_string(),
+                        stage: policy.stage,
+                        mode: policy.mode,
+                        rule: policy.rule.clone(),
+                        reason: policy.reason.clone(),
+                        severity: policy.severity.clone(),
+                        requires_key: policy.requires.key.clone(),
+                        via: policy.requires.via.clone(),
+                        satisfied,
+                        strict,
+                    });
+                }
+                Ok(verdicts)
+            }
+            ProxyInner::Socket { root } => {
+                let cmd = p::Command::PolicyEvaluate(p::PolicyEvaluateInput {
+                    action: action.clone(),
+                    actor: actor.map(str::to_string),
+                });
+                match daemon_v2(root, cmd).await {
+                    DaemonResult::Ok(resp) => {
+                        if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                            serde_json::from_value(resp.get("data").cloned().unwrap_or_default())
+                                .context("daemon policy_evaluate returned invalid data")
+                        } else {
+                            let error = resp
+                                .get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            anyhow::bail!("daemon policy_evaluate failed: {error}")
+                        }
+                    }
+                    other => Err(socket_read_error("policy_evaluate", other)),
+                }
+            }
+        }
+    }
+
     /// Tombstone a gotcha and remove its graph edges.
     ///
     /// In direct mode, delegates to `apply_gotcha_tombstone`.
@@ -803,7 +982,7 @@ impl StoreProxy {
     pub async fn config_get(&self, key: &str) -> Result<String> {
         use mati_core::mcp::protocol as p;
         use mati_core::store::enforcement::{
-            get_enforcement_mode, get_retention_days, EnforcementMode,
+            get_enforcement_mode, get_policy_mode, get_retention_days, EnforcementMode,
         };
 
         match &self.inner {
@@ -813,9 +992,13 @@ impl StoreProxy {
                     EnforcementMode::Strict => "strict".to_string(),
                 }),
                 "enforcement.retention" => Ok(get_retention_days(store).await.to_string()),
+                "policy.mode" => Ok(match get_policy_mode(store).await {
+                    EnforcementMode::Advisory => "advisory".to_string(),
+                    EnforcementMode::Strict => "strict".to_string(),
+                }),
                 other => anyhow::bail!(
                     "unknown config key: {other}\n\
-                     Valid keys: audit.write_durability, enforcement.retention"
+                     Valid keys: audit.write_durability, enforcement.retention, policy.mode"
                 ),
             },
             ProxyInner::Socket { root } => {
@@ -848,7 +1031,7 @@ impl StoreProxy {
     pub async fn config_set(&self, key: &str, value: &str) -> Result<String> {
         use mati_core::mcp::protocol as p;
         use mati_core::store::enforcement::{
-            set_enforcement_mode, set_retention_days, EnforcementMode,
+            set_enforcement_mode, set_policy_mode, set_retention_days, EnforcementMode,
         };
 
         match &self.inner {
@@ -878,9 +1061,23 @@ impl StoreProxy {
                     set_retention_days(store, days).await?;
                     Ok(String::new())
                 }
+                "policy.mode" => {
+                    let mode = match value {
+                        "advisory" => EnforcementMode::Advisory,
+                        "strict" => EnforcementMode::Strict,
+                        other => anyhow::bail!(
+                            "invalid policy.mode: {other}\nValid values: advisory, strict"
+                        ),
+                    };
+                    let old = set_policy_mode(store, mode).await?;
+                    Ok(match old {
+                        EnforcementMode::Advisory => "advisory".to_string(),
+                        EnforcementMode::Strict => "strict".to_string(),
+                    })
+                }
                 other => anyhow::bail!(
                     "unknown config key: {other}\n\
-                     Valid keys: audit.write_durability, enforcement.retention"
+                     Valid keys: audit.write_durability, enforcement.retention, policy.mode"
                 ),
             },
             ProxyInner::Socket { root } => {
@@ -1138,9 +1335,87 @@ fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
     )
 }
 
+fn socket_write_error(op: &str, result: DaemonResult) -> anyhow::Error {
+    let detail = match result {
+        DaemonResult::NotRunning => "daemon stopped",
+        DaemonResult::StaleSocket => "daemon socket became stale",
+        DaemonResult::Unresponsive => "daemon did not respond",
+        DaemonResult::PermissionDenied => {
+            "connection was denied (a sandbox may be blocking the daemon socket)"
+        }
+        DaemonResult::Ok(_) => {
+            unreachable!("socket_write_error only handles non-ok daemon results")
+        }
+    };
+    anyhow::anyhow!("mati daemon {detail} while handling '{op}'; retry after restarting the daemon")
+}
+
+/// Interpret a daemon `policy_write` response (as normalized by `daemon_v2` into
+/// `{"ok":bool,...}`) into a unit result, translating a version-skew rejection
+/// from an older daemon into an actionable hint.
+fn interpret_policy_write_ack(result: DaemonResult) -> Result<()> {
+    match result {
+        DaemonResult::Ok(resp) => {
+            if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+                Ok(())
+            } else {
+                let code = resp.get("code").and_then(|v| v.as_str());
+                let error = resp
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                if matches!(code, Some("malformed_request" | "version_mismatch")) {
+                    anyhow::bail!(
+                        "this daemon predates policy authoring; run `mati daemon stop` and retry"
+                    )
+                }
+                anyhow::bail!("daemon policy_write failed: {error}")
+            }
+        }
+        other => Err(socket_write_error("policy_write", other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_write_ack_accepts_ok() {
+        let ack = interpret_policy_write_ack(DaemonResult::Ok(
+            serde_json::json!({"ok": true, "v": 2, "data": null}),
+        ));
+        assert!(ack.is_ok());
+    }
+
+    #[test]
+    fn policy_write_ack_maps_version_skew_to_hint() {
+        for code in ["malformed_request", "version_mismatch"] {
+            let err = interpret_policy_write_ack(DaemonResult::Ok(
+                serde_json::json!({"ok": false, "code": code, "error": "unknown command"}),
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("predates policy authoring"),
+                "code {code} should map to the version-skew hint, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_write_ack_surfaces_generic_daemon_error() {
+        let err = interpret_policy_write_ack(DaemonResult::Ok(
+            serde_json::json!({"ok": false, "code": "store_error", "error": "boom"}),
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("daemon policy_write failed: boom"));
+    }
+
+    #[test]
+    fn policy_write_ack_reports_unreachable_daemon() {
+        let err = interpret_policy_write_ack(DaemonResult::NotRunning).unwrap_err();
+        assert!(err.to_string().contains("daemon"));
+    }
 
     use mati_core::store::repair::{DirtyMarker, DIRTY_MARKER_KEY};
     use tempfile::TempDir;
@@ -1158,6 +1433,116 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("get"));
         assert!(msg.contains("restarting the daemon"));
+    }
+
+    #[tokio::test]
+    async fn direct_policy_evaluate_checks_receipts() {
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let policy = mati_core::store::PolicyRecord {
+            name: "Production query".into(),
+            rule: "Consult first.".into(),
+            reason: "Production changes because deployments happen.".into(),
+            scope: "repo".into(),
+            mode: mati_core::store::PolicyMode::Block,
+            trigger: mati_core::store::PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: mati_core::store::PolicyRequires {
+                key: "schema:orders".into(),
+                via: vec![mati_core::store::ReceiptSource::MemGet],
+                freshness: mati_core::store::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: false,
+                },
+            },
+            stage: mati_core::store::PolicyStage::Enforce,
+            severity: mati_core::store::Priority::High,
+            created_by: "test".into(),
+        };
+        mati_core::store::policy_ops::create(&store, "policy:direct", &policy)
+            .await
+            .unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Direct(store),
+        };
+        let action = mati_core::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.prod.internal".into()),
+            argv: vec!["psql".into()],
+            files: vec![],
+        };
+        let verdicts = proxy.policy_evaluate(&action, None).await.unwrap();
+        assert!(
+            verdicts[0].strict,
+            "direct policy evaluation defaults to strict"
+        );
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].satisfied);
+    }
+
+    #[tokio::test]
+    async fn direct_policy_evaluate_invalidates_fingerprinted_receipt_on_drift() {
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "schema:orders";
+        store
+            .put(
+                key,
+                &mati_core::store::session::session_record(key, "orders v1".into()),
+            )
+            .await
+            .unwrap();
+        mati_core::store::session::log_hit(&store, key)
+            .await
+            .unwrap();
+        let policy = mati_core::store::PolicyRecord {
+            name: "Fingerprint query".into(),
+            rule: "Consult current schema.".into(),
+            reason: "Schemas drift because deployments change.".into(),
+            scope: "repo".into(),
+            mode: mati_core::store::PolicyMode::Block,
+            trigger: mati_core::store::PolicyTrigger {
+                tool: Some("db_client".into()),
+                host_glob: Some("*prod*".into()),
+                target_path_glob: None,
+            },
+            requires: mati_core::store::PolicyRequires {
+                key: key.into(),
+                via: vec![mati_core::store::ReceiptSource::MemGet],
+                freshness: mati_core::store::PolicyFreshness {
+                    ttl_secs: 900,
+                    fingerprint: true,
+                },
+            },
+            stage: mati_core::store::PolicyStage::Enforce,
+            severity: mati_core::store::Priority::High,
+            created_by: "test".into(),
+        };
+        mati_core::store::policy_ops::create(&store, "policy:fingerprint", &policy)
+            .await
+            .unwrap();
+        let proxy = StoreProxy {
+            inner: ProxyInner::Direct(store),
+        };
+        let action = mati_core::hooks::decide::Action {
+            tool: "db_client".into(),
+            target_path: None,
+            host: Some("db.prod.internal".into()),
+            argv: vec!["psql".into()],
+            files: vec![],
+        };
+        assert!(proxy.policy_evaluate(&action, None).await.unwrap()[0].satisfied);
+
+        let mut changed = proxy.get(key).await.unwrap().unwrap();
+        changed.value = "orders v2".into();
+        proxy.put(key, &changed).await.unwrap();
+        assert!(!proxy.policy_evaluate(&action, None).await.unwrap()[0].satisfied);
     }
 
     #[tokio::test]

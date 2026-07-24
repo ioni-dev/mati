@@ -4,7 +4,7 @@
 //! each section to a [`Record`] with the correct [`Category`] based on the
 //! heading text.
 //!
-//! Section-to-category mapping (from ARCHITECTURE.md §12.1):
+//! Section-to-category mapping (from ARCHITECTURE.md section 12.1):
 //!
 //! ```text
 //! "## Gotchas" / "## Known Issues"          → Category::Gotcha
