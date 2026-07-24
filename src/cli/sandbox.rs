@@ -38,8 +38,12 @@ use super::proxy::StoreProxy;
 /// - `crown-jewel`: shell / subprocess cannot WRITE the file (protect critical
 ///   logic from out-of-gate modification). Reads still work.
 /// - `sandbox-deny-read`: additionally, the shell cannot READ the file (secrets).
-const TAG_DENY_WRITE: &str = "crown-jewel";
-const TAG_DENY_READ: &str = "sandbox-deny-read";
+///
+/// Visible to `cli::init`, whose rename migration warns when it re-keys a
+/// gotcha that compiles into the floor: the already-materialized
+/// settings.local.json still names the pre-rename path.
+pub(super) const TAG_DENY_WRITE: &str = "crown-jewel";
+pub(super) const TAG_DENY_READ: &str = "sandbox-deny-read";
 
 #[derive(Args, Debug)]
 pub struct SandboxArgs {
