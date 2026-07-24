@@ -869,6 +869,7 @@ async fn edit_candidate(
             ref_url: gotcha.ref_url.clone(),
             discovered_session: gotcha.discovered_session,
             confirmed: false,
+            confirmed_content: Default::default(),
         };
 
         record.value = if reason.is_empty() {
@@ -1161,6 +1162,7 @@ mod tests {
             ref_url: None,
             discovered_session: 0,
             confirmed,
+            confirmed_content: Default::default(),
         };
         let now = 1_710_520_800u64;
         let record = Record {

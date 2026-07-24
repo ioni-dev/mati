@@ -1404,6 +1404,45 @@ mod tests {
         ));
     }
 
+    /// A gotcha whose code has drifted since it was confirmed must keep
+    /// denying. Content drift (`health::drift`) is reported by `mati stale` and
+    /// `mati doctor`; it is deliberately not visible to this function, does not
+    /// touch `staleness`/`confidence`/`quality`/`confirmed`, and therefore
+    /// cannot move a record into the `liability` or `tombstone` branches above
+    /// that return before the gotcha loop is ever reached.
+    ///
+    /// The mismatch below is the real shape: `confirmed_content` was stamped at
+    /// confirm time, the file record's `content_hash` moved on since. Both
+    /// records carry it; the decision is identical to `eval_confirmed_gotcha_denies`.
+    #[test]
+    fn eval_drifted_gotcha_still_denies() {
+        let mut gotcha = make_gotcha(true, 0.7, 0.5);
+        gotcha["payload"]["confirmed_content"] = json!({ "src/main.rs": "STAMPED_AT_CONFIRM" });
+
+        let mut file_record = make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"]);
+        file_record["payload"]["content_hash"] = json!("CHANGED_SINCE");
+
+        let mut gotchas = HashMap::new();
+        gotchas.insert("gotcha:test".to_string(), gotcha);
+
+        let input = EnforcementInput {
+            rel_path: "src/main.rs".into(),
+            file_record: Some(file_record),
+            gotcha_records: gotchas,
+            already_consulted: false,
+        };
+        let result = evaluate(&input);
+        assert!(
+            matches!(&result.decision, Decision::Deny { origin, .. } if *origin == DenyOrigin::Gotcha),
+            "a drifted gotcha must still deny — drift reports, it never disables the gate; got {:?}",
+            result.decision
+        );
+        assert!(matches!(
+            &result.events[0],
+            HookEvent::BlockedUnconsultedRead { key } if key == "file:src/main.rs"
+        ));
+    }
+
     #[test]
     fn eval_unconfirmed_gotcha_allows() {
         let mut gotchas = HashMap::new();

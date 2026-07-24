@@ -338,6 +338,7 @@ async fn upsert_commit_once(
                 .unwrap_or(now)
         },
         confirmed: false, // Always reset on upsert.
+        confirmed_content: Default::default(),
     };
 
     let mut record = match existing {
@@ -564,6 +565,16 @@ async fn confirm_commit_once(
         .unwrap_or_default();
     let file_link_updates = compute_file_link_updates(store, key, &[], &affected_files).await;
     let confirmation_updates = compute_confirmation_propagation(store, &affected_files).await;
+
+    // Stamp the content digest each affected file currently carries, so a later
+    // change to that file is reportable as content drift. The direct-store path
+    // does this inside `gotcha_ops::apply_gotcha_confirm`; this handler commits
+    // its own `transact_knowledge` and never calls it, so it carries the stamp
+    // itself — same as the `affected_files` normalization split. Recomputed from
+    // records already read above, so no file is opened and nothing is re-hashed.
+    // Must run before the record is staged below.
+    let stamp = crate::store::gotcha_ops::confirm_content_stamp(store, &affected_files).await;
+    crate::store::gotcha_ops::set_confirm_stamp(&mut record, &stamp);
 
     // Atomic: gotcha record + file-link updates + confirmation propagation + audit.
     // Audit is required — fail closed if serialization fails.

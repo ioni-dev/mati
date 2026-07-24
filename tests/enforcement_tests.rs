@@ -548,6 +548,7 @@ async fn gotcha_crud_records_control_changed_events() {
             ref_url: None,
             discovered_session: 1_000_000,
             confirmed,
+            confirmed_content: Default::default(),
         };
         Record {
             key: key.to_string(),
@@ -1166,6 +1167,7 @@ async fn gotcha_add_on_unindexed_file_wires_read_gate() {
         ref_url: None,
         discovered_session: 1_000_000,
         confirmed: true,
+        confirmed_content: Default::default(),
     };
     let record = Record {
         key: gkey.into(),
