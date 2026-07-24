@@ -20,14 +20,23 @@ pub struct MemQueryParams {
     /// Search query string. For text mode: matched against record keys, values, and tags.
     /// For tag mode: matched against record tags (substring, case-insensitive).
     /// For graph mode: must be a full namespaced record key (e.g. "file:src/main.rs" or "gotcha:my-rule").
+    /// For policy_observations / policy_activity: a policy slug (empty = all policies).
+    /// For analytics: a key substring filter (empty = all analytics records).
     pub query: String,
-    /// Search mode: "text" (default, BM25 full-text), "tag" (filter by tag),
-    /// or "graph" (1-hop traversal from a seed key — query must be an exact namespaced key, not a keyword).
+    /// Search mode. Knowledge search: "text" (default, BM25 full-text),
+    /// "tag" (filter by tag), "graph" (1-hop traversal from an exact seed key).
+    /// Enforcement telemetry (read-only, local): "policy_observations" (shadow
+    /// observations), "policy_activity" (activity report, honors `since`),
+    /// "analytics" (raw analytics:* records).
     #[serde(default = "default_mode")]
     pub mode: String,
     /// Maximum number of results to return (default: 20).
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Look-back window in days for the "policy_activity" mode (default: 30).
+    /// Ignored by other modes.
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 fn default_mode() -> String {

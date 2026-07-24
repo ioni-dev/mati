@@ -1668,6 +1668,78 @@ pub(crate) async fn handle_mem_query(
             ErrorCode::ValidationFailed,
             "semantic search requires --features semantic (not enabled)".into(),
         )),
+        protocol::QueryMode::PolicyObservations => {
+            // Shadow observations — bounded daily aggregates of what a
+            // not-yet-live policy would have denied. `query` selects one slug.
+            let slug = (!input.query.is_empty()).then_some(input.query.as_str());
+            let shadow = store
+                .scan_prefix("analytics:policy_shadow_")
+                .await
+                .map_err(|e| (ErrorCode::StoreError, format!("scan shadow: {e}")))?;
+            let observations =
+                crate::store::observability::assemble_shadow_observations(&shadow, slug);
+            serde_json::to_value(observations)
+                .map_err(|e| (ErrorCode::StoreError, format!("serialize: {e}")))
+        }
+        protocol::QueryMode::PolicyActivity => {
+            use crate::store::{enforcement, observability};
+            let days = input
+                .since
+                .unwrap_or(observability::POLICY_ACTIVITY_DEFAULT_DAYS);
+            let slug = (!input.query.is_empty()).then_some(input.query.as_str());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let window_start = observability::window_start_secs(now, days);
+            let enforcement = enforcement::scan_enforcement_events_since_ms(
+                store,
+                window_start.saturating_mul(1000),
+                now.saturating_mul(1000),
+            )
+            .await
+            .map_err(|e| (ErrorCode::StoreError, format!("scan enforcement: {e}")))?;
+            let policy_records = store
+                .scan_prefix("policy:")
+                .await
+                .map_err(|e| (ErrorCode::StoreError, format!("scan policy: {e}")))?;
+            let shadow_records = store
+                .scan_prefix("analytics:policy_shadow_")
+                .await
+                .map_err(|e| (ErrorCode::StoreError, format!("scan shadow: {e}")))?;
+            let steer_records = store
+                .scan_prefix("analytics:policy_steer_")
+                .await
+                .map_err(|e| (ErrorCode::StoreError, format!("scan steer: {e}")))?;
+            let report = observability::assemble_activity_report(
+                now,
+                days,
+                &policy_records,
+                &enforcement,
+                &shadow_records,
+                &steer_records,
+                slug,
+            );
+            serde_json::to_value(report)
+                .map_err(|e| (ErrorCode::StoreError, format!("serialize: {e}")))
+        }
+        protocol::QueryMode::Analytics => {
+            // Raw analytics records. Text mode deliberately excludes this
+            // category; this mode is the explicit opt-in for reading it.
+            let needle = input.query.to_lowercase();
+            let records = store
+                .scan_prefix("analytics:")
+                .await
+                .map_err(|e| (ErrorCode::StoreError, format!("scan analytics: {e}")))?;
+            let arr: Vec<serde_json::Value> = records
+                .iter()
+                .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+                .filter(|r| needle.is_empty() || r.key.to_lowercase().contains(&needle))
+                .take(limit)
+                .map(super::tools::record_to_agent_json)
+                .collect();
+            Ok(serde_json::Value::Array(arr))
+        }
     }
 }
 

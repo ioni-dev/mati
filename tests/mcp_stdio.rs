@@ -720,6 +720,60 @@ fn mcp_stdio_search_modes() {
     );
 }
 
+// ── Test: enforcement-telemetry query modes reach the daemon over the socket ─
+//
+// These are the reads a sandboxed agent shell cannot make over the CLI (the
+// daemon socket is unreachable from the sandbox). Driving them through the
+// stdio server proves they are reachable over MCP, which runs outside it.
+
+#[test]
+fn mcp_stdio_telemetry_modes() {
+    let (mut stdin, rx, _guard, _dir) = setup_mcp_server();
+
+    // policy_observations on a fresh store — empty object, not a transport error.
+    let text = call_tool(
+        &mut stdin,
+        &rx,
+        50,
+        "mem_query",
+        r#"{"query":"","mode":"policy_observations","limit":20}"#,
+    );
+    assert!(
+        text == "{}",
+        "policy_observations on empty store should be an empty object: {text}"
+    );
+
+    // policy_activity honors the `since` window carried over the v1→v2 bridge.
+    let text = call_tool(
+        &mut stdin,
+        &rx,
+        51,
+        "mem_query",
+        r#"{"query":"","mode":"policy_activity","limit":20,"since":7}"#,
+    );
+    assert!(
+        text.contains("\"window_days\":7"),
+        "policy_activity must echo the `since` window: {text}"
+    );
+    assert!(
+        text.contains("\"policies\":[]"),
+        "policy_activity on empty store should list no policies: {text}"
+    );
+
+    // analytics on a fresh store — empty array.
+    let text = call_tool(
+        &mut stdin,
+        &rx,
+        52,
+        "mem_query",
+        r#"{"query":"","mode":"analytics","limit":20}"#,
+    );
+    assert!(
+        text == "[]",
+        "analytics on empty store should return []: {text}"
+    );
+}
+
 // ── Test: write-then-search consistency ──────────────────────────────────────
 
 #[test]
