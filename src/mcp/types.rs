@@ -21,7 +21,8 @@ pub struct MemQueryParams {
     /// For tag mode: matched against record tags (substring, case-insensitive).
     /// For graph mode: must be a full namespaced record key (e.g. "file:src/main.rs" or "gotcha:my-rule").
     /// For policy_observations / policy_activity: a policy slug (empty = all policies).
-    /// For analytics: a key substring filter (empty = all analytics records).
+    /// For analytics: a key substring naming the aggregate (e.g. "miss_"); required —
+    /// an empty query returns nothing (it will not dump every analytics record).
     pub query: String,
     /// Search mode. Knowledge search: "text" (default, BM25 full-text),
     /// "tag" (filter by tag), "graph" (1-hop traversal from an exact seed key).
@@ -30,11 +31,14 @@ pub struct MemQueryParams {
     /// "analytics" (raw analytics:* records).
     #[serde(default = "default_mode")]
     pub mode: String,
-    /// Maximum number of results to return (default: 20).
+    /// Maximum number of results to return (default: 20). Bounds the "analytics"
+    /// result set; "policy_observations" and "policy_activity" return the full
+    /// aggregate regardless.
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Look-back window in days for the "policy_activity" mode (default: 30).
-    /// 0 is treated as unset and uses the default. Ignored by other modes.
+    /// 0 is treated as unset (uses the default); values above the 365-day
+    /// retention horizon are capped. Ignored by other modes.
     #[serde(default)]
     pub since: Option<u64>,
 }

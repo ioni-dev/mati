@@ -1662,6 +1662,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mem_query_analytics_empty_query_returns_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // A record exists, but an empty query must NOT dump it — the mode
+        // requires a named aggregate so it can't firehose internal analytics.
+        let r = make_record("analytics:miss_2026-07-24", "m", Category::Analytics, 0.5);
+        store.put(&r.key, &r).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let out = call_mem_query(&graph_arc, "", crate::mcp::protocol::QueryMode::Analytics, 20).await;
+        assert_eq!(out, "[]", "empty analytics query must return nothing, got: {out}");
+    }
+
+    #[tokio::test]
+    async fn mem_query_policy_activity_since_caps_at_retention() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: String::new(),
+            mode: crate::mcp::protocol::QueryMode::PolicyActivity,
+            limit: 20,
+            since: Some(u64::MAX),
+        };
+        let g = graph_arc.read().await;
+        let value = crate::mcp::handlers::handle_mem_query(g.store(), &g, &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            value["window_days"], 365,
+            "an absurd `since` must cap at the retention horizon"
+        );
+    }
+
     // ── mem_bootstrap tests ──────────────────────────────────────────────────
 
     #[tokio::test]

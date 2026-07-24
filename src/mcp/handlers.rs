@@ -1683,13 +1683,15 @@ pub(crate) async fn handle_mem_query(
         }
         protocol::QueryMode::PolicyActivity => {
             use crate::store::{enforcement, observability};
-            // Treat since:0 as unset: a zero-width window reports every policy
+            // Treat since:0 as unset (a zero-width window reports every policy
             // as NoActivity, which an agent could misread as "these rules are
-            // dead." Fall back to the default look-back instead.
+            // dead"), and cap at the retention horizon so an absurd `since`
+            // can't yield a nonsensical window or force a full-history rescan.
             let days = input
                 .since
                 .filter(|&d| d > 0)
-                .unwrap_or(observability::POLICY_ACTIVITY_DEFAULT_DAYS);
+                .unwrap_or(observability::POLICY_ACTIVITY_DEFAULT_DAYS)
+                .min(observability::POLICY_ACTIVITY_RETENTION_DAYS);
             let slug = (!input.query.is_empty()).then_some(input.query.as_str());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1730,19 +1732,28 @@ pub(crate) async fn handle_mem_query(
         protocol::QueryMode::Analytics => {
             // Raw analytics records. Text mode deliberately excludes this
             // category; this mode is the explicit opt-in for reading it.
-            let needle = input.query.to_lowercase();
-            let records = store
-                .scan_prefix("analytics:")
-                .await
-                .map_err(|e| (ErrorCode::StoreError, format!("scan analytics: {e}")))?;
-            let arr: Vec<serde_json::Value> = records
-                .iter()
-                .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
-                .filter(|r| needle.is_empty() || r.key.to_lowercase().contains(&needle))
-                .take(limit)
-                .map(super::tools::record_to_agent_json)
-                .collect();
-            Ok(serde_json::Value::Array(arr))
+            // Require a query that names the aggregate (e.g. "miss_"): an empty
+            // query would otherwise dump every analytics record — daily
+            // telemetry aggregates AND internal caches (gaps/stale caches,
+            // negative exemplars) — at the agent. Empty → nothing, consistent
+            // with text/tag modes.
+            let needle = input.query.trim().to_lowercase();
+            if needle.is_empty() {
+                Ok(serde_json::Value::Array(Vec::new()))
+            } else {
+                let records = store
+                    .scan_prefix("analytics:")
+                    .await
+                    .map_err(|e| (ErrorCode::StoreError, format!("scan analytics: {e}")))?;
+                let arr: Vec<serde_json::Value> = records
+                    .iter()
+                    .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+                    .filter(|r| r.key.to_lowercase().contains(&needle))
+                    .take(limit)
+                    .map(super::tools::record_to_agent_json)
+                    .collect();
+                Ok(serde_json::Value::Array(arr))
+            }
         }
     }
 }

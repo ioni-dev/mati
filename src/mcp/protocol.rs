@@ -463,7 +463,8 @@ pub struct MemQueryInput {
     #[serde(default = "default_query_limit")]
     pub limit: u32,
     /// Look-back window in days for time-scoped modes (`policy_activity`).
-    /// Ignored by other modes; `None` or `0` falls back to the mode's own default.
+    /// Ignored by other modes; `None` or `0` falls back to the mode's own
+    /// default, and values above the retention horizon are capped.
     #[serde(default)]
     pub since: Option<u64>,
 }
@@ -494,8 +495,9 @@ pub enum QueryMode {
     /// Activity report for active local policies over a look-back window.
     /// `query` selects one policy slug (empty = all); `since` sets the days.
     PolicyActivity,
-    /// Raw local analytics records (`analytics:*`). `query` filters by key
-    /// substring (empty = all), bounded by `limit`.
+    /// Raw local analytics records (`analytics:*`). `query` names the aggregate
+    /// by key substring (e.g. `miss_`) and is required — an empty query returns
+    /// nothing rather than dumping every record. Bounded by `limit`.
     Analytics,
 }
 
