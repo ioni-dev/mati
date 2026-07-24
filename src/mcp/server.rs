@@ -712,9 +712,13 @@ pub(crate) async fn socket_dispatch(
                 "tag" => super::protocol::QueryMode::Tag,
                 "graph" => super::protocol::QueryMode::Graph,
                 "semantic" => super::protocol::QueryMode::Semantic,
+                "policy_observations" => super::protocol::QueryMode::PolicyObservations,
+                "policy_activity" => super::protocol::QueryMode::PolicyActivity,
+                "analytics" => super::protocol::QueryMode::Analytics,
                 other => {
                     return SocketResponse::err(format!(
-                        "unknown mode: {other}. Valid modes: text, tag, graph, semantic"
+                        "unknown mode: {other}. Valid modes: text, tag, graph, semantic, \
+                         policy_observations, policy_activity, analytics"
                     ));
                 }
             };
@@ -722,6 +726,7 @@ pub(crate) async fn socket_dispatch(
                 query: params.query,
                 mode,
                 limit: params.limit as u32,
+                since: params.since,
             };
             let g = graph.read().await;
             match super::handlers::handle_mem_query(g.store(), &g, &input).await {

@@ -239,13 +239,13 @@ impl MatiServer {
     /// Text mode returns a JSON array. Graph mode returns a grouped JSON object.
     #[rmcp::tool(
         name = "mem_query",
-        description = "Search the mati knowledge store. Use mode \"text\" for BM25 full-text search, mode \"tag\" to filter by tag, or mode \"graph\" for a 1-hop traversal from a seed key.",
+        description = "Search the mati knowledge store, or read local enforcement telemetry. Knowledge modes: \"text\" (BM25 full-text), \"tag\" (filter by tag), \"graph\" (1-hop traversal from a seed key). Telemetry modes (read-only): \"policy_observations\", \"policy_activity\" (optional `since` in days), \"analytics\".",
         annotations(read_only_hint = true)
     )]
     pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
         self.socket_call(
             "mem_query",
-            json!({ "query": params.query, "mode": params.mode, "limit": params.limit }),
+            json!({ "query": params.query, "mode": params.mode, "limit": params.limit, "since": params.since }),
         )
         .await
     }
@@ -1197,6 +1197,7 @@ mod tests {
             query: query.to_string(),
             mode,
             limit,
+            since: None,
         };
         let g = graph_arc.read().await;
         match crate::mcp::handlers::handle_mem_query(g.store(), &g, &input).await {
@@ -1521,6 +1522,193 @@ mod tests {
         assert!(
             result.contains("--features semantic"),
             "semantic mode must surface feature-gate error, got: {result}"
+        );
+    }
+
+    // ── mem_query telemetry-mode tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn mem_query_analytics_mode_surfaces_analytics_records() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let record = make_record(
+            "analytics:miss_2026-07-24",
+            "misses today",
+            Category::Analytics,
+            0.5,
+        );
+        store.put(&record.key, &record).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        // Substring match returns the record — Text mode filters analytics out,
+        // this mode is the explicit opt-in.
+        let hit = call_mem_query(
+            &graph_arc,
+            "miss",
+            crate::mcp::protocol::QueryMode::Analytics,
+            20,
+        )
+        .await;
+        assert!(
+            hit.contains("analytics:miss_2026-07-24"),
+            "analytics mode must surface matching records, got: {hit}"
+        );
+
+        // A non-matching substring filters it out.
+        let miss = call_mem_query(
+            &graph_arc,
+            "compliance",
+            crate::mcp::protocol::QueryMode::Analytics,
+            20,
+        )
+        .await;
+        assert!(
+            !miss.contains("analytics:miss_2026-07-24"),
+            "analytics query filter must exclude non-matching keys, got: {miss}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_policy_observations_empty_store_is_empty_object() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_query(
+            &graph_arc,
+            "",
+            crate::mcp::protocol::QueryMode::PolicyObservations,
+            20,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            value.is_object() && value.as_object().unwrap().is_empty(),
+            "policy_observations on an empty store must be an empty object, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_policy_activity_empty_store_returns_report() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_query(
+            &graph_arc,
+            "",
+            crate::mcp::protocol::QueryMode::PolicyActivity,
+            20,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Default window applies when `since` is absent, and no policies exist.
+        assert_eq!(value["window_days"], 30);
+        assert!(value["policies"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mem_query_policy_activity_since_zero_falls_back_to_default() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        // since:0 is a footgun (zero-width window → every policy NoActivity);
+        // the handler coerces it to the default window. call_mem_query hardcodes
+        // since:None, so drive the handler directly.
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: String::new(),
+            mode: crate::mcp::protocol::QueryMode::PolicyActivity,
+            limit: 20,
+            since: Some(0),
+        };
+        let g = graph_arc.read().await;
+        let value = crate::mcp::handlers::handle_mem_query(g.store(), &g, &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            value["window_days"], 30,
+            "since:0 must fall back to default"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_analytics_filters_before_take_limit() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // Three non-matching analytics records sort BEFORE the one we want
+        // ("hit_" < "miss_"); with limit=1 the substring filter must still
+        // surface the match, proving the filter runs before take(limit).
+        for d in ["2026-07-01", "2026-07-02", "2026-07-03"] {
+            let r = make_record(&format!("analytics:hit_{d}"), "h", Category::Analytics, 0.5);
+            store.put(&r.key, &r).await.unwrap();
+        }
+        let want = make_record("analytics:miss_2026-07-04", "m", Category::Analytics, 0.5);
+        store.put(&want.key, &want).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let out = call_mem_query(
+            &graph_arc,
+            "miss_",
+            crate::mcp::protocol::QueryMode::Analytics,
+            1,
+        )
+        .await;
+        assert!(
+            out.contains("analytics:miss_2026-07-04"),
+            "substring filter must run before take(limit): {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_analytics_empty_query_returns_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // A record exists, but an empty query must NOT dump it — the mode
+        // requires a named aggregate so it can't firehose internal analytics.
+        let r = make_record("analytics:miss_2026-07-24", "m", Category::Analytics, 0.5);
+        store.put(&r.key, &r).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let out = call_mem_query(
+            &graph_arc,
+            "",
+            crate::mcp::protocol::QueryMode::Analytics,
+            20,
+        )
+        .await;
+        assert_eq!(
+            out, "[]",
+            "empty analytics query must return nothing, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mem_query_policy_activity_since_caps_at_retention() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let input = crate::mcp::protocol::MemQueryInput {
+            query: String::new(),
+            mode: crate::mcp::protocol::QueryMode::PolicyActivity,
+            limit: 20,
+            since: Some(u64::MAX),
+        };
+        let g = graph_arc.read().await;
+        let value = crate::mcp::handlers::handle_mem_query(g.store(), &g, &input)
+            .await
+            .unwrap();
+        assert_eq!(
+            value["window_days"], 365,
+            "an absurd `since` must cap at the retention horizon"
         );
     }
 

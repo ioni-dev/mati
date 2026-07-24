@@ -462,6 +462,11 @@ pub struct MemQueryInput {
     pub mode: QueryMode,
     #[serde(default = "default_query_limit")]
     pub limit: u32,
+    /// Look-back window in days for time-scoped modes (`policy_activity`).
+    /// Ignored by other modes; `None` or `0` falls back to the mode's own
+    /// default, and values above the retention horizon are capped.
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 fn default_query_mode() -> QueryMode {
@@ -484,6 +489,16 @@ pub enum QueryMode {
     Graph,
     /// Semantic search (requires --features semantic).
     Semantic,
+    /// Shadow observations for local policies (`analytics:policy_shadow_*`).
+    /// `query` selects one policy slug; empty means all.
+    PolicyObservations,
+    /// Activity report for active local policies over a look-back window.
+    /// `query` selects one policy slug (empty = all); `since` sets the days.
+    PolicyActivity,
+    /// Raw local analytics records (`analytics:*`). `query` names the aggregate
+    /// by key substring (e.g. `miss_`) and is required — an empty query returns
+    /// nothing rather than dumping every record. Bounded by `limit`.
+    Analytics,
 }
 
 // ── B. Read-with-side-effect inputs ─────────────────────────────────────────
@@ -1025,6 +1040,7 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "query": args["query"],
             "mode": args.get("mode").and_then(|v| v.as_str()).unwrap_or("text"),
             "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20),
+            "since": args.get("since").and_then(|v| v.as_u64()),
         }),
         "scan_enforcement_events" => json!({
             "type": "scan_enforcement_events",
@@ -1082,7 +1098,15 @@ mod tests {
     #[test]
     fn query_mode_deserialize_accepts_all_known_variants() {
         // Snake-case wire form per `#[serde(rename_all = "snake_case")]`.
-        for variant in &["text", "tag", "graph", "semantic"] {
+        for variant in &[
+            "text",
+            "tag",
+            "graph",
+            "semantic",
+            "policy_observations",
+            "policy_activity",
+            "analytics",
+        ] {
             let json = format!("\"{variant}\"");
             let result: Result<QueryMode, _> = serde_json::from_str(&json);
             assert!(
@@ -1602,6 +1626,7 @@ mod tests {
                     query: "q".into(),
                     mode: QueryMode::Text,
                     limit: 20,
+                    since: None,
                 }),
             ),
             ("mem_get", Command::MemGet(MemGetInput { key: "k".into() })),
@@ -1726,6 +1751,7 @@ mod tests {
             query: "q".into(),
             mode: QueryMode::Text,
             limit: 20,
+            since: None,
         })
         .is_mutation());
 

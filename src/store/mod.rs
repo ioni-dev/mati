@@ -14,6 +14,7 @@ pub mod extraction;
 pub mod gotcha_ops;
 pub mod migrations;
 pub mod negative_exemplar;
+pub mod observability;
 pub mod policy_ops;
 pub mod record;
 pub mod repair;
