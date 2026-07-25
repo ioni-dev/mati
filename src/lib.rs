@@ -13,6 +13,10 @@ pub mod eval;
 pub mod graph;
 pub mod health;
 pub mod hooks;
+/// Repo-wide invariants, checked by source scan. Test-only — nothing here is
+/// linked into the binary.
+#[cfg(test)]
+mod invariants;
 pub mod mcp;
 pub mod policy;
 pub mod scaffold;

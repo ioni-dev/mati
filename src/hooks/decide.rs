@@ -2240,4 +2240,363 @@ mod tests {
             }]
         );
     }
+
+    // ── Regression suite: enforcement never silently disables ─────────────
+
+    /// Pins every edge of the one boundary that decides whether mati enforces.
+    ///
+    /// `evaluate` denies through exactly one path: the gotcha loop near the end
+    /// of the function, guarded by
+    /// `confirmed && gconfidence >= 0.6 && gquality >= 0.4`. Everything above
+    /// that loop is a way to never reach it. The file staleness tiers
+    /// `tombstone` and `liability` both `return` before it — `Tombstone` is an
+    /// unconditional pass-through and `Liability` is an allow with a warning.
+    ///
+    /// That gives four independent kinds of change that convert a denying
+    /// gotcha into an allow with no compile error, no panic, and nothing in the
+    /// diff that reads as "turn enforcement off":
+    ///
+    /// 1. raising a file's staleness into `liability` or `tombstone`
+    ///    (a gotcha crossing staleness 0.4 also raises `cascade_factor` on
+    ///    every file that links it, which feeds that same file tier);
+    /// 2. lowering a gotcha's confidence below 0.6;
+    /// 3. lowering its quality below 0.4;
+    /// 4. clearing `confirmed`.
+    ///
+    /// Three separate agents reached for a change of kind 1 in a single day
+    /// (2026-07-24) and no test would have caught any of them. `health::drift`
+    /// documents the same trap from the other side, and stays out of the
+    /// staleness composite precisely so it cannot trip it.
+    ///
+    /// Read a failure here as "the gate moved", not as "this test is stale".
+    /// A deliberate threshold change must also update CLAUDE.md's hook decision
+    /// matrix and ARCHITECTURE.md section 10.1 — the numbers below are copies of
+    /// that matrix, not independent constants.
+    mod gate_never_silently_disables {
+        use super::*;
+
+        /// The documented gotcha-deny thresholds (CLAUDE.md, "Hook decision
+        /// matrix"). Duplicated here on purpose: a change to `evaluate` that
+        /// does not also change these fails the suite.
+        const DENY_MIN_CONFIDENCE: f32 = 0.6;
+        const DENY_MIN_QUALITY: f32 = 0.4;
+
+        /// The canonical valid confirmed gotcha: confirmed, exactly at both
+        /// thresholds, attached to a fresh file record. This is the weakest
+        /// input that must still deny — every stronger one is a superset.
+        fn canonical_valid_confirmed_gotcha() -> EnforcementInput {
+            input_with_gotcha(true, DENY_MIN_CONFIDENCE, DENY_MIN_QUALITY, "fresh")
+        }
+
+        fn input_with_gotcha(
+            confirmed: bool,
+            gconfidence: f32,
+            gquality: f32,
+            file_tier: &str,
+        ) -> EnforcementInput {
+            let mut gotchas = HashMap::new();
+            gotchas.insert(
+                "gotcha:test".to_string(),
+                make_gotcha(confirmed, gconfidence, gquality),
+            );
+            // File-level scores are deliberately healthy so that only the
+            // gotcha's own fields and the file's staleness tier can move the
+            // decision.
+            let staleness = match file_tier {
+                "liability" => 0.85,
+                "tombstone" => 0.95,
+                _ => 0.1,
+            };
+            EnforcementInput {
+                rel_path: "src/main.rs".into(),
+                file_record: Some(make_file_record(
+                    0.7,
+                    0.5,
+                    staleness,
+                    file_tier,
+                    &["gotcha:test"],
+                )),
+                gotcha_records: gotchas,
+                already_consulted: false,
+            }
+        }
+
+        /// The anchor. If this ever stops denying, mati has stopped enforcing.
+        #[test]
+        fn canonical_valid_confirmed_gotcha_denies() {
+            let result = evaluate(&canonical_valid_confirmed_gotcha());
+            match &result.decision {
+                Decision::Deny { origin, reason, .. } => {
+                    assert_eq!(
+                        *origin,
+                        DenyOrigin::Gotcha,
+                        "a confirmed gotcha must deny with DenyOrigin::Gotcha"
+                    );
+                    assert!(
+                        reason.contains("mem_get"),
+                        "the deny reason must tell the agent how to clear the gate: {reason}"
+                    );
+                }
+                other => panic!(
+                    "ENFORCEMENT DISABLED: the canonical valid confirmed gotcha \
+                     (confirmed=true, confidence={DENY_MIN_CONFIDENCE}, \
+                     quality={DENY_MIN_QUALITY}, fresh file) produced {other:?} \
+                     instead of Deny"
+                ),
+            }
+            assert!(
+                matches!(
+                    &result.events[0],
+                    HookEvent::BlockedUnconsultedRead { key } if key == "file:src/main.rs"
+                ),
+                "a deny must emit BlockedUnconsultedRead so the enforcement \
+                 event log records it; got {:?}",
+                result.events
+            );
+        }
+
+        /// Confidence boundary: `>=`, not `>`. Exactly 0.6 denies.
+        #[test]
+        fn confidence_exactly_at_threshold_denies() {
+            for quality in [DENY_MIN_QUALITY, 0.5, 1.0] {
+                let input = input_with_gotcha(true, DENY_MIN_CONFIDENCE, quality, "fresh");
+                assert!(
+                    matches!(evaluate(&input).decision, Decision::Deny { .. }),
+                    "confidence exactly {DENY_MIN_CONFIDENCE} (quality {quality}) must deny — \
+                     the matrix is `confidence >= {DENY_MIN_CONFIDENCE}`, not `>`"
+                );
+            }
+        }
+
+        /// One ULP-scale step below the threshold must not deny. Pins the
+        /// comparison direction: an accidental `>` -> `>=` flip on the other
+        /// side of the boundary shows up here.
+        #[test]
+        fn confidence_just_below_threshold_does_not_deny() {
+            for confidence in [DENY_MIN_CONFIDENCE - f32::EPSILON, 0.59, 0.0] {
+                let input = input_with_gotcha(true, confidence, 0.5, "fresh");
+                let decision = evaluate(&input).decision;
+                assert!(
+                    !matches!(decision, Decision::Deny { .. }),
+                    "confidence {confidence} is below {DENY_MIN_CONFIDENCE} and must not deny; \
+                     got {decision:?}"
+                );
+            }
+        }
+
+        /// Quality boundary: `>=`, not `>`. Exactly 0.4 denies.
+        #[test]
+        fn quality_exactly_at_threshold_denies() {
+            for confidence in [DENY_MIN_CONFIDENCE, 0.8, 1.0] {
+                let input = input_with_gotcha(true, confidence, DENY_MIN_QUALITY, "fresh");
+                assert!(
+                    matches!(evaluate(&input).decision, Decision::Deny { .. }),
+                    "quality exactly {DENY_MIN_QUALITY} (confidence {confidence}) must deny — \
+                     the matrix is `quality >= {DENY_MIN_QUALITY}`, not `>`"
+                );
+            }
+        }
+
+        #[test]
+        fn quality_just_below_threshold_does_not_deny() {
+            for quality in [DENY_MIN_QUALITY - f32::EPSILON, 0.39, 0.0] {
+                let input = input_with_gotcha(true, 0.8, quality, "fresh");
+                let decision = evaluate(&input).decision;
+                assert!(
+                    !matches!(decision, Decision::Deny { .. }),
+                    "quality {quality} is below {DENY_MIN_QUALITY} and must not deny; \
+                     got {decision:?}"
+                );
+            }
+        }
+
+        /// `confirmed` is the whole difference between a Layer 0 stub and a
+        /// control. Same scores, opposite outcomes — clearing the flag anywhere
+        /// upstream disables the gate for that record.
+        #[test]
+        fn confirmed_flag_alone_decides_deny_versus_allow() {
+            let confirmed = evaluate(&input_with_gotcha(
+                true,
+                DENY_MIN_CONFIDENCE,
+                DENY_MIN_QUALITY,
+                "fresh",
+            ))
+            .decision;
+            let unconfirmed = evaluate(&input_with_gotcha(
+                false,
+                DENY_MIN_CONFIDENCE,
+                DENY_MIN_QUALITY,
+                "fresh",
+            ))
+            .decision;
+
+            assert!(
+                matches!(confirmed, Decision::Deny { .. }),
+                "confirmed=true at both thresholds must deny; got {confirmed:?}"
+            );
+            assert!(
+                !matches!(unconfirmed, Decision::Deny { .. }),
+                "confirmed=false must never deny — unconfirmed records are Layer 0 \
+                 stubs (P4); got {unconfirmed:?}"
+            );
+        }
+
+        /// Not an aspiration — a trap, pinned as intended behaviour.
+        ///
+        /// A file at staleness tier `liability` returns before the gotcha loop,
+        /// so a valid confirmed gotcha attached to it is silently NOT enforced.
+        /// The existing `eval_liability` test uses a file with no gotchas and
+        /// therefore cannot see this. Keeping it pinned means any future change
+        /// to the short-circuit — in either direction — is a visible, deliberate
+        /// decision instead of an accident.
+        #[test]
+        fn liability_tier_short_circuits_before_the_gotcha_loop() {
+            let input = input_with_gotcha(true, 1.0, 1.0, "liability");
+            let result = evaluate(&input);
+            assert!(
+                matches!(&result.decision, Decision::Liability { .. }),
+                "tier `liability` must return Liability before the gotcha loop; \
+                 got {:?}. If this now denies, enforcement coverage GREW — \
+                 update CLAUDE.md and ARCHITECTURE.md section 10.1 rather than \
+                 this assertion alone",
+                result.decision
+            );
+        }
+
+        /// Same trap, harder edge: tier `tombstone` is an unconditional
+        /// pass-through with no event at all, so a maximally-valid confirmed
+        /// gotcha on a tombstoned file is invisible to the gate.
+        #[test]
+        fn tombstone_tier_short_circuits_before_the_gotcha_loop() {
+            let input = input_with_gotcha(true, 1.0, 1.0, "tombstone");
+            let result = evaluate(&input);
+            assert_eq!(
+                result.decision,
+                Decision::Tombstone,
+                "tier `tombstone` must return Tombstone before the gotcha loop"
+            );
+            assert!(
+                result.events.is_empty(),
+                "the tombstone short-circuit records nothing — this is the \
+                 quietest way to disable the gate and is pinned here on purpose; \
+                 got {:?}",
+                result.events
+            );
+        }
+
+        /// Raising staleness *without* crossing into `liability`/`tombstone`
+        /// must not weaken the deny. Guards the near-miss of the trap above.
+        #[test]
+        fn stale_but_not_liability_still_denies() {
+            let mut input = canonical_valid_confirmed_gotcha();
+            input.file_record = Some(make_file_record(0.7, 0.5, 0.65, "stale", &["gotcha:test"]));
+            let decision = evaluate(&input).decision;
+            assert!(
+                matches!(decision, Decision::Deny { .. }),
+                "a `stale` file still enforces its confirmed gotchas; got {decision:?}"
+            );
+        }
+
+        /// End-to-end with the real drift detector rather than a hand-built
+        /// JSON shape: build records that `health::drift::detect_drift`
+        /// actually reports as drifted, then feed those same records to the
+        /// gate and require a Deny.
+        ///
+        /// `eval_drifted_gotcha_still_denies` above pins the same rule against
+        /// a synthetic payload; this one proves the two modules agree on the
+        /// record shape, so a change to `confirmed_content` / `content_hash`
+        /// cannot make drift detection and enforcement drift apart.
+        #[test]
+        fn drift_detected_by_health_drift_still_denies() {
+            use crate::health::drift::{current_content_hashes, detect_drift};
+            use crate::store::record::{
+                Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record,
+                RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+            };
+            use std::collections::BTreeMap;
+
+            fn base(key: &str) -> Record {
+                Record {
+                    key: key.to_string(),
+                    value: "Do not use unwrap here".into(),
+                    payload: None,
+                    category: Category::Gotcha,
+                    priority: Priority::High,
+                    tags: vec![],
+                    created_at: 1_000_000,
+                    updated_at: 1_000_000,
+                    ref_url: None,
+                    staleness: StalenessScore::fresh(),
+                    lifecycle: RecordLifecycle::Active,
+                    version: RecordVersion {
+                        device_id: uuid::Uuid::new_v4(),
+                        logical_clock: 1,
+                        wall_clock: 1_000_000,
+                    },
+                    quality: QualityScore::layer0_default(),
+                    access_count: 0,
+                    last_accessed: 0,
+                    source: RecordSource::DeveloperManual,
+                    confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+                    gap_analysis_score: 0.0,
+                }
+            }
+
+            let mut stamp = BTreeMap::new();
+            stamp.insert("src/main.rs".to_string(), "STAMPED_AT_CONFIRM".to_string());
+            let mut gotcha_record = base("gotcha:test");
+            gotcha_record.payload = serde_json::to_value(GotchaRecord {
+                rule: "Do not use unwrap here".into(),
+                reason: "because it panics on the hook path".into(),
+                severity: Priority::High,
+                affected_files: vec!["src/main.rs".into()],
+                ref_url: None,
+                discovered_session: 1_000_000,
+                confirmed: true,
+                confirmed_content: stamp,
+            })
+            .ok();
+            gotcha_record.confidence.value = DENY_MIN_CONFIDENCE;
+            gotcha_record.quality.value = DENY_MIN_QUALITY;
+
+            let mut file_record = base("file:src/main.rs");
+            file_record.category = Category::File;
+            file_record.payload = Some(json!({
+                "path": "src/main.rs",
+                "content_hash": "CHANGED_SINCE",
+                "gotcha_keys": ["gotcha:test"],
+            }));
+
+            // 1. The drift detector must actually see this as drifted,
+            //    otherwise step 2 proves nothing.
+            let hashes = current_content_hashes(std::slice::from_ref(&file_record));
+            let drifted = detect_drift(std::slice::from_ref(&gotcha_record), &hashes);
+            assert_eq!(
+                drifted.len(),
+                1,
+                "fixture must be drifted for this test to mean anything; got {drifted:?}"
+            );
+
+            // 2. The same records, through the gate, must still deny.
+            let mut gotchas = HashMap::new();
+            gotchas.insert(
+                "gotcha:test".to_string(),
+                serde_json::to_value(&gotcha_record).expect("gotcha record serializes"),
+            );
+            let input = EnforcementInput {
+                rel_path: "src/main.rs".into(),
+                file_record: Some(
+                    serde_json::to_value(&file_record).expect("file record serializes"),
+                ),
+                gotcha_records: gotchas,
+                already_consulted: false,
+            };
+            let decision = evaluate(&input).decision;
+            assert!(
+                matches!(&decision, Decision::Deny { origin, .. } if *origin == DenyOrigin::Gotcha),
+                "a gotcha `health::drift` reports as drifted must still deny — drift \
+                 reports, it never disables the gate; got {decision:?}"
+            );
+        }
+    }
 }
