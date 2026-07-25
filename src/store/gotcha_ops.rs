@@ -343,7 +343,7 @@ fn payload_is_confirmed(record: &Record) -> bool {
 /// Replace the `confirmed_content` field of a gotcha payload with `stamp`.
 ///
 /// Patches the JSON object in place for the same reason
-/// [`with_normalized_affected_files`] does: `mem_set` merges caller-supplied
+/// `with_normalized_affected_files` does: `mem_set` merges caller-supplied
 /// payloads, so re-serializing a [`crate::store::GotchaRecord`] would drop any
 /// field the struct does not know about.
 ///
