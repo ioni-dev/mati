@@ -1383,6 +1383,88 @@ pub async fn count_events_by_type(store: &Store, since_ms: u64) -> Result<Enforc
     Ok(aggregate_event_counts(&events))
 }
 
+/// Window over which several `ReceiptMinted` events on the same subject are
+/// read as reports of a **single** consultation. See [`count_consultations`].
+///
+/// Derived from the hook path's own deadline rather than picked: the second
+/// event of a pair is written by the `post-memget.sh` PostToolUse hook, and
+/// that hook is bounded by `cli::hook_decide::HOOK_DEADLINE_MS` (2500ms, itself
+/// under Claude Code's 3000ms SIGKILL), so it cannot report later than that.
+/// Measured spread against a warm daemon is 8–100ms, so 2s is the bound with
+/// margin, not the typical case.
+pub const CONSULTATION_COALESCE_MS: u64 = 2_000;
+
+/// Count *consultations* — not `ReceiptMinted` events.
+///
+/// # Why the raw count is wrong
+///
+/// `ReceiptMinted` has three emitters and they are not mutually exclusive:
+///
+/// - `mcp::handlers::handle_mem_get` — every MCP `mem_get`, never
+///   session-attributed.
+/// - `Command::ConsultationHit` (`mcp::dispatch_v2`) — the `post-memget.sh`
+///   PostToolUse hook, and `mati explain` / `mati diff` over the daemon socket.
+///   The only emitter that can carry an `agent_session`.
+/// - `store::session::log_hit` — direct-mode CLI, gotcha confirm, legacy socket.
+///
+/// On a fully-installed Claude Code setup the first two both fire for a single
+/// `mem_get`, so the raw count is twice the number of consultations. All three
+/// are wanted in the *log* (each is the only record when the others' path is
+/// absent) — the correction belongs in the metric, and it has to be at read
+/// time because the log is append-only and existing stores already hold the
+/// duplicates.
+///
+/// # Identity
+///
+/// One consultation is `(subject_key, run of receipts starting at the first
+/// event of that run and extending at most [`CONSULTATION_COALESCE_MS`])`.
+/// Nothing sharper is available: `receipt_id` is `None` at all three emission
+/// sites, and `agent_session` is set on only some events from only one emitter,
+/// so grouping by it would keep the duplicate rather than remove it.
+///
+/// The run is anchored to its first event, not chained to the previous one: a
+/// steady drip of receipts under the window would otherwise collapse into one
+/// unbounded "consultation".
+///
+/// # Failure modes
+///
+/// Over-counts when the two reporters of one action are further apart than the
+/// window (a cold daemon start slow enough to push the hook past 2s — beyond
+/// that Claude Code kills the hook and there is only one event anyway), and
+/// when a genuine burst on one subject spans more than the window, which splits
+/// it at the anchor boundary.
+///
+/// Under-counts when two *different* consultations of the same subject land
+/// inside the window — a retry, or a subagent and the main thread consulting
+/// the same file at once. Splitting those apart needs a per-consultation id on
+/// the event, which is a schema change.
+pub fn count_consultations(events: &[EnforcementEvent]) -> u64 {
+    let mut by_subject: HashMap<&str, Vec<u64>> = HashMap::new();
+    for e in events {
+        if matches!(e.event_type, EnforcementEventType::ReceiptMinted) {
+            by_subject
+                .entry(e.subject_key.as_str())
+                .or_default()
+                .push(e.recorded_at_ms);
+        }
+    }
+
+    let mut consultations = 0u64;
+    for times in by_subject.values_mut() {
+        times.sort_unstable();
+        let mut anchor: Option<u64> = None;
+        for &t in times.iter() {
+            let coalesces =
+                matches!(anchor, Some(a) if t.saturating_sub(a) <= CONSULTATION_COALESCE_MS);
+            if !coalesces {
+                anchor = Some(t);
+                consultations += 1;
+            }
+        }
+    }
+    consultations
+}
+
 /// Aggregate a slice of events into typed counts.
 ///
 /// Pure (no store / no I/O) so the aggregation — including the `ControlChanged`
@@ -1390,6 +1472,7 @@ pub async fn count_events_by_type(store: &Store, since_ms: u64) -> Result<Enforc
 pub fn aggregate_event_counts(events: &[EnforcementEvent]) -> EnforcementEventCounts {
     let mut counts = EnforcementEventCounts {
         total: events.len() as u64,
+        consultations: count_consultations(events),
         ..Default::default()
     };
     for e in events {
@@ -1421,7 +1504,13 @@ pub struct EnforcementEventCounts {
     pub total: u64,
     pub denials: u64,
     pub allowed_after_receipt: u64,
+    /// Raw `ReceiptMinted` event count — audit-grade, one row per emitter.
+    /// Not the number of consultations: see [`count_consultations`].
     pub receipts_minted: u64,
+    /// `receipts_minted` de-duplicated to one per consultation. This is the
+    /// number to report as "consulted"; the raw count above is inflated by the
+    /// multiple emitters that record the same consultation.
+    pub consultations: u64,
     pub bypasses: u64,
     /// Total `ControlChanged` events (sum of the four `controls_*` lifecycle
     /// counters below).
@@ -1491,6 +1580,14 @@ pub fn derive_enforcement_metrics(events: &[EnforcementEvent]) -> DerivedEnforce
     // --- time to consult: Deny -> next ReceiptMinted on the same subject ---
     // Index receipt timestamps per subject, sorted ascending, so each Deny can
     // find the first consultation at or after it.
+    //
+    // Deliberately NOT de-duplicated the way `count_consultations` is, and it
+    // does not need to be: the pairing takes the *minimum* receipt timestamp at
+    // or after the deny, and a duplicate report of the same consultation is
+    // always at or after the first one, so it can never become the minimum.
+    // `consult_pairs` counts denials, not receipts, so it is unaffected too.
+    // `duplicate_receipts_do_not_move_the_median` pins both — this is a
+    // property of `find`-the-first, and a change to the pairing rule breaks it.
     let mut receipts_by_subject: HashMap<&str, Vec<u64>> = HashMap::new();
     for e in events {
         if matches!(e.event_type, EnforcementEventType::ReceiptMinted) {
@@ -1991,6 +2088,286 @@ mod tests {
         let m = derive_enforcement_metrics(&events);
         assert_eq!(m.consult_pairs, 1, "only the in-window pair counts");
         assert_eq!(m.median_time_to_consult_ms, Some(window_ms));
+    }
+
+    /// "One consultation is one consultation."
+    ///
+    /// `ReceiptMinted` has three emitters (`mcp::handlers::handle_mem_get`,
+    /// `Command::ConsultationHit`, `store::session::log_hit`) and on a
+    /// fully-installed Claude Code setup two of them fire for a single
+    /// `mem_get` — measured, not assumed: driving the real dispatch path for
+    /// one `mem_get` plus its `post-memget.sh` hook writes two `ReceiptMinted`
+    /// events 8–100ms apart, both on the same `subject_key`, both with
+    /// `receipt_id: None`, one session-attributed and one not. `mati stats`
+    /// reported that raw count as "consulted", so every consultation counted
+    /// twice.
+    ///
+    /// The emitters stay: each is the only record when the others' path is not
+    /// installed, and only the hook path carries a session id. The log is
+    /// append-only and hash-chained, so the duplicates are already in every
+    /// existing store — the correction can only live at read time. These tests
+    /// are what keeps it there.
+    ///
+    /// The end-to-end companion — the same property against the real
+    /// emitters rather than hand-built events — is
+    /// `mcp::dispatch_v2::tests::one_mem_get_counts_as_one_consultation`.
+    mod one_consultation_counts_once {
+        use super::*;
+
+        /// The exact sequence measured from the real dispatch path: the MCP
+        /// handler's unattributed receipt, then the PostToolUse hook's
+        /// session-attributed one 91ms later, same subject.
+        fn one_mem_get_on_a_full_install(at_ms: u64, subject: &str) -> Vec<EnforcementEvent> {
+            vec![
+                ev(EnforcementEventType::ReceiptMinted, subject, at_ms, None),
+                ev(
+                    EnforcementEventType::ReceiptMinted,
+                    subject,
+                    at_ms + 91,
+                    Some("sess-1"),
+                ),
+            ]
+        }
+
+        /// The anchor. If this starts reporting 2, the metric is broken again.
+        #[test]
+        fn one_mem_get_counts_once_however_many_events_it_emitted() {
+            let events = one_mem_get_on_a_full_install(1_000, "file:src/a.rs");
+            let counts = aggregate_event_counts(&events);
+
+            assert_eq!(
+                counts.receipts_minted, 2,
+                "the raw event count must stay raw — the audit log records \
+                 every emitter, and mati-cloud reads those rows"
+            );
+            assert_eq!(
+                counts.consultations, 1,
+                "INFLATED CONSULTATION COUNT: one mem_get emitted \
+                 {} ReceiptMinted events and was counted as {} consultations. \
+                 `mati stats` reports `consultations` as \"consulted\"; it must \
+                 count consultations, not events.",
+                counts.receipts_minted, counts.consultations
+            );
+        }
+
+        /// All three emitters at once — the worst case the log can hold for a
+        /// single action.
+        #[test]
+        fn three_emitters_on_one_action_still_count_once() {
+            let mut events = one_mem_get_on_a_full_install(1_000, "file:src/a.rs");
+            // `log_hit`, e.g. a `mati explain` on the same file in the same beat.
+            events.push(ev(
+                EnforcementEventType::ReceiptMinted,
+                "file:src/a.rs",
+                1_150,
+                None,
+            ));
+            let counts = aggregate_event_counts(&events);
+            assert_eq!(counts.receipts_minted, 3);
+            assert_eq!(counts.consultations, 1);
+        }
+
+        /// De-duplication must not swallow real work: two consultations far
+        /// apart are two consultations, even on the same file.
+        #[test]
+        fn consultations_outside_the_window_stay_separate() {
+            let mut events = one_mem_get_on_a_full_install(1_000, "file:src/a.rs");
+            events.extend(one_mem_get_on_a_full_install(
+                1_000 + CONSULTATION_COALESCE_MS * 10,
+                "file:src/a.rs",
+            ));
+            let counts = aggregate_event_counts(&events);
+            assert_eq!(counts.receipts_minted, 4);
+            assert_eq!(
+                counts.consultations, 2,
+                "two mem_gets ten windows apart are two consultations"
+            );
+        }
+
+        /// Different files are never the same consultation, however close.
+        #[test]
+        fn different_subjects_never_coalesce() {
+            let mut events = one_mem_get_on_a_full_install(1_000, "file:src/a.rs");
+            events.extend(one_mem_get_on_a_full_install(1_000, "file:src/b.rs"));
+            let counts = aggregate_event_counts(&events);
+            assert_eq!(counts.receipts_minted, 4);
+            assert_eq!(counts.consultations, 2);
+        }
+
+        /// The window boundary is inclusive, and one millisecond past it is a
+        /// new consultation. Pins the comparison direction.
+        #[test]
+        fn the_window_boundary_is_inclusive() {
+            let at = |delta: u64| {
+                vec![
+                    ev(EnforcementEventType::ReceiptMinted, "file:a.rs", 0, None),
+                    ev(
+                        EnforcementEventType::ReceiptMinted,
+                        "file:a.rs",
+                        delta,
+                        None,
+                    ),
+                ]
+            };
+            assert_eq!(count_consultations(&at(CONSULTATION_COALESCE_MS)), 1);
+            assert_eq!(count_consultations(&at(CONSULTATION_COALESCE_MS + 1)), 2);
+        }
+
+        /// The run is anchored to its first event, not chained to the previous
+        /// one. A drip of receipts every `window - 1` ms would otherwise
+        /// collapse into a single unbounded "consultation" and hide real usage.
+        #[test]
+        fn a_steady_drip_cannot_collapse_into_one_consultation() {
+            let step = CONSULTATION_COALESCE_MS - 1;
+            let events: Vec<EnforcementEvent> = (0..10)
+                .map(|i| {
+                    ev(
+                        EnforcementEventType::ReceiptMinted,
+                        "file:a.rs",
+                        i * step,
+                        None,
+                    )
+                })
+                .collect();
+            // Each anchor covers itself plus the next event (2 * step > window
+            // for step = window - 1), so 10 events land in 5 runs.
+            assert_eq!(count_consultations(&events), 5);
+        }
+
+        /// Out-of-order arrival must not change the answer: events are sorted
+        /// per subject before coalescing, and `scan_enforcement_events` orders
+        /// by seq_no, which is allocation order, not wall-clock order.
+        #[test]
+        fn coalescing_is_independent_of_event_order() {
+            let mut forward = one_mem_get_on_a_full_install(1_000, "file:src/a.rs");
+            forward.extend(one_mem_get_on_a_full_install(50_000, "file:src/a.rs"));
+            let mut reversed = forward.clone();
+            reversed.reverse();
+            assert_eq!(
+                count_consultations(&forward),
+                count_consultations(&reversed)
+            );
+            assert_eq!(count_consultations(&forward), 2);
+        }
+
+        /// The two bounds that must hold for any input: de-duplication can only
+        /// remove, never invent, and it must not erase a subject entirely.
+        #[test]
+        fn consultations_are_bounded_by_receipt_events_and_by_subject_count() {
+            use std::collections::BTreeSet;
+            let subjects = ["file:a.rs", "file:b.rs", "file:c.rs"];
+            let mut events = Vec::new();
+            for (i, subject) in subjects.iter().enumerate() {
+                for step in 0..4u64 {
+                    events.push(ev(
+                        EnforcementEventType::ReceiptMinted,
+                        subject,
+                        (i as u64) * 7 + step * 500,
+                        None,
+                    ));
+                }
+            }
+            // Non-receipt events must be ignored entirely.
+            events.push(ev(EnforcementEventType::Deny, "file:a.rs", 0, Some("s")));
+
+            let counts = aggregate_event_counts(&events);
+            let distinct: BTreeSet<&str> = events
+                .iter()
+                .filter(|e| matches!(e.event_type, EnforcementEventType::ReceiptMinted))
+                .map(|e| e.subject_key.as_str())
+                .collect();
+
+            assert!(
+                counts.consultations <= counts.receipts_minted,
+                "de-duplication may only remove events, never invent them"
+            );
+            assert!(
+                counts.consultations >= distinct.len() as u64,
+                "every consulted subject must contribute at least one consultation"
+            );
+        }
+
+        /// Nothing consulted, nothing counted — and non-receipt events on their
+        /// own must not produce a consultation.
+        #[test]
+        fn no_receipts_means_no_consultations() {
+            assert_eq!(count_consultations(&[]), 0);
+            let others = vec![
+                ev(EnforcementEventType::Deny, "file:a.rs", 0, Some("s")),
+                ev(
+                    EnforcementEventType::AllowAfterReceipt,
+                    "file:a.rs",
+                    1,
+                    None,
+                ),
+                ev(EnforcementEventType::BypassDetected, "file:a.rs", 2, None),
+            ];
+            assert_eq!(count_consultations(&others), 0);
+            assert_eq!(aggregate_event_counts(&others).consultations, 0);
+        }
+
+        /// The claim in `derive_enforcement_metrics` that duplicate receipts do
+        /// not move the median, tested rather than reasoned. Pairing takes the
+        /// first receipt at or after the deny, so a second report of the same
+        /// consultation — always at or after the first — can never become that
+        /// minimum, and `consult_pairs` counts denials rather than receipts.
+        #[test]
+        fn duplicate_receipts_do_not_move_the_median() {
+            use EnforcementEventType::*;
+            let single = vec![
+                ev(Deny, "file:x.rs", 1_000, Some("sessA")),
+                ev(ReceiptMinted, "file:x.rs", 1_500, None),
+                ev(Deny, "file:y.rs", 2_000, Some("sessB")),
+                ev(ReceiptMinted, "file:y.rs", 2_300, None),
+            ];
+            // Same history as a full install records it: every receipt reported
+            // twice, the hook's copy arriving 91ms after the handler's.
+            let mut doubled = Vec::new();
+            for e in &single {
+                doubled.push(e.clone());
+                if matches!(e.event_type, ReceiptMinted) {
+                    doubled.push(ev(
+                        ReceiptMinted,
+                        &e.subject_key,
+                        e.recorded_at_ms + 91,
+                        Some("sess-1"),
+                    ));
+                }
+            }
+
+            let m_single = derive_enforcement_metrics(&single);
+            let m_doubled = derive_enforcement_metrics(&doubled);
+
+            assert_eq!(
+                m_doubled.median_time_to_consult_ms, m_single.median_time_to_consult_ms,
+                "duplicate receipts must not move the median: {:?} vs {:?}",
+                m_doubled.median_time_to_consult_ms, m_single.median_time_to_consult_ms
+            );
+            assert_eq!(
+                m_doubled.consult_pairs, m_single.consult_pairs,
+                "consult_pairs counts denials, not receipts"
+            );
+            assert_eq!(m_single.median_time_to_consult_ms, Some(400));
+        }
+
+        /// The duplicate landing *before* the original is the one case where a
+        /// naive "keep the last" de-duplication would move the median. Sorting
+        /// per subject makes the pairing take the earliest either way.
+        #[test]
+        fn median_is_unmoved_when_the_duplicate_arrives_first() {
+            use EnforcementEventType::*;
+            let events = vec![
+                ev(Deny, "file:x.rs", 1_000, Some("sessA")),
+                // Hook copy recorded (and scanned) before the handler's, e.g.
+                // clock jitter between two writers.
+                ev(ReceiptMinted, "file:x.rs", 1_591, Some("sess-1")),
+                ev(ReceiptMinted, "file:x.rs", 1_500, None),
+            ];
+            let m = derive_enforcement_metrics(&events);
+            assert_eq!(m.median_time_to_consult_ms, Some(500));
+            assert_eq!(m.consult_pairs, 1);
+            assert_eq!(count_consultations(&events), 1);
+        }
     }
 
     #[test]

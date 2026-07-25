@@ -1879,6 +1879,75 @@ mod tests {
         );
     }
 
+    /// The end-to-end half of the "one consultation is one consultation"
+    /// invariant (`store::enforcement::tests::one_consultation_counts_once`
+    /// holds the pure half). This one drives the two emitters that actually
+    /// co-fire — the MCP `mem_get` handler and the `post-memget.sh` PostToolUse
+    /// hook's `ConsultationHit` — through real dispatch against a real store,
+    /// so it measures the multiplicity rather than restating it.
+    #[tokio::test]
+    async fn one_mem_get_counts_as_one_consultation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+        let key = "file:src/billing/charges.rs";
+
+        // A record must exist or the handler skips its deferred write path.
+        {
+            let g = graph.read().await;
+            let record = crate::store::session::session_record(key, "charges".into());
+            g.store().put(key, &record).await.unwrap();
+        }
+
+        // 1. The agent calls `mem_get`.
+        let mem_get = make_request(Command::MemGet(MemGetInput { key: key.into() }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, mem_get).await,
+            Response::Ok { .. }
+        ));
+
+        // 2. Claude Code fires post-memget.sh, which sends ConsultationHit with
+        //    the session id. Same logical action, second reporter.
+        let hit = make_request(Command::ConsultationHit(ConsultationHitInput {
+            key: key.into(),
+            capture_fingerprint: true,
+            actor: None,
+            session_id: Some("sess-e2e".into()),
+            agent_id: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, hit).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .unwrap();
+        let counts = crate::store::enforcement::aggregate_event_counts(&events);
+
+        assert_eq!(
+            counts.receipts_minted, 2,
+            "one mem_get on a full install emits two ReceiptMinted events (the \
+             handler's unattributed one and the hook's session-attributed one); \
+             if this changed, re-derive the de-duplication window before \
+             touching the assertion below"
+        );
+        assert_eq!(
+            counts.consultations, 1,
+            "INFLATED CONSULTATION COUNT: one mem_get produced \
+             {} ReceiptMinted events and was counted as {} consultations. \
+             `mati stats` reports this as \"consulted\" — it must count \
+             consultations, not events. The emitters are deliberate (each is \
+             the only record when the other's path is absent, and only the hook \
+             path carries a session id) and the log is append-only, so the fix \
+             belongs in `store::enforcement::count_consultations`, not here.",
+            counts.receipts_minted, counts.consultations
+        );
+    }
+
     #[tokio::test]
     async fn v2_session_clear_consults_deletes_receipts_silently() {
         let dir = tempfile::tempdir().unwrap();
