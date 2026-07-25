@@ -115,7 +115,7 @@ fn now_secs() -> u64 {
 /// `file:src/foo.rs` and was silently inert — no denial, no warning.
 ///
 /// This is deliberately the *same* function the gate calls, with the repo root
-/// resolved the *same* way (see [`discover_repo_root`]). Agreeing with the read
+/// resolved the *same* way (see `discover_repo_root`). Agreeing with the read
 /// side is the whole point; a second, "smarter" normalizer here would
 /// reintroduce the mismatch from the other direction.
 ///
