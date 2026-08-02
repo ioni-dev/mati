@@ -963,6 +963,12 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
     };
     let action = decide::normalize_action(Some(command), None);
     if action.tool != "db_client" {
+        // `command` passed `is_schema_introspection` above but its leading
+        // word didn't classify — an upstream PreToolUse hook rewrote it
+        // (observed live: `rtk psql …`). The receipt this command should
+        // mint never mints, so a `db_client` policy stays permanently
+        // denied. Record the signature; do not attempt to mint or recover.
+        record_wrapped_client_miss(input, &action).await;
         return Ok(());
     }
 
@@ -1016,6 +1022,47 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
         .await;
     }
     Ok(())
+}
+
+/// Record the wrapped-db-client deadlock signature: `is_schema_introspection`
+/// was true but `normalize_action` did not classify the same command as
+/// `db_client`. Diagnostic only — best-effort and fail-open like the rest of
+/// this module, and never touches any allow/deny decision (this hook variant
+/// emits no `permissionDecision` at all; see `allow_output`).
+async fn record_wrapped_client_miss(input: &serde_json::Value, action: &decide::Action) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let Ok(mati_root) = mati_root_for(root_for_slug) else {
+        return;
+    };
+    if !ensure_daemon(&mati_root).await {
+        return;
+    }
+
+    let session_id = input
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    // The leading token survives env-assignment and PREFIX_WORDS stripping in
+    // `normalize_action`, so it names the wrapper (e.g. "rtk") without ever
+    // carrying the full command text (which may embed a DSN password).
+    let wrapper = action.argv.first().map(String::as_str).unwrap_or("unknown");
+    tracing::warn!(
+        "post-bash: schema-introspection command led by '{wrapper}' did not \
+         classify as db_client — likely rewritten by another PreToolUse hook; \
+         its consultation receipt cannot mint (deadlock signature)"
+    );
+
+    let cmd =
+        mati_core::mcp::protocol::Command::SessionLog(mati_core::mcp::protocol::SessionLogInput {
+            event: mati_core::mcp::protocol::SessionEvent::WrappedDbClientMiss,
+            key: format!("enforcement:wrapped_client:{wrapper}"),
+            session_id: session_id.map(str::to_string),
+        });
+    let _ = daemon_v2(&mati_root, cmd).await;
 }
 
 /// Select the receipt scope shared by the gate and both post-tool mint paths.

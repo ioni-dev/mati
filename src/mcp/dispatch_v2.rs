@@ -915,6 +915,7 @@ async fn dispatch_session_side(
                 protocol::SessionEvent::PolicyConsultMiss => "compliance:miss_",
                 protocol::SessionEvent::PolicyConsultHit => "compliance:allow_after_receipt_",
                 protocol::SessionEvent::PolicySteered => "analytics:policy_steer_",
+                protocol::SessionEvent::WrappedDbClientMiss => "compliance:wrapped_db_client_miss_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -1097,6 +1098,25 @@ async fn dispatch_session_side(
                 // Steering is context injection, not enforcement. Its trace
                 // belongs only in the eventual analytics tree.
                 protocol::SessionEvent::PolicySteered => {}
+                // Post-bash saw a wrapped, unclassifiable introspection command:
+                // the receipt it should mint never mints, so a db_client policy
+                // stays permanently denied. Nothing was bypassed — record as
+                // BypassDetected anyway (same "detected after the fact, no
+                // decision changes" shape as CodexShellMiss) rather than adding
+                // a new event type to the frozen hash contract.
+                protocol::SessionEvent::WrappedDbClientMiss => {
+                    let _ = crate::store::enforcement::record_event(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::BypassDetected,
+                        crate::store::enforcement::SubjectKind::System,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "wrapped_client_unclassifiable".to_string(),
+                        None,
+                    )
+                    .await;
+                }
                 _ => {}
             }
 
@@ -2702,6 +2722,67 @@ mod tests {
 
         // Sanity: the CLI label that `mati history --enforcement` would show
         // for this event is "bypass" (per src/store/enforcement.rs:1000).
+        assert_eq!(
+            crate::store::enforcement::event_type_label(&evt.event_type),
+            "bypass"
+        );
+    }
+
+    /// A wrapped, unclassifiable db-client introspection command (e.g.
+    /// `rtk psql -h prod -c "\d orders"`) diagnoses the same way as
+    /// `CodexShellMiss`: a `BypassDetected` event in the hash-chained log,
+    /// tagged with its own reason code so it is distinguishable from an
+    /// actual bypass. Nothing was denied by this event — it records a
+    /// receipt that could never mint, not an access that slipped through.
+    #[tokio::test]
+    async fn session_log_wrapped_db_client_miss_records_diagnosable_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::SessionLog(SessionLogInput {
+            event: SessionEvent::WrappedDbClientMiss,
+            key: "enforcement:wrapped_client:rtk".into(),
+            session_id: None,
+        }));
+        let resp = dispatch_v2(&graph, &ctx, req).await;
+        assert!(matches!(resp, Response::Ok { .. }));
+
+        let g = graph.read().await;
+
+        let agg = g
+            .store()
+            .scan_keys("compliance:wrapped_db_client_miss_")
+            .await
+            .unwrap();
+        assert!(
+            !agg.is_empty(),
+            "wrapped_db_client_miss daily agg must be written"
+        );
+
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .expect("scan enforcement events");
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one diagnosable event, no correlation state"
+        );
+
+        let evt = &events[0];
+        assert_eq!(evt.agent_type, "claude");
+        assert_eq!(evt.subject_key, "enforcement:wrapped_client:rtk");
+        assert!(matches!(
+            evt.subject_kind,
+            crate::store::enforcement::SubjectKind::System
+        ));
+        assert!(matches!(
+            evt.event_type,
+            crate::store::enforcement::EnforcementEventType::BypassDetected
+        ));
+        assert_eq!(evt.decision_reason_code, "wrapped_client_unclassifiable");
         assert_eq!(
             crate::store::enforcement::event_type_label(&evt.event_type),
             "bypass"
