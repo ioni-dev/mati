@@ -1961,6 +1961,51 @@ mod tests {
         assert!(is_schema_introspection("psql -c \"SHOW TABLES\" | cat"));
     }
 
+    // ── wrapped-db-client deadlock signature ───────────────────────────
+    //
+    // A wrapper `PreToolUse` hook (e.g. `rtk`) can rewrite `psql …` to
+    // `rtk psql …` before mati's post-bash hook sees it. `rtk` is not in
+    // `PREFIX_WORDS`, so `classify_command`/`normalize_action` see an
+    // unrecognized leading word and never reach `db_client`, even though
+    // `is_schema_introspection` still matches every token in the string.
+    // `run_post_bash_introspection` detects exactly this pair of outcomes
+    // on the SAME command text — no cross-invocation correlation needed.
+
+    #[test]
+    fn wrapped_db_client_passes_introspection_but_fails_classification() {
+        let command = r#"rtk psql -h prod -c "\d orders""#;
+        assert!(
+            is_schema_introspection(command),
+            "the wrapped command is still recognizable introspection"
+        );
+        assert_ne!(
+            normalize_action(Some(command), None).tool,
+            "db_client",
+            "the unrecognized 'rtk' prefix must block db_client classification \
+             — this mismatch is the deadlock's detectable signature"
+        );
+    }
+
+    #[test]
+    fn sudo_wrapped_db_client_is_not_the_deadlock_signature() {
+        // Control: sudo IS in PREFIX_WORDS, so this command must classify
+        // normally and never trip the detector — it still mints as before.
+        let command = r#"sudo psql -c "\d orders""#;
+        assert!(is_schema_introspection(command));
+        assert_eq!(normalize_action(Some(command), None).tool, "db_client");
+    }
+
+    #[test]
+    fn non_introspection_command_is_not_the_deadlock_signature() {
+        // A plain, non-introspection command never trips the detector,
+        // classified or not — this is the separate silent-miss variant the
+        // detector deliberately does not cover.
+        assert!(!is_schema_introspection(
+            "rtk psql -c \"SELECT * FROM orders\""
+        ));
+        assert!(!is_schema_introspection("rtk ls -la"));
+    }
+
     #[test]
     fn normalize_db_action_extracts_host_and_file_flag() {
         let action = normalize_action(

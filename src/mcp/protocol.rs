@@ -680,7 +680,7 @@ pub struct DevNoteUpsertInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLogInput {
-    /// The event type (closed enum, 8 variants).
+    /// The event type (closed enum, 13 variants).
     pub event: SessionEvent,
     /// The record key this event pertains to.
     pub key: String,
@@ -729,6 +729,13 @@ pub enum SessionEvent {
     CodexShellMiss,
     Bootstrap,
     PromptNudge,
+    /// Post-bash observed a command that passed `is_schema_introspection` but
+    /// whose leading word did not classify as `db_client` — an upstream
+    /// PreToolUse hook rewrote it (observed live: `rtk psql …`). The
+    /// consultation receipt this command should mint never mints, so a
+    /// `db_client` policy stays permanently unsatisfiable: a deadlock, not a
+    /// bypass. Diagnostic only; does not change any decision.
+    WrappedDbClientMiss,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
