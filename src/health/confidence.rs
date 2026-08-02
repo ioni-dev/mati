@@ -6,7 +6,7 @@
 //! ```text
 //! confidence = base_score
 //!   × log2(confirmation_count + 2)      capped at 2.0
-//!   × min(contributor_count, 3) / 3
+//!   × contributor_factor                 1.0 solo, +0.1 per extra, capped at 3
 //!   × recency_weight(last_accessed)      90-day half-life
 //!   × ref_boost                          1.5× if ref_url set
 //! ```
@@ -14,6 +14,11 @@
 //! The `+2` inside the log ensures the base case (0 confirmations) yields
 //! `log2(2) = 1.0`, so the score is never zeroed out by the log factor alone.
 //! The cap at 2.0 prevents runaway inflation from many confirmations.
+//!
+//! The contributor factor is a bonus, never a penalty. It used to be
+//! `min(contributor_count, 3) / 3`, which scaled a solo developer's record to
+//! a third of its base and put every confirmed `DeveloperManual` gotcha below
+//! the 0.6 deny threshold in the hook decision matrix.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,7 +36,10 @@ const SECS_PER_DAY: f64 = 86_400.0;
 const LOG_FACTOR_CAP: f32 = 2.0;
 
 /// Maximum contributor count that contributes to the score.
-const MAX_CONTRIBUTORS: f32 = 3.0;
+const MAX_CONTRIBUTORS: u32 = 3;
+
+/// Confidence bonus per corroborating contributor beyond the first.
+const CONTRIBUTOR_BONUS: f32 = 0.1;
 
 /// Multiplier applied when `ref_url` is present.
 const REF_BOOST: f32 = 1.5;
@@ -55,9 +63,7 @@ pub fn recompute(record: &Record) -> ConfidenceScore {
     // +2 ensures 0 confirmations → log2(2) = 1.0 (identity).
     let log_factor = ((conf.confirmation_count as f32 + 2.0).log2()).min(LOG_FACTOR_CAP);
 
-    // min(contributor_count, 3) / 3 — at least 1 contributor assumed.
-    let contributor_factor =
-        (conf.contributor_count.max(1) as f32).min(MAX_CONTRIBUTORS) / MAX_CONTRIBUTORS;
+    let contributor_factor = contributor_factor(conf.contributor_count);
 
     // Recency weight: 2^(-days_since_access / 90).
     let recency = recency_weight(record.last_accessed, record.created_at);
@@ -81,6 +87,16 @@ pub fn recompute(record: &Record) -> ConfidenceScore {
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
+
+/// Corroboration bonus: `1.0` for a solo author, rising by `CONTRIBUTOR_BONUS`
+/// per extra contributor up to `MAX_CONTRIBUTORS`.
+///
+/// Never returns below `1.0`. A record only one person has touched is the
+/// normal case for a solo developer, not grounds for discounting it.
+fn contributor_factor(contributor_count: u32) -> f32 {
+    let extra = contributor_count.clamp(1, MAX_CONTRIBUTORS) - 1;
+    1.0 + CONTRIBUTOR_BONUS * extra as f32
+}
 
 /// Compute the recency weight using exponential decay with a 90-day half-life.
 ///
@@ -135,8 +151,7 @@ fn recompute_at(record: &Record, now: u64) -> ConfidenceScore {
 
     let base = ConfidenceScore::base_for_source(&record.source);
     let log_factor = ((conf.confirmation_count as f32 + 2.0).log2()).min(LOG_FACTOR_CAP);
-    let contributor_factor =
-        (conf.contributor_count.max(1) as f32).min(MAX_CONTRIBUTORS) / MAX_CONTRIBUTORS;
+    let contributor_factor = contributor_factor(conf.contributor_count);
     let recency = recency_weight_at(record.last_accessed, record.created_at, now);
     let ref_boost = if record.ref_url.is_some() {
         REF_BOOST
@@ -216,22 +231,9 @@ mod tests {
 
     #[test]
     fn developer_manual_zero_confirmations_gives_base() {
-        // base=0.80, log2(0+2)=1.0, contributors=1/3, recency=1.0, no ref
-        // expected: 0.80 × 1.0 × (1/3) × 1.0 × 1.0 ≈ 0.2667
+        // base=0.80, log2(0+2)=1.0, contributors=1.0, recency=1.0, no ref
+        // expected: 0.80 × 1.0 × 1.0 × 1.0 × 1.0 = 0.80
         let r = make_record(RecordSource::DeveloperManual, 0, 1, None);
-        let score = recompute_at(&r, NOW);
-        assert!(
-            (score.value - 0.2667).abs() < 0.01,
-            "expected ~0.27, got {:.4}",
-            score.value
-        );
-    }
-
-    #[test]
-    fn developer_manual_full_contributors_gives_base() {
-        // base=0.80, log2(2)=1.0, contributors=3/3=1.0, recency=1.0, no ref
-        // expected: 0.80
-        let r = make_record(RecordSource::DeveloperManual, 0, 3, None);
         let score = recompute_at(&r, NOW);
         assert!(
             (score.value - 0.80).abs() < 0.01,
@@ -240,14 +242,45 @@ mod tests {
         );
     }
 
+    /// The solo-developer default: one contributor, one confirmation, no
+    /// `ref_url`. Must clear the 0.6 deny threshold in the hook decision
+    /// matrix, or enforcement silently stops denying reads once `recompute`
+    /// is wired into `mem_get`.
+    #[test]
+    fn solo_developer_confirmed_gotcha_clears_deny_threshold() {
+        // base=0.80, log2(1+2)≈1.585, contributors=1.0, recency=1.0, no ref
+        // expected: 0.80 × 1.585 × 1.0 ≈ 1.27 → clamped to 1.0
+        let r = make_record(RecordSource::DeveloperManual, 1, 1, None);
+        let score = recompute_at(&r, NOW);
+        assert!(
+            score.value >= 0.6,
+            "solo-developer confirmed gotcha must stay at or above the 0.6 \
+             deny threshold, got {:.4}",
+            score.value
+        );
+    }
+
+    #[test]
+    fn developer_manual_full_contributors_adds_bonus() {
+        // base=0.80, log2(2)=1.0, contributors=1.2, recency=1.0, no ref
+        // expected: 0.96
+        let r = make_record(RecordSource::DeveloperManual, 0, 3, None);
+        let score = recompute_at(&r, NOW);
+        assert!(
+            (score.value - 0.96).abs() < 0.01,
+            "expected ~0.96, got {:.4}",
+            score.value
+        );
+    }
+
     #[test]
     fn static_analysis_gives_low_score() {
-        // base=0.10, log2(2)=1.0, contributors=1/3, recency=1.0, no ref
-        // expected: 0.10 × 1.0 × 0.333 × 1.0 ≈ 0.0333
+        // base=0.10, log2(2)=1.0, contributors=1.0, recency=1.0, no ref
+        // expected: 0.10 × 1.0 × 1.0 × 1.0 = 0.10
         let r = make_record(RecordSource::StaticAnalysis, 0, 1, None);
         let score = recompute_at(&r, NOW);
         assert!(
-            score.value < 0.10,
+            score.value < 0.3,
             "expected low score for StaticAnalysis, got {:.4}",
             score.value
         );
@@ -348,10 +381,10 @@ mod tests {
         r.last_accessed = NOW - days_180;
 
         let score = recompute_at(&r, NOW);
-        // base=0.80 × 1.0 × 1.0 × 0.25 × 1.0 = 0.20
+        // base=0.80 × 1.0 × 1.2 × 0.25 × 1.0 = 0.24
         assert!(
-            (score.value - 0.20).abs() < 0.02,
-            "180-day-old record should score ~0.20, got {:.4}",
+            (score.value - 0.24).abs() < 0.02,
+            "180-day-old record should score ~0.24, got {:.4}",
             score.value
         );
     }
@@ -439,8 +472,8 @@ mod tests {
         let score = recompute_at(&r, NOW);
         // Should behave as if last_accessed == NOW
         assert!(
-            (score.value - 0.80).abs() < 0.01,
-            "never-accessed record created now should score ~0.80, got {:.4}",
+            (score.value - 0.96).abs() < 0.01,
+            "never-accessed record created now should score ~0.96, got {:.4}",
             score.value
         );
     }
@@ -454,10 +487,10 @@ mod tests {
 
         let score = recompute_at(&r, NOW);
         // Falls back to created_at which is 180 days ago → recency ≈ 0.25
-        // 0.80 × 1.0 × 1.0 × 0.25 = 0.20
+        // 0.80 × 1.0 × 1.2 × 0.25 = 0.24
         assert!(
-            (score.value - 0.20).abs() < 0.02,
-            "never-accessed 180-day-old record should score ~0.20, got {:.4}",
+            (score.value - 0.24).abs() < 0.02,
+            "never-accessed 180-day-old record should score ~0.24, got {:.4}",
             score.value
         );
     }

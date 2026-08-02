@@ -716,11 +716,13 @@ base_score by source:
   StaticAnalysis  -> 0.10
 
 confidence = base_score
-  x log2(confirmation_count + 2)
-  x min(contributor_count, 3) / 3
+  x log2(confirmation_count + 2)     capped at 2.0
+  x contributor_factor               1.0 + 0.1 per contributor past the first, capped at 3
   x recency_weight(last_accessed)    90-day half-life
   x ref_boost                        1.5x if ref_url is set
 ```
+
+The contributor factor is a bonus, never a penalty. It was `min(contributor_count, 3) / 3` until it was found to scale a solo developer's record to a third of its base: a confirmed `DeveloperManual` gotcha with one contributor and no `ref_url` recomputed to 0.42, below the 0.6 deny threshold in section 10.1. Since mati is the complete product for a solo developer, one contributor is the normal case and scores 1.0. Corroboration still helps, capped at 1.2x.
 
 Recomputation is implemented as a pure function, `health::confidence::recompute`, but it is **not wired into the `mem_get` path yet**. Right now, `mem_get` only bumps `access_count`. Automatic recomputation on access is planned.
 
