@@ -170,7 +170,15 @@ fn test_item_ranges(root: tree_sitter::Node, source: &[u8]) -> Vec<Range<usize>>
 /// In tree-sitter-rust an attribute is a *sibling* preceding its item,
 /// not a child of it. Doc comments may sit between the two.
 fn has_test_attribute(item: tree_sitter::Node, source: &[u8]) -> bool {
-    let mut sibling = item.prev_named_sibling();
+    // An attributed block inside a function body parses as an
+    // `expression_statement` wrapping the block, so the attribute is the
+    // wrapper's sibling, not the block's.
+    let anchor = match item.parent() {
+        Some(parent) if parent.kind() == "expression_statement" => parent,
+        _ => item,
+    };
+
+    let mut sibling = anchor.prev_named_sibling();
     while let Some(node) = sibling {
         match node.kind() {
             "attribute_item" if attribute_marks_test(node, source) => return true,
@@ -437,3 +445,4 @@ fn gated() {
         assert!(signals.iter().any(|s| s.evidence.contains("panic")));
     }
 }
+
