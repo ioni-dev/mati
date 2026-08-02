@@ -55,6 +55,10 @@ pub enum GotchaCommand {
     Delete {
         /// Gotcha key (e.g., "gotcha:session-token-expiry" or just "session-token-expiry")
         key: String,
+        /// Skip the confirmation prompt. Pairs with `confirm`, which is already
+        /// non-interactive, so review can be scripted end to end.
+        #[arg(long)]
+        yes: bool,
     },
     /// Confirm a gotcha — activates hook enforcement (non-interactive, no TTY required)
     Confirm {
@@ -72,7 +76,7 @@ pub async fn run(args: GotchaArgs) -> Result<()> {
             severity,
         } => run_gotcha_add(&file, rule, reason, severity).await,
         GotchaCommand::Edit { key } => run_gotcha_edit(&normalize_key(&key)).await,
-        GotchaCommand::Delete { key } => run_gotcha_delete(&normalize_key(&key)).await,
+        GotchaCommand::Delete { key, yes } => run_gotcha_delete(&normalize_key(&key), yes).await,
         GotchaCommand::Confirm { key } => {
             const NON_GOTCHA_PREFIXES: &[&str] =
                 &["file:", "decision:", "dev_note:", "dep:", "stage:"];
@@ -634,14 +638,14 @@ async fn run_gotcha_edit_inner(proxy: &StoreProxy, key: &str) -> Result<()> {
 
 // ── Delete ────────────────────────────────────────────────────────────────────
 
-async fn run_gotcha_delete(key: &str) -> Result<()> {
+async fn run_gotcha_delete(key: &str, yes: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
-    let result = run_gotcha_delete_inner(&proxy, key).await;
+    let result = run_gotcha_delete_inner(&proxy, key, yes).await;
     proxy.close_with_result(result).await
 }
 
-async fn run_gotcha_delete_inner(proxy: &StoreProxy, key: &str) -> Result<()> {
+async fn run_gotcha_delete_inner(proxy: &StoreProxy, key: &str, yes: bool) -> Result<()> {
     let use_color = io::stderr().is_terminal();
 
     let record = proxy
@@ -664,15 +668,17 @@ async fn run_gotcha_delete_inner(proxy: &StoreProxy, key: &str) -> Result<()> {
     eprintln!("  Files:  {}", gotcha.affected_files.join(", "));
     eprintln!();
 
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+    if !yes {
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
 
-    eprint_prompt(&format!("Delete {key}? [y/N]: "), use_color);
-    let confirm = read_line(&mut lines)?;
+        eprint_prompt(&format!("Delete {key}? [y/N]: "), use_color);
+        let confirm = read_line(&mut lines)?;
 
-    if confirm.to_lowercase() != "y" && confirm.to_lowercase() != "yes" {
-        println!("Aborted.");
-        return Ok(());
+        if confirm.to_lowercase() != "y" && confirm.to_lowercase() != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
     }
 
     proxy.gotcha_tombstone(key, &gotcha.affected_files).await?;
