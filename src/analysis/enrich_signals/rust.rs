@@ -23,6 +23,7 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -147,6 +148,72 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     Ok(signals)
 }
 
+/// Whether the parent module declares this file's module behind a test gate
+/// (`#[cfg(test)] mod compliance;`). Such a file is entirely test code without
+/// containing any evidence of it.
+///
+/// An unreadable or unparseable parent yields `false`, so extraction proceeds
+/// normally rather than failing.
+pub fn parent_declares_test_module(path: &Path) -> bool {
+    let Some(module) = declared_module_name(path) else {
+        return false;
+    };
+    parent_module_candidates(path)
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .any(|src| declares_test_module(&src, &module))
+}
+
+/// The name this file is declared under in its parent. `None` for a crate
+/// root, which no parent declares.
+fn declared_module_name(path: &Path) -> Option<String> {
+    match path.file_stem()?.to_str()? {
+        "lib" | "main" => None,
+        "mod" => Some(path.parent()?.file_name()?.to_str()?.to_string()),
+        stem => Some(stem.to_string()),
+    }
+}
+
+/// Files that could hold the `mod <name>;` declaration: the enclosing module's
+/// `mod.rs`, its Rust 2018 sibling form, or the crate root.
+fn parent_module_candidates(path: &Path) -> Vec<PathBuf> {
+    let scope = match path.file_stem().and_then(|s| s.to_str()) {
+        Some("mod") => path.parent().and_then(|p| p.parent()),
+        _ => path.parent(),
+    };
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    vec![
+        scope.join("mod.rs"),
+        scope.with_extension("rs"),
+        scope.join("lib.rs"),
+        scope.join("main.rs"),
+    ]
+}
+
+/// Whether `source` declares a bodyless `mod <name>;` behind a test gate.
+/// Only top-level declarations count — a nested one names a different file.
+fn declares_test_module(source: &str, module: &str) -> bool {
+    let Some(tree) = RUST_PARSER.with(|p| p.borrow_mut().parse(source.as_bytes(), None)) else {
+        return false;
+    };
+    let bytes = source.as_bytes();
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+
+    for node in root.named_children(&mut cursor) {
+        if node.kind() == "mod_item"
+            && node.child_by_field_name("body").is_none()
+            && super::named_field_matches(node, bytes, "name", |n| n == module)
+            && has_test_attribute(node, bytes)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether `#![cfg(test)]` gates the whole file. An inner attribute is a
 /// child of the root, not a preceding sibling like an outer one.
 fn file_is_test_gated(root: tree_sitter::Node, source: &[u8]) -> bool {
@@ -255,6 +322,61 @@ fn mentions_test_flag(node: tree_sitter::Node, source: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_candidates_cover_both_module_forms() {
+        let c = parent_module_candidates(Path::new("src/hooks/compliance.rs"));
+        assert!(c.contains(&PathBuf::from("src/hooks/mod.rs")));
+        assert!(c.contains(&PathBuf::from("src/hooks.rs")));
+
+        // A crate-root child: `src/invariants.rs` is declared in `src/lib.rs`.
+        let c = parent_module_candidates(Path::new("src/invariants.rs"));
+        assert!(c.contains(&PathBuf::from("src/lib.rs")));
+
+        // `src/hooks/mod.rs` is itself declared one scope up.
+        let c = parent_module_candidates(Path::new("src/hooks/mod.rs"));
+        assert!(c.contains(&PathBuf::from("src/lib.rs")));
+    }
+
+    #[test]
+    fn declared_module_name_uses_dir_for_mod_rs_and_skips_crate_roots() {
+        assert_eq!(
+            declared_module_name(Path::new("src/hooks/compliance.rs")).as_deref(),
+            Some("compliance")
+        );
+        assert_eq!(
+            declared_module_name(Path::new("src/hooks/mod.rs")).as_deref(),
+            Some("hooks")
+        );
+        assert!(declared_module_name(Path::new("src/lib.rs")).is_none());
+        assert!(declared_module_name(Path::new("src/main.rs")).is_none());
+    }
+
+    #[test]
+    fn declares_test_module_matches_only_gated_bodyless_declarations() {
+        assert!(declares_test_module(
+            "#[cfg(test)]\nmod compliance;",
+            "compliance"
+        ));
+        assert!(declares_test_module(
+            "#[cfg(all(test, unix))]\nmod compliance;",
+            "compliance"
+        ));
+        assert!(!declares_test_module("mod compliance;", "compliance"));
+        assert!(!declares_test_module(
+            "#[cfg(not(test))]\nmod compliance;",
+            "compliance"
+        ));
+        // Inline module: names no file.
+        assert!(!declares_test_module(
+            "#[cfg(test)]\nmod compliance { fn x() {} }",
+            "compliance"
+        ));
+        assert!(!declares_test_module(
+            "#[cfg(test)]\nmod other;",
+            "compliance"
+        ));
+    }
 
     #[test]
     fn detects_panic_macro() {

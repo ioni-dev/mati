@@ -18,10 +18,12 @@
 //! `ENRICH_QUALITY.md` Section 4 — Proposal D, SOTA expansion.
 //!
 //! Test code is excluded, because assertions in a test suite are the
-//! suite checking itself, not knowledge worth capturing. Two layers:
+//! suite checking itself, not knowledge worth capturing. Three layers:
 //! [`is_test_path`] skips whole files by naming convention (all
-//! languages), and each per-language extractor skips in-file test blocks
-//! via [`collect_test_ranges`] with its own predicate.
+//! languages), each per-language extractor skips in-file test blocks via
+//! [`collect_test_ranges`] with its own predicate, and — Rust only —
+//! [`rust::parent_declares_test_module`] skips a file whose only test
+//! marker is the `#[cfg(test)] mod foo;` in its parent.
 //!
 //! In-file filtering covers Rust, Go, Python, JavaScript, TypeScript,
 //! Java, Ruby and Elixir. Three languages are deliberately not covered:
@@ -177,13 +179,16 @@ pub fn language_label(lang: Language) -> &'static str {
 /// via `comments::scan_unknown` so files like `.toml` or `.md` still
 /// surface their WARN/FIXME annotations.
 ///
-/// Files [`is_test_path`] recognises yield an empty report rather than
-/// an error — a zero-signal report is a valid Stage 1 result.
+/// Files [`is_test_path`] or [`rust::parent_declares_test_module`]
+/// recognises yield an empty report rather than an error — a zero-signal
+/// report is a valid Stage 1 result.
 pub fn extract_signals(path: &Path, language: Language) -> Result<SignalReport> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
 
-    if is_test_path(path) {
+    let parent_gated = language == Language::Rust && rust::parent_declares_test_module(path);
+
+    if is_test_path(path) || parent_gated {
         return Ok(SignalReport {
             file: path.display().to_string(),
             language: language_label(language).to_string(),
@@ -476,6 +481,77 @@ mod tests {
         assert_eq!(report.language, "go");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Scratch crate: `<root>/src/<parent>` declaring `mod child;`, plus a
+    /// `child.rs` full of panics. Returns the child's path.
+    fn write_gated_module(name: &str, parent: &str, decl: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(name);
+        std::fs::remove_dir_all(&root).ok();
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("hooks")).unwrap();
+        std::fs::write(src.join(parent), decl).unwrap();
+        let child = src.join("hooks").join("compliance.rs");
+        std::fs::write(&child, "fn go() { panic!(\"boom\"); assert!(true); }").unwrap();
+        child
+    }
+
+    #[test]
+    fn parent_mod_rs_test_gate_yields_empty_report() {
+        let child = write_gated_module(
+            "mati_enrich_parent_modrs",
+            "hooks/mod.rs",
+            "pub mod other;\n\n#[cfg(test)]\nmod compliance;\n",
+        );
+
+        let report = extract_signals(&child, Language::Rust).unwrap();
+        assert_eq!(report.signal_count, 0);
+        assert!(report.signals.is_empty());
+        assert_eq!(report.language, "rust");
+
+        std::fs::remove_dir_all(child.parent().unwrap().parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn parent_sibling_form_test_gate_yields_empty_report() {
+        let child = write_gated_module(
+            "mati_enrich_parent_sibling",
+            "hooks.rs",
+            "#[cfg(all(test, unix))]\nmod compliance;\n",
+        );
+
+        let report = extract_signals(&child, Language::Rust).unwrap();
+        assert_eq!(report.signal_count, 0);
+
+        std::fs::remove_dir_all(child.parent().unwrap().parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn ungated_parent_declaration_extracts_normally() {
+        let child = write_gated_module(
+            "mati_enrich_parent_ungated",
+            "hooks/mod.rs",
+            "#[cfg(not(test))]\nmod compliance;\n",
+        );
+
+        let report = extract_signals(&child, Language::Rust).unwrap();
+        assert!(report.signal_count > 0, "cfg(not(test)) is production code");
+
+        std::fs::remove_dir_all(child.parent().unwrap().parent().unwrap().parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn missing_parent_file_falls_through_to_extraction() {
+        let root = std::env::temp_dir().join("mati_enrich_parent_missing");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let file = root.join("src").join("orphan.rs");
+        std::fs::write(&file, "fn go() { panic!(\"boom\"); }").unwrap();
+
+        let report = extract_signals(&file, Language::Rust).unwrap();
+        assert!(report.signal_count > 0);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

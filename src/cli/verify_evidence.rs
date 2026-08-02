@@ -5,7 +5,9 @@
 //! number, and an `evidence_quote` + optional `pattern` from a candidate
 //! gotcha, confirm that:
 //!
-//! 1. The quote literally appears within `line ± WINDOW_LINES` of context.
+//! 1. The quote appears within `line ± WINDOW_LINES` of context, comparing
+//!    both sides after comment markers and whitespace runs are normalized so
+//!    a quote wrapped across source lines still matches.
 //! 2. The pattern (if provided) also appears in that window — used to verify
 //!    the API/literal named in the rule actually exists where the candidate
 //!    claims.
@@ -47,7 +49,8 @@ pub struct VerifyEvidenceArgs {
     #[arg(long)]
     pub line: String,
 
-    /// Exact substring expected to appear within line ± 5 lines.
+    /// Substring expected within line ± 5 lines. Comment markers and line
+    /// breaks are normalized away, so a wrapped quote may be given as one line.
     #[arg(long)]
     pub quote: String,
 
@@ -74,8 +77,14 @@ pub async fn run(args: VerifyEvidenceArgs) -> Result<()> {
     let window = read_window(&args.file, line_num, WINDOW_LINES)
         .with_context(|| format!("failed to read window from {}", args.file))?;
 
-    let quote_match = !args.quote.is_empty() && window.contains(&args.quote);
-    let pattern_match = args.pattern.as_ref().map(|p| window.contains(p));
+    let haystack = normalize(&window);
+    let needle = normalize(&args.quote);
+
+    let quote_match = !needle.is_empty() && haystack.contains(&needle);
+    let pattern_match = args
+        .pattern
+        .as_ref()
+        .map(|p| haystack.contains(&normalize(p)));
 
     let verified = quote_match && pattern_match.unwrap_or(true);
 
@@ -129,6 +138,35 @@ fn parse_line_arg(raw: &str) -> Result<usize> {
         anyhow::bail!("line must be 1-based, got 0");
     }
     Ok(n)
+}
+
+/// Leading comment markers stripped before matching, longest prefix first so
+/// `///` wins over `//` and `*/` over `*`. Covers the comment syntax of every
+/// language mati parses: C-family, Rust, Python/Ruby/Elixir, Haskell.
+const LINE_COMMENT_MARKERS: [&str; 9] = ["///", "//!", "//", "/**", "/*", "*/", "*", "--", "#"];
+
+/// Flatten text so a quote spanning several source lines still matches.
+///
+/// Each line loses its leading comment marker, then all whitespace runs —
+/// newlines included — collapse to one space. Applied identically to the
+/// window, the quote, and the pattern, so the check still rejects text that
+/// is genuinely absent.
+fn normalize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let body = LINE_COMMENT_MARKERS
+            .iter()
+            .find_map(|m| trimmed.strip_prefix(m))
+            .unwrap_or(trimmed);
+        for word in body.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+    }
+    out
 }
 
 /// Read `file` and return the joined text of lines `[line - radius, line + radius]`
@@ -220,6 +258,69 @@ mod tests {
         let window = read_window(path, 5, 5).unwrap();
         assert!(window.contains('a'));
         assert!(window.contains('e'));
+    }
+
+    /// The real shape from `src/cli/hook_decide.rs` that the flat substring
+    /// match rejected: one sentence wrapped across two doc-comment lines.
+    #[test]
+    fn quote_wrapped_across_doc_comment_lines_matches() {
+        let content = "\
+/// Delegates to serde_json so ALL control characters (U+0000-U+001F) are
+/// escaped, not just `\\n`/`\\r`/`\\t` — an unescaped control char anywhere in a
+/// deny reason would make the whole hook output unparseable, and an
+/// unparseable deny is a lost deny.
+fn escape_json_string(s: &str) -> String {";
+        let f = write_tmp(content);
+        let window = read_window(f.path().to_str().unwrap(), 3, WINDOW_LINES).unwrap();
+
+        assert!(normalize(&window).contains(&normalize("an unparseable deny is a lost deny")));
+        assert!(!window.contains("an unparseable deny is a lost deny"));
+    }
+
+    #[test]
+    fn absent_quote_still_rejected() {
+        let content = "\
+/// Delegates to serde_json so ALL control characters are
+/// escaped, and an unparseable deny is a lost deny.
+fn escape_json_string(s: &str) -> String {";
+        let f = write_tmp(content);
+        let window = normalize(&read_window(f.path().to_str().unwrap(), 2, WINDOW_LINES).unwrap());
+
+        assert!(!window.contains(&normalize("a lost deny is an unparseable deny")));
+        assert!(!window.contains(&normalize("fsync every write")));
+    }
+
+    #[test]
+    fn pattern_outside_window_still_rejected() {
+        let content = (1..=40)
+            .map(|n| {
+                if n == 35 {
+                    "let x = with_versioning(true, 0);".to_string()
+                } else {
+                    format!("// line {n}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let f = write_tmp(&content);
+        let window = normalize(&read_window(f.path().to_str().unwrap(), 10, WINDOW_LINES).unwrap());
+
+        assert!(window.contains(&normalize("line 10")));
+        assert!(!window.contains(&normalize("with_versioning")));
+    }
+
+    #[test]
+    fn normalize_strips_markers_and_collapses_whitespace() {
+        assert_eq!(normalize("///  a\n//! b\n// c"), "a b c");
+        assert_eq!(normalize("# py\n-- hs\n * block"), "py hs block");
+        assert_eq!(normalize("  plain   code  "), "plain code");
+        assert_eq!(normalize("   \n  \n"), "");
+    }
+
+    #[test]
+    fn empty_quote_never_matches() {
+        assert!(normalize("").is_empty());
+        assert!(normalize("   \n///\n").is_empty());
     }
 
     #[test]
