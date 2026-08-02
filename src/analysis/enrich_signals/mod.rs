@@ -16,6 +16,15 @@
 //!
 //! Exposed via `mati extract-signals --file <path> --json`. See
 //! `ENRICH_QUALITY.md` Section 4 — Proposal D, SOTA expansion.
+//!
+//! Test code is excluded, because assertions in a test suite are the
+//! suite checking itself, not knowledge worth capturing. Two layers:
+//! [`is_test_path`] skips whole files by naming convention (all
+//! languages), and each per-language extractor skips in-file test
+//! blocks. **In-file filtering is implemented for Rust only.** The
+//! other 11 languages still emit signals from `describe`/`it` blocks,
+//! `@Test` methods, `func TestXxx`, pytest classes, and so on; each
+//! needs its own AST rule.
 
 use std::path::Path;
 
@@ -154,9 +163,21 @@ pub fn language_label(lang: Language) -> &'static str {
 /// Unknown / unsupported languages fall back to comment-only scanning
 /// via `comments::scan_unknown` so files like `.toml` or `.md` still
 /// surface their WARN/FIXME annotations.
+///
+/// Files [`is_test_path`] recognises yield an empty report rather than
+/// an error — a zero-signal report is a valid Stage 1 result.
 pub fn extract_signals(path: &Path, language: Language) -> Result<SignalReport> {
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
+
+    if is_test_path(path) {
+        return Ok(SignalReport {
+            file: path.display().to_string(),
+            language: language_label(language).to_string(),
+            signal_count: 0,
+            signals: Vec::new(),
+        });
+    }
 
     let mut signals = match language {
         Language::Rust => rust::extract(&source)?,
@@ -184,6 +205,37 @@ pub fn extract_signals(path: &Path, language: Language) -> Result<SignalReport> 
         language: language_label(language).to_string(),
         signal_count: signals.len(),
         signals,
+    })
+}
+
+/// True when the path names a test file by convention, in any of the
+/// supported languages. Such files are skipped wholesale.
+///
+/// Covers a `tests/` or `__tests__/` directory anywhere in the path, Go
+/// `*_test.go`, Python `test_*.py` / `*_test.py`, and JS/TS
+/// `*.test.*` / `*.spec.*`.
+pub fn is_test_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some("tests") | Some("__tests__")))
+    {
+        return true;
+    }
+
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    if name.ends_with("_test.go") {
+        return true;
+    }
+    if name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py")) {
+        return true;
+    }
+
+    const JS_EXTS: [&str; 4] = ["js", "ts", "jsx", "tsx"];
+    JS_EXTS.iter().any(|ext| {
+        name.ends_with(&format!(".test.{ext}")) || name.ends_with(&format!(".spec.{ext}"))
     })
 }
 
@@ -285,6 +337,51 @@ mod tests {
         assert_eq!(language_label(Language::Cpp), "cpp");
         assert_eq!(language_label(Language::Haskell), "haskell");
         assert_eq!(language_label(Language::Unknown), "unknown");
+    }
+
+    #[test]
+    fn test_paths_are_recognised() {
+        for p in [
+            "tests/integration.rs",
+            "crates/foo/tests/smoke.rs",
+            "src/__tests__/helper.js",
+            "pkg/server_test.go",
+            "app/test_views.py",
+            "app/views_test.py",
+            "src/Button.test.tsx",
+            "src/Button.spec.js",
+        ] {
+            assert!(is_test_path(Path::new(p)), "{p} should be a test path");
+        }
+    }
+
+    #[test]
+    fn production_paths_are_not_test_paths() {
+        for p in [
+            "src/store/durability.rs",
+            "src/latest/contest.go",
+            "src/protest.py",
+            "src/testing.py",
+            "src/attest.ts",
+            "src/harness/testutil.go",
+        ] {
+            assert!(!is_test_path(Path::new(p)), "{p} should not be a test path");
+        }
+    }
+
+    #[test]
+    fn skipped_file_returns_empty_report_not_error() {
+        let dir = std::env::temp_dir().join("mati_enrich_signals_skip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("thing_test.go");
+        std::fs::write(&file, "func TestX(t *testing.T) { panic(\"x\") }").unwrap();
+
+        let report = extract_signals(&file, Language::Go).unwrap();
+        assert_eq!(report.signal_count, 0);
+        assert!(report.signals.is_empty());
+        assert_eq!(report.language, "go");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
