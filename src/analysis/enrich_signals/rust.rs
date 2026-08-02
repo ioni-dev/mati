@@ -147,10 +147,8 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     Ok(signals)
 }
 
-/// Byte ranges covering every test-attributed module, function, impl, or
-/// block. Test items are not descended into, so nested items inherit the
-/// exclusion.
-/// Whether `#![cfg(test)]` gates the whole file.
+/// Whether `#![cfg(test)]` gates the whole file. An inner attribute is a
+/// child of the root, not a preceding sibling like an outer one.
 fn file_is_test_gated(root: tree_sitter::Node, source: &[u8]) -> bool {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
@@ -161,6 +159,9 @@ fn file_is_test_gated(root: tree_sitter::Node, source: &[u8]) -> bool {
     false
 }
 
+/// Byte ranges covering every test-attributed module, function, impl, or
+/// block. Test items are not descended into, so nested items inherit the
+/// exclusion.
 fn test_item_ranges(root: tree_sitter::Node, source: &[u8]) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut stack = vec![root];
@@ -472,5 +473,3 @@ fn gated() {
         assert!(signals.iter().any(|s| s.evidence.contains("panic")));
     }
 }
-
-

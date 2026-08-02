@@ -20,11 +20,24 @@
 //! Test code is excluded, because assertions in a test suite are the
 //! suite checking itself, not knowledge worth capturing. Two layers:
 //! [`is_test_path`] skips whole files by naming convention (all
-//! languages), and each per-language extractor skips in-file test
-//! blocks. **In-file filtering is implemented for Rust only.** The
-//! other 11 languages still emit signals from `describe`/`it` blocks,
-//! `@Test` methods, `func TestXxx`, pytest classes, and so on; each
-//! needs its own AST rule.
+//! languages), and each per-language extractor skips in-file test blocks
+//! via [`collect_test_ranges`] with its own predicate.
+//!
+//! In-file filtering covers Rust, Go, Python, JavaScript, TypeScript,
+//! Java, Ruby and Elixir. Three languages are deliberately not covered:
+//!
+//! - **C and C++** — gtest's `TEST(Suite, Name) { … }` does not parse as
+//!   a function at all; tree-sitter emits an `ERROR` node and a detached
+//!   `compound_statement`. There is no reliable node to anchor on.
+//! - **Scala** — ScalaTest's `"x" should "y" in { … }` is arbitrary infix
+//!   application, indistinguishable from ordinary code without picking a
+//!   framework to special-case.
+//! - **Haskell** — hspec's `describe`/`it` is plain function application
+//!   with the same problem.
+//!
+//! Each predicate requires positive evidence rather than a name guess, so
+//! the failure mode is a missed test block, never an excluded production
+//! one. Excluding real code silently is the expensive direction.
 
 use std::path::Path;
 
@@ -248,6 +261,87 @@ pub(crate) fn node_text(source: &[u8], node: tree_sitter::Node) -> String {
         return String::new();
     }
     String::from_utf8_lossy(&source[start..end]).into_owned()
+}
+
+/// Collect byte ranges of test-only nodes, without descending into a match.
+///
+/// Each language supplies its own `is_test` predicate; the traversal is
+/// shared. Skipping the subtree of a match keeps nested test helpers from
+/// being scanned twice.
+pub(crate) fn collect_test_ranges<F>(
+    root: tree_sitter::Node,
+    is_test: F,
+) -> Vec<std::ops::Range<usize>>
+where
+    F: Fn(tree_sitter::Node) -> bool,
+{
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+
+    while let Some(node) = stack.pop() {
+        if node.id() != root.id() && is_test(node) {
+            ranges.push(node.start_byte()..node.end_byte());
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+
+    ranges
+}
+
+/// Whether a captured node starts inside any collected test range.
+pub(crate) fn in_test_range(ranges: &[std::ops::Range<usize>], node: tree_sitter::Node) -> bool {
+    ranges.iter().any(|r| r.contains(&node.start_byte()))
+}
+
+/// A `describe(…)`/`it(…)`/`test(…)` call taking a callback — the shape Jest,
+/// Mocha and Vitest share. Requiring the callback keeps a production helper
+/// named `test(value)` out of the match. Used by both JS and TS, whose
+/// grammars agree on these node kinds.
+pub(crate) fn is_js_test_call(node: tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() != "call_expression" {
+        return false;
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let text = node_text(source, callee);
+    let base = text.split('.').next().unwrap_or("").trim();
+    if !matches!(
+        base,
+        "describe" | "it" | "test" | "suite" | "context" | "beforeEach" | "afterEach"
+    ) {
+        return false;
+    }
+    let Some(args) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    for arg in args.named_children(&mut cursor) {
+        if matches!(
+            arg.kind(),
+            "arrow_function" | "function_expression" | "function"
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a node's `name`/`method` child text matches `pred`.
+pub(crate) fn named_field_matches<F>(
+    node: tree_sitter::Node,
+    source: &[u8],
+    field: &str,
+    pred: F,
+) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    node.child_by_field_name(field)
+        .map(|n| pred(node_text(source, n).trim()))
+        .unwrap_or(false)
 }
 
 /// Collapse newlines and cap evidence at 200 characters with an ellipsis

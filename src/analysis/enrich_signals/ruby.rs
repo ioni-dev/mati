@@ -34,6 +34,23 @@ thread_local! {
     });
 }
 
+/// RSpec blocks (`describe`/`it`/`context` with a `do` block) and minitest
+/// `def test_*`. The block is required so a bare `context(x)` call stays in.
+fn is_test_node(node: tree_sitter::Node, source: &[u8]) -> bool {
+    match node.kind() {
+        "call" => {
+            super::named_field_matches(node, source, "method", |m| {
+                matches!(
+                    m,
+                    "describe" | "it" | "context" | "specify" | "before" | "after"
+                )
+            }) && node.child_by_field_name("block").is_some()
+        }
+        "method" => super::named_field_matches(node, source, "name", |n| n.starts_with("test_")),
+        _ => false,
+    }
+}
+
 pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let tree = RB_PARSER.with(|p| {
         let mut parser = p.borrow_mut();
@@ -42,6 +59,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             .ok_or_else(|| anyhow::anyhow!("enrich_signals/ruby: parse returned None"))
     })?;
     let bytes = source.as_bytes();
+    let test_ranges = super::collect_test_ranges(tree.root_node(), |n| is_test_node(n, bytes));
     let mut out: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| RB_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
@@ -49,6 +67,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 
     for m in cursor.matches(&RB_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
+            if super::in_test_range(&test_ranges, c.node) {
+                continue;
+            }
             let line = c.node.start_position().row as u32 + 1;
             let evidence = super::node_text(bytes, c.node);
             if c.index == i_panic {
@@ -91,5 +112,23 @@ mod tests {
         let src = "# rubocop:disable Metrics/MethodLength\ndef f; end";
         let signals = extract(src).unwrap();
         assert!(signals.iter().any(|s| s.kind == SignalKind::LinterDisable));
+    }
+    #[test]
+    fn rspec_block_excluded() {
+        assert!(extract("describe 'a' do\n  raise 'x'\nend\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn minitest_method_excluded() {
+        assert!(extract("def test_foo\n  raise 'y'\nend\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn production_method_kept() {
+        assert_eq!(extract("def run\n  raise 'z'\nend\n").unwrap().len(), 1);
     }
 }

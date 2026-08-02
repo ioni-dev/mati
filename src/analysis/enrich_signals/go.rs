@@ -37,6 +37,24 @@ thread_local! {
     });
 }
 
+/// A test function is `func TestX(t *testing.T)`. The name prefix alone is
+/// not enough — `TestData()` is ordinary code — so the `testing` parameter
+/// is required. `Example` functions take no parameter and are left in.
+fn is_test_fn(node: tree_sitter::Node, source: &[u8]) -> bool {
+    fn has_test_prefix(name: &str) -> bool {
+        ["Test", "Benchmark", "Fuzz"].iter().any(|p| {
+            name.strip_prefix(p)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(|c: char| c.is_uppercase()))
+        })
+    }
+
+    node.kind() == "function_declaration"
+        && super::named_field_matches(node, source, "name", has_test_prefix)
+        && node
+            .child_by_field_name("parameters")
+            .is_some_and(|p| super::node_text(source, p).contains("testing."))
+}
+
 pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let tree = GO_PARSER.with(|p| {
         let mut parser = p.borrow_mut();
@@ -45,6 +63,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             .ok_or_else(|| anyhow::anyhow!("enrich_signals/go: parse returned None"))
     })?;
     let bytes = source.as_bytes();
+    let test_ranges = super::collect_test_ranges(tree.root_node(), |n| is_test_fn(n, bytes));
     let mut out: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| GO_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
@@ -52,6 +71,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 
     for m in cursor.matches(&GO_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
+            if super::in_test_range(&test_ranges, c.node) {
+                continue;
+            }
             let line = c.node.start_position().row as u32 + 1;
             let evidence = super::node_text(bytes, c.node);
             if c.index == i_panic {
@@ -107,5 +129,17 @@ mod tests {
     fn detects_nolint_comment() {
         let signals = extract("package x\nvar x = 1 //nolint:unused\n").unwrap();
         assert!(signals.iter().any(|s| s.kind == SignalKind::LinterDisable));
+    }
+
+    #[test]
+    fn test_function_signals_excluded() {
+        let src = "package x\nimport \"testing\"\nfunc TestF(t *testing.T) { panic(\"boom\") }";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_prefixed_production_function_kept() {
+        let src = "package x\nfunc TestData() { panic(\"boom\") }";
+        assert_eq!(extract(src).unwrap().len(), 1);
     }
 }

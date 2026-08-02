@@ -46,6 +46,8 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             .ok_or_else(|| anyhow::anyhow!("enrich_signals/typescript: parse returned None"))
     })?;
     let bytes = source.as_bytes();
+    let test_ranges =
+        super::collect_test_ranges(tree.root_node(), |n| super::is_js_test_call(n, bytes));
     let mut out: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| TS_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
@@ -53,6 +55,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 
     for m in cursor.matches(&TS_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
+            if super::in_test_range(&test_ranges, c.node) {
+                continue;
+            }
             let line = c.node.start_position().row as u32 + 1;
             let evidence = super::node_text(bytes, c.node);
             if c.index == i_panic {
@@ -103,5 +108,16 @@ mod tests {
     fn detects_ts_ignore_comment() {
         let signals = extract("// @ts-ignore — fix later\nconst x: any = 1;").unwrap();
         assert!(signals.iter().any(|s| s.kind == SignalKind::LinterDisable));
+    }
+    #[test]
+    fn describe_block_signals_excluded() {
+        let src = "describe('a', () => { it('b', () => { throw new Error('x') }) })";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn production_call_named_test_kept() {
+        let src = "test(value);\nthrow new Error('boom');";
+        assert_eq!(extract(src).unwrap().len(), 1);
     }
 }
