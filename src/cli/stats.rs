@@ -190,7 +190,11 @@ async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
             "total": counts.total,
             "denials": counts.denials,
             "allowed_after_receipt": counts.allowed_after_receipt,
-            "consulted": counts.receipts_minted,
+            // De-duplicated: one consultation is reported by up to three
+            // `ReceiptMinted` emitters, so the raw event count is inflated.
+            // `receipt_events` keeps the raw number so the two stay comparable.
+            "consulted": counts.consultations,
+            "receipt_events": counts.receipts_minted,
             "bypasses": counts.bypasses,
             "gaps": counts.gaps,
             "controls": {
@@ -558,10 +562,20 @@ pub async fn run(args: StatsArgs) -> Result<()> {
                 "    Allowed after receipt  {green}{}{reset}",
                 counts.allowed_after_receipt
             );
-            println!(
-                "    Consulted (receipts)   {white}{}{reset}",
-                counts.receipts_minted
-            );
+            // `receipts_minted` is the raw event count; a single consultation
+            // is reported by up to three emitters, so show the de-duplicated
+            // figure and keep the raw one visible when they differ.
+            if counts.receipts_minted > counts.consultations {
+                println!(
+                    "    Consultations          {white}{}{reset}  {gray}({} receipt events){reset}",
+                    counts.consultations, counts.receipts_minted
+                );
+            } else {
+                println!(
+                    "    Consultations          {white}{}{reset}",
+                    counts.consultations
+                );
+            }
             let bp_c = if counts.bypasses > 0 { red } else { green };
             println!(
                 "    Bypasses               {bp_c}{}{reset}",
