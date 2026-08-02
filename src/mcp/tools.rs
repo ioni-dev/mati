@@ -1136,6 +1136,7 @@ mod tests {
             ref_url: None,
             discovered_session: now(),
             confirmed,
+            confirmed_content: Default::default(),
         };
         let mut record = make_record(key, rule, Category::Gotcha, quality_value);
         record.payload = serde_json::to_value(&gotcha).ok();

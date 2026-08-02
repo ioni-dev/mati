@@ -796,7 +796,7 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
             detail: "unknown — run `mati stale` for a current count".to_string(),
             fix: None,
         },
-        Some(s) if s.total == 0 => CheckResult {
+        Some(s) if s.total == 0 && s.drift == 0 => CheckResult {
             section: "knowledge",
             name: "freshness",
             status: Status::Pass,
@@ -808,12 +808,30 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
             name: "freshness",
             status: Status::Warn,
             detail: format!(
-                "{} stale record(s) ({} stale, {} liability, {} tombstone)",
-                s.total, s.stale, s.liability, s.tombstone
+                "{} stale record(s) ({} stale, {} liability, {} tombstone){}",
+                s.total,
+                s.stale,
+                s.liability,
+                s.tombstone,
+                drift_detail(s.drift)
             ),
             fix: Some("mati stale  (then mati init / mati reparse to refresh)"),
         },
     }
+}
+
+/// Content-drift clause appended to the freshness detail.
+///
+/// Folded into the existing `knowledge/freshness` check rather than added as
+/// its own entry: the `--json` check array is index-stable for consumers (see
+/// `doctor_json_shape_is_stable_across_scenarios`), and `integrity/drift`
+/// already means something else entirely — derived-index drift, not content
+/// drift. Same freshness question, so same check.
+fn drift_detail(drift: usize) -> String {
+    if drift == 0 {
+        return String::new();
+    }
+    format!("; {drift} confirmed gotcha(s) describe changed code")
 }
 
 /// Read all `analytics:extraction:*` records via StoreProxy and aggregate.
@@ -1212,5 +1230,17 @@ mod tests {
              stays index-stable for existing consumers)"
         );
         assert_eq!(report.version, 2);
+    }
+
+    /// Content drift rides on the existing `knowledge/freshness` detail rather
+    /// than adding a check, so the `--json` array stays index-stable and does
+    /// not collide with `integrity/drift`, which means derived-index drift.
+    #[test]
+    fn drift_detail_is_appended_only_when_there_is_drift() {
+        assert_eq!(drift_detail(0), "");
+        assert_eq!(
+            drift_detail(3),
+            "; 3 confirmed gotcha(s) describe changed code"
+        );
     }
 }

@@ -20,6 +20,8 @@
 //! semantically equal but bitwise distinct, making derived `==` a footgun for
 //! computed scores. Use field-level epsilon comparison in tests and comparators.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
@@ -808,6 +810,27 @@ pub struct GotchaRecord {
     /// Layer 0 stubs are always `false` until confirmed via `mati gotcha add`.
     #[serde(default)]
     pub confirmed: bool,
+    /// SHA-256 digest of each affected file's content at the moment a human
+    /// last confirmed this rule — `<path> → hex`, the same digest
+    /// [`FileRecord::content_hash`] already carries. Written by the confirm
+    /// paths only; nothing else re-stamps it.
+    ///
+    /// This is the baseline that *content drift* compares against: when a
+    /// file's current hash differs from the one stamped here, the code the
+    /// rule describes changed after the last human sign-off, so the rule may
+    /// now be **wrong** rather than merely dusty. Purely informational — see
+    /// [`crate::health::drift`]. It feeds no score, no tier, and no hook
+    /// decision, deliberately: the read gate must keep denying on a drifted
+    /// gotcha (ARCHITECTURE.md section 10.1).
+    ///
+    /// Keyed per file rather than as one combined digest so the report can
+    /// name *which* file moved, and so an entry with no indexed hash (a glob
+    /// like `src/payments/**`, an unparsed file, a path indexed before
+    /// content hashing existed) is simply absent. An absent entry means
+    /// "unknown", never "drifted" — which is also what a record confirmed
+    /// before this field existed deserializes to.
+    #[serde(default)]
+    pub confirmed_content: BTreeMap<String, String>,
 }
 
 /// Declarative action predicate stored on a local policy.
@@ -1192,6 +1215,7 @@ mod tests {
             ref_url: Some("https://github.com/example/issue/99".to_string()),
             discovered_session: 1_710_520_800,
             confirmed: true,
+            confirmed_content: Default::default(),
         };
         assert_serde_roundtrip(&gotcha);
     }
@@ -1635,6 +1659,7 @@ mod tests {
             ref_url: None,
             discovered_session: 0,
             confirmed: false,
+            confirmed_content: Default::default(),
         };
         assert!(
             !stub.confirmed,
@@ -1662,6 +1687,7 @@ mod tests {
             ref_url: Some("https://github.com/example/issue/5".to_string()),
             discovered_session: 1_710_520_800,
             confirmed: true,
+            confirmed_content: Default::default(),
         };
         assert_serde_roundtrip(&confirmed);
         let json = serde_json::to_string(&confirmed).unwrap();

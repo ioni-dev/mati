@@ -251,6 +251,7 @@ Stored under `gotcha:<slug>`. Like `FileRecord`, it is attached to the base `Rec
 | `affected_files` | Canonical source of truth for which files this gotcha applies to                        |
 | `ref_url`        | Optional link to the incident or PR that produced this rule                             |
 | `confirmed`      | `false` means Layer 0 candidate stub, never injected. `true` means developer-validated. |
+| `confirmed_content` | SHA-256 of each affected file at the moment the rule was last confirmed (`<path>` -> hex). Baseline for content drift; see section 17.1. |
 
 `confirmed: false` records exist as graph nodes and gap signals. They are not used in hook enforcement. A gotcha can trigger a deny only when `confirmed: true`, `confidence >= 0.6`, and `quality >= 0.4`.
 
@@ -870,6 +871,38 @@ At Tombstone, the record is fully excluded. Injecting a wrong record silently is
 Sync merge rule, planned for v0.2: `Tombstone > Liability > Stale > Aging > Fresh`, meaning higher severity wins. There is no sync or conflict resolution in v0.1.
 
 Staleness propagation happens during `mati init`. Staleness scores are propagated through `Imports` edges. A file whose upstream dependency has high staleness inherits partial staleness through `propagated_staleness` in `FileRecord`.
+
+### 17.1 Content drift
+
+Staleness answers *how old* a record is. Content drift answers a different
+question: has the code this rule describes changed since a human last confirmed
+the rule? A stale gotcha is dusty; a drifted one may be wrong.
+
+The confirm paths (`gotcha_ops::apply_gotcha_confirm` for direct-store runs,
+`mcp::handlers::handle_gotcha_confirm` for the daemon) stamp
+`GotchaRecord.confirmed_content` with the `content_hash` each affected `file:*`
+record already carries. A gotcha is drifted when a stamped path's current hash
+differs. `health::drift` computes this as a pure comparison of two values that
+already exist, so it adds no work to `mati init` and opens no files.
+
+Drift is **reported, never enforced**. It is not a `StalenessSignal` and carries
+no weight in the formula above, deliberately:
+
+- The formula decides the file tier, and `hooks::decide::evaluate` passes reads
+  through unconditionally at `Tombstone` and returns an allow at `Liability`
+  *before* it reaches the gotcha loop. A drifted gotcha raising its own
+  staleness past 0.4 would also raise `cascade_factor` on every file that links
+  it. Weight here could switch the gate off for exactly the records it flags.
+- `StalenessAnalyzer::compute_staleness` rebuilds `staleness.signals` on every
+  pass, so a drift signal parked there would be erased by the next `mati init`.
+
+A drifted gotcha keeps denying reads. Re-confirming (`mati gotcha confirm
+<key>`) re-stamps against the current content and clears the drift; that is the
+curation loop. `mati stale` lists drifted gotchas in their own block, and
+`mati doctor`'s `knowledge/freshness` check appends the count.
+
+Absence of a stamp — a record confirmed before the field existed, a glob entry,
+a file with no `content_hash` — reads as *unknown*, never as drifted.
 
 ---
 

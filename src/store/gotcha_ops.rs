@@ -68,7 +68,7 @@
 //!
 //! See [`super::repair`] for the full consistency model.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -274,6 +274,99 @@ fn with_normalized_affected_files(record: &Record, files: &[String]) -> Option<R
     Some(out)
 }
 
+// ── Confirm-time content stamp ───────────────────────────────────────────────
+
+/// Read the SHA-256 content digest a `file:*` record already carries.
+///
+/// Returns `None` for a record with no payload, no `content_hash` (a file
+/// indexed before content hashing existed, or a language Layer 0 does not
+/// parse), or a hash stored as something other than a string. Reads the JSON
+/// key directly rather than deserializing a whole
+/// [`crate::store::FileRecord`] — one field is wanted and the rest of that
+/// struct is comparatively expensive to build.
+pub fn content_hash_of(file_record: &Record) -> Option<String> {
+    file_record
+        .payload
+        .as_ref()?
+        .get("content_hash")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Collect the confirm-time content stamp for `affected_files`.
+///
+/// Confirmation is the moment a human vouched for a rule against *specific*
+/// code, so that is the moment worth stamping: a later mismatch means the
+/// code moved out from under a rule someone signed off on, which is a
+/// stronger claim than "this record is old". See
+/// [`crate::store::GotchaRecord::confirmed_content`].
+///
+/// Reuses the digest `mati init` already computed and stored on the file
+/// record — no file is opened and nothing is hashed a second time. Paths with
+/// no file record or no stored digest (globs, unparsed files, a path added
+/// before the next init) are simply omitted; the reader treats a missing
+/// entry as "unknown", never as drift.
+///
+/// Store-read failures are swallowed for the same reason: an unstamped entry
+/// under-reports drift, which is the safe direction. Confirmation must not
+/// fail because a file record could not be read.
+pub async fn confirm_content_stamp(
+    store: &Store,
+    affected_files: &[String],
+) -> BTreeMap<String, String> {
+    let mut stamp = BTreeMap::new();
+    for path in affected_files {
+        let file_key = format!("file:{path}");
+        if let Ok(Some(file_record)) = store.get(&file_key).await {
+            if let Some(hash) = content_hash_of(&file_record) {
+                stamp.insert(path.clone(), hash);
+            }
+        }
+    }
+    stamp
+}
+
+/// Whether a gotcha record's payload says the rule is developer-confirmed.
+///
+/// Reads the raw JSON rather than deserializing a
+/// [`crate::store::GotchaRecord`]: the caller may hold a payload merged by
+/// `mem_set` that does not round-trip through the struct.
+fn payload_is_confirmed(record: &Record) -> bool {
+    record
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("confirmed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Replace the `confirmed_content` field of a gotcha payload with `stamp`.
+///
+/// Patches the JSON object in place for the same reason
+/// `with_normalized_affected_files` does: `mem_set` merges caller-supplied
+/// payloads, so re-serializing a [`crate::store::GotchaRecord`] would drop any
+/// field the struct does not know about.
+///
+/// Replaces rather than merges. A confirmation asserts the rule is right
+/// against the files it names *now*, so any earlier baseline — including one
+/// for a path the gotcha no longer covers — is spent. Merging would let a
+/// stale entry keep reporting drift after a human explicitly re-confirmed,
+/// which would break the curation loop; dropping an entry we could not read
+/// only under-reports, which is the safe direction.
+pub fn set_confirm_stamp(record: &mut Record, stamp: &BTreeMap<String, String>) {
+    let Some(obj) = record.payload.as_mut().and_then(|p| p.as_object_mut()) else {
+        return;
+    };
+    let stamped: serde_json::Map<String, serde_json::Value> = stamp
+        .iter()
+        .map(|(path, hash)| (path.clone(), serde_json::Value::String(hash.clone())))
+        .collect();
+    obj.insert(
+        "confirmed_content".into(),
+        serde_json::Value::Object(stamped),
+    );
+}
+
 // ── Key collision ────────────────────────────────────────────────────────────
 
 /// Bail if `key` already exists as an active record.
@@ -313,8 +406,28 @@ pub async fn apply_gotcha_write(
     is_new: bool,
 ) -> Result<()> {
     let new_files = &normalize_affected_files(new_files);
-    let normalized = with_normalized_affected_files(record, new_files);
-    let record = normalized.as_ref().unwrap_or(record);
+    let mut staged = with_normalized_affected_files(record, new_files);
+
+    // A new record that already carries `confirmed: true` is a developer
+    // vouching for the rule right now — the direct-store `mati gotcha add`
+    // path — so it earns the same content stamp `apply_gotcha_confirm`
+    // writes. Without it the most common way to create an *enforcing* gotcha
+    // would never be able to report drift.
+    //
+    // Guarded on `is_new` deliberately. Re-stamping on an edit would read the
+    // file as it is now and silently clear the drift of a rule whose text was
+    // tweaked but whose code nobody re-read — and the rename migration in
+    // `cli::init` edits confirmed gotchas, where a moved path is precisely not
+    // a content change. Layer 0 stubs, `mem_set` upserts and review edits all
+    // write `confirmed: false`, so this is inert on every bulk path.
+    if is_new && payload_is_confirmed(staged.as_ref().unwrap_or(record)) {
+        let stamp = confirm_content_stamp(store, new_files).await;
+        let mut owned = staged.take().unwrap_or_else(|| record.clone());
+        set_confirm_stamp(&mut owned, &stamp);
+        staged = Some(owned);
+    }
+
+    let record = staged.as_ref().unwrap_or(record);
     let key = &record.key;
 
     // 1. Collision guard — fail hard
@@ -593,14 +706,21 @@ pub async fn apply_gotcha_tombstone(
 /// additive (`old` is empty), so a link left behind at the old spelling stays
 /// until `mati repair` — which now reports it as a stale file link and clears
 /// it, per the derived-index model in [`super::repair`].
+///
+/// Confirming also stamps each affected file's current content digest onto the
+/// record (see [`confirm_content_stamp`]), which is what makes re-confirming a
+/// drifted gotcha clear its drift.
 pub async fn apply_gotcha_confirm(
     store: &Store,
     record: &Record,
     affected_files: &[String],
 ) -> Result<()> {
     let affected_files = &normalize_affected_files(affected_files);
-    let normalized = with_normalized_affected_files(record, affected_files);
-    let record = normalized.as_ref().unwrap_or(record);
+    let stamp = confirm_content_stamp(store, affected_files).await;
+    let mut stamped =
+        with_normalized_affected_files(record, affected_files).unwrap_or_else(|| record.clone());
+    set_confirm_stamp(&mut stamped, &stamp);
+    let record = &stamped;
     let key = &record.key;
 
     // Persist the confirmed record — fail hard.
@@ -873,6 +993,7 @@ mod tests {
             ref_url: None,
             discovered_session: 1_000_000,
             confirmed: true,
+            confirmed_content: Default::default(),
         };
         Record {
             key: key.to_string(),
@@ -898,6 +1019,25 @@ mod tests {
             confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
             gap_analysis_score: 0.0,
         }
+    }
+
+    /// `make_file_record` with a content digest, as `mati init` writes it.
+    fn make_file_record_hashed(path: &str, content_hash: &str) -> Record {
+        let mut rec = make_file_record(path);
+        if let Some(obj) = rec.payload.as_mut().and_then(|p| p.as_object_mut()) {
+            obj.insert(
+                "content_hash".into(),
+                serde_json::Value::String(content_hash.to_string()),
+            );
+        }
+        rec
+    }
+
+    fn stored_stamp(record: &Record) -> BTreeMap<String, String> {
+        record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.confirmed_content)
+            .unwrap_or_default()
     }
 
     fn make_file_record(path: &str) -> Record {
@@ -1321,6 +1461,281 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+
+        store.close().await.unwrap();
+    }
+
+    // ── confirm-time content stamp ───────────────────────────────────────
+    //
+    // The stamp is the baseline `health::drift` compares against. It is
+    // written only by the confirm paths, reuses the digest already on the
+    // file record, and never touches a score.
+
+    #[tokio::test]
+    async fn confirm_stamps_the_current_file_digest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v1"),
+            )
+            .await
+            .unwrap();
+
+        let record = make_gotcha_record("gotcha:stamped", &["src/a.rs"]);
+        apply_gotcha_confirm(&store, &record, &["src/a.rs".into()])
+            .await
+            .unwrap();
+
+        let stored = store.get("gotcha:stamped").await.unwrap().unwrap();
+        assert_eq!(
+            stored_stamp(&stored).get("src/a.rs"),
+            Some(&"hash-v1".to_string())
+        );
+
+        // Stamping must not disturb anything the read gate reads. Quality and
+        // confidence are set by the callers of this function, so the check here
+        // is that they came through untouched.
+        let gotcha = stored.payload_as::<GotchaRecord>().unwrap();
+        assert!(gotcha.confirmed);
+        assert_eq!(stored.confidence.value, record.confidence.value);
+        assert_eq!(stored.quality.value, record.quality.value);
+        assert!(matches!(
+            stored.staleness.tier,
+            crate::store::record::StalenessTier::Fresh
+        ));
+
+        store.close().await.unwrap();
+    }
+
+    /// Multi-file gotchas get one entry per affected file. A file with no
+    /// indexed digest (unparsed file, glob, path not yet walked) is simply
+    /// absent — the reader treats that as unknown, never as drift.
+    #[tokio::test]
+    async fn confirm_stamps_each_affected_file_and_skips_unindexed_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-a"),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                "file:src/b.rs",
+                &make_file_record_hashed("src/b.rs", "hash-b"),
+            )
+            .await
+            .unwrap();
+        // Indexed but never parsed — no content_hash on the payload.
+        store
+            .put("file:src/c.bin", &make_file_record("src/c.bin"))
+            .await
+            .unwrap();
+
+        let files: Vec<String> = ["src/a.rs", "src/b.rs", "src/c.bin", "src/payments/**"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let record = make_gotcha_record(
+            "gotcha:multi",
+            &["src/a.rs", "src/b.rs", "src/c.bin", "src/payments/**"],
+        );
+        apply_gotcha_confirm(&store, &record, &files).await.unwrap();
+
+        let stamp = stored_stamp(&store.get("gotcha:multi").await.unwrap().unwrap());
+        assert_eq!(stamp.get("src/a.rs"), Some(&"hash-a".to_string()));
+        assert_eq!(stamp.get("src/b.rs"), Some(&"hash-b".to_string()));
+        assert_eq!(stamp.len(), 2, "unindexed paths must not be stamped");
+
+        store.close().await.unwrap();
+    }
+
+    /// The curation loop: edit the file, re-confirm, drift clears. Exercised
+    /// end-to-end through `health::drift` so the test fails if either side of
+    /// the comparison moves.
+    #[tokio::test]
+    async fn reconfirm_restamps_and_clears_drift() {
+        use crate::health::drift::{current_content_hashes, detect_drift};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v1"),
+            )
+            .await
+            .unwrap();
+
+        let record = make_gotcha_record("gotcha:curated", &["src/a.rs"]);
+        apply_gotcha_confirm(&store, &record, &["src/a.rs".into()])
+            .await
+            .unwrap();
+
+        // `mati init` re-hashes the edited file.
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v2"),
+            )
+            .await
+            .unwrap();
+
+        let gotchas = store.scan_prefix("gotcha:").await.unwrap();
+        let files = store.scan_prefix("file:").await.unwrap();
+        let drifted = detect_drift(&gotchas, &current_content_hashes(&files));
+        assert_eq!(drifted.len(), 1, "edited file must report drift");
+        assert_eq!(drifted[0].drifted_files, vec!["src/a.rs".to_string()]);
+
+        // Developer re-reads and re-confirms.
+        let current = store.get("gotcha:curated").await.unwrap().unwrap();
+        apply_gotcha_confirm(&store, &current, &["src/a.rs".into()])
+            .await
+            .unwrap();
+
+        let gotchas = store.scan_prefix("gotcha:").await.unwrap();
+        let files = store.scan_prefix("file:").await.unwrap();
+        assert!(
+            detect_drift(&gotchas, &current_content_hashes(&files)).is_empty(),
+            "re-confirming must re-stamp the current digest and clear the drift"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// `mati gotcha add` writes an already-confirmed record straight through
+    /// `apply_gotcha_write`, so that path stamps too — otherwise the most
+    /// common way to create an enforcing gotcha could never report drift.
+    /// Unconfirmed writes (Layer 0 stubs, `mem_set`) must stay unstamped.
+    #[tokio::test]
+    async fn new_confirmed_write_stamps_and_unconfirmed_does_not() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v1"),
+            )
+            .await
+            .unwrap();
+
+        let confirmed = make_gotcha_record("gotcha:added", &["src/a.rs"]);
+        apply_gotcha_write(&store, &confirmed, &[], &["src/a.rs".into()], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_stamp(&store.get("gotcha:added").await.unwrap().unwrap()).get("src/a.rs"),
+            Some(&"hash-v1".to_string())
+        );
+
+        let mut candidate = make_gotcha_record("gotcha:candidate", &["src/a.rs"]);
+        if let Some(obj) = candidate.payload.as_mut().and_then(|p| p.as_object_mut()) {
+            obj.insert("confirmed".into(), serde_json::Value::Bool(false));
+        }
+        apply_gotcha_write(&store, &candidate, &[], &["src/a.rs".into()], true)
+            .await
+            .unwrap();
+        assert!(
+            stored_stamp(&store.get("gotcha:candidate").await.unwrap().unwrap()).is_empty(),
+            "an unconfirmed candidate has no human sign-off to stamp"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// An edit is not a re-confirmation: `apply_gotcha_write` with
+    /// `is_new = false` must leave the baseline alone, so a rule whose text
+    /// was tweaked (or whose path the rename migration moved) stays drifted.
+    #[tokio::test]
+    async fn edit_does_not_restamp_a_confirmed_gotcha() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v1"),
+            )
+            .await
+            .unwrap();
+
+        let record = make_gotcha_record("gotcha:edited", &["src/a.rs"]);
+        apply_gotcha_confirm(&store, &record, &["src/a.rs".into()])
+            .await
+            .unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v2"),
+            )
+            .await
+            .unwrap();
+
+        // Re-write the record the way `mati gotcha edit` does — payload carried
+        // forward, `is_new = false`.
+        let edited = store.get("gotcha:edited").await.unwrap().unwrap();
+        apply_gotcha_write(
+            &store,
+            &edited,
+            &["src/a.rs".into()],
+            &["src/a.rs".into()],
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stored_stamp(&store.get("gotcha:edited").await.unwrap().unwrap()).get("src/a.rs"),
+            Some(&"hash-v1".to_string()),
+            "an edit must not silently re-baseline a drifted rule"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// A record confirmed before the stamp existed deserializes with an empty
+    /// map, which `detect_drift` treats as unknown. Written as raw JSON with
+    /// no `confirmed_content` key so it exercises the actual serde default.
+    #[tokio::test]
+    async fn pre_upgrade_record_has_no_stamp_and_is_not_drifted() {
+        use crate::health::drift::{current_content_hashes, detect_drift};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        store
+            .put(
+                "file:src/a.rs",
+                &make_file_record_hashed("src/a.rs", "hash-v2"),
+            )
+            .await
+            .unwrap();
+
+        let mut legacy = make_gotcha_record("gotcha:legacy", &["src/a.rs"]);
+        legacy.payload = Some(serde_json::json!({
+            "rule": "test rule",
+            "reason": "test reason",
+            "severity": "high",
+            "affected_files": ["src/a.rs"],
+            "discovered_session": 1_000_000,
+            "confirmed": true
+        }));
+        store.put("gotcha:legacy", &legacy).await.unwrap();
+
+        let stored = store.get("gotcha:legacy").await.unwrap().unwrap();
+        let gotcha = stored
+            .payload_as::<GotchaRecord>()
+            .expect("a payload without confirmed_content must still deserialize");
+        assert!(gotcha.confirmed);
+        assert!(gotcha.confirmed_content.is_empty());
+
+        let files = store.scan_prefix("file:").await.unwrap();
+        assert!(
+            detect_drift(&[stored], &current_content_hashes(&files)).is_empty(),
+            "no stamp must read as unknown, never as drifted"
+        );
 
         store.close().await.unwrap();
     }

@@ -6,6 +6,7 @@ use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
 use serde::{Deserialize, Serialize};
 
+use mati_core::health::drift::{current_content_hashes, detect_drift, DriftedGotcha};
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, Priority, QualityScore, Record, RecordLifecycle,
     RecordSource, RecordVersion, StalenessScore, StalenessSignal, StalenessTier, Store,
@@ -39,6 +40,14 @@ struct StaleCache {
     /// Knowledge write-seq at cache time. Cache is valid while this matches the store.
     write_seq: u64,
     records: Vec<Record>,
+    /// Confirmed gotchas whose code changed since confirmation
+    /// ([`mati_core::health::drift`]). Kept alongside `records` rather than
+    /// inside it because a drifted gotcha is usually still `Fresh` — drift is
+    /// about content moving, not about age — so it would never survive the
+    /// tier filter above. `default` so a cache written by an older binary
+    /// deserializes as "no drift known" instead of invalidating.
+    #[serde(default)]
+    drift: Vec<DriftedGotcha>,
 }
 
 fn now_secs() -> u64 {
@@ -99,9 +108,17 @@ pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
             .partial_cmp(&effective_staleness(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    // Cold init rewrote every file record, so `records` carries the current
+    // digest for every path. The gotchas do need a scan: a confirmed gotcha
+    // written in an earlier session is not part of this run's output, and
+    // seeding the cache without it would hide real drift behind a cache hit
+    // until the next store write. One prefix scan on the cold path only.
+    let gotchas = store.scan_prefix("gotcha:").await.unwrap_or_default();
+    let drift = detect_drift(&gotchas, &current_content_hashes(records));
     let entry = StaleCache {
         write_seq,
         records: stale,
+        drift,
     };
     let mut rec = cache_record(String::new());
     rec.payload = serde_json::to_value(&entry).ok();
@@ -119,6 +136,10 @@ pub(crate) struct StaleSummary {
     pub stale: usize,
     pub liability: usize,
     pub tombstone: usize,
+    /// Confirmed gotchas whose code changed since confirmation. Counted apart
+    /// from `total` — drift is not a staleness tier and most drifted gotchas
+    /// are not stale at all.
+    pub drift: usize,
 }
 
 /// Read stale counts from the write-seq-validated cache. Returns `None` when no
@@ -136,6 +157,7 @@ pub(crate) async fn cached_stale_summary(proxy: &StoreProxy) -> Option<StaleSumm
         stale: 0,
         liability: 0,
         tombstone: 0,
+        drift: entry.drift.len(),
     };
     for r in &entry.records {
         match r.staleness.tier {
@@ -174,7 +196,7 @@ pub async fn run(args: StaleArgs) -> Result<()> {
                 let mut stale = entry.records;
                 stale.truncate(args.limit);
                 proxy.close().await?;
-                display_stale(&stale, args.verbose);
+                display_stale(&stale, &entry.drift, args.verbose);
                 return Ok(());
             }
         }
@@ -187,6 +209,11 @@ pub async fn run(args: StaleArgs) -> Result<()> {
         proxy.scan_prefix("file:"),
         proxy.scan_prefix("dev_note:"),
     )?;
+
+    // Content drift, from the two scans already in hand — no extra store reads
+    // and no hashing: `confirmed_content` was stamped at confirm time and
+    // `content_hash` at the last `mati init`.
+    let drift = detect_drift(&gotchas, &current_content_hashes(&files));
 
     let mut stale: Vec<Record> = gotchas
         .into_iter()
@@ -212,6 +239,7 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     let cache_entry = StaleCache {
         write_seq: current_seq,
         records: stale.clone(),
+        drift: drift.clone(),
     };
     let mut rec = cache_record(String::new());
     rec.payload = serde_json::to_value(&cache_entry).ok();
@@ -221,13 +249,19 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     stale.truncate(args.limit);
 
     proxy.close().await?;
-    display_stale(&stale, args.verbose);
+    display_stale(&stale, &drift, args.verbose);
     Ok(())
 }
 
-fn display_stale(stale: &[Record], verbose: bool) {
+fn display_stale(stale: &[Record], drift: &[DriftedGotcha], verbose: bool) {
     if stale.is_empty() {
-        println!("No stale records.");
+        if drift.is_empty() {
+            println!("No stale records.");
+            return;
+        }
+        // Drift is not a staleness tier, so it can be the only thing to report.
+        println!("No stale records.\n");
+        display_drift(drift, std::io::stdout().is_terminal());
         return;
     }
 
@@ -349,6 +383,10 @@ fn display_stale(stale: &[Record], verbose: bool) {
         println!();
     }
 
+    // ── Content drift ────────────────────────────────────────────────────────
+
+    display_drift(drift, use_color);
+
     // ── Verbose per-record blocks ────────────────────────────────────────────
 
     if verbose {
@@ -384,6 +422,90 @@ fn display_stale(stale: &[Record], verbose: bool) {
             println!("               \u{2192} Action: {}\n", action_hint(r));
         }
     }
+}
+
+// ── Content drift ────────────────────────────────────────────────────────────
+
+/// Render the confirmed gotchas whose code changed since confirmation.
+///
+/// A separate block rather than extra rows in the table above: these records
+/// are usually `Fresh` — nothing about them is old — so they carry no tier,
+/// no score, and no age worth printing. What they have is a specific claim,
+/// which is why the third column is [`drift_impact_label`] rather than the
+/// tier-derived [`impact_label`].
+fn display_drift(drift: &[DriftedGotcha], use_color: bool) {
+    if drift.is_empty() {
+        return;
+    }
+
+    let (yellow, gray, bold, reset) = if use_color {
+        (colors::YELLOW, colors::GRAY, colors::BOLD, colors::RESET)
+    } else {
+        ("", "", "", "")
+    };
+
+    let (noun, verb) = if drift.len() == 1 {
+        ("gotcha", "describes")
+    } else {
+        ("gotchas", "describe")
+    };
+    println!(
+        "  {yellow}{bold}\u{26a0} {n} confirmed {noun} {verb} code that has \
+         changed since confirmation{reset}\n",
+        n = drift.len(),
+    );
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            Cell::new("Key"),
+            Cell::new("Changed since confirm"),
+            Cell::new("Impact"),
+        ]);
+    if !use_color {
+        table.force_no_tty();
+    }
+
+    for d in drift {
+        table.add_row(vec![
+            Cell::new(truncate(&d.key, 40)).fg(Color::White),
+            Cell::new(summarize_drifted_files(&d.drifted_files, 2)).fg(Color::Yellow),
+            Cell::new(drift_impact_label()).fg(Color::Yellow),
+        ]);
+    }
+
+    println!("{table}");
+    println!(
+        "\n  {gray}Re-read the file, then re-confirm to clear: \
+         mati gotcha confirm <key>{reset}\n"
+    );
+}
+
+/// Join the drifted paths the same way [`summarize_signals`] joins signals.
+fn summarize_drifted_files(files: &[String], max: usize) -> String {
+    let mut result = files
+        .iter()
+        .take(max)
+        .map(|f| truncate(f, 40))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if files.len() > max {
+        result.push_str(&format!(" +{} more", files.len() - max));
+    }
+    result
+}
+
+/// Impact label for content drift — the sibling of [`impact_label`], which
+/// only speaks tiers.
+///
+/// Deliberately says "may be wrong" and not "not enforced": a drifted gotcha
+/// is still `confirmed`, still above the confidence and quality thresholds,
+/// and still denies the read (ARCHITECTURE.md section 10.1). Drift is a
+/// prompt to re-check the rule, never a reason to stop applying it.
+fn drift_impact_label() -> &'static str {
+    "rule may be wrong"
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -551,6 +673,70 @@ mod tests {
         assert_eq!(impact_label(&StalenessTier::Stale), "warn in bootstrap");
         assert_eq!(impact_label(&StalenessTier::Liability), "blocks injection");
         assert_eq!(impact_label(&StalenessTier::Tombstone), "excluded entirely");
+    }
+
+    // ── content drift ────────────────────────────────────────────────────────
+
+    /// Drift is not a staleness tier, so it must not be described in tier
+    /// language. It also must not claim enforcement stopped — a drifted gotcha
+    /// still denies (`hooks::decide::eval_drifted_gotcha_still_denies`).
+    #[test]
+    fn drift_impact_label_does_not_claim_enforcement_stopped() {
+        let label = drift_impact_label();
+        assert_eq!(label, "rule may be wrong");
+        for tier_label in ["warn in bootstrap", "blocks injection", "excluded entirely"] {
+            assert_ne!(label, tier_label);
+        }
+    }
+
+    #[test]
+    fn summarize_drifted_files_truncates_like_signals() {
+        let files: Vec<String> = ["src/a.rs", "src/b.rs", "src/c.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(summarize_drifted_files(&files[..1], 2), "src/a.rs");
+        let result = summarize_drifted_files(&files, 2);
+        assert!(result.contains("src/a.rs"));
+        assert!(result.contains("src/b.rs"));
+        assert!(result.contains("+1 more"));
+    }
+
+    /// A drifted gotcha is usually `Fresh`, so it never lands in `records`.
+    /// The cache has to carry it separately or `mati stale` would report it on
+    /// the miss path and lose it on every subsequent hit.
+    #[test]
+    fn stale_cache_round_trips_drift_alongside_records() {
+        let entry = StaleCache {
+            write_seq: 42,
+            records: vec![make_record(
+                "file:src/x.rs",
+                Category::File,
+                StalenessTier::Stale,
+            )],
+            drift: vec![DriftedGotcha {
+                key: "gotcha:lock".into(),
+                rule: "hold the lock".into(),
+                drifted_files: vec!["src/a.rs".into()],
+            }],
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        let back: StaleCache = serde_json::from_value(value).unwrap();
+        assert_eq!(back.write_seq, 42);
+        assert_eq!(back.records.len(), 1);
+        assert_eq!(back.drift.len(), 1);
+        assert_eq!(back.drift[0].key, "gotcha:lock");
+    }
+
+    /// A cache written before drift existed must still deserialize — it is
+    /// keyed on `write_seq`, so invalidating it on a schema addition would
+    /// force an unnecessary full scan on every upgrade.
+    #[test]
+    fn stale_cache_from_older_binary_deserializes_with_no_drift() {
+        let legacy = serde_json::json!({ "write_seq": 7, "records": [] });
+        let back: StaleCache = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.write_seq, 7);
+        assert!(back.drift.is_empty());
     }
 
     // ── action_hint ──────────────────────────────────────────────────────────

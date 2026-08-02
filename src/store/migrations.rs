@@ -759,6 +759,7 @@ mod tests {
             ref_url: None,
             discovered_session: now,
             confirmed,
+            confirmed_content: Default::default(),
         };
         Record {
             key: key.to_string(),

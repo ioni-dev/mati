@@ -122,6 +122,7 @@ fn candidate_record(
         ref_url: None,
         discovered_session: now,
         confirmed: false,
+        confirmed_content: Default::default(),
     };
     let mut rec = Record::layer0_file_stub(&key, device_id, logical_clock, now);
     rec.category = Category::Gotcha;

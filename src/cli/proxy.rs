@@ -705,6 +705,7 @@ impl StoreProxy {
                         ref_url: None,
                         discovered_session: 0,
                         confirmed: false,
+                        confirmed_content: Default::default(),
                     });
                 let source = match &record.source {
                     mati_core::store::RecordSource::DeveloperManual => {
@@ -1629,6 +1630,7 @@ mod tests {
             ref_url: None,
             discovered_session: 1_000_000,
             confirmed: true,
+            confirmed_content: Default::default(),
         };
         store
             .put(

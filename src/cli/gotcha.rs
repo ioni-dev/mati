@@ -412,6 +412,7 @@ async fn finish_gotcha_add(
         ref_url: ref_url.clone(),
         discovered_session: now,
         confirmed: true,
+        confirmed_content: Default::default(),
     };
     let key = choose_manual_gotcha_key(proxy, &slug, &gotcha).await?;
 
@@ -588,6 +589,12 @@ async fn run_gotcha_edit_inner(proxy: &StoreProxy, key: &str) -> Result<()> {
         ref_url: ref_url.clone(),
         discovered_session: old_gotcha.discovered_session,
         confirmed: old_gotcha.confirmed,
+        // Carried forward, never recomputed. Editing the rule text is not
+        // re-reading the code, so a gotcha that had drifted must still show as
+        // drifted afterwards; only `mati gotcha confirm` clears it. Entries for
+        // paths dropped from `affected_files` are inert (see
+        // `health::drift::detect_drift`).
+        confirmed_content: old_gotcha.confirmed_content.clone(),
     };
 
     let value = if reason.is_empty() {
@@ -807,6 +814,7 @@ mod tests {
             ref_url: None,
             discovered_session: now,
             confirmed: false,
+            confirmed_content: Default::default(),
         };
         Record {
             key: key.to_string(),
@@ -945,6 +953,7 @@ mod tests {
             ref_url: None,
             discovered_session: now_secs(),
             confirmed: true,
+            confirmed_content: Default::default(),
         };
 
         let proxy = StoreProxy::open(dir.path()).await.unwrap();

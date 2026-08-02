@@ -1724,6 +1724,7 @@ fn build_cochange_gotchas(
             ref_url: None,
             discovered_session: now,
             confirmed: false,
+            confirmed_content: Default::default(),
         };
 
         let key = format!("gotcha:cochange:{source}|{target}");
@@ -1824,6 +1825,7 @@ fn build_revert_gotchas(
             ref_url: None,
             discovered_session: now,
             confirmed: false,
+            confirmed_content: Default::default(),
         };
 
         let key = format!("gotcha:revert:{path}");
@@ -1930,6 +1932,7 @@ fn build_ownership_gotchas(
             ref_url: None,
             discovered_session: now,
             confirmed: false,
+            confirmed_content: Default::default(),
         };
 
         let key = format!("gotcha:ownership:{path}");
@@ -2333,6 +2336,7 @@ mod tests {
             ref_url: None,
             discovered_session: 1_000_000,
             confirmed,
+            confirmed_content: Default::default(),
         };
         let mut rec = make_record_with_category(key, Category::Gotcha);
         rec.value = "hold the lock because concurrent writers corrupt the index".into();

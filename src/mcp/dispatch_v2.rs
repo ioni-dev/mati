@@ -2259,6 +2259,85 @@ mod tests {
         assert!(g.store().get("file:./src/a.rs").await.unwrap().is_none());
     }
 
+    /// `handle_gotcha_confirm` also commits through its own
+    /// `transact_knowledge` loop and never calls
+    /// `gotcha_ops::apply_gotcha_confirm`, so the content stamp there does not
+    /// cover the daemon path — which is the path every socket-mode
+    /// `mati gotcha confirm` and `mem_set` confirm takes. Without its own
+    /// stamp, drift would only ever be detectable on direct-store runs.
+    #[tokio::test]
+    async fn gotcha_confirm_stamps_content_hash_on_the_daemon_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        // Seed a file record carrying the digest `mati init` computes.
+        {
+            let g = graph.read().await;
+            let mut file = crate::store::record::Record::layer0_file_stub(
+                "file:src/a.rs",
+                crate::store::stable_device_id(),
+                1,
+                1_000_000,
+            );
+            file.payload = Some(serde_json::json!({
+                "path": "src/a.rs",
+                "gotcha_keys": [],
+                "content_hash": "hash-v1",
+            }));
+            g.store().put("file:src/a.rs", &file).await.unwrap();
+        }
+
+        let upsert = make_request(Command::GotchaUpsert(GotchaDraftInput {
+            key: "gotcha:daemon-confirm".into(),
+            rule: "hold the write lock before touching the index".into(),
+            reason: "concurrent writers corrupt it otherwise".into(),
+            severity: Severity::High,
+            affected_files: vec!["src/a.rs".into()],
+            ref_url: None,
+            tags: vec![],
+            priority: Priority::Normal,
+            source: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, upsert).await,
+            Response::Ok { .. }
+        ));
+
+        let confirm = make_request(Command::GotchaConfirm(GotchaConfirmInput {
+            key: "gotcha:daemon-confirm".into(),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, confirm).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        let stored = g
+            .store()
+            .get("gotcha:daemon-confirm")
+            .await
+            .unwrap()
+            .expect("confirmed record");
+        let gotcha = stored
+            .payload_as::<crate::store::GotchaRecord>()
+            .expect("gotcha payload");
+        assert!(gotcha.confirmed);
+        assert_eq!(
+            gotcha.confirmed_content.get("src/a.rs"),
+            Some(&"hash-v1".to_string()),
+            "daemon confirm must stamp the file's current digest"
+        );
+        // Confirmation must not weaken anything the read gate reads. Confidence
+        // is set to the DeveloperManual base by the handler; quality is whatever
+        // `quality::analyze` scores this (deliberately terse) test rule at, so
+        // only assert it was not zeroed by the stamp write.
+        assert!(stored.confidence.value >= 0.6);
+        assert!(stored.quality.value > 0.0);
+    }
+
     // ── Native MemGet / MemBootstrap tests ──────────────────────────────
 
     #[tokio::test]
