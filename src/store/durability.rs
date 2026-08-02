@@ -8,6 +8,7 @@
 //! ```text
 //! Immediate  gotcha:*   decision:*   file:*   stage:*   dev_note:*   policy:*
 //! Eventual   session:*  analytics:*  hook_event:*  compliance:*  graph:edge:*
+//!            health:*   parse:*      audit:session:*
 //! ```
 //!
 //! `graph:edge:*` is Eventual because edges are derived data (re-computed from

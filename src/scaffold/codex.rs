@@ -216,6 +216,11 @@ The CLI is the source of truth. Do not second-guess a verdict, and do
 not re-run a candidate that already returned one — the check is
 deterministic, so a repeat call returns the same answer.
 
+Known limit: the check reads a ±5-line window. It proves the citation
+is real, not that the rule follows from it. Keep `draft_rule` anchored
+to what is visible at `file_line` — a rule whose claim spans more of
+the file than that window passes unverified.
+
 ### Stage 4 — Refinement and write
 
 For each verified candidate:
