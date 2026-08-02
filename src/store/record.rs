@@ -451,11 +451,13 @@ impl StalenessScore {
 ///
 /// confidence = base_score
 ///   × log2(confirmation_count + 2)
-///   × min(contributor_count, 3) / 3
+///   × contributor_factor              1.0 solo, +0.1 per extra, capped at 3
 ///   × recency_weight(last_accessed)   90-day half-life
 ///   × ref_boost                       1.5× if ref_url set
 /// ```
-/// Recomputed on every `mem_get`, written back with `Durability::Eventual`.
+/// `health::confidence::recompute` implements this and currently has no
+/// callers — every stored value comes from `for_new_record`. Wiring it into
+/// `mem_get` is planned, not done.
 ///
 /// Hook injection thresholds:
 /// ```text
