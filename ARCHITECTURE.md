@@ -782,7 +782,7 @@ estimated_minutes = base_time x (1 - weighted_reduction)
 
 Specificity — specific, enforceable, non-obvious, causal — is drafting guidance here, not a filter. Stage 2 maximizes recall; filtering is deterministic and happens later.
 
-**Stage 3 (Evidence verification):** One pass, every tier. Call `mati verify-evidence`, a deterministic CLI, to confirm that each candidate’s file line and quote are real. Discard the ones that fail. The CLI is the source of truth; there is no self-critique round and no re-run, because a repeat call on the same candidate returns the same verdict.
+**Stage 3 (Evidence verification):** One pass, every tier. Call `mati verify-evidence`, a deterministic CLI, to confirm that each candidate’s file line and quote are real. Discard the ones that fail. The CLI is the source of truth; there is no self-critique round and no re-run, because a repeat call on the same candidate returns the same verdict. It reads a ±5-line window, so it proves the citation is real, not that the rule follows from it — a rule whose claim spans more of the file than that window passes unverified.
 
 **Stage 4 (Write):** For each verified candidate, tighten the rule and drop any that stays vague, verify causality language, assign severity through a hybrid keyword and semantic classifier, then call `mem_set`.
 
