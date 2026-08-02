@@ -1460,6 +1460,20 @@ pub(crate) async fn handle_mem_get(
 ///
 /// Returns a JSON `Value` (text/tag → array, graph → grouped object).
 /// Callers that need a String wrap with `serde_json::to_string_pretty`.
+/// Trim a caller-supplied directory query into a comparable repo-relative prefix.
+fn normalize_path_prefix(query: &str) -> &str {
+    query.trim().trim_start_matches("./").trim_matches('/')
+}
+
+/// Segment-aware prefix test — `src/st` must not match `src/store/db.rs`.
+fn path_under_prefix(path: &str, prefix: &str) -> bool {
+    let path = normalize_path_prefix(path);
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub(crate) async fn handle_mem_query(
     store: &Store,
     graph_ref: &crate::graph::Graph,
@@ -1683,6 +1697,44 @@ pub(crate) async fn handle_mem_query(
             };
             result.insert("summary".to_string(), serde_json::Value::String(summary));
             Ok(serde_json::Value::Object(result))
+        }
+        protocol::QueryMode::DirGotchas => {
+            // The tantivy index stores no `affected_files`, so a text query for a
+            // directory can only match file records. This mode resolves the
+            // canonical `gotcha:*` records instead — no index, no ranking.
+            let prefix = normalize_path_prefix(&input.query);
+            if prefix.is_empty() {
+                return Ok(serde_json::Value::Array(Vec::new()));
+            }
+            let records = store
+                .scan_prefix("gotcha:")
+                .await
+                .map_err(|e| (ErrorCode::StoreError, format!("scan gotcha: {e}")))?;
+            let mut matched: Vec<&Record> = records
+                .iter()
+                .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+                .filter(|r| {
+                    r.payload_as::<GotchaRecord>().is_some_and(|g| {
+                        g.confirmed
+                            && g.affected_files
+                                .iter()
+                                .any(|f| path_under_prefix(f, prefix))
+                    })
+                })
+                .collect();
+            matched.sort_by(|a, b| {
+                b.confidence
+                    .value
+                    .total_cmp(&a.confidence.value)
+                    .then(b.quality.value.total_cmp(&a.quality.value))
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+            let arr: Vec<serde_json::Value> = matched
+                .into_iter()
+                .take(limit)
+                .map(super::tools::record_to_agent_json)
+                .collect();
+            Ok(serde_json::Value::Array(arr))
         }
         protocol::QueryMode::Semantic => Err((
             ErrorCode::ValidationFailed,
