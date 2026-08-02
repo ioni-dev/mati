@@ -92,6 +92,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     })?;
 
     let source_bytes = source.as_bytes();
+    if file_is_test_gated(tree.root_node(), source_bytes) {
+        return Ok(Vec::new());
+    }
     let test_ranges = test_item_ranges(tree.root_node(), source_bytes);
     let mut signals: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
@@ -147,6 +150,17 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 /// Byte ranges covering every test-attributed module, function, impl, or
 /// block. Test items are not descended into, so nested items inherit the
 /// exclusion.
+/// Whether `#![cfg(test)]` gates the whole file.
+fn file_is_test_gated(root: tree_sitter::Node, source: &[u8]) -> bool {
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "inner_attribute_item" && attribute_marks_test(child, source) {
+            return true;
+        }
+    }
+    false
+}
+
 fn test_item_ranges(root: tree_sitter::Node, source: &[u8]) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut stack = vec![root];
@@ -408,6 +422,19 @@ fn production() {
     }
 
     #[test]
+    fn inner_cfg_test_attribute_gates_whole_file() {
+        let src = "#![cfg(test)]\nfn helper() {\n    assert!(x);\n}\n";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inner_attribute_that_is_not_cfg_test_keeps_signals() {
+        let src = "#![allow(dead_code)]\nfn production() {\n    assert!(invariant);\n}\n";
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+    }
+
+    #[test]
     fn cfg_test_block_and_impl_excluded() {
         let src = r#"
 fn home() -> Option<PathBuf> {
@@ -445,4 +472,5 @@ fn gated() {
         assert!(signals.iter().any(|s| s.evidence.contains("panic")));
     }
 }
+
 
