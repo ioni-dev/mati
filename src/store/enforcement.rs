@@ -1283,7 +1283,8 @@ pub enum PruneResult {
 /// Prune enforcement events older than the configured retention period
 /// and record a RetentionPruned event for the deletion.
 ///
-/// Called during `mati init` and `mati repair --full`.
+/// Nothing in production calls this — the only caller is a test. Until it is
+/// wired into `mati init` or `mati repair`, the event log grows without bound.
 pub async fn enforce_retention(store: &Store) -> Result<PruneResult> {
     let retention_days = get_retention_days(store).await;
     let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
