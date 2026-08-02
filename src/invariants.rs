@@ -1,18 +1,20 @@
 //! Repo-wide invariants that prose alone kept getting wrong.
 //!
-//! Every module in this crate tests its own behaviour. The two rules below are
+//! Every module in this crate tests its own behaviour. The rules below are
 //! different: they are properties of the *whole source tree*, so no single
-//! module owns them, and both were stated in `CLAUDE.md` / `ARCHITECTURE.md`
-//! long before anything checked them. Both turned out to be false in prose and
-//! silently drifting in code.
+//! module owns them, and each was stated in prose long before anything checked
+//! it. All of them turned out to be false in prose and silently drifting in
+//! code.
 //!
 //! - [`gotcha_write_sites`] — "all create/edit/tombstone paths go through
 //!   `store::gotcha_ops`".
 //! - [`zero_network`] — "the OSS binary never phones home. Period."
+//! - [`documented_caller_claims`] — a doc comment that names a caller must
+//!   actually have one.
 //!
-//! Both are implemented as source scans over `src/**/*.rs`. That approach has
+//! All are implemented as source scans over `src/**/*.rs`. That approach has
 //! real limits and each module states its own; read them before trusting a
-//! green run. The scan deliberately skips this file — it quotes every marker
+//! green run. The scans deliberately skip this file — it quotes every marker
 //! string it searches for and would otherwise match itself.
 
 use std::path::{Path, PathBuf};
@@ -1045,6 +1047,342 @@ mod zero_network {
             "sanity check: `cargo tree` returned only {} crates, so the scan \
              above proved nothing",
             linked.len()
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// "Called during `mati init` and `mati repair --full`."
+/// — the doc comment on `store::enforcement::enforce_retention`, which nothing
+/// outside a test has ever called.
+///
+/// Five separate defects found weeks apart turned out to be one shape:
+/// documentation asserting behaviour the code does not have. `ConfidenceScore`
+/// said it was recomputed on every `mem_get`; `health::confidence::recompute`
+/// has no callers. `enforce_retention` said `mati init` and `mati repair`
+/// called it; only a test does, so the event log grows without bound. Each was
+/// found by accident. Nothing was looking.
+///
+/// This module looks. It finds every `fn` whose doc comment makes a caller
+/// claim, and asserts the function has at least one call site in production
+/// source. A doc that says "called during X" while nothing anywhere calls it is
+/// false no matter what X is.
+///
+/// # What the scan proves
+///
+/// Only the weak half of the claim, and deliberately so. It proves *a* caller
+/// exists — not that the *named* caller is the one calling. Checking the named
+/// caller means resolving prose like "the CLI path" or "`mati repair --full`"
+/// to a function, which a text scan cannot do. The weak half is still worth
+/// mechanizing: every known instance of this bug had **zero** callers, not the
+/// wrong one.
+///
+/// # What it does not catch
+///
+/// - **Claims on anything that is not a `fn`.** `ConfidenceScore`'s false
+///   "Recomputed on every `mem_get`" was on a *struct*; "has a caller" is not a
+///   property a struct has. That case is out of reach here, and so is the
+///   `enrichment_depth` rubric row that scored a `comment_density` input the
+///   daemon always passes as `None` — a table cell, not a caller claim.
+/// - **Module docs (`//!`).** The documented item is a module; same problem.
+/// - **A caller that is itself dead.** Reachability from `main` is not checked,
+///   only that some production line calls the name.
+/// - **Name collisions.** Call sites are matched on the bare identifier, so
+///   `foo()` in any file satisfies a claim on any `fn foo`. Two same-named
+///   functions can cover for each other. This errs toward silence, which is the
+///   right direction for a test that must not cry wolf.
+/// - **Function values.** A call site is `name(`. Passing `name` as a function
+///   pointer or storing it in a table does not count, so such a site reads as
+///   "no caller". No current claim is affected; a future one would need an
+///   allowlist entry.
+/// - **`src/bin/bench_real` counts as a caller.** [`rust_sources`] walks all of
+///   `src/`, and that dev binary is gated behind the `bench-bin` feature, so a
+///   function called only from it would pass. Checked: none is today.
+///
+/// # The phrase list
+///
+/// Derived by grepping every `///` line in `src/` for verbs of invocation and
+/// reading the hits, not by guessing. Two shapes survived: phrases whose object
+/// is the **caller** ("used by `mati doctor`") and phrases whose object is the
+/// **occasion** ("called on cold init") — both assert the function runs.
+///
+/// Four phrasings present in the tree were rejected as not caller claims at
+/// all: "runs on" always names a thread (`walk_channel`: "the walk runs on a
+/// background thread"; `install_panic_hook`: "the hook runs on the panicking
+/// thread"), "runs from" names a side of a comparison, "used when" names a
+/// situation ("used when git is unavailable"), and "used in" matches inside
+/// "used instead of".
+///
+/// Phrase matching is word-bounded on both ends. Substring matching read
+/// "Called once at daemon startup" as "called on" and "used instead of" as
+/// "used in"; both are wrong.
+///
+/// One phrase is knowingly imprecise: "called on" also matches the precondition
+/// form "must be called on a store whose index is empty". That costs nothing —
+/// an over-matched doc only fails the test if the function *also* has no
+/// caller, and a function in that state is worth a look regardless.
+#[cfg(test)]
+mod documented_caller_claims {
+    use super::{declared_fn_name, fn_bodies, production_lines, rust_sources};
+    use std::collections::BTreeSet;
+
+    /// Doc phrasings that assert the documented function gets called.
+    ///
+    /// Matched case-insensitively and word-bounded against the joined text of
+    /// the `///` block. First group names a caller, second names an occasion.
+    const CLAIM_PHRASES: &[&str] = &[
+        "called by",
+        "called from",
+        "invoked by",
+        "invoked from",
+        "used by",
+        "used from",
+        "consumed by",
+        "triggered by",
+        "driven by",
+        "executed by",
+        "fired by",
+        "recomputed by",
+        "called at",
+        "called during",
+        "called on",
+        "called once",
+        "called whenever",
+        "invoked during",
+        "invoked on",
+        "recomputed on",
+        "runs during",
+        "runs whenever",
+        "fires on",
+        "fires when",
+        "fires after",
+        "fires during",
+    ];
+
+    /// Functions whose doc claims a caller that this scan cannot see.
+    ///
+    /// `(file, function, why)`. An entry is a claim that the scan is wrong, and
+    /// it must say why it is wrong — trait objects, macro-generated call sites
+    /// and FFI are the shapes that qualify. "It made the test red" is not a
+    /// reason. Empty is the correct state; keep it that way.
+    const ALLOWLIST: &[(&str, &str, &str)] = &[];
+
+    /// A `fn` whose doc comment claims it gets called.
+    struct Claim {
+        file: String,
+        line: usize,
+        name: String,
+        phrase: &'static str,
+    }
+
+    /// True when `needle` occurs in `hay` bounded by non-identifier characters.
+    fn contains_word(hay: &str, needle: &str) -> bool {
+        let bytes = hay.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut from = 0;
+        while let Some(pos) = hay[from..].find(needle) {
+            let start = from + pos;
+            let end = start + needle.len();
+            if (start == 0 || !ident(bytes[start - 1]))
+                && (end == bytes.len() || !ident(bytes[end]))
+            {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// The first claim phrase the doc block uses, if any.
+    fn claim_phrase(doc: &str) -> Option<&'static str> {
+        let lower = doc.to_ascii_lowercase();
+        CLAIM_PHRASES
+            .iter()
+            .copied()
+            .find(|p| contains_word(&lower, p))
+    }
+
+    /// Every `fn` in `src` whose preceding `///` block makes a caller claim.
+    ///
+    /// A doc block is a run of `///` lines directly above the item, optionally
+    /// separated from it by attributes. Any other line ends the block, so a
+    /// `//` comment or a blank line between doc and item detaches them — the
+    /// same rule rustdoc applies for blank lines, stricter for `//`.
+    ///
+    /// `#[cfg(test)]` items are skipped: [`production_lines`] omits their line
+    /// numbers, which both drops test fixtures and ends any doc block that ran
+    /// into one.
+    fn claims(file: &str, src: &str) -> Vec<Claim> {
+        let production: BTreeSet<usize> = production_lines(src).iter().map(|(n, _)| *n).collect();
+        let mut out = Vec::new();
+        let mut doc = String::new();
+        for (idx, line) in src.lines().enumerate() {
+            let lineno = idx + 1;
+            if !production.contains(&lineno) {
+                doc.clear();
+                continue;
+            }
+            let trimmed = line.trim_start();
+            if let Some(text) = trimmed.strip_prefix("///") {
+                doc.push_str(text);
+                doc.push('\n');
+                continue;
+            }
+            if doc.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("#[") {
+                continue;
+            }
+            if let (Some(name), Some(phrase)) = (declared_fn_name(line), claim_phrase(&doc)) {
+                out.push(Claim {
+                    file: file.to_string(),
+                    line: lineno,
+                    name: name.to_string(),
+                    phrase,
+                });
+            }
+            doc.clear();
+        }
+        out
+    }
+
+    /// Line numbers belonging to the function's own declaration and body, so a
+    /// recursive call cannot pass as an external caller.
+    ///
+    /// Falls back to the declaration line alone for a nested `fn`, which
+    /// [`fn_bodies`] attributes to its enclosing function.
+    fn own_lines(src: &str, name: &str, decl_line: usize) -> BTreeSet<usize> {
+        fn_bodies(src)
+            .into_iter()
+            .find(|b| b.name == name && b.line == decl_line)
+            .map(|b| b.lines.iter().map(|(n, _)| *n).collect())
+            .unwrap_or_else(|| BTreeSet::from([decl_line]))
+    }
+
+    /// Production source as `(file, line number, line)`, computed once.
+    fn production_corpus(sources: &[(String, String)]) -> Vec<(&str, usize, &str)> {
+        sources
+            .iter()
+            .flat_map(|(file, src)| {
+                production_lines(src)
+                    .into_iter()
+                    .map(move |(n, l)| (file.as_str(), n, l))
+            })
+            .collect()
+    }
+
+    /// True when some production line calls `name` from outside its own body.
+    ///
+    /// Declarations of the same name are skipped, so a trait method and its
+    /// impls do not vouch for each other; only a `name(` call site counts.
+    fn has_call_site(claim: &Claim, own: &BTreeSet<usize>, corpus: &[(&str, usize, &str)]) -> bool {
+        corpus.iter().any(|(file, lineno, line)| {
+            if *file == claim.file && own.contains(lineno) {
+                return false;
+            }
+            if declared_fn_name(line) == Some(claim.name.as_str()) {
+                return false;
+            }
+            call_site(line, &claim.name)
+        })
+    }
+
+    /// True when `line` contains `name(` as a whole identifier.
+    fn call_site(line: &str, name: &str) -> bool {
+        let bytes = line.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut from = 0;
+        while let Some(pos) = line[from..].find(name) {
+            let start = from + pos;
+            let end = start + name.len();
+            let bounded = start == 0 || !ident(bytes[start - 1]);
+            if bounded && line[end..].starts_with('(') {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
+    /// The load-bearing test: every function documented as being called is.
+    #[test]
+    fn every_documented_caller_claim_has_a_caller() {
+        let sources = rust_sources();
+        let corpus = production_corpus(&sources);
+
+        let mut claim_count = 0;
+        let mut uncalled = Vec::new();
+        for (file, src) in &sources {
+            for claim in claims(file, src) {
+                claim_count += 1;
+                if ALLOWLIST
+                    .iter()
+                    .any(|(f, n, _)| *f == claim.file && *n == claim.name)
+                {
+                    continue;
+                }
+                let own = own_lines(src, &claim.name, claim.line);
+                if !has_call_site(&claim, &own, &corpus) {
+                    uncalled.push(format!(
+                        "{}:{} fn {}  — doc says \"{}\", nothing calls it",
+                        claim.file, claim.line, claim.name, claim.phrase
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            uncalled.is_empty(),
+            "DOC CLAIMS A CALLER THAT DOES NOT EXIST:\n{}\n\n\
+             Each of these functions is documented as being called and has no \
+             call site in src/. Fix the doc to say what is true — that is what \
+             `enforce_retention` does now. Do not wire up a caller to silence \
+             the test; that is a behaviour change and needs its own review. If \
+             the call site is real but invisible to a text scan (trait object, \
+             macro, FFI), add it to ALLOWLIST in src/invariants.rs with the \
+             reason.",
+            uncalled.join("\n")
+        );
+
+        assert!(
+            claim_count > 30,
+            "sanity check: only {claim_count} caller claims found in src/, so \
+             the doc-block parser is broken and the assertion above proved \
+             nothing"
+        );
+    }
+
+    /// Every allowlist entry must name a function that still exists and still
+    /// makes a caller claim. A stale suppression is a suppression nobody reads.
+    #[test]
+    fn the_allowlist_has_no_stale_entries() {
+        let sources = rust_sources();
+        let live: BTreeSet<(String, String)> = sources
+            .iter()
+            .flat_map(|(file, src)| claims(file, src))
+            .map(|c| (c.file, c.name))
+            .collect();
+
+        let stale: Vec<_> = ALLOWLIST
+            .iter()
+            .filter(|(f, n, _)| !live.contains(&(f.to_string(), n.to_string())))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "STALE ALLOWLIST ENTRIES — renamed, deleted, or the doc no longer \
+             claims a caller:\n{stale:#?}"
+        );
+
+        let unexplained: Vec<_> = ALLOWLIST
+            .iter()
+            .filter(|(_, _, why)| why.trim().is_empty())
+            .collect();
+        assert!(
+            unexplained.is_empty(),
+            "ALLOWLIST ENTRIES WITHOUT A REASON — an entry that does not say \
+             why the scan is wrong is a suppression:\n{unexplained:#?}"
         );
     }
 }
