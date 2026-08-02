@@ -77,7 +77,10 @@ mod thresholds {
 /// | 5+    | Deep      |
 ///
 /// `comment_density` is `None` on the cheap path (recomputing it requires
-/// re-reading source); the function still works without it.
+/// re-reading source); the function still works without it. The daemon's
+/// `handle_mem_get` is the only production caller and always passes `None`,
+/// so today the `+1` row never fires and the tier is a four-input score.
+/// Scoring it means storing density on `FileRecord` at parse time first.
 pub fn enrichment_depth(
     line_count: u32,
     blast_tier: BlastTier,

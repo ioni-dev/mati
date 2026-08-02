@@ -1292,7 +1292,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
 
     // Block 4: Review backlog
-    let review_count = gotcha_candidates + cochange_count + revert_count + ownership_count;
+    // Only written records reach `mati review`. `gotcha_candidates` counts raw
+    // scan signals (TODO, unsafe, unwrap) that are never persisted, so adding
+    // it here promised a backlog 26x larger than the one review presents.
+    let review_count = cochange_count + revert_count + ownership_count;
     if review_count > 0 {
         println!();
         println!(

@@ -179,6 +179,13 @@ pub fn build_edges_with_root(
         }
     }
 
+    // An edge's identity is its whole `(from, kind, to)` triple, which is also
+    // its storage key, so duplicates collapse on write anyway. Several `use`
+    // lines in one file routinely resolve to the same target; deduping here
+    // keeps the reported count equal to what the store actually holds.
+    let mut seen = std::collections::HashSet::new();
+    edges.retain(|e| seen.insert(e.clone()));
+
     Layer0Edges {
         edges,
         unresolved_imports,
@@ -562,6 +569,25 @@ mod tests {
         assert_eq!(result.edges[0].1, EdgeKind::Imports);
         assert_eq!(result.edges[0].2, "file:src/utils.rs");
         assert_eq!(result.unresolved_imports, 0);
+    }
+
+    #[test]
+    fn repeated_imports_of_same_target_yield_one_edge() {
+        let files = vec![
+            walked("src/lib.rs", Language::Rust),
+            walked("src/utils.rs", Language::Rust),
+        ];
+        let analyses = vec![
+            analysis(
+                "src/lib.rs",
+                Language::Rust,
+                &["crate::utils", "crate::utils"],
+            ),
+            analysis("src/utils.rs", Language::Rust, &[]),
+        ];
+
+        let result = build_edges(&files, &analyses, &[]);
+        assert_eq!(result.edges.len(), 1, "got {:?}", result.edges);
     }
 
     #[test]
