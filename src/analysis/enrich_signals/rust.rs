@@ -15,8 +15,14 @@
 //! Defensive guards (early returns with custom errors) are deliberately
 //! NOT captured — too noisy without per-context judgment. The LLM's
 //! Stage 2 critique handles that semantic call.
+//!
+//! Signals inside `#[cfg(test)]` modules and `#[test]` / `#[tokio::test]`
+//! functions are dropped: a test asserting itself is not a gotcha, and
+//! every `assert*` is HIGH tier, so test bodies otherwise dominate the
+//! tier-sorted output.
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -86,6 +92,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     })?;
 
     let source_bytes = source.as_bytes();
+    let test_ranges = test_item_ranges(tree.root_node(), source_bytes);
     let mut signals: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
 
@@ -99,6 +106,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     for m in cursor.matches(&RUST_QUERY, tree.root_node(), source_bytes) {
         for cap in m.captures {
             let node = cap.node;
+            if test_ranges.iter().any(|r| r.contains(&node.start_byte())) {
+                continue;
+            }
             let line = node.start_position().row as u32 + 1;
             let evidence = super::node_text(source_bytes, node);
 
@@ -132,6 +142,91 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     }
 
     Ok(signals)
+}
+
+/// Byte ranges covering every test-attributed module, function, impl, or
+/// block. Test items are not descended into, so nested items inherit the
+/// exclusion.
+fn test_item_ranges(root: tree_sitter::Node, source: &[u8]) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+
+    while let Some(node) = stack.pop() {
+        let attributable = matches!(
+            node.kind(),
+            "mod_item" | "function_item" | "impl_item" | "block"
+        );
+        if attributable && has_test_attribute(node, source) {
+            ranges.push(node.start_byte()..node.end_byte());
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+
+    ranges
+}
+
+/// In tree-sitter-rust an attribute is a *sibling* preceding its item,
+/// not a child of it. Doc comments may sit between the two.
+fn has_test_attribute(item: tree_sitter::Node, source: &[u8]) -> bool {
+    let mut sibling = item.prev_named_sibling();
+    while let Some(node) = sibling {
+        match node.kind() {
+            "attribute_item" if attribute_marks_test(node, source) => return true,
+            "attribute_item" | "line_comment" | "block_comment" => {}
+            _ => return false,
+        }
+        sibling = node.prev_named_sibling();
+    }
+    false
+}
+
+/// Matches `#[test]`, any `::test` suffix (`#[tokio::test]`), and any
+/// `cfg` predicate mentioning the bare `test` flag (`#[cfg(all(test, unix))]`).
+fn attribute_marks_test(attr_item: tree_sitter::Node, source: &[u8]) -> bool {
+    let mut item_cursor = attr_item.walk();
+    let Some(attr) = attr_item
+        .named_children(&mut item_cursor)
+        .find(|n| n.kind() == "attribute")
+    else {
+        return false;
+    };
+
+    let mut attr_cursor = attr.walk();
+    let Some(path) = attr.named_children(&mut attr_cursor).next() else {
+        return false;
+    };
+
+    let path_text = super::node_text(source, path);
+    match path_text.rsplit("::").next().unwrap_or("").trim() {
+        "test" => true,
+        "cfg" => mentions_test_flag(attr, source),
+        _ => false,
+    }
+}
+
+/// Whether a `cfg` predicate enables the bare `test` flag. Subtrees under
+/// `not(...)` are skipped, so `#[cfg(not(test))]` stays production code.
+fn mentions_test_flag(node: tree_sitter::Node, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    let mut negated = false;
+
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier" {
+            let text = super::node_text(source, child);
+            if text == "test" {
+                return true;
+            }
+            negated = text == "not";
+        } else if negated {
+            negated = false;
+        } else if mentions_test_flag(child, source) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -220,6 +315,119 @@ mod tests {
             .filter(|s| s.kind == SignalKind::Panic)
             .collect();
         assert_eq!(panics.len(), 1);
+    }
+
+    #[test]
+    fn cfg_test_module_signals_excluded() {
+        let src = r#"
+// WARNING: real signal
+fn real() {
+    assert!(cond, "production invariant");
+}
+
+#[cfg(test)]
+mod tests {
+    // FIXME: test-only note
+    #[test]
+    fn a() {
+        assert_eq!(1, 1);
+        panic!("in a test");
+    }
+}
+"#;
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 2, "got {signals:?}");
+        assert!(signals.iter().all(|s| s.file_line < 7));
+        assert!(signals.iter().any(|s| s.kind == SignalKind::WarnComment));
+        assert!(signals.iter().any(|s| s.kind == SignalKind::Assert));
+    }
+
+    #[test]
+    fn nested_cfg_test_predicate_excluded() {
+        let src = r#"
+#[cfg(all(test, unix))]
+mod tests {
+    fn a() { assert_eq!(1, 1); }
+}
+"#;
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fn_outside_test_module_excluded() {
+        let src = r#"
+#[test]
+fn standalone() {
+    assert_eq!(1, 1);
+}
+
+#[tokio::test]
+async fn async_case() {
+    assert!(ready);
+}
+
+fn production() {
+    assert!(invariant);
+}
+"#;
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+        assert_eq!(signals[0].file_line, 13);
+    }
+
+    #[test]
+    fn doc_comment_between_attribute_and_item_still_excluded() {
+        let src = r#"
+#[cfg(test)]
+/// Unit tests.
+mod tests {
+    fn a() { assert_eq!(1, 1); }
+}
+"#;
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cfg_not_test_is_production_code() {
+        let src = r#"
+#[cfg(not(test))]
+fn production() {
+    assert!(invariant);
+}
+"#;
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+    }
+
+    #[test]
+    fn cfg_test_block_and_impl_excluded() {
+        let src = r#"
+fn home() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        assert!(in_test);
+        Some(test_home())
+    }
+}
+
+#[cfg(test)]
+impl Fixture {
+    fn new() { assert!(ok); }
+}
+"#;
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cfg_feature_named_test_not_excluded() {
+        let src = r#"
+#[cfg(feature = "testing")]
+fn gated() {
+    assert!(invariant);
+}
+"#;
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
     }
 
     #[test]

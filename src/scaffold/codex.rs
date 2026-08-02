@@ -153,15 +153,18 @@ routing, etc).
 
 ### Tier branches (D2)
 
-| Tier      | Stage 2     | Stage 3 critique | Negative exemplars |
-| --------- | ----------- | ---------------- | ------------------ |
-| fast      | schema only | skip             | no                 |
-| standard  | positive    | Round 1 + 2      | no                 |
-| deep      | positive    | Rounds 1, 2, 3   | yes                |
+| Tier      | Positive exemplars | Negative exemplars |
+| --------- | ------------------ | ------------------ |
+| fast      | no (schema only)   | no                 |
+| standard  | yes                | no                 |
+| deep      | yes                | yes                |
 
 `fast` for trivial files (LoC < 100, isolated blast, no cluster).
-`standard` is the default. `deep` runs the full pipeline including
-negative exemplars for hotspot / signal-rich files.
+`standard` is the default. `deep` adds negative exemplars for
+hotspot / signal-rich files.
+
+Stage 3 runs at every tier. It is one CLI call per candidate, not a
+reasoning pass, so tier does not gate it.
 
 ### Stage 2 — Enumeration (maximize recall)
 
@@ -187,19 +190,19 @@ Schema (strict JSON):
     "draft_reason": "what breaks and why",
     "draft_severity": "critical" | "high" | "normal" | "low" } ]
 
+Write each candidate to be Specific (names a concrete API, value, or
+pattern — never "be careful" or "review carefully"), Enforceable (a
+hook could deny a real mistake on it), Non-obvious (not derivable
+from type signatures alone), and Causal (the reason says WHAT breaks,
+with "because"/"since"). These shape how you draft a candidate. They
+are not a filter — do not drop a candidate for failing them here.
+
 Goal: maximize recall. Weak candidates are OK — filtered next.
 
-### Stage 3 — Critique loop (bounded, 3 rounds)
+### Stage 3 — Evidence verification (deterministic, D-α)
 
-ROUND 1 — Specificity. Discard candidates failing ANY of:
-  Specific    — names a concrete API, value, or pattern
-  Enforceable — could a hook deny a real mistake based on this rule?
-  Non-obvious — would a reviewer learn something not derivable from
-                type signatures alone?
-  Causal      — does the reason state WHAT breaks with "because"/"since"?
-
-ROUND 2 — Cross-reference verification (DETERMINISTIC, D-α).
-For each Round 1 survivor, call `mati verify-evidence` via Bash:
+One pass, no rounds. For each candidate, call `mati verify-evidence`
+via Bash:
   mati verify-evidence \
     --file <path> \
     --line <candidate.file_line> \
@@ -209,18 +212,18 @@ The CLI returns JSON. Parse it:
   { "verified": true, ... }  → keep, add "verified": true
   { "verified": false, ... } → DISCARD (hallucinated citation, or
                                 rule generalizes beyond visible scope)
-Do NOT trust self-critique here. The CLI is the source of truth.
-
-ROUND 3 — Stability check. If Round 2 == Round 1, proceed. If Round 2
-discarded items, re-run Round 2 on the new survivor set. Cap at 3
-iterations total.
+The CLI is the source of truth. Do not second-guess a verdict, and do
+not re-run a candidate that already returned one — the check is
+deterministic, so a repeat call returns the same answer.
 
 ### Stage 4 — Refinement and write
 
 For each verified candidate:
 
 1. Tighten rule: imperative verb first; concrete names not pronouns;
-   ≤ 80 chars where possible.
+   ≤ 80 chars where possible. If a candidate is still vague after
+   tightening — no concrete API, value, or pattern to enforce on —
+   drop it here.
 2. Verify reason uses "because"/"since"/"as" — add if missing.
 3. Assign severity via HYBRID CLASSIFIER (D-β). Two passes:
 
@@ -264,10 +267,15 @@ For each verified candidate:
 
 ### Notes
 
-- Per-file token budget: ~8K tokens for Stages 2-3 combined. If you
-  exceed, truncate Stage 2 candidates to top 10 by signal_tier.
+- Per-file token budget: ~8K tokens for Stage 2. Stage 3 is CLI
+  calls, near-zero tokens. If you exceed the budget, truncate Stage 2
+  candidates to top 10 by signal_tier.
 - Rust-side quality gate still applies at write time. The pipeline
   maximizes what gets through; the gate enforces the floor.
+- Do not add verification passes of your own, and do not spawn a
+  subagent to double-check candidates. Stage 3 and the write-time
+  quality gate are the only filters. Extra self-review costs tokens
+  and suppresses recall without improving precision.
 "#;
 
 const SKILL_CONFIG_PATH: &str = ".codex/skills/mati/SKILL.md";

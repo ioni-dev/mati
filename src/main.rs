@@ -203,7 +203,7 @@ enum Commands {
         path: String,
     },
     /// Verify a candidate gotcha's evidence quote and pattern (deterministic
-    /// cross-reference check for `/mati-enrich` Stage 3 Round 2). Outputs JSON.
+    /// cross-reference check for `/mati-enrich` Stage 3). Outputs JSON.
     #[command(name = "verify-evidence")]
     VerifyEvidence(cli::verify_evidence::VerifyEvidenceArgs),
     /// Extract enrichment signals (panic/assert/WARN comments/etc.) from a
