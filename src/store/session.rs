@@ -542,9 +542,13 @@ pub async fn session_clear_consults(store: &Store) -> Result<()> {
 
 /// Archive session, run staleness analysis, auto-promote gotchas.
 ///
-/// Full version: includes git-based staleness analysis. Used from CLI path.
-/// For the daemon socket path (tokio::spawn, !Send constraint), use
-/// `session_harvest_no_staleness` instead.
+/// Full version: includes git-based staleness analysis, which the daemon
+/// cannot run because `StalenessAnalyzer` holds git2 handles and is `!Send`.
+///
+/// Nothing calls this. It was the CLI-path harvest, but `mati session-harvest`
+/// now forwards to the daemon socket, and both socket handlers take
+/// `session_harvest_no_staleness`. So `StalenessAnalyzer::analyze_all` never
+/// runs in production and git-derived staleness is never scored.
 pub async fn session_harvest(store: &Store, cwd: &Path) -> Result<()> {
     let now = now_secs();
 
