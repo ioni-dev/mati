@@ -1,5 +1,5 @@
 //! `mati verify-evidence` — deterministic cross-reference verification for
-//! `/mati-enrich` Stage 3 Round 2.
+//! `/mati-enrich` Stage 3.
 //!
 //! Replaces LLM self-critique with a Rust-side check: given a file, a line
 //! number, and an `evidence_quote` + optional `pattern` from a candidate
@@ -14,8 +14,8 @@
 //!
 //! Per ENRICH_QUALITY.md Section 4 (D-α), this is the SOTA upgrade that moves
 //! evidence verification from "LLM grades itself" to "deterministic code grades
-//! the LLM's claim." The whole point of the critique loop's Round 2 is that
-//! the LLM that proposed the citation cannot be trusted to verify it.
+//! the LLM's claim." The whole point of Stage 3 is that the LLM that proposed
+//! the citation cannot be trusted to verify it.
 //!
 //! Hidden in `--help` output; intended for programmatic use by the slash flow.
 
@@ -27,14 +27,14 @@ use serde::Serialize;
 
 /// Lines of context on each side of the cited line to scan.
 ///
-/// Matches the spec — Round 2 says "Re-read `<path>` at the cited file_line ± 5
+/// Matches the spec — Stage 3 says "Re-read `<path>` at the cited file_line ± 5
 /// lines." Eleven-line window is generous enough to absorb off-by-one drift
 /// in LLM citations without losing precision.
 const WINDOW_LINES: usize = 5;
 
 #[derive(Args, Debug)]
 #[command(
-    long_about = "Deterministic cross-reference check for /mati-enrich Stage 3 Round 2.\n\
+    long_about = "Deterministic cross-reference check for /mati-enrich Stage 3.\n\
                   Returns JSON: {verified, file, line, quote_match, pattern_match, reason}.\n\
                   Exit 0 iff verified=true."
 )]

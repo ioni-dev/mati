@@ -111,7 +111,7 @@ Enforcement keys on gotchas, against a single threshold. If a gotcha is `confirm
 
 `mati init` runs a Layer 0 scan with no LLM calls: tree-sitter parsing across 12 languages, import-graph construction, and co-change clustering from git history.
 
-`mati enrich` runs Layer 1 through Claude Code: Claude reads each file and extracts gotcha candidates via a four-stage pipeline (setup, enumeration, critique loop, write). Run `mati review` afterward to confirm candidates and turn on enforcement.
+`mati enrich` runs Layer 1 through Claude Code: Claude reads each file and extracts gotcha candidates via a four-stage pipeline (setup, enumeration, evidence verification, write). Run `mati review` afterward to confirm candidates and turn on enforcement.
 
 ---
 

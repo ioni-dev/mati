@@ -780,13 +780,11 @@ estimated_minutes = base_time x (1 - weighted_reduction)
 - MEDIUM: defensive guards, non-obvious literals
 - LOW: raw API usage
 
-**Stage 3 (Critique loop):** Run up to three bounded rounds.
+Specificity — specific, enforceable, non-obvious, causal — is drafting guidance here, not a filter. Stage 2 maximizes recall; filtering is deterministic and happens later.
 
-1. Specificity filter: discard candidates that are not specific, enforceable, non-obvious, and causal.
-2. Cross-reference verification: call `mati verify-evidence`, a deterministic CLI, to confirm that each candidate’s file line and quote are real.
-3. Stability check: repeat round 2 if round 2 discarded items. This allows cascading discard, with a maximum of 3 iterations.
+**Stage 3 (Evidence verification):** One pass, every tier. Call `mati verify-evidence`, a deterministic CLI, to confirm that each candidate’s file line and quote are real. Discard the ones that fail. The CLI is the source of truth; there is no self-critique round and no re-run, because a repeat call on the same candidate returns the same verdict.
 
-**Stage 4 (Write):** For each verified candidate, tighten the rule, verify causality language, assign severity through a hybrid keyword and semantic classifier, then call `mem_set`.
+**Stage 4 (Write):** For each verified candidate, tighten the rule and drop any that stays vague, verify causality language, assign severity through a hybrid keyword and semantic classifier, then call `mem_set`.
 
 Severity classification works like this:
 

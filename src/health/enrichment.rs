@@ -4,9 +4,11 @@
 //! uses to decide how aggressive to be during extraction:
 //!
 //! - **Fast** — single-pass, schema-only guidance. ~30% of typical files.
-//! - **Standard** — positive exemplars + Pass 3 Rounds 1 and 2. ~50% of files.
-//! - **Deep** — full pipeline with positive AND negative exemplars +
-//!   full critique loop. ~20% of files.
+//! - **Standard** — positive exemplars. ~50% of files.
+//! - **Deep** — positive AND negative exemplars. ~20% of files.
+//!
+//! The tier gates exemplar retrieval only. Pass 3 evidence verification runs
+//! at every tier because it is a CLI call per candidate, not a reasoning pass.
 //!
 //! Surfaced to the agent via the `enrichment_depth_hint` field on `mem_get`
 //! responses for `file:` keys (`src/mcp/handlers.rs::handle_mem_get`).
