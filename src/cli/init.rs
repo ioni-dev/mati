@@ -397,6 +397,52 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
     }
 
+    // One scan feeds both the rename migration and the §8c back-fill below —
+    // the migration adds no store reads on the common (no-rename) path.
+    let mut all_gotchas = store.scan_prefix("gotcha:").await.unwrap_or_default();
+
+    // ── 8b-rename. Follow git renames onto developer gotchas ─────────────────
+    // A gotcha binds to a file by the exact `affected_files` string, so a
+    // `git mv` silently unbinds it: `file:<new>` is minted fresh with no
+    // gotcha_keys and `file:<old>` is orphaned. Enforcement does not merely
+    // lapse — `StalenessAnalyzer` tombstones the orphan and `hooks::decide`
+    // returns `Decision::Tombstone` (pass through unconditionally) for a
+    // tombstoned record, so the gate degrades to an explicit allow.
+    //
+    // Runs before §8c so the back-fill sees the re-keyed `affected_files` and
+    // links the gotcha onto the `file:<new>` record this run is about to write.
+    {
+        let renames: &[(String, String)] = git_signals
+            .as_ref()
+            .map(|g| g.recent_renames.as_slice())
+            .unwrap_or(&[]);
+        let t = Instant::now();
+        let applied = migrate_renamed_gotchas(&store, &root, renames, &mut all_gotchas).await;
+        if !applied.is_empty() {
+            println!(
+                "  Following git renames...       {:>4} gotchas {:>4}ms",
+                applied.len(),
+                t.elapsed().as_millis()
+            );
+            for a in &applied {
+                for (old, new) in &a.followed {
+                    println!("    {old} → {new}  ({})", a.key);
+                }
+            }
+            // `mati sandbox compile` reads `affected_files` live, but the L3
+            // deny floor already materialized into settings.local.json still
+            // names the old path — and the drift guard treats the vanished old
+            // entry as a protection whose tag is gone, so the re-sync needs
+            // --force. Say so rather than leaving a silently stale floor.
+            if applied.iter().any(|a| a.sandbox_tagged) {
+                println!(
+                    "    note: a re-keyed gotcha is sandbox-tagged — run \
+                     `mati sandbox compile --apply --force` to move the deny floor"
+                );
+            }
+        }
+    }
+
     // ── 8c. Back-fill developer-created gotcha keys ──────────────────────────
     // Auto-generated gotchas (cochange, revert, ownership) were handled above.
     // Developer-created gotchas added via `mati gotcha add` before the file
@@ -404,16 +450,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // record didn't exist at confirm time). Re-scan all non-auto gotcha records
     // and merge their affected_files into the file records being written now.
     {
-        let all_gotchas = store.scan_prefix("gotcha:").await.unwrap_or_default();
         let mut path_to_manual_keys: HashMap<String, Vec<String>> = HashMap::new();
         for rec in &all_gotchas {
             if !matches!(rec.lifecycle, RecordLifecycle::Active) {
                 continue;
             }
-            let is_auto = rec.key.starts_with("gotcha:cochange:")
-                || rec.key.starts_with("gotcha:revert:")
-                || rec.key.starts_with("gotcha:ownership:");
-            if is_auto {
+            if is_auto_gotcha(&rec.key) {
                 continue;
             }
             if let Some(g) = rec.payload_as::<GotchaRecord>() {
@@ -1315,6 +1357,235 @@ pub async fn run(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+// ── Rename migration ─────────────────────────────────────────────────────────
+
+/// Marks a gotcha whose `affected_files` this pass re-keyed onto a renamed path.
+///
+/// A rename is a mechanical fact; whether the *rule* still holds at the new path
+/// is not. The obvious alternative — dropping confidence — would push the record
+/// under the 0.6 gate and disable enforcement, which is the failure mode this
+/// whole pass exists to fix. So the gotcha keeps enforcing and carries a flag
+/// instead. Bare kebab-case to match the other review markers
+/// (`severity-disputed`, `crown-jewel`).
+const TAG_PATH_MIGRATED: &str = "path-migrated";
+
+/// Auto-generated Layer-0 gotchas, regenerated from fresh git signals on every
+/// init and tombstoned when their signal drops out (§8c). Their `affected_files`
+/// are already derived from current paths.
+fn is_auto_gotcha(key: &str) -> bool {
+    key.starts_with("gotcha:cochange:")
+        || key.starts_with("gotcha:revert:")
+        || key.starts_with("gotcha:ownership:")
+}
+
+/// A planned `affected_files` rewrite for one gotcha.
+#[derive(Debug, PartialEq, Eq)]
+struct RenameMigration {
+    key: String,
+    /// `affected_files` exactly as stored — what `sync_gotcha_file_links` needs
+    /// in order to unlink the old `file:*` records, legacy spellings included.
+    old_files: Vec<String>,
+    /// The rewritten list, normalized through the write-side normalizer.
+    new_files: Vec<String>,
+    /// The (old, new) pairs this record actually followed.
+    followed: Vec<(String, String)>,
+}
+
+/// One applied migration, for the init summary.
+struct AppliedRename {
+    key: String,
+    followed: Vec<(String, String)>,
+    /// The gotcha compiles into the sandbox deny floor (`cli::sandbox`), whose
+    /// materialized copy still names the old path.
+    sandbox_tagged: bool,
+}
+
+/// Plan the `affected_files` rewrites implied by `renames`. Pure apart from the
+/// `exists()` probes, which are what make the plan safe.
+///
+/// `renames` is `GitSignals::recent_renames` — despite the name, every rename
+/// git2 detected across the whole `MAX_COMMITS` window, newest first
+/// (`analysis::git` walks with `Sort::TIME`). That is the right window here:
+/// following an old rename is still correct as long as the two disk probes
+/// below hold, and narrowing it would only lose migrations. Cost is bounded by
+/// the number of renames, not by history length.
+fn plan_rename_migrations(
+    renames: &[(String, String)],
+    gotchas: &[Record],
+    root: &std::path::Path,
+) -> Vec<RenameMigration> {
+    if renames.is_empty() {
+        return Vec::new();
+    }
+
+    // old → new. The first decision for a given `old` is final, so a path
+    // renamed away more than once follows its newest move and duplicate deltas
+    // (the same rename replayed across commits) collapse.
+    //
+    // Two probes decide whether a pair is followable:
+    //   * `old` still on disk — a copy rather than a move, or the path was
+    //     re-created since. The gotcha still describes a real file; leave it.
+    //   * `new` missing — the target moved on again or is gone. Nothing to
+    //     point the gotcha at, and rewriting would only relocate the orphan.
+    let mut moves: HashMap<&str, &str> = HashMap::new();
+    let mut decided: HashSet<&str> = HashSet::new();
+    for (old, new) in renames {
+        if old == new || !decided.insert(old.as_str()) {
+            continue;
+        }
+        if root.join(old).exists() || !root.join(new).exists() {
+            continue;
+        }
+        moves.insert(old.as_str(), new.as_str());
+    }
+    if moves.is_empty() {
+        return Vec::new();
+    }
+
+    let mut plans = Vec::new();
+    for rec in gotchas {
+        if !matches!(rec.lifecycle, RecordLifecycle::Active) || is_auto_gotcha(&rec.key) {
+            continue;
+        }
+        let Some(g) = rec.payload_as::<GotchaRecord>() else {
+            continue; // CLAUDE.md-imported gotchas carry no affected_files.
+        };
+
+        let mut followed: Vec<(String, String)> = Vec::new();
+        let rewritten: Vec<String> = g
+            .affected_files
+            .iter()
+            .map(|f| match moves.get(f.as_str()) {
+                Some(new) => {
+                    followed.push((f.clone(), (*new).to_string()));
+                    (*new).to_string()
+                }
+                None => f.clone(),
+            })
+            .collect();
+        if followed.is_empty() {
+            // Nothing named a renamed path — the steady state on every re-init
+            // once a rename has been followed, so this pass is a no-op then.
+            continue;
+        }
+
+        // Through the write-side normalizer, against init's own root rather
+        // than a cwd-discovered one, so the stored strings are the ones the
+        // read gate looks up. It also collapses duplicates, which is what
+        // makes a gotcha already naming BOTH the old and the new path resolve
+        // to a single entry instead of listing the target twice.
+        let new_files = mati_core::store::gotcha_ops::normalize_affected_files_with_root(
+            &rewritten,
+            root.to_str(),
+        );
+        if new_files == g.affected_files {
+            continue;
+        }
+
+        plans.push(RenameMigration {
+            key: rec.key.clone(),
+            old_files: g.affected_files.clone(),
+            new_files,
+            followed,
+        });
+    }
+    plans
+}
+
+/// Apply the planned rewrites: re-key each gotcha, move its `file:*` links and
+/// `HasGotcha` edges, and retire the orphaned `file:<old>` records.
+///
+/// `gotchas` is updated in place from the store so §8c back-fills the new paths.
+async fn migrate_renamed_gotchas(
+    store: &Store,
+    root: &std::path::Path,
+    renames: &[(String, String)],
+    gotchas: &mut [Record],
+) -> Vec<AppliedRename> {
+    let plans = plan_rename_migrations(renames, gotchas, root);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut applied = Vec::new();
+    for plan in plans {
+        let Some(rec) = gotchas.iter_mut().find(|r| r.key == plan.key) else {
+            continue;
+        };
+
+        // Rule text, confidence and quality are left exactly as they were.
+        // Only the binding moved; re-scoring here would change enforcement.
+        let sandbox_tagged = rec
+            .tags
+            .iter()
+            .any(|t| t == super::sandbox::TAG_DENY_WRITE || t == super::sandbox::TAG_DENY_READ);
+        if !rec.tags.iter().any(|t| t == TAG_PATH_MIGRATED) {
+            rec.tags.push(TAG_PATH_MIGRATED.to_string());
+        }
+        rec.updated_at = now;
+        rec.version.logical_clock += 1;
+        rec.version.wall_clock = now;
+
+        // `apply_gotcha_write` rather than a bare `sync_gotcha_file_links`:
+        // it is the centralized mutation path (CLAUDE.md), and it also patches
+        // the payload's `affected_files` from `new_files`, moves the HasGotcha
+        // edges, records the `ControlChanged::Updated` enforcement event, and
+        // carries the dirty-marker cancellation guard.
+        if let Err(e) = mati_core::store::gotcha_ops::apply_gotcha_write(
+            store,
+            rec,
+            &plan.old_files,
+            &plan.new_files,
+            false,
+        )
+        .await
+        {
+            tracing::warn!("init: rename migration failed for {}: {e}", plan.key);
+            continue;
+        }
+
+        // Re-read so §8c sees what was actually persisted rather than this
+        // record's pre-migration payload.
+        if let Ok(Some(fresh)) = store.get(&plan.key).await {
+            *rec = fresh;
+        }
+
+        // Retire the orphaned `file:<old>`. The link sync above already removed
+        // this gotcha from it; delete the record outright once nothing else
+        // references it and nothing exists at that path. Leaving it is not
+        // neutral — `StalenessAnalyzer` tombstones a vanished file, and the gate
+        // passes a tombstoned record through unconditionally, so a later
+        // re-creation of that path would inherit a silent allow. `NoRecord`
+        // logs a miss instead, which is the honest state.
+        for (old, _) in &plan.followed {
+            if root.join(old).exists() {
+                continue;
+            }
+            let file_key = format!("file:{old}");
+            let still_linked = match store.get(&file_key).await {
+                Ok(Some(r)) => r
+                    .payload_as::<FileRecord>()
+                    .map(|f| !f.gotcha_keys.is_empty())
+                    .unwrap_or(true),
+                _ => continue,
+            };
+            if !still_linked {
+                if let Err(e) = store.delete(&file_key).await {
+                    tracing::warn!("init: retiring orphaned {file_key} failed: {e}");
+                }
+            }
+        }
+
+        applied.push(AppliedRename {
+            key: plan.key,
+            followed: plan.followed,
+            sandbox_tagged,
+        });
+    }
+    applied
+}
+
 // ── CODEOWNERS onboarding candidates (idea 2.2) ──────────────────────────────
 
 /// Build CODEOWNERS ownership candidate records, skipping any key that already
@@ -2032,6 +2303,481 @@ mod tests {
         assert_eq!(stale.len(), 2);
         assert!(stale.contains(&"dep:serde".to_string()));
         assert!(stale.contains(&"dep:cargo:old".to_string()));
+    }
+
+    // ── Rename migration ──────────────────────────────────────────────────────
+    //
+    // A gotcha binds to a file by exact `affected_files` string, so a `git mv`
+    // unbinds it and the gate degrades to a pass-through once the orphaned
+    // `file:<old>` is tombstoned. These cover the follow, and — more important,
+    // since init runs constantly — that following is a one-shot.
+
+    /// Lay out `files` under a fresh tempdir so the planner's disk probes see a
+    /// real tree. Returns the root.
+    fn scratch_tree(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for f in files {
+            let p = dir.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "fn main() {}\n").unwrap();
+        }
+        dir
+    }
+
+    fn make_gotcha(key: &str, files: &[&str], confirmed: bool) -> Record {
+        let gotcha = GotchaRecord {
+            rule: "hold the lock before touching the index".into(),
+            reason: "concurrent writers corrupt it otherwise".into(),
+            severity: Priority::High,
+            affected_files: files.iter().map(|s| s.to_string()).collect(),
+            ref_url: None,
+            discovered_session: 1_000_000,
+            confirmed,
+        };
+        let mut rec = make_record_with_category(key, Category::Gotcha);
+        rec.value = "hold the lock because concurrent writers corrupt the index".into();
+        rec.payload = serde_json::to_value(&gotcha).ok();
+        rec.source = RecordSource::DeveloperManual;
+        rec.confidence = ConfidenceScore::for_new_record(&RecordSource::DeveloperManual);
+        rec.quality = QualityScore::doc_comment_default();
+        rec
+    }
+
+    fn renames(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    fn affected(rec: &Record) -> Vec<String> {
+        rec.payload_as::<GotchaRecord>().unwrap().affected_files
+    }
+
+    #[test]
+    fn plan_follows_a_simple_rename() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].key, "gotcha:lock");
+        assert_eq!(plans[0].old_files, vec!["src/old.rs"]);
+        assert_eq!(plans[0].new_files, vec!["src/new.rs"]);
+        assert_eq!(
+            plans[0].followed,
+            vec![("src/old.rs".to_string(), "src/new.rs".to_string())]
+        );
+    }
+
+    /// The steady state. `recent_renames` still reports the move on every
+    /// subsequent init — git history does not forget — so the no-op has to come
+    /// from the gotcha no longer naming the old path.
+    #[test]
+    fn plan_is_empty_once_the_rename_is_followed() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let gotchas = vec![make_gotcha("gotcha:lock", &["src/new.rs"], true)];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert!(plans.is_empty(), "re-running init must not re-migrate");
+    }
+
+    /// A file still at the old path is a copy, not a move — git reports the
+    /// delta either way when the content matches. The gotcha still describes a
+    /// real file, so leave it alone.
+    #[test]
+    fn plan_skips_a_copy_where_the_old_path_survives() {
+        let dir = scratch_tree(&["src/old.rs", "src/new.rs"]);
+        let gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn plan_skips_when_the_new_path_is_gone_too() {
+        let dir = scratch_tree(&[]);
+        let gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert!(plans.is_empty());
+    }
+
+    /// Unconfirmed gotchas are re-keyed too: they are pending `mati review`,
+    /// and a reviewer confirming one later must get the current path.
+    #[test]
+    fn plan_follows_an_unconfirmed_gotcha() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], false)];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].new_files, vec!["src/new.rs"]);
+    }
+
+    #[test]
+    fn plan_skips_auto_generated_and_tombstoned_gotchas() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let mut tombstoned = make_gotcha("gotcha:dead", &["src/old.rs"], true);
+        tombstoned.lifecycle = RecordLifecycle::Tombstoned {
+            reason: mati_core::store::TombstoneReason::ManualDeletion,
+            at: 1,
+        };
+        let gotchas = vec![
+            make_gotcha("gotcha:cochange:src/old.rs|src/x.rs", &["src/old.rs"], true),
+            make_gotcha("gotcha:revert:src/old.rs", &["src/old.rs"], true),
+            make_gotcha("gotcha:ownership:src/old.rs", &["src/old.rs"], true),
+            tombstoned,
+        ];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert!(plans.is_empty());
+    }
+
+    /// A gotcha that already listed both paths must not end up naming the
+    /// target twice — the write-side normalizer collapses the duplicate, and
+    /// `old_files` still carries the old spelling so the link is unwound.
+    #[test]
+    fn plan_collapses_a_gotcha_naming_both_paths() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let gotchas = vec![make_gotcha(
+            "gotcha:lock",
+            &["src/old.rs", "src/new.rs"],
+            true,
+        )];
+
+        let plans = plan_rename_migrations(
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].new_files, vec!["src/new.rs"]);
+        assert_eq!(plans[0].old_files, vec!["src/old.rs", "src/new.rs"]);
+    }
+
+    /// `recent_renames` is newest-first, so the newest move off a path wins and
+    /// a replayed delta does not produce a second plan.
+    #[test]
+    fn plan_takes_the_newest_move_off_a_path() {
+        let dir = scratch_tree(&["src/newest.rs"]);
+        let gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+
+        let plans = plan_rename_migrations(
+            &renames(&[
+                ("src/old.rs", "src/newest.rs"),
+                ("src/old.rs", "src/older.rs"),
+                ("src/old.rs", "src/newest.rs"),
+            ]),
+            &gotchas,
+            dir.path(),
+        );
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].new_files, vec!["src/newest.rs"]);
+    }
+
+    // ── Store-backed ──────────────────────────────────────────────────────────
+
+    async fn seed_file_record(store: &Store, path: &str, gotcha_keys: &[&str]) {
+        let key = format!("file:{path}");
+        let mut rec = make_record_with_category(&key, Category::File);
+        rec.payload = Some(serde_json::json!({
+            "path": path,
+            "purpose": "",
+            "entry_points": [],
+            "imports": [],
+            "gotcha_keys": gotcha_keys,
+            "decision_keys": [],
+            "todos": [],
+            "unsafe_count": 0,
+            "unwrap_count": 0,
+            "change_frequency": 0,
+            "last_author": null,
+            "is_hotspot": false,
+            "token_cost_estimate": 0,
+            "last_modified_session": 0,
+            "line_count": 0,
+        }));
+        store.put(&key, &rec).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_rekeys_the_gotcha_and_moves_the_file_link() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+        store.put("gotcha:lock", &gotchas[0]).await.unwrap();
+        seed_file_record(&store, "src/old.rs", &["gotcha:lock"]).await;
+        seed_file_record(&store, "src/new.rs", &[]).await;
+
+        let applied = migrate_renamed_gotchas(
+            &store,
+            dir.path(),
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &mut gotchas,
+        )
+        .await;
+
+        assert_eq!(applied.len(), 1);
+        assert!(!applied[0].sandbox_tagged);
+
+        // Canonical record re-keyed, and the in-memory copy §8c reads matches.
+        let stored = store.get("gotcha:lock").await.unwrap().unwrap();
+        assert_eq!(affected(&stored), vec!["src/new.rs"]);
+        assert_eq!(affected(&gotchas[0]), vec!["src/new.rs"]);
+
+        // Enforcement inputs untouched — a followed rename keeps enforcing.
+        let g = stored.payload_as::<GotchaRecord>().unwrap();
+        assert!(g.confirmed);
+        assert!(stored.confidence.value >= 0.6, "confidence must not drop");
+        assert!(stored.quality.value >= 0.4, "quality must not drop");
+        assert!(stored.tags.iter().any(|t| t == TAG_PATH_MIGRATED));
+
+        // Link moved onto the new file record.
+        let new_file = store.get("file:src/new.rs").await.unwrap().unwrap();
+        let keys = new_file.payload_as::<FileRecord>().unwrap().gotcha_keys;
+        assert_eq!(keys, vec!["gotcha:lock"]);
+
+        // Orphan retired outright rather than left to be tombstoned, which the
+        // gate would read as an unconditional allow.
+        assert!(store.get("file:src/old.rs").await.unwrap().is_none());
+
+        store.close().await.unwrap();
+    }
+
+    /// init runs on every session, so a second pass over the same git history
+    /// must write nothing at all — asserted on the record version, which
+    /// `apply_gotcha_write` would bump.
+    #[tokio::test]
+    async fn re_running_the_migration_is_a_no_op() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+        store.put("gotcha:lock", &gotchas[0]).await.unwrap();
+        seed_file_record(&store, "src/old.rs", &["gotcha:lock"]).await;
+        seed_file_record(&store, "src/new.rs", &[]).await;
+
+        let pairs = renames(&[("src/old.rs", "src/new.rs")]);
+        assert_eq!(
+            migrate_renamed_gotchas(&store, dir.path(), &pairs, &mut gotchas)
+                .await
+                .len(),
+            1
+        );
+        let after_first = store.get("gotcha:lock").await.unwrap().unwrap();
+
+        let second = migrate_renamed_gotchas(&store, dir.path(), &pairs, &mut gotchas).await;
+
+        assert!(second.is_empty(), "second init must not re-migrate");
+        let after_second = store.get("gotcha:lock").await.unwrap().unwrap();
+        assert_eq!(
+            after_second.version.logical_clock, after_first.version.logical_clock,
+            "no-op pass must not write the record"
+        );
+        assert_eq!(
+            after_second
+                .tags
+                .iter()
+                .filter(|t| *t == TAG_PATH_MIGRATED)
+                .count(),
+            1,
+            "tag must not accumulate"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// An unconfirmed gotcha follows the rename so a later `mati review`
+    /// confirmation lands on the current path — but following must not itself
+    /// promote it: the gate still allows, because `confirmed` is untouched.
+    #[tokio::test]
+    async fn migration_of_an_unconfirmed_gotcha_does_not_start_enforcing() {
+        use mati_core::hooks::decide::{evaluate, Decision, EnforcementInput};
+
+        let dir = scratch_tree(&["src/new.rs"]);
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut gotchas = vec![make_gotcha("gotcha:draft", &["src/old.rs"], false)];
+        store.put("gotcha:draft", &gotchas[0]).await.unwrap();
+        seed_file_record(&store, "src/old.rs", &["gotcha:draft"]).await;
+        seed_file_record(&store, "src/new.rs", &[]).await;
+
+        let applied = migrate_renamed_gotchas(
+            &store,
+            dir.path(),
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &mut gotchas,
+        )
+        .await;
+
+        assert_eq!(applied.len(), 1);
+        let stored = store.get("gotcha:draft").await.unwrap().unwrap();
+        assert_eq!(affected(&stored), vec!["src/new.rs"]);
+        assert!(!stored.payload_as::<GotchaRecord>().unwrap().confirmed);
+
+        let file_record = store.get("file:src/new.rs").await.unwrap().unwrap();
+        let decision = evaluate(&EnforcementInput {
+            rel_path: "src/new.rs".into(),
+            file_record: serde_json::to_value(&file_record).ok(),
+            gotcha_records: HashMap::from([(
+                "gotcha:draft".to_string(),
+                serde_json::to_value(&stored).unwrap(),
+            )]),
+            already_consulted: false,
+        })
+        .decision;
+        assert!(
+            matches!(decision, Decision::Allow),
+            "an unconfirmed gotcha must not deny after being re-keyed"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// Both paths already carry a gotcha. Keys are distinct, so the new file
+    /// record ends up enforcing both rather than either being dropped.
+    #[tokio::test]
+    async fn migration_merges_when_both_paths_have_gotchas() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut gotchas = vec![
+            make_gotcha("gotcha:on-old", &["src/old.rs"], true),
+            make_gotcha("gotcha:on-new", &["src/new.rs"], true),
+        ];
+        store.put("gotcha:on-old", &gotchas[0]).await.unwrap();
+        store.put("gotcha:on-new", &gotchas[1]).await.unwrap();
+        seed_file_record(&store, "src/old.rs", &["gotcha:on-old"]).await;
+        seed_file_record(&store, "src/new.rs", &["gotcha:on-new"]).await;
+
+        let applied = migrate_renamed_gotchas(
+            &store,
+            dir.path(),
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &mut gotchas,
+        )
+        .await;
+
+        assert_eq!(applied.len(), 1, "only the gotcha naming `old` moves");
+        let new_file = store.get("file:src/new.rs").await.unwrap().unwrap();
+        let mut keys = new_file.payload_as::<FileRecord>().unwrap().gotcha_keys;
+        keys.sort();
+        assert_eq!(keys, vec!["gotcha:on-new", "gotcha:on-old"]);
+        assert!(store.get("file:src/old.rs").await.unwrap().is_none());
+
+        store.close().await.unwrap();
+    }
+
+    /// The point of the whole pass: the read gate must deny on the new path.
+    #[tokio::test]
+    async fn gate_denies_on_the_new_path_after_migration() {
+        use mati_core::hooks::decide::{evaluate, Decision, EnforcementInput};
+
+        let dir = scratch_tree(&["src/new.rs"]);
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut gotchas = vec![make_gotcha("gotcha:lock", &["src/old.rs"], true)];
+        store.put("gotcha:lock", &gotchas[0]).await.unwrap();
+        seed_file_record(&store, "src/old.rs", &["gotcha:lock"]).await;
+        seed_file_record(&store, "src/new.rs", &[]).await;
+
+        // Before: the new path has no gotcha attached, so the gate allows.
+        let before = evaluate(&EnforcementInput {
+            rel_path: "src/new.rs".into(),
+            file_record: serde_json::to_value(store.get("file:src/new.rs").await.unwrap().unwrap())
+                .ok(),
+            gotcha_records: HashMap::new(),
+            already_consulted: false,
+        });
+        assert!(matches!(before.decision, Decision::Allow));
+
+        migrate_renamed_gotchas(
+            &store,
+            dir.path(),
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &mut gotchas,
+        )
+        .await;
+
+        let file_record = store.get("file:src/new.rs").await.unwrap().unwrap();
+        let gotcha = store.get("gotcha:lock").await.unwrap().unwrap();
+        let after = evaluate(&EnforcementInput {
+            rel_path: "src/new.rs".into(),
+            file_record: serde_json::to_value(&file_record).ok(),
+            gotcha_records: HashMap::from([(
+                "gotcha:lock".to_string(),
+                serde_json::to_value(&gotcha).unwrap(),
+            )]),
+            already_consulted: false,
+        });
+        assert!(
+            matches!(after.decision, Decision::Deny { .. }),
+            "expected a deny on the renamed path, got {:?}",
+            std::mem::discriminant(&after.decision)
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// A sandbox-tagged gotcha is flagged so init can tell the user the
+    /// materialized deny floor still names the old path.
+    #[tokio::test]
+    async fn migration_flags_a_sandbox_tagged_gotcha() {
+        let dir = scratch_tree(&["src/new.rs"]);
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut rec = make_gotcha("gotcha:secrets", &["src/old.rs"], true);
+        rec.tags = vec![super::super::sandbox::TAG_DENY_READ.to_string()];
+        store.put("gotcha:secrets", &rec).await.unwrap();
+        let mut gotchas = vec![rec];
+        seed_file_record(&store, "src/old.rs", &["gotcha:secrets"]).await;
+
+        let applied = migrate_renamed_gotchas(
+            &store,
+            dir.path(),
+            &renames(&[("src/old.rs", "src/new.rs")]),
+            &mut gotchas,
+        )
+        .await;
+
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].sandbox_tagged);
+
+        store.close().await.unwrap();
     }
 }
 
