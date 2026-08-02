@@ -127,9 +127,12 @@ routing, etc).
 
 ### Stage 1 — Setup (before reading)
 
-1. `mem_query mode="text" query="<dirname-of-file>" limit 5`
-   → top 5 confirmed gotchas as POSITIVE EXEMPLARS. If zero exist
-     (cold start), continue with schema-only guidance.
+1. `mem_query mode="dir_gotchas" query="<dirname-of-file>" limit 5`
+   → top 5 confirmed gotchas for that directory as POSITIVE
+     EXEMPLARS. If the array is empty (cold start), continue with
+     schema-only guidance. Do not use `mode="text"` here: the search
+     index carries no `affected_files`, so a directory query returns
+     file records instead of gotchas.
 2. `mem_get("file:<path>")` — mints the consultation receipt, returns
    existing gotcha_keys, AND returns the `enrichment_depth_hint` field
    (D2-α: one of "fast", "standard", "deep"). Use it to pick the

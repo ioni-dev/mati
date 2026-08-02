@@ -711,14 +711,15 @@ pub(crate) async fn socket_dispatch(
                 "text" => super::protocol::QueryMode::Text,
                 "tag" => super::protocol::QueryMode::Tag,
                 "graph" => super::protocol::QueryMode::Graph,
+                "dir_gotchas" => super::protocol::QueryMode::DirGotchas,
                 "semantic" => super::protocol::QueryMode::Semantic,
                 "policy_observations" => super::protocol::QueryMode::PolicyObservations,
                 "policy_activity" => super::protocol::QueryMode::PolicyActivity,
                 "analytics" => super::protocol::QueryMode::Analytics,
                 other => {
                     return SocketResponse::err(format!(
-                        "unknown mode: {other}. Valid modes: text, tag, graph, semantic, \
-                         policy_observations, policy_activity, analytics"
+                        "unknown mode: {other}. Valid modes: text, tag, graph, dir_gotchas, \
+                         semantic, policy_observations, policy_activity, analytics"
                     ));
                 }
             };

@@ -20,20 +20,25 @@ pub struct MemQueryParams {
     /// Search query string. For text mode: matched against record keys, values, and tags.
     /// For tag mode: matched against record tags (substring, case-insensitive).
     /// For graph mode: must be a full namespaced record key (e.g. "file:src/main.rs" or "gotcha:my-rule").
+    /// For dir_gotchas mode: a repo-relative directory or file path (e.g. "src/store");
+    /// an empty query returns nothing.
     /// For policy_observations / policy_activity: a policy slug (empty = all policies).
     /// For analytics: a key substring naming the aggregate (e.g. "miss_"); required —
     /// an empty query returns nothing (it will not dump every analytics record).
     pub query: String,
     /// Search mode. Knowledge search: "text" (default, BM25 full-text),
-    /// "tag" (filter by tag), "graph" (1-hop traversal from an exact seed key).
+    /// "tag" (filter by tag), "graph" (1-hop traversal from an exact seed key),
+    /// "dir_gotchas" (confirmed gotchas whose affected_files sit under a
+    /// directory path, ranked by confidence then quality).
     /// Enforcement telemetry (read-only, local): "policy_observations" (shadow
     /// observations), "policy_activity" (activity report, honors `since`),
     /// "analytics" (raw analytics:* records).
     #[serde(default = "default_mode")]
     pub mode: String,
-    /// Maximum number of results to return (default: 20). Bounds the "analytics"
-    /// result set; "policy_observations" and "policy_activity" return the full
-    /// aggregate regardless.
+    /// Maximum number of results to return (default: 20, clamped to 50 — a
+    /// larger value silently returns 50, it is not an error). Bounds the
+    /// "analytics" result set; "policy_observations" and "policy_activity"
+    /// return the full aggregate regardless.
     #[serde(default = "default_limit")]
     pub limit: usize,
     /// Look-back window in days for the "policy_activity" mode (default: 30).

@@ -239,7 +239,7 @@ impl MatiServer {
     /// Text mode returns a JSON array. Graph mode returns a grouped JSON object.
     #[rmcp::tool(
         name = "mem_query",
-        description = "Search the mati knowledge store, or read local enforcement telemetry. Knowledge modes: \"text\" (BM25 full-text), \"tag\" (filter by tag), \"graph\" (1-hop traversal from a seed key). Telemetry modes (read-only): \"policy_observations\", \"policy_activity\" (optional `since` in days), \"analytics\".",
+        description = "Search the mati knowledge store, or read local enforcement telemetry. Knowledge modes: \"text\" (BM25 full-text), \"tag\" (filter by tag), \"graph\" (1-hop traversal from a seed key), \"dir_gotchas\" (confirmed gotchas whose affected_files sit under a directory path). Telemetry modes (read-only): \"policy_observations\", \"policy_activity\" (optional `since` in days), \"analytics\". `limit` is clamped to 50 in every mode; a larger value returns 50 results, not an error.",
         annotations(read_only_hint = true)
     )]
     pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
@@ -1523,6 +1523,150 @@ mod tests {
         assert!(
             result.contains("--features semantic"),
             "semantic mode must surface feature-gate error, got: {result}"
+        );
+    }
+
+    // ── mem_query dir_gotchas tests ──────────────────────────────────────────
+
+    fn make_dir_gotcha(
+        key: &str,
+        rule: &str,
+        confirmed: bool,
+        affected_files: &[&str],
+        confidence: f32,
+    ) -> Record {
+        let gotcha = GotchaRecord {
+            rule: rule.to_string(),
+            reason: "test reason".to_string(),
+            severity: Priority::High,
+            affected_files: affected_files.iter().map(|f| f.to_string()).collect(),
+            ref_url: None,
+            discovered_session: now(),
+            confirmed,
+            confirmed_content: Default::default(),
+        };
+        let mut record = make_record(key, rule, Category::Gotcha, 0.7);
+        record.confidence.value = confidence;
+        record.payload = serde_json::to_value(&gotcha).ok();
+        record
+    }
+
+    async fn seeded_dir_gotcha_graph(dir: &TempDir) -> std::sync::Arc<tokio::sync::RwLock<Graph>> {
+        let store = Store::open(dir.path()).await.unwrap();
+        for record in [
+            make_dir_gotcha(
+                "gotcha:store-low",
+                "Store rule low",
+                true,
+                &["src/store/db.rs"],
+                0.7,
+            ),
+            make_dir_gotcha(
+                "gotcha:store-high",
+                "Store rule high",
+                true,
+                &["src/store/nested/deep.rs"],
+                0.9,
+            ),
+            make_dir_gotcha(
+                "gotcha:store-unconfirmed",
+                "Store stub",
+                false,
+                &["src/store/db.rs"],
+                0.9,
+            ),
+            make_dir_gotcha(
+                "gotcha:other-dir",
+                "Mcp rule",
+                true,
+                &["src/mcp/server.rs"],
+                0.9,
+            ),
+        ] {
+            let key = record.key.clone();
+            store.put(&key, &record).await.unwrap();
+        }
+        let graph = Graph::load(store).await.unwrap();
+        std::sync::Arc::new(tokio::sync::RwLock::new(graph))
+    }
+
+    /// The documented Stage 1.1 call: a directory path must return the
+    /// confirmed gotchas for that directory — including nested ones, excluding
+    /// unconfirmed stubs and other directories — ranked by confidence.
+    #[tokio::test]
+    async fn mem_query_dir_gotchas_returns_confirmed_gotchas_under_the_path() {
+        let dir = TempDir::new().unwrap();
+        let graph_arc = seeded_dir_gotcha_graph(&dir).await;
+
+        let result = call_mem_query(
+            &graph_arc,
+            "src/store",
+            crate::mcp::protocol::QueryMode::DirGotchas,
+            10,
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let keys: Vec<&str> = parsed
+            .as_array()
+            .expect("dir_gotchas must return an array")
+            .iter()
+            .map(|r| r["key"].as_str().unwrap())
+            .collect();
+        assert_eq!(keys, vec!["gotcha:store-high", "gotcha:store-low"]);
+    }
+
+    /// A directory with no confirmed gotchas returns an empty array, not an
+    /// error. `src/st` must not match `src/store` — the prefix is
+    /// segment-aware. An empty query returns nothing rather than everything.
+    #[tokio::test]
+    async fn mem_query_dir_gotchas_empty_when_nothing_matches() {
+        let dir = TempDir::new().unwrap();
+        let graph_arc = seeded_dir_gotcha_graph(&dir).await;
+
+        for query in ["docs", "src/st", ""] {
+            let result = call_mem_query(
+                &graph_arc,
+                query,
+                crate::mcp::protocol::QueryMode::DirGotchas,
+                10,
+            )
+            .await;
+            assert_eq!(
+                result.trim(),
+                "[]",
+                "query {query:?} must return an empty array, got: {result}"
+            );
+        }
+    }
+
+    /// Text mode is the wrong tool for this lookup and stays that way: the
+    /// tantivy index carries no `affected_files`, so a directory query matches
+    /// file records by key. Pins why Stage 1.1 uses `dir_gotchas`.
+    #[tokio::test]
+    async fn mem_query_text_mode_does_not_match_gotchas_by_directory() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let record = make_dir_gotcha(
+            "gotcha:some-rule",
+            "Rule text with no path in it",
+            true,
+            &["src/store/db.rs"],
+            0.9,
+        );
+        store.put("gotcha:some-rule", &record).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_query(
+            &graph_arc,
+            "src/store",
+            crate::mcp::protocol::QueryMode::Text,
+            10,
+        )
+        .await;
+        assert!(
+            !result.contains("gotcha:some-rule"),
+            "text mode must not retrieve gotchas by directory, got: {result}"
         );
     }
 

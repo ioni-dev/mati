@@ -487,6 +487,10 @@ pub enum QueryMode {
     Tag,
     /// 1-hop graph traversal from a seed key.
     Graph,
+    /// Confirmed gotchas whose `affected_files` fall under a path prefix.
+    /// `query` is a repo-relative directory or file path; empty returns nothing.
+    /// Resolves against the canonical `gotcha:*` records, not the search index.
+    DirGotchas,
     /// Semantic search (requires --features semantic).
     Semantic,
     /// Shadow observations for local policies (`analytics:policy_shadow_*`).
@@ -1102,6 +1106,7 @@ mod tests {
             "text",
             "tag",
             "graph",
+            "dir_gotchas",
             "semantic",
             "policy_observations",
             "policy_activity",
