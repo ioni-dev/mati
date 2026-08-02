@@ -37,6 +37,36 @@ thread_local! {
     });
 }
 
+/// `def test_*`, `class Test*`, a `unittest.TestCase` subclass, or anything
+/// carrying a `pytest.*` decorator.
+fn is_test_node(node: tree_sitter::Node, source: &[u8]) -> bool {
+    match node.kind() {
+        "function_definition" => {
+            super::named_field_matches(node, source, "name", |n| n.starts_with("test_"))
+        }
+        "class_definition" => {
+            super::named_field_matches(node, source, "name", |n| n.starts_with("Test"))
+                || node
+                    .child_by_field_name("superclasses")
+                    .is_some_and(|s| super::node_text(source, s).contains("TestCase"))
+        }
+        "decorated_definition" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "decorator"
+                    && super::node_text(source, child)
+                        .trim_start_matches('@')
+                        .starts_with("pytest.")
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let tree = PY_PARSER.with(|p| {
         let mut parser = p.borrow_mut();
@@ -45,6 +75,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             .ok_or_else(|| anyhow::anyhow!("enrich_signals/python: parse returned None"))
     })?;
     let bytes = source.as_bytes();
+    let test_ranges = super::collect_test_ranges(tree.root_node(), |n| is_test_node(n, bytes));
     let mut out: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| PY_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
@@ -54,6 +85,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     for m in cursor.matches(&PY_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
             let node = c.node;
+            if super::in_test_range(&test_ranges, node) {
+                continue;
+            }
             let line = node.start_position().row as u32 + 1;
             let evidence = super::node_text(bytes, node);
             if c.index == i_panic || c.index == i_sys_exit {
@@ -116,5 +150,27 @@ mod tests {
             .iter()
             .any(|s| s.kind == SignalKind::WarnComment && s.tier == SignalTier::High));
         assert!(signals.iter().any(|s| s.kind == SignalKind::LinterDisable));
+    }
+    #[test]
+    fn test_function_signals_excluded() {
+        assert!(extract("def test_f():\n    assert x\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn testcase_subclass_excluded() {
+        let src = "class B(unittest.TestCase):\n    def m(self):\n        assert y\n";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pytest_decorated_definition_excluded() {
+        let src = "@pytest.mark.skip\ndef helper():\n    assert z\n";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn production_function_named_testable_kept() {
+        let src = "def testable():\n    assert invariant\n";
+        assert_eq!(extract(src).unwrap().len(), 1);
     }
 }

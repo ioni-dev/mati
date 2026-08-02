@@ -34,6 +34,33 @@ thread_local! {
     });
 }
 
+/// JUnit lifecycle annotations live in the `modifiers` child, unlike Rust
+/// where an attribute is a preceding sibling.
+fn is_test_method(node: tree_sitter::Node, source: &[u8]) -> bool {
+    const ANNOTATIONS: [&str; 7] = [
+        "@Test",
+        "@ParameterizedTest",
+        "@RepeatedTest",
+        "@BeforeEach",
+        "@BeforeAll",
+        "@AfterEach",
+        "@AfterAll",
+    ];
+    if node.kind() != "method_declaration" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let text = super::node_text(source, child);
+            if ANNOTATIONS.iter().any(|a| text.contains(a)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let tree = JAVA_PARSER.with(|p| {
         let mut parser = p.borrow_mut();
@@ -42,6 +69,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             .ok_or_else(|| anyhow::anyhow!("enrich_signals/java: parse returned None"))
     })?;
     let bytes = source.as_bytes();
+    let test_ranges = super::collect_test_ranges(tree.root_node(), |n| is_test_method(n, bytes));
     let mut out: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| JAVA_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
@@ -49,6 +77,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 
     for m in cursor.matches(&JAVA_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
+            if super::in_test_range(&test_ranges, c.node) {
+                continue;
+            }
             let line = c.node.start_position().row as u32 + 1;
             let evidence = super::node_text(bytes, c.node);
             if c.index == i_panic {
@@ -96,5 +127,16 @@ mod tests {
         let src = "// CHECKSTYLE:OFF\nclass X {}";
         let signals = extract(src).unwrap();
         assert!(signals.iter().any(|s| s.kind == SignalKind::LinterDisable));
+    }
+    #[test]
+    fn junit_test_method_excluded() {
+        let src = "class T { @Test public void f() { throw new IllegalStateException(\"x\"); } }";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unannotated_method_kept() {
+        let src = "class T { public void f() { throw new IllegalStateException(\"x\"); } }";
+        assert_eq!(extract(src).unwrap().len(), 1);
     }
 }

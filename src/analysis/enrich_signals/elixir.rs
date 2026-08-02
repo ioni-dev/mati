@@ -39,6 +39,29 @@ thread_local! {
     });
 }
 
+/// A module that does `use ExUnit.Case`, or an ExUnit block macro. The `use`
+/// form is the reliable signal: ExUnit test files always declare it.
+fn is_test_node(node: tree_sitter::Node, source: &[u8]) -> bool {
+    if node.kind() != "call" {
+        return false;
+    }
+    let Some(target) = node.child_by_field_name("target") else {
+        return false;
+    };
+    match super::node_text(source, target).trim() {
+        "defmodule" => super::node_text(source, node).contains("ExUnit.Case"),
+        "test" | "describe" | "setup" | "setup_all" => {
+            let mut cursor = node.walk();
+            let mut has_block = false;
+            for child in node.named_children(&mut cursor) {
+                has_block |= child.kind() == "do_block";
+            }
+            has_block
+        }
+        _ => false,
+    }
+}
+
 pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let tree = EX_PARSER.with(|p| {
         let mut parser = p.borrow_mut();
@@ -47,6 +70,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
             .ok_or_else(|| anyhow::anyhow!("enrich_signals/elixir: parse returned None"))
     })?;
     let bytes = source.as_bytes();
+    let test_ranges = super::collect_test_ranges(tree.root_node(), |n| is_test_node(n, bytes));
     let mut out: Vec<Signal> = Vec::new();
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| EX_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
@@ -54,6 +78,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
 
     for m in cursor.matches(&EX_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
+            if super::in_test_range(&test_ranges, c.node) {
+                continue;
+            }
             let line = c.node.start_position().row as u32 + 1;
             let evidence = super::node_text(bytes, c.node);
             if c.index == i_panic {
@@ -104,5 +131,17 @@ mod tests {
     fn detects_warning_comment() {
         let signals = extract("# WARNING: do not call from a Plug\ndef f, do: :ok").unwrap();
         assert!(signals.iter().any(|s| s.kind == SignalKind::WarnComment));
+    }
+    #[test]
+    fn exunit_module_excluded() {
+        let src =
+            "defmodule FT do\n  use ExUnit.Case\n  test \"a\" do\n    raise \"x\"\n  end\nend\n";
+        assert!(extract(src).unwrap().is_empty());
+    }
+
+    #[test]
+    fn production_module_kept() {
+        let src = "defmodule F do\n  def run do\n    raise \"x\"\n  end\nend\n";
+        assert_eq!(extract(src).unwrap().len(), 1);
     }
 }
