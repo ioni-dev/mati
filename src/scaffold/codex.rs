@@ -230,29 +230,25 @@ For each verified candidate:
    tightening — no concrete API, value, or pattern to enforce on —
    drop it here.
 2. Verify reason uses "because"/"since"/"as" — add if missing.
-3. Assign severity via HYBRID CLASSIFIER (D-β). Two passes:
+3. Assign severity (D-β). One judgment, one deterministic floor:
 
-   3a. KEYWORD pass (deterministic):
-       contains "panic" / "data loss" / "corruption" / "security"
-         → critical
-       contains "regress" / "wrong result" / "silent failure" / "race" /
-                "silently" / "lose" / "lost" / "unbounded" / "indefinite"
-         → high
-       contains "performance" / "warning" / "deprecation" / "slow" /
-                "lock" / "exclusive" / "contention" / "stale state" /
-                "false positive" / "inconsistent"
-         → normal
-       else
-         → low
-
-   3b. SEMANTIC pass (LLM judgment) using rubric:
+   3a. SEMANTIC pass — the severity. Judge rule + reason against:
        critical — data loss, corruption, security, unbounded growth
        high     — wrong result, silent failure, race, broken invariant
        normal   — performance, workflow blocker, non-obvious cleanup
        low      — informational, stylistic, minor inconvenience
 
-   3c. If 3a and 3b agree → use that severity.
-       If they disagree → use the HIGHER + add tag "severity-disputed".
+   3b. KEYWORD FLOOR — deterministic, raises only, never lowers.
+       Scan rule + reason case-insensitively for these stems:
+         "data loss" / "corrupt" / "security" / "unbounded"  → critical
+         "silent" / "race" / "wrong result" / "lost"         → high
+       No stem present → no floor.
+
+   3c. severity = the higher of 3a and the floor.
+       Tag "severity-disputed" ONLY when the floor RAISED 3a — the
+       text names a failure the judgment underrated. No stem matched,
+       or 3a already at or above the floor → no tag. The tag flags a
+       real conflict for the reviewer; it is not a routine annotation.
 
 4. Call `mem_set`:
      key: `gotcha:<slug>`

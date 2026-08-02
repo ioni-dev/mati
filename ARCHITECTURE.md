@@ -784,13 +784,13 @@ Specificity — specific, enforceable, non-obvious, causal — is drafting guida
 
 **Stage 3 (Evidence verification):** One pass, every tier. Call `mati verify-evidence`, a deterministic CLI, to confirm that each candidate’s file line and quote are real. Discard the ones that fail. The CLI is the source of truth; there is no self-critique round and no re-run, because a repeat call on the same candidate returns the same verdict. It reads a ±5-line window, so it proves the citation is real, not that the rule follows from it — a rule whose claim spans more of the file than that window passes unverified.
 
-**Stage 4 (Write):** For each verified candidate, tighten the rule and drop any that stays vague, verify causality language, assign severity through a hybrid keyword and semantic classifier, then call `mem_set`.
+**Stage 4 (Write):** For each verified candidate, tighten the rule and drop any that stays vague, verify causality language, assign severity, then call `mem_set`.
 
 Severity classification works like this:
 
-- Keyword pass first. “panic”, “data loss”, or “corruption” becomes critical. “race” or “silent failure” becomes high. “performance” or “stale state” becomes normal.
-- Semantic pass second, using LLM judgment against the same rubric.
-- If both passes agree, use that severity. If they disagree, use the higher severity and tag the record `severity-disputed`.
+- Semantic pass sets the severity, using LLM judgment against the rubric: critical for data loss, corruption, security, unbounded growth; high for a wrong result, silent failure, race, or broken invariant; normal for performance and workflow blockers; low for everything informational.
+- A deterministic keyword floor can only raise that verdict. “data loss”, “corrupt”, “security”, or “unbounded” floors at critical. “silent”, “race”, “wrong result”, or “lost” floors at high.
+- Tag `severity-disputed` only when the floor raised the semantic verdict. An earlier design ran the keyword pass as a peer and tagged every disagreement, which fired on 69% of candidates because natural prose rarely contains the exact literals — the pass fell through to low and disagreed by default.
 
 After batch enrichment, run `mati review` to confirm candidates and activate enforcement. Single-file enrichment confirms each gotcha immediately through `mati gotcha confirm <key>`.
 
