@@ -18,6 +18,16 @@
 //! This means **links and edges are never authoritative**. They are
 //! materialized views that can be rebuilt entirely from `gotcha:*` records.
 //!
+//! # Unnormalized paths
+//!
+//! Rebuilding from the canonical record only works if the record's
+//! `affected_files` are spelled the way the read gate spells them. Writes
+//! before `gotcha_ops` normalized them could store `./src/a.rs` or an absolute
+//! path, which joins to no `file:*` record at all — the gotcha is silently
+//! inert. This is drift in the canonical record itself, not in a derived index,
+//! so it gets its own class ([`RepairReport::unnormalized_paths`]) and is
+//! repaired first, before any index reconciliation.
+//!
 //! # Dirty markers
 //!
 //! When a best-effort secondary write fails in [`super::gotcha_ops`], the
@@ -109,6 +119,12 @@ pub struct RepairReport {
     pub stale_file_links: Vec<DriftEntry>,
     pub missing_edges: Vec<DriftEntry>,
     pub stale_edges: Vec<DriftEntry>,
+    /// `affected_files` entries stored in a spelling the read gate never
+    /// produces (`./src/a.rs`, an absolute path, `src//a.rs`). `file_path`
+    /// holds the offending entry as stored. `#[serde(default)]` so reports
+    /// serialized before this field existed still deserialize.
+    #[serde(default)]
+    pub unnormalized_paths: Vec<DriftEntry>,
     pub repaired_count: usize,
     pub verification_passed: bool,
     pub dirty_marker_cleared: bool,
@@ -120,6 +136,7 @@ impl RepairReport {
             || !self.stale_file_links.is_empty()
             || !self.missing_edges.is_empty()
             || !self.stale_edges.is_empty()
+            || !self.unnormalized_paths.is_empty()
     }
 
     pub fn total_drift(&self) -> usize {
@@ -127,6 +144,7 @@ impl RepairReport {
             + self.stale_file_links.len()
             + self.missing_edges.len()
             + self.stale_edges.len()
+            + self.unnormalized_paths.len()
     }
 }
 
@@ -235,23 +253,24 @@ pub async fn is_dirty<R: RepairReader>(reader: &R) -> bool {
 /// Does not write anything.
 pub async fn check_gotcha_indexes<R: RepairReader>(reader: &R) -> Result<RepairReport> {
     // Phase 1: derive desired state from canonical gotcha records
-    let (desired_file_links, desired_edges, scanned_gotchas) = derive_desired_state(reader).await?;
+    let desired = derive_desired_state(reader).await?;
 
     // Phase 2: diff against actual state
     let (actual_file_links, scanned_files) = read_actual_file_links(reader).await?;
     let actual_edges = read_actual_edges(reader).await?;
 
     let (missing_file_links, stale_file_links) =
-        diff_file_links(&desired_file_links, &actual_file_links);
-    let (missing_edges, stale_edges) = diff_edges(&desired_edges, &actual_edges);
+        diff_file_links(&desired.file_links, &actual_file_links);
+    let (missing_edges, stale_edges) = diff_edges(&desired.edges, &actual_edges);
 
     Ok(RepairReport {
-        scanned_gotchas,
+        scanned_gotchas: desired.scanned,
         scanned_files,
         missing_file_links,
         stale_file_links,
         missing_edges,
         stale_edges,
+        unnormalized_paths: desired.unnormalized,
         repaired_count: 0,
         verification_passed: true, // check-only: no repair to verify
         dirty_marker_cleared: false,
@@ -278,16 +297,23 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
         return repair_fast(store, now).await;
     }
 
+    // Phase 0: re-key gotchas whose affected_files were stored in a spelling
+    // the read gate never produces. This has to run BEFORE the desired state is
+    // derived — desired state comes from the canonical paths, so reconciling
+    // first would rebuild links for the wrong spelling and undo itself.
+    let (unnormalized_paths, path_repairs) = repair_unnormalized_paths(store, now).await?;
+
     // Phase 1: derive desired state
-    let (desired_file_links, desired_edges, scanned_gotchas) = derive_desired_state(store).await?;
+    let desired = derive_desired_state(store).await?;
+    let scanned_gotchas = desired.scanned;
 
     // Phase 2: diff
     let (actual_file_links, scanned_files) = read_actual_file_links(store).await?;
     let actual_edges = read_actual_edges(store).await?;
 
     let (missing_file_links, stale_file_links) =
-        diff_file_links(&desired_file_links, &actual_file_links);
-    let (missing_edges, stale_edges) = diff_edges(&desired_edges, &actual_edges);
+        diff_file_links(&desired.file_links, &actual_file_links);
+    let (missing_edges, stale_edges) = diff_edges(&desired.edges, &actual_edges);
 
     let total_drift =
         missing_file_links.len() + stale_file_links.len() + missing_edges.len() + stale_edges.len();
@@ -302,7 +328,8 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
             stale_file_links: vec![],
             missing_edges: vec![],
             stale_edges: vec![],
-            repaired_count: 0,
+            unnormalized_paths,
+            repaired_count: path_repairs,
             verification_passed: true,
             dirty_marker_cleared: true,
         });
@@ -311,8 +338,8 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     // Phase 3: apply repairs
 
     // 3a. Rebuild file-record gotcha_keys from desired state
-    let mut repaired = 0usize;
-    for (file_path, desired_keys) in &desired_file_links {
+    let mut repaired = path_repairs;
+    for (file_path, desired_keys) in &desired.file_links {
         let file_key = format!("file:{file_path}");
         if let Ok(Some(mut record)) = store.get(&file_key).await {
             let current_keys = extract_gotcha_keys(&record);
@@ -334,7 +361,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     // Also clear gotcha_keys from files that should have none
     let (actual_file_links_2, _) = read_actual_file_links(store).await?;
     for (file_path, actual_keys) in &actual_file_links_2 {
-        if !desired_file_links.contains_key(file_path.as_str()) && !actual_keys.is_empty() {
+        if !desired.file_links.contains_key(file_path.as_str()) && !actual_keys.is_empty() {
             let file_key = format!("file:{file_path}");
             if let Ok(Some(mut record)) = store.get(&file_key).await {
                 set_gotcha_keys(&mut record, vec![]);
@@ -380,10 +407,81 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
         stale_file_links,
         missing_edges,
         stale_edges,
+        unnormalized_paths,
         repaired_count: repaired,
         verification_passed,
         dirty_marker_cleared: verification_passed,
     })
+}
+
+// ── Path normalization repair ────────────────────────────────────────────────
+
+/// Rewrite every active gotcha whose `affected_files` are not in normalized
+/// form, and re-point its file links at the corrected paths.
+///
+/// Detection and repair share one scan. Link maintenance goes through
+/// [`crate::store::gotcha_ops::sync_gotcha_file_links`], which diffs old
+/// against new, handles the MVCC retry, and creates a Layer 0 `file:*` stub
+/// when the corrected path has no record yet — so the gate starts enforcing
+/// without waiting for a re-index. Graph edges are left to the main diff phase,
+/// which runs afterwards against the rewritten canonical records.
+///
+/// Returns the drift that was found (for the report) and the number of records
+/// rewritten. The record write fails hard, matching the canonical-record rule
+/// in the module docs; the link sync is best-effort.
+async fn repair_unnormalized_paths(store: &Store, now: u64) -> Result<(Vec<DriftEntry>, usize)> {
+    let mut drift: Vec<DriftEntry> = Vec::new();
+    let mut repaired = 0usize;
+
+    for mut record in store.scan_prefix("gotcha:").await? {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        let Some(gotcha) = record.payload_as::<GotchaRecord>() else {
+            continue;
+        };
+
+        let normalized = crate::store::gotcha_ops::normalize_affected_files(&gotcha.affected_files);
+        if normalized == gotcha.affected_files {
+            continue;
+        }
+        drift.extend(unnormalized_entries(&record.key, &gotcha.affected_files));
+
+        // Patch the array in place rather than re-serializing a GotchaRecord:
+        // MCP `mem_set` merges caller payloads, so a gotcha payload can carry
+        // fields beyond the struct and re-serializing would drop them.
+        let Some(obj) = record.payload.as_mut().and_then(|p| p.as_object_mut()) else {
+            continue;
+        };
+        obj.insert(
+            "affected_files".into(),
+            serde_json::Value::Array(
+                normalized
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        record.updated_at = now;
+        record.version.logical_clock += 1;
+        record.version.wall_clock = now;
+        store.put(&record.key, &record).await?;
+        repaired += 1;
+
+        if let Err(e) = crate::store::gotcha_ops::sync_gotcha_file_links(
+            store,
+            &record.key,
+            &gotcha.affected_files,
+            &normalized,
+        )
+        .await
+        {
+            tracing::warn!("repair: file link re-point failed for {}: {e}", record.key);
+        }
+    }
+
+    Ok((drift, repaired))
 }
 
 // ── Fast repair ──────────────────────────────────────────────────────────────
@@ -399,6 +497,7 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
                 stale_file_links: vec![],
                 missing_edges: vec![],
                 stale_edges: vec![],
+                unnormalized_paths: vec![],
                 repaired_count: 0,
                 verification_passed: true,
                 dirty_marker_cleared: false,
@@ -497,6 +596,9 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
         stale_file_links: vec![],
         missing_edges: vec![],
         stale_edges: vec![],
+        // Fast mode never scans for unnormalized paths — that needs the full
+        // `gotcha:*` walk, which is exactly what this mode exists to skip.
+        unnormalized_paths: vec![],
         repaired_count: repaired,
         verification_passed: true,
         dirty_marker_cleared: repaired > 0,
@@ -505,19 +607,26 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
 
+/// Phase 1 output: what the derived indexes should contain, plus the canonical
+/// records that are themselves malformed.
+struct DesiredState {
+    file_links: HashMap<String, BTreeSet<String>>,
+    edges: BTreeSet<(String, String)>,
+    scanned: usize,
+    /// `affected_files` entries that are not in normalized form. Reported as
+    /// drift in its own right — the desired state derived above still uses the
+    /// stored spelling, since that is what the indexes were built from.
+    unnormalized: Vec<DriftEntry>,
+}
+
 /// Phase 1: build desired state from canonical gotcha records.
-async fn derive_desired_state<R: RepairReader>(
-    reader: &R,
-) -> Result<(
-    HashMap<String, BTreeSet<String>>,
-    BTreeSet<(String, String)>,
-    usize,
-)> {
+async fn derive_desired_state<R: RepairReader>(reader: &R) -> Result<DesiredState> {
     let gotchas = reader.scan_prefix("gotcha:").await?;
     let scanned = gotchas.len();
 
-    let mut desired_file_links: HashMap<String, BTreeSet<String>> = HashMap::new();
-    let mut desired_edges: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut file_links: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut unnormalized: Vec<DriftEntry> = Vec::new();
 
     for record in &gotchas {
         if !matches!(record.lifecycle, RecordLifecycle::Active) {
@@ -527,16 +636,44 @@ async fn derive_desired_state<R: RepairReader>(
             continue;
         };
 
+        unnormalized.extend(unnormalized_entries(&record.key, &gotcha.affected_files));
+
         for file_path in &gotcha.affected_files {
-            desired_file_links
+            file_links
                 .entry(file_path.clone())
                 .or_default()
                 .insert(record.key.clone());
-            desired_edges.insert((file_path.clone(), record.key.clone()));
+            edges.insert((file_path.clone(), record.key.clone()));
         }
     }
 
-    Ok((desired_file_links, desired_edges, scanned))
+    Ok(DesiredState {
+        file_links,
+        edges,
+        scanned,
+        unnormalized,
+    })
+}
+
+/// Which of `affected_files` are not in the form the read gate produces.
+///
+/// An entry is drift when it does not survive
+/// [`crate::store::gotcha_ops::normalize_affected_files`] verbatim — either it
+/// normalized to something else (`./src/a.rs` → `src/a.rs`) or it collapsed
+/// into a duplicate of another entry.
+fn unnormalized_entries(gotcha_key: &str, affected_files: &[String]) -> Vec<DriftEntry> {
+    let normalized = crate::store::gotcha_ops::normalize_affected_files(affected_files);
+    if normalized == affected_files {
+        return Vec::new();
+    }
+    affected_files
+        .iter()
+        .filter(|path| !normalized.contains(*path))
+        .map(|path| DriftEntry {
+            gotcha_key: gotcha_key.to_string(),
+            file_path: path.clone(),
+        })
+        .collect()
 }
 
 /// Read actual gotcha_keys from all file records.
@@ -995,6 +1132,129 @@ mod tests {
 
         let a = store.get("file:src/a.rs").await.unwrap().unwrap();
         assert!(extract_gotcha_keys(&a).is_empty());
+
+        store.close().await.unwrap();
+    }
+
+    // ── Unnormalized affected_files ──────────────────────────────────────
+    //
+    // Records written before `gotcha_ops` normalized paths carry spellings the
+    // read gate never produces, so they join to no `file:*` record and the
+    // gotcha is silently inert. `--check` has to surface that (it gates CI) and
+    // a normal run has to fix it.
+
+    #[tokio::test]
+    async fn check_detects_unnormalized_affected_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("gotcha:g1", &make_gotcha("gotcha:g1", &["./src/a.rs"]))
+            .await
+            .unwrap();
+
+        let report = check_gotcha_indexes(&store).await.unwrap();
+        assert!(report.has_drift(), "--check must exit non-zero on this");
+        assert_eq!(report.unnormalized_paths.len(), 1);
+        assert_eq!(report.unnormalized_paths[0].gotcha_key, "gotcha:g1");
+        assert_eq!(report.unnormalized_paths[0].file_path, "./src/a.rs");
+        // Check is read-only: nothing was rewritten.
+        let stored = store.get("gotcha:g1").await.unwrap().unwrap();
+        let gotcha = stored.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(gotcha.affected_files, vec!["./src/a.rs".to_string()]);
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_reports_no_unnormalized_drift_for_clean_paths_and_globs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put(
+                "gotcha:g1",
+                &make_gotcha("gotcha:g1", &["src/a.rs", "src/payments/**"]),
+            )
+            .await
+            .unwrap();
+        store
+            .put("file:src/a.rs", &make_file("src/a.rs", &["gotcha:g1"]))
+            .await
+            .unwrap();
+
+        let report = check_gotcha_indexes(&store).await.unwrap();
+        assert!(report.unnormalized_paths.is_empty());
+
+        store.close().await.unwrap();
+    }
+
+    /// Full repair re-keys the record, links the corrected path (creating a
+    /// Layer 0 stub because `mati init` never indexed it), and drops the link
+    /// at the raw spelling. Verification must pass on the same run.
+    #[tokio::test]
+    async fn repair_rewrites_unnormalized_paths_and_repoints_links() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("gotcha:g1", &make_gotcha("gotcha:g1", &["./src/a.rs"]))
+            .await
+            .unwrap();
+        // A file record left over at the raw spelling, as a pre-fix write to an
+        // existing `file:./src/a.rs` stub would have produced.
+        store
+            .put("file:./src/a.rs", &make_file("./src/a.rs", &["gotcha:g1"]))
+            .await
+            .unwrap();
+
+        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+            .await
+            .unwrap();
+        assert_eq!(report.unnormalized_paths.len(), 1);
+        assert!(report.repaired_count > 0);
+        assert!(report.verification_passed);
+
+        let stored = store.get("gotcha:g1").await.unwrap().unwrap();
+        let gotcha = stored.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(gotcha.affected_files, vec!["src/a.rs".to_string()]);
+
+        let good = store
+            .get("file:src/a.rs")
+            .await
+            .unwrap()
+            .expect("corrected path must be linked, stubbed if it had no record");
+        assert_eq!(extract_gotcha_keys(&good), vec!["gotcha:g1".to_string()]);
+
+        let raw = store.get("file:./src/a.rs").await.unwrap().unwrap();
+        assert!(
+            extract_gotcha_keys(&raw).is_empty(),
+            "link at the raw spelling must be dropped"
+        );
+
+        // Idempotent: a second run finds nothing left to do.
+        let again = check_gotcha_indexes(&store).await.unwrap();
+        assert!(!again.has_drift());
+
+        store.close().await.unwrap();
+    }
+
+    /// Tombstoned records are excluded from every other drift class; the path
+    /// check must not resurrect them into the report either.
+    #[tokio::test]
+    async fn repair_skips_unnormalized_paths_on_tombstoned_gotchas() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut record = make_gotcha("gotcha:dead", &["./src/a.rs"]);
+        record.lifecycle = RecordLifecycle::Tombstoned {
+            reason: crate::store::record::TombstoneReason::ManualDeletion,
+            at: 1_000_000,
+        };
+        store.put("gotcha:dead", &record).await.unwrap();
+
+        let report = check_gotcha_indexes(&store).await.unwrap();
+        assert!(report.unnormalized_paths.is_empty());
 
         store.close().await.unwrap();
     }
