@@ -267,8 +267,12 @@ fn init_next_steps_guidance() {
 
     // Next steps descriptions (setup_repo always has a hotspot, so explain shows hotspot path)
     assert_contains(&stdout, "start here");
-    assert_contains(&stdout, "candidates for hook enforcement");
     assert_contains(&stdout, "project knowledge dashboard");
+
+    // The `mati review` description is conditional on a non-empty backlog, and
+    // this fixture has no co-change history or CODEOWNERS, so it mints no
+    // candidates. It used to appear unconditionally only because the backlog
+    // counted raw scan signals that were never written as records.
 }
 
 #[test]
