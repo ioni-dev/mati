@@ -523,10 +523,12 @@ pub struct MemBootstrapInput {
 // ── C. Semantic mutation inputs ─────────────────────────────────────────────
 
 /// Gotcha creation/update input. The client expresses intent only — the daemon
-/// derives confirmation state, confidence, quality, timestamps, and version.
+/// derives confidence, quality, timestamps, and version.
 ///
-/// Confirmation is ALWAYS reset to `false` on upsert. Use `GotchaConfirm`
-/// to re-confirm after editing.
+/// `confirmed` is the one exception, and it is honoured only for a
+/// developer-originated write (`source: "developer_manual"`). Everything else,
+/// including every `mem_set` from an agent, is forced to `false` and must go
+/// through `GotchaConfirm`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GotchaDraftInput {
@@ -554,6 +556,11 @@ pub struct GotchaDraftInput {
     /// to `ClaudeEnrich`. CLI `gotcha add` sends `DeveloperManual` here.
     #[serde(default)]
     pub source: Option<String>,
+    /// Developer-asserted confirmation, honoured only alongside
+    /// `source: "developer_manual"`. `mem_set` never sets either field, so an
+    /// agent cannot mint an enforcing gotcha without the `confirm` action.
+    #[serde(default)]
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1333,26 +1340,41 @@ mod tests {
         assert!(result.is_err(), "missing session UUID must be rejected");
     }
 
+    /// Confidence, quality, lifecycle and timestamps stay daemon-derived: they
+    /// have no field on the DTO, so `deny_unknown_fields` refuses them.
+    ///
+    /// `confirmed` is deliberately not on that list any more. It crosses the
+    /// wire so `mati gotcha add` behaves the same with and without a daemon,
+    /// and `handle_gotcha_upsert` gates it on `source: "developer_manual"` —
+    /// see `dispatch_v2::tests::only_developer_originated_upserts_may_arrive_confirmed`.
     #[test]
     fn gotcha_upsert_rejects_server_owned_fields() {
-        // Attempt to smuggle `confirmed` through the wire
-        let json = serde_json::json!({
-            "v": 2,
-            "id": "550e8400-e29b-41d4-a716-446655440000",
-            "session": "660e8400-e29b-41d4-a716-446655440000",
-            "cmd": {
+        let with_field = |name: &str, value: serde_json::Value| {
+            let mut cmd = serde_json::json!({
                 "type": "gotcha_upsert",
                 "key": "gotcha:test",
                 "rule": "test rule",
                 "reason": "test reason",
-                "severity": "normal",
-                "confirmed": true
-            }
-        });
-        let result = serde_json::from_value::<Request>(json);
+                "severity": "normal"
+            });
+            cmd[name] = value;
+            serde_json::from_value::<Request>(serde_json::json!({
+                "v": 2,
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "session": "660e8400-e29b-41d4-a716-446655440000",
+                "cmd": cmd
+            }))
+        };
+
+        for name in ["confidence", "quality", "lifecycle", "created_at"] {
+            assert!(
+                with_field(name, serde_json::json!(1)).is_err(),
+                "server-owned field `{name}` must be rejected"
+            );
+        }
         assert!(
-            result.is_err(),
-            "server-owned field `confirmed` must be rejected"
+            with_field("confirmed", serde_json::json!(true)).is_ok(),
+            "`confirmed` carries developer intent and must parse"
         );
     }
 
@@ -1660,6 +1682,7 @@ mod tests {
                     tags: vec![],
                     priority: Priority::Normal,
                     source: None,
+                    confirmed: false,
                 }),
             ),
             (
@@ -1811,6 +1834,7 @@ mod tests {
                 tags: vec![],
                 priority: Priority::Normal,
                 source: None,
+                confirmed: false,
             })
             .target_key(),
             "gotcha:test"

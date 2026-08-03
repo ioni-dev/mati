@@ -89,6 +89,16 @@ impl PolicyMatcherSet {
     {
         let mut compiled = Vec::new();
         for (key, policy) in policies {
+            // A trigger with no predicate would make every present-field check
+            // vacuous and gate every governed action. Authoring rejects it, but
+            // a record stored before that guard existed must not compile into a
+            // repo-wide gate either — refusing here makes it inert instead.
+            if policy.trigger.tool.is_none()
+                && policy.trigger.host_glob.is_none()
+                && policy.trigger.target_path_glob.is_none()
+            {
+                anyhow::bail!("policy {key} has an empty trigger; it would match every action");
+            }
             let host_glob = policy
                 .trigger
                 .host_glob
@@ -301,7 +311,13 @@ mod tests {
     fn lenient_loader_skips_bad_glob_and_keeps_good_policy() {
         let good = crate::store::policy_ops::record_for(
             "policy:good",
-            &policy("Good", PolicyTrigger::default()),
+            &policy(
+                "Good",
+                PolicyTrigger {
+                    tool: Some("db_client".into()),
+                    ..Default::default()
+                },
+            ),
         )
         .unwrap();
         let mut bad_policy = policy(
@@ -318,5 +334,25 @@ mod tests {
 
         assert_eq!(matcher.matches(&action(None, &[])).len(), 1);
         assert_eq!(matcher.matches(&action(None, &[]))[0].key, "policy:good");
+    }
+
+    /// Before the guard, an empty trigger compiled into a matcher whose every
+    /// predicate was vacuous, so it denied every governed action.
+    #[test]
+    fn empty_trigger_never_compiles_into_a_universal_gate() {
+        assert!(PolicyMatcherSet::from_policies([(
+            "policy:everything".into(),
+            policy("Everything", PolicyTrigger::default()),
+        )])
+        .is_err());
+
+        let record = crate::store::policy_ops::record_for(
+            "policy:everything",
+            &policy("E", PolicyTrigger::default()),
+        )
+        .unwrap();
+        assert!(PolicyMatcherSet::from_records_lenient(&[record])
+            .matches(&action(None, &[]))
+            .is_empty());
     }
 }

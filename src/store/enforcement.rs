@@ -1672,7 +1672,10 @@ mod tests {
             reason: "Schemas drift because production changes independently.".into(),
             scope: "repo".into(),
             mode: crate::store::PolicyMode::Block,
-            trigger: Default::default(),
+            trigger: crate::store::PolicyTrigger {
+                tool: Some("db_client".into()),
+                ..Default::default()
+            },
             requires: crate::store::PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![crate::store::ReceiptSource::MemGet],

@@ -112,6 +112,8 @@ struct AddArgs {
     #[arg(long, default_value = "steer")]
     mode: String,
     /// JSON object such as {"tool":"db_client","host_glob":"*prod*"}.
+    /// At least one predicate is required — an empty trigger would match
+    /// every governed action.
     #[arg(long, default_value = "{}")]
     trigger: String,
     /// JSON object with key, via, and freshness.ttl_secs.
@@ -223,6 +225,17 @@ fn parse_mode(value: &str) -> Result<PolicyMode> {
     }
 }
 
+/// Parse `--trigger` JSON and validate it before anything compiles or stores it.
+///
+/// `PolicyTrigger` rejects unknown fields, so a misspelled key fails here rather
+/// than deserializing into the all-`None` trigger that matches everything;
+/// `validate_trigger` then rejects a genuinely empty one.
+fn parse_trigger(json: &str) -> Result<PolicyTrigger> {
+    let trigger = serde_json::from_str::<PolicyTrigger>(json).context("parsing --trigger JSON")?;
+    mati_core::store::policy_ops::validate_trigger(&trigger)?;
+    Ok(trigger)
+}
+
 fn parse_priority(value: &str) -> Result<Priority> {
     match value.trim().to_ascii_lowercase().as_str() {
         "low" => Ok(Priority::Low),
@@ -246,8 +259,7 @@ async fn add(args: AddArgs) -> Result<()> {
         reason: args.reason,
         scope: args.scope,
         mode: parse_mode(&args.mode)?,
-        trigger: serde_json::from_str::<PolicyTrigger>(&args.trigger)
-            .context("parsing --trigger JSON")?,
+        trigger: parse_trigger(&args.trigger)?,
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
         stage: if args.enable {
@@ -307,8 +319,7 @@ async fn edit(args: EditArgs) -> Result<()> {
         policy.mode = parse_mode(&value)?;
     }
     if let Some(value) = args.trigger {
-        policy.trigger =
-            serde_json::from_str::<PolicyTrigger>(&value).context("parsing --trigger JSON")?;
+        policy.trigger = parse_trigger(&value)?;
     }
     if let Some(value) = args.requires {
         policy.requires =
@@ -736,8 +747,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     }
     let action = normalize_action(args.command.as_deref(), args.path.as_deref());
     if let Some(trigger_json) = args.trigger {
-        let trigger = serde_json::from_str::<PolicyTrigger>(&trigger_json)
-            .context("parsing --trigger JSON")?;
+        let trigger = parse_trigger(&trigger_json)?;
         let policy = PolicyRecord {
             name: "ad-hoc".into(),
             rule: "ad-hoc trigger".into(),
@@ -935,6 +945,21 @@ mod tests {
     fn policy_keys_accept_slugs_and_full_keys() {
         assert_eq!(normalize_key("query-safety"), "policy:query-safety");
         assert_eq!(normalize_key("policy:query-safety"), "policy:query-safety");
+    }
+
+    /// `.claude/CLAUDE.md` mandates `mati policy test --trigger` as the dry run
+    /// before authoring. A typo used to compile into a match-everything trigger
+    /// and report `matched=true`, so the dry run endorsed the misconfiguration
+    /// it exists to catch.
+    #[test]
+    fn trigger_parse_rejects_typos_and_empty_predicates() {
+        let typo = parse_trigger(r#"{"tooool":"db_client"}"#).unwrap_err();
+        assert!(typo.to_string().contains("parsing --trigger JSON"));
+        let empty = parse_trigger("{}").unwrap_err();
+        assert!(empty.to_string().contains("no predicate"));
+
+        let ok = parse_trigger(r#"{"tool":"db_client","host_glob":"*prod*"}"#).unwrap();
+        assert_eq!(ok.tool.as_deref(), Some("db_client"));
     }
 
     #[test]

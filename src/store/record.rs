@@ -838,7 +838,12 @@ pub struct GotchaRecord {
 /// Declarative action predicate stored on a local policy.
 ///
 /// This is the persisted shape consumed by the pure policy matcher.
+///
+/// Unknown fields are rejected: every field is optional and an absent one is a
+/// wildcard, so a misspelled key would otherwise deserialize into an all-`None`
+/// trigger that matches every governed action.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyTrigger {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
