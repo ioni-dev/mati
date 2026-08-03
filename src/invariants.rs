@@ -380,7 +380,7 @@ mod gotcha_write_sites {
         ),
         (
             "src/health/staleness.rs",
-            "analyze_all",
+            "analyze_until",
             Class::Bypass,
             "batch-rescores every namespace in STALENESS_PREFIXES, which \
              includes \"gotcha:\"",

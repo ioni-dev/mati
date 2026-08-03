@@ -1286,7 +1286,7 @@ async fn dispatch_session_side(
             // SessionHarvest is inherently cross-tree (promotes gotchas in
             // knowledge, archives sessions). Delegate to existing logic which
             // commits its own per-step transactions, then write session-side audit.
-            let result = sess::session_harvest_no_staleness(store).await;
+            let result = sess::session_harvest(store, &ctx.repo_root).await;
             let (accepted, error_code) = match &result {
                 Ok(()) => (true, None),
                 Err(_) => (false, Some(ErrorCode::StoreError)),
