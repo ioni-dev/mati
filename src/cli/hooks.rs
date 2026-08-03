@@ -100,6 +100,8 @@ pub async fn run_log_miss(key: &str) -> Result<()> {
         event: p::SessionEvent::Miss,
         key: key.to_string(),
         session_id: None,
+        actor: None,
+        decision_basis_hash: None,
     }))
     .await
 }
@@ -112,6 +114,7 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
         actor: None,
         session_id: None,
         agent_id: None,
+        decision_basis_hash: None,
     }))
     .await
 }
@@ -122,6 +125,8 @@ pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
         event: p::SessionEvent::ComplianceMiss,
         key: key.to_string(),
         session_id: None,
+        actor: None,
+        decision_basis_hash: None,
     }))
     .await
 }
@@ -132,6 +137,8 @@ pub async fn run_log_compliance_hit(key: &str) -> Result<()> {
         event: p::SessionEvent::ComplianceHit,
         key: key.to_string(),
         session_id: None,
+        actor: None,
+        decision_basis_hash: None,
     }))
     .await
 }
@@ -142,6 +149,8 @@ pub async fn run_log_codex_shell_miss(key: &str) -> Result<()> {
         event: p::SessionEvent::CodexShellMiss,
         key: key.to_string(),
         session_id: None,
+        actor: None,
+        decision_basis_hash: None,
     }))
     .await
 }
@@ -152,6 +161,8 @@ pub async fn run_log_bootstrap(key: &str) -> Result<()> {
         event: p::SessionEvent::Bootstrap,
         key: key.to_string(),
         session_id: None,
+        actor: None,
+        decision_basis_hash: None,
     }))
     .await
 }
@@ -162,6 +173,8 @@ pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
         event: p::SessionEvent::PromptNudge,
         key: key.to_string(),
         session_id: None,
+        actor: None,
+        decision_basis_hash: None,
     }))
     .await
 }

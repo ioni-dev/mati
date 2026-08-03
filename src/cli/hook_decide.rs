@@ -473,7 +473,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // hook input) and agent_id (present in subagent payloads) attribute these
     // events to the agent session / actor — per-actor audit.
     let session_id = input.get("session_id").and_then(|v| v.as_str());
-    fire_events(&mati_root, &adapter.events, session_id, agent_id).await;
+    fire_events(
+        &mati_root,
+        &adapter.events,
+        session_id,
+        agent_id,
+        adapter.basis_hash.as_deref(),
+    )
+    .await;
 
     // Emit the lexical fail-open telemetry captured before the fallback.
     if let Some(reason) = lexical_fail_open {
@@ -533,7 +540,7 @@ async fn run_fileless_policy(
         eprintln!("{stderr}");
     }
     let session_id = input.get("session_id").and_then(|v| v.as_str());
-    fire_events(&mati_root, &events, session_id, agent_id).await;
+    fire_events(&mati_root, &events, session_id, agent_id, None).await;
     if exit_code != 0 {
         let _ = std::io::Write::flush(&mut std::io::stderr());
         std::process::exit(exit_code);
@@ -874,6 +881,8 @@ async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
             event,
             key: file_key.clone(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         });
     let _ = super::daemon::daemon_v2(mati_root, cmd).await;
 
@@ -941,6 +950,7 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
             actor: actor.map(str::to_string),
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
+            decision_basis_hash: None,
         },
     );
     let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
@@ -1016,6 +1026,7 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
                     actor: receipt_actor(agent_id, session_id).map(str::to_string),
                     session_id: session_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
+                    decision_basis_hash: None,
                 },
             ),
         )
@@ -1061,6 +1072,8 @@ async fn record_wrapped_client_miss(input: &serde_json::Value, action: &decide::
             event: mati_core::mcp::protocol::SessionEvent::WrappedDbClientMiss,
             key: format!("enforcement:wrapped_client:{wrapper}"),
             session_id: session_id.map(str::to_string),
+            actor: None,
+            decision_basis_hash: None,
         });
     let _ = daemon_v2(&mati_root, cmd).await;
 }
@@ -1337,7 +1350,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         // Firing here is what makes a non-denying policy observable at all. A
         // shadow-stage match and a satisfied block both land on this path, and
         // returning early dropped every one of them.
-        fire_events(&mati_root, &events, None, agent_id).await;
+        fire_events(&mati_root, &events, None, agent_id, None).await;
         return Ok(());
     }
     // Policy denies carry their own actionable instruction; file denies keep the
@@ -1372,7 +1385,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     // 6. Fire compliance events for the blocked files (fire-and-forget).
     // Codex apply_patch: no Claude session_id in the input; agent_id is
     // present only in subagent payloads.
-    fire_events(&mati_root, &events, None, agent_id).await;
+    fire_events(&mati_root, &events, None, agent_id, None).await;
     std::process::exit(2);
 }
 
@@ -1499,92 +1512,138 @@ async fn fire_events(
     events: &[HookEvent],
     session_id: Option<&str>,
     agent_id: Option<&str>,
+    basis_hash: Option<&str>,
 ) {
-    use mati_core::mcp::protocol as p;
-    // Per-actor audit attribution (schema_version 2): tag each SessionLog with the
-    // agent session that triggered it, when the platform provides one.
-    let sid = || session_id.map(str::to_string);
     for event in events {
-        let cmd = match event {
-            // Receipt scope must match the evaluation scope: the gate was
-            // queried with `actor = agent_id`, so the receipt minted here is
-            // scoped the same way. A subagent's Advisory hit must NOT mint a
-            // global receipt — receipts are strictly key-scoped in the store
-            // (no actor↔global fallback), and a global receipt would satisfy
-            // the main thread's gate for context only the subagent received.
-            HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
-                key: key.clone(),
-                capture_fingerprint: true,
-                actor: agent_id.map(str::to_string),
-                session_id: sid(),
-                agent_id: agent_id.map(str::to_string),
-            }),
-            HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::Miss,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::BlockedUnconsultedRead { key } => {
-                p::Command::SessionLog(p::SessionLogInput {
-                    event: p::SessionEvent::ComplianceMiss,
-                    key: key.clone(),
-                    session_id: sid(),
-                })
-            }
-            HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::CodexShellMiss,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::ComplianceHit { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::ComplianceHit,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::EditConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::EditConsulted,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::EditBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::EditBlocked,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::FloorConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::FloorConsultMiss,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::PolicyConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::PolicyConsultMiss,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::PolicyConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::PolicyConsultHit,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::PolicySteered { key } => p::Command::SessionLog(p::SessionLogInput {
-                event: p::SessionEvent::PolicySteered,
-                key: key.clone(),
-                session_id: sid(),
-            }),
-            HookEvent::PolicyShadowObserved {
-                key,
-                would,
-                action: Some(action),
-            } => p::Command::PolicyShadowObserve(p::PolicyShadowObserveInput {
-                policy_key: key.clone(),
-                action: action.clone(),
-                would: *would,
-            }),
-            HookEvent::PolicyShadowObserved { .. } => continue,
+        let Some(cmd) = session_command(event, session_id, agent_id, basis_hash) else {
+            continue;
         };
         // Fire-and-forget — drop silently on failure (P9).
         let _ = super::daemon::daemon_v2(mati_root, cmd).await;
     }
+}
+
+/// Translate one semantic [`HookEvent`] into the daemon command that records it.
+///
+/// Pure, so the mapping is testable: it decides which enforcement event type
+/// each outcome lands as, and it is where a Codex pre-hook BLOCK was recorded
+/// as the post-bash hook's after-the-fact bypass.
+fn session_command(
+    event: &HookEvent,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+    basis_hash: Option<&str>,
+) -> Option<mati_core::mcp::protocol::Command> {
+    use mati_core::mcp::protocol as p;
+    // Per-actor audit attribution (schema_version 2): tag each SessionLog with the
+    // agent session that triggered it, when the platform provides one.
+    let sid = || session_id.map(str::to_string);
+    // Receipt scope, so the daemon can find the receipt that authorized an allow,
+    // and the digest of the gotcha state this decision was made on.
+    let scope = || agent_id.map(str::to_string);
+    let basis = || basis_hash.map(str::to_string);
+    Some(match event {
+        // Receipt scope must match the evaluation scope: the gate was
+        // queried with `actor = agent_id`, so the receipt minted here is
+        // scoped the same way. A subagent's Advisory hit must NOT mint a
+        // global receipt — receipts are strictly key-scoped in the store
+        // (no actor↔global fallback), and a global receipt would satisfy
+        // the main thread's gate for context only the subagent received.
+        HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
+            key: key.clone(),
+            capture_fingerprint: true,
+            actor: agent_id.map(str::to_string),
+            session_id: sid(),
+            agent_id: agent_id.map(str::to_string),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::Miss,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::BlockedUnconsultedRead { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::ComplianceMiss,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::CodexShellBlocked,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::ComplianceHit { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::ComplianceHit,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::EditConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::EditConsulted,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::EditBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::EditBlocked,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::FloorConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::FloorConsultMiss,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
+        HookEvent::PolicyConsultBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::PolicyConsultMiss,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            // Policy decisions are made on the policy record, not on the
+            // file's gotchas — the gotcha digest is not their basis.
+            decision_basis_hash: None,
+        }),
+        HookEvent::PolicyConsulted { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::PolicyConsultHit,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            // Policy decisions are made on the policy record, not on the
+            // file's gotchas — the gotcha digest is not their basis.
+            decision_basis_hash: None,
+        }),
+        HookEvent::PolicySteered { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::PolicySteered,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            // Policy decisions are made on the policy record, not on the
+            // file's gotchas — the gotcha digest is not their basis.
+            decision_basis_hash: None,
+        }),
+        HookEvent::PolicyShadowObserved {
+            key,
+            would,
+            action: Some(action),
+        } => p::Command::PolicyShadowObserve(p::PolicyShadowObserveInput {
+            policy_key: key.clone(),
+            action: action.clone(),
+            would: *would,
+        }),
+        HookEvent::PolicyShadowObserved { .. } => return None,
+    })
 }
 
 // ── Platform output ─────────────────────────────────────────────────────────
@@ -1683,6 +1742,10 @@ struct AdapterResult {
     exit_code: i32,
     /// Events to fire (already platform-filtered).
     events: Vec<HookEvent>,
+    /// Digest of the gotcha state this decision was made on, stamped onto the
+    /// enforcement events as `decision_basis_hash`. `None` when the file has
+    /// no gotchas — there is no rule state to prove.
+    basis_hash: Option<String>,
     /// The semantic decision (used by tests via Debug).
     #[allow(dead_code)]
     decision: Decision,
@@ -1775,6 +1838,9 @@ fn apply_consult_mandate(
         stderr,
         exit_code,
         events,
+        // A glob mandate is not decided on gotcha state, so the file's gotchas
+        // are not this deny's basis.
+        basis_hash: None,
         decision,
     };
 }
@@ -1862,11 +1928,13 @@ fn process_eval_response(
                 stderr: String::new(),
                 exit_code: 0,
                 events: vec![],
+                basis_hash: None,
                 decision: Decision::Allow,
             };
         }
     };
 
+    let basis_hash = decision_basis_hash(&enforcement_input.gotcha_records);
     let result = decide::evaluate(&enforcement_input);
     let events = platform_events(variant, &result.decision, result.events);
 
@@ -1877,8 +1945,24 @@ fn process_eval_response(
         stderr,
         exit_code,
         events,
+        basis_hash,
         decision: result.decision,
     }
+}
+
+/// Digest of the gotcha state the gate decided on, for the enforcement event's
+/// `decision_basis_hash`. Proves which rule text and confidence values were in
+/// force. `None` when the file carries no gotchas — a digest of nothing proves
+/// nothing, and a constant in the chain would read as a real basis.
+fn decision_basis_hash(records: &HashMap<String, serde_json::Value>) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    let pairs: Vec<(&str, &serde_json::Value)> =
+        records.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Some(mati_core::store::enforcement::compute_decision_basis_hash(
+        &pairs,
+    ))
 }
 
 /// Format the decision as platform output strings + exit code.
@@ -2143,12 +2227,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = mati_core::store::Store::open(dir.path()).await.unwrap();
         let actor = receipt_actor(None, Some("session-main"));
-        let (receipt_key, bytes) =
-            mati_core::store::session::consultation_receipt_staged_for_store(
-                &store, key, actor, false,
-            )
-            .await
-            .unwrap();
+        let staged = mati_core::store::session::consultation_receipt_staged_for_store(
+            &store, key, actor, false,
+        )
+        .await
+        .unwrap();
+        let (receipt_key, bytes) = (staged.key, staged.bytes);
         let receipt: mati_core::store::Record = rmp_serde::from_slice(&bytes).unwrap();
         store.put(&receipt_key, &receipt).await.unwrap();
         assert_eq!(receipt_key, format!("session:consulted:{key}"));
@@ -2186,12 +2270,12 @@ mod tests {
         let actor = receipt_actor(Some("agent-a"), Some("session-main"));
         assert_eq!(actor, Some("agent-a"));
 
-        let (receipt_key, bytes) =
-            mati_core::store::session::consultation_receipt_staged_for_store(
-                &store, key, actor, false,
-            )
-            .await
-            .unwrap();
+        let staged = mati_core::store::session::consultation_receipt_staged_for_store(
+            &store, key, actor, false,
+        )
+        .await
+        .unwrap();
+        let (receipt_key, bytes) = (staged.key, staged.bytes);
         let receipt: mati_core::store::Record = rmp_serde::from_slice(&bytes).unwrap();
         store.put(&receipt_key, &receipt).await.unwrap();
         assert_eq!(receipt_key, format!("session:consulted:agent-a:{key}"));
@@ -2237,6 +2321,80 @@ mod tests {
             extract_path(&input, HookVariant::ClaudePreRead),
             Some("src/main.rs".into())
         );
+    }
+
+    // ── Event mapping ───────────────────────────────────────────────────
+    //
+    /// A Codex pre-hook block must be recorded as a BLOCK. The mapping sent it
+    /// to `CodexShellMiss`, the post-bash hook's after-the-fact bypass event, so
+    /// every Codex deny was logged as `bypass_detected` and Codex showed zero
+    /// denials in `mati stats` and in the audit built on the chain.
+    #[test]
+    fn codex_pre_hook_block_maps_to_a_block_not_a_bypass() {
+        use mati_core::mcp::protocol as p;
+        let cmd = session_command(
+            &HookEvent::CodexShellBlocked {
+                key: "file:src/main.rs".into(),
+            },
+            None,
+            None,
+            None,
+        )
+        .expect("a block must be recorded");
+        match cmd {
+            p::Command::SessionLog(input) => assert_eq!(
+                input.event,
+                p::SessionEvent::CodexShellBlocked,
+                "a pre-hook block is not the post-bash miss"
+            ),
+            other => panic!("expected SessionLog, got {other:?}"),
+        }
+    }
+
+    /// The post-bash miss keeps its own event: nothing was denied there.
+    #[test]
+    fn codex_post_bash_miss_stays_a_miss() {
+        use mati_core::mcp::protocol as p;
+        // `run_post_bash` builds this event directly; pin the two apart.
+        assert_ne!(
+            p::SessionEvent::CodexShellMiss,
+            p::SessionEvent::CodexShellBlocked
+        );
+    }
+
+    /// The gate's decision basis and receipt scope must reach the daemon, or the
+    /// chained event has nothing to record them from.
+    #[test]
+    fn gate_events_carry_the_basis_hash_and_receipt_scope() {
+        use mati_core::mcp::protocol as p;
+        let cmd = session_command(
+            &HookEvent::BlockedUnconsultedRead {
+                key: "file:src/main.rs".into(),
+            },
+            Some("sess-1"),
+            Some("agent-a"),
+            Some("deadbeef"),
+        )
+        .unwrap();
+        match cmd {
+            p::Command::SessionLog(input) => {
+                assert_eq!(input.session_id.as_deref(), Some("sess-1"));
+                assert_eq!(input.actor.as_deref(), Some("agent-a"));
+                assert_eq!(input.decision_basis_hash.as_deref(), Some("deadbeef"));
+            }
+            other => panic!("expected SessionLog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_basis_hash_is_none_without_gotchas() {
+        assert_eq!(decision_basis_hash(&HashMap::new()), None);
+        let mut records = HashMap::new();
+        records.insert(
+            "gotcha:x".to_string(),
+            json!({"value": "rule", "confidence": {"value": 0.8}}),
+        );
+        assert!(decision_basis_hash(&records).is_some());
     }
 
     #[test]
@@ -2928,6 +3086,7 @@ mod tests {
             decision: Decision::Advisory {
                 context: "File guidance.".into(),
             },
+            basis_hash: None,
         };
         merge_policy_result(
             &mut adapter,
@@ -2970,6 +3129,7 @@ mod tests {
             exit_code: 0,
             events: vec![],
             decision: Decision::NoRecord,
+            basis_hash: None,
         };
         merge_policy_result(
             &mut edit_adapter,
@@ -3008,6 +3168,7 @@ mod tests {
             decision: Decision::AlreadyConsulted {
                 context: "Record already consulted. Gotcha guidance.".into(),
             },
+            basis_hash: None,
         };
         merge_policy_result(
             &mut edit_consulted,
@@ -3031,6 +3192,7 @@ mod tests {
             decision: Decision::AlreadyConsulted {
                 context: "Record already consulted. Gotcha guidance.".into(),
             },
+            basis_hash: None,
         };
         merge_policy_result(
             &mut bash_consulted,
@@ -3433,6 +3595,7 @@ mod tests {
             stderr: String::new(),
             exit_code: 0,
             events: vec![],
+            basis_hash: None,
             decision: Decision::Allow,
         }
     }
@@ -3574,6 +3737,7 @@ mod tests {
                 reason: "gotcha-deny".to_string(),
                 origin: decide::DenyOrigin::Gotcha,
             },
+            basis_hash: None,
         };
         apply_consult_mandate(
             &mut a,

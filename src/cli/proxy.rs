@@ -504,6 +504,7 @@ impl StoreProxy {
                         actor: None,
                         session_id: None,
                         agent_id: None,
+                        decision_basis_hash: None,
                     },
                 );
                 match daemon_v2(root, cmd).await {

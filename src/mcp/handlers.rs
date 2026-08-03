@@ -1441,7 +1441,8 @@ pub(crate) async fn handle_mem_get(
     let (audit_key, audit_bytes) =
         make_session_audit(ctx, request_id, "mem_get", &input.key, true, None)
             .ok_or_else(|| (ErrorCode::Internal, "audit serialization failed".into()))?;
-    let writes: Vec<(&str, &[u8])> = vec![(&receipt.0, &receipt.1), (&audit_key, &audit_bytes)];
+    let writes: Vec<(&str, &[u8])> =
+        vec![(&receipt.key, &receipt.bytes), (&audit_key, &audit_bytes)];
     if let Err(e) = store.transact_sessions_raw(&writes).await {
         tracing::warn!(
             request_id = %request_id,
@@ -1465,8 +1466,10 @@ pub(crate) async fn handle_mem_get(
         crate::store::enforcement::SubjectKind::File,
         input.key.clone(),
         "claude".to_string(),
-        None,
+        Some(receipt.id),
         "consultation_requested".to_string(),
+        // No gotcha state is loaded on this path, so there is no decision basis
+        // to hash — mem_get returns one record, it does not run the gate.
         None,
     )
     .await;
@@ -1914,7 +1917,7 @@ pub(crate) async fn handle_mem_bootstrap(
             format!("file:{file}")
         };
         if let Ok(receipt) = crate::store::session::consultation_receipt_staged(&file_key, None) {
-            session_writes.push(receipt);
+            session_writes.push((receipt.key, receipt.bytes));
         }
         // Per-file daily hit agg.
         let hit_agg_key = crate::store::session::today_key("analytics:hit_");
