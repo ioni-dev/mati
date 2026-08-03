@@ -68,8 +68,20 @@ fn init_proposes_codeowners_candidate_idempotently() {
         "init should propose exactly one CODEOWNERS candidate; got:\n{listed}"
     );
 
+    // `ls gotchas` above went through StoreProxy -> ensure_daemon, which
+    // spawned a daemon that now holds the store's exclusive lock. `init`
+    // needs exclusive access (SurrealKV is single-writer), so it refuses
+    // while that daemon is up — stop it first, same remediation `mati init`
+    // itself prints when it detects the lock.
+    assert!(run_in(dir, &["daemon", "stop"]).status.success());
+
     // Re-init must not duplicate it.
-    assert!(run_in(dir, &["init"]).status.success());
+    let reinit = run_in(dir, &["init"]);
+    assert!(
+        reinit.status.success(),
+        "re-init failed: {}",
+        String::from_utf8_lossy(&reinit.stderr)
+    );
     let again = run_in(dir, &["ls", "gotchas"]);
     let count2 = String::from_utf8_lossy(&again.stdout)
         .matches("codeowners:src/payments/**")
