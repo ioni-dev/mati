@@ -1119,11 +1119,8 @@ pub(crate) async fn socket_dispatch(
         }
 
         "session_harvest" => {
-            // Note: uses no-staleness variant because StalenessAnalyzer (git2) is !Send.
-            // There is no CLI-path harvest to defer to — `mati session-harvest`
-            // forwards here, so git-based staleness never runs.
             let g = graph.read().await;
-            if let Err(e) = sess::session_harvest_no_staleness(g.store()).await {
+            if let Err(e) = sess::session_harvest(g.store(), repo_root).await {
                 tracing::warn!("daemon socket session_harvest: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)

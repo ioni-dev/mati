@@ -519,8 +519,8 @@ pub async fn session_flush(store: &Store) -> Result<()> {
 /// Delete all consult receipts (`session:consulted:*`) from the store.
 ///
 /// Shared by `session_clear_consults` (PostCompact) and the end-of-session
-/// `session_harvest` / `session_harvest_no_staleness` cleanup. Propagates store
-/// errors; the daemon-startup stale-marker sweep keeps its own fail-soft loop.
+/// `session_harvest` cleanup. Propagates store errors; the daemon-startup
+/// stale-marker sweep keeps its own fail-soft loop.
 async fn delete_all_receipts(store: &Store) -> Result<()> {
     let consulted_keys = store.scan_keys("session:consulted:").await?;
     for k in &consulted_keys {
@@ -542,14 +542,14 @@ pub async fn session_clear_consults(store: &Store) -> Result<()> {
 
 /// Archive session, run staleness analysis, auto-promote gotchas.
 ///
-/// Full version: includes git-based staleness analysis, which the daemon
-/// cannot run because `StalenessAnalyzer` holds git2 handles and is `!Send`.
+/// `repo_root` is the project root; the git root is discovered upward from it.
+/// Called from both daemon socket handlers — `mcp::server::socket_dispatch` and
+/// `mcp::dispatch_v2::dispatch_session_side` — on SessionEnd.
 ///
-/// Nothing calls this. It was the CLI-path harvest, but `mati session-harvest`
-/// now forwards to the daemon socket, and both socket handlers take
-/// `session_harvest_no_staleness`. So `StalenessAnalyzer::analyze_all` never
-/// runs in production and git-derived staleness is never scored.
-pub async fn session_harvest(store: &Store, cwd: &Path) -> Result<()> {
+/// Every step is fail-open: staleness runs on the SessionEnd path, and a git
+/// fault must not cost the session its archive, its promotions, or its receipt
+/// cleanup.
+pub async fn session_harvest(store: &Store, repo_root: &Path) -> Result<()> {
     let now = now_secs();
 
     // M-12-D: promote gotcha candidates before archiving
@@ -559,8 +559,8 @@ pub async fn session_harvest(store: &Store, cwd: &Path) -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "gotcha promotion failed"),
     }
 
-    // M-13-A: run full staleness analysis
-    match StalenessAnalyzer::new(cwd).analyze_all(store).await {
+    // M-13-A: run full staleness analysis. Bounded by ANALYZE_TIME_BUDGET_MS.
+    match StalenessAnalyzer::new(repo_root).analyze_all(store).await {
         Ok(report) if report.updated > 0 => {
             tracing::info!(
                 scanned = report.scanned,
@@ -602,70 +602,6 @@ pub async fn session_harvest(store: &Store, cwd: &Path) -> Result<()> {
     delete_all_receipts(store).await?;
 
     // Update stage:current with last session timestamp
-    if let Some(mut stage) = store.get("stage:current").await? {
-        stage.updated_at = now;
-        stage.version.logical_clock += 1;
-        stage.version.wall_clock = now;
-        let base = stage
-            .value
-            .lines()
-            .filter(|l| !l.starts_with("last_session:"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        stage.value = if base.is_empty() {
-            format!("last_session: {session_key}")
-        } else {
-            format!("{base}\nlast_session: {session_key}")
-        };
-        store.put("stage:current", &stage).await?;
-    }
-
-    Ok(())
-}
-
-/// Session harvest without git-based staleness analysis.
-///
-/// Used from the daemon socket (tokio::spawn requires Send, but StalenessAnalyzer
-/// contains git2::Repository which is !Send). Staleness analysis is deferred to
-/// the next CLI-path harvest (when the MCP server is not holding the lock).
-pub async fn session_harvest_no_staleness(store: &Store) -> Result<()> {
-    let now = now_secs();
-
-    // M-12-D: promote gotcha candidates
-    match promote_gotcha_candidates(store).await {
-        Ok(n) if n > 0 => tracing::info!(promoted = n, "gotcha candidates auto-promoted"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "gotcha promotion failed"),
-    }
-
-    // Read session:current (written by session-flush)
-    let session_rec = match store.get("session:current").await? {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-
-    let session_value = match session_rec.payload.as_ref() {
-        Some(p) => serde_json::to_string(p).unwrap_or_default(),
-        None => session_rec.value.clone(),
-    };
-
-    // M-13-C: collect stale reviews (no git analysis — uses existing staleness values)
-    match collect_and_store_stale_reviews(store, &session_value, now).await {
-        Ok(n) if n > 0 => tracing::info!(entries = n, "stale review entries collected"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "stale review collection failed"),
-    }
-
-    // Write permanent session record
-    let session_key = format!("session:{now}");
-    let mut perm = session_record(&session_key, session_value);
-    perm.payload = session_rec.payload;
-    store.put(&session_key, &perm).await?;
-
-    // Clean up consulted markers
-    delete_all_receipts(store).await?;
-
-    // Update stage:current
     if let Some(mut stage) = store.get("stage:current").await? {
         stage.updated_at = now;
         stage.version.logical_clock += 1;
@@ -987,6 +923,127 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = Store::open(dir.path()).await.expect("open store");
         (dir, store)
+    }
+
+    // ── session_harvest ──────────────────────────────────────────────────────
+
+    /// A git worktree with one committed file. Returns the dir and the HEAD SHA.
+    fn temp_repo_with_commit(rel_path: &str) -> (TempDir, String) {
+        let dir = TempDir::new().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("git init");
+
+        let full = dir.path().join(rel_path);
+        std::fs::create_dir_all(full.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&full, "fn main() {}").expect("write");
+
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new(rel_path)).expect("add");
+        index.write().expect("index write");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("tree");
+        let sig = git2::Signature::now("mati test", "test@example.invalid").expect("sig");
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "seed", &tree, &[])
+            .expect("commit");
+
+        (dir, oid.to_string())
+    }
+
+    fn file_record_at(key: &str, updated_at: u64) -> Record {
+        Record {
+            key: key.to_string(),
+            value: "seed".to_string(),
+            category: Category::File,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: updated_at,
+            updated_at,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            confidence: ConfidenceScore::for_new_record(&RecordSource::StaticAnalysis),
+            quality: QualityScore::layer0_default(),
+            source: RecordSource::StaticAnalysis,
+            payload: None,
+            version: RecordVersion {
+                device_id: uuid::Uuid::new_v4(),
+                logical_clock: 1,
+                wall_clock: updated_at,
+            },
+            lifecycle: RecordLifecycle::Active,
+            access_count: 0,
+            last_accessed: 0,
+            gap_analysis_score: 0.0,
+        }
+    }
+
+    /// The wired path actually runs git staleness. `last_record_sha` is written
+    /// only by `StalenessAnalyzer::git_factor`, so finding HEAD there after a
+    /// harvest proves `analyze_all` ran — this was inert since the daemon split.
+    #[tokio::test]
+    async fn session_harvest_runs_git_staleness_analysis() {
+        let (repo_dir, head_sha) = temp_repo_with_commit("src/seed.rs");
+        let (_dir, store) = temp_store().await;
+
+        let record = file_record_at("file:src/seed.rs", now_secs() - (60 * 86_400));
+        assert!(record.staleness.last_record_sha.is_empty());
+        store.put(&record.key, &record).await.expect("put");
+
+        session_harvest(&store, repo_dir.path())
+            .await
+            .expect("harvest");
+
+        let after = store
+            .get("file:src/seed.rs")
+            .await
+            .expect("get")
+            .expect("record survives harvest");
+        assert_eq!(after.staleness.last_record_sha, head_sha);
+        assert_ne!(after.staleness.tier, StalenessTier::Tombstone);
+
+        store.close().await.expect("close");
+    }
+
+    /// Staleness runs on the SessionEnd path. When git is unusable the harvest
+    /// must still archive the session, clear receipts, and stamp `stage:current`.
+    #[tokio::test]
+    async fn harvest_survives_a_staleness_failure() {
+        let (_dir, store) = temp_store().await;
+
+        let record = file_record_at("file:src/seed.rs", now_secs() - (60 * 86_400));
+        store.put(&record.key, &record).await.expect("put");
+        let mut stage = file_record_at("stage:current", now_secs());
+        stage.category = Category::Stage;
+        store.put("stage:current", &stage).await.expect("put stage");
+        session_flush(&store).await.expect("flush");
+
+        // No git repo anywhere above a tempdir — the analyzer can do nothing.
+        let nowhere = TempDir::new().expect("tempdir");
+        session_harvest(&store, nowhere.path())
+            .await
+            .expect("harvest must not fail when staleness cannot run");
+
+        let sessions = store.scan_keys("session:").await.expect("scan");
+        assert!(
+            sessions.iter().any(|k| k != "session:current"),
+            "session was archived: {sessions:?}"
+        );
+        let stage = store
+            .get("stage:current")
+            .await
+            .expect("get")
+            .expect("stage record");
+        assert!(stage.value.contains("last_session:"));
+
+        // And nothing was tombstoned off an unproven root.
+        let after = store
+            .get("file:src/seed.rs")
+            .await
+            .expect("get")
+            .expect("record");
+        assert_ne!(after.staleness.tier, StalenessTier::Tombstone);
+
+        store.close().await.expect("close");
     }
 
     #[tokio::test]

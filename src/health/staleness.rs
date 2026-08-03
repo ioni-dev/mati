@@ -10,7 +10,8 @@
 //! cascade signals.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -243,28 +244,51 @@ pub struct StalenessReport {
 
 /// Full staleness analyzer using the 5-factor formula from ARCHITECTURE.md section 17.
 ///
-/// Opened once per CLI invocation, reuses the git2 repo handle and cached HEAD.
+/// Opened once per harvest, reuses the git2 repo handle and cached HEAD.
 pub struct StalenessAnalyzer {
-    repo: Option<git2::Repository>,
+    /// `git2::Repository` is `Send` but not `Sync`, and [`Self::analyze_all`]
+    /// takes `&self` across `await` points. Without the `Mutex` the resulting
+    /// future is `!Send` and cannot run inside the daemon's spawned socket task.
+    /// The guard is never held across an `await` — see [`Self::git_factor_for`].
+    repo: Option<Mutex<git2::Repository>>,
+    /// Directory that relative `file:` record paths resolve against. Never the
+    /// process CWD: the daemon inherits its CWD from whichever hook spawned it,
+    /// and a wrong root would report every tracked file as deleted.
+    root: PathBuf,
+    /// True when [`Self::root`] is a git worktree root. `FileDeleted` — the only
+    /// signal that reaches Tombstone, which switches enforcement off for a file —
+    /// is never asserted without it.
+    root_from_git: bool,
     now: u64,
     head_commit: Option<String>,
 }
 
 impl StalenessAnalyzer {
-    /// Open the analyzer. `repo_path` should be the project root containing `.git`.
+    /// Open the analyzer. `repo_path` is the project root, or any directory
+    /// inside it — the git root is discovered upward from there.
     ///
-    /// If the git repo cannot be opened, the analyzer proceeds with git_factor = 0.0.
+    /// If no git repo is found, the analyzer proceeds with git_factor = 0.0 and
+    /// asserts no deletions.
     pub fn new(repo_path: &Path) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let repo = git2::Repository::open(repo_path).ok();
+        Self::open_at(repo_path, now)
+    }
+
+    fn open_at(repo_path: &Path, now: u64) -> Self {
+        let repo = git2::Repository::discover(repo_path).ok();
         let head_commit = repo.as_ref().and_then(head_commit_sha);
+        let workdir = repo
+            .as_ref()
+            .and_then(|r| r.workdir().map(Path::to_path_buf));
 
         Self {
-            repo,
+            repo: repo.map(Mutex::new),
+            root_from_git: workdir.is_some(),
+            root: workdir.unwrap_or_else(|| repo_path.to_path_buf()),
             now,
             head_commit,
         }
@@ -273,14 +297,12 @@ impl StalenessAnalyzer {
     /// Test-only constructor that allows injecting a fixed `now` timestamp.
     #[cfg(test)]
     fn new_with_now(repo_path: &Path, now: u64) -> Self {
-        let repo = git2::Repository::open(repo_path).ok();
-        let head_commit = repo.as_ref().and_then(head_commit_sha);
+        Self::open_at(repo_path, now)
+    }
 
-        Self {
-            repo,
-            now,
-            head_commit,
-        }
+    /// Resolve a record path against [`Self::root`] and test it on disk.
+    fn path_exists(&self, path: &str) -> bool {
+        self.root.join(path).exists()
     }
 
     /// Scan all staleness-eligible prefixes, recompute scores, and batch-write
@@ -288,7 +310,12 @@ impl StalenessAnalyzer {
     /// written if the budget is exceeded.
     pub async fn analyze_all(&self, store: &Store) -> Result<StalenessReport> {
         let deadline = Instant::now() + std::time::Duration::from_millis(ANALYZE_TIME_BUDGET_MS);
+        self.analyze_until(store, deadline).await
+    }
 
+    /// [`Self::analyze_all`] with the deadline supplied, so a test can prove the
+    /// budget gates the scan without racing a wall clock.
+    async fn analyze_until(&self, store: &Store, deadline: Instant) -> Result<StalenessReport> {
         let mut report = StalenessReport {
             scanned: 0,
             updated: 0,
@@ -411,7 +438,7 @@ impl StalenessAnalyzer {
             .any(|s| matches!(s, StalenessSignal::FileDeleted))
         {
             let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
-            if Path::new(path).exists() {
+            if self.path_exists(path) {
                 // File was restored — clear the FileDeleted signal.
                 record
                     .staleness
@@ -427,9 +454,13 @@ impl StalenessAnalyzer {
         }
 
         // Check if file: record's file no longer exists on disk (new detection).
-        if record.key.starts_with("file:") {
+        // Gated on `root_from_git`: asserting a deletion tombstones the record,
+        // and a tombstoned file record makes `hooks::decide::evaluate` pass every
+        // read through before it reaches the gotcha loop. An unproven root must
+        // not be able to switch enforcement off.
+        if record.key.starts_with("file:") && self.root_from_git {
             let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
-            if !path.is_empty() && !Path::new(path).exists() {
+            if !path.is_empty() && !self.path_exists(path) {
                 record.staleness.signals.push(StalenessSignal::FileDeleted);
                 record.staleness.value = 1.0;
                 record.staleness.tier = StalenessTier::Tombstone;
@@ -448,7 +479,7 @@ impl StalenessAnalyzer {
             // Find the new_path from the signal.
             let new_path_exists = record.staleness.signals.iter().any(|s| {
                 if let StalenessSignal::FileRenamed { new_path } = s {
-                    Path::new(new_path).exists()
+                    self.path_exists(new_path)
                 } else {
                     false
                 }
@@ -480,12 +511,7 @@ impl StalenessAnalyzer {
         // ── 5-factor computation ────────────────────────────────────────────
         let time_f = time_factor(record, self.now);
 
-        let (git_f, new_sha) = if let Some(ref repo) = self.repo {
-            let path_str = record.key.strip_prefix("file:").unwrap_or(&record.key);
-            self.git_factor(repo, path_str, &record.staleness.last_record_sha)
-        } else {
-            (0.0_f32, None)
-        };
+        let (git_f, new_sha) = self.git_factor_for(&record.key, &record.staleness.last_record_sha);
 
         let semantic_f = semantic_factor();
 
@@ -548,6 +574,22 @@ impl StalenessAnalyzer {
     }
 
     // ── Git factor ──────────────────────────────────────────────────────────
+
+    /// Take the repo lock, compute the git factor, drop the lock.
+    ///
+    /// Synchronous on purpose: the `MutexGuard` must not survive into
+    /// [`Self::compute_staleness`], which awaits after this returns.
+    /// A poisoned lock yields no git signal rather than a panic.
+    fn git_factor_for(&self, key: &str, last_record_sha: &str) -> (f32, Option<String>) {
+        let Some(mutex) = self.repo.as_ref() else {
+            return (0.0, None);
+        };
+        let Ok(repo) = mutex.lock() else {
+            return (0.0, None);
+        };
+        let path = key.strip_prefix("file:").unwrap_or(key);
+        self.git_factor(&repo, path, last_record_sha)
+    }
 
     /// Two-phase git factor:
     /// 1. O(1) blob comparison: compare blob SHA at HEAD vs blob SHA at stored commit.
@@ -658,6 +700,20 @@ impl StalenessAnalyzer {
         count
     }
 }
+
+/// The daemon serves each socket connection from a `tokio::spawn`ed task, so
+/// everything the harvest awaits must be `Send`. This was false for two
+/// releases — `&StalenessAnalyzer` is `Send` only while the analyzer is `Sync`,
+/// and `git2::Repository` is not — and the harvest silently dropped staleness
+/// rather than failing to compile. Keep the assertion; it is the whole reason
+/// the `Mutex` is there.
+const _: fn() = || {
+    fn assert_send<T: Send>(_: T) {}
+    fn probe(analyzer: &StalenessAnalyzer, store: &Store) {
+        assert_send(analyzer.analyze_all(store));
+    }
+    let _ = probe;
+};
 
 // ── Factor functions ────────────────────────────────────────────────────────
 
@@ -1472,13 +1528,15 @@ mod tests {
     fn git_factor_zero_when_no_repo() {
         let analyzer = StalenessAnalyzer {
             repo: None,
+            root: PathBuf::from("/nonexistent"),
+            root_from_git: false,
             now: 2_000_000,
             head_commit: None,
         };
-        // When there's no repo, git_factor can't be called via the analyzer path,
-        // so compute_staleness will return (0.0, None) for git.
-        // Test the direct path:
-        assert!(analyzer.repo.is_none());
+        assert_eq!(
+            analyzer.git_factor_for("file:src/main.rs", "deadbeef"),
+            (0.0, None)
+        );
     }
 
     // ── dep_factor tests ────────────────────────────────────────────────────
@@ -1837,6 +1895,8 @@ mod tests {
     async fn hard_override_file_deleted_sets_tombstone() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
+        // Deletion is only asserted from a git-proven root — establish one.
+        git2::Repository::init(dir.path()).unwrap();
 
         // Use a path that definitely doesn't exist on disk.
         let mut record = make_file_record_with_staleness(0.0);
@@ -1852,6 +1912,66 @@ mod tests {
 
         assert_eq!(record.staleness.tier, StalenessTier::Tombstone);
         assert!((record.staleness.value - 1.0).abs() < 0.01);
+
+        store.close().await.unwrap();
+    }
+
+    /// The tombstone override is the only path that reaches `Tombstone`, and a
+    /// tombstoned file record makes `hooks::decide::evaluate` pass every read
+    /// through before it reaches the gotcha loop. Without a git-proven root the
+    /// analyzer cannot tell "deleted" from "wrong working directory", so it must
+    /// assert nothing — otherwise a daemon started outside the repo would switch
+    /// enforcement off for the whole project.
+    #[tokio::test]
+    async fn missing_file_is_not_tombstoned_without_a_git_root() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let mut record = make_file_record_with_staleness(0.0);
+        record.key = "file:src/definitely_nonexistent_mati_xyz.rs".to_string();
+
+        // No `Repository::init` — `root_from_git` is false.
+        let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
+        assert!(!analyzer.root_from_git);
+
+        analyzer
+            .compute_staleness(&mut record, &store, &HashMap::new())
+            .await
+            .unwrap();
+
+        assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+        assert!(!record
+            .staleness
+            .signals
+            .iter()
+            .any(|s| matches!(s, StalenessSignal::FileDeleted)));
+
+        store.close().await.unwrap();
+    }
+
+    /// Relative record paths resolve against the analyzer's root, not the
+    /// process CWD. The daemon inherits its CWD from whichever hook spawned it.
+    #[tokio::test]
+    async fn relative_paths_resolve_against_the_repo_root_not_the_cwd() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/present.rs"), "fn main() {}").unwrap();
+
+        let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
+
+        // `src/present.rs` does not exist relative to the test process CWD.
+        assert!(!Path::new("src/present.rs").exists());
+
+        let mut record = make_file_record_with_staleness(0.0);
+        record.key = "file:src/present.rs".to_string();
+        analyzer
+            .compute_staleness(&mut record, &store, &HashMap::new())
+            .await
+            .unwrap();
+
+        assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
 
         store.close().await.unwrap();
     }
@@ -1961,6 +2081,52 @@ mod tests {
     }
 
     // ── analyze_all tests ───────────────────────────────────────────────────
+
+    /// The scan checks the deadline before every prefix and every record, so an
+    /// already-expired budget must stop it before it touches anything.
+    #[tokio::test]
+    async fn expired_time_budget_stops_the_scan_before_any_write() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let file_path = dir.path().join("old_file.rs");
+        std::fs::write(&file_path, "fn main() {}").unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut record = make_record_at(
+            &format!("file:{}", file_path.to_string_lossy()),
+            now - (60 * 86400),
+            0,
+        );
+        record.lifecycle = RecordLifecycle::Active;
+        store.put(&record.key, &record).await.unwrap();
+        let before = store.get(&record.key).await.unwrap().unwrap();
+
+        let analyzer = StalenessAnalyzer::new(dir.path());
+        let expired = Instant::now() - std::time::Duration::from_millis(1);
+        let report = analyzer.analyze_until(&store, expired).await.unwrap();
+
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.updated, 0);
+        let after = store.get(&record.key).await.unwrap().unwrap();
+        assert_eq!(after.version.logical_clock, before.version.logical_clock);
+
+        // Same store, same analyzer, real budget — proves the assertion above is
+        // the deadline talking and not an empty scan.
+        let report = analyzer.analyze_all(&store).await.unwrap();
+        assert!(report.scanned >= 1);
+        assert!(report.updated >= 1);
+
+        store.close().await.unwrap();
+    }
+
+    /// The budget bounds the SessionEnd hook, which Claude Code kills at 3000ms.
+    #[test]
+    fn time_budget_is_unchanged() {
+        assert_eq!(ANALYZE_TIME_BUDGET_MS, 2000);
+    }
 
     #[tokio::test]
     async fn analyze_all_updates_stale_records() {
