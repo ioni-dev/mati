@@ -868,6 +868,8 @@ Staleness tiers use half-open intervals.
 
 At Tombstone, the record is fully excluded. Injecting a wrong record silently is worse than having a cache miss.
 
+The `mati reparse` path adds staleness per pass, capped at 0.4 per pass by `MAX_REPARSE_INCREMENT`. Across passes it saturates at `MAX_REPARSE_STALENESS` (0.69) — inside Stale, below the Liability floor. Reparse never lowers a value another factor set, and the 24h preservation window in `compute_staleness` holds a recent reparse score up only as far as the same ceiling. Without that bound, editing one file a few times in a session pushed the file record to Tombstone and `hooks::decide::evaluate` stopped enforcing every confirmed gotcha on it, with no event logged. The other four factors still reach Liability and Tombstone on their own; so do the `FileDeleted` and `FileRenamed` overrides.
+
 Sync merge rule, planned for v0.2: `Tombstone > Liability > Stale > Aging > Fresh`, meaning higher severity wins. There is no sync or conflict resolution in v0.1.
 
 Staleness propagation happens during `mati init`. Staleness scores are propagated through `Imports` edges. A file whose upstream dependency has high staleness inherits partial staleness through `propagated_staleness` in `FileRecord`.
