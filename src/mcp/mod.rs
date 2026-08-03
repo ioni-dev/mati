@@ -13,4 +13,9 @@ pub mod server;
 pub mod tools;
 pub mod types;
 
+/// Pins the behavioural gap between the two live gotcha write paths
+/// (`store::gotcha_ops` vs the v2 handlers). See the module docs.
+#[cfg(test)]
+mod write_path_equivalence;
+
 pub use server::serve;
