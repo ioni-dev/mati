@@ -39,10 +39,26 @@ pub enum PolicyOpError {
         pattern: String,
         source: globset::Error,
     },
+    #[error(
+        "trigger has no predicate; an empty trigger matches every governed action. \
+         Name at least one of tool ({tools}), host_glob, or target_path_glob"
+    )]
+    EmptyTrigger { tools: String },
 }
 
-/// Validate the glob predicates before a policy can become durable state.
+/// Validate a trigger before a policy can become durable state, or before
+/// `mati policy test --trigger` reports on it.
+///
+/// An all-`None` trigger is rejected rather than compiled: absent fields are
+/// wildcards, so it would gate every `db_client`, `file_read` and `path` action
+/// in the repo. A rule that broad has to name the category it means.
 pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
+    if trigger.tool.is_none() && trigger.host_glob.is_none() && trigger.target_path_glob.is_none() {
+        return Err(PolicyOpError::EmptyTrigger {
+            tools: crate::hooks::decide::KNOWN_ACTION_TOOLS.join(", "),
+        }
+        .into());
+    }
     if let Some(pattern) = trigger.host_glob.as_deref() {
         Glob::new(pattern).map_err(|source| PolicyOpError::InvalidGlob {
             field: "host_glob",
@@ -339,7 +355,10 @@ mod tests {
             reason: "Schemas drift because production changes independently.".into(),
             scope: "repo".into(),
             mode: super::super::record::PolicyMode::Block,
-            trigger: Default::default(),
+            trigger: super::super::record::PolicyTrigger {
+                tool: Some("db_client".into()),
+                ..Default::default()
+            },
             requires: super::super::record::PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![super::super::record::ReceiptSource::MemGet],
@@ -452,5 +471,55 @@ mod tests {
 
         assert!(error.to_string().contains("invalid host_glob"));
         assert!(store.get(key).await.unwrap().is_none());
+    }
+
+    /// A trigger JSON with a misspelled key used to deserialize into an
+    /// all-`None` trigger, which every predicate treats as a wildcard.
+    #[test]
+    fn trigger_json_rejects_unknown_fields() {
+        let error = serde_json::from_str::<super::super::record::PolicyTrigger>(
+            r#"{"tooool":"db_client"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `tooool`"));
+        assert!(serde_json::from_str::<super::super::record::PolicyTrigger>(
+            r#"{"tool":"db_client"}"#
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_empty_trigger_before_persisting() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let key = "policy:matches-everything";
+        let mut policy = sample();
+        policy.trigger = Default::default();
+
+        let error = create(&store, key, &policy).await.unwrap_err();
+
+        assert!(error.to_string().contains("no predicate"));
+        assert!(store.get(key).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_trigger_accepts_any_single_predicate() {
+        for trigger in [
+            super::super::record::PolicyTrigger {
+                tool: Some("db_client".into()),
+                ..Default::default()
+            },
+            super::super::record::PolicyTrigger {
+                host_glob: Some("*prod*".into()),
+                ..Default::default()
+            },
+            super::super::record::PolicyTrigger {
+                target_path_glob: Some("**/*.sql".into()),
+                ..Default::default()
+            },
+        ] {
+            validate_trigger(&trigger).expect("one predicate is enough");
+        }
+        assert!(validate_trigger(&Default::default()).is_err());
     }
 }

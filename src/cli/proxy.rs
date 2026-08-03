@@ -394,6 +394,7 @@ impl StoreProxy {
                             mati_core::store::RecordSource::Import => Some("import".to_string()),
                             _ => None,
                         },
+                        confirmed: gotcha.as_ref().is_some_and(|g| g.confirmed),
                     })
                 } else if key.starts_with("file:") {
                     let path = key.strip_prefix("file:").unwrap_or(key);
@@ -724,6 +725,7 @@ impl StoreProxy {
                     tags: record.tags.clone(),
                     priority: record.priority.clone().into(),
                     source,
+                    confirmed: gotcha.confirmed,
                 });
                 match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {

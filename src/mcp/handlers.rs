@@ -321,8 +321,34 @@ async fn upsert_commit_once(
         .map(|g| g.affected_files)
         .unwrap_or_default();
 
+    let source = match input.source.as_deref() {
+        Some("developer_manual") => RecordSource::DeveloperManual,
+        Some("import") => RecordSource::Import,
+        _ => RecordSource::ClaudeEnrich,
+    };
+
+    // Only a developer-originated write may assert confirmation. `mem_set`
+    // sends neither field, so an agent still has to use the `confirm` action —
+    // P4, memory reflects developer intent. Everything else resets, as before.
+    let confirmed = input.confirmed && matches!(source, RecordSource::DeveloperManual);
+
+    // Carry the existing drift baseline through an edit that stays confirmed.
+    // Rebuilding it from scratch would erase the stamp a `mati gotcha confirm`
+    // wrote, and re-stamping here would clear real drift on a rule whose text
+    // was tweaked without anyone re-reading the code.
+    let previous = existing
+        .as_ref()
+        .and_then(|r| r.payload_as::<GotchaRecord>());
+    let confirmed_content = match (confirmed, is_new) {
+        (true, false) => previous
+            .as_ref()
+            .map(|g| g.confirmed_content.clone())
+            .unwrap_or_default(),
+        _ => Default::default(),
+    };
+
     // Build gotcha payload.
-    let gotcha = GotchaRecord {
+    let mut gotcha = GotchaRecord {
         rule: input.rule.clone(),
         reason: input.reason.clone(),
         severity: map_severity(&input.severity),
@@ -331,15 +357,22 @@ async fn upsert_commit_once(
         discovered_session: if is_new {
             now
         } else {
-            existing
+            previous
                 .as_ref()
-                .and_then(|r| r.payload_as::<GotchaRecord>())
                 .map(|g| g.discovered_session)
                 .unwrap_or(now)
         },
-        confirmed: false, // Always reset on upsert.
-        confirmed_content: Default::default(),
+        confirmed,
+        confirmed_content,
     };
+
+    // Mirror of the `gotcha_ops::apply_gotcha_write` stamp: a new record that
+    // arrives already confirmed is a developer vouching for it right now, so it
+    // earns the drift baseline `mati gotcha confirm` would have written.
+    if confirmed && is_new {
+        gotcha.confirmed_content =
+            crate::store::gotcha_ops::confirm_content_stamp(store, affected_files).await;
+    }
 
     let mut record = match existing {
         Some(mut r) if !is_tombstoned => {
@@ -380,15 +413,16 @@ async fn upsert_commit_once(
     record.lifecycle = RecordLifecycle::Active;
     record.priority = map_priority(&input.priority);
     record.tags = input.tags.clone();
-    let source = match input.source.as_deref() {
-        Some("developer_manual") => RecordSource::DeveloperManual,
-        Some("import") => RecordSource::Import,
-        _ => RecordSource::ClaudeEnrich,
-    };
     record.source = source.clone();
     record.confidence = ConfidenceScore::for_new_record(&source);
     if is_tombstoned {
         record.confidence.confirmation_count = 0;
+    }
+    // A confirmed record carries one explicit developer assertion, matching
+    // what `cli::gotcha::finish_gotcha_add` stores on the direct path. The
+    // count feeds `log2(count + 2)` in the confidence formula.
+    if confirmed {
+        record.confidence.confirmation_count = 1;
     }
     record.payload = serde_json::to_value(&gotcha).ok();
     record.quality = quality::analyze(&record);
@@ -558,13 +592,27 @@ async fn confirm_commit_once(
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
+    // Re-key `affected_files` into the form the read gate looks up, and write
+    // the normalized list back into the payload. `apply_gotcha_confirm` does
+    // this on the direct path; without it here, confirming a record stored as
+    // `./src/a.rs` leaves `file:src/a.rs.gotcha_keys` empty and the HasGotcha
+    // edge pointing at a key nothing reads — confirmed and inert
+    // (ARCHITECTURE.md section 22, "Path normalization").
+    let affected_files = crate::store::gotcha_ops::normalize_affected_files(
+        &record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default(),
+    );
+    if let Some(rekeyed) =
+        crate::store::gotcha_ops::with_normalized_affected_files(&record, &affected_files)
+    {
+        record = rekeyed;
+    }
+
     // Compute file-link updates + confirmation propagation for same transaction.
-    let affected_files: Vec<String> = record
-        .payload_as::<GotchaRecord>()
-        .map(|g| g.affected_files)
-        .unwrap_or_default();
-    let file_link_updates = compute_file_link_updates(store, key, &[], &affected_files).await;
-    let confirmation_updates = compute_confirmation_propagation(store, &affected_files).await;
+    let mut file_updates = compute_file_link_updates(store, key, &[], &affected_files).await;
+    apply_confirmation_propagation(store, &affected_files, &mut file_updates).await;
 
     // Stamp the content digest each affected file currently carries, so a later
     // change to that file is reportable as content drift. The direct-store path
@@ -586,13 +634,7 @@ async fn confirm_commit_once(
         key,
         record: &record,
     });
-    for (fkey, frec) in &file_link_updates {
-        ops.push(KnowledgeWriteOp::PutRecord {
-            key: fkey.as_str(),
-            record: frec,
-        });
-    }
-    for (fkey, frec) in &confirmation_updates {
+    for (fkey, frec) in &file_updates {
         ops.push(KnowledgeWriteOp::PutRecord {
             key: fkey.as_str(),
             record: frec,
@@ -2057,26 +2099,35 @@ async fn sync_has_gotcha_edges(
     }
 }
 
-/// Compute confirmation_count propagation updates for file records.
+/// Bump `confirmation_count` on each affected file record, **in place** on any
+/// entry `updates` already stages.
 ///
-/// Returns updated file records with incremented confirmation_count.
-async fn compute_confirmation_propagation(
+/// Staging a second copy read straight from the store would clobber the
+/// gotcha-key link `compute_file_link_updates` just added: both name the same
+/// `file:*` key and the last op in `transact_knowledge` wins.
+async fn apply_confirmation_propagation(
     store: &Store,
     affected_files: &[String],
-) -> Vec<(String, Record)> {
+    updates: &mut Vec<(String, Record)>,
+) {
     let now = now_secs();
-    let mut updates = Vec::new();
     for file_path in affected_files {
         let file_key = format!("file:{file_path}");
-        if let Ok(Some(mut record)) = store.get(&file_key).await {
-            record.confidence.confirmation_count += 1;
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
-            updates.push((file_key, record));
-        }
+        let staged = match updates.iter_mut().find(|(key, _)| key == &file_key) {
+            Some((_, record)) => record,
+            None => match store.get(&file_key).await {
+                Ok(Some(record)) => {
+                    updates.push((file_key, record));
+                    &mut updates.last_mut().expect("just pushed").1
+                }
+                _ => continue,
+            },
+        };
+        staged.confidence.confirmation_count += 1;
+        staged.updated_at = now;
+        staged.version.logical_clock += 1;
+        staged.version.wall_clock = now;
     }
-    updates
 }
 
 fn add_gotcha_key_to_record(record: &mut Record, gotcha_key: &str) -> bool {

@@ -248,7 +248,10 @@ fn resolve_lenient(path: &str) -> Option<String> {
 /// payloads, so a gotcha payload may legitimately carry fields beyond the
 /// struct and re-serializing would drop them. Returning `None` keeps the
 /// already-normalized path clone-free.
-fn with_normalized_affected_files(record: &Record, files: &[String]) -> Option<Record> {
+///
+/// Crate-visible because the daemon's `confirm_commit_once` re-keys a legacy
+/// record the same way and cannot reach this module's private items.
+pub(crate) fn with_normalized_affected_files(record: &Record, files: &[String]) -> Option<Record> {
     let current = record.payload.as_ref()?.get("affected_files")?.as_array()?;
     let unchanged = current.len() == files.len()
         && current

@@ -175,7 +175,7 @@ pub(crate) async fn dispatch_v2(
                 dispatch_knowledge_mutation(graph, ctx, &req).await
             }
         } else if is_compound(&req.cmd) {
-            // FileEditHook: compound (consultation hit in sessions + reparse in knowledge).
+            // FileEditHook: compound (edit activity in sessions + reparse in knowledge).
             // Each substep has its own audit in its respective tree.
             dispatch_file_edit_hook(graph, ctx, &req).await
         } else if is_config_command(&req.cmd) {
@@ -236,8 +236,9 @@ fn is_knowledge_mutation(cmd: &Command) -> bool {
     )
 }
 
-/// FileEditHook is a compound: ConsultationHit (session) + FileReparse (knowledge).
-/// Handled by dispatching to both paths — not a single-tree transaction.
+/// FileEditHook is a compound: edit-activity tracking (session) + FileReparse
+/// (knowledge). Handled by dispatching to both paths — not a single-tree
+/// transaction.
 fn is_compound(cmd: &Command) -> bool {
     matches!(cmd, Command::FileEditHook(_))
 }
@@ -670,7 +671,8 @@ async fn dispatch_policy_write(
                 Some(
                     PolicyOpError::InvalidKey { .. }
                     | PolicyOpError::NotAPolicy { .. }
-                    | PolicyOpError::InvalidGlob { .. },
+                    | PolicyOpError::InvalidGlob { .. }
+                    | PolicyOpError::EmptyTrigger { .. },
                 ) => ErrorCode::ValidationFailed,
                 Some(PolicyOpError::InvalidPayload { .. }) | None => ErrorCode::StoreError,
             };
@@ -770,7 +772,7 @@ async fn dispatch_policy_evaluate(
 
 // ── FileEditHook — compound command ─────────────────────────────────────────
 //
-// Substep 1: ConsultationHit (sessions tree) — best-effort.
+// Substep 1: edit-activity tracking (sessions tree) — best-effort.
 // Substep 2: FileReparse (knowledge tree) — native handler with audit.
 // Each substep writes its own audit in its respective tree.
 
@@ -785,13 +787,20 @@ async fn dispatch_file_edit_hook(
     };
     let request_id = req.id;
 
-    // Substep 1: consultation hit (sessions tree, best-effort).
+    // Substep 1: edit-activity tracking (sessions tree, best-effort).
     //
-    // Same staged transactional model as ConsultationHit: daily agg +
-    // consultation receipt + audit committed atomically in one
-    // sessions-tree transaction. Cross-tree access_count bump is a
-    // separate best-effort write. The whole substep is non-blocking —
-    // staging or transaction failures are logged, never propagated.
+    // Daily `analytics:hit_` aggregate + audit committed atomically in one
+    // sessions-tree transaction. Cross-tree access_count bump is a separate
+    // best-effort write. The whole substep is non-blocking — staging or
+    // transaction failures are logged, never propagated.
+    //
+    // Deliberately mints NO consultation receipt. A receipt is proof the agent
+    // READ the record (`run_post_memget`), and an edit is not a consultation:
+    // minting here let an edit that slipped through a fail-open suppress every
+    // later deny on that file, and refreshed the `consulted_recent` TTL the
+    // `claude-pre-edit` backstop is keyed on so that gate could never fire.
+    // The receipt was incidental to the `mati log-hit` this hook replaced,
+    // whose stated job was edit-activity tracking; the tracking stays.
     {
         let g = graph.read().await;
         let store = g.store();
@@ -800,11 +809,10 @@ async fn dispatch_file_edit_hook(
         // Stage session-tree writes.
         let agg_key = sess::today_key("analytics:hit_");
         let staged_agg = sess::upsert_daily_agg_staged(store, &agg_key, &file_key).await;
-        let staged_receipt = sess::consultation_receipt_staged(&file_key, None);
         let audit_entry = build_audit_entry(
             ctx,
             request_id,
-            "file_edit_hook:consultation",
+            "file_edit_hook:activity",
             &file_key,
             true,
             None,
@@ -812,13 +820,10 @@ async fn dispatch_file_edit_hook(
         let audit_key = audit_nanos_key("audit:session:");
         let audit_bytes = serialize_audit(&audit_entry);
 
-        // Atomic commit: agg + receipt + audit (all sessions tree).
+        // Atomic commit: agg + audit (all sessions tree).
         let mut writes: Vec<(&str, &[u8])> = Vec::new();
         if let Ok(ref agg) = staged_agg {
             writes.push((&agg.0, &agg.1));
-        }
-        if let Ok(ref receipt) = staged_receipt {
-            writes.push((&receipt.0, &receipt.1));
         }
         if let Some(ref ab) = audit_bytes {
             writes.push((&audit_key, ab));
@@ -827,7 +832,7 @@ async fn dispatch_file_edit_hook(
         if let Err(e) = store.transact_sessions_raw(&writes).await {
             tracing::warn!(
                 request_id = %request_id,
-                "file_edit_hook: consultation substep sessions transaction failed: {e}"
+                "file_edit_hook: activity substep sessions transaction failed: {e}"
             );
         }
 
@@ -1632,7 +1637,10 @@ mod tests {
             reason: "The schema changes because production is live.".into(),
             scope: "repo".into(),
             mode: PolicyMode::Block,
-            trigger: PolicyTrigger::default(),
+            trigger: PolicyTrigger {
+                tool: Some("db_client".into()),
+                ..Default::default()
+            },
             requires: PolicyRequires {
                 key: "schema:orders".into(),
                 via: vec![ReceiptSource::MemGet],
@@ -2193,6 +2201,7 @@ mod tests {
                 tags: vec![],
                 priority: Priority::Normal,
                 source: None,
+                confirmed: false,
             }),
             Command::GotchaConfirm(GotchaConfirmInput {
                 key: "gotcha:t".into(),
@@ -2288,6 +2297,53 @@ mod tests {
         );
     }
 
+    /// `confirmed` crosses the wire, but only a developer-originated write may
+    /// assert it. Before the field existed, `mati gotcha add` produced an
+    /// enforcing gotcha without a daemon and a dormant one with; after it,
+    /// an agent's `mem_set` still cannot mint one.
+    #[tokio::test]
+    async fn only_developer_originated_upserts_may_arrive_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+
+        let draft = |key: &str, source: Option<&str>| {
+            make_request(Command::GotchaUpsert(GotchaDraftInput {
+                key: key.into(),
+                rule: "Never swallow the error returned by Store::put".into(),
+                reason: "a dropped error loses the write silently".into(),
+                severity: Severity::High,
+                affected_files: vec!["src/a.rs".into()],
+                ref_url: None,
+                tags: vec![],
+                priority: Priority::Normal,
+                source: source.map(str::to_string),
+                confirmed: true,
+            }))
+        };
+
+        for (key, source, expected) in [
+            ("gotcha:from-developer", Some("developer_manual"), true),
+            ("gotcha:from-agent", None, false),
+            ("gotcha:from-import", Some("import"), false),
+        ] {
+            let resp = dispatch_v2(&graph, &ctx, draft(key, source)).await;
+            assert!(matches!(resp, Response::Ok { .. }), "{key} must be written");
+            let g = graph.read().await;
+            let gotcha = g
+                .store()
+                .get(key)
+                .await
+                .unwrap()
+                .expect("record written")
+                .payload_as::<crate::store::GotchaRecord>()
+                .expect("gotcha payload");
+            assert_eq!(gotcha.confirmed, expected, "{key}");
+        }
+    }
+
     /// `handle_gotcha_upsert` commits through its own `transact_knowledge`
     /// loop and never touches `gotcha_ops::apply_gotcha_write`, so the
     /// normalization there does not cover the MCP write path. It has to do its
@@ -2311,6 +2367,7 @@ mod tests {
             tags: vec![],
             priority: Priority::Normal,
             source: None,
+            confirmed: false,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }), "upsert must succeed");
@@ -2389,6 +2446,7 @@ mod tests {
             tags: vec![],
             priority: Priority::Normal,
             source: None,
+            confirmed: false,
         }));
         assert!(matches!(
             dispatch_v2(&graph, &ctx, upsert).await,
@@ -2839,8 +2897,11 @@ mod tests {
         }
     }
 
+    /// An edit is not a consultation. Minting a receipt here let an edit that
+    /// slipped through a fail-open suppress every later deny on that file, and
+    /// kept refreshing the TTL the `claude-pre-edit` backstop keys on.
     #[tokio::test]
-    async fn file_edit_hook_consultation_substep_writes_receipt_and_audit_atomically() {
+    async fn file_edit_hook_mints_no_consultation_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
@@ -2859,32 +2920,29 @@ mod tests {
 
         let g = graph.read().await;
 
-        // Session-side audit must exist (from consultation substep).
+        // Session-side audit must exist (from the activity substep).
         let audit_keys = g.store().scan_keys("audit:session:").await.unwrap();
         assert!(
             !audit_keys.is_empty(),
-            "FileEditHook consultation substep must produce session-side audit"
+            "FileEditHook activity substep must produce session-side audit"
         );
 
-        // Consultation receipt must exist (staged + committed atomically with audit).
-        let consulted = g
-            .store()
-            .get("session:consulted:file:test.rs")
-            .await
-            .unwrap();
+        // No consultation receipt: editing a file never proves the agent read
+        // its record.
+        let receipts = g.store().scan_keys("session:consulted:").await.unwrap();
         assert!(
-            consulted.is_some(),
-            "FileEditHook consultation substep must write consultation receipt"
+            receipts.is_empty(),
+            "an edit must mint no consultation receipt, got {receipts:?}"
         );
 
         // Daily hit agg must exist (staged + committed atomically with audit).
         let hit_keys = g.store().scan_keys("analytics:hit_").await.unwrap();
         assert!(
             !hit_keys.is_empty(),
-            "FileEditHook consultation substep must write daily hit agg"
+            "FileEditHook activity substep must write daily hit agg"
         );
 
-        // Verify the audit entry is for the consultation substep.
+        // Verify the audit entry is for the activity substep.
         let txn = g
             .store()
             .sessions_tree()
@@ -2892,7 +2950,7 @@ mod tests {
             .unwrap();
         let raw = txn.get(audit_keys[0].as_bytes()).unwrap().unwrap();
         let entry: AuditEntry = rmp_serde::from_slice(&raw).unwrap();
-        assert_eq!(entry.command_kind, "file_edit_hook:consultation");
+        assert_eq!(entry.command_kind, "file_edit_hook:activity");
         assert!(entry.accepted);
     }
 

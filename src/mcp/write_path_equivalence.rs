@@ -110,6 +110,7 @@ async fn drive_write(
                 tags: record.tags.clone(),
                 priority: record.priority.clone().into(),
                 source,
+                confirmed: gotcha.confirmed,
             };
             handlers::handle_gotcha_upsert(store, &test_ctx(), uuid::Uuid::nil(), &input)
                 .await
@@ -156,10 +157,12 @@ async fn drive_confirm(path: Path, store: &Store, key: &str) -> Result<(), Strin
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    let affected_files: Vec<String> = record
-        .payload_as::<GotchaRecord>()
-        .map(|g| g.affected_files)
-        .unwrap_or_default();
+    let affected_files = gotcha_ops::normalize_affected_files(
+        &record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default(),
+    );
 
     match path {
         Path::Direct => {
@@ -452,17 +455,6 @@ fn assert_divergences(scenario: &str, d: &BTreeMap<String, (String, String)>, ex
 
 /// Divergences on a **create** (`mati gotcha add`, `is_new = true`).
 ///
-/// - `payload.confirmed` — `gotcha_ops` honours the caller's
-///   `confirmed: true`; `upsert_commit_once` hard-codes `confirmed: false`.
-///   Only `confirmed: true` can deny a read, so the daemon transport turns a
-///   developer's enforcing rule into an advisory one.
-/// - `payload.confirmed_content` — follows from the above:
-///   `apply_gotcha_write` stamps the content digest of a new confirmed
-///   record, so `mati stale` can report drift against it. The handler never
-///   stamps, so drift on that gotcha is unreportable.
-/// - `confidence.confirmation_count` — the CLI sets 1 (an explicit developer
-///   assertion); the handler rebuilds the score with `for_new_record`, which
-///   zeroes it. Feeds `log2(count + 2)` in the confidence formula.
 /// - `dirty_marker` — `gotcha_ops` pre-arms and clears a cancellation guard,
 ///   leaving a clean marker behind; the handler has no dirty-marker path at
 ///   all, so its best-effort edge writes fail invisibly to
@@ -470,34 +462,27 @@ fn assert_divergences(scenario: &str, d: &BTreeMap<String, (String, String)>, ex
 ///   `gotcha_ops` write has run, the marker record exists on both sides.
 /// - `audit_knowledge_rows` — only the handler writes `audit:knowledge:*`.
 ///
+/// `payload.confirmed`, `payload.confirmed_content` and
+/// `confidence.confirmation_count` used to split here. `GotchaDraftInput` now
+/// carries `confirmed`, honoured only for `source: "developer_manual"`, and
+/// `upsert_commit_once` mirrors the content stamp and the single confirmation
+/// count that `apply_gotcha_write` writes for a new confirmed record.
+///
 /// Quality does **not** split: `quality::analyze` reads rule, reason, value
 /// and tags, none of which the handler rewrites, so its recomputation lands
 /// on the same score the CLI already stored.
-const CREATE_DIVERGENCES: &[&str] = &[
-    "payload.confirmed",
-    "payload.confirmed_content",
-    "confidence.confirmation_count",
-    "dirty_marker",
-    "audit_knowledge_rows",
-];
+const CREATE_DIVERGENCES: &[&str] = &["dirty_marker", "audit_knowledge_rows"];
 
 /// Divergences on an **edit** (`mati gotcha edit`, `is_new = false`).
 ///
-/// Same causes as create. `payload.confirmed_content` splits for a different
-/// reason here: the CLI carries the existing baseline forward untouched
-/// (editing rule text is not re-reading the code), while the handler rebuilds
-/// the payload with `confirmed_content: Default::default()` and discards it.
-/// Editing a confirmed, stamped gotcha over the socket therefore both
-/// un-confirms it and erases its drift baseline.
+/// Only the one-sided v2 audit row is left. The handler carries the existing
+/// `confirmed_content` baseline forward on a still-confirmed edit rather than
+/// rebuilding an empty one, matching the CLI: editing rule text is not
+/// re-reading the code, so a drifted gotcha must stay drifted.
 ///
 /// `dirty_marker` is absent from this list only because the fixture seeds via
 /// `apply_gotcha_write`, which leaves a marker record in both stores.
-const EDIT_DIVERGENCES: &[&str] = &[
-    "payload.confirmed",
-    "payload.confirmed_content",
-    "confidence.confirmation_count",
-    "audit_knowledge_rows",
-];
+const EDIT_DIVERGENCES: &[&str] = &["audit_knowledge_rows"];
 
 /// Divergences on **confirm** (`mati gotcha confirm`).
 ///
@@ -511,24 +496,18 @@ const CONFIRM_DIVERGENCES: &[&str] = &["consultation_receipts", "audit_knowledge
 /// Divergences on **confirm of a legacy record** whose `affected_files` were
 /// stored before path normalization existed.
 ///
-/// `apply_gotcha_confirm` re-keys them through `normalize_affected_files`;
-/// `confirm_commit_once` does not. The daemon transport leaves the record
-/// pointing at `./src/a.rs`, which `file:src/a.rs` never matches, so the
-/// derived index, the graph edge and the confirm-time content stamp all miss
-/// too. This is the silent-non-enforcement case ARCHITECTURE.md section 22
-/// calls out under "Path normalization".
+/// `confirm_commit_once` now re-keys them through `normalize_affected_files`
+/// and writes the normalized list back into the payload, so the record, the
+/// derived index, the graph edge and the confirm-time content stamp all land
+/// on the key the read gate looks up. That closes the silent-non-enforcement
+/// case ARCHITECTURE.md section 22 calls out under "Path normalization".
+///
+/// Only the two whole-path differences are left, both shared with every other
+/// scenario: the CLI's dirty-marker guard and the handler's v2 audit row.
 ///
 /// No receipt is seeded here, so `consultation_receipts` does not appear —
 /// that difference is covered by [`CONFIRM_DIVERGENCES`].
-const CONFIRM_LEGACY_DIVERGENCES: &[&str] = &[
-    "payload.affected_files",
-    "payload.confirmed_content",
-    "file[src/a.rs].gotcha_keys",
-    "file[src/a.rs].logical_clock",
-    "graph.has_gotcha_edges",
-    "dirty_marker",
-    "audit_knowledge_rows",
-];
+const CONFIRM_LEGACY_DIVERGENCES: &[&str] = &["dirty_marker", "audit_knowledge_rows"];
 
 /// Divergences on **tombstone** (`mati gotcha delete`).
 ///
@@ -751,12 +730,11 @@ async fn create_on_existing_slug_diverges_only_where_pinned() {
             // Daemon replaced it. Everything the second write touches splits,
             // including the enforcement stream: Direct records nothing at all,
             // Daemon records a `ControlChanged::Updated` for what the caller
-            // asked to be a create.
+            // asked to be a create. Confirmation state no longer splits: the
+            // handler treats the existing key as an edit and keeps both the
+            // developer's `confirmed: true` and its drift baseline.
             "record.value",
             "payload.rule",
-            "payload.confirmed",
-            "payload.confirmed_content",
-            "confidence.confirmation_count",
             "quality.value",
             "version.logical_clock",
             "enforcement_events",
@@ -850,6 +828,66 @@ async fn confirm_of_legacy_unnormalized_paths_diverges_only_where_pinned() {
     })
     .await;
     assert_divergences("confirm legacy paths", &d, CONFIRM_LEGACY_DIVERGENCES);
+}
+
+/// The daemon half of the legacy-path scenario, asserted directly rather than
+/// as a diff: a confirm over the socket has to leave the gotcha enforceable.
+///
+/// Before `confirm_commit_once` normalized, the record kept `./src/a.rs`,
+/// `file:src/a.rs.gotcha_keys` stayed empty and the `HasGotcha` edge pointed at
+/// a key nothing reads — confirmed and inert.
+#[tokio::test]
+async fn daemon_confirm_re_keys_a_legacy_gotcha_into_the_read_gate() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = Store::open(dir.path()).await.expect("open store");
+    seed_file(&store, "src/a.rs").await;
+
+    let mut record = manual_add_record(KEY, RULE, REASON, &["./src/a.rs"]);
+    let mut g = record.payload_as::<GotchaRecord>().unwrap();
+    g.confirmed = false;
+    g.affected_files = vec!["./src/a.rs".into()];
+    record.payload = serde_json::to_value(&g).ok();
+    record.source = RecordSource::ClaudeEnrich;
+    record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
+    seed_verbatim(&store, &record).await;
+
+    drive_confirm(Path::Daemon, &store, KEY)
+        .await
+        .expect("confirm");
+
+    let stored = store.get(KEY).await.unwrap().unwrap();
+    let gotcha = stored.payload_as::<GotchaRecord>().unwrap();
+    assert_eq!(gotcha.affected_files, vec!["src/a.rs".to_string()]);
+    assert!(gotcha.confirmed);
+
+    let file = store.get("file:src/a.rs").await.unwrap().unwrap();
+    let keys: Vec<String> = file
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("gotcha_keys"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        keys,
+        vec![KEY.to_string()],
+        "the derived link must survive the confirmation-count bump staged for the same key"
+    );
+    assert_eq!(file.confidence.confirmation_count, 1);
+
+    let edges = store.scan_keys("graph:edge:").await.unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.contains("file:src/a.rs") && e.ends_with(KEY)),
+        "HasGotcha edge must name the normalized file key, got {edges:?}"
+    );
+
+    store.close().await.expect("close");
 }
 
 #[tokio::test]

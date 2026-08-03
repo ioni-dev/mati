@@ -763,11 +763,17 @@ pub(crate) async fn confirm_gotcha(proxy: &StoreProxy, key: &str) -> Result<()> 
     record.version.logical_clock += 1;
     record.version.wall_clock = now;
 
-    // Extract affected_files for the gotcha_write call.
-    let affected_files: Vec<String> = record
-        .payload_as::<GotchaRecord>()
-        .map(|g| g.affected_files)
-        .unwrap_or_default();
+    // Extract affected_files for the gotcha_write call, normalized to the form
+    // the read gate keys on. `apply_gotcha_confirm` re-keys its own copy, but
+    // `propagate_confirmation` below takes this list verbatim — a legacy
+    // `./src/a.rs` would look up `file:./src/a.rs` and silently propagate to
+    // nothing.
+    let affected_files = mati_core::store::gotcha_ops::normalize_affected_files(
+        &record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default(),
+    );
 
     // In socket mode, use the daemon's native GotchaConfirm handler which
     // atomically sets DeveloperManual source + 0.80 confidence + file links

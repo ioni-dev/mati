@@ -804,9 +804,15 @@ Sessions use three layers of state in `sessions.db`, with Eventual durability.
 
 **During the session:**
 
-Each `mem_get` call writes `session:consulted:<key>`. This is the consultation receipt proving Claude read the record for that file. The TTL is 15 minutes, set by `CONSULTED_RECENT_TTL_SECS = 900`.
+Each `mem_get` call writes a consultation receipt: proof that the agent read the record for that key. The TTL is 15 minutes, set by `CONSULTED_RECENT_TTL_SECS = 900`.
 
-The hook decision engine checks for that key before choosing between Deny and AlreadyConsulted. See section 10.1.
+The hook decision engine checks for that receipt before choosing between Deny and AlreadyConsulted. See section 10.1.
+
+**Receipt scope.** The receipt key is `session:consulted:<actor>:<key>` when the hook payload carries an `agent_id`, and `session:consulted:<key>` when it does not. The actor is the agent, never the session: `cli::hook_decide::receipt_actor` takes `agent_id` and discards `session_id`, because the gate reads the global key on the main thread and scoping by session would mint receipts nothing ever checks. Lookup is strictly key-equal — there is no actor-to-global fallback in either direction. One subagent cannot ride another's receipt, a subagent cannot ride the main thread's, and the main thread cannot ride a subagent's. Pinned by `store::session::tests::gate_requires_actor_scoped_receipt_for_subagent` and `cli::hook_decide::tests::subagent_receipt_stays_actor_scoped`.
+
+The `session:` prefix names the tree and the lifetime, not the scope. Receipts live in `sessions.db` and are wiped three times: at daemon startup, on PostCompact (compaction erases the agent's memory of what it read, so the receipt has to go with it), and at session end. They are not keyed by session id, so two agent sessions sharing a repo and a daemon share the main-thread receipt namespace until one of those sweeps runs.
+
+**What may mint one.** Only a read. `mem_get` mints through the post-memget hook, and an allowlisted schema-introspection command mints through post-bash for policies that accept `DbIntrospection` (section 10a.5). Editing a file mints nothing: `FileEditHook` records edit activity and reparses, but a write is not evidence the agent saw the record, and minting there would let an edit that slipped through a fail-open suppress every later deny on that file.
 
 **On session flush:**
 

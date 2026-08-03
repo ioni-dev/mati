@@ -493,7 +493,10 @@ fn build_mem_set_write_command(params: &MemSetParams) -> Result<Command, String>
             ref_url,
             tags: params.tags.clone(),
             priority,
+            // An agent writes drafts. Enforcement requires the separate
+            // `confirm` action, which is the developer's call (P4).
             source: None,
+            confirmed: false,
         }));
     }
 
