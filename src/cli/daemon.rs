@@ -467,6 +467,12 @@ pub async fn run_daemon_start() -> Result<()> {
     // PID is written — remove the starting sentinel so `mati init` won't block.
     let _ = std::fs::remove_file(&starting_path);
 
+    // The daemon is the authoritative metrics surface (dispatch_v2 records
+    // every command here, not on the `mati serve` proxy path) -- initialize
+    // before the serve loop starts accepting connections, or every sample
+    // dies at METRICS.get() in metrics::record.
+    mati_core::mcp::metrics::init();
+
     // Phase: ready. Terminal success state of the cold-start sequence. The
     // socket is bound, metadata is published, and the daemon is committed to
     // accepting connections. Callers waiting in `ensure_daemon` look for
