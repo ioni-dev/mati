@@ -452,6 +452,14 @@ mod gotcha_write_sites {
              emitted as PutRecord { key: r.key }",
         ),
         (
+            "src/mcp/write_path_equivalence.rs",
+            "seed_verbatim",
+            Class::Bypass,
+            "test fixture, #[cfg(test)] only: seeds a gotcha whose \
+             affected_files predate path normalization, which is exactly what \
+             apply_gotcha_write would rewrite on the way in",
+        ),
+        (
             "src/mcp/handlers.rs",
             "apply_mem_set_write",
             Class::Bypass,
