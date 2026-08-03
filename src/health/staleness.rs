@@ -235,6 +235,13 @@ const ANALYZE_TIME_BUDGET_MS: u64 = 2000;
 /// Record key prefixes that the analyzer scans.
 const STALENESS_PREFIXES: &[&str] = &["file:", "gotcha:", "decision:", "dep:", "dev_note:"];
 
+/// Where a budget-truncated scan stopped, so the next one resumes there.
+///
+/// `health:*` is Eventual durability (`store::durability`): the cursor is
+/// derived scheduling state, not knowledge. Losing it to a crash restarts the
+/// sweep at the first prefix, which costs one redundant pass and nothing else.
+const STALENESS_CURSOR_KEY: &str = "health:staleness_cursor";
+
 /// 24 hours in seconds — window for reparse signal preservation.
 const REPARSE_WINDOW_SECS: u64 = 86_400;
 
@@ -322,7 +329,8 @@ impl StalenessAnalyzer {
 
     /// Scan all staleness-eligible prefixes, recompute scores, and batch-write
     /// updated records. Respects a 2-second time budget — partial results are
-    /// written if the budget is exceeded.
+    /// written if the budget is exceeded, and the next call resumes where this
+    /// one stopped.
     pub async fn analyze_all(&self, store: &Store) -> Result<StalenessReport> {
         let deadline = Instant::now() + std::time::Duration::from_millis(ANALYZE_TIME_BUDGET_MS);
         self.analyze_until(store, deadline).await
@@ -330,6 +338,14 @@ impl StalenessAnalyzer {
 
     /// [`Self::analyze_all`] with the deadline supplied, so a test can prove the
     /// budget gates the scan without racing a wall clock.
+    ///
+    /// The scan walks `STALENESS_PREFIXES` in order and each prefix in key
+    /// order, so a budget that expires always expires in the same place: inside
+    /// `file:`, the largest prefix and the only one paying git cost. Without a
+    /// resume cursor the next pass starts over at `file:`, and the four prefixes
+    /// behind it recompute only on a pass that happens to finish `file:` — luck,
+    /// not a bound. The cursor carries the position over, so coverage advances
+    /// every harvest whatever the budget reached.
     async fn analyze_until(&self, store: &Store, deadline: Instant) -> Result<StalenessReport> {
         let mut report = StalenessReport {
             scanned: 0,
@@ -346,10 +362,28 @@ impl StalenessAnalyzer {
             .map(|r| (r.key.clone(), r))
             .collect();
 
-        let mut updates: Vec<(String, Record)> = Vec::new();
+        // A cursor naming a prefix the sweep no longer covers is not a position.
+        // Restart rather than skip: `record.key <= cursor` against an unrelated
+        // key would silently starve whatever sorts below it.
+        let stored_cursor = read_cursor(store).await;
+        let resume = stored_cursor.as_deref().and_then(|key| {
+            STALENESS_PREFIXES
+                .iter()
+                .position(|p| key.starts_with(p))
+                .map(|idx| (idx, key))
+        });
+        let (resume_prefix, resume_after) = match resume {
+            Some((idx, key)) => (idx, Some(key)),
+            None => (0, None),
+        };
 
-        for prefix in STALENESS_PREFIXES {
+        let mut updates: Vec<(String, Record)> = Vec::new();
+        let mut last_visited: Option<String> = None;
+        let mut truncated = false;
+
+        'prefixes: for (idx, prefix) in STALENESS_PREFIXES.iter().enumerate().skip(resume_prefix) {
             if Instant::now() >= deadline {
+                truncated = true;
                 tracing::warn!(
                     "staleness analyze_all: time budget exceeded after {} records",
                     report.scanned
@@ -357,24 +391,41 @@ impl StalenessAnalyzer {
                 break;
             }
 
-            let records = match store.scan_prefix(prefix).await {
+            // `scan_prefix` does not promise an order. The cursor is a key, so
+            // the sweep needs one: sort, or a resumed pass skips whatever
+            // happens to sort low this time and revisits the rest.
+            let mut records = match store.scan_prefix(prefix).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("staleness scan_prefix({prefix}) failed: {e}");
                     continue;
                 }
             };
+            records.sort_by(|a, b| a.key.cmp(&b.key));
 
             for record in records {
+                // Already covered by the pass that set the cursor. Checked
+                // before the deadline so a resumed pass spends its budget on
+                // new records, not on re-deciding to skip old ones.
+                if idx == resume_prefix {
+                    if let Some(after) = resume_after {
+                        if record.key.as_str() <= after {
+                            continue;
+                        }
+                    }
+                }
+
                 if Instant::now() >= deadline {
+                    truncated = true;
                     tracing::warn!(
                         "staleness analyze_all: time budget exceeded mid-prefix at {} records",
                         report.scanned
                     );
-                    break;
+                    break 'prefixes;
                 }
 
                 report.scanned += 1;
+                last_visited = Some(record.key.clone());
 
                 // Skip non-active records.
                 if !matches!(record.lifecycle, RecordLifecycle::Active) {
@@ -422,6 +473,18 @@ impl StalenessAnalyzer {
             store.put_batch(&batch).await.with_context(|| {
                 format!("staleness batch write failed for {} records", batch.len())
             })?;
+        }
+
+        // Cursor last: it must only ever claim work the batch above persisted.
+        // A truncated pass that visited nothing leaves the cursor alone rather
+        // than rewinding it.
+        match (truncated, last_visited) {
+            (true, Some(key)) => write_cursor(store, &key, self.now).await,
+            (true, None) => {}
+            // Only when one exists: a store with a budget it never exhausts
+            // must not pay a tantivy delete every harvest to clear nothing.
+            (false, _) if stored_cursor.is_some() => clear_cursor(store).await,
+            (false, _) => {}
         }
 
         Ok(report)
@@ -732,6 +795,57 @@ const _: fn() = || {
     }
     let _ = probe;
 };
+
+// ── Resume cursor ───────────────────────────────────────────────────────────
+//
+// Every cursor operation is best-effort. Staleness runs on the SessionEnd hook
+// path, so a store fault here must cost a fair sweep and nothing more: a lost
+// cursor restarts at `file:`, exactly the behaviour that existed before it.
+
+/// Payload field holding the resume position.
+///
+/// The position lives in `payload`, not `value`: `Store::put` indexes `value`
+/// into tantivy, and the position is a record key — a `mem_query` for a path
+/// would match the cursor as if it were knowledge about that path.
+const CURSOR_FIELD: &str = "after";
+
+/// The key the last truncated scan stopped on, or `None` to start at the top.
+async fn read_cursor(store: &Store) -> Option<String> {
+    let record = match store.get(STALENESS_CURSOR_KEY).await {
+        Ok(record) => record?,
+        Err(e) => {
+            tracing::warn!("staleness cursor read failed: {e}");
+            return None;
+        }
+    };
+    record
+        .payload
+        .as_ref()
+        .and_then(|p| p.get(CURSOR_FIELD))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+async fn write_cursor(store: &Store, key: &str, now: u64) {
+    let mut record = Record::layer0_file_stub(
+        STALENESS_CURSOR_KEY,
+        crate::store::stable_device_id(),
+        1,
+        now,
+    );
+    record.category = Category::Analytics;
+    record.payload = Some(serde_json::json!({ CURSOR_FIELD: key }));
+    if let Err(e) = store.put(STALENESS_CURSOR_KEY, &record).await {
+        tracing::warn!("staleness cursor write failed: {e}");
+    }
+}
+
+async fn clear_cursor(store: &Store) {
+    if let Err(e) = store.delete(STALENESS_CURSOR_KEY).await {
+        tracing::warn!("staleness cursor clear failed: {e}");
+    }
+}
 
 // ── Factor functions ────────────────────────────────────────────────────────
 
@@ -2227,6 +2341,180 @@ mod tests {
 
         // Record was scanned but not updated because it's tombstoned.
         assert_eq!(report.updated, 0);
+
+        store.close().await.unwrap();
+    }
+
+    // ── resume cursor tests ─────────────────────────────────────────────────
+
+    /// Every prefix, seeded old enough that the first computation changes the
+    /// score and therefore persists `computed_at`.
+    async fn seed_one_record_per_prefix(store: &Store, now: u64) -> Vec<String> {
+        let old = now - (60 * 86_400);
+        let keys = [
+            "file:zzz_last.rs",
+            "gotcha:g1",
+            "decision:d1",
+            "dep:cargo:serde",
+            "dev_note:n1",
+        ];
+        for key in keys {
+            let mut record = make_record_at(key, old, 0);
+            record.category = match key.split(':').next().unwrap() {
+                "gotcha" => Category::Gotcha,
+                "decision" => Category::Decision,
+                "dep" => Category::Dependency,
+                "dev_note" => Category::DevNote,
+                _ => Category::File,
+            };
+            store.put(key, &record).await.unwrap();
+        }
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// A `file:` record that costs a whole budget to score: `cascade_factor`
+    /// issues one store read per linked key, and none of these exist.
+    fn make_budget_eating_record(key: &str, now: u64, links: usize) -> Record {
+        let mut record = make_record_at(key, now - (60 * 86_400), 0);
+        let gotcha_keys: Vec<String> = (0..links).map(|i| format!("gotcha:absent-{i}")).collect();
+        let fr = make_file_record_full(key, vec![], gotcha_keys, vec![], 0);
+        record.payload = serde_json::from_str(&fr.value).ok();
+        record
+    }
+
+    /// The scan order is fixed, so a budget that expires always expires inside
+    /// `file:`, and the four prefixes behind it would never recompute. The
+    /// cursor is what bounds coverage: pass 2 must start where pass 1 stopped
+    /// and finish the store, not restart at `file:` and starve the tail again.
+    #[tokio::test]
+    async fn a_truncated_pass_parks_a_cursor_and_the_next_pass_finishes_the_store() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let now = 20_000_000u64;
+
+        let mut keys = seed_one_record_per_prefix(&store, now).await;
+        // Sorts first inside `file:`, so it is what a truncated pass spends
+        // its whole budget on.
+        let hog = "file:aaa_expensive.rs";
+        let record = make_budget_eating_record(hog, now, 20_000);
+        store.put(hog, &record).await.unwrap();
+        keys.push(hog.to_string());
+
+        let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+
+        let deadline = Instant::now() + std::time::Duration::from_millis(5);
+        let first = analyzer.analyze_until(&store, deadline).await.unwrap();
+        assert!(first.scanned >= 1, "a pass must make progress");
+        assert!(
+            first.scanned < keys.len() as u32,
+            "the budget did not truncate: scanned {} of {}",
+            first.scanned,
+            keys.len()
+        );
+        assert_eq!(
+            read_cursor(&store).await.as_deref(),
+            Some(hog),
+            "a truncated pass parks the cursor on the last record it finished"
+        );
+
+        let second = analyzer.analyze_all(&store).await.unwrap();
+        assert_eq!(
+            second.scanned,
+            keys.len() as u32 - first.scanned,
+            "the resumed pass must not re-scan what the cursor already covered"
+        );
+        assert!(
+            read_cursor(&store).await.is_none(),
+            "a pass that reaches the end clears the cursor"
+        );
+
+        for key in &keys {
+            let record = store.get(key).await.unwrap().unwrap();
+            assert_eq!(
+                record.staleness.computed_at, now,
+                "{key} was never recomputed across the sweep"
+            );
+        }
+
+        store.close().await.unwrap();
+    }
+
+    /// The cursor is scheduling state on the Eventual path, so it can be lost,
+    /// stale, or left behind by a prefix list that has since changed. Anything
+    /// the sweep cannot place must restart it, never skip.
+    #[tokio::test]
+    async fn an_unplaceable_cursor_restarts_the_sweep() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let now = 20_000_000u64;
+
+        let keys = seed_one_record_per_prefix(&store, now).await;
+        write_cursor(&store, "retired_namespace:zzz", now).await;
+
+        let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+        let report = analyzer.analyze_all(&store).await.unwrap();
+
+        assert_eq!(
+            report.scanned,
+            keys.len() as u32,
+            "an unplaceable cursor must not skip any record"
+        );
+        assert!(read_cursor(&store).await.is_none());
+
+        store.close().await.unwrap();
+    }
+
+    /// An empty position is absence, not position zero.
+    #[tokio::test]
+    async fn an_empty_cursor_position_reads_as_no_cursor() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        write_cursor(&store, "", 20_000_000).await;
+        assert!(read_cursor(&store).await.is_none());
+
+        store.close().await.unwrap();
+    }
+
+    /// The position must not reach the search index: it is a record key, and a
+    /// `mem_query` for that path would otherwise match the cursor.
+    #[tokio::test]
+    async fn the_cursor_position_is_not_searchable() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        write_cursor(&store, "file:src/distinctive_marker.rs", 20_000_000).await;
+        let hits = store.search("distinctive_marker", 10).await.unwrap();
+
+        assert!(
+            !hits.iter().any(|r| r.key == STALENESS_CURSOR_KEY),
+            "cursor leaked into the search index: {hits:?}"
+        );
+
+        store.close().await.unwrap();
+    }
+
+    /// The budget still stops the scan. An expired one writes no cursor either:
+    /// a pass that visited nothing has no position to record, and rewinding to
+    /// one it did not reach would re-run work the previous pass already did.
+    #[tokio::test]
+    async fn an_expired_budget_leaves_the_cursor_untouched() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let now = 20_000_000u64;
+
+        seed_one_record_per_prefix(&store, now).await;
+        write_cursor(&store, "file:zzz_last.rs", now).await;
+
+        let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+        let expired = Instant::now() - std::time::Duration::from_millis(1);
+        let report = analyzer.analyze_until(&store, expired).await.unwrap();
+
+        assert_eq!(report.scanned, 0);
+        assert_eq!(
+            read_cursor(&store).await.as_deref(),
+            Some("file:zzz_last.rs")
+        );
 
         store.close().await.unwrap();
     }

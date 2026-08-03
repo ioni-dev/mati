@@ -1046,6 +1046,47 @@ mod tests {
         store.close().await.expect("close");
     }
 
+    /// The staleness sweep parks a resume cursor when its budget runs out. That
+    /// state is on the Eventual path and reachable by the SessionEnd hook, so a
+    /// junk value must cost a fair sweep and nothing else — not the archive,
+    /// not the receipts, not the harvest's return value.
+    #[tokio::test]
+    async fn harvest_survives_a_junk_staleness_cursor() {
+        let (repo_dir, head_sha) = temp_repo_with_commit("src/seed.rs");
+        let (_dir, store) = temp_store().await;
+
+        let record = file_record_at("file:src/seed.rs", now_secs() - (60 * 86_400));
+        store.put(&record.key, &record).await.expect("put");
+        session_flush(&store).await.expect("flush");
+
+        // Literals on purpose: the cursor key and its payload field are private
+        // to `health::staleness`, which owns the only writes to them.
+        let mut junk = file_record_at("health:staleness_cursor", now_secs());
+        junk.payload = Some(serde_json::json!({ "after": "retired_namespace:whatever" }));
+        store
+            .put("health:staleness_cursor", &junk)
+            .await
+            .expect("put cursor");
+
+        session_harvest(&store, repo_dir.path())
+            .await
+            .expect("harvest must survive a cursor it cannot place");
+
+        let after = store
+            .get("file:src/seed.rs")
+            .await
+            .expect("get")
+            .expect("record");
+        assert_eq!(
+            after.staleness.last_record_sha, head_sha,
+            "the sweep restarted instead of skipping past the junk cursor"
+        );
+        let sessions = store.scan_keys("session:").await.expect("scan");
+        assert!(sessions.iter().any(|k| k != "session:current"));
+
+        store.close().await.expect("close");
+    }
+
     #[tokio::test]
     async fn log_bootstrap_creates_daily_aggregate() {
         let (_dir, store) = temp_store().await;
