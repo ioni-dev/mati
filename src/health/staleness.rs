@@ -25,6 +25,16 @@ use crate::store::Store;
 /// Maximum staleness increment from a single reparse pass.
 const MAX_REPARSE_INCREMENT: f32 = 0.4;
 
+/// Ceiling on the staleness a record can hold from reparse alone.
+///
+/// Sits below the 0.7 `Liability` floor on purpose. `hooks::decide::evaluate`
+/// returns before the gotcha loop at both `Liability` and `Tombstone`, so an
+/// increment that accumulates per edit would let a few edits in one session
+/// switch enforcement off for every confirmed gotcha on the file. Git, time,
+/// dep and cascade factors still reach those tiers through
+/// [`StalenessAnalyzer::compute_staleness`].
+const MAX_REPARSE_STALENESS: f32 = 0.69;
+
 /// Staleness increment per entry point change.
 const ENTRY_POINT_WEIGHT: f32 = 0.15;
 
@@ -117,8 +127,11 @@ pub fn apply_reparse_staleness(record: &mut Record, diff: &ReparseDiff) -> Vec<S
     // Cap increment
     increment = increment.min(MAX_REPARSE_INCREMENT);
 
-    // Update score
-    let new_value = (record.staleness.value + increment).min(1.0);
+    // Saturating add: never past the reparse ceiling, never below a value some
+    // other factor (or a hard override) already set.
+    let new_value = (record.staleness.value + increment)
+        .min(MAX_REPARSE_STALENESS)
+        .max(record.staleness.value);
     record.staleness.value = new_value;
     record.staleness.tier = StalenessScore::tier_from_value(new_value);
     record.staleness.computed_at = now;
@@ -155,7 +168,9 @@ pub async fn cascade_staleness_to_gotchas(store: &Store, file_record: &FileRecor
                 path: file_record.path.clone(),
             };
 
-            let new_value = (gotcha_record.staleness.value + CASCADE_WEIGHT).min(1.0);
+            let new_value = (gotcha_record.staleness.value + CASCADE_WEIGHT)
+                .min(MAX_REPARSE_STALENESS)
+                .max(gotcha_record.staleness.value);
             gotcha_record.staleness.value = new_value;
             gotcha_record.staleness.tier = StalenessScore::tier_from_value(new_value);
             gotcha_record.staleness.computed_at = now;
@@ -528,10 +543,13 @@ impl StalenessAnalyzer {
         let clamped = raw_value.clamp(0.0, 1.0);
 
         // ── Reparse signal preservation ─────────────────────────────────────
-        // If recent reparse signals exist (within 24h) and the analyzer would
-        // reduce the score, preserve the higher value.
-        let final_value = if had_recent_reparse && clamped < old_value {
-            old_value
+        // Recent reparse signals (within 24h) hold the score up against a lower
+        // recompute, but only as far as reparse is itself allowed to raise it.
+        // Without that bound a record over-accumulated before the ceiling
+        // existed stays pinned at its old tier instead of recovering, and every
+        // further edit renews the window.
+        let final_value = if had_recent_reparse {
+            clamped.max(old_value.min(MAX_REPARSE_STALENESS))
         } else {
             clamped
         };
@@ -1188,6 +1206,29 @@ mod tests {
             source: RecordSource::DeveloperManual,
             confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
             gap_analysis_score: 0.0,
+        }
+    }
+
+    fn make_linked_file_record() -> FileRecord {
+        FileRecord {
+            path: "src/main.rs".into(),
+            purpose: String::new(),
+            entry_points: vec![],
+            imports: vec![],
+            gotcha_keys: vec![],
+            decision_keys: vec![],
+            todos: vec![],
+            unsafe_count: 0,
+            unwrap_count: 0,
+            change_frequency: 0,
+            last_author: None,
+            is_hotspot: false,
+            token_cost_estimate: 0,
+            last_modified_session: 0,
+            content_hash: None,
+            line_count: 0,
+            blast_radius: None,
+            propagated_staleness: None,
         }
     }
 
@@ -2291,5 +2332,212 @@ mod tests {
         assert!(!is_reparse_signal(&StalenessSignal::FileDeleted));
         assert!(!is_reparse_signal(&StalenessSignal::LinesChangedPct(0.5)));
         assert!(!is_reparse_signal(&StalenessSignal::NotAccessedDays(7)));
+    }
+
+    // ── Reparse accumulation cannot disable enforcement ─────────────────────
+
+    /// `hooks::decide::evaluate` returns before the gotcha loop when a file
+    /// record's staleness tier is `liability` or `tombstone` — pinned by
+    /// `decide::tests::gate_never_silently_disables`. Reparse staleness is
+    /// applied per edit, so without a ceiling across passes, editing one file a
+    /// handful of times in a session crosses that boundary and every confirmed
+    /// gotcha on the file stops being enforced. Nothing is logged: `Tombstone`
+    /// returns an empty event list.
+    ///
+    /// These tests bound the reparse contribution. They do not touch the tier
+    /// thresholds or what the tiers mean.
+    mod reparse_cannot_disable_enforcement {
+        use super::*;
+        use crate::hooks::decide::{evaluate, Decision, EnforcementInput};
+
+        /// A diff big enough to saturate a single pass at
+        /// [`MAX_REPARSE_INCREMENT`].
+        fn saturating_diff() -> ReparseDiff {
+            ReparseDiff {
+                entry_points_added: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                imports_added: vec!["x".into(), "y".into(), "z".into()],
+                ..empty_diff()
+            }
+        }
+
+        /// A file record carrying one maximally-valid confirmed gotcha, plus
+        /// that gotcha, in the JSON shape `evaluate` reads.
+        fn enforcement_input_for(record: &Record) -> EnforcementInput {
+            let mut gotcha = make_gotcha_record("gotcha:test");
+            gotcha.confidence.value = 1.0;
+            gotcha.quality.value = 1.0;
+
+            let mut file = record.clone();
+            file.confidence.value = 0.7;
+            file.quality.value = 0.5;
+            file.payload = serde_json::json!({ "gotcha_keys": ["gotcha:test"] }).into();
+
+            let mut gotchas = HashMap::new();
+            gotchas.insert(
+                "gotcha:test".to_string(),
+                serde_json::to_value(&gotcha).unwrap(),
+            );
+            EnforcementInput {
+                rel_path: "src/main.rs".into(),
+                file_record: Some(serde_json::to_value(&file).unwrap()),
+                gotcha_records: gotchas,
+                already_consulted: false,
+            }
+        }
+
+        /// The anchor: no number of reparse passes reaches a tier that returns
+        /// before the gotcha loop.
+        #[test]
+        fn repeated_reparse_never_reaches_a_tier_that_stops_enforcing() {
+            let mut record = make_file_record_with_staleness(0.0);
+
+            for pass in 1..=50 {
+                apply_reparse_staleness(&mut record, &saturating_diff());
+                assert!(
+                    !matches!(
+                        record.staleness.tier,
+                        StalenessTier::Liability | StalenessTier::Tombstone
+                    ),
+                    "ENFORCEMENT DISABLED: {} reparse passes reached tier {:?} \
+                     (value {}). Liability and Tombstone both return before the \
+                     gotcha loop in hooks::decide::evaluate",
+                    pass,
+                    record.staleness.tier,
+                    record.staleness.value
+                );
+
+                let decision = evaluate(&enforcement_input_for(&record)).decision;
+                assert!(
+                    matches!(decision, Decision::Deny { .. }),
+                    "ENFORCEMENT DISABLED: after {pass} reparse passes a confirmed \
+                     gotcha produced {decision:?} instead of Deny"
+                );
+            }
+
+            assert!(record.staleness.value <= MAX_REPARSE_STALENESS + f32::EPSILON);
+        }
+
+        /// The ceiling is only meaningful while it stays inside `Stale`.
+        #[test]
+        fn ceiling_sits_below_the_liability_floor() {
+            assert_eq!(
+                StalenessScore::tier_from_value(MAX_REPARSE_STALENESS),
+                StalenessTier::Stale,
+                "MAX_REPARSE_STALENESS must stay below the 0.7 Liability floor"
+            );
+        }
+
+        /// The signal is not neutered: one pass still moves the score, and the
+        /// score keeps climbing until it saturates.
+        #[test]
+        fn a_single_reparse_still_raises_staleness() {
+            let mut record = make_file_record_with_staleness(0.0);
+            let signals = apply_reparse_staleness(&mut record, &saturating_diff());
+
+            assert!(!signals.is_empty(), "a non-empty diff must emit signals");
+            assert!(
+                (record.staleness.value - MAX_REPARSE_INCREMENT).abs() < 0.01,
+                "one saturating pass must still add the full increment, got {}",
+                record.staleness.value
+            );
+            assert_eq!(record.staleness.tier, StalenessTier::Stale);
+
+            let after_first = record.staleness.value;
+            apply_reparse_staleness(&mut record, &saturating_diff());
+            assert!(
+                record.staleness.value > after_first,
+                "a second pass must still raise the score below the ceiling"
+            );
+        }
+
+        /// Another factor may legitimately hold a record above the ceiling.
+        /// Reparse must not drag it back down.
+        #[test]
+        fn reparse_never_lowers_a_score_set_by_another_factor() {
+            let mut record = make_file_record_with_staleness(0.95);
+            apply_reparse_staleness(&mut record, &saturating_diff());
+            assert!((record.staleness.value - 0.95).abs() < f32::EPSILON);
+            assert_eq!(record.staleness.tier, StalenessTier::Tombstone);
+        }
+
+        /// The cascade to linked gotchas accumulates the same way. A tombstoned
+        /// gotcha is dropped by `mcp::tools::is_injectable_gotcha`.
+        #[tokio::test]
+        async fn cascade_to_gotchas_saturates_below_liability() {
+            let dir = TempDir::new().unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
+            store
+                .put("gotcha:test-rule", &make_gotcha_record("gotcha:test-rule"))
+                .await
+                .unwrap();
+
+            let mut file_record = make_linked_file_record();
+            file_record.gotcha_keys = vec!["gotcha:test-rule".into()];
+
+            for _ in 0..30 {
+                cascade_staleness_to_gotchas(&store, &file_record)
+                    .await
+                    .unwrap();
+            }
+
+            let updated = store.get("gotcha:test-rule").await.unwrap().unwrap();
+            assert!(
+                updated.staleness.value <= MAX_REPARSE_STALENESS + f32::EPSILON,
+                "cascade accumulated to {}",
+                updated.staleness.value
+            );
+            assert_eq!(updated.staleness.tier, StalenessTier::Stale);
+
+            store.close().await.unwrap();
+        }
+
+        /// `compute_staleness` preserves a recent reparse score against a lower
+        /// recompute. A record already over the ceiling — accumulated before it
+        /// existed — must recompute down instead of staying pinned.
+        #[tokio::test]
+        async fn analyze_recomputes_an_over_accumulated_record_down() {
+            let dir = TempDir::new().unwrap();
+            let store = Store::open(dir.path()).await.unwrap();
+
+            let file_path = dir.path().join("hot.rs");
+            std::fs::write(&file_path, "fn main() {}").unwrap();
+
+            let now = 2_000_000u64;
+            let key = format!("file:{}", file_path.to_string_lossy());
+            let mut record = make_record_at(&key, now - 100, 0);
+            record.staleness.value = 0.95;
+            record.staleness.tier = StalenessTier::Tombstone;
+            record.staleness.computed_at = now - 3600;
+            record.staleness.signals = vec![
+                StalenessSignal::ImportsChanged(2),
+                StalenessSignal::UnwrapCountChanged(12),
+            ];
+
+            let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+            analyzer
+                .compute_staleness(&mut record, &store, &HashMap::new())
+                .await
+                .unwrap();
+
+            assert!(
+                record.staleness.value <= MAX_REPARSE_STALENESS + f32::EPSILON,
+                "the 24h preservation window pinned the record at {}",
+                record.staleness.value
+            );
+            assert!(!matches!(
+                record.staleness.tier,
+                StalenessTier::Liability | StalenessTier::Tombstone
+            ));
+            assert!(
+                record
+                    .staleness
+                    .signals
+                    .iter()
+                    .any(|s| matches!(s, StalenessSignal::ImportsChanged(_))),
+                "recomputing down must not erase the reparse signals"
+            );
+
+            store.close().await.unwrap();
+        }
     }
 }
