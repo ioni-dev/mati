@@ -687,7 +687,7 @@ pub struct DevNoteUpsertInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLogInput {
-    /// The event type (closed enum, 13 variants).
+    /// The event type (closed enum, 14 variants).
     pub event: SessionEvent,
     /// The record key this event pertains to.
     pub key: String,
@@ -696,6 +696,16 @@ pub struct SessionLogInput {
     /// older clients and agents that provide no session.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Receipt scope this event was decided at — the subagent `agent_id`, or
+    /// absent for the main thread. The daemon needs it to look up the receipt
+    /// that authorized an allow, since receipts are actor-scoped.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// SHA-256 of the gotcha state the hook decided on, for the enforcement
+    /// event's `decision_basis_hash`. Computed hook-side because that is where
+    /// the decision was made; a digest, never raw tool input.
+    #[serde(default)]
+    pub decision_basis_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -734,6 +744,11 @@ pub enum SessionEvent {
     /// Local policy injected steering context without changing the decision.
     PolicySteered,
     CodexShellMiss,
+    /// Codex PRE-hook (`codex-pre-bash` / `codex-pre-apply-patch`) BLOCKED an
+    /// unconsulted access — the shell command or patch never ran. Records
+    /// `Deny`, unlike [`SessionEvent::CodexShellMiss`], which the POST-bash
+    /// hook fires after the fact when nothing was denied.
+    CodexShellBlocked,
     Bootstrap,
     PromptNudge,
     /// Post-bash observed a command that passed `is_schema_introspection` but
@@ -760,6 +775,9 @@ pub struct ConsultationHitInput {
     /// Subagent agent_id when present (fallback attribution).
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// SHA-256 of the gotcha state in force when the receipt was minted.
+    #[serde(default)]
+    pub decision_basis_hash: Option<String>,
 }
 
 fn default_capture_fingerprint() -> bool {
@@ -1747,6 +1765,8 @@ mod tests {
                     event: SessionEvent::Miss,
                     key: "k".into(),
                     session_id: None,
+                    actor: None,
+                    decision_basis_hash: None,
                 }),
             ),
             (
@@ -1757,6 +1777,7 @@ mod tests {
                     actor: None,
                     session_id: None,
                     agent_id: None,
+                    decision_basis_hash: None,
                 }),
             ),
             ("session_flush", Command::SessionFlush),
@@ -1806,6 +1827,8 @@ mod tests {
             event: SessionEvent::Miss,
             key: "k".into(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         })
         .is_mutation());
         assert!(Command::SessionFlush.is_mutation());

@@ -155,6 +155,19 @@ pub const GOTCHA_PROMOTION_ACCESS_THRESHOLD: u32 = 3;
 pub struct ConsultationReceipt {
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// Identifies this mint in the enforcement chain: the `ReceiptMinted` event
+    /// carries it, and so does the `AllowAfterReceipt` this receipt later
+    /// authorizes. `None` on receipts written before the field existed.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// A consultation receipt staged for write, carrying the id that links it to
+/// the enforcement events it authorizes.
+pub struct StagedReceipt {
+    pub key: String,
+    pub bytes: Vec<u8>,
+    pub id: String,
 }
 
 /// Hash the stable, knowledge-bearing content of a record. Mutable access and
@@ -276,7 +289,7 @@ fn receipt_key(key: &str, actor: Option<&str>) -> String {
 ///
 /// When `actor` is `Some`, writes an actor-scoped key `session:consulted:<actor>:<key>`
 /// alongside the global key path. Pass `None` for all existing callers (global).
-pub fn consultation_receipt_staged(key: &str, actor: Option<&str>) -> Result<(String, Vec<u8>)> {
+pub fn consultation_receipt_staged(key: &str, actor: Option<&str>) -> Result<StagedReceipt> {
     consultation_receipt_staged_with_fingerprint(key, actor, None)
 }
 
@@ -284,15 +297,31 @@ pub fn consultation_receipt_staged_with_fingerprint(
     key: &str,
     actor: Option<&str>,
     fingerprint: Option<String>,
-) -> Result<(String, Vec<u8>)> {
+) -> Result<StagedReceipt> {
     let consulted_key = receipt_key(key, actor);
+    let id = uuid::Uuid::now_v7().to_string();
     let mut record = session_record(&consulted_key, String::new());
-    if fingerprint.is_some() {
-        record.payload = Some(serde_json::to_value(ConsultationReceipt { fingerprint })?);
-    }
+    record.payload = Some(serde_json::to_value(ConsultationReceipt {
+        fingerprint,
+        id: Some(id.clone()),
+    })?);
     let bytes = rmp_serde::to_vec_named(&record)
         .with_context(|| format!("failed to serialize consulted receipt for {consulted_key}"))?;
-    Ok((consulted_key, bytes))
+    Ok(StagedReceipt {
+        key: consulted_key,
+        bytes,
+        id,
+    })
+}
+
+/// Id of the consultation receipt in force for `key` at this actor's scope.
+///
+/// `None` when no receipt exists or it was minted before receipt ids. Used to
+/// stamp `AllowAfterReceipt` with the receipt that authorized it — never to
+/// decide anything, so a missing id costs the audit link, not the gate.
+pub async fn receipt_id_in_force(store: &Store, key: &str, actor: Option<&str>) -> Option<String> {
+    let record = store.get(&receipt_key(key, actor)).await.ok().flatten()?;
+    record.payload_as::<ConsultationReceipt>()?.id
 }
 
 pub async fn consultation_receipt_staged_for_store(
@@ -300,7 +329,7 @@ pub async fn consultation_receipt_staged_for_store(
     key: &str,
     actor: Option<&str>,
     capture_fingerprint: bool,
-) -> Result<(String, Vec<u8>)> {
+) -> Result<StagedReceipt> {
     let fingerprint = if capture_fingerprint {
         store
             .get(key)
@@ -350,11 +379,10 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     upsert_daily_agg(store, &agg_key, key).await?;
 
     // 2. Mark as consulted for session tracking
-    let (consulted_key, receipt_bytes) =
-        consultation_receipt_staged_for_store(store, key, None, true).await?;
-    let receipt: Record = rmp_serde::from_slice(&receipt_bytes)
+    let staged = consultation_receipt_staged_for_store(store, key, None, true).await?;
+    let receipt: Record = rmp_serde::from_slice(&staged.bytes)
         .context("failed to deserialize staged consultation receipt")?;
-    store.put(&consulted_key, &receipt).await?;
+    store.put(&staged.key, &receipt).await?;
 
     // 3. Bump access_count and last_accessed on the target record
     if let Some(mut record) = store.get(key).await? {
@@ -377,7 +405,7 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
         crate::store::enforcement::SubjectKind::File,
         key.to_string(),
         "claude".to_string(),
-        None,
+        Some(staged.id),
         "consultation_requested".to_string(),
         None,
     )
@@ -1211,7 +1239,8 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        let (receipt_key_value, receipt_bytes) = consultation_receipt_staged(key, None).unwrap();
+        let staged = consultation_receipt_staged(key, None).unwrap();
+        let (receipt_key_value, receipt_bytes) = (staged.key, staged.bytes);
         store
             .transact_sessions_raw(&[(&receipt_key_value, &receipt_bytes)])
             .await
@@ -1266,7 +1295,8 @@ mod tests {
         let (_dir, store) = temp_store().await;
 
         // Actor-scoped receipt: actor Some("agentA").
-        let (k, v) = consultation_receipt_staged("file:x", Some("agentA")).unwrap();
+        let staged_k = consultation_receipt_staged("file:x", Some("agentA")).unwrap();
+        let (k, v) = (staged_k.key, staged_k.bytes);
         store.transact_sessions_raw(&[(&k, &v)]).await.unwrap();
 
         let keys = store.scan_keys("session:consulted:").await.unwrap();
@@ -1280,7 +1310,8 @@ mod tests {
         );
 
         // Global receipt: actor None.
-        let (k2, v2) = consultation_receipt_staged("file:x", None).unwrap();
+        let staged_k2 = consultation_receipt_staged("file:x", None).unwrap();
+        let (k2, v2) = (staged_k2.key, staged_k2.bytes);
         store.transact_sessions_raw(&[(&k2, &v2)]).await.unwrap();
 
         let keys2 = store.scan_keys("session:consulted:").await.unwrap();
@@ -1295,7 +1326,8 @@ mod tests {
         let (_dir, store) = temp_store().await;
 
         // Write an actor-scoped receipt for agentA / file:x.
-        let (k, v) = consultation_receipt_staged("file:x", Some("agentA")).unwrap();
+        let staged_k = consultation_receipt_staged("file:x", Some("agentA")).unwrap();
+        let (k, v) = (staged_k.key, staged_k.bytes);
         store.transact_sessions_raw(&[(&k, &v)]).await.unwrap();
 
         // agentA's own receipt is found.
@@ -1315,7 +1347,8 @@ mod tests {
         );
 
         // Write a GLOBAL receipt for file:y (main-thread path).
-        let (k2, v2) = consultation_receipt_staged("file:y", None).unwrap();
+        let staged_k2 = consultation_receipt_staged("file:y", None).unwrap();
+        let (k2, v2) = (staged_k2.key, staged_k2.bytes);
         store.transact_sessions_raw(&[(&k2, &v2)]).await.unwrap();
 
         // Main thread (actor=None) sees the global receipt unchanged.

@@ -934,16 +934,16 @@ enforcement:event:<seq_no>
 - Each event carries `prev_hash`, which is the `event_hash` of the immediately preceding event. The first event uses an empty string.
 - `seq_no` is globally unique, monotonically increasing, and persisted before the event that uses it.
 - Gaps in `seq_no` are acceptable after a crash. Recovery produces a `RecordingGap` event. Hash chain breaks indicate tampering or corruption.
-- `schema_version = 1` is frozen. Do not change field order or serialization without incrementing the schema version.
+- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 2 (v2 appends `agent_session`); v1 events still hash under the original 14-field form. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
 
 There are 8 event types:
 
 | Event                      | Trigger                                                                                                          |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `Deny`                     | Pre-read hook blocked an unconsulted file read                                                                   |
+| `Deny`                     | A pre hook blocked an unconsulted access — Claude read or edit, or a Codex shell read or `apply_patch`           |
 | `AllowAfterReceipt`        | Pre-read hook allowed a read because a valid consultation receipt exists                                         |
 | `ReceiptMinted`            | A one-time-use read receipt was created by `mem_get`                                                             |
-| `BypassDetected`           | A hook bypass was detected after the fact                                                                        |
+| `BypassDetected`           | A hook bypass was detected after the fact — `codex-post-bash` only; nothing was denied                           |
 | `ControlChanged`           | A gotcha was created, confirmed, updated, or deleted                                                             |
 | `EnforcementConfigChanged` | A configuration setting changed. Records old and new value.                                                      |
 | `RecordingGap`             | Crash/restart gap detected on recovery. Records cause, duration, enforcement mode during the gap, and certainty. |
@@ -957,11 +957,17 @@ actor_local
 agent_type
 subject_kind
 subject_key
+receipt_id
 decision_reason_code
 decision_basis_hash
+agent_session
 ```
 
-`installation_id` is the stable UUID generated at `mati init`. `actor_local` includes OS username and uid, and is explicitly labeled unverified. `decision_basis_hash` is the hash of the gotcha/config state in force at decision time.
+`installation_id` is the stable UUID generated at `mati init`. `actor_local` includes OS username and uid, and is explicitly labeled unverified. `decision_basis_hash` is the SHA-256 of the gotcha state in force at decision time — key, rule text, and confidence per gotcha, sorted by key. It is computed hook-side, where the decision is made, and only ever holds a digest of stored knowledge, never the command or tool input that triggered the gate.
+
+`receipt_id` is the `ConsultationReceipt::id` minted with the receipt: `ReceiptMinted` carries the id it minted, and the `AllowAfterReceipt` that receipt later authorizes carries the same one. `agent_session` is the Claude Code `session_id`, added in schema_version 2. Both are absent where the emitter has neither: an MCP `mem_get` carries no session id, and a deny has no receipt.
+
+All three are optional and were part of the v2 canonical layout before anything wrote them, so filling them in needs no schema bump — an event written when they were null still hashes under the layout it recorded, and both eras verify in one chain.
 
 The enforcement event log is local and owned by the developer. The enterprise tier reads it to generate signed audit artifacts. It does not add events to the log.
 

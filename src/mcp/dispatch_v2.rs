@@ -907,6 +907,10 @@ async fn dispatch_session_side(
                 protocol::SessionEvent::ComplianceMiss => "compliance:miss_",
                 protocol::SessionEvent::ComplianceHit => "compliance:allow_after_receipt_",
                 protocol::SessionEvent::CodexShellMiss => "compliance:codex_shell_miss_",
+                // A pre-hook block IS a deny, so it shares the deny aggregate.
+                // Only the post-bash miss stays in codex_shell_miss_, which is
+                // what `mati stats` counts as a bypass.
+                protocol::SessionEvent::CodexShellBlocked => "compliance:miss_",
                 protocol::SessionEvent::Bootstrap => "analytics:bootstrap_",
                 protocol::SessionEvent::PromptNudge => "analytics:codex_prompt_nudge_",
                 // Edit-gate events share the read aggregates (coarse counts); the
@@ -984,7 +988,7 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "gotcha_above_threshold".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -996,9 +1000,9 @@ async fn dispatch_session_side(
                         crate::store::enforcement::SubjectKind::File,
                         input.key.clone(),
                         "claude".to_string(),
-                        None,
+                        sess::receipt_id_in_force(store, &input.key, input.actor.as_deref()).await,
                         "receipt_valid".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -1020,7 +1024,25 @@ async fn dispatch_session_side(
                         "codex".to_string(),
                         None,
                         "codex_shell_pre_consult_miss".to_string(),
+                        input.decision_basis_hash.clone(),
+                    )
+                    .await;
+                }
+                // The Codex PRE hooks exit 2: the read or patch was BLOCKED,
+                // not observed after the fact. Recording it as `BypassDetected`
+                // alongside the post-bash miss above reported every Codex block
+                // as a bypass and left Codex with zero denials in `mati stats`
+                // and in the signed audit built on this chain.
+                protocol::SessionEvent::CodexShellBlocked => {
+                    let _ = crate::store::enforcement::record_event(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "codex".to_string(),
                         None,
+                        "codex_pre_consult_blocked".to_string(),
+                        input.decision_basis_hash.clone(),
                     )
                     .await;
                 }
@@ -1035,9 +1057,9 @@ async fn dispatch_session_side(
                         crate::store::enforcement::SubjectKind::File,
                         input.key.clone(),
                         "claude".to_string(),
-                        None,
+                        sess::receipt_id_in_force(store, &input.key, input.actor.as_deref()).await,
                         "edit_after_receipt".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -1051,7 +1073,7 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "edit_blocked_unconsulted".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -1067,7 +1089,7 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "floor_consult_required".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -1081,7 +1103,7 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "policy_consult_required".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -1093,9 +1115,9 @@ async fn dispatch_session_side(
                         crate::store::enforcement::SubjectKind::Control,
                         input.key.clone(),
                         "claude".to_string(),
-                        None,
+                        sess::receipt_id_in_force(store, &input.key, input.actor.as_deref()).await,
                         "policy_receipt_valid".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
                     .await;
@@ -1118,7 +1140,7 @@ async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "wrapped_client_unclassifiable".to_string(),
-                        None,
+                        input.decision_basis_hash.clone(),
                     )
                     .await;
                 }
@@ -1187,7 +1209,7 @@ async fn dispatch_session_side(
             // One atomic transaction: agg + receipt + audit (all sessions tree).
             let writes: Vec<(&str, &[u8])> = vec![
                 (&staged_agg.0, &staged_agg.1),
-                (&staged_receipt.0, &staged_receipt.1),
+                (&staged_receipt.key, &staged_receipt.bytes),
                 (&audit_key, &audit_bytes),
             ];
             if let Err(e) = store.transact_sessions_raw(&writes).await {
@@ -1219,9 +1241,9 @@ async fn dispatch_session_side(
                 crate::store::enforcement::SubjectKind::File,
                 input.key.clone(),
                 "claude".to_string(),
-                None,
+                Some(staged_receipt.id.clone()),
                 "consultation_requested".to_string(),
-                None,
+                input.decision_basis_hash.clone(),
                 input.session_id.clone().or_else(|| input.agent_id.clone()),
             )
             .await;
@@ -1888,6 +1910,8 @@ mod tests {
             event: SessionEvent::Miss,
             key: "file:test".into(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -1944,6 +1968,7 @@ mod tests {
             actor: None,
             session_id: Some("sess-e2e".into()),
             agent_id: None,
+            decision_basis_hash: None,
         }));
         assert!(matches!(
             dispatch_v2(&graph, &ctx, hit).await,
@@ -1992,6 +2017,7 @@ mod tests {
                 actor: None,
                 session_id: None,
                 agent_id: None,
+                decision_basis_hash: None,
             }));
             assert!(matches!(
                 dispatch_v2(&graph, &ctx, req).await,
@@ -2079,6 +2105,7 @@ mod tests {
             actor: None,
             session_id: None,
             agent_id: None,
+            decision_basis_hash: None,
         }));
         let request_id = req.id;
         let _ = dispatch_v2(&graph, &ctx, req).await;
@@ -2239,6 +2266,8 @@ mod tests {
                 event: SessionEvent::Miss,
                 key: "k".into(),
                 session_id: None,
+                actor: None,
+                decision_basis_hash: None,
             }),
             Command::ConsultationHit(ConsultationHitInput {
                 key: "k".into(),
@@ -2246,6 +2275,7 @@ mod tests {
                 actor: None,
                 session_id: None,
                 agent_id: None,
+                decision_basis_hash: None,
             }),
             Command::SessionFlush,
             Command::SessionHarvest,
@@ -2662,6 +2692,8 @@ mod tests {
             event: SessionEvent::ComplianceMiss,
             key: "file:src/auth.rs".into(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -2695,6 +2727,8 @@ mod tests {
             event: SessionEvent::PolicySteered,
             key: "policy:steer-test".into(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -2732,6 +2766,8 @@ mod tests {
             event: SessionEvent::CodexShellMiss,
             key: "file:src/cli/repair.rs".into(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));
@@ -2786,6 +2822,160 @@ mod tests {
         );
     }
 
+    /// A Codex PRE-hook block is a DENY. `fire_events` routed
+    /// `HookEvent::CodexShellBlocked` onto `SessionEvent::CodexShellMiss`, so
+    /// every Codex block landed as `BypassDetected` and `mati stats` reported
+    /// zero Codex denials even while Codex was blocking the action.
+    #[tokio::test]
+    async fn session_log_codex_shell_blocked_records_a_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+        let ctx = test_ctx(dir.path());
+
+        let req = make_request(Command::SessionLog(SessionLogInput {
+            event: SessionEvent::CodexShellBlocked,
+            key: "file:src/cli/repair.rs".into(),
+            session_id: None,
+            actor: None,
+            decision_basis_hash: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, req).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let evt = &events[0];
+        assert!(
+            matches!(
+                evt.event_type,
+                crate::store::enforcement::EnforcementEventType::Deny
+            ),
+            "a Codex pre-hook block must record Deny, got: {:?}",
+            evt.event_type
+        );
+        assert_eq!(evt.agent_type, "codex");
+        assert_eq!(evt.decision_reason_code, "codex_pre_consult_blocked");
+        assert_eq!(
+            crate::store::enforcement::aggregate_event_counts(&events).denials,
+            1,
+            "the block must count as a denial in `mati stats`"
+        );
+        // The post-bash bypass aggregate must stay clean: nothing was bypassed.
+        assert!(g
+            .store()
+            .scan_keys("compliance:codex_shell_miss_")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `receipt_minted` must name the receipt it minted, and the
+    /// `allow_after_receipt` it later authorizes must name the same one.
+    /// Both were `None` on every event in the log.
+    #[tokio::test]
+    async fn receipt_id_links_a_mint_to_the_allow_it_authorizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+        let ctx = test_ctx(dir.path());
+
+        let key = "file:src/main.rs";
+        let mint = make_request(Command::ConsultationHit(ConsultationHitInput {
+            key: key.into(),
+            capture_fingerprint: false,
+            actor: None,
+            session_id: None,
+            agent_id: None,
+            decision_basis_hash: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, mint).await,
+            Response::Ok { .. }
+        ));
+
+        let allow = make_request(Command::SessionLog(SessionLogInput {
+            event: SessionEvent::ComplianceHit,
+            key: key.into(),
+            session_id: None,
+            actor: None,
+            decision_basis_hash: None,
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, allow).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        let stored = crate::store::session::receipt_id_in_force(g.store(), key, None)
+            .await
+            .expect("minted receipt must carry an id");
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .unwrap();
+        let minted = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.event_type,
+                    crate::store::enforcement::EnforcementEventType::ReceiptMinted
+                )
+            })
+            .expect("receipt_minted event");
+        let allowed = events
+            .iter()
+            .find(|e| {
+                matches!(
+                    e.event_type,
+                    crate::store::enforcement::EnforcementEventType::AllowAfterReceipt
+                )
+            })
+            .expect("allow_after_receipt event");
+        assert_eq!(minted.receipt_id.as_deref(), Some(stored.as_str()));
+        assert_eq!(allowed.receipt_id.as_deref(), Some(stored.as_str()));
+    }
+
+    /// The gate's `decision_basis_hash` must reach the chained event. It was
+    /// `None` on all 1472 events despite `compute_decision_basis_hash` existing.
+    #[tokio::test]
+    async fn deny_records_the_decision_basis_it_was_made_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+        let ctx = test_ctx(dir.path());
+
+        let basis = crate::store::enforcement::compute_decision_basis_hash(&[(
+            "gotcha:no-raw-put",
+            &serde_json::json!({"value": "Never call put_raw", "confidence": {"value": 0.9}}),
+        )]);
+        let req = make_request(Command::SessionLog(SessionLogInput {
+            event: SessionEvent::ComplianceMiss,
+            key: "file:src/main.rs".into(),
+            session_id: Some("sess-1".into()),
+            actor: None,
+            decision_basis_hash: Some(basis.clone()),
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, req).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            events[0].decision_basis_hash.as_deref(),
+            Some(basis.as_str())
+        );
+        assert_eq!(events[0].agent_session.as_deref(), Some("sess-1"));
+    }
+
     /// A wrapped, unclassifiable db-client introspection command (e.g.
     /// `rtk psql -h prod -c "\d orders"`) diagnoses the same way as
     /// `CodexShellMiss`: a `BypassDetected` event in the hash-chained log,
@@ -2804,6 +2994,8 @@ mod tests {
             event: SessionEvent::WrappedDbClientMiss,
             key: "enforcement:wrapped_client:rtk".into(),
             session_id: None,
+            actor: None,
+            decision_basis_hash: None,
         }));
         let resp = dispatch_v2(&graph, &ctx, req).await;
         assert!(matches!(resp, Response::Ok { .. }));

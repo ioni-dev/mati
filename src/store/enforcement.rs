@@ -108,7 +108,11 @@ pub struct EnforcementEvent {
     /// cross-referencing even if paths are later renamed.
     pub canonical_subject_hash: Option<String>,
 
-    /// Links events back to the receipt that authorized them.
+    /// Links events back to the receipt that authorized them: the
+    /// `ConsultationReceipt::id` minted by `mem_get` / the consult hook.
+    /// `ReceiptMinted` carries the id it just minted; `AllowAfterReceipt`
+    /// carries the id of the receipt that satisfied the gate. `None` on denies
+    /// (no receipt existed) and on receipts minted before ids existed.
     pub receipt_id: Option<String>,
 
     /// Stable enum string for the reason. NOT freeform prose.
@@ -1117,9 +1121,20 @@ pub async fn set_retention_days(store: &Store, days: u64) -> Result<()> {
 ///
 /// Each gotcha contributes its key, rule text, and confidence value to the
 /// hash. This proves which exact rule state was in force at decision time.
-pub fn compute_decision_basis_hash(gotchas: &[(String, serde_json::Value)]) -> String {
+///
+/// Gotchas are sorted by key first: callers hold them in a `HashMap`, whose
+/// iteration order varies per process, so an unsorted digest would differ
+/// between two decisions made on identical state.
+///
+/// Only stored knowledge goes in — key, rule, confidence — never the command
+/// line or tool input that triggered the decision, and the output is a digest,
+/// so no secret can reach the append-only chain through this field.
+pub fn compute_decision_basis_hash(gotchas: &[(&str, &serde_json::Value)]) -> String {
+    let mut ordered: Vec<&(&str, &serde_json::Value)> = gotchas.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(b.0));
+
     let mut hasher = Sha256::new();
-    for (key, record_json) in gotchas {
+    for (key, record_json) in ordered {
         hasher.update(key.as_bytes());
         let rule = record_json
             .pointer("/value")
@@ -1419,9 +1434,10 @@ pub const CONSULTATION_COALESCE_MS: u64 = 2_000;
 ///
 /// One consultation is `(subject_key, run of receipts starting at the first
 /// event of that run and extending at most [`CONSULTATION_COALESCE_MS`])`.
-/// Nothing sharper is available: `receipt_id` is `None` at all three emission
-/// sites, and `agent_session` is set on only some events from only one emitter,
-/// so grouping by it would keep the duplicate rather than remove it.
+/// Nothing sharper is available. `receipt_id` does not help: each emitter mints
+/// its OWN receipt for the same consultation, so the two reports of one action
+/// carry two different ids. `agent_session` is set on only some events from only
+/// one emitter, so grouping by it would keep the duplicate rather than remove it.
 ///
 /// The run is anchored to its first event, not chained to the previous one: a
 /// steady drip of receipts under the window would otherwise collapse into one
@@ -2019,6 +2035,69 @@ mod tests {
         assert_eq!(counts.total, 0);
         assert_eq!(counts.controls_changed, 0);
         assert_eq!(counts.denials, 0);
+    }
+
+    /// `receipt_id`, `decision_basis_hash` and `agent_session` are all already
+    /// part of the v2 canonical layout, so filling them in where they used to be
+    /// null needs no `SCHEMA_VERSION` bump: an event that predates the fix keeps
+    /// hashing under the layout it was written with, and both eras verify in one
+    /// chain.
+    #[test]
+    fn populating_the_optional_fields_keeps_a_mixed_era_chain_valid() {
+        assert_eq!(SCHEMA_VERSION, 2, "these fields live in the v2 layout");
+
+        // Pre-change shape: v2 event with every optional attribution left null.
+        let mut before = EnforcementEvent {
+            schema_version: 2,
+            seq_no: 1,
+            receipt_id: None,
+            decision_basis_hash: None,
+            agent_session: None,
+            ..frozen_test_event()
+        };
+        before.event_hash = before.compute_hash();
+
+        // Post-change shape: same layout, real values.
+        let mut after = EnforcementEvent {
+            schema_version: 2,
+            seq_no: 2,
+            prev_hash: before.event_hash.clone(),
+            receipt_id: Some("0199aaaa-0000-7000-8000-00000000000f".to_string()),
+            decision_basis_hash: Some(compute_decision_basis_hash(&[(
+                "gotcha:x",
+                &serde_json::json!({"value": "rule", "confidence": {"value": 0.8}}),
+            )])),
+            agent_session: Some("sess-1".to_string()),
+            ..frozen_test_event()
+        };
+        after.event_hash = after.compute_hash();
+
+        let result = verify_chain(&[before.clone(), after]);
+        assert_eq!(result.checked, 2);
+        assert_eq!(result.tampered_events, 0);
+        assert_eq!(result.linkage_breaks, 0);
+        assert!(result.is_valid());
+
+        // The pre-change event still hashes to what it was written with.
+        assert_eq!(before.event_hash, before.compute_hash());
+    }
+
+    /// Callers hold gotchas in a `HashMap`, whose order varies per process. An
+    /// order-dependent digest would make two decisions on identical state prove
+    /// different bases.
+    #[test]
+    fn decision_basis_hash_ignores_gotcha_order() {
+        let a = serde_json::json!({"value": "rule a", "confidence": {"value": 0.7}});
+        let b = serde_json::json!({"value": "rule b", "confidence": {"value": 0.9}});
+        assert_eq!(
+            compute_decision_basis_hash(&[("gotcha:a", &a), ("gotcha:b", &b)]),
+            compute_decision_basis_hash(&[("gotcha:b", &b), ("gotcha:a", &a)])
+        );
+        assert_ne!(
+            compute_decision_basis_hash(&[("gotcha:a", &a)]),
+            compute_decision_basis_hash(&[("gotcha:a", &b)]),
+            "a changed rule must change the basis"
+        );
     }
 
     /// Build an event with explicit type/subject/time/session over the template.
