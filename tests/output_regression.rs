@@ -249,6 +249,41 @@ fn help_subcommands_present() {
     }
 }
 
+// ── 1a. Enrich: does not advertise a network dependency ─────────────────────
+//
+// Regression: `mati --help`'s one-line summary for `enrich` used to say
+// "using Claude API (Layer 1)", the only line in top-level help that implied
+// mati makes a network call — contradicting `mati doctor`'s zero-network
+// attestation. Enrichment actually runs inside the caller's own agent
+// session (`/mati-enrich`); this asserts the wording says that instead.
+
+#[test]
+fn enrich_help_does_not_claim_network_dependency() {
+    let bin = mati_bin();
+
+    let (top_level, _stderr, ok) = run(&bin, Path::new("."), Path::new("/tmp"), &["--help"]);
+    assert!(ok, "mati --help should succeed");
+    let top_level = strip_ansi(&top_level);
+    assert!(
+        !top_level.contains("Claude API"),
+        "top-level help must not claim enrich calls the Claude API: {top_level}"
+    );
+
+    let (sub_help, _stderr, ok) = run(
+        &bin,
+        Path::new("."),
+        Path::new("/tmp"),
+        &["enrich", "--help"],
+    );
+    assert!(ok, "mati enrich --help should succeed");
+    let sub_help = strip_ansi(&sub_help);
+    assert!(
+        !sub_help.contains("Claude API"),
+        "mati enrich --help must not claim a Claude API dependency: {sub_help}"
+    );
+    assert_contains(&sub_help, "session");
+}
+
 // ── 2. Init: summary structure and next steps ──────────────────────────────
 
 #[test]

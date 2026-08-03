@@ -1092,7 +1092,15 @@ All gotcha create, edit, and tombstone paths go through `store::gotcha_ops`. A d
 
 The canonical `gotcha:*` record is the source of truth. `file:*` `gotcha_keys` and `HasGotcha` graph edges are derived indexes.
 
-The daemon's v2 protocol handlers (`mcp::handlers`) are the exception to the rule above: they stage the gotcha record, the file-link updates, and the audit entry in a single atomic `transact_knowledge` call rather than calling `gotcha_ops`. Anything `gotcha_ops` enforces at write time has to be mirrored there — `handle_gotcha_upsert` and `apply_mem_set_write` both carry their own copy.
+The daemon's v2 protocol handlers (`mcp::handlers`) are the exception to the rule above: they stage the gotcha record, the file-link updates, and the audit entry in a single atomic `transact_knowledge` call rather than calling `gotcha_ops`. Anything `gotcha_ops` enforces at write time has to be mirrored there — `handle_gotcha_upsert` carries its own copy. It is reachable from both the MCP `mem_set` tool and `StoreProxy`'s `Socket` arm (`mati gotcha` CLI commands, when a daemon owns the store).
+
+The second live write path is `StoreProxy`'s `Direct` arm, used only when no daemon owns the store: `gotcha_write` calls `gotcha_ops::apply_gotcha_write` directly, so there is no duplicate validation to keep in sync. The two paths still diverge on tombstone handling: `handle_gotcha_upsert` treats an existing `Tombstoned` record as `is_new` and forces `lifecycle: Active`, reviving it. `apply_gotcha_write` never inspects or resets `lifecycle` — it persists whatever the caller passed in. A `Direct`-mode edit of a tombstoned key therefore reports success but leaves the record invisible to `mem_get` and the hook gate, unlike the same edit over a daemon socket.
+
+(`apply_mem_set_write` / `apply_mem_set_confirm` / `apply_mem_set_delete`, formerly in `mcp::handlers` behind `handle_mem_set`, were unreachable from the wire protocol — the daemon connection handler is v2-only and no `Command` variant ever produced the "mem_set" v1 op string — and have been removed. `invariants.rs` no longer lists them.)
+
+**Reviving a tombstoned gotcha:**
+
+A `mem_set` write to a tombstoned `gotcha:<slug>` key revives it as `Active`, with `confirmed` reset to `false` and `confirmation_count` reset to 0 (deliberate: commit `b0eac6d`, "mem_set revives tombstoned records on write"). Re-adding a previously deleted gotcha is a supported workflow, not an accident — a plain write is not distinguished from a fresh create in its response, and it does not log that the key was previously tombstoned. Because `mem_set` writes always land unconfirmed (P4 — only a developer-sourced action can assert confirmation), a revived record cannot deny a read until a developer runs `mati gotcha confirm` again. `confirm`, by contrast, explicitly rejects a `Tombstoned` key with an error (commit `eca993e`) — a deleted gotcha cannot be silently reactivated without going through `write` first.
 
 **Path normalization:**
 

@@ -38,7 +38,7 @@ use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
 
 use super::tools::MatiServer;
-use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams, MemSetParams};
+use super::types::{MemBootstrapParams, MemGetParams, MemQueryParams};
 
 #[derive(Debug)]
 pub(crate) enum ProxyDaemonResult {
@@ -761,17 +761,6 @@ pub(crate) async fn socket_dispatch(
                 Ok(s) => SocketResponse::ok(serde_json::Value::String(s)),
                 Err((_code, msg)) => SocketResponse::err(msg),
             }
-        }
-
-        "mem_set" => {
-            let params = match serde_json::from_value::<MemSetParams>(req.args.clone()) {
-                Ok(p) => p,
-                Err(e) => return SocketResponse::err(format!("invalid mem_set args: {e}")),
-            };
-            let ctx = build_v1_dispatch_ctx(repo_root);
-            let response =
-                super::handlers::handle_mem_set(graph, &ctx, uuid::Uuid::new_v4(), &params).await;
-            SocketResponse::ok(serde_json::Value::String(response))
         }
 
         // ── Hook commands (store-only) ─────────────────────────────────

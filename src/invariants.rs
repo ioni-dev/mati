@@ -206,7 +206,7 @@ fn fn_bodies(src: &str) -> Vec<FnBody<'_>> {
 ///
 /// That sentence is false, and was false for a long time before anything said
 /// so. `mcp::handlers` (`upsert_commit_once`, `confirm_commit_once`,
-/// `tombstone_commit_once`, `apply_mem_set_write`), the socket `put`/`confirm`
+/// `tombstone_commit_once`), the socket `put`/`confirm`
 /// commands in `mcp::server`, `store::session::promote_gotcha_candidates`,
 /// `health::staleness`, `store::repair`, `store::migrations` and several CLI
 /// commands all write canonical `gotcha:*` records without touching
@@ -458,20 +458,6 @@ mod gotcha_write_sites {
             "test fixture, #[cfg(test)] only: seeds a gotcha whose \
              affected_files predate path normalization, which is exactly what \
              apply_gotcha_write would rewrite on the way in",
-        ),
-        (
-            "src/mcp/handlers.rs",
-            "apply_mem_set_write",
-            Class::Bypass,
-            "v1 mem_set bridge: writes any key whose prefix is in [gotcha:, \
-             decision:, dev_note:, policy:]",
-        ),
-        (
-            "src/mcp/handlers.rs",
-            "try_confirm_once",
-            Class::Bypass,
-            "v1 confirm: rejects non-Gotcha categories, then flips \
-             payload.confirmed and puts back at the same key",
         ),
         (
             "src/mcp/server.rs",

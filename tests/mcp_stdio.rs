@@ -832,3 +832,68 @@ fn mcp_stdio_write_then_search() {
         "tombstoned record should not appear in search: {text}"
     );
 }
+
+// ── Test: result.isError reflects real success/failure ──────────────────────
+//
+// Regression for the bug where every tool call returned `isError: false`
+// regardless of outcome (rejected write, missing record, malformed mode),
+// forcing clients to string-match the text body instead of checking the
+// protocol-level error flag.
+
+#[test]
+fn mcp_stdio_is_error_flag() {
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
+
+    // A rejected write (unknown mem_set action) must set isError: true.
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"mem_set","arguments":{"action":"destroy","key":"gotcha:test"}}}"#,
+    );
+    let resp = read_until_id(&rx, 50);
+    assert_eq!(
+        resp["result"]["isError"].as_bool(),
+        Some(true),
+        "rejected mem_set action should set isError=true: {resp}"
+    );
+    assert!(
+        extract_text(&resp).contains("unknown action"),
+        "error text should still be present in content: {resp}"
+    );
+
+    // Confirming a gotcha that does not exist must also set isError: true.
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"mem_set","arguments":{"action":"confirm","key":"gotcha:does-not-exist"}}}"#,
+    );
+    let resp = read_until_id(&rx, 51);
+    assert_eq!(
+        resp["result"]["isError"].as_bool(),
+        Some(true),
+        "confirm on missing gotcha should set isError=true: {resp}"
+    );
+
+    // A successful write must NOT set isError.
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"mem_set","arguments":{"action":"write","key":"gotcha:is-error-ok","value":"Rule because reason","category":"Gotcha","payload":"{\"rule\":\"Rule\",\"reason\":\"reason\"}"}}}"#,
+    );
+    let resp = read_until_id(&rx, 52);
+    assert_ne!(
+        resp["result"]["isError"].as_bool(),
+        Some(true),
+        "successful write must not set isError=true: {resp}"
+    );
+
+    // A legitimate miss (mem_get on a nonexistent key) is not an error.
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"mem_get","arguments":{"key":"file:nonexistent-xyz"}}}"#,
+    );
+    let resp = read_until_id(&rx, 53);
+    assert_ne!(
+        resp["result"]["isError"].as_bool(),
+        Some(true),
+        "mem_get miss (null) must not set isError=true: {resp}"
+    );
+    assert_eq!(extract_text(&resp), "null");
+}

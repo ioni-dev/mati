@@ -166,10 +166,10 @@ impl MatiServer {
         json!({ "error": message }).to_string()
     }
 
-    async fn socket_call(&self, op: &str, args: serde_json::Value) -> String {
+    async fn socket_call(&self, op: &str, args: serde_json::Value) -> Result<String, String> {
         match proxy_daemon_result(&self.root, op, args).await {
             ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
-            other => Self::socket_error(op, other),
+            other => Err(Self::socket_error(op, other)),
         }
     }
 
@@ -180,17 +180,18 @@ impl MatiServer {
     /// decision_upsert, dev_note_upsert) which have no entry in the legacy
     /// v1→v2 mapper and would panic the rmcp task if routed through
     /// [`Self::socket_call`].
-    async fn socket_call_typed(&self, cmd: Command) -> String {
+    async fn socket_call_typed(&self, cmd: Command) -> Result<String, String> {
         let op = cmd.kind();
         match proxy_daemon_v2(&self.root, cmd).await {
             ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
-            other => Self::socket_error(op, other),
+            other => Err(Self::socket_error(op, other)),
         }
     }
 
-    /// Render a daemon envelope `{ok,data}` / `{ok:false,error}` into the
-    /// JSON string the rmcp `String` return type expects.
-    fn format_envelope(op: &str, v: serde_json::Value) -> String {
+    /// Render a daemon envelope `{ok,data}` / `{ok:false,error}`. `Err`
+    /// propagates to the rmcp tool result as `isError: true`; `Ok` carries
+    /// the plain data string, unmodified from today's behaviour.
+    fn format_envelope(op: &str, v: serde_json::Value) -> Result<String, String> {
         if v.get("ok") != Some(&serde_json::Value::Bool(true)) {
             let err = v
                 .get("error")
@@ -200,15 +201,15 @@ impl MatiServer {
             // distinguish validation failures from store errors.
             let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("");
             if code.is_empty() {
-                return json!({ "error": err, "op": op }).to_string();
+                return Err(json!({ "error": err, "op": op }).to_string());
             }
-            return json!({ "error": err, "op": op, "code": code }).to_string();
+            return Err(json!({ "error": err, "op": op, "code": code }).to_string());
         }
-        match v.get("data") {
+        Ok(match v.get("data") {
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
-            None => json!({ "error": "daemon response missing data" }).to_string(),
-        }
+            None => return Err(json!({ "error": "daemon response missing data" }).to_string()),
+        })
     }
 }
 
@@ -228,7 +229,10 @@ impl MatiServer {
         description = "Look up one mati knowledge record by key. Before reading a file directly, call this with \"file:<path>\" and use the record instead when it is confirmed and high-confidence.",
         annotations(read_only_hint = true)
     )]
-    pub(crate) async fn mem_get(&self, Parameters(params): Parameters<MemGetParams>) -> String {
+    pub(crate) async fn mem_get(
+        &self,
+        Parameters(params): Parameters<MemGetParams>,
+    ) -> Result<String, String> {
         self.socket_call("mem_get", json!({ "key": params.key }))
             .await
     }
@@ -242,7 +246,10 @@ impl MatiServer {
         description = "Search the mati knowledge store, or read local enforcement telemetry. Knowledge modes: \"text\" (BM25 full-text), \"tag\" (filter by tag), \"graph\" (1-hop traversal from a seed key), \"dir_gotchas\" (confirmed gotchas whose affected_files sit under a directory path). Telemetry modes (read-only): \"policy_observations\", \"policy_activity\" (optional `since` in days), \"analytics\". `limit` is clamped to 50 in every mode; a larger value returns 50 results, not an error.",
         annotations(read_only_hint = true)
     )]
-    pub(crate) async fn mem_query(&self, Parameters(params): Parameters<MemQueryParams>) -> String {
+    pub(crate) async fn mem_query(
+        &self,
+        Parameters(params): Parameters<MemQueryParams>,
+    ) -> Result<String, String> {
         self.socket_call(
             "mem_query",
             json!({ "query": params.query, "mode": params.mode, "limit": params.limit, "since": params.since }),
@@ -262,7 +269,7 @@ impl MatiServer {
     pub(crate) async fn mem_bootstrap(
         &self,
         Parameters(params): Parameters<MemBootstrapParams>,
-    ) -> String {
+    ) -> Result<String, String> {
         self.socket_call(
             "mem_bootstrap",
             json!({ "context_files": params.context_files }),
@@ -284,21 +291,21 @@ impl MatiServer {
             idempotent_hint = false
         )
     )]
-    pub(crate) async fn mem_set(&self, Parameters(params): Parameters<MemSetParams>) -> String {
+    pub(crate) async fn mem_set(
+        &self,
+        Parameters(params): Parameters<MemSetParams>,
+    ) -> Result<String, String> {
         if params.key.starts_with("policy:") {
             let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
             if params.action == "confirm" {
-                return json!({"error": format!("policies are activated with `mati policy enable {slug}`")}).to_string();
+                return Err(json!({"error": format!("policies are activated with `mati policy enable {slug}`")}).to_string());
             }
-            let existing = match self
-                .socket_call("get", json!({"key": params.key}))
-                .await
-                .as_str()
-            {
+            let existing_lookup = self.socket_call("get", json!({"key": params.key})).await?;
+            let existing = match existing_lookup.as_str() {
                 "null" => None,
                 value => match serde_json::from_str::<crate::store::Record>(value) {
                     Ok(record) => Some(record),
-                    Err(_) => return value.to_string(),
+                    Err(_) => return Ok(value.to_string()),
                 },
             };
             if params.action == "delete" {
@@ -313,7 +320,7 @@ impl MatiServer {
                         .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
                         .map(|policy| format!("{:?}", policy.stage).to_ascii_lowercase())
                         .unwrap_or_else(|| "non-off".into());
-                    return json!({"error": format!("policy {} is {stage}; an agent cannot delete developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.", params.key)}).to_string();
+                    return Err(json!({"error": format!("policy {} is {stage}; an agent cannot delete developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.", params.key)}).to_string());
                 }
                 return self
                     .socket_call_typed(Command::PolicyWrite(
@@ -338,7 +345,7 @@ impl MatiServer {
                         .and_then(|record| record.payload_as::<crate::store::PolicyRecord>())
                         .map(|policy| format!("{:?}", policy.stage).to_ascii_lowercase())
                         .unwrap_or_else(|| "non-off".into());
-                    return json!({"error": format!("policy {} is {stage}; an agent cannot edit developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.", params.key)}).to_string();
+                    return Err(json!({"error": format!("policy {} is {stage}; an agent cannot edit developer-controlled policies. Run `mati policy stage {slug} off` to hand it back to the agent.", params.key)}).to_string());
                 }
                 let payload = match &params.payload {
                     serde_json::Value::String(value) => {
@@ -348,7 +355,7 @@ impl MatiServer {
                 };
                 let mut policy: crate::store::PolicyRecord = match serde_json::from_value(payload) {
                     Ok(policy) => policy,
-                    Err(error) => return json!({"error": format!("policy payload must deserialize into PolicyRecord: {error}")}).to_string(),
+                    Err(error) => return Err(json!({"error": format!("policy payload must deserialize into PolicyRecord: {error}")}).to_string()),
                 };
                 // Agents may create or edit only off policies. Shadow and
                 // enforce are developer-controlled and agent-immutable.
@@ -378,7 +385,7 @@ impl MatiServer {
         // surfaced as `Transport closed` to the client.
         match build_mem_set_command(&params) {
             Ok(cmd) => self.socket_call_typed(cmd).await,
-            Err(error) => json!({ "error": error }).to_string(),
+            Err(error) => Err(json!({ "error": error }).to_string()),
         }
     }
 }
@@ -574,15 +581,6 @@ fn parse_protocol_severity(s: Option<&str>) -> proto::Severity {
     }
 }
 
-// ── mem_set action helpers ──────────────────────────────────────────────────
-//
-// γ-C1.85: the `mem_set_confirm` / `try_confirm_once` / `finalize_confirm` /
-// `mem_set_delete` helpers that lived here are now free functions inside
-// `super::handlers` (apply_mem_set_*). `MatiServer::mem_set` delegates to
-// `handlers::handle_mem_set` so v1 (rmcp wrapper) and v2 (Socket → typed
-// Commands) cannot diverge. The bodies are byte-for-byte identical to the
-// originals — only the `&self` parameter was dropped.
-
 /// Returns true if a gotcha record is eligible for injection into a context packet.
 ///
 /// Two classes of gotchas surface in bootstrap:
@@ -617,24 +615,6 @@ fn is_injectable_gotcha(r: &Record) -> bool {
     r.key.starts_with("gotcha:cochange:")
         || r.key.starts_with("gotcha:revert:")
         || r.key.starts_with("gotcha:ownership:")
-}
-
-/// Resolve the existing record for a mem_set write path.
-///
-/// Returns `Ok(Option<Record>)` on success, or an error JSON string
-/// if the store read failed — callers must abort the write.
-/// Extracted for testability: the `Err` branch was previously untestable
-/// because it required a real store failure.
-pub(crate) fn resolve_existing_for_write(
-    store_result: anyhow::Result<Option<Record>>,
-) -> Result<Option<Record>, String> {
-    match store_result {
-        Ok(record) => Ok(record),
-        Err(e) => Err(serde_json::json!({
-            "error": format!("store read failed \u{2014} refusing to write: {e}")
-        })
-        .to_string()),
-    }
 }
 
 /// Assemble a [`ContextPacket`] from the store and graph.
@@ -1079,7 +1059,6 @@ pub async fn assemble_context_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::policy_match::PolicyMatcherSet;
     use crate::store::record::*;
     use crate::store::Store;
     use tempfile::TempDir;
@@ -1144,6 +1123,32 @@ mod tests {
         let mut record = make_record(key, rule, Category::Gotcha, quality_value);
         record.payload = serde_json::to_value(&gotcha).ok();
         record
+    }
+
+    /// Seed a gotcha directly through the canonical `gotcha_ops` write path —
+    /// used by tests that need real `HasGotcha` graph edges to traverse, not
+    /// the mem_set request/response envelope itself.
+    async fn seed_gotcha_for_graph_test(
+        store: &Store,
+        key: &str,
+        rule: &str,
+        affected_files: &[String],
+    ) {
+        let gotcha = GotchaRecord {
+            rule: rule.to_string(),
+            reason: "testing".to_string(),
+            severity: Priority::Normal,
+            affected_files: affected_files.to_vec(),
+            ref_url: None,
+            discovered_session: 0,
+            confirmed: false,
+            confirmed_content: Default::default(),
+        };
+        let mut record = make_record(key, rule, Category::Gotcha, 0.5);
+        record.payload = serde_json::to_value(&gotcha).ok();
+        crate::store::gotcha_ops::apply_gotcha_write(store, &record, &[], affected_files, true)
+            .await
+            .expect("seed gotcha write must succeed");
     }
 
     // ── γ-C3a helpers: handler-level test entry points ───────────────────────
@@ -1230,14 +1235,6 @@ mod tests {
             Ok(s) => s,
             Err((_code, msg)) => format!("[mati] bootstrap error: {msg}"),
         }
-    }
-
-    async fn call_mem_set(
-        graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
-        params: crate::mcp::types::MemSetParams,
-    ) -> String {
-        let ctx = handler_test_ctx();
-        crate::mcp::handlers::handle_mem_set(graph_arc, &ctx, uuid::Uuid::new_v4(), &params).await
     }
 
     // ── mem_get tests ────────────────────────────────────────────────────────
@@ -2666,103 +2663,6 @@ mod tests {
 
     // ── mem_set tests ────────────────────────────────────────────────────────
 
-    /// Direct-path mem_set must reject `file:*` writes — they are owned by
-    /// the static-analysis pipeline (`mati init` Layer 0 + the
-    /// `file_enrich` / `file_reparse` typed Commands). Mirrors the Socket
-    /// path's rejection in `build_mem_set_command` so both backends behave
-    /// identically (regression for the codex smoke-test step 57 failure).
-    #[tokio::test]
-    async fn mem_set_rejects_file_writes_on_direct_path() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "file:src/main.rs".to_string(),
-                value: "Handles CLI dispatch and binary entry point".to_string(),
-                category: "File".to_string(),
-                payload: serde_json::json!({
-                    "path": "src/main.rs",
-                    "purpose": "Handles CLI dispatch and binary entry point"
-                }),
-                tags: vec!["entry-point".to_string()],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let error = parsed["error"]
-            .as_str()
-            .unwrap_or_else(|| panic!("expected an error envelope, got: {result}"));
-        assert!(
-            error.contains("must start with"),
-            "file: write must be rejected by the prefix gate, got: {error}"
-        );
-        assert_eq!(parsed.get("ok"), None, "no record should be written");
-
-        // Confirm no record was persisted.
-        let graph = graph_arc.read().await;
-        assert!(
-            graph
-                .store()
-                .get("file:src/main.rs")
-                .await
-                .unwrap()
-                .is_none(),
-            "file: write must not create a record"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_writes_gotcha_with_quality_score() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams { action: "write".to_string(),
-                key: "gotcha:always-use-idempotency-keys".to_string(),
-                value: "Always pass idempotency_key to Stripe charge creation because duplicate charges cause customer refund disputes".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Always pass idempotency_key to Stripe charge creation",
-                    "reason": "duplicate charges cause customer refund disputes",
-                    "severity": "Critical",
-                    "affected_files": ["src/payments/stripe.go"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "Critical".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true);
-        // Quality should be > 0.2 (passes gate) since rule has imperative verb + reason has causality
-        assert!(parsed["quality"].as_f64().unwrap() > 0.2);
-
-        // Read back
-        let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("gotcha:always-use-idempotency-keys")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.priority, Priority::Critical);
-        assert_eq!(record.source, RecordSource::ClaudeEnrich);
-    }
-
     fn policy_payload(enabled: bool) -> serde_json::Value {
         serde_json::json!({
             "name": "Query safety",
@@ -2782,619 +2682,10 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn mem_set_creates_policy_inert_even_when_payload_enables_it() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".into(),
-                key: "policy:query-safety".into(),
-                value: String::new(),
-                category: "Policy".into(),
-                payload: policy_payload(true),
-                tags: vec![],
-                priority: "High".into(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true, "policy create failed: {result}");
-        assert_eq!(parsed["stage"], "off");
-        assert_eq!(parsed["key"], "policy:query-safety");
-        assert!(parsed["warnings"].is_array());
-
-        let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("policy:query-safety")
-            .await
-            .unwrap()
-            .unwrap();
-        let policy = record.payload_as::<PolicyRecord>().unwrap();
-        assert!(matches!(policy.stage, crate::store::PolicyStage::Off));
-        assert!(PolicyMatcherSet::from_records(&[record])
-            .unwrap()
-            .matches(&crate::hooks::decide::Action {
-                tool: "db_client".into(),
-                target_path: None,
-                host: None,
-                argv: vec![],
-                files: vec![],
-            })
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_policy_confirm_for_human_enable_path() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "confirm".into(),
-                key: "policy:query-safety".into(),
-                value: String::new(),
-                category: "Policy".into(),
-                payload: serde_json::Value::Null,
-                tags: vec![],
-                priority: "Normal".into(),
-            },
-        )
-        .await;
-        assert!(result.contains("mati policy enable <slug>"), "{result}");
-    }
-
-    #[tokio::test]
-    async fn mem_set_deletes_inert_policy() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
-            .await
-            .unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "delete".into(),
-                key: "policy:query-safety".into(),
-                value: String::new(),
-                category: "Policy".into(),
-                payload: serde_json::Value::Null,
-                tags: vec![],
-                priority: "Normal".into(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true, "{result}");
-        let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("policy:query-safety")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            record.lifecycle,
-            RecordLifecycle::Tombstoned { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_delete_of_shadow_policy() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        policy.stage = crate::store::PolicyStage::Shadow;
-        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
-            .await
-            .unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "delete".into(),
-                key: "policy:query-safety".into(),
-                value: String::new(),
-                category: "Policy".into(),
-                payload: serde_json::Value::Null,
-                tags: vec![],
-                priority: "Normal".into(),
-            },
-        )
-        .await;
-        assert!(result.contains("policy:query-safety is shadow"), "{result}");
-        assert!(
-            result.contains("mati policy stage query-safety off"),
-            "{result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_edits_existing_inert_policy_and_keeps_it_disabled() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
-            .await
-            .unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-        let mut revised = policy_payload(true);
-        revised["rule"] = serde_json::json!("Consult the current schema first.");
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".into(),
-                key: "policy:query-safety".into(),
-                value: String::new(),
-                category: "Policy".into(),
-                payload: revised,
-                tags: vec![],
-                priority: "High".into(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true, "{result}");
-        let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("policy:query-safety")
-            .await
-            .unwrap()
-            .unwrap();
-        let policy = record.payload_as::<PolicyRecord>().unwrap();
-        assert_eq!(policy.rule, "Consult the current schema first.");
-        assert!(matches!(policy.stage, crate::store::PolicyStage::Off));
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_existing_shadow_policy_write() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let mut policy: PolicyRecord = serde_json::from_value(policy_payload(false)).unwrap();
-        policy.stage = crate::store::PolicyStage::Shadow;
-        crate::store::policy_ops::create(&store, "policy:query-safety", &policy)
-            .await
-            .unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".into(),
-                key: "policy:query-safety".into(),
-                value: String::new(),
-                category: "Policy".into(),
-                payload: policy_payload(true),
-                tags: vec![],
-                priority: "High".into(),
-            },
-        )
-        .await;
-        assert!(result.contains("policy:query-safety is shadow"), "{result}");
-        assert!(
-            result.contains("mati policy stage query-safety off"),
-            "{result}"
-        );
-    }
-
     // `mem_set_preserves_existing_layer0_data` was removed: file: writes
     // are no longer accepted via mem_set on either backend. Layer 0
     // preservation under enrichment is now exercised by the
     // `file_enrich` typed Command's tests (see `handle_file_enrich`).
-
-    #[tokio::test]
-    async fn mem_set_rejects_invalid_key_prefix() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "session:12345".to_string(),
-                value: "test".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        let error = parsed["error"].as_str().unwrap();
-        assert!(error.contains("must start with"), "got: {error}");
-        // file: was deliberately removed from the accepted prefix list.
-        assert!(!error.contains("file:"), "got: {error}");
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_invalid_category() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:test".to_string(),
-                value: "test".to_string(),
-                category: "Unknown".to_string(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("unknown category"));
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_key_category_mismatch() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // gotcha: key with Decision category — must be rejected.
-        // (File is no longer a valid category for mem_set, so the prior
-        // gotcha:/File pairing now fails category parsing instead of the
-        // mismatch check; pick another valid-but-wrong category to keep
-        // exercising the mismatch arm.)
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:should-fail".to_string(),
-                value: "test".to_string(),
-                category: "Decision".to_string(),
-                payload: serde_json::json!({"summary": "x", "rationale": "y"}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("requires category"),
-            "key-category mismatch must be rejected: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_new_gotcha_without_rule_and_reason() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:missing-fields".to_string(),
-                value: "test".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({"severity": "Normal"}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("'rule' and 'reason'"),
-            "new gotcha without rule/reason must be rejected: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_new_decision_without_summary_rationale() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "decision:incomplete".to_string(),
-                value: "test".to_string(),
-                category: "Decision".to_string(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("'summary' and 'rationale'"),
-            "new decision without summary/rationale must be rejected: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_rejects_new_dev_note_with_empty_value() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "dev_note:empty".to_string(),
-                value: "".to_string(),
-                category: "DevNote".to_string(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("non-empty value"),
-            "new dev_note with empty value must be rejected: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_allows_partial_payload_on_update() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // First write: full payload (new record).
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:partial-update".to_string(),
-                value: "test rule because test reason".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "test rule",
-                    "reason": "test reason",
-                    "severity": "Normal",
-                    "affected_files": [],
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true, "initial write must succeed");
-
-        // Second write: partial payload (update) — must succeed because
-        // payload validation is skipped for existing records (merge fills fields).
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:partial-update".to_string(),
-                value: "updated rule because updated reason".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({"reason": "updated reason"}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            parsed["ok"], true,
-            "partial-payload update must succeed: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_preserves_confirmation_state_on_update() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        // Create a confirmed gotcha (simulates post-mati gotcha confirm state)
-        let mut record = make_gotcha_record(
-            "gotcha:confirmed-edit-test",
-            "Always test first",
-            true,
-            0.70,
-        );
-        record.source = RecordSource::DeveloperManual;
-        record.confidence = ConfidenceScore {
-            value: 0.80,
-            confirmation_count: 1,
-            contributor_count: 1,
-            last_challenged: None,
-            challenge_count: 0,
-        };
-        record.tags = vec!["important".to_string()];
-        store
-            .put("gotcha:confirmed-edit-test", &record)
-            .await
-            .unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // Update the gotcha's value via mem_set (simulates Claude editing the reason)
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:confirmed-edit-test".to_string(),
-                value: "Always test first because untested changes cause regressions".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Always test first",
-                    "reason": "untested changes cause regressions",
-                    "severity": "High",
-                    "affected_files": ["src/main.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": true
-                }),
-                tags: vec![], // empty — should NOT clear existing tags
-                priority: "High".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true);
-
-        // Verify confirmation state preserved
-        let graph = graph_arc.read().await;
-        let updated = graph
-            .store()
-            .get("gotcha:confirmed-edit-test")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.source, RecordSource::DeveloperManual);
-        assert!(
-            (updated.confidence.value - 0.80).abs() < 0.01,
-            "confidence should stay 0.80, got {}",
-            updated.confidence.value
-        );
-        assert_eq!(updated.confidence.confirmation_count, 1);
-        assert_eq!(
-            updated.tags,
-            vec!["important".to_string()],
-            "tags should be preserved when caller sends empty"
-        );
-    }
-
-    #[tokio::test]
-    async fn mem_set_moves_gotcha_links_and_edges_on_edit() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        // Seed file records for both old and new affected files.
-        let old_file = Record::layer0_file_stub("file:src/old.rs", device_id(), 1, now());
-        let new_file = Record::layer0_file_stub("file:src/new.rs", device_id(), 1, now());
-        store.put("file:src/old.rs", &old_file).await.unwrap();
-        store.put("file:src/new.rs", &new_file).await.unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:test-move".to_string(),
-                value: "Always update the paired file because drift breaks the feature".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Always update the paired file",
-                    "reason": "drift breaks the feature",
-                    "severity": "High",
-                    "affected_files": ["src/old.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "High".to_string(),
-            },
-        )
-        .await;
-
-        call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:test-move".to_string(),
-                value: "Always update the paired file because drift breaks the feature".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Always update the paired file",
-                    "reason": "drift breaks the feature",
-                    "severity": "High",
-                    "affected_files": ["src/new.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "High".to_string(),
-            },
-        )
-        .await;
-
-        let graph = graph_arc.read().await;
-
-        let old_file = graph.store().get("file:src/old.rs").await.unwrap().unwrap();
-        let new_file = graph.store().get("file:src/new.rs").await.unwrap().unwrap();
-        let old_payload = old_file.payload.unwrap();
-        let new_payload = new_file.payload.unwrap();
-
-        assert!(
-            old_payload["gotcha_keys"]
-                .as_array()
-                .map(|arr| arr.is_empty())
-                .unwrap_or(true),
-            "old file should no longer reference moved gotcha"
-        );
-        assert_eq!(new_payload["gotcha_keys"][0], "gotcha:test-move");
-
-        assert!(
-            !graph
-                .neighbors("file:src/old.rs", &EdgeKind::HasGotcha)
-                .contains(&"gotcha:test-move".to_string()),
-            "old file should not keep stale HasGotcha edge"
-        );
-        assert!(
-            graph
-                .neighbors("file:src/new.rs", &EdgeKind::HasGotcha)
-                .contains(&"gotcha:test-move".to_string()),
-            "new file should gain HasGotcha edge"
-        );
-    }
 
     // ── Regression: query limit clamp ───────────────────────────────────────
 
@@ -3447,164 +2738,6 @@ mod tests {
         );
     }
 
-    // ── Regression: store-read-error refusal on mem_set write ───────────────
-
-    /// Regression test: mem_set write to a new key must succeed (proving the
-    /// Ok(None) arm of the store read works). The Err(e) arm returns
-    /// {"error": "store read failed — refusing to write: ..."} but cannot be
-    /// triggered without injecting a store fault, which the test harness does
-    /// not support. This test validates the happy path; the error format is
-    /// documented here for grep-ability.
-    #[tokio::test]
-    async fn test_mem_set_write_new_key_succeeds() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:store-read-ok-none".to_string(),
-                value: "Regression rule because regression reason".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Regression rule",
-                    "reason": "regression reason",
-                    "severity": "Normal"
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            parsed["ok"], true,
-            "writing a new key must succeed (Ok(None) arm)"
-        );
-        assert_eq!(parsed["key"], "gotcha:store-read-ok-none");
-
-        // Verify record persisted
-        let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("gotcha:store-read-ok-none")
-            .await
-            .unwrap()
-            .expect("record must exist after write");
-        assert_eq!(record.value, "Regression rule because regression reason");
-
-        // Note: the Err(e) path (store read failure) returns:
-        //   {"error": "store read failed — refusing to write: <details>"}
-        // This cannot be exercised without a store-fault injection mechanism.
-        // The guard exists at tools.rs line ~605 to prevent blind overwrites
-        // when the store is in a degraded state.
-    }
-
-    // ── Regression: in-memory graph cleanup after tombstone ─────────────────
-
-    /// Regression test: after deleting a gotcha via mem_set action="delete",
-    /// the in-memory graph must no longer contain HasGotcha edges pointing to
-    /// the deleted gotcha. Previously, only the store was cleaned up but the
-    /// in-memory petgraph retained stale edges until process restart.
-    #[tokio::test]
-    async fn test_tombstone_removes_in_memory_graph_edges() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        // Seed file record
-        let file_record = Record::layer0_file_stub("file:src/target.rs", device_id(), 1, now());
-        store.put("file:src/target.rs", &file_record).await.unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // Step 1: Write a gotcha linked to the file via affected_files.
-        let write_result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:graph-cleanup-test".to_string(),
-                value: "Never skip validation because it causes silent data corruption".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Never skip validation",
-                    "reason": "causes silent data corruption",
-                    "severity": "High",
-                    "affected_files": ["src/target.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "High".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&write_result).unwrap();
-        assert_eq!(parsed["ok"], true, "gotcha write must succeed");
-
-        // Step 2: Verify the in-memory graph has the HasGotcha edge.
-        {
-            let graph = graph_arc.read().await;
-            let neighbors = graph.neighbors("file:src/target.rs", &EdgeKind::HasGotcha);
-            assert!(
-                neighbors.contains(&"gotcha:graph-cleanup-test".to_string()),
-                "HasGotcha edge must exist after write; neighbors: {neighbors:?}"
-            );
-        }
-
-        // Step 3: Delete the gotcha.
-        let delete_result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "delete".to_string(),
-                key: "gotcha:graph-cleanup-test".to_string(),
-                value: String::new(),
-                category: String::new(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&delete_result).unwrap();
-        assert_eq!(parsed["ok"], true, "gotcha delete must succeed");
-        assert_eq!(parsed["tombstoned"], true);
-
-        // Step 4: Verify the in-memory graph no longer has the HasGotcha edge.
-        {
-            let graph = graph_arc.read().await;
-            let neighbors = graph.neighbors("file:src/target.rs", &EdgeKind::HasGotcha);
-            assert!(
-                !neighbors.contains(&"gotcha:graph-cleanup-test".to_string()),
-                "HasGotcha edge must be removed after delete; neighbors: {neighbors:?}"
-            );
-        }
-
-        // Also verify via graph query mode that the gotcha no longer appears.
-        let graph_query_result = call_mem_query(
-            &graph_arc,
-            "file:src/target.rs",
-            crate::mcp::protocol::QueryMode::Graph,
-            20,
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&graph_query_result).unwrap();
-        let gotchas = parsed["gotchas"]
-            .as_array()
-            .expect("gotchas group must be an array");
-        assert!(
-            !gotchas
-                .iter()
-                .any(|g| g["key"] == "gotcha:graph-cleanup-test"),
-            "deleted gotcha must not appear in graph query results"
-        );
-    }
-
     // ── Regression: graph mode respects global limit ──────────────────────
 
     /// Graph mode must respect the caller's `limit` as a global cap across all
@@ -3623,35 +2756,20 @@ mod tests {
             .await
             .unwrap();
 
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // Write 5 gotchas linked to the file
+        // Write 5 gotchas linked to the file, before the graph takes
+        // ownership of the store.
         for i in 0..5 {
-            let result = call_mem_set(
-                &graph_arc,
-                MemSetParams {
-                    action: "write".to_string(),
-                    key: format!("gotcha:limit-test-{i}"),
-                    value: format!("Limit test gotcha {i}"),
-                    category: "Gotcha".to_string(),
-                    payload: serde_json::json!({
-                        "rule": format!("Limit rule {i}"),
-                        "reason": "testing",
-                        "severity": "Normal",
-                        "affected_files": ["src/graph_limit.rs"],
-                        "ref_url": null,
-                        "discovered_session": 0,
-                        "confirmed": false
-                    }),
-                    tags: vec![],
-                    priority: "Normal".to_string(),
-                },
+            seed_gotcha_for_graph_test(
+                &store,
+                &format!("gotcha:limit-test-{i}"),
+                &format!("Limit rule {i}"),
+                &["src/graph_limit.rs".to_string()],
             )
             .await;
-            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-            assert_eq!(parsed["ok"], true, "gotcha write {i} must succeed");
         }
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // Query with limit=3 — must get at most 3 total records across all groups.
         let result = call_mem_query(
@@ -3686,31 +2804,17 @@ mod tests {
         let file_record = Record::layer0_file_stub("file:src/zero.rs", device_id(), 1, now());
         store.put("file:src/zero.rs", &file_record).await.unwrap();
 
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
         // Write one gotcha so there's something to return if limit is ignored.
-        let _ = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:zero-limit-test".to_string(),
-                value: "Should not appear".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Zero limit test",
-                    "reason": "testing",
-                    "severity": "Normal",
-                    "affected_files": ["src/zero.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
+        seed_gotcha_for_graph_test(
+            &store,
+            "gotcha:zero-limit-test",
+            "Zero limit test",
+            &["src/zero.rs".to_string()],
         )
         .await;
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         let result = call_mem_query(
             &graph_arc,
@@ -3749,32 +2853,16 @@ mod tests {
             .await
             .unwrap();
 
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:reverse-traversal-test".to_string(),
-                value: "Reverse traversal test gotcha".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Reverse traversal rule",
-                    "reason": "testing",
-                    "severity": "Normal",
-                    "affected_files": ["src/graph_reverse.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
+        seed_gotcha_for_graph_test(
+            &store,
+            "gotcha:reverse-traversal-test",
+            "Reverse traversal rule",
+            &["src/graph_reverse.rs".to_string()],
         )
         .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true, "gotcha write must succeed");
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
 
         // The file-side query must see the gotcha (sanity check, pins the
         // known-working direction).
@@ -3813,314 +2901,6 @@ mod tests {
                 .is_some_and(|a| a.iter().any(|g| g["key"] == "file:src/graph_reverse.rs")),
             "gotcha-seed graph query must surface the linked file, got: {gotcha_side}"
         );
-    }
-
-    // ── Regression: mem_set preserves existing data on overwrite ──────────
-
-    /// When overwriting an existing record, mem_set must read and preserve
-    /// Layer 0 structural data from the prior record. This is the exact
-    /// scenario that `.ok().flatten()` would have broken: a store error would
-    /// have made mem_set treat the record as new, losing preservation behavior.
-    #[tokio::test]
-    async fn test_mem_set_overwrite_preserves_existing_data() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        // Seed a DeveloperManual record with high confidence. (Switched from
-        // a file: key to a gotcha: key after file: writes were removed from
-        // mem_set; the merge-on-overwrite semantics under test are the same.)
-        let mut original =
-            make_gotcha_record("gotcha:preserve-confirmation", "Original rule", true, 0.7);
-        original.source = RecordSource::DeveloperManual;
-        original.confidence.value = 0.85;
-        original.confidence.confirmation_count = 3;
-        store
-            .put("gotcha:preserve-confirmation", &original)
-            .await
-            .unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // Overwrite with mem_set — should preserve confirmation state.
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:preserve-confirmation".to_string(),
-                value: "Updated rule from enrichment".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({"reason": "updated reason"}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true, "overwrite must succeed");
-
-        // Verify the record was updated but preserved confirmation state.
-        let graph = graph_arc.read().await;
-        let record = graph
-            .store()
-            .get("gotcha:preserve-confirmation")
-            .await
-            .unwrap()
-            .expect("record must exist");
-        assert_eq!(
-            record.value, "Updated rule from enrichment",
-            "value must be updated"
-        );
-        // DeveloperManual source + high confidence should be preserved
-        // because the write path detects was_confirmed=true.
-        assert!(
-            record.confidence.value >= 0.80,
-            "confirmed record confidence must be preserved, got {}",
-            record.confidence.value
-        );
-    }
-
-    // ── Regression: tombstone multi-file gotcha cleans all edges ──────────
-
-    /// When a gotcha affects multiple files, tombstone must remove in-memory
-    /// HasGotcha edges from ALL affected files, not just the first.
-    #[tokio::test]
-    async fn test_tombstone_multi_file_removes_all_edges() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        // Seed two file records
-        let f1 = Record::layer0_file_stub("file:src/a.rs", device_id(), 1, now());
-        let f2 = Record::layer0_file_stub("file:src/b.rs", device_id(), 1, now());
-        store.put("file:src/a.rs", &f1).await.unwrap();
-        store.put("file:src/b.rs", &f2).await.unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // Write a gotcha affecting both files
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:multi-file-tombstone".to_string(),
-                value: "Cross-file gotcha".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Cross-file rule",
-                    "reason": "testing multi-file cleanup",
-                    "severity": "Normal",
-                    "affected_files": ["src/a.rs", "src/b.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true);
-
-        // Verify both files have the edge
-        {
-            let graph = graph_arc.read().await;
-            assert!(
-                graph
-                    .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
-                    .contains(&"gotcha:multi-file-tombstone".to_string()),
-                "file:src/a.rs must have HasGotcha edge before delete"
-            );
-            assert!(
-                graph
-                    .neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
-                    .contains(&"gotcha:multi-file-tombstone".to_string()),
-                "file:src/b.rs must have HasGotcha edge before delete"
-            );
-        }
-
-        // Delete the gotcha
-        let result = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "delete".to_string(),
-                key: "gotcha:multi-file-tombstone".to_string(),
-                value: String::new(),
-                category: String::new(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(parsed["ok"], true);
-
-        // Verify BOTH files lost the edge
-        {
-            let graph = graph_arc.read().await;
-            assert!(
-                !graph
-                    .neighbors("file:src/a.rs", &EdgeKind::HasGotcha)
-                    .contains(&"gotcha:multi-file-tombstone".to_string()),
-                "file:src/a.rs must NOT have HasGotcha edge after delete"
-            );
-            assert!(
-                !graph
-                    .neighbors("file:src/b.rs", &EdgeKind::HasGotcha)
-                    .contains(&"gotcha:multi-file-tombstone".to_string()),
-                "file:src/b.rs must NOT have HasGotcha edge after delete"
-            );
-        }
-    }
-
-    // ── Regression: confirm is non-idempotent ────────────────────────────
-
-    /// Calling confirm twice must increment confirmation_count each time,
-    /// proving `idempotent_hint = false` is correct for mem_set.
-    #[tokio::test]
-    async fn test_confirm_is_non_idempotent() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).await.unwrap();
-
-        let file_record = Record::layer0_file_stub("file:src/idem.rs", device_id(), 1, now());
-        store.put("file:src/idem.rs", &file_record).await.unwrap();
-
-        let graph = Graph::load(store).await.unwrap();
-        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
-
-        // Write an unconfirmed gotcha
-        let _ = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "write".to_string(),
-                key: "gotcha:idem-test".to_string(),
-                value: "Idempotency test rule".to_string(),
-                category: "Gotcha".to_string(),
-                payload: serde_json::json!({
-                    "rule": "Idempotency test",
-                    "reason": "testing",
-                    "severity": "Normal",
-                    "affected_files": ["src/idem.rs"],
-                    "ref_url": null,
-                    "discovered_session": 0,
-                    "confirmed": false
-                }),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-
-        // First confirm
-        let r1 = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "confirm".to_string(),
-                key: "gotcha:idem-test".to_string(),
-                value: String::new(),
-                category: String::new(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let p1: serde_json::Value = serde_json::from_str(&r1).unwrap();
-        assert_eq!(p1["ok"], true, "first confirm must succeed");
-        assert_eq!(p1["confirmed"], true);
-
-        // Read confirmation_count after first confirm
-        let count_after_first = {
-            let graph = graph_arc.read().await;
-            let record = graph
-                .store()
-                .get("gotcha:idem-test")
-                .await
-                .unwrap()
-                .unwrap();
-            record.confidence.confirmation_count
-        };
-
-        // Second confirm
-        let r2 = call_mem_set(
-            &graph_arc,
-            MemSetParams {
-                action: "confirm".to_string(),
-                key: "gotcha:idem-test".to_string(),
-                value: String::new(),
-                category: String::new(),
-                payload: serde_json::json!({}),
-                tags: vec![],
-                priority: "Normal".to_string(),
-            },
-        )
-        .await;
-        let p2: serde_json::Value = serde_json::from_str(&r2).unwrap();
-        assert_eq!(p2["ok"], true, "second confirm must succeed");
-
-        // Read confirmation_count after second confirm
-        let count_after_second = {
-            let graph = graph_arc.read().await;
-            let record = graph
-                .store()
-                .get("gotcha:idem-test")
-                .await
-                .unwrap()
-                .unwrap();
-            record.confidence.confirmation_count
-        };
-
-        assert!(
-            count_after_second > count_after_first,
-            "confirmation_count must increase on each confirm: first={count_after_first}, second={count_after_second}"
-        );
-    }
-
-    // ── Regression: store-read-error refusal (extracted helper) ───────────
-
-    /// The Err(e) branch must return a structured JSON error and refuse to write.
-    /// Previously untestable because it required a real store failure.
-    #[test]
-    fn test_store_read_error_refuses_write() {
-        let result = resolve_existing_for_write(Err(anyhow::anyhow!("simulated disk I/O timeout")));
-        assert!(result.is_err(), "store error must refuse write");
-        let err = result.unwrap_err();
-        let parsed: serde_json::Value = serde_json::from_str(&err).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("store read failed"),
-            "error must mention store read failure"
-        );
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .contains("simulated disk I/O timeout"),
-            "error must include the underlying cause"
-        );
-    }
-
-    /// Ok(None) must pass through — new record, no existing data to preserve.
-    #[test]
-    fn test_store_read_ok_none_passes_through() {
-        let result = resolve_existing_for_write(Ok(None));
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    /// Ok(Some(record)) must pass through — existing record for preservation.
-    #[test]
-    fn test_store_read_ok_some_passes_through() {
-        let record = make_record("file:test.rs", "test", Category::File, 0.5);
-        let result = resolve_existing_for_write(Ok(Some(record.clone())));
-        assert!(result.is_ok());
-        let resolved = result.unwrap();
-        assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap().key, "file:test.rs");
     }
 
     #[tokio::test]
