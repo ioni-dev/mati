@@ -4,6 +4,7 @@
 // metadata because Codex surfaces this list directly in `/mcp`.
 
 pub mod daemon_lifecycle;
+pub mod daemon_log;
 pub mod dispatch_v2;
 pub mod handlers;
 pub mod metadata;

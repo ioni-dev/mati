@@ -64,6 +64,20 @@ pub struct DaemonMetadata {
     pub session: Uuid,
     /// Who started this daemon (daemon vs mcp server).
     pub owner: DaemonOwner,
+    /// Version of the binary serving this store.
+    ///
+    /// Hooks and the MCP server can resolve to *different* binaries — hooks
+    /// run `.claude/hooks/mati`, which `mati init` pinned to whichever
+    /// executable ran it, while `.mcp.json` registers a bare `mati` off PATH.
+    /// A rebuild of one and not the other puts a stale client against a live
+    /// daemon, and hooks fail open on a protocol mismatch, so the symptom is
+    /// silent under-enforcement. Recording the version here lets `mati doctor`
+    /// name the mismatch instead.
+    ///
+    /// `#[serde(default)]`: a `mati.pid` written by an older binary has no
+    /// version, and must still parse.
+    #[serde(default)]
+    pub version: String,
 }
 
 impl DaemonMetadata {
@@ -73,6 +87,7 @@ impl DaemonMetadata {
             pid: std::process::id(),
             session: Uuid::new_v4(),
             owner,
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 }
@@ -187,6 +202,7 @@ pub fn read_metadata(root: &Path) -> Option<DaemonMetadata> {
             pid,
             session: Uuid::nil(),
             owner: DaemonOwner::Daemon,
+            version: String::new(),
         });
     }
 
@@ -208,6 +224,7 @@ pub fn read_metadata(root: &Path) -> Option<DaemonMetadata> {
             // (SessionMismatch), forcing the proxy to re-read after daemon restart.
             session: Uuid::nil(),
             owner,
+            version: String::new(),
         });
     }
 
@@ -1191,6 +1208,7 @@ mod tests {
             pid: 42,
             session: Uuid::new_v4(),
             owner: DaemonOwner::Mcp,
+            version: String::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: DaemonMetadata = serde_json::from_str(&json).unwrap();
@@ -1205,6 +1223,7 @@ mod tests {
             pid: 1234,
             session,
             owner: DaemonOwner::Daemon,
+            version: String::new(),
         };
         publish_metadata(dir.path(), &meta).unwrap();
 
@@ -1278,6 +1297,7 @@ mod tests {
             pid: 1,
             session: Uuid::new_v4(),
             owner: DaemonOwner::Daemon,
+            version: String::new(),
         };
         publish_metadata(dir.path(), &meta1).unwrap();
 
@@ -1286,6 +1306,7 @@ mod tests {
             pid: 2,
             session: Uuid::new_v4(),
             owner: DaemonOwner::Mcp,
+            version: String::new(),
         };
         publish_metadata(dir.path(), &meta2).unwrap();
 
@@ -1338,6 +1359,7 @@ mod tests {
             pid: 4_000_000, // almost certainly dead
             session: Uuid::new_v4(),
             owner: DaemonOwner::Daemon,
+            version: String::new(),
         };
         publish_metadata(dir.path(), &meta).unwrap();
         std::fs::write(dir.path().join("mati.sock"), "").unwrap();
@@ -1355,6 +1377,7 @@ mod tests {
             pid: std::process::id(), // our own PID — alive
             session: Uuid::new_v4(),
             owner: DaemonOwner::Daemon,
+            version: String::new(),
         };
         publish_metadata(dir.path(), &meta).unwrap();
 

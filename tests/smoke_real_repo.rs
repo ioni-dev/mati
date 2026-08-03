@@ -372,6 +372,68 @@ mod tests {
         store.close().await.expect("store close failed");
     }
 
+    // ── Test 4b: budget holds when every baseline forces a revwalk ──────────
+
+    /// Proves the pass respects its budget on the *expensive* path.
+    ///
+    /// Test 4 seeds empty baselines, so `git_factor` returns at its
+    /// baseline-setting short-circuit and never walks. Here every record
+    /// carries the repo's root commit as its baseline, so each one blob-
+    /// compares against HEAD and then revwalks the entire history — the shape
+    /// that used to run one record for seconds past a spent budget, because
+    /// `ANALYZE_TIME_BUDGET_MS` gated only when a record *started*.
+    ///
+    /// The ceiling is the SessionEnd hook's: Claude Code SIGKILLs at 3000ms and
+    /// non-staleness harvest work costs ~330ms, so the pass has ~2170ms.
+    #[tokio::test]
+    #[ignore] // touches disk and git extensively
+    async fn smoke_staleness_analyzer_budget_holds_with_stale_git_baselines() {
+        let (store, _dir) = temp_store().await;
+        let root = project_root();
+
+        let repo = git2::Repository::discover(&root).expect("project must be a git repo");
+        let mut walk = repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        let root_commit = walk
+            .last()
+            .and_then(|o| o.ok())
+            .expect("repo has at least one commit")
+            .to_string();
+
+        // Every tracked source file, baselined at the root commit.
+        let mut seeded = 0u32;
+        for entry in ignore::Walk::new(root.join("src")).flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
+            let key = format!("file:{rel}");
+            let mut record = make_file_record(&key);
+            record.staleness.last_record_sha = root_commit.clone();
+            store.put(&key, &record).await.expect("seed failed");
+            seeded += 1;
+        }
+        assert!(seeded > 50, "expected a real corpus, seeded {seeded}");
+
+        let analyzer = StalenessAnalyzer::new(&root);
+        let start = Instant::now();
+        analyzer
+            .analyze_all(&store)
+            .await
+            .expect("analyze_all failed");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_millis() < 2170,
+            "staleness pass overshot the SessionEnd hook's ceiling: {:.2}s \
+             (budget 2000ms; one record's revwalk must not run past it)",
+            elapsed.as_secs_f64()
+        );
+
+        store.close().await.expect("store close failed");
+    }
+
     // ── Test 5: Staleness preserved after reparse ───────────────────────────
 
     /// Proves the reparse preservation fix works: staleness signals from

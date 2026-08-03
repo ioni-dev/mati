@@ -434,7 +434,7 @@ impl StalenessAnalyzer {
 
                 let mut updated = record.clone();
                 match self
-                    .compute_staleness(&mut updated, store, &dep_cache)
+                    .compute_staleness(&mut updated, store, &dep_cache, deadline)
                     .await
                 {
                     Ok(()) => {}
@@ -493,11 +493,17 @@ impl StalenessAnalyzer {
     /// Compute the 5-factor staleness score for a single record.
     ///
     /// Modifies the record in-place. Returns `Ok(())` on success.
+    ///
+    /// `deadline` is the pass deadline, not a per-record one. Only the git
+    /// factor consults it: its revwalk is the sole unbounded-by-wall-clock step
+    /// here, and it stops mid-walk rather than letting one record run the pass
+    /// past its budget. See [`Self::count_commits_since`].
     async fn compute_staleness(
         &self,
         record: &mut Record,
         store: &Store,
         dep_cache: &HashMap<String, Record>,
+        deadline: Instant,
     ) -> Result<()> {
         // Parse FileRecord once if this is a file: record.
         let file_record: Option<FileRecord> = if record.key.starts_with("file:") {
@@ -589,7 +595,8 @@ impl StalenessAnalyzer {
         // ── 5-factor computation ────────────────────────────────────────────
         let time_f = time_factor(record, self.now);
 
-        let (git_f, new_sha) = self.git_factor_for(&record.key, &record.staleness.last_record_sha);
+        let (git_f, new_sha) =
+            self.git_factor_for(&record.key, &record.staleness.last_record_sha, deadline);
 
         let semantic_f = semantic_factor();
 
@@ -661,7 +668,12 @@ impl StalenessAnalyzer {
     /// Synchronous on purpose: the `MutexGuard` must not survive into
     /// [`Self::compute_staleness`], which awaits after this returns.
     /// A poisoned lock yields no git signal rather than a panic.
-    fn git_factor_for(&self, key: &str, last_record_sha: &str) -> (f32, Option<String>) {
+    fn git_factor_for(
+        &self,
+        key: &str,
+        last_record_sha: &str,
+        deadline: Instant,
+    ) -> (f32, Option<String>) {
         let Some(mutex) = self.repo.as_ref() else {
             return (0.0, None);
         };
@@ -669,7 +681,7 @@ impl StalenessAnalyzer {
             return (0.0, None);
         };
         let path = key.strip_prefix("file:").unwrap_or(key);
-        self.git_factor(&repo, path, last_record_sha)
+        self.git_factor(&repo, path, last_record_sha, deadline)
     }
 
     /// Two-phase git factor:
@@ -682,6 +694,7 @@ impl StalenessAnalyzer {
         repo: &git2::Repository,
         path: &str,
         last_record_sha: &str,
+        deadline: Instant,
     ) -> (f32, Option<String>) {
         let head_sha = match &self.head_commit {
             Some(sha) => sha.clone(),
@@ -717,18 +730,33 @@ impl StalenessAnalyzer {
         }
 
         // Phase 2: revwalk to count commits since stored SHA.
-        let count = self.count_commits_since(repo, path, last_record_sha);
+        let count = self.count_commits_since(repo, path, last_record_sha, deadline);
         let factor = commits_to_factor(count);
 
         (factor, Some(head_sha))
     }
 
-    /// Count commits touching `path` since `since_sha`, respecting GIT_REVWALK_LIMIT.
+    /// Count commits touching `path` since `since_sha`, respecting
+    /// GIT_REVWALK_LIMIT and the pass deadline.
     ///
     /// Uses `total_iterations` (not walked-commit counter) for consistent
-    /// merge-commit handling. Returns GIT_CAP_HIT_COMMITS if the revwalk cap
-    /// is hit without finding `since_sha` and no commits were counted.
-    fn count_commits_since(&self, repo: &git2::Repository, path: &str, since_sha: &str) -> u32 {
+    /// merge-commit handling. Returns GIT_CAP_HIT_COMMITS if the walk stops
+    /// early — cap or deadline — without finding `since_sha` and no commits
+    /// were counted.
+    ///
+    /// The deadline check is per iteration because each one runs
+    /// [`commit_touches_file`], two tree lookups against the object database.
+    /// `GIT_REVWALK_LIMIT` alone bounds the walk at 2000 of those, which on a
+    /// deep history costs seconds — longer than the whole pass budget, inside a
+    /// single record. The outer loop only gates when a record *starts*, so
+    /// without this the pass overshoots by however long the walk takes.
+    fn count_commits_since(
+        &self,
+        repo: &git2::Repository,
+        path: &str,
+        since_sha: &str,
+        deadline: Instant,
+    ) -> u32 {
         let head_oid = match repo.head().ok().and_then(|h| h.target()) {
             Some(oid) => oid,
             None => return 0,
@@ -749,10 +777,16 @@ impl StalenessAnalyzer {
         let mut count: u32 = 0;
         let mut total_iterations: usize = 0;
         let mut found_since = false;
+        let mut stopped_early = false;
 
         for oid_result in revwalk {
             total_iterations += 1;
             if total_iterations > GIT_REVWALK_LIMIT {
+                stopped_early = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                stopped_early = true;
                 break;
             }
 
@@ -773,8 +807,10 @@ impl StalenessAnalyzer {
             }
         }
 
-        // Cap hit without finding since_sha and no commits counted.
-        if !found_since && count == 0 && total_iterations >= GIT_REVWALK_LIMIT {
+        // Stopped early without finding since_sha and nothing counted: the
+        // history is known to have moved, so report the conservative floor
+        // rather than 0, which reads as "unchanged".
+        if !found_since && count == 0 && stopped_early {
             return GIT_CAP_HIT_COMMITS;
         }
 
@@ -1253,6 +1289,11 @@ mod tests {
     use crate::store::record::*;
     use tempfile::TempDir;
 
+    /// A deadline no test will reach — for call sites not testing the budget.
+    fn far_deadline() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
     fn make_file_record_with_staleness(value: f32) -> Record {
         Record {
             key: "file:src/main.rs".to_string(),
@@ -1689,7 +1730,7 @@ mod tests {
             head_commit: None,
         };
         assert_eq!(
-            analyzer.git_factor_for("file:src/main.rs", "deadbeef"),
+            analyzer.git_factor_for("file:src/main.rs", "deadbeef", far_deadline()),
             (0.0, None)
         );
     }
@@ -2061,7 +2102,7 @@ mod tests {
         let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
         let dep_cache = HashMap::new();
         analyzer
-            .compute_staleness(&mut record, &store, &dep_cache)
+            .compute_staleness(&mut record, &store, &dep_cache, far_deadline())
             .await
             .unwrap();
 
@@ -2090,7 +2131,7 @@ mod tests {
         assert!(!analyzer.root_from_git);
 
         analyzer
-            .compute_staleness(&mut record, &store, &HashMap::new())
+            .compute_staleness(&mut record, &store, &HashMap::new(), far_deadline())
             .await
             .unwrap();
 
@@ -2122,7 +2163,7 @@ mod tests {
         let mut record = make_file_record_with_staleness(0.0);
         record.key = "file:src/present.rs".to_string();
         analyzer
-            .compute_staleness(&mut record, &store, &HashMap::new())
+            .compute_staleness(&mut record, &store, &HashMap::new(), far_deadline())
             .await
             .unwrap();
 
@@ -2151,7 +2192,7 @@ mod tests {
         let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
         let dep_cache = HashMap::new();
         analyzer
-            .compute_staleness(&mut record, &store, &dep_cache)
+            .compute_staleness(&mut record, &store, &dep_cache, far_deadline())
             .await
             .unwrap();
 
@@ -2178,7 +2219,7 @@ mod tests {
         let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
         let dep_cache = HashMap::new();
         analyzer
-            .compute_staleness(&mut record, &store, &dep_cache)
+            .compute_staleness(&mut record, &store, &dep_cache, far_deadline())
             .await
             .unwrap();
 
@@ -2562,7 +2603,7 @@ mod tests {
         let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
         let dep_cache = HashMap::new();
         analyzer
-            .compute_staleness(&mut record, &store, &dep_cache)
+            .compute_staleness(&mut record, &store, &dep_cache, far_deadline())
             .await
             .unwrap();
 
@@ -2803,7 +2844,7 @@ mod tests {
 
             let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
             analyzer
-                .compute_staleness(&mut record, &store, &HashMap::new())
+                .compute_staleness(&mut record, &store, &HashMap::new(), far_deadline())
                 .await
                 .unwrap();
 
@@ -2827,5 +2868,70 @@ mod tests {
 
             store.close().await.unwrap();
         }
+    }
+
+    // ── revwalk deadline ────────────────────────────────────────────────────
+
+    /// Commit `content` to `name` and return the commit SHA.
+    fn commit_file(repo: &git2::Repository, name: &str, content: &str) -> String {
+        let workdir = repo.workdir().expect("bare repo").to_path_buf();
+        std::fs::write(workdir.join(name), content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(name)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, "c", &tree, &parents)
+            .unwrap()
+            .to_string()
+    }
+
+    /// The revwalk stops at the pass deadline instead of running to
+    /// `GIT_REVWALK_LIMIT`.
+    ///
+    /// `analyze_until` gates only when a record *starts*, so before the
+    /// deadline reached here one record could walk 2000 commits — seconds —
+    /// after the pass had already spent its budget, and the SessionEnd hook
+    /// overshot by that much.
+    #[test]
+    fn count_commits_since_stops_at_the_deadline() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut shas = Vec::new();
+        for i in 0..12 {
+            shas.push(commit_file(&repo, "a.txt", &format!("v{i}\n")));
+        }
+        let analyzer = StalenessAnalyzer::new(dir.path());
+        let root_sha = &shas[0];
+
+        assert_eq!(
+            analyzer.count_commits_since(&repo, "a.txt", root_sha, far_deadline()),
+            11,
+            "an unbounded walk reaches the root commit and counts the rest"
+        );
+
+        assert_eq!(
+            analyzer.count_commits_since(&repo, "a.txt", root_sha, Instant::now()),
+            GIT_CAP_HIT_COMMITS,
+            "an expired deadline stops the walk and reports the conservative floor"
+        );
+    }
+
+    /// A record whose walk cannot finish inside the budget still gets a
+    /// staleness signal — undercounting keeps enforcement on, silence would
+    /// read as "unchanged".
+    #[test]
+    fn deadline_truncated_walk_reports_a_nonzero_git_factor() {
+        let dir = TempDir::new().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let root_sha = commit_file(&repo, "a.txt", "v0\n");
+        commit_file(&repo, "a.txt", "v1\n");
+        let analyzer = StalenessAnalyzer::new(dir.path());
+
+        let (factor, sha) = analyzer.git_factor(&repo, "a.txt", &root_sha, Instant::now());
+        assert!(factor > 0.0, "truncated walk must not report 'unchanged'");
+        assert!(sha.is_some(), "baseline still advances to HEAD");
     }
 }

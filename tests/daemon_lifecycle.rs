@@ -365,6 +365,71 @@ fn wait_for_phase_ready(log_path: &Path, timeout: Duration) -> bool {
     false
 }
 
+/// The daemon's INFO output must land somewhere a human can find it, with
+/// **no `RUST_LOG` set** — production never sets it.
+///
+/// Before `mcp::daemon_log`, `tracing` wrote to stderr at a `warn` default.
+/// Stderr reached `~/.mati/daemon_start.log` only when `ensure_daemon` spawned
+/// the daemon, and INFO was filtered out before it got there. So the lines that
+/// answer "did this run?" — `mati daemon listening`, `staleness analysis
+/// complete scanned=… updated=…` — existed in the source and nowhere on disk,
+/// and three investigations read "nothing invoked it" as "it is broken".
+///
+/// Note the deliberately absent `.env("RUST_LOG", …)`: setting it is what made
+/// the original problem invisible in every existing test.
+#[tokio::test]
+#[ignore]
+async fn daemon_info_logging_is_readable_without_rust_log() {
+    let project_temp = TempDir::new().expect("project tempdir");
+    let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
+
+    let bin = env!("CARGO_BIN_EXE_mati");
+    let mut child = Command::new(bin)
+        .arg("daemon")
+        .arg("start")
+        .current_dir(&project)
+        .env("MATI_HOME", common::mati_home())
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `mati daemon start`");
+    let pid = child.id().expect("child pid available pre-wait");
+
+    let slug = derive_slug(&project);
+    let mati_root = common::mati_home().join(&slug);
+    let daemon_log = mati_root.join("daemon.log");
+
+    let seen = wait_for_file_containing(&daemon_log, "mati daemon listening", READY_TIMEOUT);
+
+    unsafe {
+        // SAFETY: SIGTERM to our own child — the documented shutdown signal.
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
+
+    assert!(
+        seen,
+        "daemon.log should carry the daemon's INFO lifecycle lines; contents:\n{:?}",
+        std::fs::read_to_string(&daemon_log).ok()
+    );
+}
+
+fn wait_for_file_containing(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if contents.contains(needle) {
+                return true;
+            }
+        }
+        std::thread::sleep(POLL);
+    }
+    false
+}
+
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), &'static str> {
     let start = Instant::now();
     while start.elapsed() < timeout {

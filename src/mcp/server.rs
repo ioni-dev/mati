@@ -2312,6 +2312,7 @@ mod tests {
             pid: std::process::id(),
             session: session_before,
             owner: super::super::metadata::DaemonOwner::Daemon,
+            version: String::new(),
         };
         super::super::metadata::publish_metadata(&root, &meta_before).unwrap();
 
@@ -2349,6 +2350,7 @@ mod tests {
                 pid: std::process::id(),
                 session: session_after,
                 owner: super::super::metadata::DaemonOwner::Daemon,
+                version: String::new(),
             };
             super::super::metadata::publish_metadata(&root_for_rotate, &meta_after).unwrap();
         });
@@ -2410,6 +2412,7 @@ mod tests {
             pid: std::process::id(),
             session,
             owner: super::super::metadata::DaemonOwner::Daemon,
+            version: String::new(),
         };
         super::super::metadata::publish_metadata(&root, &meta).unwrap();
 

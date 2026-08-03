@@ -219,6 +219,12 @@ pub async fn run_daemon_start() -> Result<()> {
     // 1. Ensure runtime directory exists with correct permissions (0700).
     mati_core::mcp::metadata::ensure_runtime_dir(&mati_root)?;
 
+    // Redirect this process's tracing output into <root>/daemon.log now that
+    // the directory exists. Anything logged before this — and anything logged
+    // if the redirect fails — still goes to stderr, which `ensure_daemon`
+    // captures into daemon_start.log.
+    mati_core::mcp::daemon_log::install(&mati_root);
+
     // 2. Stale-socket cleanup — refuse startup if a live daemon is detected.
     //
     // Run BEFORE install_panic_hook + serve_start record. Two reasons:
@@ -1392,7 +1398,75 @@ fn send_sigkill_only(_pid: u32) -> bool {
     false
 }
 
-/// γ-C6: find and SIGKILL all `mati serve` processes on the host.
+/// PIDs of `mati serve` proxies attached to **this** store, from the store's
+/// own `lifecycle.log`.
+///
+/// `mati serve` appends `serve_start pid=<n> owner=proxy` to
+/// `<root>/lifecycle.log` before it forwards anything, and a terminating event
+/// when it goes away. A proxy serving a different store writes to that store's
+/// log and can never appear here.
+///
+/// That indirection is necessary because the process itself carries no usable
+/// discriminator. Its command line is a bare `mati serve` (that is what `mati
+/// init` registers in `.mcp.json` and Codex's `config.toml`), so `pgrep`
+/// cannot tell two stores apart. Its CWD is not the project either — Codex
+/// spawns MCP servers with `CWD=/`. It holds no long-lived socket to match on:
+/// `proxy_daemon_result` connects per call. `MATI_HOME` in its environment
+/// would only narrow the home, not the slug, and reading another process's
+/// environment is not portable. The log entry is written by the process we
+/// want to identify, into the directory that defines the store — the only
+/// place the association actually exists.
+///
+/// Under-inclusive by construction: a truncated log, or a proxy started by a
+/// binary too old to record the event, yields a PID we will not kill. That is
+/// the correct direction to fail — the bug being fixed is killing MCP sessions
+/// that belong to other stores.
+fn recorded_serve_pids(root: &Path) -> std::collections::HashSet<u32> {
+    let mut live = std::collections::HashSet::new();
+    let Ok(contents) = std::fs::read_to_string(root.join("lifecycle.log")) else {
+        return live;
+    };
+    for line in contents.lines() {
+        // ts \t pid \t event \t detail — see `mcp::metadata::record_lifecycle_event`.
+        let mut cols = line.split('\t');
+        let (Some(_ts), Some(pid), Some(event)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        let detail = cols.next().unwrap_or("");
+        match event {
+            // `mati daemon start` writes serve_start too, with owner=daemon.
+            "serve_start" if detail.contains("owner=proxy") => {
+                live.insert(pid);
+            }
+            "serve_shutdown" | "serve_failed" | "panic" => {
+                live.remove(&pid);
+            }
+            _ => {}
+        }
+    }
+    live
+}
+
+/// Which of the `mati serve` processes currently running belong to `root`.
+///
+/// Split out from [`kill_mati_serve_processes`] so the selection is testable
+/// without signalling anything.
+fn serve_pids_to_kill(root: &Path, running: &[u32]) -> Vec<u32> {
+    let recorded = recorded_serve_pids(root);
+    let my_pid = std::process::id();
+    running
+        .iter()
+        .copied()
+        // Don't suicide — `mati daemon stop`'s own argv is not `mati serve`,
+        // but belt-and-suspenders against pgrep pattern slop.
+        .filter(|pid| *pid != my_pid && recorded.contains(pid))
+        .collect()
+}
+
+/// γ-C6: SIGKILL the `mati serve` processes attached to this store.
 ///
 /// After γ, `mati serve` is a separate process from the daemon; killing
 /// the daemon alone does not end the MCP session. `--include-mcp` adds
@@ -1400,7 +1474,12 @@ fn send_sigkill_only(_pid: u32) -> bool {
 /// when needed (e.g. agent gone rogue, or operator wants to force a
 /// fresh session start).
 ///
-/// Uses `pgrep -f "mati serve"` for portability across macOS + Linux.
+/// `pgrep -f "mati serve"` enumerates candidates portably across macOS +
+/// Linux, but it matches every proxy on the host, and `root` used to be read
+/// only by the audit line — so stopping a daemon for one store killed the MCP
+/// sessions of every other store on the machine. [`serve_pids_to_kill`]
+/// narrows the list to proxies this store recorded.
+///
 /// Best-effort — failures are logged but don't fail the stop command,
 /// because the daemon stop itself already succeeded by the time we're
 /// here. The user's primary intent (stop the daemon) is honored even if
@@ -1429,34 +1508,37 @@ async fn kill_mati_serve_processes(root: &Path) {
         return;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let my_pid = std::process::id();
+    let running: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect();
+    let targets = serve_pids_to_kill(root, &running);
+    let spared = running.len().saturating_sub(targets.len());
+
     let mut killed: Vec<u32> = Vec::new();
-    for line in stdout.lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            if pid == my_pid {
-                // Don't suicide — the running `mati daemon stop`
-                // command itself matches "mati " but its argv is
-                // `mati daemon stop`, not `mati serve`. Belt-and-
-                // suspenders against pgrep pattern slop.
-                continue;
-            }
-            #[cfg(unix)]
-            {
-                // SAFETY: SIGKILL is non-catchable. ESRCH on already-
-                // gone process is a benign no-op; any other error is
-                // logged but not fatal.
-                let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                if ret == 0 {
-                    killed.push(pid);
-                } else {
-                    let errno = std::io::Error::last_os_error().raw_os_error();
-                    if !matches!(errno, Some(libc::ESRCH)) {
-                        tracing::warn!(pid, ?errno, "kill_mati_serve_processes: SIGKILL failed");
-                    }
+    for pid in targets {
+        #[cfg(unix)]
+        {
+            // SAFETY: SIGKILL is non-catchable. ESRCH on already-
+            // gone process is a benign no-op; any other error is
+            // logged but not fatal.
+            let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            if ret == 0 {
+                killed.push(pid);
+            } else {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if !matches!(errno, Some(libc::ESRCH)) {
+                    tracing::warn!(pid, ?errno, "kill_mati_serve_processes: SIGKILL failed");
                 }
             }
         }
+    }
+
+    if spared > 0 {
+        println!(
+            "mati daemon: --include-mcp left {spared} `mati serve` process(es) alone \
+             (not recorded against this store)"
+        );
     }
 
     if !killed.is_empty() {
@@ -1793,6 +1875,10 @@ pub async fn run_daemon_status() -> Result<()> {
             }
             println!("  socket: {}", sock_path.display());
             println!(
+                "  log:    {}",
+                mati_core::mcp::daemon_log::log_path(&root).display()
+            );
+            println!(
                 "  protocol version: {}",
                 resp.get("v")
                     .and_then(|v| v.as_u64())
@@ -1833,6 +1919,88 @@ mod tests {
     // Protocol type serialization tests removed — Request/Response types
     // now live in mcp::server as SocketRequest/SocketResponse and are
     // tested there.
+
+    // ── --include-mcp scoping ───────────────────────────────────────────
+
+    fn write_lifecycle(root: &std::path::Path, lines: &[(u32, &str, &str)]) {
+        let body: String = lines
+            .iter()
+            .map(|(pid, event, detail)| format!("1700000000\t{pid}\t{event}\t{detail}\n"))
+            .collect();
+        std::fs::write(root.join("lifecycle.log"), body).unwrap();
+    }
+
+    /// The whole point of the fix: a `mati serve` this store never recorded is
+    /// not ours to kill.
+    ///
+    /// `pgrep -f "mati serve"` matches every proxy on the host, and `root` used
+    /// to reach only the audit line — so `mati daemon stop --include-mcp` on a
+    /// disposable `MATI_HOME` SIGKILLed the MCP server of an unrelated store.
+    #[test]
+    fn include_mcp_spares_serves_this_store_never_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lifecycle(dir.path(), &[(4242, "serve_start", "pid=4242 owner=proxy")]);
+
+        assert_eq!(
+            serve_pids_to_kill(dir.path(), &[4242, 9999]),
+            vec![4242],
+            "9999 belongs to some other store's lifecycle.log"
+        );
+    }
+
+    /// No log, no claim. A store that has never seen a proxy kills nothing,
+    /// even with proxies running on the host.
+    #[test]
+    fn include_mcp_kills_nothing_without_a_lifecycle_log() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(serve_pids_to_kill(dir.path(), &[4242, 9999]).is_empty());
+    }
+
+    #[test]
+    fn recorded_serve_pids_tracks_start_and_termination() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lifecycle(
+            dir.path(),
+            &[
+                (10, "serve_start", "pid=10 owner=proxy"),
+                (11, "serve_start", "pid=11 owner=proxy"),
+                // The daemon writes serve_start too — never a kill target.
+                (12, "serve_start", "pid=12 owner=daemon"),
+                (11, "serve_shutdown", "reason=client_disconnect"),
+            ],
+        );
+
+        let pids = recorded_serve_pids(dir.path());
+        assert!(pids.contains(&10));
+        assert!(!pids.contains(&11), "a shut-down proxy is gone");
+        assert!(!pids.contains(&12), "owner=daemon is not a proxy");
+    }
+
+    /// A recycled PID must not resurrect a claim: the proxy that owned it
+    /// recorded its exit, so the process running under it now is someone else's.
+    #[test]
+    fn a_terminated_pid_is_not_reclaimed_by_a_later_run() {
+        let dir = tempfile::tempdir().unwrap();
+        write_lifecycle(
+            dir.path(),
+            &[
+                (77, "serve_start", "pid=77 owner=proxy"),
+                (77, "serve_failed", "proxy init: boom"),
+            ],
+        );
+        assert!(serve_pids_to_kill(dir.path(), &[77]).is_empty());
+    }
+
+    #[test]
+    fn include_mcp_never_targets_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        write_lifecycle(
+            dir.path(),
+            &[(me, "serve_start", &format!("pid={me} owner=proxy"))],
+        );
+        assert!(serve_pids_to_kill(dir.path(), &[me]).is_empty());
+    }
 
     #[tokio::test]
     async fn daemon_result_not_running_without_socket() {

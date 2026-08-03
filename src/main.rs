@@ -221,16 +221,34 @@ enum Commands {
     },
 }
 
+/// Default tracing directives for a command.
+///
+/// The daemon is the only process nobody can watch: it is detached, long-lived,
+/// and its lifecycle and outcome lines are the ones support questions turn on.
+/// It logs at INFO into `<root>/daemon.log` (see `mcp::daemon_log`); everything
+/// else keeps the quiet `warn` default so CLI output stays clean. `RUST_LOG`
+/// still overrides both.
+fn default_directives(cli: &Cli) -> &'static str {
+    match &cli.command {
+        Commands::Daemon(args) if matches!(args.command, cli::daemon::DaemonCommand::Start) => {
+            mati_core::mcp::daemon_log::DAEMON_DIRECTIVES
+        }
+        _ => "warn",
+    }
+}
+
 fn main() -> Result<()> {
+    // Parsed before the subscriber is built: the default level depends on the
+    // command. `Cli::parse` exits on `--help` / bad args without logging.
+    let cli = Cli::parse();
+
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(mati_core::mcp::daemon_log::DaemonLogWriter)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_directives(&cli))),
         )
         .init();
-
-    let cli = Cli::parse();
 
     // Build the tokio runtime explicitly so we can call `on_thread_start`.
     // On macOS, mati inherits QOS_CLASS_USER_INTERACTIVE from Claude Code
@@ -664,6 +682,37 @@ fn read_line(lines: &mut io::Lines<io::StdinLock<'_>>) -> Result<String> {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod logging_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn directives_for(args: &[&str]) -> &'static str {
+        default_directives(&Cli::parse_from(args))
+    }
+
+    /// The daemon must log at INFO by default. Nobody sets `RUST_LOG` on a
+    /// process that `ensure_daemon` spawns, so a `warn` default meant its
+    /// lifecycle and outcome lines were never written anywhere.
+    #[test]
+    fn daemon_start_defaults_to_info() {
+        assert_eq!(
+            directives_for(&["mati", "daemon", "start"]),
+            mati_core::mcp::daemon_log::DAEMON_DIRECTIVES
+        );
+        assert!(mati_core::mcp::daemon_log::DAEMON_DIRECTIVES.contains("mati_core=info"));
+    }
+
+    /// Everything else stays quiet — INFO on a foreground CLI command is noise
+    /// on the user's terminal, not diagnostics.
+    #[test]
+    fn other_commands_stay_at_warn() {
+        assert_eq!(directives_for(&["mati", "status"]), "warn");
+        assert_eq!(directives_for(&["mati", "daemon", "status"]), "warn");
+        assert_eq!(directives_for(&["mati", "serve"]), "warn");
+    }
+}
 
 #[cfg(test)]
 mod qos_tests {
