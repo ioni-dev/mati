@@ -123,6 +123,7 @@ fn mcp_stdio_all_four_tools() {
     // ── 1. Set up a fresh project directory ──────────────────────────────────
     let project_dir = TempDir::new().expect("failed to create tempdir for MCP test");
     common::isolate_mati_home(); // keep the spawned server's store out of ~/.mati
+    let _daemon_guard = common::DaemonGuard::for_mati_home(project_dir.path(), common::mati_home());
 
     // ── 2. Spawn `mati serve` ─────────────────────────────────────────────────
     let bin = env!("CARGO_BIN_EXE_mati");
@@ -342,16 +343,18 @@ fn extract_text(response: &serde_json::Value) -> String {
         .to_string()
 }
 
-// ── Helper: set up MCP server, return (stdin, rx, _guard, _tempdir) ──────────
+// ── Helper: set up MCP server, return (stdin, rx, _guard, _tempdir, _daemon_guard) ──
 
 fn setup_mcp_server() -> (
     std::process::ChildStdin,
     mpsc::Receiver<String>,
     ChildGuard,
     TempDir,
+    common::DaemonGuard,
 ) {
     let project_dir = TempDir::new().expect("failed to create tempdir");
     common::isolate_mati_home(); // keep the spawned server's store out of ~/.mati
+    let daemon_guard = common::DaemonGuard::for_mati_home(project_dir.path(), common::mati_home());
     let bin = env!("CARGO_BIN_EXE_mati");
 
     let mut child = Command::new(bin)
@@ -383,7 +386,10 @@ fn setup_mcp_server() -> (
         r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
     );
 
-    (stdin, rx, guard, project_dir)
+    // Tuple order matters: fields drop in reverse, so `daemon_guard` (last)
+    // runs `mati daemon stop` while `project_dir` (second-to-last) still
+    // exists on disk — the stop command needs that cwd to derive the slug.
+    (stdin, rx, guard, project_dir, daemon_guard)
 }
 
 // ── Helper: call a tool and return the parsed text ───────────────────────────
@@ -411,7 +417,7 @@ fn call_tool(
 
 #[test]
 fn mcp_stdio_gotcha_lifecycle() {
-    let (mut stdin, rx, _guard, _dir) = setup_mcp_server();
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
 
     // Write a gotcha
     let write_text = call_tool(
@@ -511,7 +517,7 @@ fn mcp_stdio_gotcha_lifecycle() {
 
 #[test]
 fn mcp_stdio_validation_gates() {
-    let (mut stdin, rx, _guard, _dir) = setup_mcp_server();
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
 
     // Invalid key prefix
     let text = call_tool(
@@ -612,7 +618,7 @@ fn mcp_stdio_validation_gates() {
 
 #[test]
 fn mcp_stdio_search_modes() {
-    let (mut stdin, rx, _guard, _dir) = setup_mcp_server();
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
 
     // Write two records with different tags
     call_tool(
@@ -728,7 +734,7 @@ fn mcp_stdio_search_modes() {
 
 #[test]
 fn mcp_stdio_telemetry_modes() {
-    let (mut stdin, rx, _guard, _dir) = setup_mcp_server();
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
 
     // policy_observations on a fresh store — empty object, not a transport error.
     let text = call_tool(
@@ -778,7 +784,7 @@ fn mcp_stdio_telemetry_modes() {
 
 #[test]
 fn mcp_stdio_write_then_search() {
-    let (mut stdin, rx, _guard, _dir) = setup_mcp_server();
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
 
     // Write with a unique sentinel
     call_tool(
