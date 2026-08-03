@@ -437,13 +437,16 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // the frozen-contract primitive `enforcement::verify_chain`.
     checks.push(collect_chain_check(cwd).await);
     checks.push(collect_freshness_check(cwd).await);
-    checks.push(collect_policy_check(cwd).await);
 
     // Network/telemetry posture — a compile-time attestation surfaced in-tool,
     // so an auditor sees mati's headline invariant by running `mati doctor`
-    // rather than reading the CI workflow. Appended last so the `--json`
-    // (version 2) array stays index-stable for existing consumers.
+    // rather than reading the CI workflow.
     checks.push(collect_network_attestation());
+
+    // Appended after `network` on purpose: every check added from here on goes
+    // at the end, so an index a consumer already relies on never moves. Adding
+    // this one before `network` would have shifted it from 13 to 14.
+    checks.push(collect_policy_check(cwd).await);
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -1192,6 +1195,11 @@ mod tests {
     /// that order. CI consumers parse the report by name and by index, and a
     /// `version: 2` schema must keep both stable.
     ///
+    /// `attestation/network` holds index 13 and `enforcement/policy` index 14.
+    /// Policy was added later (75bec3a) and originally landed before `network`,
+    /// which pushed a published index. New checks append at the end so an
+    /// index a consumer already relies on never moves.
+    ///
     /// This is a hermetic test: it drives `collect()` against a tempdir
     /// with no daemon and no `knowledge.db`, exercising the no-store
     /// branch. The other branches are exercised by the smoke tests in
@@ -1221,13 +1229,14 @@ mod tests {
                 ("integrity", "chain"),
                 ("knowledge", "freshness"),
                 ("attestation", "network"),
+                ("enforcement", "policy"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
-             ping → dirty_marker → drift → chain → freshness → network \
-             (the network attestation is appended last so the --json array \
-             stays index-stable for existing consumers)"
+             ping → dirty_marker → drift → chain → freshness → network → policy \
+             (new checks append at the end so an index a consumer already \
+             relies on never moves)"
         );
         assert_eq!(report.version, 2);
     }
