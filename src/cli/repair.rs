@@ -226,22 +226,16 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read-only drift check. Requires direct store access because graph edges
-/// are not guaranteed to be fully persisted while the daemon holds the store —
-/// in-memory edges can produce false-positive drift reports through the proxy.
+/// Read-only drift check. Runs through `StoreProxy`, which routes reads to
+/// the daemon socket when one holds the lock and falls back to a direct
+/// `Store` otherwise -- `StoreProxy` implements `RepairReader` for exactly
+/// this (see `src/cli/proxy.rs`). Edge writes go back to SurrealKV
+/// immediately (never held only in the daemon's in-memory graph), so the
+/// socket-routed scan sees the same on-disk state a direct open would.
 async fn run_check(cwd: &std::path::Path, json: bool, use_color: bool) -> Result<()> {
     let proxy = StoreProxy::open(cwd).await?;
 
-    let result = async {
-        match proxy.direct_store() {
-            Some(store) => check_gotcha_indexes(store).await,
-            None => anyhow::bail!(
-                "mati repair --check requires direct store access, which is unavailable while the daemon is running.\n\
-                 Run `mati daemon stop` and retry."
-            ),
-        }
-    }
-    .await;
+    let result = check_gotcha_indexes(&proxy).await;
 
     let report = proxy.close_with_result(result).await?;
 

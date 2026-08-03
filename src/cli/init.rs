@@ -15,7 +15,9 @@ use mati_core::graph::edges::EdgeKind;
 use mati_core::graph::Graph;
 use mati_core::scaffold::codex::CodexInstallResult;
 use mati_core::scaffold::settings::InstallResult;
-use mati_core::scaffold::{install_codex, install_hooks, write_claude_md_stub};
+use mati_core::scaffold::{
+    install_codex, install_hooks, write_claude_md_stub, write_mati_enrich_command,
+};
 use mati_core::store::{
     derive_slug, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
     Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
@@ -2887,6 +2889,21 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
             Err(e) => {
                 tracing::warn!("CLAUDE.md stub write failed: {e}");
                 println!("  Writing .claude/CLAUDE.md stub...    skipped — {:#}", e);
+            }
+        }
+
+        let t = Instant::now();
+        match write_mati_enrich_command(root) {
+            Ok(_) => println!(
+                "  Writing .claude/commands/mati-enrich.md...          {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("mati-enrich command write failed: {e}");
+                println!(
+                    "  Writing .claude/commands/mati-enrich.md...    skipped — {:#}",
+                    e
+                );
             }
         }
 

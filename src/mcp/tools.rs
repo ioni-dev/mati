@@ -3730,6 +3730,91 @@ mod tests {
         assert_eq!(total, 0, "limit=0 must return zero records, got {total}");
     }
 
+    // ── Regression: graph mode traverses from non-file seeds ───────────────
+
+    /// `HasGotcha` edges are written `file:* -> gotcha:*` only. Graph mode
+    /// must still resolve a `gotcha:*` seed to the files that carry it via
+    /// the reverse (incoming) lookup, not just a `file:*` seed via the
+    /// forward lookup -- otherwise the same (file, gotcha) pair is visible
+    /// from one side and invisible from the other.
+    #[tokio::test]
+    async fn test_graph_mode_traverses_from_gotcha_seed() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        let file_record =
+            Record::layer0_file_stub("file:src/graph_reverse.rs", device_id(), 1, now());
+        store
+            .put("file:src/graph_reverse.rs", &file_record)
+            .await
+            .unwrap();
+
+        let graph = Graph::load(store).await.unwrap();
+        let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+        let result = call_mem_set(
+            &graph_arc,
+            MemSetParams {
+                action: "write".to_string(),
+                key: "gotcha:reverse-traversal-test".to_string(),
+                value: "Reverse traversal test gotcha".to_string(),
+                category: "Gotcha".to_string(),
+                payload: serde_json::json!({
+                    "rule": "Reverse traversal rule",
+                    "reason": "testing",
+                    "severity": "Normal",
+                    "affected_files": ["src/graph_reverse.rs"],
+                    "ref_url": null,
+                    "discovered_session": 0,
+                    "confirmed": false
+                }),
+                tags: vec![],
+                priority: "Normal".to_string(),
+            },
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["ok"], true, "gotcha write must succeed");
+
+        // The file-side query must see the gotcha (sanity check, pins the
+        // known-working direction).
+        let file_side = call_mem_query(
+            &graph_arc,
+            "file:src/graph_reverse.rs",
+            crate::mcp::protocol::QueryMode::Graph,
+            20,
+        )
+        .await;
+        let file_side: serde_json::Value = serde_json::from_str(&file_side).unwrap();
+        assert!(
+            file_side["gotchas"].as_array().is_some_and(|a| a
+                .iter()
+                .any(|g| g["key"] == "gotcha:reverse-traversal-test")),
+            "file-side graph query must surface the gotcha, got: {file_side}"
+        );
+
+        // The gotcha-side query must see the file -- this is the direction
+        // that previously returned "No related records found".
+        let gotcha_side = call_mem_query(
+            &graph_arc,
+            "gotcha:reverse-traversal-test",
+            crate::mcp::protocol::QueryMode::Graph,
+            20,
+        )
+        .await;
+        let gotcha_side: serde_json::Value = serde_json::from_str(&gotcha_side).unwrap();
+        assert_ne!(
+            gotcha_side["summary"], "No related records found",
+            "gotcha-seed graph query should find the linked file, got: {gotcha_side}"
+        );
+        assert!(
+            gotcha_side["gotchas"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|g| g["key"] == "file:src/graph_reverse.rs")),
+            "gotcha-seed graph query must surface the linked file, got: {gotcha_side}"
+        );
+    }
+
     // ── Regression: mem_set preserves existing data on overwrite ──────────
 
     /// When overwriting an existing record, mem_set must read and preserve

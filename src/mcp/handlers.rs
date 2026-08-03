@@ -1622,14 +1622,33 @@ pub(crate) async fn handle_mem_query(
             );
             let mut summary_parts: Vec<String> = Vec::new();
 
+            // HasGotcha / AffectedBy / HasNote edges are written file -> X
+            // only (see gotcha_ops::apply_gotcha_write). A file seed's
+            // outgoing traversal already finds them; a gotcha:/decision:/
+            // dev_note: seed needs the reverse (incoming) lookup instead,
+            // or it silently returns nothing for a pair the file-side query
+            // surfaces. Imports and CoChanges are unaffected: CoChanges
+            // edges are written in both directions at creation time, and
+            // Imports is intentionally forward-only ("what I import" is a
+            // different question from "who imports me").
             let mut available: Vec<Vec<String>> = edge_groups
                 .iter()
                 .map(|(kind, _, cap)| {
-                    graph_ref
-                        .neighbors(&input.query, kind)
-                        .into_iter()
-                        .take(*cap)
-                        .collect()
+                    let mut keys = graph_ref.neighbors(&input.query, kind);
+                    if matches!(
+                        kind,
+                        EdgeKind::HasGotcha | EdgeKind::AffectedBy | EdgeKind::HasNote
+                    ) {
+                        let mut seen: std::collections::HashSet<String> =
+                            keys.iter().cloned().collect();
+                        for key in graph_ref.neighbors_incoming(&input.query, kind) {
+                            if seen.insert(key.clone()) {
+                                keys.push(key);
+                            }
+                        }
+                    }
+                    keys.truncate(*cap);
+                    keys
                 })
                 .collect();
 

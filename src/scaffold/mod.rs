@@ -7,10 +7,12 @@ use anyhow::Result;
 
 pub mod claude_md;
 pub mod codex;
+pub mod commands;
 pub mod settings;
 
 pub use claude_md::write_claude_md_stub;
 pub use codex::install_codex;
+pub use commands::write_mati_enrich_command;
 pub use settings::install_hooks;
 
 /// Resolve the absolute path to the running mati binary.

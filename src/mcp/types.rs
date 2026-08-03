@@ -89,16 +89,17 @@ pub struct MemSetParams {
 
     #[schemars(description = "\
         Namespaced key. Patterns: \
-        file:src/payments/stripe.go | \
         gotcha:stripe-idempotency-key-required | \
         decision:unified-retry-strategy | \
-        dev_note:deployment-checklist")]
+        dev_note:deployment-checklist | \
+        policy:<slug>. \
+        file:* keys are read-only via mem_get — mem_set write rejects them \
+        (file records are owned by the static-analysis pipeline, not agents).")]
     pub key: String,
 
     #[schemars(description = "\
         Human-readable text (tantivy-indexed). \
         Gotcha: '{rule} because {reason}'. \
-        File: purpose sentence starting with a verb. \
         Decision: 'We use X because Y'. \
         DevNote: freeform observation. \
         Not required for confirm or delete actions.")]
@@ -106,8 +107,9 @@ pub struct MemSetParams {
     pub value: String,
 
     #[schemars(description = "\
-        Exactly one of: File | Gotcha | Decision | DevNote. \
-        Not required for confirm or delete actions.")]
+        Ignored. Record routing is determined entirely by the key prefix \
+        (gotcha:/decision:/dev_note:/policy:) — this field has no effect on \
+        the write and is accepted only for backward compatibility.")]
     #[serde(default)]
     pub category: String,
 
@@ -115,10 +117,6 @@ pub struct MemSetParams {
         Structured payload as a JSON object. \
         Gotcha: {rule:string, reason:string, severity:Critical|High|Normal|Low, \
                 affected_files:[string], ref_url:null, discovered_session:0, confirmed:false}. \
-        File: {path:string, purpose:string, entry_points:[string], imports:[string], \
-               gotcha_keys:[string], decision_keys:[string], todos:[], \
-               unsafe_count:0, unwrap_count:0, change_frequency:0, \
-               last_author:null, is_hotspot:false, content_hash:null, line_count:0}. \
         Decision: {summary:string, rationale:string}. \
         DevNote or confirm/delete: empty object {}.")]
     #[serde(default = "default_payload")]
@@ -131,4 +129,56 @@ pub struct MemSetParams {
     #[schemars(description = "Exactly one of: Normal | High | Critical | Low. Default: Normal.")]
     #[serde(default = "default_priority")]
     pub priority: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MemSetParams;
+
+    /// Regression: the `mem_set` tool schema previously advertised `file:*`
+    /// as a writable key pattern and `File` as a valid category, with a full
+    /// `FileRecord` payload shape documented — none of which
+    /// `build_mem_set_command` (src/mcp/tools.rs) has ever accepted; every
+    /// `file:` write is rejected. The schema must not promise what the
+    /// implementation refuses.
+    #[test]
+    fn mem_set_schema_does_not_advertise_file_writes() {
+        let schema = schemars::schema_for!(MemSetParams);
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        let properties = value
+            .get("properties")
+            .expect("schema has a properties object");
+
+        let key_desc = properties["key"]["description"]
+            .as_str()
+            .expect("key has a description");
+        assert!(
+            !key_desc.contains("file:src"),
+            "key description should not offer a file: write example, got: {key_desc}"
+        );
+
+        let value_desc = properties["value"]["description"]
+            .as_str()
+            .expect("value has a description");
+        assert!(
+            !value_desc.contains("File:"),
+            "value description should not document a File case, got: {value_desc}"
+        );
+
+        let category_desc = properties["category"]["description"]
+            .as_str()
+            .expect("category has a description");
+        assert!(
+            !category_desc.contains("File"),
+            "category description should not list File as valid, got: {category_desc}"
+        );
+
+        let payload_desc = properties["payload"]["description"]
+            .as_str()
+            .expect("payload has a description");
+        assert!(
+            !payload_desc.contains("File:"),
+            "payload description should not document a File shape, got: {payload_desc}"
+        );
+    }
 }

@@ -248,6 +248,123 @@ async fn serve_exits_cleanly_on_sigterm_after_client_disconnect() {
     );
 }
 
+/// Regression test for the bug where `metrics::init()` was only ever called
+/// on the `mati serve` proxy path (a different process's `OnceLock`), never
+/// in `run_daemon_start`. Every `metrics::record` call in `dispatch_v2`
+/// runs in the daemon process, so every sample died at `METRICS.get()` and
+/// `mati doctor --internal` could never report a number.
+///
+/// Spawns a real daemon, drives one request through it, then asserts
+/// `mati doctor --internal --json` reports a nonzero `total_calls` instead
+/// of `null`/`(daemon has no metrics yet)`.
+#[tokio::test]
+#[ignore]
+async fn daemon_start_initializes_metrics_for_doctor_internal() {
+    let project_temp = TempDir::new().expect("project tempdir");
+    let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
+
+    let bin = env!("CARGO_BIN_EXE_mati");
+    let stderr_path = project.join("daemon.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let mut child = Command::new(bin)
+        .arg("daemon")
+        .arg("start")
+        .current_dir(&project)
+        .env("RUST_LOG", "info")
+        .env("MATI_HOME", common::mati_home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `mati daemon start`");
+    let pid = child.id().expect("child pid available pre-wait");
+
+    let slug = derive_slug(&project);
+    let mati_root = common::mati_home().join(&slug);
+    let lifecycle_log = mati_root.join("lifecycle.log");
+    let sock = mati_root.join("mati.sock");
+
+    if wait_for_path(&sock, READY_TIMEOUT).is_err() {
+        let _ = child.kill().await;
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!("mati.sock never appeared.\nstderr:\n{stderr}");
+    }
+    // Wait past the "phase=ready" event — metrics::init() runs just before
+    // it is logged, so this also guarantees init() has completed.
+    let ready_seen = wait_for_log_event(&lifecycle_log, "startup", READY_TIMEOUT)
+        && wait_for_phase_ready(&lifecycle_log, READY_TIMEOUT);
+    assert!(
+        ready_seen,
+        "lifecycle.log should contain phase=ready; contents:\n{:?}",
+        std::fs::read_to_string(&lifecycle_log).ok()
+    );
+
+    // Drive one request through the daemon so there is a sample to report.
+    let ping = Command::new(bin)
+        .arg("ping")
+        .current_dir(&project)
+        .env("MATI_HOME", common::mati_home())
+        .output()
+        .await
+        .expect("failed to run `mati ping`");
+    assert!(
+        ping.status.success(),
+        "mati ping should succeed against a live daemon: {}",
+        String::from_utf8_lossy(&ping.stderr)
+    );
+
+    // `mati doctor --internal` must now report real numbers, not "no metrics".
+    let doctor = Command::new(bin)
+        .arg("doctor")
+        .arg("--internal")
+        .arg("--json")
+        .current_dir(&project)
+        .env("MATI_HOME", common::mati_home())
+        .output()
+        .await
+        .expect("failed to run `mati doctor --internal --json`");
+    assert!(
+        doctor.status.success(),
+        "mati doctor --internal --json should succeed against a live daemon: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("doctor --internal --json output valid JSON");
+    assert!(
+        !report.is_null(),
+        "metrics snapshot should not be null once the daemon has served requests"
+    );
+    let total_calls = report
+        .get("total_calls")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        total_calls > 0,
+        "expected total_calls > 0, got report: {report}"
+    );
+
+    // Cleanup: SIGTERM and reap.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
+}
+
+fn wait_for_phase_ready(log_path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(contents) = std::fs::read_to_string(log_path) {
+            if contents.contains("phase=ready") {
+                return true;
+            }
+        }
+        std::thread::sleep(POLL);
+    }
+    false
+}
+
 fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), &'static str> {
     let start = Instant::now();
     while start.elapsed() < timeout {
