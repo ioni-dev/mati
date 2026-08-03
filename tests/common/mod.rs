@@ -47,3 +47,58 @@ pub fn mati_home() -> PathBuf {
 pub fn isolate_mati_home() {
     let _ = mati_home();
 }
+
+/// Stops the daemon for a scratch mati root on drop — including when the test
+/// panics, since `Drop` still runs during unwinding.
+///
+/// A test that spawns `mati <cmd>` against a scratch home touches the store
+/// through `StoreProxy::open`, which calls `ensure_daemon` and spawns a
+/// *detached* `mati daemon start` process: it is not a child of the test's own
+/// `Command`, so `kill_on_drop` on that `Command` (or killing a `mati serve`
+/// wrapping it) never reaches it. Keep one of these alive for the scope that
+/// owns the scratch home; it shells out to `mati daemon stop` against that
+/// exact root on drop, so the daemon comes down no matter how the test exits.
+///
+/// Never point this at a developer's real `~/.mati` — it unconditionally
+/// stops whatever daemon answers for the given root.
+///
+/// Needs the same `cwd` the original commands ran with, not just the home
+/// override: the store root is `<home>/<slug>`, and the slug is derived from
+/// cwd. Pointing `mati daemon stop` at the wrong cwd computes a different
+/// slug and silently misses the daemon.
+pub struct DaemonGuard {
+    cwd: PathBuf,
+    env_key: &'static str,
+    env_val: PathBuf,
+}
+
+impl DaemonGuard {
+    /// For tests isolating via `MATI_HOME` (i.e. [`mati_home`] / [`isolate_mati_home`]).
+    pub fn for_mati_home(cwd: impl Into<PathBuf>, mati_home: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            env_key: "MATI_HOME",
+            env_val: mati_home.into(),
+        }
+    }
+
+    /// For tests isolating via `HOME` (mati falls back to `$HOME/.mati` when
+    /// `MATI_HOME` is unset) rather than setting `MATI_HOME` directly.
+    pub fn for_home(cwd: impl Into<PathBuf>, home: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            env_key: "HOME",
+            env_val: home.into(),
+        }
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_mati"))
+            .args(["daemon", "stop"])
+            .current_dir(&self.cwd)
+            .env(self.env_key, &self.env_val)
+            .output();
+    }
+}

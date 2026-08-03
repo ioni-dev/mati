@@ -21,6 +21,8 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+mod common;
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn mati_bin() -> PathBuf {
@@ -50,10 +52,17 @@ fn run(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> (String, String, 
 }
 
 /// Create a minimal git repo with one Rust file and one commit.
-/// Returns (repo_dir, home_dir) — both are TempDirs that must be kept alive.
-fn setup_repo() -> (TempDir, TempDir) {
+///
+/// Returns `(repo_dir, home_dir, _daemon_guard)`. All three must be kept
+/// alive: the tempdirs for the store isolation, the guard so the daemon that
+/// `mati init`/etc. spawn against `home_dir` (via `StoreProxy::open` ->
+/// `ensure_daemon`) gets stopped on drop instead of leaking. Guard must stay
+/// LAST in the returned tuple — locals drop in reverse order, so it stops the
+/// daemon before `repo_dir` (its cwd) is removed.
+fn setup_repo() -> (TempDir, TempDir, common::DaemonGuard) {
     let repo_dir = TempDir::new().expect("create repo dir");
     let home_dir = TempDir::new().expect("create home dir");
+    let daemon_guard = common::DaemonGuard::for_home(repo_dir.path(), home_dir.path());
     let repo = repo_dir.path();
 
     // git init + configure identity
@@ -123,7 +132,7 @@ edition = "2021"
         .output()
         .expect("git commit");
 
-    (repo_dir, home_dir)
+    (repo_dir, home_dir, daemon_guard)
 }
 
 /// Run `mati init --no-hooks` and return stdout.
@@ -245,7 +254,7 @@ fn help_subcommands_present() {
 #[test]
 fn init_next_steps_guidance() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let stdout = init_repo(&bin, repo_dir.path(), home_dir.path());
 
     // Project header
@@ -278,7 +287,7 @@ fn init_next_steps_guidance() {
 #[test]
 fn init_summary_has_candidate_categories() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let stdout = init_repo(&bin, repo_dir.path(), home_dir.path());
 
     // Layer 0 candidate categories
@@ -290,7 +299,7 @@ fn init_summary_has_candidate_categories() {
 #[test]
 fn init_codex_reports_platform_capability() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let stdout = init_repo_codex(&bin, repo_dir.path(), home_dir.path());
 
     assert_contains(&stdout, "integration:");
@@ -303,7 +312,7 @@ fn init_codex_reports_platform_capability() {
 #[test]
 fn init_autodetects_codex_without_forcing_claude() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let stdout = init_repo_autodetect_codex(&bin, repo_dir.path(), home_dir.path());
 
     assert_contains(&stdout, "integration:");
@@ -320,7 +329,7 @@ fn init_autodetects_codex_without_forcing_claude() {
 #[test]
 fn explain_output_structure() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(
@@ -347,7 +356,7 @@ fn explain_output_structure() {
 #[test]
 fn explain_todo_section() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(
@@ -366,7 +375,7 @@ fn explain_todo_section() {
 #[test]
 fn explain_missing_file_suggests_init() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, stderr, _ok) = run(
@@ -386,7 +395,7 @@ fn explain_missing_file_suggests_init() {
 #[test]
 fn diff_output_structure() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let repo = repo_dir.path();
     init_repo(&bin, repo, home_dir.path());
 
@@ -440,7 +449,7 @@ fn diff_output_structure() {
 #[test]
 fn diff_summary_line_format() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let repo = repo_dir.path();
     init_repo(&bin, repo, home_dir.path());
 
@@ -476,7 +485,7 @@ fn diff_summary_line_format() {
 #[test]
 fn status_dashboard_sections() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(&bin, repo_dir.path(), home_dir.path(), &["status"]);
@@ -499,7 +508,7 @@ fn status_dashboard_sections() {
 #[test]
 fn status_trust_section_with_unconfirmed() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(&bin, repo_dir.path(), home_dir.path(), &["status"]);
@@ -520,7 +529,7 @@ fn status_trust_section_with_unconfirmed() {
 #[test]
 fn repair_check_clean_state() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(
@@ -545,7 +554,7 @@ fn repair_check_clean_state() {
 #[test]
 fn repair_check_json_output() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(
@@ -616,7 +625,7 @@ fn repair_help_explains_semantics() {
 #[test]
 fn status_shows_codex_platform_mode() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     let repo = repo_dir.path();
     init_repo_codex(&bin, repo, home_dir.path());
 
@@ -671,7 +680,7 @@ fn diff_help_describes_premerge() {
 #[test]
 fn history_enforcement_empty_state_is_explicit() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     let (stdout, _stderr, ok) = run(
@@ -705,7 +714,7 @@ fn history_enforcement_empty_state_is_explicit() {
 #[test]
 fn history_enforcement_type_filter_accepts_documented_labels() {
     let bin = mati_bin();
-    let (repo_dir, home_dir) = setup_repo();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
     init_repo(&bin, repo_dir.path(), home_dir.path());
 
     for label in &[

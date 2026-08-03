@@ -33,6 +33,10 @@ fn git_in(dir: &Path, args: &[&str]) -> bool {
 fn search_finds_and_ranks_matching_records() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
+    // Panic-safety net: the explicit `daemon stop` at the end of this test is
+    // cleanup-only, so it never runs if an assertion above panics.
+    common::isolate_mati_home();
+    let _daemon_guard = common::DaemonGuard::for_mati_home(dir, common::mati_home());
 
     // A minimal git repo so `mati init` mines history cleanly.
     if !git_in(dir, &["init", "-q"]) {

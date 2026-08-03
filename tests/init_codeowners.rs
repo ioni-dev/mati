@@ -34,6 +34,11 @@ fn git(dir: &Path, args: &[&str]) -> bool {
 fn init_proposes_codeowners_candidate_idempotently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
+    // Panic-safety net: the explicit `daemon stop` calls below are a
+    // functional requirement (re-init needs the store lock released), not
+    // just cleanup, so a panic between them would still leak a daemon.
+    common::isolate_mati_home();
+    let _daemon_guard = common::DaemonGuard::for_mati_home(dir, common::mati_home());
     if !git(dir, &["init", "-q"]) {
         eprintln!("skip: git unavailable");
         return;
