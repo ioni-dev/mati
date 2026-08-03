@@ -71,7 +71,7 @@ enum Commands {
     Clusters(cli::clusters::ClustersArgs),
     /// Show knowledge health metrics
     Stats(cli::stats::StatsArgs),
-    /// Batch-enrich file records using Claude API (Layer 1)
+    /// Show how to run enrichment inside your active Claude Code or Codex session
     Enrich(cli::enrich::EnrichArgs),
     /// Add a quick developer note
     Note {

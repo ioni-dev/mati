@@ -669,9 +669,15 @@ pub async fn doc_capture(store: &Store, path: &str, content: &str) -> Result<()>
         None => return Ok(()),
     };
 
-    // Only update when the record's current source is static analysis
-    // (Layer 0 stub) — don't overwrite developer-manual or higher-quality records.
-    if record.source != RecordSource::StaticAnalysis {
+    // Update only records nobody has manually curated: a Layer 0 stub, or a
+    // prior doc-capture pass. Never overwrite DeveloperManual, ClaudeEnrich,
+    // or Import — those reflect a human or an enrichment pass, not this
+    // heuristic scan. Excluding SessionHook here would make this function's
+    // own prior write permanently block every later re-capture of the file.
+    if !matches!(
+        record.source,
+        RecordSource::StaticAnalysis | RecordSource::SessionHook
+    ) {
         return Ok(());
     }
 
@@ -1393,5 +1399,120 @@ mod tests {
             .await
             .expect("scan after");
         assert!(after.is_empty(), "all receipts should be gone after clear");
+    }
+
+    // ── doc_capture ───────────────────────────────────────────────────────────
+
+    /// Regression: before the fix, the update gate checked
+    /// `record.source != RecordSource::StaticAnalysis`, so the very first
+    /// capture's `SessionHook` stamp made every later capture on the same
+    /// file a permanent no-op — 19 records in the live store were locked
+    /// this way. A second capture with different content must still refresh
+    /// the purpose while the record stays `SessionHook`-sourced.
+    #[tokio::test]
+    async fn doc_capture_refreshes_a_prior_session_hook_capture() {
+        let (_dir, store) = temp_store().await;
+
+        let mut record = file_record_at("file:src/lib.rs", 100);
+        let fr = FileRecord::layer0_stub(
+            "src/lib.rs",
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+            0,
+            None,
+            false,
+            0,
+            1,
+        );
+        record.payload = serde_json::to_value(&fr).ok();
+        store.put("file:src/lib.rs", &record).await.expect("seed");
+
+        doc_capture(
+            &store,
+            "src/lib.rs",
+            "//! First purpose.
+fn main() {}",
+        )
+        .await
+        .expect("first capture");
+        let after_first = store
+            .get("file:src/lib.rs")
+            .await
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(after_first.source, RecordSource::SessionHook);
+        let fr1: FileRecord = after_first.payload_as().expect("payload");
+        assert_eq!(fr1.purpose, "First purpose.");
+
+        doc_capture(
+            &store,
+            "src/lib.rs",
+            "//! Updated purpose.
+fn main() {}",
+        )
+        .await
+        .expect("second capture");
+        let after_second = store
+            .get("file:src/lib.rs")
+            .await
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(after_second.source, RecordSource::SessionHook);
+        let fr2: FileRecord = after_second.payload_as().expect("payload");
+        assert_eq!(
+            fr2.purpose, "Updated purpose.",
+            "doc-capture must refresh a SessionHook-sourced record, not ratchet shut"
+        );
+    }
+
+    /// The gate must still protect developer- and enrichment-authored records
+    /// from being clobbered by the heuristic doc-comment scan.
+    #[tokio::test]
+    async fn doc_capture_never_overwrites_developer_manual() {
+        let (_dir, store) = temp_store().await;
+
+        let mut record = file_record_at("file:src/manual.rs", 100);
+        record.source = RecordSource::DeveloperManual;
+        let fr = FileRecord::layer0_stub(
+            "src/manual.rs",
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+            0,
+            None,
+            false,
+            0,
+            1,
+        );
+        record.payload = serde_json::to_value(&fr).ok();
+        store
+            .put("file:src/manual.rs", &record)
+            .await
+            .expect("seed");
+
+        doc_capture(
+            &store,
+            "src/manual.rs",
+            "//! Should not apply.
+fn main() {}",
+        )
+        .await
+        .expect("capture");
+        let after = store
+            .get("file:src/manual.rs")
+            .await
+            .expect("get")
+            .expect("record exists");
+        assert_eq!(after.source, RecordSource::DeveloperManual);
+        let fr_after: FileRecord = after.payload_as().expect("payload");
+        assert_eq!(
+            fr_after.purpose, "",
+            "developer-curated purpose must not be overwritten by doc-capture"
+        );
     }
 }

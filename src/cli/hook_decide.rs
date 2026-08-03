@@ -711,6 +711,19 @@ fn merge_policy_result(
 
 // ── Path extraction ─────────────────────────────────────────────────────────
 
+/// Reject `extract_file_path` results that cannot be a file path: shell
+/// redirection fragments (`2>/dev/null`, `>>`, `2>&1`) or a multi-line blob
+/// (the classifier grabbed an entire quoted command, not one argument).
+/// These pollute the `analytics:miss_*` aggregate that feeds `mati status`'s
+/// hit rate. Only rejects; never widens what counts as a real path.
+fn looks_like_file_path(s: &str) -> bool {
+    if s.is_empty() || s.contains('\n') || s.contains('\r') {
+        return false;
+    }
+    let trimmed = s.trim_start_matches(|c: char| c.is_ascii_digit());
+    !trimmed.starts_with('>') && !trimmed.starts_with('<') && !trimmed.starts_with('|')
+}
+
 fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<String> {
     match variant {
         HookVariant::ClaudePreRead | HookVariant::ClaudePreEdit => {
@@ -734,7 +747,7 @@ fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<Strin
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())?;
             let class = decide::classify_command(cmd)?;
-            decide::extract_file_path(cmd, class)
+            decide::extract_file_path(cmd, class).filter(|p| looks_like_file_path(p))
         }
         // apply_patch is multi-file and handled by `run_apply_patch` before the
         // single-path pipeline; never reaches here.
@@ -2431,6 +2444,43 @@ mod tests {
         assert_eq!(
             extract_path(&input, HookVariant::CodexPreBash),
             Some("src/main.rs".into())
+        );
+    }
+
+    // ── extract_path: reject non-path shell tokens (miss aggregate pollution) ──
+    //
+    // Regression for live `analytics:miss_*` entries like
+    // `"file:2>/dev/null": 7` and `"file:>>": 3` — the GrepLike extractor
+    // took the last non-flag token, which can be a redirect fragment rather
+    // than a real path. These must now be rejected as "not a file read op",
+    // matching section 10.2's fallthrough for non-file commands.
+
+    #[test]
+    fn extract_path_rejects_stderr_redirect() {
+        let input = json!({"tool_input": {"command": "grep pattern file.rs 2>/dev/null"}});
+        assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+    }
+
+    #[test]
+    fn extract_path_rejects_bare_append_redirect() {
+        let input = json!({"tool_input": {"command": "grep pattern file.txt >>"}});
+        assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+    }
+
+    #[test]
+    fn extract_path_rejects_multiline_quoted_blob() {
+        let input = json!({"tool_input": {"command": "grep -n \"pattern\nacross lines\""}});
+        assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+    }
+
+    #[test]
+    fn extract_path_still_accepts_real_path_with_digits() {
+        // Guard against over-rejection: a real filename that starts with a
+        // digit must not be caught by the redirect-fragment filter.
+        let input = json!({"tool_input": {"command": "cat 2024-report.txt"}});
+        assert_eq!(
+            extract_path(&input, HookVariant::CodexPreBash),
+            Some("2024-report.txt".into())
         );
     }
 
