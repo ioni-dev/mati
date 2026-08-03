@@ -152,14 +152,18 @@ After the gamma refactor, mati runs as two separate processes.
 
 **Sandboxed shells cannot reach the socket, and that is not a mati fault.** An AI agent's shell tool may run inside an OS sandbox (macOS Seatbelt) that blocks connecting to Unix domain sockets. Hooks and `mati serve` run outside that sandbox and are unaffected, but `mati` CLI commands invoked from the sandboxed shell get `EACCES` on the socket connect. The store, daemon, and MCP tools all work; only the sandboxed CLI is blocked, and it says so (`DaemonResult::PermissionDenied` surfaces an accurate message rather than a spurious lock or busy error). An agent should read through the MCP tools, or run the command in an unsandboxed shell.
 
+**The daemon logs to `<root>/daemon.log`.** It is detached, so its stderr goes wherever the spawner pointed it — `~/.mati/daemon_start.log` under `ensure_daemon`, `/dev/null` otherwise — at a `warn` default that filters out everything worth reading. `mati daemon start` therefore redirects its own tracing to a per-store `daemon.log` at INFO (mati targets only), rotating at 1 MiB with one previous generation kept, so lifecycle and outcome lines (`mati daemon listening`, `staleness analysis complete scanned=… updated=…`) are readable without setting `RUST_LOG`. `mati daemon status` prints the path. Local file, no network, not a store record.
+
 ### 4.1 `mati daemon stop` semantics
 
 | Flag                    | Effect                                                                                         |
 | ----------------------- | ---------------------------------------------------------------------------------------------- |
 | default                 | Sends SIGTERM, then escalates to SIGKILL on timeout. Serve proxies auto-respawn transparently. |
 | `--force`               | Sends SIGKILL directly, with no SIGTERM grace. Serve proxies still auto-respawn.               |
-| `--include-mcp`         | Also kills all `mati serve` processes. MCP sessions die.                                       |
-| `--force --include-mcp` | Sends SIGKILL to the daemon, then SIGKILL to all serves.                                       |
+| `--include-mcp`         | Also kills the `mati serve` processes attached to this store. Their MCP sessions die.          |
+| `--force --include-mcp` | Sends SIGKILL to the daemon, then SIGKILL to this store's serves.                              |
+
+`--include-mcp` is scoped to the target store. `pgrep -f "mati serve"` enumerates candidates, but a proxy's command line is a bare `mati serve`, its CWD may be `/` (Codex), and it holds no long-lived socket — nothing on the process identifies the store. The association only exists where the proxy wrote it: `serve_start pid=<n> owner=proxy` in that store's `lifecycle.log`. The kill list is the intersection of that record with the running set, and skipped processes are reported. Under-inclusive on purpose — a truncated log means a proxy survives, which is the right way to fail.
 
 ### 4.2 State-aware daemon readiness
 

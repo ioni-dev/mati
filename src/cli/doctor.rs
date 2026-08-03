@@ -12,7 +12,7 @@
 //! already running the same logic on its side.
 
 use std::io::{self, IsTerminal};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::Args;
@@ -447,6 +447,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // at the end, so an index a consumer already relies on never moves. Adding
     // this one before `network` would have shifted it from 13 to 14.
     checks.push(collect_policy_check(cwd).await);
+    checks.push(collect_binary_parity_check(cwd, root));
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -823,6 +824,112 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
     }
 }
 
+/// Do the hooks and the daemon run the same mati build?
+///
+/// They resolve independently. `mati init` pins `.claude/hooks/mati` (and the
+/// Codex equivalent) to the absolute path of whatever executable ran it, while
+/// `.mcp.json` registers a bare `mati` off PATH. On a normal install both are
+/// `~/.cargo/bin/mati` and the wrapper's promise holds. Run `mati init` from a
+/// dev build and the hooks are pinned to `target/debug/mati` instead — then
+/// rebuilding one and not the other puts a stale client against a live daemon.
+///
+/// That failure is silent: hooks fail open on a protocol mismatch (P9), so the
+/// symptom is under-enforcement, not an error. This check is the detection —
+/// `Warn`, never `Fail`, because a version skew is a diagnosis, not a broken
+/// pipeline, and doctor's exit code gates CI.
+fn collect_binary_parity_check(cwd: &Path, root: &Path) -> CheckResult {
+    let check = |name: &'static str, status, detail: String, fix| CheckResult {
+        section: "enforcement",
+        name,
+        status,
+        detail,
+        fix,
+    };
+
+    let Some(wrapper) = hook_wrapper_path(cwd) else {
+        return check(
+            "binary parity",
+            Status::Info,
+            "no hook wrapper installed".into(),
+            None,
+        );
+    };
+    let Some(hook_version) = binary_version(&wrapper) else {
+        return check(
+            "binary parity",
+            Status::Warn,
+            format!(
+                "hook wrapper {} did not report a version",
+                wrapper.display()
+            ),
+            Some("mati hooks"),
+        );
+    };
+
+    // The running daemon is authoritative — it is the process hooks talk to.
+    // With none running, PATH is what the next `mati serve` will resolve.
+    let (server_version, server_label) = match mati_core::mcp::metadata::read_metadata(root)
+        .map(|m| m.version)
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => (v, "daemon"),
+        None => match binary_version(Path::new("mati")) {
+            Some(v) => (v, "mati on PATH"),
+            None => {
+                return check(
+                    "binary parity",
+                    Status::Warn,
+                    "no running daemon and no mati on PATH to compare against".into(),
+                    Some("mati daemon start"),
+                )
+            }
+        },
+    };
+
+    if hook_version == server_version {
+        check(
+            "binary parity",
+            Status::Pass,
+            format!("hooks and {server_label} both {hook_version}"),
+            None,
+        )
+    } else {
+        check(
+            "binary parity",
+            Status::Warn,
+            format!(
+                "hooks run {hook_version} ({}), {server_label} runs {server_version} — \
+                 hooks fail open on a protocol mismatch, so enforcement can silently degrade",
+                wrapper.display()
+            ),
+            Some("mati init  (re-pins the hook wrapper to this binary)"),
+        )
+    }
+}
+
+/// The binary wrapper a host's hooks exec, if one is installed.
+fn hook_wrapper_path(cwd: &Path) -> Option<PathBuf> {
+    [".claude/hooks/mati", ".codex/hooks/mati"]
+        .iter()
+        .map(|p| cwd.join(p))
+        .find(|p| p.exists())
+}
+
+/// `<bin> --version` → the version token, or `None` if it cannot be run.
+fn binary_version(bin: &Path) -> Option<String> {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .last()
+        .map(str::to_owned)
+}
+
 /// Content-drift clause appended to the freshness detail.
 ///
 /// Folded into the existing `knowledge/freshness` check rather than added as
@@ -1187,6 +1294,75 @@ mod tests {
         }
     }
 
+    // ── binary parity ───────────────────────────────────────────────────
+
+    fn fake_wrapper(cwd: &Path, version: &str) {
+        let dir = cwd.join(".claude/hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mati");
+        std::fs::write(&path, format!("#!/bin/sh\necho 'mati {version}'\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn fake_daemon(root: &Path, version: &str) {
+        let mut meta = mati_core::mcp::metadata::DaemonMetadata::new(
+            mati_core::mcp::metadata::DaemonOwner::Daemon,
+        );
+        meta.version = version.to_string();
+        mati_core::mcp::metadata::publish_metadata(root, &meta).unwrap();
+    }
+
+    /// The hook binary and the daemon binary resolve independently, and a skew
+    /// between them degrades enforcement *silently* — hooks fail open on a
+    /// protocol mismatch. Nothing used to compare them.
+    #[test]
+    fn binary_parity_names_a_version_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_wrapper(dir.path(), "0.1.3");
+        fake_daemon(dir.path(), "0.2.0");
+
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Warn));
+        assert!(result.detail.contains("0.1.3"), "{}", result.detail);
+        assert!(result.detail.contains("0.2.0"), "{}", result.detail);
+    }
+
+    #[test]
+    fn binary_parity_passes_when_they_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_wrapper(dir.path(), "0.1.3");
+        fake_daemon(dir.path(), "0.1.3");
+
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Pass), "{}", result.detail);
+    }
+
+    /// A project with no hooks installed is not a mismatch.
+    #[test]
+    fn binary_parity_is_informational_without_a_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Info));
+    }
+
+    /// A `mati.pid` from a binary predating the version field must still parse.
+    #[test]
+    fn metadata_without_a_version_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mati.pid"),
+            r#"{"pid":42,"session":"00000000-0000-0000-0000-000000000000","owner":"daemon"}"#,
+        )
+        .unwrap();
+        let meta = mati_core::mcp::metadata::read_metadata(dir.path()).expect("must parse");
+        assert_eq!(meta.pid, 42);
+        assert!(meta.version.is_empty());
+    }
+
     /// Schema-stability invariant for `mati doctor --json`:
     /// every scenario (no-daemon-no-store, no-daemon-with-store,
     /// daemon-running, daemon-unresponsive, store-open-failed) must emit
@@ -1195,7 +1371,8 @@ mod tests {
     /// that order. CI consumers parse the report by name and by index, and a
     /// `version: 2` schema must keep both stable.
     ///
-    /// `attestation/network` holds index 13 and `enforcement/policy` index 14.
+    /// `attestation/network` holds index 13, `enforcement/policy` index 14, and
+    /// `enforcement/binary parity` index 15.
     /// Policy was added later (75bec3a) and originally landed before `network`,
     /// which pushed a published index. New checks append at the end so an
     /// index a consumer already relies on never moves.
@@ -1230,13 +1407,14 @@ mod tests {
                 ("knowledge", "freshness"),
                 ("attestation", "network"),
                 ("enforcement", "policy"),
+                ("enforcement", "binary parity"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
              ping → dirty_marker → drift → chain → freshness → network → policy \
-             (new checks append at the end so an index a consumer already \
-             relies on never moves)"
+             → binary parity (new checks append at the end so an index a \
+             consumer already relies on never moves)"
         );
         assert_eq!(report.version, 2);
     }
