@@ -361,6 +361,14 @@ fn effective_command(cmd: &str) -> String {
     out
 }
 
+/// Fuzz-only reexport of the private [`effective_command`]. `cargo fuzz`
+/// sets `--cfg fuzzing` automatically, so this compiles only under
+/// `cargo fuzz build`/`run` and never in a normal build.
+#[cfg(fuzzing)]
+pub fn effective_command_for_fuzzing(cmd: &str) -> String {
+    effective_command(cmd)
+}
+
 /// Classify a bash command string. Returns `None` for non-file-read commands.
 pub fn classify_command(cmd: &str) -> Option<CommandClass> {
     let eff = effective_command(cmd);

@@ -1,0 +1,11 @@
+*** Begin Patch
+*** Update File: src/a.rs
+@@ ...
+ context
+-old
++new
+*** Add File: src/b.rs
++contents
+*** Delete File: src/c.rs
+*** Move to: src/a_renamed.rs
+*** End Patch

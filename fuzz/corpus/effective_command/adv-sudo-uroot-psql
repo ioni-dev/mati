@@ -1,0 +1,1 @@
+sudo -u root psql -h db.prod.internal -c "select 1"

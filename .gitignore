@@ -4,6 +4,9 @@
 .mati/
 
 /target/
+fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/*/crash-*
 .DS_Store
 *.swp
 *.swo

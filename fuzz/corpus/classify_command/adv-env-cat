@@ -1,0 +1,1 @@
+env LOG=1 cat src/secret.rs
