@@ -385,6 +385,12 @@ struct LsFilesCache {
     limit: usize,
     /// Total file records in the store (shown in the footer even when truncated).
     total: usize,
+    /// Active file records excluded because `StalenessTier::Tombstone` — the
+    /// file no longer exists on disk (see `health::staleness`'s `FileDeleted`
+    /// hard override). Hidden from the table rather than shown as a dead row
+    /// mixed in with live ones; `mati stale` is where a tombstoned record's
+    /// existence and reason are surfaced in full.
+    excluded_deleted: usize,
     rows: Vec<LsFileRow>,
 }
 
@@ -463,13 +469,58 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
 
 const LS_FILES_CACHE_KEY: &str = "analytics:ls_files_cache";
 
-async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<()> {
+/// Build a display row for a `file:*` record, or `None` if it should be
+/// excluded from `mati ls files`.
+///
+/// Excludes `StalenessTier::Tombstone` — the `FileDeleted` hard override
+/// (`health::staleness::compute_staleness`) — because the path no longer
+/// exists on disk and enforcement already treats the record as inert; a
+/// dead row mixed into a live listing trains the reader to skim past all of
+/// them. Excluded, not hidden outright: `mati stale` is the existing place
+/// an inert staleness tier is surfaced with a reason and an impact label,
+/// and `ls_files` reports how many rows it left out for the caller to look
+/// there.
+fn ls_file_row(r: &Record) -> Option<LsFileRow> {
+    if r.staleness.tier == StalenessTier::Tombstone {
+        return None;
+    }
+    let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
+    let (purpose, entry_count, is_hotspot) = match r.payload_as::<FileRecord>() {
+        Some(fr) => {
+            let purpose = if fr.purpose.is_empty() {
+                "(pending enrichment)".to_string()
+            } else {
+                truncate(&fr.purpose, 40)
+            };
+            (purpose, fr.entry_points.len(), fr.is_hotspot)
+        }
+        None => {
+            let purpose = if r.value.is_empty() {
+                "(pending enrichment)".to_string()
+            } else {
+                truncate(&r.value, 40)
+            };
+            (purpose, 0, false)
+        }
+    };
+    Some(LsFileRow {
+        path,
+        purpose,
+        entry_count,
+        confidence: r.confidence.value,
+        quality: r.quality.value,
+        is_hotspot,
+    })
+}
+
+async fn ls_files(store: &StoreProxy, use_color: bool, limit: usize) -> Result<()> {
     // ── Cache check ───────────────────────────────────────────────────────
     let current_seq = store.read_write_seq();
     if let Some(cached) = store.get(LS_FILES_CACHE_KEY).await? {
         if let Some(entry) = cached.payload_as::<LsFilesCache>() {
             if entry.write_seq == current_seq && entry.limit == limit {
                 render_ls_files_table(&entry.rows, entry.total, limit);
+                print_excluded_deleted_note(entry.excluded_deleted, use_color);
                 return Ok(());
             }
         }
@@ -483,38 +534,16 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
     let mut first = true;
     let mut rows: Vec<LsFileRow> = Vec::new();
     let mut printed_count: usize = 0;
+    let mut excluded_deleted: usize = 0;
 
     let all_records = store.scan_prefix("file:").await?;
     for r in &all_records {
         if !matches!(r.lifecycle, RecordLifecycle::Active) {
             continue;
         }
-        let path = r.key.strip_prefix("file:").unwrap_or(&r.key).to_string();
-        let (purpose, entry_count, is_hotspot) = match r.payload_as::<FileRecord>() {
-            Some(fr) => {
-                let purpose = if fr.purpose.is_empty() {
-                    "(pending enrichment)".to_string()
-                } else {
-                    truncate(&fr.purpose, 40)
-                };
-                (purpose, fr.entry_points.len(), fr.is_hotspot)
-            }
-            None => {
-                let purpose = if r.value.is_empty() {
-                    "(pending enrichment)".to_string()
-                } else {
-                    truncate(&r.value, 40)
-                };
-                (purpose, 0, false)
-            }
-        };
-        let row = LsFileRow {
-            path,
-            purpose,
-            entry_count,
-            confidence: r.confidence.value,
-            quality: r.quality.value,
-            is_hotspot,
+        let Some(row) = ls_file_row(r) else {
+            excluded_deleted += 1;
+            continue;
         };
         if limit == 0 || printed_count < limit {
             if first {
@@ -528,7 +557,12 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
     }
 
     if rows.is_empty() {
-        println!("No file records found.");
+        if excluded_deleted == 0 {
+            println!("No file records found.");
+        } else {
+            println!("No file records found.");
+            print_excluded_deleted_note(excluded_deleted, use_color);
+        }
         return Ok(());
     }
 
@@ -541,6 +575,7 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
     } else {
         println!("  {} file records", total);
     }
+    print_excluded_deleted_note(excluded_deleted, use_color);
 
     // ── Write cache (sorted, best-effort) ────────────────────────────────
     rows.sort_by(|a, b| {
@@ -557,6 +592,7 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
         write_seq: current_seq,
         limit,
         total,
+        excluded_deleted,
         rows: display_rows,
     };
     let mut record = ls_cache_record(LS_FILES_CACHE_KEY, String::new());
@@ -570,6 +606,29 @@ async fn ls_files(store: &StoreProxy, _use_color: bool, limit: usize) -> Result<
 // PATH is left-truncated to preserve the filename when paths are long.
 const COL_PATH: usize = 42;
 const COL_PURPOSE: usize = 38;
+
+/// Tell the reader why the file count doesn't match what's on disk, rather
+/// than letting `excluded_deleted` rows disappear without a trace.
+fn print_excluded_deleted_note(excluded_deleted: usize, use_color: bool) {
+    if excluded_deleted == 0 {
+        return;
+    }
+    let plural = if excluded_deleted == 1 { "" } else { "s" };
+    if use_color {
+        println!(
+            "  {}{} file record{} excluded — file deleted on disk. See `mati stale`.{}",
+            colors::RED,
+            excluded_deleted,
+            plural,
+            colors::RESET
+        );
+    } else {
+        println!(
+            "  {excluded_deleted} file record{plural} excluded — file deleted on disk. \
+             See `mati stale`."
+        );
+    }
+}
 
 /// Print the fixed-width header for the streaming cold-path display.
 fn print_ls_files_stream_header() {
@@ -1951,5 +2010,32 @@ mod tests {
         // skip == 50, so .skip(50).collect() on 0..50 returns empty.
         let kept: Vec<usize> = (0..total).skip(skip).collect();
         assert!(kept.is_empty(), "limit=0 returns empty");
+    }
+
+    // ── ls_file_row ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ls_file_row_shows_a_live_file_record() {
+        let record = Record::layer0_file_stub("file:src/live.rs", uuid::Uuid::nil(), 1, 0);
+        assert!(
+            ls_file_row(&record).is_some(),
+            "a record with no staleness signal must appear in `mati ls files`"
+        );
+    }
+
+    /// `mati ls files` must not mix in a row for a `file:*` record whose
+    /// path was deleted from disk (`StalenessTier::Tombstone`, set by the
+    /// `FileDeleted` hard override in `health::staleness::compute_staleness`).
+    /// The gotcha this closes: eight such records showed up as ordinary
+    /// rows, indistinguishable from files that are actually gated.
+    #[test]
+    fn ls_file_row_excludes_a_deleted_file_record() {
+        let mut record = Record::layer0_file_stub("file:src/dead.rs", uuid::Uuid::nil(), 1, 0);
+        record.staleness.tier = StalenessTier::Tombstone;
+        record.staleness.value = 1.0;
+        assert!(
+            ls_file_row(&record).is_none(),
+            "a Tombstone-tier record must be excluded from `mati ls files`"
+        );
     }
 }
