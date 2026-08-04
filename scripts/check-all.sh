@@ -3,30 +3,36 @@
 # Catches fmt drift, clippy violations, broken intra-doc links, and
 # feature-gate rot before push instead of after.
 #
-# Does NOT run the test suites — those take much longer. Run `cargo test`
-# separately if you want full coverage.
+# Does NOT run the main test suites — those take much longer. Run
+# `cargo nextest run --lib` separately for full coverage. The eval corpus is
+# the one exception: pure functions, no daemon, no store.
 #
 # Usage:
 #   scripts/check-all.sh           # run every gate, stop on first failure
 #   scripts/check-all.sh --keep    # run every gate, report at the end
 #   scripts/check-all.sh --smoke   # also run the policy engine smoke test
+#   scripts/check-all.sh --fast    # skip `cargo bench --no-run` (~11 of ~15 min)
 #
-# `--smoke` is opt-in because it builds the binary, spawns a daemon, and takes
-# roughly a minute, which would break this script's fast-by-default contract.
-# It skips itself where Unix domain sockets are unavailable.
+# A full run is ~15 min, dominated by the bench compile; `--fast` drops it to
+# ~3. `--smoke` is opt-in on top of that because it builds the binary and
+# spawns a daemon. It skips itself where Unix domain sockets are unavailable.
 #
 # Mirrors .github/workflows/ci.yml as of:
 #   - check: fmt, clippy --locked, check --locked, no-default-features, doc
 #   - benches compile (cargo bench --no-run)
+#   - eval-corpus: enforcement eval corpus regression test
+#   - supply-chain: zero-network attestation (no HTTP-client crate)
 
 set -uo pipefail
 
 KEEP_GOING=false
 RUN_SMOKE=false
+RUN_FAST=false
 for arg in "$@"; do
     case "$arg" in
         --keep)  KEEP_GOING=true ;;
         --smoke) RUN_SMOKE=true ;;
+        --fast)  RUN_FAST=true ;;
     esac
 done
 
@@ -48,12 +54,34 @@ run_check() {
     fi
 }
 
+# Mirrors the "Zero-network attestation" step in the supply-chain job
+# (ci.yml): the default build must link no HTTP-client crate.
+zero_network_check() {
+    local net
+    net=$(cargo tree --no-default-features --edges normal --prefix none --format '{p}' \
+          | awk '{print $1}' | sort -u \
+          | grep -iE '^(reqwest|hyper|hyper-util|hyper-rustls|hyper-tls|h2|ureq|isahc|surf|attohttpc|curl|curl-sys)$' \
+          || true)
+    if [ -n "$net" ]; then
+        echo "network-capable crate(s) in the DEFAULT (enforcement) build — violates the zero-network invariant (CLAUDE.md):"
+        echo "$net"
+        return 1
+    fi
+}
+
 run_check "cargo fmt --check"               cargo fmt --all -- --check
 run_check "cargo clippy --locked"           cargo clippy --locked --all-targets -- -D warnings
 run_check "cargo check --locked"            cargo check --locked --all-targets
 run_check "cargo check --no-default-features" cargo check --locked --no-default-features --all-targets
 run_check "cargo doc (-D warnings)"         cargo doc --locked --no-deps --all-features
-run_check "cargo bench --no-run"            cargo bench --locked --no-run
+if [[ "$RUN_FAST" == "true" ]]; then
+    printf '\n── cargo bench --no-run ────────────────────\n'
+    printf '  skipped: --fast (this is not a full run).\n'
+else
+    run_check "cargo bench --no-run"        cargo bench --locked --no-run
+fi
+run_check "eval / regression corpus"        cargo test --locked --test eval_corpus -- --nocapture
+run_check "zero-network attestation"        zero_network_check
 
 if [[ "$RUN_SMOKE" == "true" ]]; then
     printf '\n── policy engine smoke ─────────────────────\n'
@@ -72,7 +100,11 @@ fi
 
 printf '\n'
 if [[ ${#FAILED[@]} -eq 0 ]]; then
-    printf '✓ All CI gates pass locally.\n'
+    if [[ "$RUN_FAST" == "true" ]]; then
+        printf '✓ All CI gates pass locally (--fast: bench compile skipped).\n'
+    else
+        printf '✓ All CI gates pass locally.\n'
+    fi
     exit 0
 else
     printf '✗ %d gate(s) failed:\n' "${#FAILED[@]}" >&2

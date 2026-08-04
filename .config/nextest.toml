@@ -117,6 +117,13 @@ hook-compliance = { max-threads = 2 }
 # pressure on weaker hardware.
 cli-daemon = { max-threads = 1 }
 
+# Every `tests/*.rs` integration test spawns the real `mati` binary, and
+# each spawn calls `ensure_daemon`. Unbounded, 22 integration binaries
+# contend on daemon startup and blow past its 15s `Wedged` threshold —
+# this is what produced the `TRY 1 FAIL` retries under `--all-targets`.
+# Capping determinism over wall-clock speed on purpose.
+cli-integration = { max-threads = 2 }
+
 # ─── group assignments ───────────────────────────────────────────────────
 #
 # Nextest requires per-profile override blocks. Define once for each
@@ -134,6 +141,10 @@ test-group = 'hook-compliance'
 filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
+[[profile.default.overrides]]
+filter = 'kind(test)'
+test-group = 'cli-integration'
+
 [[profile.ci.overrides]]
 filter = 'test(/^mcp::/)'
 test-group = 'mcp'
@@ -146,6 +157,10 @@ test-group = 'hook-compliance'
 filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
+[[profile.ci.overrides]]
+filter = 'kind(test)'
+test-group = 'cli-integration'
+
 [[profile.stress.overrides]]
 filter = 'test(/^mcp::/)'
 test-group = 'mcp'
@@ -157,3 +172,7 @@ test-group = 'hook-compliance'
 [[profile.stress.overrides]]
 filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
+
+[[profile.stress.overrides]]
+filter = 'kind(test)'
+test-group = 'cli-integration'

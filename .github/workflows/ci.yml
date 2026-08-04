@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,11 +68,12 @@ jobs:
     # SKIPPED ON PULL REQUESTS: this job takes >15min on cold cache and
     # blocks PR feedback. It still runs on every push to main so coverage
     # is preserved after merge. To re-enable for PRs, remove the `if:` line.
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS is dispatch-only: 10x runner cost vs Linux.
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -125,11 +127,11 @@ jobs:
     # SKIPPED ON PULL REQUESTS: subprocess tests are >15min on cold cache.
     # Runs on push to main only. To re-enable for PRs, remove the `if:` line.
     name: Ignored integration tests (${{ matrix.os }})
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       # Full history, not the default shallow (fetch-depth: 1) clone:
