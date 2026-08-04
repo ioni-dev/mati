@@ -256,6 +256,38 @@ mod tests {
     }
 
     #[test]
+    fn resolution_is_deterministic_across_fresh_indexes() {
+        let dir = TempDir::new().unwrap();
+        let files = [
+            "main.go",
+            "pkg/alpha.go",
+            "pkg/beta.go",
+            "pkg/gamma.go",
+            "pkg/package_test.go",
+        ];
+        setup_go_project(&dir, "github.com/acme/project", &files);
+
+        let resolved: Vec<Option<String>> = (0..64)
+            .map(|_| {
+                let mut paths = vec!["go.mod".to_string()];
+                paths.extend(files.iter().map(|path| (*path).to_string()));
+                let file_index = FileIndex::new_with_root(dir.path().to_path_buf(), paths);
+                GoResolver.resolve(
+                    &import("github.com/acme/project/pkg"),
+                    "main.go",
+                    &file_index,
+                )
+            })
+            .collect();
+
+        assert!(
+            resolved.windows(2).all(|pair| pair[0] == pair[1]),
+            "identical Go imports resolved to different targets: {resolved:?}"
+        );
+        assert_eq!(resolved[0].as_deref(), Some("pkg/alpha.go"));
+    }
+
+    #[test]
     fn rejects_stdlib_import() {
         let dir = TempDir::new().unwrap();
         let file_index = setup_go_project(&dir, "github.com/acme/project", &["main.go"]);
