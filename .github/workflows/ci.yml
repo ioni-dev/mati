@@ -162,9 +162,15 @@ jobs:
         #     instead of the clean idle-wait -> SIGTERM path.
         #   - metrics_snapshot_reflects_dispatch_traffic: queries the metrics
         #     snapshot before it is initialized -> `version: None`.
+        # EXCLUDED — `real_world_verification` clones external repos over the
+        # network. That is a dependency on GitHub being up and on CI minutes
+        # spent fetching, neither of which tells us anything about mati. Run
+        # them locally: `cargo nextest run --run-ignored only -E
+        # 'binary(real_world_verification)'`.
+        #
         # `not kind(bench)` is restated so the filterset is self-contained
         # regardless of how `-E` composes with the profile default-filter.
-        run: cargo nextest run --locked --all-targets --profile ci --run-ignored only --test-threads 1 -E 'not kind(bench) and not test(serve_exits_cleanly_on_sigterm_after_client_disconnect) and not test(metrics_snapshot_reflects_dispatch_traffic)'
+        run: cargo nextest run --locked --all-targets --profile ci --run-ignored only --test-threads 1 -E 'not kind(bench) and not binary(real_world_verification) and not test(serve_exits_cleanly_on_sigterm_after_client_disconnect) and not test(metrics_snapshot_reflects_dispatch_traffic)'
 
   benches:
     # Benches are not run for wall-time (criterion regressions need a
