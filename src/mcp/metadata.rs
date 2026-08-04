@@ -754,10 +754,15 @@ const LIFECYCLE_FILENAME: &str = "lifecycle.log";
 
 /// Maximum number of lines retained in `lifecycle.log`. Trimmed at
 /// `install_panic_hook` time (single-writer window: we hold the kernel
-/// flock, so no concurrent daemon can race the rotation). At ~150 bytes
-/// per line, 10k lines ≈ 1.5 MB — enough to retain a year of normal
-/// lifecycle events while bounding growth in pathological respawn loops.
-const MAX_LIFECYCLE_LINES: usize = 10_000;
+/// flock, so no concurrent daemon can race the rotation), and again on
+/// every idle-check tick of a long-running daemon (`cli::daemon`'s
+/// `IDLE_CHECK_INTERVAL_SECS` loop) — a daemon kept alive by continuous
+/// use never restarts, and every `mati serve` proxy it hands off to also
+/// appends `serve_start`/`serve_shutdown` lines, so the startup-only trim
+/// alone does not bound growth. At ~150 bytes per line, 10k lines ≈ 1.5 MB
+/// — enough to retain a year of normal lifecycle events while bounding
+/// growth in pathological respawn loops.
+pub const MAX_LIFECYCLE_LINES: usize = 10_000;
 
 /// Hard ceiling on the byte size of `lifecycle.log` we will read into
 /// memory at startup. The legitimate cap (10k lines × ~150 B ≈ 1.5 MB)
@@ -782,7 +787,15 @@ const LIFECYCLE_TRIM_MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 /// without being read. This protects startup from OOM on a pathological
 /// log (P9). The legitimate cap is ~1.5 MB so the threshold is not hit
 /// under any normal operation.
-fn trim_lifecycle_log(root: &Path, max_lines: usize) {
+///
+/// Safe to call from a steady-state daemon, not only at startup: the
+/// tmp+rename swap changes `lifecycle.log`'s inode, which would drop
+/// events out from under a concurrent `wait_for_ready` tail if one were
+/// running — but a tail only exists during the narrow spawn window, and a
+/// daemon calling this from its own idle-check loop is by definition long
+/// past that window (its own readiness event already fired, and any peer
+/// sentinel a fresh spawn would look for has long since expired).
+pub fn trim_lifecycle_log(root: &Path, max_lines: usize) {
     let path = root.join(LIFECYCLE_FILENAME);
 
     // Size guard: refuse to read pathological files into memory. Truncate
