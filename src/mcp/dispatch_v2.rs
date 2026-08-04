@@ -2658,7 +2658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_does_not_unlock_apply_patch_or_emit_unpaired_receipt() {
+    async fn bootstrap_does_not_unlock_the_gate_or_emit_unpaired_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).await.unwrap();
         let graph = Graph::load(store).await.unwrap();
@@ -2675,10 +2675,12 @@ mod tests {
         ));
 
         let g = graph.read().await;
-        assert!(
-            !crate::store::session::check_consulted_recent(&g.store(), key, 900, None)
+        let already_consulted =
+            crate::store::session::check_consulted_recent(&g.store(), key, 900, None)
                 .await
-                .unwrap(),
+                .unwrap();
+        assert!(
+            !already_consulted,
             "bootstrap context must not mint a consultation receipt"
         );
 
@@ -2702,7 +2704,7 @@ mod tests {
                 "gotcha:hash-algorithm-frozen-at-sha256".to_string(),
                 gotcha_record,
             )]),
-            already_consulted: false,
+            already_consulted,
         });
         assert!(
             matches!(result.decision, crate::hooks::decide::Decision::Deny { .. }),

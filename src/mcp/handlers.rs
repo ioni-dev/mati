@@ -1928,7 +1928,10 @@ pub(crate) async fn handle_mem_bootstrap(
     // later reads/edits and has no ReceiptMinted event to anchor that receipt.
     let mut session_writes: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // Bootstrap aggregation.
+    // Bootstrap aggregation. `analytics:hit_` stays out on purpose: it pairs
+    // 1:1 with `HookEvent::Hit`/`Miss` from a real per-file gate decision
+    // (decide::evaluate), and bootstrap has no per-file miss to pair against —
+    // counting it would only inflate `mati stats` hit rate.
     let bootstrap_agg_key = crate::store::session::today_key("analytics:bootstrap_");
     if let Ok(staged) =
         crate::store::session::upsert_daily_agg_staged(store, &bootstrap_agg_key, "__bootstrap__")
