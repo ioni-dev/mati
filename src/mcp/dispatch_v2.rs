@@ -2607,6 +2607,19 @@ mod tests {
             "MemGet should write consultation receipt"
         );
 
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event.event_type,
+                    crate::store::enforcement::EnforcementEventType::ReceiptMinted
+                ) && event.subject_key == "file:src/main.rs"
+            }),
+            "MemGet receipt must have a matching receipt_minted event"
+        );
+
         // No knowledge-side audit.
         let k_audit = g.store().scan_keys("audit:knowledge:").await.unwrap();
         assert!(
@@ -2641,6 +2654,70 @@ mod tests {
         assert!(
             !audit_keys.is_empty(),
             "MemBootstrap should produce session-side audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_unlock_apply_patch_or_emit_unpaired_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let graph = Graph::load(store).await.unwrap();
+        let graph = Arc::new(tokio::sync::RwLock::new(graph));
+        let ctx = test_ctx(dir.path());
+        let key = "file:src/store/db.rs";
+
+        let req = make_request(Command::MemBootstrap(MemBootstrapInput {
+            context_files: vec![key.to_string()],
+        }));
+        assert!(matches!(
+            dispatch_v2(&graph, &ctx, req).await,
+            Response::Ok { .. }
+        ));
+
+        let g = graph.read().await;
+        assert!(
+            !crate::store::session::check_consulted_recent(&g.store(), key, 900, None)
+                .await
+                .unwrap(),
+            "bootstrap context must not mint a consultation receipt"
+        );
+
+        let file_record = serde_json::json!({
+            "value": "Database storage",
+            "confidence": {"value": 0.8},
+            "quality": {"value": 0.7},
+            "staleness": {"value": 0.0, "tier": "fresh"},
+            "payload": {"gotcha_keys": ["gotcha:hash-algorithm-frozen-at-sha256"]}
+        });
+        let gotcha_record = serde_json::json!({
+            "value": "Keep HASH_ALGORITHM at sha256",
+            "confidence": {"value": 0.8},
+            "quality": {"value": 0.7},
+            "payload": {"confirmed": true}
+        });
+        let result = crate::hooks::decide::evaluate(&crate::hooks::decide::EnforcementInput {
+            rel_path: "src/store/db.rs".to_string(),
+            file_record: Some(file_record),
+            gotcha_records: std::collections::HashMap::from([(
+                "gotcha:hash-algorithm-frozen-at-sha256".to_string(),
+                gotcha_record,
+            )]),
+            already_consulted: false,
+        });
+        assert!(
+            matches!(result.decision, crate::hooks::decide::Decision::Deny { .. }),
+            "an unconsulted apply-patch target must remain denied after bootstrap"
+        );
+
+        let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.event_type,
+                crate::store::enforcement::EnforcementEventType::ReceiptMinted
+            )),
+            "bootstrap must not create a receipt_minted event without minting a receipt"
         );
     }
 
