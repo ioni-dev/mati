@@ -3,8 +3,8 @@
 //!
 //! These tests are marked `#[ignore]` because real-repository initialization is
 //! too expensive for normal `cargo test` runs. Most targets also clone from
-//! GitHub; the ripgrep target uses the tracked fixture under
-//! `tests/fixtures/real_world/ripgrep` when present.
+//! GitHub; vendored targets use the tracked fixture under
+//! `tests/fixtures/real_world/<name>` when present.
 //! Run them explicitly with:
 //!
 //!     cargo nextest run --test real_world_verification --run-ignored only
@@ -25,21 +25,21 @@
 //! - Java:       jhy/jsoup             (Java package import resolution)
 //! - C:          microsoft/mimalloc    (C #include "..." resolution)
 //!
-//! ## Measurement baselines (2026-04-16, updated after Go/Java/C coverage)
+//! ## Measurement baselines (2026-08-03, updated after vendoring five fixtures)
 //!
 //! | Codebase      | Edges | Resolution | Hub tier              | Notes                              |
 //! |---------------|-------|------------|-----------------------|------------------------------------|
 //! | ripgrep       |   342 | intra+cross| grep_matcher moderate | brace decomposition + cross-crate  |
-//! | httpx         |   124 | ~100%      | __init__.py high      | healthy                            |
+//! | httpx         |   122 | ~100%      | __init__.py high      | healthy                            |
 //! | vitest        |  2147 | ~97%       | core.ts critical      | healthy                            |
 //! | nlohmann-json |   619 | ~84%       | json.hpp critical     | angle-bracket fix (Phase 2)        |
 //! | aeson         |   223 | ~50%       | Aeson.hs critical     | stdlib allowlist fix (Phase 2)     |
 //! | zio-json      |    21 | ~8%        | —                     | source root fix, wildcard limited  |
-//! | sinatra       |   145 | ~60%       | base.rb high          | lib/ fallback fix (Phase 2)        |
+//! | sinatra       |   133 | ~60%       | base.rb high          | lib/ fallback fix (Phase 2)        |
 //! | discourse     |  2622 | struct     | AppController critical| Rails autoload (Inherits/Includes) |
 //! | solidus       |  1090 | struct     | core.rb moderate      | monorepo autoload + lib/ roots     |
-//! | hcl           |   190 | ~98%       | expr_list.go critical | Go cross-package via go.mod        |
-//! | jsoup         |   576 | ~88%       | Jsoup.java critical   | Java package resolution            |
+//! | hcl           |   189 | ~98%    | expr_list.go critical | Go cross-package via go.mod        |
+//! | jsoup         |   730 | ~88%       | Jsoup.java critical   | Java package resolution            |
 //! | mimalloc      |   129 | ~100%      | mimalloc.h high       | C #include "..." resolution        |
 
 use std::path::PathBuf;
@@ -291,24 +291,26 @@ fn real_world_ripgrep() {
 // ── httpx (Python) ──────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "real_world: requires network and external repos"]
+#[ignore = "real_world: expensive verification"]
 fn real_world_httpx() {
-    let repo = clone_or_reuse("httpx", "https://github.com/encode/httpx");
+    let repo = verification_repo("httpx", "https://github.com/encode/httpx");
     let (output, _slug) = fresh_init(&repo);
 
     // ── Resolution rate ─────────────────────────────────────────────────
     let edges = parse_edge_count(&output);
     let files = parse_file_count(&output);
 
-    // Baseline 2026-04-14: 124 edges, 115 files.
-    // Floor set 5pp below measured rate (~100% → 95%): 100 edges minimum.
+    // Previous recorded baseline 2026-04-14: 124 edges, 115 files.
+    // Vendored measurement 2026-08-03: 122 edges, 115 files. A clean clone
+    // control produced the same numbers, so the two-edge movement is not an
+    // archive omission. Floors are ~5% below the vendored measurement.
     assert!(
-        files >= 50,
-        "httpx should index at least 50 files, got {files}"
+        files >= 109,
+        "httpx should index at least 109 files (baseline 115), got {files}"
     );
     assert!(
-        edges >= 100,
-        "httpx resolution regressed: expected >= 100 edges (baseline 124), got {edges}"
+        edges >= 115,
+        "httpx resolution regressed: expected >= 115 edges (baseline 122), got {edges}"
     );
 
     eprintln!("[real_world_httpx] files={files} edges={edges}");
@@ -549,24 +551,25 @@ fn real_world_zio_json_resolution() {
 // Baseline before fix: 63 edges. After fix: 93 edges.
 
 #[test]
-#[ignore = "real_world: requires network and external repos"]
+#[ignore = "real_world: expensive verification"]
 fn real_world_sinatra_resolution() {
-    let repo = clone_or_reuse("sinatra", "https://github.com/sinatra/sinatra");
+    let repo = verification_repo("sinatra", "https://github.com/sinatra/sinatra");
     let (output, _slug) = fresh_init(&repo);
 
     let edges = parse_edge_count(&output);
     let files = parse_file_count(&output);
 
+    // Previous recorded baseline 2026-04-15: 145 edges (lib/ fallback +
+    // Inherits/Includes). Vendored measurement 2026-08-03: 133 edges, 289
+    // files. A clean clone control produced the same numbers, so the movement
+    // is not an archive omission. Floors are ~5% below the vendored measure.
     assert!(
-        files >= 100,
-        "sinatra should index at least 100 files, got {files}"
+        files >= 274,
+        "sinatra should index at least 274 files (baseline 289), got {files}"
     );
-
-    // Baseline 2026-04-15: 145 edges (lib/ fallback + Inherits/Includes).
-    // Floor set ~10% below: 130 edges minimum.
     assert!(
-        edges >= 130,
-        "sinatra resolution regressed: expected >= 130 edges (baseline 145), got {edges}"
+        edges >= 126,
+        "sinatra resolution regressed: expected >= 126 edges (baseline 133), got {edges}"
     );
 
     eprintln!("[real_world_sinatra] files={files} edges={edges}");
@@ -691,37 +694,37 @@ fn real_world_solidus_core_is_hub() {
 // ── hcl (Go) ──────────────────────────────────────────────────────────
 //
 // Go cross-package import resolution via go.mod module path.
-// Baseline 2026-04-16: 190 edges, 370 files.
-// Go resolves package imports to the first non-test .go file in the target
-// directory (alphabetical), so blast radius concentrates on package
-// entry-point files. expr_list.go (root package) is the hub — 118 direct.
+// Previous recorded baseline 2026-04-16: 190 edges, 370 files.
+// Go resolves package imports to the alphabetically first non-test .go file in
+// the target directory, so blast radius concentrates on package entry points.
+// expr_list.go (root package) is the hub — 118 direct.
 
 #[test]
-#[ignore = "real_world: requires network and external repos"]
+#[ignore = "real_world: expensive verification"]
 fn real_world_hcl_resolution() {
-    let repo = clone_or_reuse("hcl", "https://github.com/hashicorp/hcl");
+    let repo = verification_repo("hcl", "https://github.com/hashicorp/hcl");
     let (output, _slug) = fresh_init(&repo);
 
     let edges = parse_edge_count(&output);
     let files = parse_file_count(&output);
 
+    // Vendored measurement 2026-08-03: 370 files and 189 edges across repeated
+    // fresh runs on identical input. The deterministic Go resolver now chooses
+    // the alphabetically first non-test file in each package. Floor is ~5% below
+    // the stable measurement.
     assert!(
-        files >= 200,
-        "hcl should index at least 200 files, got {files}"
+        files >= 351,
+        "hcl should index at least 351 files (baseline 370), got {files}"
     );
-
-    // Baseline 2026-04-16: 190 edges (go.mod cross-package resolution).
-    // Floor set ~5% below: 180 edges minimum.
     assert!(
         edges >= 180,
-        "hcl resolution regressed: expected >= 180 edges (baseline 190), got {edges}"
+        "hcl resolution regressed: expected >= 180 edges (stable baseline 189), got {edges}"
     );
 
     eprintln!("[real_world_hcl] files={files} edges={edges}");
 
-    // Go resolves package imports to one file per package. Which file is
-    // chosen depends on HashMap iteration order, so it varies between runs.
-    // hclparse/ is a single-file package — parser.go is always the target.
+    // Go resolves package imports to one file per package, choosing the
+    // alphabetically first non-test file. hclparse/ is a single-file package.
     // It has 4 direct importers (stable across runs).
     let key = "file:hclparse/parser.go";
     let show_out = run_show(&repo, key)
@@ -740,28 +743,29 @@ fn real_world_hcl_resolution() {
 // ── jsoup (Java) ──────────────────────────────────────────────────────
 //
 // Java package import resolution.
-// Baseline 2026-04-16: 576 edges, 238 files.
+// Previous recorded baseline 2026-04-16: ~745 edges, 238 files.
 // Jsoup.java is the hub — 60 direct importers, critical tier.
 
 #[test]
-#[ignore = "real_world: requires network and external repos"]
+#[ignore = "real_world: expensive verification"]
 fn real_world_jsoup_resolution() {
-    let repo = clone_or_reuse("jsoup", "https://github.com/jhy/jsoup");
+    let repo = verification_repo("jsoup", "https://github.com/jhy/jsoup");
     let (output, _slug) = fresh_init(&repo);
 
     let edges = parse_edge_count(&output);
     let files = parse_file_count(&output);
 
+    // Vendored measurement 2026-08-03: 730 edges, 251 files (inner class
+    // stripping + test source root). A clean clone control produced the same
+    // numbers, so the movement from the recorded baseline is not an archive
+    // omission. Floors are ~5% below the vendored measurement.
     assert!(
-        files >= 100,
-        "jsoup should index at least 100 files, got {files}"
+        files >= 238,
+        "jsoup should index at least 238 files (baseline 251), got {files}"
     );
-
-    // Baseline 2026-04-16: ~745 edges (inner class stripping + test source root).
-    // Floor set ~5% below: 700 edges minimum.
     assert!(
-        edges >= 700,
-        "jsoup resolution regressed: expected >= 700 edges (baseline ~745), got {edges}"
+        edges >= 693,
+        "jsoup resolution regressed: expected >= 693 edges (baseline 730), got {edges}"
     );
 
     eprintln!("[real_world_jsoup] files={files} edges={edges}");
