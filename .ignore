@@ -1,2 +1,6 @@
 # Vendored real-world fixtures are test inputs, not mati project source.
 tests/fixtures/real_world/ripgrep/
+tests/fixtures/real_world/sinatra/
+tests/fixtures/real_world/hcl/
+tests/fixtures/real_world/jsoup/
+tests/fixtures/real_world/httpx/

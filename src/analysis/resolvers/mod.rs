@@ -201,18 +201,25 @@ impl FileIndex {
     }
 
     /// Find all files whose path starts with the given prefix.
-    /// Returns references to avoid allocation when only checking existence.
+    /// Returns sorted references so callers that choose one candidate do so
+    /// deterministically, while avoiding allocation of the path strings.
     pub fn files_with_prefix(&self, prefix: &str) -> Vec<&String> {
-        self.files
+        let mut matches: Vec<&String> = self
+            .files
             .iter()
             .filter(|f| f.starts_with(prefix))
-            .collect()
+            .collect();
+        matches.sort_unstable();
+        matches
     }
 
     /// Find all files whose stem (filename without extension) matches.
-    /// Useful for Go package resolution where `foo.go` matches package `foo`.
+    /// Useful for resolvers where `foo.go` matches package `foo`.
+    /// Results are sorted so callers that choose one candidate are
+    /// deterministic.
     pub fn files_with_stem(&self, stem: &str) -> Vec<&String> {
-        self.files
+        let mut matches: Vec<&String> = self
+            .files
             .iter()
             .filter(|f| {
                 std::path::Path::new(f.as_str())
@@ -220,7 +227,9 @@ impl FileIndex {
                     .and_then(|s| s.to_str())
                     == Some(stem)
             })
-            .collect()
+            .collect();
+        matches.sort_unstable();
+        matches
     }
 }
 

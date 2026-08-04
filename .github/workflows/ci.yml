@@ -172,11 +172,11 @@ jobs:
         # regardless of how `-E` composes with the profile default-filter.
         run: cargo nextest run --locked --all-targets --profile ci --run-ignored only --test-threads 1 -E 'not kind(bench) and not binary(real_world_verification) and not test(serve_exits_cleanly_on_sigterm_after_client_disconnect) and not test(metrics_snapshot_reflects_dispatch_traffic)'
 
-      # Run the highest-value real-code resolver check without network access.
-      # The ripgrep source is vendored under tests/fixtures, and the test falls
-      # back to cloning only when that fixture is absent for local use.
-      - name: real-world resolver (vendored ripgrep)
-        run: cargo nextest run --locked --profile ci --run-ignored only --test real_world_verification --test-threads 1 -E 'test(real_world_ripgrep)'
+      # Run the highest-value real-code resolver checks without network access.
+      # These sources are vendored under tests/fixtures, and each test falls
+      # back to cloning only when its fixture is absent for local use.
+      - name: real-world resolvers (vendored fixtures)
+        run: cargo nextest run --locked --profile ci --run-ignored only --test real_world_verification --test-threads 1 -E 'test(real_world_ripgrep) or test(real_world_sinatra_resolution) or test(real_world_hcl_resolution) or test(real_world_jsoup_resolution) or test(real_world_httpx)'
 
   benches:
     # Benches are not run for wall-time (criterion regressions need a
