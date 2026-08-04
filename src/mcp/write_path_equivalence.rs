@@ -484,6 +484,37 @@ const CREATE_DIVERGENCES: &[&str] = &["dirty_marker", "audit_knowledge_rows"];
 /// `apply_gotcha_write`, which leaves a marker record in both stores.
 const EDIT_DIVERGENCES: &[&str] = &["audit_knowledge_rows"];
 
+/// Divergences on an **edit that reaches a tombstoned key**.
+///
+/// `record.lifecycle` is deliberately absent — that split is the bug this
+/// scenario exists to catch, and it is now fixed on both paths.
+///
+/// `apply_gotcha_write` used to trust the caller's `old_files` verbatim, so
+/// a resurrection whose `affected_files` were unchanged diffed `old == new`
+/// and no-opped, leaving the Direct path's `gotcha_keys` link and
+/// `HasGotcha` edge un-restored. It now diffs against an empty old-file set
+/// whenever the incoming record was `Tombstoned`, the same relink
+/// `handle_gotcha_upsert` gets for free from deriving `is_new` off store
+/// state — `file[*].gotcha_keys`, `file[*].logical_clock` and
+/// `graph.has_gotcha_edges` no longer split.
+///
+/// What is left is the two paths disagreeing on whether the resurrection
+/// itself is a "create" or an "edit", which the fix above does not touch:
+/// `handle_gotcha_upsert` derives `is_new = true` from store state and
+/// rebuilds the record from scratch, including a fresh `RecordVersion`
+/// (`logical_clock` resets to 1); `apply_gotcha_write` still trusts the
+/// caller's `is_new` argument (the CLI always passes `false` for an edit)
+/// and keeps incrementing the existing clock. Resetting a logical clock that
+/// SurrealKV versions indefinitely (`with_versioning(true, 0)`) is a
+/// regression risk of its own, so the Direct path's monotonic behavior was
+/// left alone rather than made to match. `enforcement_events` follows the
+/// same split: Direct still records `Updated`, Daemon `Created`.
+const EDIT_OF_TOMBSTONED_KEY_DIVERGENCES: &[&str] = &[
+    "audit_knowledge_rows",
+    "enforcement_events",
+    "version.logical_clock",
+];
+
 /// Divergences on **confirm** (`mati gotcha confirm`).
 ///
 /// `consultation_receipts` — the handler drops
@@ -781,6 +812,60 @@ async fn edit_paths_diverge_only_where_pinned() {
 }
 
 #[tokio::test]
+async fn edit_of_a_tombstoned_key_un_tombstones_on_both_paths() {
+    // `mati gotcha edit`: the CLI fetches whatever record is at `key` —
+    // tombstoned or not — mutates rule/reason/etc., and calls `gotcha_write`
+    // with `is_new = false`. It never inspects or resets `.lifecycle` itself.
+    // `apply_gotcha_write` (Direct) used to persist the caller's record
+    // as-is, so an edit reaching a tombstoned key stayed `Tombstoned` —
+    // invisible to `mem_get` — while `handle_gotcha_upsert` (Daemon) has
+    // always reset it to `Active`. This asserts the one field that must no
+    // longer split: `record.lifecycle`.
+    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
+        seed_file(&store, "src/a.rs").await;
+        let original = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
+        gotcha_ops::apply_gotcha_write(&store, &original, &[], &["src/a.rs".into()], true)
+            .await
+            .expect("seed");
+        gotcha_ops::apply_gotcha_tombstone(&store, KEY, &["src/a.rs".into()])
+            .await
+            .expect("tombstone");
+
+        let mut edited = store.get(KEY).await.unwrap().unwrap();
+        let mut g = edited.payload_as::<GotchaRecord>().unwrap();
+        g.rule = "Always close the store handle".into();
+        edited.value = format!("{} because {}", g.rule, g.reason);
+        edited.payload = serde_json::to_value(&g).ok();
+        edited.version.logical_clock += 1;
+        edited.quality = crate::health::quality::analyze(&edited);
+
+        drive_write(
+            path,
+            &store,
+            &edited,
+            &["src/a.rs".into()],
+            &["src/a.rs".into()],
+            false,
+        )
+        .await
+        .expect("edit of tombstoned key");
+        store
+    })
+    .await;
+    assert!(
+        !d.contains_key("record.lifecycle"),
+        "record.lifecycle must agree on both paths after an edit reaches a \
+         tombstoned key: {:?}",
+        d.get("record.lifecycle")
+    );
+    assert_divergences(
+        "edit of a tombstoned key",
+        &d,
+        EDIT_OF_TOMBSTONED_KEY_DIVERGENCES,
+    );
+}
+
+#[tokio::test]
 async fn confirm_paths_diverge_only_where_pinned() {
     let d = compare(&["src/a.rs"], KEY, |path, store| async move {
         seed_file(&store, "src/a.rs").await;
@@ -935,4 +1020,75 @@ async fn enriched_tag_extraction_row_matches_on_both_paths() {
         d.get("extraction")
     );
     assert_divergences("create with enriched tags", &d, CREATE_DIVERGENCES);
+}
+
+/// The Direct half of the tombstoned-key resurrection, asserted directly
+/// rather than as a diff: an edit that reaches a tombstoned key with an
+/// unchanged `affected_files` has to restore the derived indexes, the same
+/// way `handle_gotcha_upsert` already does. `apply_gotcha_write` used to
+/// trust the caller's `old_files` verbatim; diffed against an identical
+/// `new_files` it saw no change and skipped both the file-record link and
+/// the `HasGotcha` edge, leaving them missing until a full `mati repair`.
+#[tokio::test]
+async fn direct_edit_of_tombstoned_key_restores_links_and_edges() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let store = Store::open(dir.path()).await.expect("open store");
+    seed_file(&store, "src/a.rs").await;
+
+    let original = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
+    gotcha_ops::apply_gotcha_write(&store, &original, &[], &["src/a.rs".into()], true)
+        .await
+        .expect("seed");
+    gotcha_ops::apply_gotcha_tombstone(&store, KEY, &["src/a.rs".into()])
+        .await
+        .expect("tombstone");
+
+    // Mirror of `cli::gotcha::run_gotcha_edit_inner`: `affected_files` is
+    // left unchanged (the developer accepted the default at the prompt), so
+    // `old_files` and `new_files` are identical.
+    let mut edited = store.get(KEY).await.unwrap().unwrap();
+    let mut g = edited.payload_as::<GotchaRecord>().unwrap();
+    g.rule = "Always close the store handle".into();
+    edited.value = format!("{} because {}", g.rule, g.reason);
+    edited.payload = serde_json::to_value(&g).ok();
+    edited.version.logical_clock += 1;
+    edited.quality = crate::health::quality::analyze(&edited);
+
+    gotcha_ops::apply_gotcha_write(
+        &store,
+        &edited,
+        &["src/a.rs".into()],
+        &["src/a.rs".into()],
+        false,
+    )
+    .await
+    .expect("edit of tombstoned key");
+
+    let file = store.get("file:src/a.rs").await.unwrap().unwrap();
+    let keys: Vec<String> = file
+        .payload
+        .as_ref()
+        .and_then(|p| p.get("gotcha_keys"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        keys,
+        vec![KEY.to_string()],
+        "file-record gotcha_keys link must be restored on resurrection"
+    );
+
+    let edges = store.scan_keys("graph:edge:").await.unwrap();
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.contains("file:src/a.rs") && e.ends_with(KEY)),
+        "HasGotcha edge must be restored on resurrection, got {edges:?}"
+    );
+
+    store.close().await.expect("close");
 }

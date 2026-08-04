@@ -401,6 +401,12 @@ pub async fn ensure_gotcha_key_available(store: &Store, key: &str) -> Result<()>
 /// gate looks up. `old_files` is deliberately left verbatim: it describes what
 /// the derived indexes actually contain — possibly an unnormalized legacy
 /// spelling — and [`sync_gotcha_file_links`] needs the real key to unlink.
+///
+/// If `record` arrives `Tombstoned`, steps 3–5 diff against an empty old-file
+/// set instead of the caller's `old_files`: `apply_gotcha_tombstone` already
+/// tore down every link and edge, so the caller's `old_files` no longer
+/// describes what the indexes hold, and diffing against it would no-op on an
+/// unchanged `affected_files`, leaving the resurrected record unlinked.
 pub async fn apply_gotcha_write(
     store: &Store,
     record: &Record,
@@ -410,6 +416,24 @@ pub async fn apply_gotcha_write(
 ) -> Result<()> {
     let new_files = &normalize_affected_files(new_files);
     let mut staged = with_normalized_affected_files(record, new_files);
+
+    // A write through this function is a create or an edit of live content —
+    // never a tombstone, which is `apply_gotcha_tombstone`'s job alone. Force
+    // `Active` unconditionally so this mirrors `mcp::handlers::
+    // handle_gotcha_upsert`'s own unconditional reset. Without it, an edit
+    // that reaches a tombstoned key over this direct (no-daemon) path
+    // persists the record but leaves it `Tombstoned` — invisible to
+    // `mem_get`, which filters that lifecycle on read — so the write lands
+    // with no visible effect and no error.
+    let was_tombstoned = !matches!(
+        staged.as_ref().unwrap_or(record).lifecycle,
+        RecordLifecycle::Active
+    );
+    if was_tombstoned {
+        let mut owned = staged.take().unwrap_or_else(|| record.clone());
+        owned.lifecycle = RecordLifecycle::Active;
+        staged = Some(owned);
+    }
 
     // A new record that already carries `confirmed: true` is a developer
     // vouching for the rule right now — the direct-store `mati gotcha add`
@@ -493,15 +517,24 @@ pub async fn apply_gotcha_write(
 
     let mut secondary_failed = false;
 
+    // A key that was tombstoned had its links and edges torn down by
+    // `apply_gotcha_tombstone` regardless of `affected_files`. Diffing
+    // against the caller's `old_files` here would see `old == new` for an
+    // unchanged file list and no-op, leaving the resurrected record
+    // unlinked. Treat resurrection as relinking every current file, the same
+    // way `handle_gotcha_upsert` does when it derives `is_new` from a
+    // tombstoned `existing` and finds no prior links to diff against.
+    let sync_old_files: &[String] = if was_tombstoned { &[] } else { old_files };
+
     // 3. Sync file-record gotcha_keys — best-effort
-    if let Err(e) = sync_gotcha_file_links(store, key, old_files, new_files).await {
+    if let Err(e) = sync_gotcha_file_links(store, key, sync_old_files, new_files).await {
         tracing::warn!("gotcha_write: file link sync failed for {key}: {e}");
         secondary_failed = true;
         crate::store::repair::mark_dirty(store, key, &format!("link sync failed: {e}")).await;
     }
 
     // 4 + 5. Graph edges — best-effort
-    let old_set: HashSet<&str> = old_files.iter().map(String::as_str).collect();
+    let old_set: HashSet<&str> = sync_old_files.iter().map(String::as_str).collect();
     let new_set: HashSet<&str> = new_files.iter().map(String::as_str).collect();
 
     let ts = now_secs().to_le_bytes();
