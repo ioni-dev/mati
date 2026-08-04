@@ -1,0 +1,4 @@
+# Lockfiles are tracked on purpose (binary crates) but never read in review.
+# Collapse them in GitHub diffs and keep them out of the language stats.
+/Cargo.lock linguist-generated=true
+/fuzz/Cargo.lock linguist-generated=true
