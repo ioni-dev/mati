@@ -28,6 +28,7 @@ GOTCHAS.md
 ROADMAP.md
 DECISIONS.md
 mati\ -\ readme.md
+PENDING\ WORK/
 
 *.md
 !tests/fixtures/real_world/**

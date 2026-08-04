@@ -31,8 +31,13 @@ cat > "$HOOK_PATH" <<'HOOK'
 
 set -uo pipefail
 
-# Collect staged .rs files (added, copied, modified).
-mapfile -t STAGED_RS < <(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
+# Collect staged .rs files (added, copied, modified). No `mapfile` — macOS
+# ships bash 3.2, where it does not exist, and `set -u` then kills the hook
+# on the unset array.
+STAGED_RS=()
+while IFS= read -r f; do
+    STAGED_RS+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACM | grep -E '\.rs$' || true)
 
 [[ ${#STAGED_RS[@]} -eq 0 ]] && exit 0
 
