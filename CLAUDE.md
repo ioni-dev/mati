@@ -164,6 +164,13 @@ no record                                                     → allow, log mis
 confidence < 0.3 OR quality < 0.4                            → allow, no injection
 ```
 
+Staleness tier gates injection, not the gotcha deny above — a qualifying
+gotcha denies at any tier, including `liability` and `tombstone`. The only
+enforcement bypass is a literal `FileDeleted` staleness signal: allow
+unconditionally, no injection. Absent that signal, `liability` degrades
+injection to a warning and `tombstone` excludes it, but the gotcha check
+still runs first.
+
 Design principles (full set in ARCHITECTURE.md section 2): hook enforcement is primary
 (P1); inject nothing by default, pull on demand (P2); four MCP tools max (P3);
 never block Claude on a mati outage — hooks fail open (P9).

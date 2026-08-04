@@ -287,11 +287,15 @@ impl QualityScore {
 // Staleness scoring
 // ─────────────────────────────────────────────
 
-/// Staleness tier — determines injection and hook behaviour.
+/// Staleness tier — determines injection behaviour, not enforcement.
 ///
-/// At `Tombstone`: PreToolUse allows file reads through unconditionally.
-/// Record excluded from injection entirely. Trusting a wrong record is a
-/// worse failure mode than a cache miss (ARCHITECTURE.md section 17).
+/// At `Liability` and `Tombstone`, the file record's own content is degraded
+/// or excluded from injection entirely — trusting a wrong record silently is
+/// a worse failure mode than a cache miss (ARCHITECTURE.md section 17). A
+/// confirmed gotcha still denies at either tier: `hooks::decide::evaluate`
+/// runs the gotcha loop before it ever checks the tier (section 10.1). The
+/// one unconditional pass-through is the literal `FileDeleted` signal, not
+/// the tier by itself.
 ///
 /// Sync merge rule: `Tombstone > Liability > Stale > Aging > Fresh`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -300,9 +304,10 @@ pub enum StalenessTier {
     Fresh,
     Aging,
     Stale,
-    /// Blocks injection; injected into PreToolUse as a warning.
+    /// Injection degrades to a read-the-file warning. Enforcement unaffected.
     Liability,
-    /// Record fully excluded. Hook passes file reads through unconditionally.
+    /// Injection fully excluded. Enforcement unaffected unless the record
+    /// also carries a `FileDeleted` signal.
     Tombstone,
 }
 

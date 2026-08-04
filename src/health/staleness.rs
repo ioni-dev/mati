@@ -27,10 +27,13 @@ const MAX_REPARSE_INCREMENT: f32 = 0.4;
 
 /// Ceiling on the staleness a record can hold from reparse alone.
 ///
-/// Sits below the 0.7 `Liability` floor on purpose. `hooks::decide::evaluate`
-/// returns before the gotcha loop at both `Liability` and `Tombstone`, so an
-/// increment that accumulates per edit would let a few edits in one session
-/// switch enforcement off for every confirmed gotcha on the file. Git, time,
+/// Sits below the 0.7 `Liability` floor on purpose. `Liability` and
+/// `Tombstone` no longer gate gotcha enforcement (`hooks::decide::evaluate`
+/// runs the gotcha loop before it checks the tier), but they still gate
+/// injection — `Liability` degrades the cached blurb to a warning,
+/// `Tombstone` suppresses it. An increment that accumulates per edit would
+/// let a few edits in one session mark a file's blurb untrustworthy, when
+/// the file was only being actively worked on, not abandoned. Git, time,
 /// dep and cascade factors still reach those tiers through
 /// [`StalenessAnalyzer::compute_staleness`].
 const MAX_REPARSE_STALENESS: f32 = 0.69;
@@ -2665,13 +2668,16 @@ mod tests {
 
     // ── Reparse accumulation cannot disable enforcement ─────────────────────
 
-    /// `hooks::decide::evaluate` returns before the gotcha loop when a file
-    /// record's staleness tier is `liability` or `tombstone` — pinned by
-    /// `decide::tests::gate_never_silently_disables`. Reparse staleness is
-    /// applied per edit, so without a ceiling across passes, editing one file a
-    /// handful of times in a session crosses that boundary and every confirmed
-    /// gotcha on the file stops being enforced. Nothing is logged: `Tombstone`
-    /// returns an empty event list.
+    /// `hooks::decide::evaluate` runs the gotcha loop before it looks at the
+    /// file's staleness tier — pinned by `decide::tests::gate_never_silently_
+    /// disables`. So `Liability`/`Tombstone` no longer disable enforcement of
+    /// a confirmed gotcha. They still gate *injection*: `Liability` degrades
+    /// the file's cached purpose blurb to a bare warning, and `Tombstone`
+    /// (absent a `FileDeleted` signal) suppresses it entirely. Reparse
+    /// staleness is applied per edit, so without a ceiling across passes,
+    /// editing one file a handful of times in a session would cross that
+    /// boundary and mark its cached blurb untrustworthy — a false signal,
+    /// since the file wasn't abandoned, just actively edited.
     ///
     /// These tests bound the reparse contribution. They do not touch the tier
     /// thresholds or what the tiers mean.
@@ -2714,10 +2720,12 @@ mod tests {
             }
         }
 
-        /// The anchor: no number of reparse passes reaches a tier that returns
-        /// before the gotcha loop.
+        /// The anchor: no number of reparse passes reaches a tier that
+        /// degrades injection, and a confirmed gotcha keeps denying
+        /// regardless — the second assertion holds even without the ceiling
+        /// now, but stays here as a regression guard.
         #[test]
-        fn repeated_reparse_never_reaches_a_tier_that_stops_enforcing() {
+        fn repeated_reparse_never_reaches_a_tier_that_degrades_injection() {
             let mut record = make_file_record_with_staleness(0.0);
 
             for pass in 1..=50 {
@@ -2727,9 +2735,10 @@ mod tests {
                         record.staleness.tier,
                         StalenessTier::Liability | StalenessTier::Tombstone
                     ),
-                    "ENFORCEMENT DISABLED: {} reparse passes reached tier {:?} \
-                     (value {}). Liability and Tombstone both return before the \
-                     gotcha loop in hooks::decide::evaluate",
+                    "INJECTION DEGRADED: {} reparse passes reached tier {:?} \
+                     (value {}). Liability and Tombstone still gate what gets \
+                     injected for this file, even though they no longer gate \
+                     gotcha enforcement",
                     pass,
                     record.staleness.tier,
                     record.staleness.value

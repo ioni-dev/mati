@@ -432,23 +432,31 @@ Decisions are evaluated in this order:
 1. file_record is None
    -> NoRecord: log miss, allow unconditionally
 
-2. staleness_tier == "tombstone"
-   -> Tombstone: allow unconditionally, no injection
+2. staleness.signals contains FileDeleted
+   -> Tombstone: allow unconditionally, no injection. The one enforcement
+      bypass — keyed on the literal signal, not the tier, since the source
+      file is gone and there is nothing left to enforce against.
 
-3. staleness_tier == "liability"
-   -> Liability: allow + inject WARNING (staleness value shown), log hit
-
-4. any attached gotcha has (confirmed=true AND confidence >= 0.6 AND quality >= 0.4):
+3. any attached gotcha has (confirmed=true AND confidence >= 0.6 AND quality >= 0.4):
      a. already_consulted == true
         -> AlreadyConsulted: allow + inject context, log ComplianceHit
      b. already_consulted == false
         -> Deny: block read, inject mem_get() instruction, log BlockedUnconsultedRead
+   Runs regardless of staleness_tier — staleness gates injection (steps 4-5
+   below), not enforcement. A qualifying gotcha denies even at Liability or
+   Tombstone.
 
-5. file_record.confidence >= 0.3 AND file_record.quality >= 0.4
+4. staleness_tier == "tombstone" (no gotcha qualified in step 3)
+   -> Tombstone: allow unconditionally, no injection
+
+5. staleness_tier == "liability" (no gotcha qualified in step 3)
+   -> Liability: allow + inject WARNING (staleness value shown), log hit
+
+6. file_record.confidence >= 0.3 AND file_record.quality >= 0.4
    (checks the file record's own scores; unconfirmed gotchas do not factor in here)
    -> Advisory: allow + inject context as additionalContext, log hit
 
-6. default
+7. default
    -> Allow: pass through, no injection
 ```
 
@@ -868,17 +876,17 @@ Hard overrides bypass the formula:
 
 Staleness tiers use half-open intervals.
 
-| Tier      | Range      | Hook behavior                                                           |
-| --------- | ---------- | ----------------------------------------------------------------------- |
-| Fresh     | [0.0, 0.2) | Normal injection                                                        |
-| Aging     | [0.2, 0.4) | Normal injection                                                        |
-| Stale     | [0.4, 0.7) | Injected with staleness warning                                         |
-| Liability | [0.7, 0.9) | Hook passes through; injects warning to read the file directly          |
-| Tombstone | [0.9, 1.0] | Hook passes through unconditionally; record excluded from all injection |
+| Tier      | Range      | Hook behavior                                                                      |
+| --------- | ---------- | ------------------------------------------------------------------------------------- |
+| Fresh     | [0.0, 0.2) | Normal injection                                                                   |
+| Aging     | [0.2, 0.4) | Normal injection                                                                   |
+| Stale     | [0.4, 0.7) | Injected with staleness warning                                                    |
+| Liability | [0.7, 0.9) | Injection degrades to a warning to read the file directly; enforcement unaffected  |
+| Tombstone | [0.9, 1.0] | Injection fully excluded; enforcement unaffected unless the file was deleted       |
 
-At Tombstone, the record is fully excluded. Injecting a wrong record silently is worse than having a cache miss.
+At Tombstone, the file record's own content is excluded from injection — injecting a wrong purpose blurb silently is worse than a cache miss. That is an injection rule, not an enforcement one: a confirmed gotcha still denies at both Liability and Tombstone (section 10.1). The sole unconditional pass-through is the `FileDeleted` signal — the source file is gone, so there is nothing left to enforce.
 
-The `mati reparse` path adds staleness per pass, capped at 0.4 per pass by `MAX_REPARSE_INCREMENT`. Across passes it saturates at `MAX_REPARSE_STALENESS` (0.69) — inside Stale, below the Liability floor. Reparse never lowers a value another factor set, and the 24h preservation window in `compute_staleness` holds a recent reparse score up only as far as the same ceiling. Without that bound, editing one file a few times in a session pushed the file record to Tombstone and `hooks::decide::evaluate` stopped enforcing every confirmed gotcha on it, with no event logged. The other four factors still reach Liability and Tombstone on their own; so do the `FileDeleted` and `FileRenamed` overrides.
+The `mati reparse` path adds staleness per pass, capped at 0.4 per pass by `MAX_REPARSE_INCREMENT`. Across passes it saturates at `MAX_REPARSE_STALENESS` (0.69) — inside Stale, below the Liability floor. Reparse never lowers a value another factor set, and the 24h preservation window in `compute_staleness` holds a recent reparse score up only as far as the same ceiling. Without that bound, editing one file a few times in a session pushed the file record to Tombstone — before section 10.1's reorder, that silently disabled enforcement of every confirmed gotcha on the file, with no event logged. Enforcement is unaffected today (the gotcha loop runs ahead of the tier check); the ceiling still matters because Tombstone still suppresses injection, and a file edited a lot in one session was never abandoned. The other four factors reach Liability on their own but cannot reach Tombstone: with `semantic_factor` stubbed, their combined maximum is 0.75. Only the `FileDeleted` override reaches Tombstone; `FileRenamed` stops at Liability.
 
 `StalenessAnalyzer::analyze_all` runs on the SessionEnd harvest, so it is bounded by `ANALYZE_TIME_BUDGET_MS` (2000). That budget sits close to its ceiling already: Claude Code kills the hook at 3000ms, and process spawn, the socket round trip, and the rest of the harvest account for roughly another 300ms. Raising it is not available; the scan has to be fair inside it.
 
@@ -906,11 +914,13 @@ already exist, so it adds no work to `mati init` and opens no files.
 Drift is **reported, never enforced**. It is not a `StalenessSignal` and carries
 no weight in the formula above, deliberately:
 
-- The formula decides the file tier, and `hooks::decide::evaluate` passes reads
-  through unconditionally at `Tombstone` and returns an allow at `Liability`
-  *before* it reaches the gotcha loop. A drifted gotcha raising its own
-  staleness past 0.4 would also raise `cascade_factor` on every file that links
-  it. Weight here could switch the gate off for exactly the records it flags.
+- A drifted gotcha's own staleness feeds `cascade_factor` on every file that
+  links it. Weight added here would raise that factor and could push a
+  linked file's tier into `Liability` or `Tombstone`, which degrades what
+  `hooks::decide::evaluate` injects for it (section 10.1) even though the
+  gotcha itself keeps denying — the gotcha loop runs ahead of the tier
+  checks, so enforcement is unaffected, but the linked files' context would
+  go dark for a fact that says nothing about them.
 - `StalenessAnalyzer::compute_staleness` rebuilds `staleness.signals` on every
   pass, so a drift signal parked there would be erased by the next `mati init`.
 
