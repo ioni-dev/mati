@@ -261,8 +261,16 @@ so state is reclaimed at exit.
 ```bash
 cargo install cargo-nextest --locked   # one-time
 cargo nt --lib                         # alias for `cargo nextest run`
-cargo nextest run --lib --profile ci   # match CI behavior locally
+cargo nextest run --all-targets        # full local run, incl. integration tests
 ```
+
+Never add `--all-targets` to `--profile ci` or `--profile stress` locally on
+Apple Silicon. Both profiles set `test-threads = "num-cpus"`, tuned for
+Linux CI runners; on macOS that many concurrent `mati` subprocesses flake the
+integration tests (`mcp_stdio_*`, `output_regression::*`) under daemon
+contention. The default profile's `test-threads = 4` is the measured-clean
+setting for a full local run — two consecutive `--profile stress
+--test-threads 4 --all-targets` runs passed 2074/2074 with zero retries.
 
 Profiles and the resource-bound test groups (`mcp`, `hook-compliance`,
 `cli-daemon`) are defined in `.config/nextest.toml`. Doc tests still run under

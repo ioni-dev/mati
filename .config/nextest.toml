@@ -19,8 +19,15 @@
 # Quickstart:
 #   cargo install cargo-nextest --locked       # one-time
 #   cargo nextest run --lib                    # safe default (this file)
-#   cargo nextest run --lib --profile ci       # match CI behavior locally
+#   cargo nextest run --all-targets            # full local run incl. integration tests
+#   cargo nextest run --lib --profile ci       # match CI's test selection
 #   cargo nextest run --lib --profile stress   # no retries, surface flakes
+#
+# Do not add --all-targets to --profile ci or --profile stress locally on
+# Apple Silicon: both set test-threads = "num-cpus", tuned for Linux CI, and
+# num-cpus concurrent `mati` subprocesses flake the integration tests (see
+# the ci profile below). The default profile's test-threads = 4 is the
+# known-clean setting for a full local run.
 #
 # Vanilla `cargo test --lib` still works as a fallback (gated by
 # RUST_TEST_THREADS=1 in .cargo/config.toml) but is single-threaded and
@@ -62,6 +69,15 @@ success-output = "never"
 #
 # CI machines are dedicated and Linux is more permissive with fs events;
 # push parallelism higher. Heavy clusters are still capped by test-groups.
+#
+# Do not run this profile locally with --all-targets on Apple Silicon.
+# Measured: `--profile ci --all-targets` at num-cpus threads (14 on an
+# M-series 14-core) flakes 3 spawned-process tests per run (mcp_stdio_*,
+# output_regression::*) — 14 concurrent `mati` subprocesses miss
+# ensure_daemon's response window under contention. `--profile stress
+# --test-threads 4` (two consecutive runs, 2074/2074 each, ~205s) shows the
+# thread count is the whole story: use the default profile for a full local
+# run instead.
 [profile.ci]
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 4 }
