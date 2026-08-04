@@ -75,9 +75,10 @@ success-output = "never"
 # M-series 14-core) flakes 3 spawned-process tests per run (mcp_stdio_*,
 # output_regression::*) — 14 concurrent `mati` subprocesses miss
 # ensure_daemon's response window under contention. `--profile stress
-# --test-threads 4` (two consecutive runs, 2074/2074 each, ~205s) shows the
-# thread count is the whole story: use the default profile for a full local
-# run instead.
+# --test-threads 4` (two consecutive runs, 2074/2074 each, ~205s) isolates
+# the thread count as the cause: use the default profile for a full local
+# run instead. Both runs predate the `cli-integration` cap below, which
+# bounds the same contention by a different lever.
 [profile.ci]
 test-threads = "num-cpus"
 slow-timeout = { period = "60s", terminate-after = 4 }
@@ -117,17 +118,24 @@ hook-compliance = { max-threads = 2 }
 # pressure on weaker hardware.
 cli-daemon = { max-threads = 1 }
 
-# Every `tests/*.rs` integration test spawns the real `mati` binary, and
-# each spawn calls `ensure_daemon`. Unbounded, 22 integration binaries
-# contend on daemon startup and blow past its 15s `Wedged` threshold —
-# this is what produced the `TRY 1 FAIL` retries under `--all-targets`.
-# Capping determinism over wall-clock speed on purpose.
+# Integration tests that spawn the real `mati` binary; each spawn calls
+# `ensure_daemon`, and unbounded they contend on daemon startup and blow
+# past its 15s `Wedged` threshold. Thread count is the measured cause of
+# that contention (see the ci profile above) — this cap is a second lever
+# on the same problem, and the one that still applies where test-threads
+# is high by design.
 cli-integration = { max-threads = 2 }
 
 # ─── group assignments ───────────────────────────────────────────────────
 #
 # Nextest requires per-profile override blocks. Define once for each
 # profile so the same caps apply locally and in CI.
+#
+# The seven binaries subtracted from `cli-integration` open `Store` directly
+# instead of going through `StoreProxy`, so they never call `ensure_daemon`
+# and never spawn — 68 of the 114 integration tests, capped for nothing.
+# Subtracting by name rather than listing the spawning binaries keeps the
+# failure safe: a new test binary lands in the capped group by default.
 
 [[profile.default.overrides]]
 filter = 'test(/^mcp::/)'
@@ -142,7 +150,16 @@ filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
 [[profile.default.overrides]]
-filter = 'kind(test)'
+filter = '''
+  kind(test)
+  - binary(resolver_fixtures)
+  - binary(blast_radius_fixtures)
+  - binary(enforcement_tests)
+  - binary(rust_resolver_regression)
+  - binary(surrealkv_tx_size_spike)
+  - binary(eval_corpus)
+  - binary(cluster_repair_diag)
+'''
 test-group = 'cli-integration'
 
 [[profile.ci.overrides]]
@@ -158,7 +175,16 @@ filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
 [[profile.ci.overrides]]
-filter = 'kind(test)'
+filter = '''
+  kind(test)
+  - binary(resolver_fixtures)
+  - binary(blast_radius_fixtures)
+  - binary(enforcement_tests)
+  - binary(rust_resolver_regression)
+  - binary(surrealkv_tx_size_spike)
+  - binary(eval_corpus)
+  - binary(cluster_repair_diag)
+'''
 test-group = 'cli-integration'
 
 [[profile.stress.overrides]]
@@ -174,5 +200,14 @@ filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
 [[profile.stress.overrides]]
-filter = 'kind(test)'
+filter = '''
+  kind(test)
+  - binary(resolver_fixtures)
+  - binary(blast_radius_fixtures)
+  - binary(enforcement_tests)
+  - binary(rust_resolver_regression)
+  - binary(surrealkv_tx_size_spike)
+  - binary(eval_corpus)
+  - binary(cluster_repair_diag)
+'''
 test-group = 'cli-integration'
