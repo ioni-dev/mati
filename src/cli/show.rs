@@ -1145,13 +1145,14 @@ async fn run_enforcement_history(
         None => 0,
     };
 
-    // Pull all events via the proxy (routes through the daemon socket if it's
-    // running, otherwise opens the store directly), then filter by since_ms.
-    let all_events = proxy.scan_enforcement_events(0, u64::MAX).await?;
-    let events: Vec<_> = all_events
-        .into_iter()
-        .filter(|e| e.recorded_at_ms >= since_ms)
-        .collect();
+    // Bounded scan via the proxy (daemon socket if one is running, direct store
+    // otherwise). `--since` binary-searches to the boundary instead of reading
+    // the whole chain; `u64::MAX` leaves the upper bound open, so the window is
+    // identical to the scan-then-filter this replaced.
+    let events = proxy
+        .scan_enforcement_events_since_ms(since_ms, u64::MAX)
+        .await?
+        .events;
 
     // Apply filters
     let filtered: Vec<_> = events

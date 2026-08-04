@@ -154,16 +154,17 @@ async fn enforcement_metrics_30d(
     // Route through the proxy (not `direct_store()`) so metrics render whether
     // or not a daemon holds the store — the daemon is the recommended prod
     // config, and previously the whole Enforcement section silently vanished
-    // under it. The proxy command filters by seq; scan all and window by ms here
-    // to match `scan_events_since` semantics (last 30 days).
-    match store.scan_enforcement_events(0, u64::MAX).await {
-        Ok(mut events) => {
-            events.retain(|e| e.recorded_at_ms >= since_ms);
-            Some((
-                mati_core::store::enforcement::aggregate_event_counts(&events),
-                mati_core::store::enforcement::derive_enforcement_metrics(&events),
-            ))
-        }
+    // under it. Bounded scan (binary search to the 30d boundary, forward read
+    // from there) avoids reading the entire unbounded enforcement chain just
+    // to discard everything older than 30 days.
+    match store
+        .scan_enforcement_events_since_ms(since_ms, now_ms)
+        .await
+    {
+        Ok(scan) => Some((
+            mati_core::store::enforcement::aggregate_event_counts(&scan.events),
+            mati_core::store::enforcement::derive_enforcement_metrics(&scan.events),
+        )),
         Err(e) => {
             tracing::debug!("enforcement event scan failed: {e}");
             None

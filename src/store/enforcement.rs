@@ -2564,4 +2564,78 @@ mod tests {
             "v1 and v2 canonical forms must differ (14 vs 15 fields)"
         );
     }
+
+    /// Write an event straight into the store at a given seq/timestamp,
+    /// bypassing `record_event`'s hash chain (irrelevant to scan windowing).
+    async fn put_event_at(store: &Store, seq_no: u64, recorded_at_ms: u64) {
+        let event = EnforcementEvent {
+            seq_no,
+            recorded_at_ms,
+            ..frozen_test_event()
+        };
+        let key = format!("{EVENT_PREFIX}{seq_no:020}");
+        store
+            .put_raw(&key, &serde_json::to_vec(&event).unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// `mati stats` used to call `scan_enforcement_events(0, u64::MAX)` and
+    /// `retain` everything older than 30 days — an unbounded scan of the whole
+    /// chain. It now calls `scan_enforcement_events_since_ms`, the bounded
+    /// primitive `policy.rs` already uses. This proves the bounded scan returns
+    /// exactly the set the old scan-then-retain produced for events inside the
+    /// window (inclusive at both the `since_ms` and `until_ms` boundary), and
+    /// that it does not read past the window to get there.
+    #[tokio::test]
+    async fn scan_since_ms_matches_legacy_scan_then_retain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // seq_no order must track recorded_at_ms order — the bounded scan
+        // binary-searches the timestamp boundary assuming that invariant.
+        let timestamps: &[(u64, u64)] = &[
+            (1, 1_000),  // before the window
+            (2, 1_999),  // one ms before since_ms — excluded
+            (3, 2_000),  // exactly since_ms — included (inclusive lower bound)
+            (4, 2_001),  // inside the window
+            (5, 3_000),  // inside the window
+            (6, 5_000),  // exactly until_ms (now) — included (inclusive upper bound)
+            (7, 5_001),  // one ms after until_ms — excluded
+            (8, 9_000),  // well after the window
+            (9, 20_000), // well after the window
+        ];
+        for &(seq, ts) in timestamps {
+            put_event_at(&store, seq, ts).await;
+        }
+
+        let since_ms = 2_000;
+        let until_ms = 5_000;
+
+        // Old behavior: scan everything, retain by the lower bound the code
+        // actually applied. `mati stats` never had an upper-bound filter, but
+        // for events at or before "now" (the only valid case — a recorded
+        // event cannot postdate the moment `stats` computes `now`) that has
+        // the same effect as also retaining `<= until_ms`.
+        let mut legacy = scan_enforcement_events(&store, 0, u64::MAX).await.unwrap();
+        legacy.retain(|e| e.recorded_at_ms >= since_ms && e.recorded_at_ms <= until_ms);
+        let legacy_seqs: Vec<u64> = legacy.iter().map(|e| e.seq_no).collect();
+
+        let bounded = scan_enforcement_events_since_ms(&store, since_ms, until_ms)
+            .await
+            .unwrap();
+        let bounded_seqs: Vec<u64> = bounded.events.iter().map(|e| e.seq_no).collect();
+
+        assert_eq!(bounded_seqs, legacy_seqs);
+        assert_eq!(bounded_seqs, vec![3, 4, 5, 6]);
+
+        // Must not walk past the window to get there: only seq 3..=7 need
+        // reading (7 is read and rejected to confirm the boundary, then the
+        // scan stops) — seq 8 and 9 are never touched.
+        assert!(
+            bounded.scanned_keys <= 5,
+            "scan read past the until_ms boundary: scanned_keys={}",
+            bounded.scanned_keys
+        );
+    }
 }
