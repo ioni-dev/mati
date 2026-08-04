@@ -9,7 +9,11 @@ repository  = "https://github.com/ioni-dev/mati"
 homepage    = "https://getmati.dev"
 keywords    = ["ai", "mcp", "claude", "knowledge", "developer-tools"]
 categories  = ["command-line-utilities", "development-tools"]
-exclude     = [".claude/", "docs/", "*.md"]
+exclude     = [".claude/", "docs/", "*.md", "fuzz/"]
+
+[lints.rust]
+# `cargo fuzz` sets --cfg fuzzing automatically; see src/hooks/decide.rs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 # ─────────────────────────────────────────────
 # Targets

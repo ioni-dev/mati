@@ -1,0 +1,42 @@
+[package]
+name = "mati-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+# The package is `mati`; its lib target is `mati_core`. Cargo matches path
+# dependencies on package name, so the rename is required.
+[dependencies.mati_core]
+path = ".."
+package = "mati"
+
+[[bin]]
+name = "classify_command"
+path = "fuzz_targets/classify_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "effective_command"
+path = "fuzz_targets/effective_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract_apply_patch_files"
+path = "fuzz_targets/extract_apply_patch_files.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace so `cargo fuzz` never pulls this crate's deps
+# (nightly-only libfuzzer-sys) into the parent package's resolution.
+[workspace]

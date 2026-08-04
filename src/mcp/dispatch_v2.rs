@@ -925,6 +925,7 @@ async fn dispatch_session_side(
                 protocol::SessionEvent::PolicyConsultHit => "compliance:allow_after_receipt_",
                 protocol::SessionEvent::PolicySteered => "analytics:policy_steer_",
                 protocol::SessionEvent::WrappedDbClientMiss => "compliance:wrapped_db_client_miss_",
+                protocol::SessionEvent::TombstoneBypassedDeny => "compliance:tombstone_bypass_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -1141,6 +1142,26 @@ async fn dispatch_session_side(
                         None,
                         "wrapped_client_unclassifiable".to_string(),
                         input.decision_basis_hash.clone(),
+                    )
+                    .await;
+                }
+                // The `FileDeleted` bypass already decided `Tombstone` (allow)
+                // before this event fires — nothing here changes that. This
+                // only records that the bypass suppressed a deny a qualifying
+                // confirmed gotcha would otherwise have produced, same
+                // "detected after the fact, no decision changes" shape as
+                // `CodexShellMiss`.
+                protocol::SessionEvent::TombstoneBypassedDeny => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::BypassDetected,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "tombstone_file_deleted".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
                     )
                     .await;
                 }
@@ -2705,6 +2726,7 @@ mod tests {
                 gotcha_record,
             )]),
             already_consulted,
+            file_exists: None,
         });
         assert!(
             matches!(result.decision, crate::hooks::decide::Decision::Deny { .. }),

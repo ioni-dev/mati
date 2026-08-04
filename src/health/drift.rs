@@ -16,16 +16,16 @@
 //! so detection costs one map lookup per affected file and adds nothing to
 //! `mati init`.
 //!
-//! It deliberately stays out of the staleness composite. Two reasons, both
-//! about not disabling enforcement:
+//! It deliberately stays out of the staleness composite. Two reasons:
 //!
-//! 1. `hooks::decide::evaluate` returns `Decision::Tombstone` (unconditional
-//!    pass-through) at file staleness tier `tombstone`, and returns
-//!    `Decision::Liability` — an allow — at tier `liability`, *before* it ever
-//!    reaches the gotcha loop. A gotcha whose staleness crosses 0.4 also
-//!    raises `cascade_factor` on every file that links it, which feeds that
-//!    same file tier. Weight added here could therefore switch the gate off
-//!    for the exact records it is meant to flag.
+//! 1. A gotcha's own staleness feeds `cascade_factor` on every file that
+//!    links it (ARCHITECTURE.md section 17). Weight added here would raise
+//!    that factor and could push a linked file's tier into `Liability` or
+//!    `Tombstone`, which degrades what `hooks::decide::evaluate` injects for
+//!    it — `Liability` shows a bare warning, `Tombstone` suppresses the
+//!    record entirely (section 10.1). Enforcement itself would be unaffected
+//!    (the gotcha loop runs ahead of the tier checks), but the linked files'
+//!    context would go dark for a fact that says nothing about them.
 //! 2. `StalenessAnalyzer::compute_staleness` rebuilds `staleness.signals` from
 //!    scratch on every pass, so a drift signal parked there would be erased by
 //!    the next `mati init` — a fact that silently decays is worse than no

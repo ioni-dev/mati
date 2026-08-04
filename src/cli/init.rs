@@ -407,9 +407,11 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // A gotcha binds to a file by the exact `affected_files` string, so a
     // `git mv` silently unbinds it: `file:<new>` is minted fresh with no
     // gotcha_keys and `file:<old>` is orphaned. Enforcement does not merely
-    // lapse — `StalenessAnalyzer` tombstones the orphan and `hooks::decide`
-    // returns `Decision::Tombstone` (pass through unconditionally) for a
-    // tombstoned record, so the gate degrades to an explicit allow.
+    // lapse — `StalenessAnalyzer` sets `FileDeleted` on the orphan (the old
+    // path no longer exists on disk) and `hooks::decide` treats that literal
+    // signal, not the tombstone tier by itself, as its one enforcement
+    // bypass. So the gate still degrades to an explicit allow here — because
+    // the file is gone, not merely because its staleness crossed 0.9.
     //
     // Runs before §8c so the back-fill sees the re-keyed `affected_files` and
     // links the gotcha onto the `file:<new>` record this run is about to write.
@@ -2667,6 +2669,7 @@ mod tests {
                 serde_json::to_value(&stored).unwrap(),
             )]),
             already_consulted: false,
+            file_exists: None,
         })
         .decision;
         assert!(
@@ -2731,6 +2734,7 @@ mod tests {
                 .ok(),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         });
         assert!(matches!(before.decision, Decision::Allow));
 
@@ -2752,6 +2756,7 @@ mod tests {
                 serde_json::to_value(&gotcha).unwrap(),
             )]),
             already_consulted: false,
+            file_exists: None,
         });
         assert!(
             matches!(after.decision, Decision::Deny { .. }),

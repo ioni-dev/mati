@@ -47,13 +47,13 @@
   },
   {
     "id": "dec-tombstone-beats-gotcha",
-    "label": "benign",
+    "label": "violation",
     "rel_path": "src/deleted_with_gotcha.rs",
     "file_record": {"staleness": {"value": 0.99, "tier": "tombstone"}, "payload": {"gotcha_keys": ["g-z"]}},
     "gotcha_records": {"g-z": {"value": "rule", "confidence": {"value": 0.9}, "quality": {"value": 0.9}, "payload": {"confirmed": true}}},
     "already_consulted": false,
-    "expect": "tombstone",
-    "note": "precedence: tombstone short-circuits BEFORE the gotcha check -> Tombstone, not Deny"
+    "expect": "deny",
+    "note": "precedence: a qualifying gotcha runs BEFORE the tombstone-tier check -> Deny, not Tombstone. Staleness gates injection, not enforcement; only a literal FileDeleted signal (absent here) bypasses the gotcha loop"
   },
   {
     "id": "dec-liability",
@@ -108,5 +108,16 @@
     "already_consulted": false,
     "expect": "advisory",
     "note": "robustness: a dangling gotcha key with no record is skipped -> Advisory"
+  },
+  {
+    "id": "dec-file-restored-stale-signal-denies",
+    "label": "violation",
+    "rel_path": "src/restored.rs",
+    "file_record": {"staleness": {"value": 0.99, "tier": "tombstone", "signals": ["file_deleted"]}, "confidence": {"value": 0.8}, "quality": {"value": 0.6}, "payload": {"gotcha_keys": ["g-restored"]}},
+    "gotcha_records": {"g-restored": {"value": "rule", "confidence": {"value": 0.9}, "quality": {"value": 0.9}, "payload": {"confirmed": true}}},
+    "already_consulted": false,
+    "file_exists": true,
+    "expect": "deny",
+    "note": "a FileDeleted signal is a stale snapshot; once the caller confirms the path exists (delete-then-restore), it must not bypass a qualifying confirmed gotcha -> Deny, not Tombstone"
   }
 ]

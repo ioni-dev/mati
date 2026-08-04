@@ -4,6 +4,12 @@
 .mati/
 
 /target/
+fuzz/target/
+fuzz/artifacts/
+# libFuzzer writes ~1200 hash-named files here per run. The committed seeds
+# stay tracked (gitignore does not affect tracked files); add a new one with
+# `git add -f`.
+fuzz/corpus/
 .DS_Store
 *.swp
 *.swo
