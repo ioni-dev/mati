@@ -230,6 +230,39 @@ mod tests {
         }
     }
 
+    /// The vendored ripgrep tree is test input: skip it when walking mati,
+    /// while preserving the ability to walk it when it is itself the root.
+    #[test]
+    fn walker_skips_vendored_fixture_only_from_project_root() {
+        let project_files = Walker::new(project_root())
+            .walk()
+            .expect("walker failed on project root");
+        let fixture_root = project_root().join("tests/fixtures/real_world/ripgrep");
+        let fixture_files = Walker::new(&fixture_root)
+            .walk()
+            .expect("walker failed on ripgrep fixture root");
+
+        let fixture_prefix = "tests/fixtures/real_world/";
+        let fixture_paths: Vec<_> = project_files
+            .iter()
+            .filter(|file| file.rel_path.starts_with(fixture_prefix))
+            .collect();
+        assert_eq!(
+            fixture_paths.len(),
+            0,
+            "project-root walk returned fixture paths: {:?}",
+            fixture_paths
+                .iter()
+                .map(|file| file.rel_path.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            fixture_files.len() >= 200,
+            "fixture-root walk should include the vendored tree, found {} files",
+            fixture_files.len()
+        );
+    }
+
     // ── Test 3: Parser parses real Rust files ───────────────────────────────
 
     /// Proves tree-sitter parsing works on real Rust code: no panics, produces

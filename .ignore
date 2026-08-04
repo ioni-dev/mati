@@ -1,0 +1,2 @@
+# Vendored real-world fixtures are test inputs, not mati project source.
+tests/fixtures/real_world/ripgrep/
