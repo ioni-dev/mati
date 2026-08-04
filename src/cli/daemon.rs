@@ -1467,8 +1467,7 @@ fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
 /// defense-in-depth for a log the trim hasn't reached yet.
 fn recorded_serve_pids(root: &Path) -> std::collections::HashSet<u32> {
     let mut live = std::collections::HashSet::new();
-    let Ok(contents) = read_tail(&root.join("lifecycle.log"), RECORDED_SERVE_SCAN_MAX_BYTES)
-    else {
+    let Ok(contents) = read_tail(&root.join("lifecycle.log"), RECORDED_SERVE_SCAN_MAX_BYTES) else {
         return live;
     };
     for line in contents.lines() {
