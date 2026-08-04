@@ -119,11 +119,20 @@ fn run_init(repo: &PathBuf) -> (String, String) {
     (stdout, slug)
 }
 
+/// Stop the daemon for a fixture repo using the same cwd and MATI_HOME as the
+/// commands that touched its store.
+fn stop_daemon(repo: &std::path::Path) {
+    let _daemon_guard = common::DaemonGuard::for_mati_home(repo, common::mati_home());
+}
+
 /// Delete the mati store for a given slug so the next `mati init` is fresh.
-fn clean_store(slug: &str) {
+fn clean_store(repo: &std::path::Path, slug: &str) {
     if slug.is_empty() {
         return;
     }
+    // `mati daemon stop` derives the slug from cwd. Stop before removing the
+    // directory so a live daemon never keeps an unlinked store open.
+    stop_daemon(repo);
     let store_dir = common::mati_home().join(slug);
     if store_dir.exists() {
         let _ = std::fs::remove_dir_all(&store_dir);
@@ -135,7 +144,7 @@ fn fresh_init(repo: &PathBuf) -> (String, String) {
     // First run to discover the slug (may be incremental).
     let (_, slug) = run_init(repo);
     // Clean the store so next init is fresh.
-    clean_store(&slug);
+    clean_store(repo, &slug);
     // Second run: full fresh scan.
     run_init(repo)
 }
@@ -173,6 +182,9 @@ fn run_show(repo: &PathBuf, key: &str) -> Option<String> {
         .current_dir(repo)
         .output()
         .ok()?;
+    // `show` uses StoreProxy and may auto-start a detached daemon. The result
+    // is complete once the subprocess exits, so release that daemon here.
+    stop_daemon(repo);
     if !output.status.success() {
         return None;
     }
@@ -708,17 +720,19 @@ fn real_world_hcl_resolution() {
     let edges = parse_edge_count(&output);
     let files = parse_file_count(&output);
 
-    // Vendored measurement 2026-08-03: 370 files and 189 edges across repeated
-    // fresh runs on identical input. The deterministic Go resolver now chooses
-    // the alphabetically first non-test file in each package. Floor is ~5% below
-    // the stable measurement.
+    // Vendored measurement 2026-08-03: 370 files and exactly 189 edges across
+    // five fresh runs on identical input. The fixture is frozen and the Go
+    // resolver now chooses the alphabetically first non-test file in each
+    // package, so there is no environmental drift to tolerate. Keep exact
+    // equality: a grammar/dependency change may legitimately move the count,
+    // but it must trigger an explicit baseline review rather than pass silently.
     assert!(
         files >= 351,
         "hcl should index at least 351 files (baseline 370), got {files}"
     );
-    assert!(
-        edges >= 180,
-        "hcl resolution regressed: expected >= 180 edges (stable baseline 189), got {edges}"
+    assert_eq!(
+        edges, 189,
+        "hcl resolution changed: expected exactly 189 edges (frozen deterministic baseline), got {edges}"
     );
 
     eprintln!("[real_world_hcl] files={files} edges={edges}");
