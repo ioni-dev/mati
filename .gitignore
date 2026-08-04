@@ -30,6 +30,7 @@ DECISIONS.md
 mati\ -\ readme.md
 
 *.md
+!tests/fixtures/real_world/**
 
 # Public OSS-release docs — override the *.md ignore above
 !CONTRIBUTING.md

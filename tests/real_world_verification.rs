@@ -1,11 +1,13 @@
 //! Real-world verification tests that run mati against external open-source
 //! codebases to catch silent resolver and blast radius regressions on real code.
 //!
-//! These tests are marked `#[ignore]` because they require cloning external
-//! repositories from GitHub, which is too expensive for normal `cargo test` runs.
+//! These tests are marked `#[ignore]` because real-repository initialization is
+//! too expensive for normal `cargo test` runs. Most targets also clone from
+//! GitHub; the ripgrep target uses the tracked fixture under
+//! `tests/fixtures/real_world/ripgrep` when present.
 //! Run them explicitly with:
 //!
-//!     cargo test --test real_world_verification -- --ignored
+//!     cargo nextest run --test real_world_verification --run-ignored only
 //!
 //! Run before every release to catch silent correctness drift.
 //!
@@ -76,6 +78,16 @@ fn clone_or_reuse(name: &str, url: &str) -> PathBuf {
         assert!(status.success(), "failed to clone {url}");
     }
     dir
+}
+
+fn verification_repo(name: &str, url: &str) -> PathBuf {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/real_world")
+        .join(name);
+    if fixture.is_dir() {
+        return fixture;
+    }
+    clone_or_reuse(name, url)
 }
 
 /// Run `mati init` and return (init_stdout, slug).
@@ -219,25 +231,25 @@ fn parse_blast_direct(show_output: &str) -> usize {
 // data in ~/.mati/<slug>/ and parallel inits on the same slug deadlock.
 
 #[test]
-#[ignore = "real_world: requires network and external repos"]
+#[ignore = "real_world: expensive verification"]
 fn real_world_ripgrep() {
-    let repo = clone_or_reuse("ripgrep", "https://github.com/BurntSushi/ripgrep");
+    let repo = verification_repo("ripgrep", "https://github.com/BurntSushi/ripgrep");
     let (output, _slug) = fresh_init(&repo);
 
     // ── Resolution rate ─────────────────────────────────────────────────
     let edges = parse_edge_count(&output);
     let files = parse_file_count(&output);
 
-    assert!(
-        files >= 50,
-        "ripgrep should index at least 50 files, got {files}"
-    );
-
-    // Baseline 2026-08-04: 142 edges, 231 files (brace decomposition + cross-crate).
-    // The old 342 counted edge writes attempted, not edges — `use` lines in one
-    // file routinely resolve to the same target and storage collapsed the
+    // Baseline measured 2026-08-03 against the complete vendored fixture:
+    // 142 edges, 231 indexed files (brace decomposition + cross-crate). The old 342
+    // counted edge writes attempted, not edges — `use` lines in one file
+    // routinely resolve to the same target and storage collapsed the
     // duplicates. c96af87 made the reported number match what the store holds.
-    // Floor set ~5% below measured rate: 135 edges minimum.
+    // Floors are ~5% below the vendored measurement.
+    assert!(
+        files >= 219,
+        "ripgrep file scan regressed: expected >= 219 files (baseline 231), got {files}"
+    );
     assert!(
         edges >= 135,
         "ripgrep resolution regressed: expected >= 135 edges (baseline 142), got {edges}"
@@ -246,8 +258,9 @@ fn real_world_ripgrep() {
     eprintln!("[real_world_ripgrep] files={files} edges={edges}");
 
     // ── Hub file blast radius ───────────────────────────────────────────
-    // grep_matcher is the most-imported crate in the workspace (used by
-    // searcher, regex, printer, pcre2, and others).
+    // Vendored baseline: high tier, 17 direct importers. grep_matcher is the
+    // most-imported crate in the workspace (used by searcher, regex, printer,
+    // pcre2, and others).
     let key = "file:crates/matcher/src/lib.rs";
     let show_out = run_show(&repo, key)
         .unwrap_or_else(|| panic!("{key} not found — ripgrep may have restructured"));
@@ -259,8 +272,8 @@ fn real_world_ripgrep() {
         "ripgrep grep-matcher lib.rs should be moderate or higher, got tier={tier}"
     );
     assert!(
-        direct >= 4,
-        "ripgrep grep-matcher lib.rs should have >= 4 direct importers (baseline 6), got {direct}"
+        direct >= 16,
+        "ripgrep grep-matcher lib.rs should have >= 16 direct importers (baseline 17), got {direct}"
     );
 
     eprintln!("[real_world_ripgrep] {key} tier={tier} direct={direct}");
