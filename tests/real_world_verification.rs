@@ -29,7 +29,7 @@
 //!
 //! | Codebase      | Edges | Resolution | Hub tier              | Notes                              |
 //! |---------------|-------|------------|-----------------------|------------------------------------|
-//! | ripgrep       |   342 | intra+cross| grep_matcher moderate | brace decomposition + cross-crate  |
+//! | ripgrep       |   142 | intra+cross| grep_matcher moderate | brace decomposition + cross-crate  |
 //! | httpx         |   122 | ~100%      | __init__.py high      | healthy                            |
 //! | vitest        |  2147 | ~97%       | core.ts critical      | healthy                            |
 //! | nlohmann-json |   619 | ~84%       | json.hpp critical     | angle-bracket fix (Phase 2)        |
@@ -262,9 +262,12 @@ fn real_world_ripgrep() {
         files >= 219,
         "ripgrep file scan regressed: expected >= 219 files (baseline 231), got {files}"
     );
-    assert!(
-        edges >= 135,
-        "ripgrep resolution regressed: expected >= 135 edges (baseline 142), got {edges}"
+    // Exact, not a floor: the tree is vendored and frozen, so nothing drifts
+    // but mati itself. A grammar or dependency change may legitimately move
+    // this — it should force a baseline review, not pass silently.
+    assert_eq!(
+        edges, 142,
+        "ripgrep resolution changed: expected exactly 142 edges (frozen deterministic baseline), got {edges}"
     );
 
     eprintln!("[real_world_ripgrep] files={files} edges={edges}");
@@ -320,9 +323,10 @@ fn real_world_httpx() {
         files >= 109,
         "httpx should index at least 109 files (baseline 115), got {files}"
     );
-    assert!(
-        edges >= 115,
-        "httpx resolution regressed: expected >= 115 edges (baseline 122), got {edges}"
+    // Exact — see the note in real_world_ripgrep.
+    assert_eq!(
+        edges, 122,
+        "httpx resolution changed: expected exactly 122 edges (frozen deterministic baseline), got {edges}"
     );
 
     eprintln!("[real_world_httpx] files={files} edges={edges}");
@@ -579,9 +583,10 @@ fn real_world_sinatra_resolution() {
         files >= 274,
         "sinatra should index at least 274 files (baseline 289), got {files}"
     );
-    assert!(
-        edges >= 126,
-        "sinatra resolution regressed: expected >= 126 edges (baseline 133), got {edges}"
+    // Exact — see the note in real_world_ripgrep.
+    assert_eq!(
+        edges, 133,
+        "sinatra resolution changed: expected exactly 133 edges (frozen deterministic baseline), got {edges}"
     );
 
     eprintln!("[real_world_sinatra] files={files} edges={edges}");
@@ -777,9 +782,10 @@ fn real_world_jsoup_resolution() {
         files >= 238,
         "jsoup should index at least 238 files (baseline 251), got {files}"
     );
-    assert!(
-        edges >= 693,
-        "jsoup resolution regressed: expected >= 693 edges (baseline 730), got {edges}"
+    // Exact — see the note in real_world_ripgrep.
+    assert_eq!(
+        edges, 730,
+        "jsoup resolution changed: expected exactly 730 edges (frozen deterministic baseline), got {edges}"
     );
 
     eprintln!("[real_world_jsoup] files={files} edges={edges}");
