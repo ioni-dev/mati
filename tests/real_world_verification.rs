@@ -233,11 +233,14 @@ fn real_world_ripgrep() {
         "ripgrep should index at least 50 files, got {files}"
     );
 
-    // Baseline 2026-04-14: 342 edges, 214 files (brace decomposition + cross-crate).
-    // Floor set ~5% below measured rate: 325 edges minimum.
+    // Baseline 2026-08-04: 142 edges, 231 files (brace decomposition + cross-crate).
+    // The old 342 counted edge writes attempted, not edges — `use` lines in one
+    // file routinely resolve to the same target and storage collapsed the
+    // duplicates. c96af87 made the reported number match what the store holds.
+    // Floor set ~5% below measured rate: 135 edges minimum.
     assert!(
-        edges >= 325,
-        "ripgrep resolution regressed: expected >= 325 edges (baseline 342), got {edges}"
+        edges >= 135,
+        "ripgrep resolution regressed: expected >= 135 edges (baseline 142), got {edges}"
     );
 
     eprintln!("[real_world_ripgrep] files={files} edges={edges}");
