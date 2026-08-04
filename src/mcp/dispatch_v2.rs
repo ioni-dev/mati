@@ -2676,7 +2676,7 @@ mod tests {
 
         let g = graph.read().await;
         let already_consulted =
-            crate::store::session::check_consulted_recent(&g.store(), key, 900, None)
+            crate::store::session::check_consulted_recent(g.store(), key, 900, None)
                 .await
                 .unwrap();
         assert!(
