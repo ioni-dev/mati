@@ -1188,3 +1188,57 @@ mati sets an internal deadline of 2,500ms with `HOOK_DEADLINE_MS`. That leaves a
 **`with_versioning(true, 0)` on `knowledge.db` means indefinite retention.**
 
 The `0` argument is not “disabled.” It means retain all versions forever. This is intentional for knowledge records. Sessions use the 90-day retention value. Do not change the `knowledge.db` versioning config unless you understand the storage implications.
+
+---
+
+## 25. Scale Budget
+
+Numbers on when this stops being "just a KV store on disk." Ground truth where it exists; everything else is labeled as derived or assumed.
+
+### 25.1 Store size
+
+`knowledge.db` uses `with_versioning(true, 0)` — indefinite retention, never compacted away (section 21, section 24). Growth has two shapes in the same tree:
+
+- **Mutable keys** (`gotcha:*` `file:*` `decision:*` `stage:*` `dev_note:*` `dep:*` `policy:*`): every write is a new full version. Growth is proportional to edit churn on the keys actually touched, not to repo size — a file nobody edits after `mati init` stays at one version forever.
+- **`enforcement:event:*`**: append-only, one unique key per event, no version multiplication — but no prune path either (section 25.3).
+
+| Measurement | Value | Basis |
+| --- | --- | --- |
+| Fresh init, zero history, rust repo (58,378 source files, 58,736 records) | 182.3MB | measured, `BENCHMARKS.md` |
+| → average bytes per record-version | ~3.2KB | derived (182.3MB / 58,736) |
+| This repo's live store (`~/.mati/<slug>`), ~13h of one active dev session | knowledge.db 2.4MB + sessions.db 1.0MB + search_index 192KB ≈ 3.6MB total | measured, `du -sh` |
+| Same session's write rate | 426 new record-versions in a 30-day window (effectively one day) | measured, `mati stats` |
+
+At ~3.2KB/version and this session's rate, one heavily tool-driven dev-day adds on the order of 1-2MB. That's an upper bound, not a typical pace — most of those 426 writes came from automated tooling, not a human at a keyboard. "MB/week per real developer" is the right order of magnitude, not "MB/day."
+
+What "a problem" means concretely here is not disk space — a multi-GB store is nothing on modern hardware — it's linear-scan latency. `mati export --format json` took 226ms on the 182.3MB fresh store (`BENCHMARKS.md`); most other commands (`stats`, `gaps`, `status`) are cache-backed via `health_write_seq` and stay near O(1) regardless of store size (`BENCHMARKS.md` Phase 2/3), but export and any other full-scan path don't get that shield. Scaling the export figure linearly — **assumption**, no larger store has been measured — puts a 2GB store's export around 2.5s and a 20GB store around 25s: uncomfortable for an interactive CLI, self-inflicted only by commands that still do a full scan. **Unmeasured**: SurrealKV compaction behavior once the live (non-collectible, because retention is indefinite) data volume is itself multi-GB. Nothing in this repo exercises that.
+
+### 25.2 Graph edges
+
+`Graph::load` (`src/graph/graph.rs:47-65`) does one `scan_keys("graph:edge:")` — a key-only range scan, no value bytes read (`src/store/db.rs:936-951`) — then one `Edge::from_key` parse plus one petgraph insert (HashMap + HashSet + `DiGraph`) per edge, entirely in memory.
+
+The real ceiling isn't FLOPs, it's the daemon readiness watchdog. `Graph::load` runs inside `mati daemon`'s startup (`src/cli/daemon.rs:348`), between the `phase=store_opened` and `phase=ready` lifecycle events — and **no intermediate event is emitted** for graph load, the dirty-queue auto-drain, or the policy-matcher load that follow it in the same window (`src/cli/daemon.rs:313-401`). `wait_for_ready` calls the daemon `Wedged` if `lifecycle.log` stops growing for 15s (`READINESS_WEDGE_THRESHOLD`, `src/mcp/daemon_lifecycle.rs:67`) and gives up entirely (`HardCap`) at 60s (line 61) — regardless of whether the daemon is still silently making progress. A graph load slow enough to blow through 15s reads as a hung daemon, not a big one.
+
+Edge-count sources are all structurally bounded, which is why this is unlikely to bite soon:
+
+- `HasGotcha` — one per confirmed gotcha. Confirmation is a manual step (`mati gotcha confirm` / developer review), so this scales with review throughput, not repo size.
+- `CoChanges` — capped per commit by `MAX_COMMIT_FILES = 50` (`src/analysis/git.rs:44`) → ≤1,225 pairs/commit, further cut by a co-change ratio threshold (`src/analysis/git.rs:313-318`). Linear in commit count at worst, not combinatorial in file count.
+- `Imports` — bounded by files × imports/file, recomputed (not accumulated) on every `mati init`.
+
+The measured init on the 58k-file rust repo produced only 80 edges (dependency edges at that init depth), so it says nothing about load time at high edge counts — that's unmeasured territory. **Assumption**, labeled: a HashMap insert + HashSet insert + `DiGraph` edge add for a short string key runs on the order of 1-2μs in Rust. On that basis: 100k edges ≈ 0.1-0.2s (no issue), 1M edges ≈ 1-2s (comfortably inside Wedged), 5-10M edges ≈ 5-20s (starts to cross the 15s Wedged threshold, especially stacked with the separate 10s `AUTO_DRAIN_TIMEOUT` budget for the dirty-queue drain running in the same gap, `src/mcp/server.rs:455`). Reaching millions of edges needs a genuinely large, long-lived monorepo with a dense import graph — not a near-term risk for a single-repo instance, but real for very large ones.
+
+### 25.3 Event log length
+
+`enforcement:event:*` is append-only and hash-chained, stored in `knowledge.db` (Immediate durability by default — `src/store/durability.rs`). `enforce_retention` (`src/store/enforcement.rs:1303`) is the only prune logic that exists, and it has no production caller — confirmed by `src/invariants.rs`'s caller-claim test (`every_documented_caller_claim_has_a_caller`, `src/invariants.rs:1305`), which names `enforce_retention` as the sanctioned exception rather than a bug to fix. There is no working prune path today, full stop; do not wire one up to silence that test (`src/invariants.rs:1335`) — that's a behavior change and needs its own review.
+
+Both consumers that need the full chain call `scan_enforcement_events(store, 0, u64::MAX)` unconditionally (`src/store/enforcement.rs:871-911`): `mati verify-chain` (`src/cli/verify_chain.rs:37`) and `mati history --enforcement`, even with `--limit` (`src/cli/show.rs:1150`). That's one key scan, then one separate `get_raw_bytes` call per event — each opens its own read-only transaction (`src/store/db.rs:749-756`) — one JSON deserialize per event, and, for `verify-chain`, one SHA-256 recompute per event to check tamper and linkage (`src/store/enforcement.rs:424-479`). `--limit N` on `mati history --enforcement` filters *after* loading everything (`src/cli/show.rs:1132-1175`); it does not bound the scan.
+
+This is the one place in the codebase that never got the equivalent of the fix already applied to `StalenessAnalyzer::analyze_all`: a resumable cursor plus a hard 2000ms deadline (`ANALYZE_TIME_BUDGET_MS`, `src/health/staleness.rs:236`, `src/health/staleness.rs:337` onward), added specifically because an unbounded full scan doesn't hold up at scale. The enforcement scan path never got that treatment.
+
+Measured: this repo's live store recorded 204 enforcement events in a 30-day window that's effectively one active dev-day (`mati stats`) — a burst rate from heavy tool use, an upper bound rather than a steady-state number. **Unmeasured** beyond that: nothing in this repo has run `verify-chain` or `mati history --enforcement` against a chain with more than a few hundred events, so the point where the per-event transaction-plus-JSON-plus-SHA-256 cost turns into seconds rather than milliseconds is a derived guess, not a benchmark. What's certain: this is the only one of the three limits in this section with zero mitigation in the code today — no cursor, no deadline, no working prune.
+
+### 25.4 What breaks first
+
+1. **Event log** breaks first. It has no natural throttle (unlike `HasGotcha` edges, gated by human confirmation), no cache shield (unlike `stats`/`status`), no resumable-scan fix (unlike staleness analysis), and no prune path at all — `enforce_retention` exists and has never been called in production.
+2. **Store size** is next. Growth is real and permanent (no compaction under indefinite retention), but self-limited by edit churn rather than repo size, and most day-to-day commands are cache-backed and stay fast regardless of store size.
+3. **Graph edges** last. All three edge-generating paths are structurally bounded — by commit size, by file/import count, or by a manual confirmation step — so reaching a count that threatens the 15s/60s daemon-readiness ceiling needs a scale of monorepo this tool hasn't been pointed at yet.

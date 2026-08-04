@@ -33,9 +33,16 @@ const MAX_REPARSE_INCREMENT: f32 = 0.4;
 /// injection — `Liability` degrades the cached blurb to a warning,
 /// `Tombstone` suppresses it. An increment that accumulates per edit would
 /// let a few edits in one session mark a file's blurb untrustworthy, when
-/// the file was only being actively worked on, not abandoned. Git, time,
-/// dep and cascade factors still reach those tiers through
-/// [`StalenessAnalyzer::compute_staleness`].
+/// the file was only being actively worked on, not abandoned.
+///
+/// That harm is smaller now than when this constant was written: a degraded
+/// blurb precedes a file read that was about to happen anyway, not a
+/// disabled deny. It is still real — Liability also drops any blast-radius
+/// warning from the same pass, per `hooks::decide::evaluate` — and the
+/// margin under 0.7 is about maximizing signal while staying clear of the
+/// floor, not about which harm sits past it. The value does not need to
+/// change because of the reorder. Git, time, dep and cascade factors still
+/// reach those tiers through [`StalenessAnalyzer::compute_staleness`].
 const MAX_REPARSE_STALENESS: f32 = 0.69;
 
 /// Staleness increment per entry point change.
