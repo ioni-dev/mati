@@ -1,7 +1,7 @@
 //! Write the `/mati-enrich` slash command file (M-06-K).
 //!
 //! `.claude/CLAUDE.md` (see [`super::claude_md`]) tells Claude to
-//! "Run /mati-enrich [path]", but nothing ever wrote
+//! "Run /mati-enrich \[path\]", but nothing ever wrote
 //! `.claude/commands/mati-enrich.md` — so typing the command failed with
 //! "no such command" even though the pipeline it should run is fully
 //! documented. This scaffolds the missing command file so the slash
@@ -41,7 +41,7 @@ or add extra verification passes beyond what those sections describe.
 /// - If `.claude/` doesn't exist, the user isn't using Claude Code — skip.
 /// - Otherwise creates `.claude/commands/` if needed and writes the command
 ///   file. Idempotent: re-running with the same content is a no-op write
-///   (see [`write_if_changed`]).
+///   (see `write_if_changed`).
 pub fn write_mati_enrich_command(project_root: &Path) -> Result<WriteResult> {
     let claude_dir = project_root.join(".claude");
     if !claude_dir.is_dir() {
