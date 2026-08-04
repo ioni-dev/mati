@@ -21,8 +21,8 @@
 //! suite checking itself, not knowledge worth capturing. Three layers:
 //! [`is_test_path`] skips whole files by naming convention (all
 //! languages), each per-language extractor skips in-file test blocks via
-//! [`collect_test_ranges`] with its own predicate, and — Rust only —
-//! [`rust::parent_declares_test_module`] skips a file whose only test
+//! `collect_test_ranges` with its own predicate, and — Rust only —
+//! `rust::parent_declares_test_module` skips a file whose only test
 //! marker is the `#[cfg(test)] mod foo;` in its parent.
 //!
 //! In-file filtering covers Rust, Go, Python, JavaScript, TypeScript,
