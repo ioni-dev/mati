@@ -2669,6 +2669,7 @@ mod tests {
                 serde_json::to_value(&stored).unwrap(),
             )]),
             already_consulted: false,
+            file_exists: None,
         })
         .decision;
         assert!(
@@ -2733,6 +2734,7 @@ mod tests {
                 .ok(),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         });
         assert!(matches!(before.decision, Decision::Allow));
 
@@ -2754,6 +2756,7 @@ mod tests {
                 serde_json::to_value(&gotcha).unwrap(),
             )]),
             already_consulted: false,
+            file_exists: None,
         });
         assert!(
             matches!(after.decision, Decision::Deny { .. }),

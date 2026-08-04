@@ -2724,6 +2724,7 @@ mod tests {
                 file_record: Some(serde_json::to_value(&file).unwrap()),
                 gotcha_records: gotchas,
                 already_consulted: false,
+                file_exists: None,
             }
         }
 

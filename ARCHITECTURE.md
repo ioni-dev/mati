@@ -432,10 +432,21 @@ Decisions are evaluated in this order:
 1. file_record is None
    -> NoRecord: log miss, allow unconditionally
 
-2. staleness.signals contains FileDeleted
+2. staleness.signals contains FileDeleted AND input.file_exists != Some(true)
    -> Tombstone: allow unconditionally, no injection. The one enforcement
       bypass — keyed on the literal signal, not the tier, since the source
       file is gone and there is nothing left to enforce against.
+      The signal is a stale snapshot (cleared only by the staleness sweep,
+      which can be many sessions behind); `file_exists` is the caller's own
+      fresher on-disk observation, populated ONLY by stat-ing the path when
+      this signal is present. `Some(true)` (path is back — delete-then-
+      restore, branch switch, `git stash pop`) skips this step and falls
+      through to step 3 instead of bypassing on stale information. `None`
+      (caller did not check) and `Some(false)` (confirmed gone) both bypass
+      as before. If a qualifying gotcha (step 3) would have denied and
+      `file_exists == Some(false)`, the bypass logs `BypassDetected`
+      (`tombstone_file_deleted`) instead of the ordinary `Miss` — enforcement
+      was suppressed, not merely a cache miss.
 
 3. any attached gotcha has (confirmed=true AND confidence >= 0.6 AND quality >= 0.4):
      a. already_consulted == true
@@ -884,7 +895,7 @@ Staleness tiers use half-open intervals.
 | Liability | [0.7, 0.9) | Injection degrades to a warning to read the file directly; enforcement unaffected  |
 | Tombstone | [0.9, 1.0] | Injection fully excluded; enforcement unaffected unless the file was deleted       |
 
-At Tombstone, the file record's own content is excluded from injection — injecting a wrong purpose blurb silently is worse than a cache miss. That is an injection rule, not an enforcement one: a confirmed gotcha still denies at both Liability and Tombstone (section 10.1). The sole unconditional pass-through is the `FileDeleted` signal — the source file is gone, so there is nothing left to enforce.
+At Tombstone, the file record's own content is excluded from injection — injecting a wrong purpose blurb silently is worse than a cache miss. That is an injection rule, not an enforcement one: a confirmed gotcha still denies at both Liability and Tombstone (section 10.1). The sole pass-through is the `FileDeleted` signal — the source file is gone, so there is nothing left to enforce — but it is not unconditional: the signal is a stale snapshot, cleared only by the staleness sweep, so a caller that confirms the path exists again (`file_exists: Some(true)`, section 10.1 step 2) is not bypassed on it.
 
 The `mati reparse` path adds staleness per pass, capped at 0.4 per pass by `MAX_REPARSE_INCREMENT`. Across passes it saturates at `MAX_REPARSE_STALENESS` (0.69) — inside Stale, below the Liability floor. Reparse never lowers a value another factor set, and the 24h preservation window in `compute_staleness` holds a recent reparse score up only as far as the same ceiling. Without that bound, editing one file a few times in a session pushed the file record to Tombstone — before section 10.1's reorder, that silently disabled enforcement of every confirmed gotcha on the file, with no event logged. Enforcement is unaffected today (the gotcha loop runs ahead of the tier check); the ceiling still matters because Tombstone still suppresses injection, and a file edited a lot in one session was never abandoned. The other four factors reach Liability on their own but cannot reach Tombstone: with `semantic_factor` stubbed, their combined maximum is 0.75. Only the `FileDeleted` override reaches Tombstone; `FileRenamed` stops at Liability.
 
@@ -957,7 +968,7 @@ There are 8 event types:
 | `Deny`                     | A pre hook blocked an unconsulted access — Claude read or edit, or a Codex shell read or `apply_patch`           |
 | `AllowAfterReceipt`        | Pre-read hook allowed a read because a valid consultation receipt exists                                         |
 | `ReceiptMinted`            | A one-time-use read receipt was created by `mem_get`                                                             |
-| `BypassDetected`           | A hook bypass was detected after the fact — `codex-post-bash` only; nothing was denied                           |
+| `BypassDetected`           | A hook bypass was detected after the fact — `codex-post-bash`, or the `FileDeleted` tombstone bypass suppressing a would-have-denied gotcha; nothing was denied |
 | `ControlChanged`           | A gotcha was created, confirmed, updated, or deleted                                                             |
 | `EnforcementConfigChanged` | A configuration setting changed. Records old and new value.                                                      |
 | `RecordingGap`             | Crash/restart gap detected on recovery. Records cause, duration, enforcement mode during the gap, and certainty. |

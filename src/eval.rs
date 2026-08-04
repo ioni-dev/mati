@@ -66,6 +66,10 @@ struct DecisionCase {
     gotcha_records: HashMap<String, serde_json::Value>,
     #[serde(default)]
     already_consulted: bool,
+    /// Caller's on-disk observation — see `EnforcementInput::file_exists`.
+    /// Absent in a case means `None`, preserving that case's prior behavior.
+    #[serde(default)]
+    file_exists: Option<bool>,
     /// Ground-truth decision variant: "allow" | "advisory" | "deny" |
     /// "already_consulted" | "liability" | "tombstone" | "no_record".
     expect: String,
@@ -208,6 +212,7 @@ fn decision_pass(c: &DecisionCase) -> bool {
         file_record: c.file_record.clone(),
         gotcha_records: c.gotcha_records.clone(),
         already_consulted: c.already_consulted,
+        file_exists: c.file_exists,
     };
     decision_variant(&evaluate(&input).decision) == c.expect
 }
@@ -384,6 +389,7 @@ mod tests {
                 }),
             )]),
             already_consulted: false,
+            file_exists: None,
             expect: "deny".into(),
             note: None,
         };

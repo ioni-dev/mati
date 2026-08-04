@@ -144,6 +144,13 @@ pub enum HookEvent {
         would: ShadowOutcome,
         action: Option<Action>,
     },
+    /// The `FileDeleted` bypass fired on a caller-confirmed deletion
+    /// (`file_exists: Some(false)`) that also suppressed a deny a qualifying
+    /// confirmed gotcha would otherwise have produced. Unlike the plain
+    /// `Miss` the bypass ordinarily emits, this reaches the hash-chained
+    /// enforcement log as `BypassDetected` — enforcement was suppressed, not
+    /// merely a cache miss.
+    TombstoneBypassedDeny { key: String },
 }
 
 /// The I/O-free subset of a daemon policy verdict needed by the hook adapter.
@@ -254,6 +261,15 @@ pub struct EnforcementInput {
     pub gotcha_records: HashMap<String, serde_json::Value>,
     /// Whether this file was already consulted via `mem_get` this session.
     pub already_consulted: bool,
+    /// Caller's own observation of whether `rel_path` exists on disk, checked
+    /// ONLY when the caller saw a `FileDeleted` staleness signal (that signal
+    /// is a stale snapshot — cleared only by the staleness sweep, so it can
+    /// outlive a delete-then-restore by many sessions). `None` means the
+    /// caller did not check (preserves prior behavior: the signal alone
+    /// bypasses enforcement). `Some(true)` means the path exists, so the
+    /// signal is stale and must NOT bypass enforcement. `Some(false)` means
+    /// the caller confirmed the path is really gone.
+    pub file_exists: Option<bool>,
 }
 
 /// Result of `evaluate()`.
@@ -835,17 +851,40 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
     // other four factors alone can cross 0.9 through ordinary drift. Gating
     // on the tier would silently reopen this bypass for a gotcha that never
     // stopped being true; gating on the signal cannot.
-    if json_has_signal(file_record, "/staleness/signals", "file_deleted") {
+    //
+    // The signal itself is a stale snapshot: it is cleared only by the
+    // staleness sweep, which can be many sessions away from a given record's
+    // turn. `input.file_exists == Some(true)` is the caller's own fresher
+    // observation that the path is back — in that case fall through to the
+    // ordinary gotcha loop below instead of bypassing on stale information.
+    if has_file_deleted_signal(file_record) && input.file_exists != Some(true) {
         // Behaviourally identical to `NoRecord` from the agent's point of
         // view — allow unconditionally, nothing injected — so it shares
-        // `NoRecord`'s event. `Hit` is wrong here: it mints a consultation
-        // receipt (see `HookEvent::Hit` doc comment and its Codex-path
-        // suppression in `cli::hook_decide::platform_events`), which would
-        // falsely mark this file "consulted" for a read that delivered no
-        // context, and could downgrade a real deny once staleness drops.
+        // `NoRecord`'s event, UNLESS the bypass is suppressing a real deny.
+        // `Hit` is wrong here: it mints a consultation receipt (see
+        // `HookEvent::Hit` doc comment and its Codex-path suppression in
+        // `cli::hook_decide::platform_events`), which would falsely mark
+        // this file "consulted" for a read that delivered no context, and
+        // could downgrade a real deny once staleness drops.
+        //
+        // Computed here, before the return, and used ONLY to pick the event
+        // — the decision below stays `Tombstone` (allow) either way. Denying
+        // instead would create an unclearable phantom: the file that would
+        // need denying does not exist, so the `mem_get` that clears a deny
+        // can never run against it.
+        let would_have_denied = input.file_exists == Some(false)
+            && any_qualifying_gotcha(
+                &json_string_array(file_record, "/payload/gotcha_keys"),
+                &input.gotcha_records,
+            );
+        let event = if would_have_denied {
+            HookEvent::TombstoneBypassedDeny { key: file_key }
+        } else {
+            HookEvent::Miss { key: file_key }
+        };
         return EnforcementResult {
             decision: Decision::Tombstone,
-            events: vec![HookEvent::Miss { key: file_key }],
+            events: vec![event],
         };
     }
 
@@ -1043,6 +1082,35 @@ fn json_has_signal(val: &serde_json::Value, pointer: &str, signal: &str) -> bool
     val.pointer(pointer)
         .and_then(|v| v.as_array())
         .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(signal)))
+}
+
+/// True if `file_record` carries the `FileDeleted` staleness signal.
+///
+/// I/O-free — this only inspects JSON already in hand. It exists so an
+/// impure caller can decide whether a stat is worth paying for (only when
+/// this returns true) before populating [`EnforcementInput::file_exists`],
+/// without duplicating the signal's pointer path and string spelling.
+pub fn has_file_deleted_signal(file_record: &serde_json::Value) -> bool {
+    json_has_signal(file_record, "/staleness/signals", "file_deleted")
+}
+
+/// True if any gotcha in `gotcha_keys` qualifies for enforcement under the
+/// same test the main gotcha loop in [`evaluate`] uses: `confirmed &&
+/// confidence >= 0.6 && quality >= 0.4`.
+fn any_qualifying_gotcha(
+    gotcha_keys: &[String],
+    gotcha_records: &HashMap<String, serde_json::Value>,
+) -> bool {
+    gotcha_keys.iter().any(|gkey| {
+        gotcha_records
+            .get(gkey.as_str())
+            .filter(|grec| grec.is_object())
+            .is_some_and(|grec| {
+                json_bool(grec, "/payload/confirmed")
+                    && json_f32(grec, "/confidence/value") >= 0.6
+                    && json_f32(grec, "/quality/value") >= 0.4
+            })
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1426,6 +1494,7 @@ mod tests {
             file_record: None,
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert_eq!(result.decision, Decision::NoRecord);
@@ -1440,6 +1509,7 @@ mod tests {
             file_record: Some(make_file_record(0.8, 0.5, 0.95, "tombstone", &[])),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert_eq!(result.decision, Decision::Tombstone);
@@ -1456,6 +1526,7 @@ mod tests {
             file_record: Some(make_file_record(0.8, 0.5, 0.85, "liability", &[])),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(
@@ -1483,6 +1554,7 @@ mod tests {
             )),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(
@@ -1509,6 +1581,7 @@ mod tests {
             )),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(
@@ -1521,6 +1594,11 @@ mod tests {
     /// `FileDeleted` is the one signal that still bypasses enforcement —
     /// there is no file left to protect. It wins over a maximally-valid
     /// confirmed gotcha, unlike the tier alone (see the two tests above).
+    ///
+    /// `file_exists: None` — the caller did not check — must preserve this
+    /// exact prior behavior: bypass fires, decision is `Tombstone`, and the
+    /// event stays the plain `Miss` (never the new bypass event, since an
+    /// unchecked caller has no confirmation the file is really gone).
     #[test]
     fn eval_file_deleted_bypasses_qualifying_gotcha() {
         let mut gotchas = HashMap::new();
@@ -1534,6 +1612,7 @@ mod tests {
             file_record: Some(file_record),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert_eq!(
@@ -1545,6 +1624,108 @@ mod tests {
         assert_eq!(result.events.len(), 1);
         assert!(
             matches!(&result.events[0], HookEvent::Miss { key } if key == "file:src/deleted.rs")
+        );
+    }
+
+    /// The caller's fresher observation wins: a `FileDeleted` signal is a
+    /// stale snapshot, and once the caller confirms the path exists
+    /// (delete-then-restore, branch switch, `git stash pop`, a widened
+    /// sparse-checkout cone), the bypass must not fire — a qualifying
+    /// confirmed gotcha denies exactly as it would with no signal at all.
+    #[test]
+    fn eval_file_deleted_signal_stale_when_path_exists_denies() {
+        let mut gotchas = HashMap::new();
+        gotchas.insert("gotcha:test".to_string(), make_gotcha(true, 0.7, 0.5));
+
+        let mut file_record = make_file_record(0.8, 0.5, 0.95, "tombstone", &["gotcha:test"]);
+        file_record["staleness"]["signals"] = json!(["file_deleted"]);
+
+        let input = EnforcementInput {
+            rel_path: "src/restored.rs".into(),
+            file_record: Some(file_record),
+            gotcha_records: gotchas,
+            already_consulted: false,
+            file_exists: Some(true),
+        };
+        let result = evaluate(&input);
+        assert!(
+            matches!(&result.decision, Decision::Deny { origin, .. } if *origin == DenyOrigin::Gotcha),
+            "a restored file with a qualifying gotcha must Deny, not bypass on a stale \
+             FileDeleted signal; got {:?}",
+            result.decision
+        );
+        assert!(matches!(
+            &result.events[0],
+            HookEvent::BlockedUnconsultedRead { key } if key == "file:src/restored.rs"
+        ));
+    }
+
+    /// A genuinely deleted file (`file_exists: Some(false)`) still bypasses
+    /// as `Tombstone` — there is nothing left to enforce against, and
+    /// denying would create an unclearable phantom deny (the file that would
+    /// need consulting does not exist). But a qualifying confirmed gotcha
+    /// WOULD have denied had the file still been there, so that suppression
+    /// must reach the hash-chained log as a bypass event, not the plain Miss.
+    #[test]
+    fn eval_file_confirmed_deleted_with_qualifying_gotcha_emits_bypass_event() {
+        let mut gotchas = HashMap::new();
+        gotchas.insert("gotcha:test".to_string(), make_gotcha(true, 0.7, 0.5));
+
+        let mut file_record = make_file_record(0.8, 0.5, 0.95, "tombstone", &["gotcha:test"]);
+        file_record["staleness"]["signals"] = json!(["file_deleted"]);
+
+        let input = EnforcementInput {
+            rel_path: "src/deleted.rs".into(),
+            file_record: Some(file_record),
+            gotcha_records: gotchas,
+            already_consulted: false,
+            file_exists: Some(false),
+        };
+        let result = evaluate(&input);
+        assert_eq!(
+            result.decision,
+            Decision::Tombstone,
+            "a confirmed-gone file must still bypass as Tombstone, never Deny \
+             (an unclearable phantom deny); got {:?}",
+            result.decision
+        );
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(&result.events[0], HookEvent::TombstoneBypassedDeny { key } if key == "file:src/deleted.rs"),
+            "a suppressed real deny must reach the enforcement log, not the plain Miss; \
+             got {:?}",
+            result.events[0]
+        );
+    }
+
+    /// Same confirmed deletion, but no gotcha qualifies (unconfirmed here) —
+    /// nothing was suppressed, so this stays the ordinary per-read Miss and
+    /// must NOT enter the hash-chained enforcement log (ARCHITECTURE.md
+    /// section 25: that log is the first thing to break at scale under a
+    /// per-read event).
+    #[test]
+    fn eval_file_confirmed_deleted_without_qualifying_gotcha_stays_plain_miss() {
+        let mut gotchas = HashMap::new();
+        gotchas.insert("gotcha:test".to_string(), make_gotcha(false, 0.7, 0.5));
+
+        let mut file_record = make_file_record(0.8, 0.5, 0.95, "tombstone", &["gotcha:test"]);
+        file_record["staleness"]["signals"] = json!(["file_deleted"]);
+
+        let input = EnforcementInput {
+            rel_path: "src/deleted.rs".into(),
+            file_record: Some(file_record),
+            gotcha_records: gotchas,
+            already_consulted: false,
+            file_exists: Some(false),
+        };
+        let result = evaluate(&input);
+        assert_eq!(result.decision, Decision::Tombstone);
+        assert_eq!(result.events.len(), 1);
+        assert!(
+            matches!(&result.events[0], HookEvent::Miss { key } if key == "file:src/deleted.rs"),
+            "no qualifying gotcha means nothing was suppressed — must stay the plain \
+             Miss; got {:?}",
+            result.events[0]
         );
     }
 
@@ -1577,6 +1758,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(matches!(&result.decision, Decision::Deny { .. }));
@@ -1612,6 +1794,7 @@ mod tests {
             file_record: Some(file_record),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(
@@ -1635,6 +1818,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         // No deny signal — falls through to advisory (confidence 0.7 >= 0.3, quality 0.5 >= 0.4).
@@ -1659,6 +1843,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(matches!(&result.decision, Decision::Advisory { .. }));
@@ -1674,6 +1859,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(matches!(&result.decision, Decision::Advisory { .. }));
@@ -1689,6 +1875,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: true,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(matches!(
@@ -1707,6 +1894,7 @@ mod tests {
             file_record: Some(make_file_record(0.45, 0.5, 0.1, "fresh", &[])),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(matches!(&result.decision, Decision::Advisory { .. }));
@@ -1720,6 +1908,7 @@ mod tests {
             file_record: Some(make_file_record(0.1, 0.1, 0.1, "fresh", &[])),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert_eq!(result.decision, Decision::Allow);
@@ -1733,6 +1922,7 @@ mod tests {
             file_record: Some(make_file_record(0.5, 0.5, 0.5, "stale", &[])),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         if let Decision::Advisory { context } = &result.decision {
@@ -1759,6 +1949,7 @@ mod tests {
             )),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         assert!(matches!(&result.decision, Decision::Deny { .. }));
@@ -1774,6 +1965,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.5, "stale", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         if let Decision::Deny { reason, .. } = &result.decision {
@@ -1790,6 +1982,7 @@ mod tests {
             file_record: Some(json!("not an object")),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         // Invalid record treated as no-record.
@@ -1807,18 +2000,21 @@ mod tests {
                 file_record: None,
                 gotcha_records: HashMap::new(),
                 already_consulted: false,
+                file_exists: None,
             },
             EnforcementInput {
                 rel_path: "x".into(),
                 file_record: Some(json!(null)),
                 gotcha_records: HashMap::new(),
                 already_consulted: false,
+                file_exists: None,
             },
             EnforcementInput {
                 rel_path: "x".into(),
                 file_record: Some(json!({})),
                 gotcha_records: HashMap::new(),
                 already_consulted: false,
+                file_exists: None,
             },
         ];
         for input in cases {
@@ -1849,6 +2045,7 @@ mod tests {
             file_record: Some(make_file_record(0.7, 0.5, 0.1, "fresh", &["gotcha:test"])),
             gotcha_records: gotchas,
             already_consulted: true,
+            file_exists: None,
         };
         let result = evaluate(&input);
         if let Decision::AlreadyConsulted { context } = &result.decision {
@@ -1880,6 +2077,7 @@ mod tests {
             file_record: Some(file_record),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         if let Decision::Advisory { context } = &result.decision {
@@ -1914,6 +2112,7 @@ mod tests {
             file_record: Some(file_record),
             gotcha_records: HashMap::new(),
             already_consulted: false,
+            file_exists: None,
         };
         let result = evaluate(&input);
         if let Decision::Advisory { context } = &result.decision {
@@ -2550,6 +2749,7 @@ mod tests {
                 )),
                 gotcha_records: gotchas,
                 already_consulted: false,
+                file_exists: None,
             }
         }
 
@@ -2836,6 +3036,7 @@ mod tests {
                 ),
                 gotcha_records: gotchas,
                 already_consulted: false,
+                file_exists: None,
             };
             let decision = evaluate(&input).decision;
             assert!(

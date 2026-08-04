@@ -230,7 +230,8 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     };
 
     // 8–11. Process eval response through the adapter pipeline.
-    let mut adapter = process_eval_response(args.variant, &rel_path, &eval_data);
+    let file_exists = file_exists_for_deleted_signal(&eval_data, &raw_path, &cwd);
+    let mut adapter = process_eval_response(args.variant, &rel_path, &eval_data, file_exists);
     // Consult mandate on the PRIMARY (lexical) file — before the escalation blocks so a
     // mandated deny short-circuits the canonical/extra round-trips too.
     apply_consult_mandate(
@@ -245,7 +246,11 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // This describes the lexical lookup that just ran; the canonical fallback
     // below has its own per-lookup error handling (a failed canonical
     // hook_evaluate simply leaves the lexical decision intact).
-    let lexical_fail_open = match check_eval_data(args.variant, &rel_path, &eval_data) {
+    // `file_exists` is irrelevant here — this call only classifies
+    // store/gotcha errors, and its `Ok` branch's EnforcementInput is
+    // discarded (the real one, with `file_exists` populated, is built by
+    // `process_eval_response` above).
+    let lexical_fail_open = match check_eval_data(args.variant, &rel_path, &eval_data, None) {
         EvalDataCheck::FailOpen(reason) => Some(reason),
         EvalDataCheck::Ok(_) => None,
     };
@@ -291,7 +296,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 }
                 _ => None,
             } {
-                let mut canon_adapter = process_eval_response(args.variant, canon_rel, &canon_eval);
+                let canon_file_exists =
+                    file_exists_for_deleted_signal(&canon_eval, canon_rel, &cwd);
+                let mut canon_adapter =
+                    process_eval_response(args.variant, canon_rel, &canon_eval, canon_file_exists);
                 // Mandate the symlink's real target too (parity with the gotcha WI-20 close).
                 apply_consult_mandate(
                     &mut canon_adapter,
@@ -358,8 +366,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                                 );
                                 continue;
                             };
-                            let mut extra_adapter =
-                                process_eval_response(args.variant, &extra_rel, &extra_eval);
+                            let extra_file_exists =
+                                file_exists_for_deleted_signal(&extra_eval, &extra_raw, &cwd);
+                            let mut extra_adapter = process_eval_response(
+                                args.variant,
+                                &extra_rel,
+                                &extra_eval,
+                                extra_file_exists,
+                            );
                             // Mandate non-primary bash args too (parity with gotcha extra-file gating).
                             apply_consult_mandate(
                                 &mut extra_adapter,
@@ -842,6 +856,40 @@ fn canonical_rel_path(
     Some(canon_rel)
 }
 
+/// Resolve `accessed_path` to an absolute path against `cwd`, the way the
+/// hook process resolves a bare relative shell argument. Same rule
+/// `canonical_rel_path` uses for `abs_access`, without the symlink
+/// resolution — an existence check doesn't need it.
+fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
+    let raw = Path::new(accessed_path);
+    if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        cwd.join(raw)
+    }
+}
+
+/// Populate [`EnforcementInput::file_exists`] — but ONLY when `eval_data`'s
+/// file record actually carries the `FileDeleted` staleness signal. The
+/// common, non-deleted-file path must pay nothing for this: `None` short-
+/// circuits before any stat runs.
+///
+/// `Path::try_exists()` distinguishes "confirmed absent" (`Ok(false)`) from
+/// "can't tell" (`Err`, e.g. a permission-denied parent directory) — the
+/// latter stays `None` so an ambiguous stat fails open into today's
+/// behavior (the signal alone decides) rather than inventing a new one.
+fn file_exists_for_deleted_signal(
+    eval_data: &serde_json::Value,
+    accessed_path: &str,
+    cwd: &Path,
+) -> Option<bool> {
+    let file_record = eval_data.get("file_record")?;
+    if !decide::has_file_deleted_signal(file_record) {
+        return None;
+    }
+    resolve_access_path(accessed_path, cwd).try_exists().ok()
+}
+
 // ── Daemon readiness ────────────────────────────────────────────────────────
 
 /// Ensure the daemon is reachable. Auto-starts if needed.
@@ -1254,7 +1302,8 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
             }
         };
 
-        let mut adapter = process_eval_response(variant, &rel_path, &eval_data);
+        let file_exists = file_exists_for_deleted_signal(&eval_data, raw, &cwd);
+        let mut adapter = process_eval_response(variant, &rel_path, &eval_data, file_exists);
         // Consult mandate on the patch target — parity with the read/edit
         // gates (this path uses include_recent semantics, hence `true`).
         apply_consult_mandate(
@@ -1321,8 +1370,10 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                     }
                     _ => None,
                 } {
+                    let canon_file_exists =
+                        file_exists_for_deleted_signal(&canon_eval, canon_rel, &cwd);
                     let mut canon_adapter =
-                        process_eval_response(variant, canon_rel, &canon_eval);
+                        process_eval_response(variant, canon_rel, &canon_eval, canon_file_exists);
                     apply_consult_mandate(
                         &mut canon_adapter,
                         variant,
@@ -1508,6 +1559,12 @@ fn platform_events(
                     Some(HookEvent::PolicyShadowObserved { key, would, action })
                 }
                 HookEvent::ComplianceHit { key } => Some(HookEvent::EditConsulted { key }),
+                // Not a Hit/Miss the read gate owns — a real deny was
+                // suppressed on this edit's target, so the edit path must
+                // keep it too, not drop it like the plain Miss below.
+                HookEvent::TombstoneBypassedDeny { key } => {
+                    Some(HookEvent::TombstoneBypassedDeny { key })
+                }
                 _ => None,
             })
             .collect(),
@@ -1656,6 +1713,13 @@ fn session_command(
             would: *would,
         }),
         HookEvent::PolicyShadowObserved { .. } => return None,
+        HookEvent::TombstoneBypassedDeny { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::TombstoneBypassedDeny,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: basis(),
+        }),
     })
 }
 
@@ -1867,10 +1931,15 @@ enum EvalDataCheck {
 }
 
 /// Check eval_data for store/gotcha errors and build EnforcementInput.
+///
+/// `file_exists` is the caller's own on-disk observation — see
+/// [`EnforcementInput::file_exists`]. Passed through unchanged; this
+/// function does no I/O itself.
 fn check_eval_data(
     variant: HookVariant,
     rel_path: &str,
     eval_data: &serde_json::Value,
+    file_exists: Option<bool>,
 ) -> EvalDataCheck {
     let include_recent = matches!(
         variant,
@@ -1900,6 +1969,7 @@ fn check_eval_data(
             .filter(|v| !v.is_null()),
         gotcha_records: extract_gotcha_map(eval_data),
         already_consulted,
+        file_exists,
     };
 
     let store_error = eval_data
@@ -1922,13 +1992,16 @@ fn check_eval_data(
 }
 
 /// Process a hook_evaluate response through the full adapter pipeline.
-/// No I/O — returns a result struct for testing.
+/// No I/O itself — `file_exists` is a value the caller already observed (or
+/// `None`); this function only threads it through. Returns a result struct
+/// for testing.
 fn process_eval_response(
     variant: HookVariant,
     rel_path: &str,
     eval_data: &serde_json::Value,
+    file_exists: Option<bool>,
 ) -> AdapterResult {
-    let enforcement_input = match check_eval_data(variant, rel_path, eval_data) {
+    let enforcement_input = match check_eval_data(variant, rel_path, eval_data, file_exists) {
         EvalDataCheck::Ok(input) => input,
         EvalDataCheck::FailOpen(_reason) => {
             // Same rule as `allow_output`: only the read gate force-allows;
@@ -2625,7 +2698,7 @@ mod tests {
     #[test]
     fn e2e_codex_deny_exit2_stderr_and_shell_blocked_event() {
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 2, "Codex deny must exit 2");
         assert!(
@@ -2648,7 +2721,8 @@ mod tests {
         // apply_patch reads the recent-TTL receipt (consulted_recent). With no
         // receipt, a confirmed gotcha on a touched file must deny the edit.
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(HookVariant::CodexPreApplyPatch, "src/main.rs", &data);
+        let result =
+            process_eval_response(HookVariant::CodexPreApplyPatch, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 2, "apply_patch deny must exit 2");
         assert!(matches!(result.decision, Decision::Deny { .. }));
@@ -2665,7 +2739,8 @@ mod tests {
         // Once the file has a recent consultation receipt, the edit is allowed.
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
-        let result = process_eval_response(HookVariant::CodexPreApplyPatch, "src/main.rs", &data);
+        let result =
+            process_eval_response(HookVariant::CodexPreApplyPatch, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "consulted edit must be allowed");
         assert!(!matches!(result.decision, Decision::Deny { .. }));
@@ -2674,7 +2749,7 @@ mod tests {
     #[test]
     fn e2e_claude_deny_json_output_and_blocked_event() {
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "Claude always exits 0");
         let json: serde_json::Value =
@@ -2715,7 +2790,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::CodexPreBash, "src/lib.rs", &data);
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/lib.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.is_empty(), "Codex advisory must be silent");
@@ -2746,7 +2821,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::ClaudePreRead, "src/lib.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreRead, "src/lib.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         let json: serde_json::Value =
@@ -2772,7 +2847,7 @@ mod tests {
     fn e2e_codex_consulted_allows_silently() {
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
-        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "consulted file must not be blocked");
         assert!(result.stdout.is_empty());
@@ -2790,7 +2865,7 @@ mod tests {
         // an AllowAfterReceipt enforcement event.
         let mut data = deny_eligible_eval_data();
         data["consulted"] = json!(true);
-        let result = process_eval_response(HookVariant::ClaudePreRead, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreRead, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "Claude always exits 0");
         let json: serde_json::Value =
@@ -2820,7 +2895,7 @@ mod tests {
             "store_error": true,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::CodexPreBash, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "store error must fail open");
         assert_eq!(result.decision, Decision::Allow);
@@ -2843,7 +2918,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": true
         });
-        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "gotcha error must fail open");
         assert!(
@@ -3279,7 +3354,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::ClaudePreBash, "src/new.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/new.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         assert!(
@@ -3310,7 +3385,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::ClaudePreBash, "src/lib.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/lib.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         let json: serde_json::Value =
@@ -3337,7 +3412,7 @@ mod tests {
         // The defer change must not weaken the deny: a confirmed unconsulted
         // gotcha on the bash path still emits permissionDecision:"deny".
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreBash, "src/main.rs", &data, None);
 
         let json: serde_json::Value =
             serde_json::from_str(&result.stdout).expect("stdout must be valid JSON");
@@ -3371,7 +3446,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::ClaudePreRead, "src/new.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreRead, "src/new.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         assert!(matches!(result.decision, Decision::NoRecord));
@@ -3431,7 +3506,7 @@ mod tests {
         // Blind edit (no consultation receipt) to a confirmed-gotcha file must be
         // denied with an edit-flavored Claude PreToolUse deny JSON.
         let data = deny_eligible_eval_data();
-        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data, None);
 
         assert_eq!(
             result.exit_code, 0,
@@ -3468,7 +3543,7 @@ mod tests {
         // flow and defers silently — deliberately NOT a forced allow.
         let mut data = deny_eligible_eval_data();
         data["consulted_recent"] = json!(true);
-        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.is_empty());
@@ -3494,7 +3569,7 @@ mod tests {
             "store_error": false,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/new.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/new.rs", &data, None);
 
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.is_empty(), "no-record edit must defer");
@@ -3515,7 +3590,7 @@ mod tests {
             "store_error": true,
             "gotcha_error": false
         });
-        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data);
+        let result = process_eval_response(HookVariant::ClaudePreEdit, "src/main.rs", &data, None);
 
         assert_eq!(result.exit_code, 0, "store error must fail open (defer)");
         assert!(result.stdout.is_empty());

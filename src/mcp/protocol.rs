@@ -758,6 +758,12 @@ pub enum SessionEvent {
     /// `db_client` policy stays permanently unsatisfiable: a deadlock, not a
     /// bypass. Diagnostic only; does not change any decision.
     WrappedDbClientMiss,
+    /// The `FileDeleted` tombstone bypass fired on a caller-confirmed
+    /// deletion, suppressing a deny a qualifying confirmed gotcha would
+    /// otherwise have produced. Records `BypassDetected` — the decision
+    /// stayed `Tombstone` (allow), but the suppression is enforcement-
+    /// relevant and must reach the hash-chained log.
+    TombstoneBypassedDeny,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
