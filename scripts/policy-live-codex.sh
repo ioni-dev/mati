@@ -133,10 +133,12 @@ Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
    several, because every Bash command you run (including these report commands)
    is captured — that is expected, NOT a failure; do not stop on the line count.
    Report each top-level key set and tool_input key set verbatim. STOP ONLY if a
-   file is genuinely absent or empty, or if the shape differs from
-   smoke-policy.sh's pre_apply_patch() payload (no tool_input.command) — that
-   finding outranks every later result, since without it run_apply_patch fails
-   open and every patch is ungated. Otherwise CONTINUE to step 1.
+   file is genuinely absent or empty, or if tool_input has no "command" key.
+   mati reads the patch text from tool_input.command (src/cli/hook_decide.rs);
+   without that key run_apply_patch fails open and every patch is ungated, and
+   that finding outranks every later result. Observing tool_input keys
+   ["command"] is the EXPECTED shape — it matches smoke-policy.sh's
+   pre_apply_patch(). Report it and CONTINUE to step 1.
 1. CANARY apply_patch migrations/prod.sql "select 1;" -> "select 2;". Expect exit 2, mati: naming decision:codex-migrations, and content unchanged; otherwise STOP.
 2. mem_get decision:codex-migrations. If Codex cannot call mati MCP mem_get, STOP: deny is unsatisfiable.
 3. Retry patch; expect success and "select 2;".

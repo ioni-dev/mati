@@ -1901,7 +1901,7 @@ pub(crate) async fn handle_mem_query(
 /// Native MemBootstrap handler.
 ///
 /// Primary: assemble context packet (pure read computation).
-/// Sessions-tree transaction: bootstrap agg + consultation receipts for all context files + audit.
+/// Sessions-tree transaction: bootstrap aggregate + audit.
 /// Deferred best-effort: access_count bumps on context file records (knowledge, cross-tree).
 pub(crate) async fn handle_mem_bootstrap(
     store: &Store,
@@ -1920,35 +1920,24 @@ pub(crate) async fn handle_mem_bootstrap(
         Err(_) => (false, Some(ErrorCode::Internal)),
     };
 
-    // 2. Stage all sessions-tree writes: bootstrap agg + per-file consultation receipts + audit.
+    // 2. Stage the bootstrap aggregate and audit only.
+    //
+    // Bootstrap surfaces context, but it is not a consultation of each file's
+    // record. Only an actual read (`mem_get`, or an allowlisted schema
+    // introspection) may mint a receipt; otherwise bootstrap silently unlocks
+    // later reads/edits and has no ReceiptMinted event to anchor that receipt.
     let mut session_writes: Vec<(String, Vec<u8>)> = Vec::new();
 
-    // Bootstrap aggregation.
+    // Bootstrap aggregation. `analytics:hit_` stays out on purpose: it pairs
+    // 1:1 with `HookEvent::Hit`/`Miss` from a real per-file gate decision
+    // (decide::evaluate), and bootstrap has no per-file miss to pair against —
+    // counting it would only inflate `mati stats` hit rate.
     let bootstrap_agg_key = crate::store::session::today_key("analytics:bootstrap_");
     if let Ok(staged) =
         crate::store::session::upsert_daily_agg_staged(store, &bootstrap_agg_key, "__bootstrap__")
             .await
     {
         session_writes.push(staged);
-    }
-
-    // Per-file consultation receipts.
-    for file in context_files {
-        let file_key = if file.starts_with("file:") {
-            file.clone()
-        } else {
-            format!("file:{file}")
-        };
-        if let Ok(receipt) = crate::store::session::consultation_receipt_staged(&file_key, None) {
-            session_writes.push((receipt.key, receipt.bytes));
-        }
-        // Per-file daily hit agg.
-        let hit_agg_key = crate::store::session::today_key("analytics:hit_");
-        if let Ok(staged) =
-            crate::store::session::upsert_daily_agg_staged(store, &hit_agg_key, &file_key).await
-        {
-            session_writes.push(staged);
-        }
     }
 
     // Audit entry — reflects actual assembly outcome.

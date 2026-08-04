@@ -526,11 +526,23 @@ pub async fn run_daemon_start() -> Result<()> {
         let last_wall = last_wall.clone();
         let active_connections = active_connections.clone();
         let notify = idle_notify.clone();
+        let mati_root = mati_root.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(IDLE_CHECK_INTERVAL_SECS));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+
+                // A daemon kept alive by continuous use never restarts, so
+                // the startup-only trim in `install_panic_hook` never fires
+                // again — and every `mati serve` proxy it hands off to also
+                // appends lifecycle lines. Re-trim here so `lifecycle.log`
+                // stays bounded across an arbitrarily long-lived daemon.
+                mati_core::mcp::metadata::trim_lifecycle_log(
+                    &mati_root,
+                    mati_core::mcp::metadata::MAX_LIFECYCLE_LINES,
+                );
+
                 let now = wall_secs();
                 let last = last_wall.load(Ordering::Relaxed);
                 let active = active_connections.load(Ordering::Relaxed);
@@ -1398,6 +1410,33 @@ fn send_sigkill_only(_pid: u32) -> bool {
     false
 }
 
+/// Hard ceiling on how much of `lifecycle.log` [`recorded_serve_pids`] reads
+/// into memory. Sized well above the ~1.5 MB the periodic trim keeps the log
+/// under, so this only bites on a log the trim hasn't reached yet.
+const RECORDED_SERVE_SCAN_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Read at most the last `max_bytes` of `path`. If that cuts into the middle
+/// of a line, the partial leading fragment is dropped so every line handed
+/// to the caller is complete.
+fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= max_bytes {
+        let mut s = String::new();
+        file.read_to_string(&mut s)?;
+        return Ok(s);
+    }
+    file.seek(SeekFrom::Start(len - max_bytes))?;
+    let mut buf = Vec::with_capacity(max_bytes as usize);
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    Ok(match text.find('\n') {
+        Some(i) => text[i + 1..].to_string(),
+        None => String::new(),
+    })
+}
+
 /// PIDs of `mati serve` proxies attached to **this** store, from the store's
 /// own `lifecycle.log`.
 ///
@@ -1421,9 +1460,15 @@ fn send_sigkill_only(_pid: u32) -> bool {
 /// binary too old to record the event, yields a PID we will not kill. That is
 /// the correct direction to fail — the bug being fixed is killing MCP sessions
 /// that belong to other stores.
+///
+/// Only reads the most recent [`RECORDED_SERVE_SCAN_MAX_BYTES`] of the log —
+/// see [`read_tail`]. The idle-loop trim in `metadata::trim_lifecycle_log`
+/// keeps the file within that window in the common case; this cap is the
+/// defense-in-depth for a log the trim hasn't reached yet.
 fn recorded_serve_pids(root: &Path) -> std::collections::HashSet<u32> {
     let mut live = std::collections::HashSet::new();
-    let Ok(contents) = std::fs::read_to_string(root.join("lifecycle.log")) else {
+    let Ok(contents) = read_tail(&root.join("lifecycle.log"), RECORDED_SERVE_SCAN_MAX_BYTES)
+    else {
         return live;
     };
     for line in contents.lines() {
@@ -2000,6 +2045,55 @@ mod tests {
             &[(me, "serve_start", &format!("pid={me} owner=proxy"))],
         );
         assert!(serve_pids_to_kill(dir.path(), &[me]).is_empty());
+    }
+
+    #[test]
+    fn read_tail_returns_whole_file_when_under_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lifecycle.log");
+        std::fs::write(&path, b"short content\n").unwrap();
+        assert_eq!(read_tail(&path, 1024).unwrap(), "short content\n");
+    }
+
+    #[test]
+    fn read_tail_drops_the_partial_leading_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lifecycle.log");
+        std::fs::write(&path, b"111111\ttrunc\n222222\tkeep\n").unwrap();
+        // Cap lands mid-way through the first line, not on a line boundary.
+        assert_eq!(read_tail(&path, 16).unwrap(), "222222\tkeep\n");
+    }
+
+    /// The bug: `recorded_serve_pids` used to `read_to_string` the whole log
+    /// on every `--include-mcp` scan. A store whose daemon has run long
+    /// enough to accumulate a multi-megabyte log (the periodic trim bounds
+    /// growth going forward, but does nothing for a log that predates it)
+    /// would load the entire thing into memory on every stop. Confirms the
+    /// scan is now capped: an event outside the trailing scan window is not
+    /// seen, exactly like a truncated log — under-inclusive, not unbounded.
+    #[test]
+    fn recorded_serve_pids_ignores_events_outside_the_scan_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lifecycle.log");
+
+        let mut body = String::new();
+        body.push_str("1700000000\t111\tserve_start\tpid=111 owner=proxy\n");
+        let filler_line = "1700000000\t0\tnoise\tpadding\n";
+        let repeats = (RECORDED_SERVE_SCAN_MAX_BYTES as usize / filler_line.len()) + 1000;
+        body.push_str(&filler_line.repeat(repeats));
+        body.push_str("1700000000\t222\tserve_start\tpid=222 owner=proxy\n");
+        std::fs::write(&path, &body).unwrap();
+        assert!(
+            body.len() as u64 > RECORDED_SERVE_SCAN_MAX_BYTES,
+            "test log must exceed the scan cap to be meaningful"
+        );
+
+        let pids = recorded_serve_pids(dir.path());
+        assert!(pids.contains(&222), "recent event must be seen");
+        assert!(
+            !pids.contains(&111),
+            "event outside the scan window must not be seen"
+        );
     }
 
     #[tokio::test]
