@@ -25,7 +25,10 @@ MATI="$REPO_ROOT/target/debug/mati"
 
 PASS=0; FAIL=0; SKIP=0
 
-cleanup() { "$MATI" daemon stop >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+# cd into $PROJECT first: daemon stop's slug comes from the repo root of cwd,
+# and without it this stops (or no-ops on) the wrong project, leaking the
+# test daemon when $WORK is removed out from under it.
+cleanup() { ( cd "$PROJECT" 2>/dev/null && "$MATI" daemon stop ) >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
@@ -33,9 +36,13 @@ pass() { PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 fail() { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; printf '       got: %s\n' "${2:-<empty>}"; }
 skip() { SKIP=$((SKIP+1)); printf '  \033[33mSKIP\033[0m %s (%s)\n' "$1" "$2"; }
 
-assert_has()   { if printf '%s' "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1" "$2"; fi; }
-assert_lacks() { if printf '%s' "$2" | grep -q -- "$3"; then fail "$1" "$2"; else pass "$1"; fi; }
-denied()       { printf '%s' "$1" | grep -q 'permissionDecision":"deny"'; }
+# A piped `printf | grep -q` races grep's early exit against printf's write
+# under `pipefail`: on a large payload, grep can find its match and close the
+# pipe before printf finishes, and the resulting SIGPIPE flips the pipeline's
+# exit status even though grep matched. A herestring avoids the pipe.
+assert_has()   { if grep -q -- "$3" <<<"$2"; then pass "$1"; else fail "$1" "$2"; fi; }
+assert_lacks() { if grep -q -- "$3" <<<"$2"; then fail "$1" "$2"; else pass "$1"; fi; }
+denied()       { grep -q 'permissionDecision":"deny"' <<<"$1"; }
 
 # Preflight: named dependencies. Later steps use jq (JSON assertions) and
 # python3 (nanosecond latency timing); a missing one otherwise fails mid-run
@@ -646,7 +653,7 @@ assert_lacks "not denied when mati is down" "$OUT" 'permissionDecision":"deny"'
 step "19. mem_set agent boundary"
 POLICY_JSON='{"name":"agent authored","rule":"Consult first.","reason":"Schemas drift because production changes.","scope":"repo","mode":"block","trigger":{"tool":"db_client","host_glob":"*agent*"},"requires":{"key":"schema:agent","via":["mem_get"],"freshness":{"ttl_secs":900}},"stage":"enforce","severity":"high","created_by":"agent"}'
 OUT="$(mcp_call mem_set "{\"action\":\"write\",\"key\":\"policy:agent-authored\",\"value\":\"Consult first.\",\"category\":\"Policy\",\"payload\":$POLICY_JSON,\"tags\":[],\"priority\":\"High\"}")"
-if printf '%s' "$OUT" | grep -q 'jsonrpc'; then
+if grep -q 'jsonrpc' <<<"$OUT"; then
   assert_has "agent-authored policy is forced inert" "$OUT" 'stage.":."off'
   OUT2="$(mcp_call mem_set '{"action":"confirm","key":"policy:agent-authored","value":"","category":"Policy","payload":{},"tags":[],"priority":"Normal"}')"
   assert_has "agent cannot enable a policy" "$OUT2" 'mati policy enable'
