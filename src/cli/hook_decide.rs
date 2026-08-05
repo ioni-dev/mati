@@ -130,6 +130,9 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     } else {
         None
     };
+    let raw_command = input
+        .pointer("/tool_input/command")
+        .and_then(|value| value.as_str());
 
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
@@ -137,7 +140,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         None => {
             if let Some(action) = bash_action
                 .as_ref()
-                .filter(|action| action.tool == "db_client")
+                .filter(|action| action.tool == "db_client" || action.tool == "unknown")
             {
                 return run_fileless_policy(&input, args.variant, action, agent_id).await;
             }
@@ -462,6 +465,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 agent_id,
                 "<policy>",
                 policy_block_exempt(args.variant, &input),
+                raw_command,
             )
             .await
             {
@@ -540,6 +544,9 @@ async fn run_fileless_policy(
         agent_id,
         "<fileless-bash>",
         policy_block_exempt(variant, input),
+        input
+            .pointer("/tool_input/command")
+            .and_then(|value| value.as_str()),
     )
     .await
     else {
@@ -573,8 +580,9 @@ async fn evaluate_governed_policy(
     agent_id: Option<&str>,
     failure_path: &str,
     introspection_exemption: bool,
+    raw_command: Option<&str>,
 ) -> Option<(Decision, Vec<HookEvent>)> {
-    if action.tool != governed_tool {
+    if action.tool != governed_tool && action.tool != "unknown" {
         return None;
     }
     let Some(mati_root) = mati_root else {
@@ -585,11 +593,12 @@ async fn evaluate_governed_policy(
         log_fail_open(failure_path, "daemon not running after auto-start");
         return None;
     }
-    let verdicts = policy_verdicts_for_action(mati_root, action, agent_id, failure_path).await?;
-    let strict = verdicts.iter().any(|verdict| verdict.strict);
-    let core_verdicts = policy_core_verdicts(&verdicts, introspection_exemption);
+    let evaluation =
+        policy_verdicts_for_action(mati_root, action, agent_id, failure_path, raw_command).await?;
+    let strict = evaluation.verdicts.iter().any(|verdict| verdict.strict);
+    let core_verdicts = policy_core_verdicts(&evaluation.verdicts, introspection_exemption);
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
-    let events = result
+    let mut events: Vec<HookEvent> = result
         .events
         .into_iter()
         .map(|event| match event {
@@ -601,6 +610,9 @@ async fn evaluate_governed_policy(
             event => event,
         })
         .collect();
+    if let Some(key) = evaluation.bypass_key {
+        events.push(HookEvent::UnclassifiedPolicyLiteralBypass { key });
+    }
     Some((result.decision, events))
 }
 
@@ -635,13 +647,15 @@ async fn policy_verdicts_for_action(
     action: &decide::Action,
     agent_id: Option<&str>,
     failure_path: &str,
-) -> Option<Vec<mati_core::mcp::protocol::PolicyVerdict>> {
+    raw_command: Option<&str>,
+) -> Option<mati_core::mcp::protocol::PolicyEvaluateResult> {
     let response = daemon_v2(
         mati_root,
         mati_core::mcp::protocol::Command::PolicyEvaluate(
             mati_core::mcp::protocol::PolicyEvaluateInput {
                 action: action.clone(),
                 actor: agent_id.map(str::to_string),
+                raw_command: raw_command.map(str::to_string),
             },
         ),
     )
@@ -1056,11 +1070,12 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
         return Ok(());
     }
 
-    let Some(verdicts) = policy_verdicts_for_action(
+    let Some(evaluation) = policy_verdicts_for_action(
         &mati_root,
         &action,
         input.get("agent_id").and_then(|value| value.as_str()),
         "<post-bash>",
+        Some(command),
     )
     .await
     else {
@@ -1074,7 +1089,7 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
         .get("session_id")
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty());
-    for verdict in verdicts {
+    for verdict in evaluation.verdicts {
         if !accepts_db_introspection(&verdict.via) {
             continue;
         }
@@ -1337,6 +1352,7 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                 agent_id,
                 "<apply-patch-policy>",
                 policy_block_exempt(variant, input),
+                None,
             )
             .await
             {
@@ -1648,6 +1664,15 @@ fn session_command(
             actor: scope(),
             decision_basis_hash: basis(),
         }),
+        HookEvent::UnclassifiedPolicyLiteralBypass { key } => {
+            p::Command::SessionLog(p::SessionLogInput {
+                event: p::SessionEvent::UnclassifiedPolicyLiteralBypass,
+                key: key.clone(),
+                session_id: sid(),
+                actor: scope(),
+                decision_basis_hash: None,
+            })
+        }
         HookEvent::ComplianceHit { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::ComplianceHit,
             key: key.clone(),

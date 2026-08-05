@@ -150,6 +150,8 @@ pub enum HookEvent {
     BlockedUnconsultedRead { key: String },
     /// Codex shell command blocked — daemon `log_codex_shell_miss`.
     CodexShellBlocked { key: String },
+    /// An unclassified command mentioned a literal from an active policy.
+    UnclassifiedPolicyLiteralBypass { key: String },
     /// Post-bash confirmed a consulted read — daemon `log_compliance_hit`.
     ComplianceHit { key: String },
     /// Claude edit gate: edit DEFERRED because a recent consultation exists —

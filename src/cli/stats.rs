@@ -1109,14 +1109,15 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 /// `dispatch_v2.rs`). The gate worked — nothing was bypassed — so it rolls
 /// into `denials_7d`, not `bypasses_7d`.
 ///
-/// `bypasses_7d` sums the three aggregates that mirror
+/// `bypasses_7d` sums the four aggregates that mirror
 /// `EnforcementEventType::BypassDetected` in the hash-chained log:
 /// `compliance:codex_shell_miss_*`, `compliance:wrapped_db_client_miss_*`,
-/// and `compliance:tombstone_bypass_*`. `compliance:codex_shell_miss_*` is
+/// `compliance:tombstone_bypass_*`, and
+/// `compliance:unclassified_policy_literal_bypass_*`. `compliance:codex_shell_miss_*` is
 /// fired by `codex-post-bash` after a file was used without a valid receipt;
 /// it also rolls into `misses_7d` (so the hook activity registers in the
 /// lookups denominator and `Hit rate` reflects real consultation behavior).
-/// The other two bypass aggregates are not consultation lookups, so they are
+/// The other three bypass aggregates are not consultation lookups, so they are
 /// not added to `misses_7d`.
 async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64) {
     let mut hits: u64 = 0;
@@ -1136,6 +1137,8 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         let codex_miss_key = format!("compliance:codex_shell_miss_{date}");
         let wrapped_db_miss_key = format!("compliance:wrapped_db_client_miss_{date}");
         let tombstone_bypass_key = format!("compliance:tombstone_bypass_{date}");
+        let unclassified_literal_bypass_key =
+            format!("compliance:unclassified_policy_literal_bypass_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
@@ -1179,6 +1182,12 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         }
 
         if let Ok(Some(record)) = store.get(&tombstone_bypass_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
+
+        if let Ok(Some(record)) = store.get(&unclassified_literal_bypass_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 bypasses += agg.count;
             }

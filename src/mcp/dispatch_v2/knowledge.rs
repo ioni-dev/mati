@@ -221,9 +221,9 @@ pub(super) async fn dispatch_policy_evaluate(
         unreachable!("dispatch_policy_evaluate only accepts PolicyEvaluate")
     };
 
-    let matched = {
+    let (matched, bypass_key) = {
         let matcher = ctx.policy_matcher.read().await;
-        matcher
+        let matched = matcher
             .matches(&input.action)
             .into_iter()
             .map(|matched| {
@@ -240,7 +240,13 @@ pub(super) async fn dispatch_policy_evaluate(
                     matched.policy.requires.freshness.ttl_secs,
                 )
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        let bypass_key = input.raw_command.as_deref().and_then(|raw| {
+            matcher
+                .detect_unclassified_literal_bypass(&input.action, raw)
+                .map(str::to_string)
+        });
+        (matched, bypass_key)
     };
 
     let g = graph.read().await;
@@ -297,6 +303,10 @@ pub(super) async fn dispatch_policy_evaluate(
 
     Response::ok(
         req.id,
-        serde_json::to_value(verdicts).unwrap_or(serde_json::Value::Array(Vec::new())),
+        serde_json::to_value(protocol::PolicyEvaluateResult {
+            verdicts,
+            bypass_key,
+        })
+        .unwrap_or_else(|_| serde_json::json!({"verdicts": [], "bypass_key": null})),
     )
 }

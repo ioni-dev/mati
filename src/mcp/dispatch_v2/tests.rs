@@ -182,6 +182,7 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
             make_request(Command::PolicyEvaluate(PolicyEvaluateInput {
                 action: action.clone(),
                 actor: None,
+                raw_command: None,
             })),
         )
     };
@@ -190,7 +191,8 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let Response::Ok { data, .. } = first else {
         panic!("policy evaluation should succeed")
     };
-    let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+    let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    let verdicts = result.verdicts;
     assert_eq!(verdicts.len(), 1);
     assert!(!verdicts[0].satisfied);
     assert!(
@@ -209,7 +211,8 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let Response::Ok { data, .. } = evaluate().await else {
         panic!("policy evaluation should succeed in advisory mode")
     };
-    let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+    let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    let verdicts = result.verdicts;
     assert!(!verdicts[0].strict);
 
     let strict = make_request(Command::ConfigSet(ConfigSetInput {
@@ -231,7 +234,8 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let Response::Ok { data, .. } = evaluate().await else {
         panic!("policy evaluation should remain available after audit mode change")
     };
-    let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+    let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    let verdicts = result.verdicts;
     assert!(
         verdicts[0].strict,
         "audit write durability must not soften policies"
@@ -247,7 +251,8 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let Response::Ok { data, .. } = second else {
         panic!("policy evaluation should succeed after receipt")
     };
-    let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+    let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    let verdicts = result.verdicts;
     assert!(verdicts[0].satisfied);
 
     let disable = make_request(Command::PolicyWrite(PolicyWriteInput {
@@ -264,8 +269,114 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let Response::Ok { data, .. } = third else {
         panic!("policy evaluation should succeed after refresh")
     };
-    let verdicts: Vec<PolicyVerdict> = serde_json::from_value(data).unwrap();
+    let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    let verdicts = result.verdicts;
     assert!(verdicts.is_empty());
+}
+
+#[tokio::test]
+async fn unclassified_policy_literal_bypass_records_and_verifies_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+    let policy_key = "policy:prod-db";
+    let policy = PolicyRecord {
+        name: "Production database safety".into(),
+        rule: "Consult the production schema first.".into(),
+        reason: "Production data changes because deployments are live.".into(),
+        scope: "repo".into(),
+        mode: PolicyMode::Block,
+        trigger: PolicyTrigger {
+            tool: Some("db_client".into()),
+            host_glob: Some("*prod-codex*".into()),
+            target_path_glob: None,
+        },
+        requires: PolicyRequires {
+            key: "schema:orders".into(),
+            via: vec![ReceiptSource::MemGet],
+            freshness: PolicyFreshness {
+                ttl_secs: 900,
+                fingerprint: false,
+            },
+        },
+        stage: crate::store::PolicyStage::Enforce,
+        severity: StorePriority::High,
+        created_by: "test".into(),
+    };
+    assert!(matches!(
+        dispatch_v2(
+            &graph,
+            &ctx,
+            make_request(Command::PolicyWrite(PolicyWriteInput {
+                op: PolicyWriteOp::Create,
+                key: policy_key.into(),
+                policy: Some(policy),
+                stage: None,
+            })),
+        )
+        .await,
+        Response::Ok { .. }
+    ));
+
+    let raw = r#"db_client=psql; "$db_client" -h db.prod-codex.internal -c 'SELECT 1'"#;
+    let action = crate::hooks::decide::normalize_action(Some(raw), None);
+    assert_eq!(action.tool, "unknown");
+    let Response::Ok { data, .. } = dispatch_v2(
+        &graph,
+        &ctx,
+        make_request(Command::PolicyEvaluate(PolicyEvaluateInput {
+            action,
+            actor: None,
+            raw_command: Some(raw.into()),
+        })),
+    )
+    .await
+    else {
+        panic!("policy evaluation should succeed")
+    };
+    let evaluation: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    assert!(evaluation.verdicts.is_empty());
+    assert_eq!(evaluation.bypass_key.as_deref(), Some(policy_key));
+
+    assert!(matches!(
+        dispatch_v2(
+            &graph,
+            &ctx,
+            make_request(Command::SessionLog(SessionLogInput {
+                event: SessionEvent::UnclassifiedPolicyLiteralBypass,
+                key: policy_key.into(),
+                session_id: None,
+                actor: None,
+                decision_basis_hash: None,
+            })),
+        )
+        .await,
+        Response::Ok { .. }
+    ));
+
+    let g = graph.read().await;
+    let aggregate = g
+        .store()
+        .scan_keys("compliance:unclassified_policy_literal_bypass_")
+        .await
+        .unwrap();
+    assert!(!aggregate.is_empty());
+    let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+        .await
+        .unwrap();
+    let bypass = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.event_type,
+                crate::store::enforcement::EnforcementEventType::BypassDetected
+            )
+        })
+        .expect("literal detector must record a bypass event");
+    assert_eq!(bypass.decision_reason_code, "unclassified_policy_literal");
+    assert_eq!(bypass.subject_key, policy_key);
+    assert!(crate::store::enforcement::verify_chain(&events).is_valid());
 }
 
 #[tokio::test]

@@ -42,6 +42,9 @@ pub(super) async fn dispatch_session_side(
                 // Only the post-bash miss stays in codex_shell_miss_, which is
                 // what `mati stats` counts as a bypass.
                 protocol::SessionEvent::CodexShellBlocked => "compliance:miss_",
+                protocol::SessionEvent::UnclassifiedPolicyLiteralBypass => {
+                    "compliance:unclassified_policy_literal_bypass_"
+                }
                 protocol::SessionEvent::Bootstrap => "analytics:bootstrap_",
                 protocol::SessionEvent::PromptNudge => "analytics:codex_prompt_nudge_",
                 // Edit-gate events share the read aggregates (coarse counts); the
@@ -291,6 +294,22 @@ pub(super) async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "tombstone_file_deleted".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                // Record-only signal; reuse BypassDetected so the frozen hash
+                // contract needs no new EnforcementEventType or schema bump.
+                protocol::SessionEvent::UnclassifiedPolicyLiteralBypass => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::BypassDetected,
+                        crate::store::enforcement::SubjectKind::Control,
+                        input.key.clone(),
+                        "hook".to_string(),
+                        None,
+                        "unclassified_policy_literal".to_string(),
                         input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
