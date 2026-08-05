@@ -54,38 +54,55 @@ pub struct HookDecideArgs {
     pub variant: HookVariant,
 }
 
+/// The result of running a hook inside the async runtime.
+///
+/// A timeout must terminate the process before Tokio waits for the blocking
+/// stdin reader to finish, but returning this outcome keeps the decision path
+/// testable. The binary entry point turns `Terminate` into the actual process
+/// exit after this future has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookRunOutcome {
+    Continue,
+    Terminate(i32),
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 /// Outer end-to-end deadline for the hook process.
 ///
-/// Claude Code SIGKILLs the hook subprocess at 3000ms wall-clock. SIGKILL
-/// bypasses every internal `log_fail_open` call, leaving operators blind to
-/// wedged-daemon spikes — the exact failure mode `fail_open.log` exists to
-/// surface. This ceiling fires ~500ms before SIGKILL so we get one clean
-/// fail-open log entry + an allow stdout before Claude reaps us.
+/// The scaffold registers these hooks with `"timeout": 4` (seconds — see
+/// `scaffold::settings`), and the host kills the subprocess at that ceiling.
+/// That kill bypasses every internal `log_fail_open` call, leaving operators
+/// blind to wedged-daemon spikes — the exact failure mode `fail_open.log`
+/// exists to surface. This deadline fires first so we get one clean fail-open
+/// log entry + an allow stdout before the host reaps us.
+///
+/// It must clear the ceiling *including* startup, which happens before this
+/// timer begins: ~115ms warm, ~1050ms on a cold binary. 2500 + 1050 = ~3.5s
+/// against a 4s ceiling.
 const HOOK_DEADLINE_MS: u64 = 2500;
 
-pub async fn run(args: HookDecideArgs) -> Result<()> {
+pub async fn run(args: HookDecideArgs) -> Result<HookRunOutcome> {
     let variant = args.variant;
     match tokio::time::timeout(Duration::from_millis(HOOK_DEADLINE_MS), run_inner(args)).await {
-        Ok(inner_result) => inner_result,
+        Ok(inner_result) => inner_result.map(|()| HookRunOutcome::Continue),
         Err(_elapsed) => {
             // Internal deadline exceeded. We don't know which path stalled
             // (path may not even have been extracted yet), so log with the
             // sentinel "<unknown>" — still better than no entry at all.
             log_fail_open("<unknown>", "hook process exceeded internal deadline");
             emit_allow(variant);
-            Ok(())
+            Ok(HookRunOutcome::Terminate(0))
         }
     }
 }
 
 async fn run_inner(args: HookDecideArgs) -> Result<()> {
-    // 1. Read stdin (tool input JSON from hook protocol). MUST be async: the
-    // outer HOOK_DEADLINE_MS timeout can only fire at an await point, so a
-    // blocking std::io read (e.g. a caller that never closes the pipe) would
-    // ride straight past the internal deadline to Claude Code's 3000ms
-    // SIGKILL — skipping the fail-open log entry the deadline exists to write.
+    // 1. Read stdin (tool input JSON from hook protocol) asynchronously so
+    // the outer HOOK_DEADLINE_MS timeout can observe a still-open pipe. Tokio
+    // may keep the underlying blocking reader alive after cancellation; the
+    // timeout path therefore exits the process explicitly after flushing its
+    // fail-open log and allow response.
     let mut input_str = String::new();
     tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut input_str).await?;
     let input: serde_json::Value =
@@ -1490,7 +1507,10 @@ pub(super) fn log_fail_open_at(log_path: &Path, rel_path: &str, reason: &str) {
         .create(true)
         .append(true)
         .open(log_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, entry.as_bytes())?;
+            std::io::Write::flush(&mut f)
+        });
 }
 
 /// UTC timestamp in ISO 8601 format `YYYY-MM-DDTHH:MM:SSZ`.
@@ -1780,6 +1800,7 @@ fn emit_allow(variant: HookVariant) {
     if let Some(json) = allow_output(variant) {
         println!("{json}");
     }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 // emit_decision, emit_claude_decision, and emit_codex_pre_bash_decision
@@ -2961,25 +2982,30 @@ mod tests {
     //
     // Mirrors the production wrapper in `run()`: when the inner future
     // exceeds the deadline, the wrapper must produce an allow output and
-    // log a fail-open entry. We can't drive the real `run()` from a unit
-    // test (it reads stdin and may spawn daemons), so we test the deadline
-    // shape directly using the same `tokio::time::timeout` + `emit_allow`
-    // path the production code takes.
+    // return an explicit termination outcome. We can't drive the real `run()`
+    // from a unit test (it reads stdin and may spawn daemons), so we test the
+    // deadline shape directly using the same `tokio::time::timeout` +
+    // `emit_allow` path the production code takes.
 
-    async fn run_with_deadline<F>(deadline_ms: u64, variant: HookVariant, inner: F) -> Result<()>
+    async fn run_with_deadline<F>(
+        deadline_ms: u64,
+        variant: HookVariant,
+        inner: F,
+    ) -> Result<HookRunOutcome>
     where
         F: std::future::Future<Output = Result<()>>,
     {
         match tokio::time::timeout(Duration::from_millis(deadline_ms), inner).await {
-            Ok(inner_result) => inner_result,
+            Ok(inner_result) => inner_result.map(|()| HookRunOutcome::Continue),
             Err(_elapsed) => {
                 // Match the production wrapper exactly. We don't write to
                 // the real fail_open.log here — production code does, and
                 // testing that side effect would require touching the home
                 // dir. The load-bearing assertion is "completes within
-                // budget + emits allow", not "wrote to disk".
+                // budget + emits allow + requests termination", not "wrote
+                // to disk".
                 emit_allow(variant);
-                Ok(())
+                Ok(HookRunOutcome::Terminate(0))
             }
         }
     }
@@ -3005,10 +3031,11 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        // The wrapper must absorb the timeout into Ok(()).
+        // The wrapper must absorb the timeout into an explicit allow-and-exit
+        // outcome without exiting the unit-test process.
         assert!(
-            result.is_ok(),
-            "deadline wrapper must never propagate Err on timeout, got: {result:?}"
+            matches!(result, Ok(HookRunOutcome::Terminate(0))),
+            "deadline wrapper must request allow exit on timeout, got: {result:?}"
         );
 
         // The wrapper must complete close to the deadline, not after the
@@ -3024,7 +3051,8 @@ mod tests {
             "wrapper took {elapsed:?} — must wait at least the deadline ({deadline_ms}ms) before timing out"
         );
 
-        // The production wrapper calls `emit_allow(variant)` on timeout.
+        // The production wrapper calls `emit_allow(variant)` on timeout and
+        // uses exit code 0, which is allow for both hook protocols.
         // We can't capture process stdout from a unit test, so we verify
         // the contract by re-checking the exact JSON shape `emit_allow`
         // produces for the Claude variants — a regression there would also

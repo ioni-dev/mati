@@ -276,9 +276,9 @@ fn main() -> Result<()> {
 /// (priority ~46, from Claude Code's GUI process) to USER_INITIATED so
 /// logd's drain threads (which run at DEFAULT/UTILITY) are not starved.
 ///
-/// USER_INITIATED rather than UTILITY: mati hook handlers are on the 3000ms
-/// Claude Code hook timeout critical path — UTILITY risks slow responses
-/// under system load. USER_INITIATED is still well below USER_INTERACTIVE.
+/// USER_INITIATED rather than UTILITY: mati hook handlers are on the 4-second
+/// hook timeout critical path — UTILITY risks slow responses under system
+/// load. USER_INITIATED is still well below USER_INTERACTIVE.
 ///
 /// IPC turnstile boosting: macOS temporarily raises a thread's priority via
 /// Mach turnstiles when a USER_INTERACTIVE client (Claude Code) is waiting
@@ -414,7 +414,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
             mati_core::mcp::serve(&root).await
         }
-        Commands::HookDecide(args) => cli::hook_decide::run(args).await,
+        Commands::HookDecide(args) => match cli::hook_decide::run(args).await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
         Commands::Get { key } => cli::hooks::run_get(&key).await,
         Commands::LogMiss { key } => cli::hooks::run_log_miss(&key).await,
         Commands::LogHit { key } => cli::hooks::run_log_hit(&key).await,
