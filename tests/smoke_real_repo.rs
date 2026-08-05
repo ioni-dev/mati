@@ -29,7 +29,9 @@ mod tests {
     use mati_core::analysis::parser::parse_file;
     use mati_core::analysis::walker::{Language, Walker};
     use mati_core::graph::{EdgeKind, Graph};
-    use mati_core::health::staleness::{apply_reparse_staleness, ReparseDiff, StalenessAnalyzer};
+    use mati_core::health::staleness::{
+        apply_reparse_staleness, ReparseDiff, StalenessAnalyzer, ANALYZE_TIME_BUDGET_MS,
+    };
     use mati_core::mcp::tools::assemble_context_packet;
     use mati_core::store::record::{
         Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, QualityTier, Record,
@@ -382,9 +384,16 @@ mod tests {
             report.scanned
         );
 
+        // This is the analyzer's standalone performance bound, not the
+        // SessionEnd scaffold ceiling. `analyze_all` stops starting work at
+        // ANALYZE_TIME_BUDGET_MS; allow 1000ms for the final writes and
+        // scheduler overhead after that deadline, preserving the old 3s
+        // bound while tying it to the budget it actually guards.
+        let analyze_all_bound_ms = ANALYZE_TIME_BUDGET_MS + 1000;
         assert!(
-            elapsed.as_secs() < 3,
-            "analyze_all exceeded 3-second budget: took {:.2}s",
+            elapsed.as_millis() < u128::from(analyze_all_bound_ms),
+            "analyze_all exceeded its {}ms budget plus 1000ms completion margin: took {:.2}s",
+            ANALYZE_TIME_BUDGET_MS,
             elapsed.as_secs_f64()
         );
 

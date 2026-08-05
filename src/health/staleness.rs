@@ -240,7 +240,7 @@ const MAX_RECOMPUTE_SIGNALS: usize = 10;
 
 /// Time budget for `analyze_all` in milliseconds. After this, stop processing
 /// new records and write out whatever was computed.
-const ANALYZE_TIME_BUDGET_MS: u64 = 2000;
+pub const ANALYZE_TIME_BUDGET_MS: u64 = 2000;
 
 /// Record key prefixes that the analyzer scans.
 const STALENESS_PREFIXES: &[&str] = &["file:", "gotcha:", "decision:", "dep:", "dev_note:"];
