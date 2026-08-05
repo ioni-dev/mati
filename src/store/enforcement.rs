@@ -1405,7 +1405,7 @@ pub async fn count_events_by_type(store: &Store, since_ms: u64) -> Result<Enforc
 /// Derived from the hook path's own deadline rather than picked: the second
 /// event of a pair is written by the `post-memget.sh` PostToolUse hook, and
 /// that hook is bounded by `cli::hook_decide::HOOK_DEADLINE_MS` (2500ms, itself
-/// under Claude Code's 3000ms SIGKILL), so it cannot report later than that.
+/// under the 4s scaffold timeout), so it cannot report later than that.
 /// Measured spread against a warm daemon is 8–100ms, so 2s is the bound with
 /// margin, not the typical case.
 pub const CONSULTATION_COALESCE_MS: u64 = 2_000;

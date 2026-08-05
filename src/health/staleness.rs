@@ -2328,7 +2328,7 @@ mod tests {
         store.close().await.unwrap();
     }
 
-    /// The budget bounds the SessionEnd hook, which Claude Code kills at 3000ms.
+    /// The budget bounds the SessionEnd hook, whose scaffold timeout is 4s.
     #[test]
     fn time_budget_is_unchanged() {
         assert_eq!(ANALYZE_TIME_BUDGET_MS, 2000);

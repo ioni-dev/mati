@@ -96,7 +96,8 @@ dirty queue only.
 
 **Hook output protocol is strict.** Hooks write JSON to stdout with a
 `hookSpecificOutput` wrapper. `permissionDecision` must be `"allow"` or
-`"deny"` — nothing else. Hook timeout is 3000ms; all logic must finish within it.
+`"deny"` — nothing else. mati's scaffold sets a 4-second hook timeout; all logic
+must finish within it.
 
 ---
 
@@ -191,9 +192,13 @@ never block Claude on a mati outage — hooks fail open (P9).
   failure, not an error.
 - **The hook fast-path checks reachability via `ensure_daemon`** (which pings
   internally), not a literal `mati ping`. If the daemon is unreachable, hooks
-  pass through unconditionally (P9). `HOOK_DEADLINE_MS = 2500` leaves a 500ms
-  buffer before Claude Code's 3000ms SIGKILL — never add blocking I/O that could
-  exceed it.
+  pass through unconditionally (P9). `HOOK_DEADLINE_MS = 2500` sits inside a
+  4-second scaffold timeout — never add blocking I/O that could exceed it. The
+  1500ms gap is not slack: the deadline starts counting inside `run()`, so
+  spawn and runtime init land before it (~115ms warm, ~1050ms on a binary not
+  yet page-cached). That 4 seconds is mati's own budget, written by
+  `src/scaffold/settings.rs`, not a platform limit: Claude Code's `timeout`
+  field is in seconds and defaults to 600 for command hooks.
 - **The bash `cat` bypass is a known, accepted miss (~2–5%).** `pre-bash.sh`
   catches `cat <file>` but not variable expansion, process substitution, or
   unusual quoting (C9 in ARCHITECTURE.md section 24). Do not chase 100%.
@@ -201,7 +206,10 @@ never block Claude on a mati outage — hooks fail open (P9).
   (ARCHITECTURE.md section 10.3): editing a file with an unconsulted confirmed gotcha
   is denied (exit 2) until `mem_get`. It parses the patch envelope for exact
   paths, so unlike the `cat` path it is immune to the wrapper/quoting bypass
-  above. Codex fires `PreToolUse` for `apply_patch` but not native reads.
+  above. This rests on a documented Codex contract: `PreToolUse` intercepts
+  `apply_patch` and reports `tool_name: "apply_patch"`. Codex now has near-full
+  hook parity with Claude Code and supports `updatedInput`, which mati does not
+  use. It still fires no hook for its native file-read tool.
   Claude edits are covered PRIMARILY by the read gate (transitively): Claude
   Code's own read-before-edit rule forces a prior read, which the read gate gates,
   so a *naive* blind edit is stopped by Claude Code's "File must be read first"

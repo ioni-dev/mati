@@ -16,6 +16,18 @@ use serde_json::Value;
 /// Contains two top-level keys:
 /// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / Stop (ARCHITECTURE.md section 10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
+///
+/// `timeout` is in SECONDS, and Claude Code's own default is 600. The `4` on the
+/// blocking hooks is mati's self-imposed budget, not a platform limit: it is the
+/// outer backstop for a wedge that `HOOK_DEADLINE_MS` (2500ms) cannot interrupt,
+/// since that timer only fires at an await point.
+///
+/// The 1500ms between them is not slack. `HOOK_DEADLINE_MS` starts counting
+/// inside `run()`, so spawn, dynamic linking, and runtime init all land before
+/// it — measured at ~115ms warm but ~1050ms for a binary not yet in the page
+/// cache (first call after an install or a reboot). At `3` that cold case put
+/// the internal deadline at ~3.5s, past the ceiling, so the host killed the
+/// process before it could write the fail-open entry the deadline exists for.
 const SETTINGS_JSON: &str = r#"{
   "hooks": {
     "PreToolUse": [
@@ -25,7 +37,7 @@ const SETTINGS_JSON: &str = r#"{
           {
             "type": "command",
             "command": ".claude/hooks/pre-read.sh",
-            "timeout": 3000
+            "timeout": 4
           }
         ]
       },
@@ -35,7 +47,7 @@ const SETTINGS_JSON: &str = r#"{
           {
             "type": "command",
             "command": ".claude/hooks/pre-bash.sh",
-            "timeout": 3000
+            "timeout": 4
           }
         ]
       },
@@ -45,7 +57,7 @@ const SETTINGS_JSON: &str = r#"{
           {
             "type": "command",
             "command": ".claude/hooks/pre-edit.sh",
-            "timeout": 3000
+            "timeout": 4
           }
         ]
       }
@@ -110,7 +122,7 @@ const SETTINGS_JSON: &str = r#"{
           {
             "type": "command",
             "command": ".claude/hooks/session-end.sh",
-            "timeout": 3000
+            "timeout": 4
           }
         ]
       }
