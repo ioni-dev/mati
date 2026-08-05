@@ -610,10 +610,15 @@ Codex `codex-pre-apply-patch` is a policy enforcement path. Its patch envelope p
 captures raw Codex `apply_patch` PreToolUse and Bash PostToolUse payloads,
 verifies the Codex hook and MCP wiring, and prompts a session to exercise the
 apply-patch deny/consult path, symlink resolution, shadow observations, the
-fileless Bash deny, and the db-introspection receipt minting pair. The fixture
-exists, but these Codex paths remain unvalidated until a real Codex session
-has run it; the synthetic assertions in `scripts/smoke-policy.sh` do not close
-that gap.
+fileless Bash deny, and the `db_client` deny → `mem_get` → allow loop. Its
+`db_client` policy requires `MemGet`, not `DbIntrospection`: a Codex session
+cannot mint the latter (section 10a.5), so a policy accepting only it would
+steer rather than deny and the check would test nothing. The fixture asserts
+that limit directly instead — introspecting first must leave the deny standing.
+The introspect-then-query path is validated on Claude by
+`scripts/policy-live-session.sh`. These Codex paths remain unvalidated until a
+real Codex session has run the fixture; the synthetic assertions in
+`scripts/smoke-policy.sh` do not close that gap.
 
 Event collection on this path is not conditional on denying. A patch that is allowed still fires whatever the gates produced: a shadow observation, a receipt-backed allow, and a `Miss` for any touched file with no record. That last one makes `codex-pre-apply-patch` a miss-recording surface, which it was not before — previously it fired nothing unless it denied, so multi-file patches under-counted misses. `fire_events` is one sequential daemon round trip per event and `MAX_APPLY_PATCH_FILES` is 50; a measured 50-file no-record patch costs ~105ms against the 2500ms `HOOK_DEADLINE_MS`, so the sequential shape stands. If that ever becomes material the fix is a batched command preserving order, not concurrency: enforcement events allocate a durable monotonic `seq_no` into a hash chain, and concurrent writes would make the order of a log whose purpose is replayable tamper-evidence non-deterministic.
 

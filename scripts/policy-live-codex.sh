@@ -100,7 +100,12 @@ add_policy codex-apply-block "Consult decision:codex-migrations before editing m
 add_policy codex-symlink "Consult decision:codex-vault before editing vault files." "Credentials rotate out of band because the secrets pipeline owns them." '{"tool":"path","target_path_glob":"vault/**"}' '{"key":"decision:codex-vault","via":["mem_get"],"freshness":{"ttl_secs":900}}' enable
 add_policy codex-shadow "Consult decision:codex-shadow before editing migrations." "Migrations drift because production changes independently." '{"tool":"path","target_path_glob":"migrations/**"}' '{"key":"decision:codex-shadow","via":["mem_get"],"freshness":{"ttl_secs":900}}' stage
 "$MATI" policy stage codex-shadow shadow >/dev/null
-add_policy codex-db "Consult decision:codex-inventory before querying production." "Schemas drift because production changes independently." '{"tool":"db_client","host_glob":"*prod-codex*"}' '{"key":"decision:codex-inventory","via":["db_introspection"],"freshness":{"ttl_secs":900}}' enable
+# via is mem_get, not db_introspection. Codex's PostToolUse payload carries no
+# exit status, so codex-post-bash never mints a DbIntrospection receipt, and a
+# block policy accepting only sources outside CODEX_PRODUCIBLE_SOURCES degrades
+# to steering — this policy would never deny. The introspect-then-query path is
+# validated on Claude by policy-live-session.sh (live-introspect).
+add_policy codex-db "Consult decision:codex-inventory before querying production." "Schemas drift because production changes independently." '{"tool":"db_client","host_glob":"*prod-codex*"}' '{"key":"decision:codex-inventory","via":["mem_get"],"freshness":{"ttl_secs":900}}' enable
 
 git init --quiet; git add -A; git -c user.email=fixture@local -c user.name=fixture commit -qm fixture >/dev/null
 printf '\n\033[1mFixture ready:\033[0m %s\n' "$DEST"; "$MATI" policy list
@@ -161,7 +166,17 @@ Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
    cannot reach the daemon socket; read the aggregate through the MCP tool, which
    runs outside it.
 9. Bash psql -h db.prod-codex.internal -c "SELECT * FROM inventory". Expect exit 2, mati: decision:codex-inventory; stub must not run.
-10. Bash psql -h db.prod-codex.internal -c "\d inventory"; report status. Expect 0/no block; introspection must mint.
-11. In a new message rerun step 9. Expect allowed/stub output, proving introspect-then-query.
-Report a table and state whether payload shapes, apply_patch deny, symlink deny, shadow observation, mem_get, fileless deny, and minting pair were live-validated.
+10. Bash psql -h db.prod-codex.internal -c "\d inventory"; report status. Expect 0/no
+    block: schema introspection is exempt from the block so you can inspect before
+    consulting. This does NOT satisfy the policy here.
+11. In a new message rerun step 9. Expect exit 2 AGAIN. Codex's PostToolUse payload
+    carries no exit status, so mati cannot tell a successful introspection from one
+    that exited 127 and never mints a db_introspection receipt on this platform.
+    Introspection alone cannot clear a policy here. An allow is a FAIL, and so is a
+    deny naming any key other than decision:codex-inventory.
+12. Call the mati MCP tool mem_get with key decision:codex-inventory, then rerun
+    step 9. Expect allowed and stub output, proving deny -> mem_get -> allow on a
+    db_client trigger. Use the MCP tool, not 'mati show': your sandboxed shell
+    cannot reach the daemon socket, but the MCP tool runs outside it.
+Report a table and state whether payload shapes, apply_patch deny, symlink deny, shadow observation, mem_get, fileless deny, the db_client deny -> mem_get -> allow loop, and introspection NOT minting on Codex were live-validated.
 EOF
