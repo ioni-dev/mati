@@ -153,7 +153,7 @@ pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Act
         match class {
             CommandClass::DbClientLike => {
                 action.tool = ACTION_TOOL_DB_CLIENT.to_string();
-                action.host = extract_db_host(command);
+                action.host = extract_db_host(command).or_else(|| extract_db_host(&effective));
                 action.files.extend(extract_file_paths(command, class));
             }
             CommandClass::CatLike | CommandClass::GrepLike => {

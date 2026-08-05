@@ -1085,6 +1085,99 @@ fn sudo_with_flags_is_a_known_gap() {
     assert_eq!(classify_command("sudo -u root cat src/secret.rs"), None);
 }
 
+#[test]
+fn classify_bash_c_db_client() {
+    let command = r#"bash -c 'psql -h host -c "SELECT 1"'"#;
+    assert_eq!(classify_command(command), Some(CommandClass::DbClientLike));
+    assert_eq!(
+        normalize_action(Some(command), None).host.as_deref(),
+        Some("host")
+    );
+}
+
+#[test]
+fn extract_file_path_through_sh_c() {
+    let command = r#"sh -c "cat /etc/passwd""#;
+    assert_eq!(classify_command(command), Some(CommandClass::CatLike));
+    assert_eq!(
+        extract_file_path(command, CommandClass::CatLike),
+        Some("/etc/passwd".to_string())
+    );
+}
+
+#[test]
+fn classify_sudo_bash_c_db_client() {
+    assert_eq!(
+        classify_command(r#"sudo bash -c 'psql -h host -c "SELECT 1"'"#),
+        Some(CommandClass::DbClientLike)
+    );
+}
+
+#[test]
+fn classify_bash_combined_c_flag() {
+    assert_eq!(
+        classify_command(r#"bash -lc 'psql -h host -c "SELECT 1"'"#),
+        Some(CommandClass::DbClientLike)
+    );
+}
+
+#[test]
+fn classify_bash_login_c_db_client() {
+    assert_eq!(
+        classify_command("bash --login -c 'psql -h db.prod-codex.internal'"),
+        Some(CommandClass::DbClientLike)
+    );
+}
+
+#[test]
+fn classify_bash_x_login_c_db_client() {
+    assert_eq!(
+        classify_command("bash -x --login -c 'psql -h db.prod-codex.internal'"),
+        Some(CommandClass::DbClientLike)
+    );
+}
+
+#[test]
+fn classify_bash_pipefail_c_db_client() {
+    assert_eq!(
+        classify_command("bash -o pipefail -c 'psql -h db.prod-codex.internal'"),
+        Some(CommandClass::DbClientLike)
+    );
+}
+
+#[test]
+fn classify_bash_c_with_escaped_double_quotes_db_client() {
+    let command = "bash -c \"psql -h db.prod-codex.internal -c \\\"SELECT 1\\\"\"";
+    assert_eq!(classify_command(command), Some(CommandClass::DbClientLike));
+}
+
+#[test]
+fn shell_commands_without_c_remain_unchanged() {
+    assert_eq!(effective_command("bash script.sh"), "bash script.sh");
+    assert_eq!(effective_command("bash"), "bash");
+}
+
+#[test]
+fn shell_script_before_c_remains_unchanged() {
+    assert_eq!(
+        effective_command("bash script.sh -c foo"),
+        "bash script.sh -c foo"
+    );
+}
+
+#[test]
+fn shell_unwrapping_is_depth_bounded() {
+    let mut command = String::from("psql");
+    for depth in 0..6 {
+        let quote = if depth % 2 == 0 { '\'' } else { '"' };
+        command = format!("bash -c {quote}{command}{quote}");
+    }
+
+    let normalized = effective_command(&command);
+    assert!(!normalized.is_empty());
+    assert!(normalized.len() <= command.len());
+}
+
 // ── quote-aware tokenizer: grep grammar (pattern vs path) ─────────────
 
 #[test]
