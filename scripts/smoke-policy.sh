@@ -339,6 +339,26 @@ CODEX_RC=$?
 [ "$CODEX_RC" -eq 0 ] && pass "Codex introspection exits 0" || fail "Codex introspection exits 0" "rc=$CODEX_RC output=$OUT"
 [ -z "$OUT" ] && pass "Codex introspection steer is silent" || fail "Codex introspection steer is silent" "output=$OUT"
 
+# A block policy whose requires.via names only db_introspection can never be
+# satisfied in Codex: its PostToolUse payload has no exit status, so
+# codex-post-bash never mints that receipt. It degrades to steering there and
+# still denies on Claude. Asserted both ways so a regression on one side shows.
+# The host glob deliberately avoids "prod-c", which step 4's query-c matches.
+OUT="$(mati_p policy add codex-degrade --name codex-degrade \
+  --rule 'Consult schema:codex-degrade first.' \
+  --reason 'Schemas drift because production changes independently.' \
+  --mode block --severity high \
+  --trigger '{"tool":"db_client","host_glob":"*degrade-smoke*"}' \
+  --requires '{"key":"schema:codex-degrade","via":["db_introspection"],"freshness":{"ttl_secs":900}}')"
+assert_has "authoring warns that Codex cannot satisfy this policy" "$OUT" 'Codex cannot produce any accepted receipt source'
+mati_p policy enable codex-degrade >/dev/null
+OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.degrade-smoke.internal -c \"select 1\""')")"
+CODEX_RC=$?
+[ "$CODEX_RC" -eq 0 ] && pass "Codex-unsatisfiable policy does not deny on Codex" || fail "Codex-unsatisfiable policy does not deny on Codex" "rc=$CODEX_RC output=$OUT"
+assert_lacks "Codex-unsatisfiable policy emits no deny text" "$OUT" 'mati:'
+OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.degrade-smoke.internal -c \"select 1\""')")"
+assert_has "same policy still denies on Claude" "$OUT" 'schema:codex-degrade'
+
 # Widening event collection to the allow path made apply_patch a miss-recording
 # surface: a touched file with no record now increments the daily aggregate,
 # where before this adapter fired nothing unless it denied.
