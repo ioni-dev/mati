@@ -103,6 +103,8 @@ impl Drop for DaemonGuard {
     }
 }
 
+/// `mati_home` exports `MATI_HOME` as a side effect, so asserting it is set
+/// after calling it proves nothing. What is worth pinning is where it points.
 #[test]
 fn integration_tests_never_use_real_mati_home() {
     let resolved = mati_home();
@@ -115,9 +117,4 @@ fn integration_tests_never_use_real_mati_home() {
             real_mati.display()
         );
     }
-    assert_eq!(
-        std::env::var_os("MATI_HOME").map(PathBuf::from),
-        Some(resolved),
-        "integration tests must export MATI_HOME for spawned mati processes"
-    );
 }
