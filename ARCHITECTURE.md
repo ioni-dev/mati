@@ -80,15 +80,35 @@ mati/
 │   ├── cli/                 # clap commands, comfy_table output
 │   ├── mcp/                 # MCP stdio server (rmcp) + daemon socket bridge
 │   │   ├── server.rs        # serve(), socket loop, policy consts
-│   │   ├── tools.rs         # mem_get, mem_query, mem_bootstrap, mem_set
+│   │   ├── tools/           # mem_get, mem_query, mem_bootstrap, mem_set
+│   │   │   ├── mod.rs             # MatiServer + #[tool_router] impl (4 tools)
+│   │   │   ├── context_packet.rs  # mem_bootstrap assembly, shared with handlers/
+│   │   │   └── mem_set_command.rs # mem_set -> typed Command mapping
 │   │   ├── types.rs         # ContextPacket, MCP response types
 │   │   ├── protocol.rs      # v2 typed Request/Response/Command + v1/v2 mapper
-│   │   ├── dispatch_v2.rs   # v2 typed Command to handler dispatch
-│   │   ├── handlers.rs      # handler bodies
+│   │   ├── dispatch_v2/     # v2 typed Command to handler dispatch
+│   │   │   ├── mod.rs       # entry point, request context, audit helpers
+│   │   │   ├── reads.rs     # MemQuery + side-effecting reads + v1 bridge
+│   │   │   ├── knowledge.rs # knowledge-side mutations + policy write/evaluate
+│   │   │   ├── compound.rs  # FileEditHook (per-tree atomic substeps)
+│   │   │   └── session.rs   # session-side mutations
+│   │   ├── handlers/        # handler bodies
+│   │   │   ├── mod.rs               # shared helpers (audit, retry) + re-exports
+│   │   │   ├── gotcha.rs             # GotchaUpsert/Confirm/Tombstone
+│   │   │   ├── file.rs               # FileEnrich/FileReparse/DocCapture
+│   │   │   ├── decision_devnote.rs   # DecisionUpsert/DevNoteUpsert
+│   │   │   ├── reads.rs              # MemGet/MemQuery/MemBootstrap
+│   │   │   ├── file_link.rs          # staged file-link computation
+│   │   │   └── record_import.rs      # RecordImport
 │   │   ├── daemon_lifecycle.rs # ensure_daemon, lifecycle.log readiness (section 4.2)
 │   │   └── metadata.rs      # DaemonMetadata, panic hook, peer cred, lifecycle log
 │   ├── store/               # SurrealKV layer
-│   │   ├── db.rs            # knowledge.db + sessions.db init
+│   │   ├── db/              # knowledge.db + sessions.db init
+│   │   │   ├── mod.rs       # Store, KnowledgeWriteOp, open/lifecycle/health/internals
+│   │   │   ├── crud.rs      # get/put/scan/search/transact_knowledge
+│   │   │   ├── history.rs   # HistoryEntry, history/history_since/records_since
+│   │   │   ├── slug.rs      # derive_slug
+│   │   │   └── tree.rs      # SurrealKV Tree construction, lock error hints
 │   │   ├── record.rs        # Record struct + all sub-types
 │   │   ├── durability.rs    # Immediate vs Eventual write paths
 │   │   ├── gotcha_ops.rs    # centralized gotcha mutations
@@ -116,7 +136,13 @@ mati/
 │   │   ├── gaps.rs          # KnowledgeGapAnalyzer
 │   │   └── onboarding.rs    # OnboardingScore
 │   └── hooks/               # hook decision engine
-│       ├── decide.rs        # pure enforcement decision, no I/O
+│       ├── decide/          # pure enforcement decision, no I/O
+│       │   ├── mod.rs              # Types + Core Decision Engine (evaluate)
+│       │   ├── classification.rs   # command classification
+│       │   ├── path_extraction.rs  # file-path extraction from shell commands
+│       │   ├── envelope.rs         # apply_patch envelope parsing
+│       │   ├── path_normalize.rs   # lexical path normalization
+│       │   └── json_helpers.rs     # payload readers used by evaluate()
 │       ├── pre_read.rs      # pre-read hook adapter
 │       ├── pre_bash.rs      # pre-bash hook adapter
 │       └── compliance.rs    # compliance event recording
@@ -415,7 +441,7 @@ Edge keys use the slugified kind name: `has_gotcha`, `imports`, `affected_by`, a
 
 Hooks are shell scripts installed by `mati hooks` into the project’s `.claude/settings.json`. The command writes files under `.claude/` inside the repository root. Hooks run on `PreToolUse`, before Claude reads a file or runs a bash command, and on `PostToolUse`, after the tool call.
 
-The decision engine in `src/hooks/decide.rs` is pure. No I/O, no daemon calls. The adapter layer in `src/cli/hook_decide.rs` maps semantic decisions to protocol output:
+The decision engine in `src/hooks/decide/` is pure. No I/O, no daemon calls. The adapter layer in `src/cli/hook_decide.rs` maps semantic decisions to protocol output:
 
 - JSON for Claude Code, which runs the hook as a shell subprocess and reads stdout
 - exit codes for environments that support the Codex hook protocol
@@ -1226,7 +1252,7 @@ What "a problem" means concretely here is not disk space — a multi-GB store is
 
 ### 25.2 Graph edges
 
-`Graph::load` (`src/graph/graph.rs:47-65`) does one `scan_keys("graph:edge:")` — a key-only range scan, no value bytes read (`src/store/db.rs:936-951`) — then one `Edge::from_key` parse plus one petgraph insert (HashMap + HashSet + `DiGraph`) per edge, entirely in memory.
+`Graph::load` (`src/graph/graph.rs:47-65`) does one `scan_keys("graph:edge:")` — a key-only range scan, no value bytes read (`src/store/db/crud.rs:626-641`) — then one `Edge::from_key` parse plus one petgraph insert (HashMap + HashSet + `DiGraph`) per edge, entirely in memory.
 
 The real ceiling isn't FLOPs, it's the daemon readiness watchdog. `Graph::load` runs inside `mati daemon`'s startup (`src/cli/daemon.rs:348`), between the `phase=store_opened` and `phase=ready` lifecycle events — and **no intermediate event is emitted** for graph load, the dirty-queue auto-drain, or the policy-matcher load that follow it in the same window (`src/cli/daemon.rs:313-401`). `wait_for_ready` calls the daemon `Wedged` if `lifecycle.log` stops growing for 15s (`READINESS_WEDGE_THRESHOLD`, `src/mcp/daemon_lifecycle.rs:67`) and gives up entirely (`HardCap`) at 60s (line 61) — regardless of whether the daemon is still silently making progress. A graph load slow enough to blow through 15s reads as a hung daemon, not a big one.
 
@@ -1242,7 +1268,7 @@ The measured init on the 58k-file rust repo produced only 80 edges (dependency e
 
 `enforcement:event:*` is append-only and hash-chained, stored in `knowledge.db` (Immediate durability by default — `src/store/durability.rs`). `enforce_retention` (`src/store/enforcement.rs:1303`) is the only prune logic that exists, and it has no production caller — confirmed by `src/invariants.rs`'s caller-claim test (`every_documented_caller_claim_has_a_caller`, `src/invariants.rs:1305`), which names `enforce_retention` as the sanctioned exception rather than a bug to fix. There is no working prune path today, full stop; do not wire one up to silence that test (`src/invariants.rs:1335`) — that's a behavior change and needs its own review.
 
-Both consumers that need the full chain call `scan_enforcement_events(store, 0, u64::MAX)` unconditionally (`src/store/enforcement.rs:871-911`): `mati verify-chain` (`src/cli/verify_chain.rs:37`) and `mati history --enforcement`, even with `--limit` (`src/cli/show.rs:1150`). That's one key scan, then one separate `get_raw_bytes` call per event — each opens its own read-only transaction (`src/store/db.rs:749-756`) — one JSON deserialize per event, and, for `verify-chain`, one SHA-256 recompute per event to check tamper and linkage (`src/store/enforcement.rs:424-479`). `--limit N` on `mati history --enforcement` filters *after* loading everything (`src/cli/show.rs:1132-1175`); it does not bound the scan.
+Both consumers that need the full chain call `scan_enforcement_events(store, 0, u64::MAX)` unconditionally (`src/store/enforcement.rs:871-911`): `mati verify-chain` (`src/cli/verify_chain.rs:37`) and `mati history --enforcement`, even with `--limit` (`src/cli/show.rs:1150`). That's one key scan, then one separate `get_raw_bytes` call per event — each opens its own read-only transaction (`src/store/db/crud.rs:439-446`) — one JSON deserialize per event, and, for `verify-chain`, one SHA-256 recompute per event to check tamper and linkage (`src/store/enforcement.rs:424-479`). `--limit N` on `mati history --enforcement` filters *after* loading everything (`src/cli/show.rs:1132-1175`); it does not bound the scan.
 
 This is the one place in the codebase that never got the equivalent of the fix already applied to `StalenessAnalyzer::analyze_all`: a resumable cursor plus a hard 2000ms deadline (`ANALYZE_TIME_BUDGET_MS`, `src/health/staleness.rs:236`, `src/health/staleness.rs:337` onward), added specifically because an unbounded full scan doesn't hold up at scale. The enforcement scan path never got that treatment.
 

@@ -358,6 +358,9 @@ pub struct PolicyEvaluateInput {
     pub action: Action,
     #[serde(default)]
     pub actor: Option<String>,
+    /// Original command text used only for record-only bypass detection.
+    #[serde(default)]
+    pub raw_command: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,6 +378,14 @@ pub struct PolicyVerdict {
     /// Snapshot of the global enforcement mode used for block degradation.
     #[serde(default)]
     pub strict: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PolicyEvaluateResult {
+    pub verdicts: Vec<PolicyVerdict>,
+    /// Policy key whose literal was found in an otherwise unclassified command.
+    #[serde(default)]
+    pub bypass_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -749,6 +760,9 @@ pub enum SessionEvent {
     /// `Deny`, unlike [`SessionEvent::CodexShellMiss`], which the POST-bash
     /// hook fires after the fact when nothing was denied.
     CodexShellBlocked,
+    /// An unclassified command mentioned a meaningful literal from an active
+    /// policy trigger; records a bypass signal without changing the decision.
+    UnclassifiedPolicyLiteralBypass,
     Bootstrap,
     PromptNudge,
     /// Post-bash observed a command that passed `is_schema_introspection` but

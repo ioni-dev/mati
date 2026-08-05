@@ -527,15 +527,15 @@ fn mcp_stdio_validation_gates() {
         "mem_set",
         r#"{"action":"write","key":"session:invalid","value":"test","category":"File","payload":"{}"}"#,
     );
-    // Source: src/mcp/tools.rs:416 — emitted when the key prefix isn't one
-    // of gotcha:/decision:/dev_note:.
+    // Source: src/mcp/tools/mem_set_command.rs — emitted when the key prefix
+    // isn't one of gotcha:/decision:/dev_note:/policy:.
     assert!(
         text.contains("requires key with") || text.contains("must start with"),
         "should reject invalid prefix: {text}"
     );
 
-    // Gotcha key with non-gotcha payload — the rule-field gate (tools.rs:360)
-    // fires before category mismatch, so we assert on the actual error path.
+    // Gotcha key with non-gotcha payload — the rule-field gate fires before
+    // category mismatch, so we assert on the actual error path.
     let text = call_tool(
         &mut stdin,
         &rx,
@@ -550,7 +550,7 @@ fn mcp_stdio_validation_gates() {
 
     // Missing gotcha fields. The rule gate fires first; verify it. Then send
     // a second payload with rule but no reason to prove the reason gate also
-    // fires (src/mcp/tools.rs:362).
+    // fires (src/mcp/tools/mem_set_command.rs).
     let text = call_tool(
         &mut stdin,
         &rx,

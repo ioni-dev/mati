@@ -72,6 +72,10 @@ struct HealthSnapshot {
     misses_7d: u64,
     hit_rate_7d: f32,
     bypasses_7d: u64,
+    /// Blocked (denied) actions — the deny aggregate, not a bypass. Older
+    /// cached snapshots predate this field.
+    #[serde(default)]
+    denials_7d: u64,
 
     computed_at: u64,
 
@@ -509,7 +513,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
 
     println!("  {bold}{blue}Compliance (7d){reset}");
 
-    let (hits_7d, misses_7d, bypasses_7d) = scan_compliance_7d(&store, now).await;
+    let (hits_7d, misses_7d, denials_7d, bypasses_7d) = scan_compliance_7d(&store, now).await;
 
     let total_lookups = hits_7d + misses_7d;
     let hit_rate = if total_lookups > 0 {
@@ -525,6 +529,10 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         );
     } else {
         println!("    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)");
+    }
+
+    if denials_7d > 0 {
+        println!("    Denials (blocked)      {red}{denials_7d}{reset}");
     }
 
     let bp_color = if bypasses_7d == 0 { green } else { yellow };
@@ -653,6 +661,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
             0.0
         },
         bypasses_7d,
+        denials_7d,
 
         computed_at: now,
         write_seq: current_seq,
@@ -838,6 +847,7 @@ pub async fn seed_snapshot(
         misses_7d: 0,
         hit_rate_7d: 0.0,
         bypasses_7d: 0,
+        denials_7d: 0,
         computed_at: now,
         write_seq,
     };
@@ -1053,6 +1063,10 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
         println!("    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)");
     }
 
+    if s.denials_7d > 0 {
+        println!("    Denials (blocked)      {red}{}{reset}", s.denials_7d);
+    }
+
     let bp_color = if s.bypasses_7d == 0 { green } else { yellow };
     if s.bypasses_7d > 0 || total_lookups > 0 {
         println!(
@@ -1082,23 +1096,33 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
 
 // ── Compliance scanning helpers ──────────────────────────────────────────────
 
-/// Scan analytics:hit_*, analytics:miss_*, compliance:miss_*,
-/// compliance:allow_after_receipt_*, and compliance:codex_shell_miss_* for the
-/// last 7 days and return (total_hits, total_misses, total_bypasses).
+/// Scan the compliance daily aggregates for the last 7 days and return
+/// `(total_hits, total_misses, total_denials, total_bypasses)`.
 ///
 /// `compliance:allow_after_receipt_*` is fired by `codex-post-bash` (and the
 /// claude post-compliance hook) when a file's consultation receipt was valid
 /// at the time of use — semantically a hit, so it rolls into `hits_7d`.
-/// `compliance:codex_shell_miss_*` is fired by `codex-post-bash` when a file
-/// was used without a valid receipt. It is counted in **both** `misses_7d`
-/// (so the hook activity registers in the lookups denominator and `Hit rate`
-/// reflects real consultation behavior) AND `bypasses_7d` (so the separate
-/// "Bypasses" line still surfaces the bypass count to operators). The two
-/// counters are not disjoint by design — `bypasses_7d` is a strict subset
-/// signal layered on top of the lookups total.
-async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
+///
+/// `compliance:miss_*` is the DENY aggregate: it is written whenever a hook
+/// blocked an unconsulted action (`ComplianceMiss`, `CodexShellBlocked`,
+/// `EditBlocked`, `FloorConsultMiss`, `PolicyConsultMiss` in
+/// `dispatch_v2.rs`). The gate worked — nothing was bypassed — so it rolls
+/// into `denials_7d`, not `bypasses_7d`.
+///
+/// `bypasses_7d` sums the four aggregates that mirror
+/// `EnforcementEventType::BypassDetected` in the hash-chained log:
+/// `compliance:codex_shell_miss_*`, `compliance:wrapped_db_client_miss_*`,
+/// `compliance:tombstone_bypass_*`, and
+/// `compliance:unclassified_policy_literal_bypass_*`. `compliance:codex_shell_miss_*` is
+/// fired by `codex-post-bash` after a file was used without a valid receipt;
+/// it also rolls into `misses_7d` (so the hook activity registers in the
+/// lookups denominator and `Hit rate` reflects real consultation behavior).
+/// The other three bypass aggregates are not consultation lookups, so they are
+/// not added to `misses_7d`.
+async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
+    let mut denials: u64 = 0;
     let mut bypasses: u64 = 0;
 
     // Generate date keys for the last 7 days
@@ -1108,9 +1132,13 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
 
         let hit_key = format!("analytics:hit_{date}");
         let miss_key = format!("analytics:miss_{date}");
-        let bypass_key = format!("compliance:miss_{date}");
+        let deny_key = format!("compliance:miss_{date}");
         let post_hit_key = format!("compliance:allow_after_receipt_{date}");
         let codex_miss_key = format!("compliance:codex_shell_miss_{date}");
+        let wrapped_db_miss_key = format!("compliance:wrapped_db_client_miss_{date}");
+        let tombstone_bypass_key = format!("compliance:tombstone_bypass_{date}");
+        let unclassified_literal_bypass_key =
+            format!("compliance:unclassified_policy_literal_bypass_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
@@ -1124,9 +1152,9 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
             }
         }
 
-        if let Ok(Some(record)) = store.get(&bypass_key).await {
+        if let Ok(Some(record)) = store.get(&deny_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
-                bypasses += agg.count;
+                denials += agg.count;
             }
         }
 
@@ -1146,9 +1174,27 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64) {
                 bypasses += agg.count;
             }
         }
+
+        if let Ok(Some(record)) = store.get(&wrapped_db_miss_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
+
+        if let Ok(Some(record)) = store.get(&tombstone_bypass_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
+
+        if let Ok(Some(record)) = store.get(&unclassified_literal_bypass_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
     }
 
-    (hits, misses, bypasses)
+    (hits, misses, denials, bypasses)
 }
 
 /// Format a Unix timestamp as `YYYY-MM-DD` for snapshot keys.
@@ -1382,6 +1428,7 @@ mod tests {
             misses_7d: 8,
             hit_rate_7d: 0.84,
             bypasses_7d: 1,
+            denials_7d: 5,
             computed_at: 1_710_520_800,
             write_seq: 42,
         }
@@ -1398,6 +1445,7 @@ mod tests {
         assert_eq!(parsed["knowledge_gaps"], 7);
         assert_eq!(parsed["hits_7d"], 42);
         assert_eq!(parsed["bypasses_7d"], 1);
+        assert_eq!(parsed["denials_7d"], 5);
         assert_eq!(parsed["critical_uncovered"], 4);
         assert_eq!(parsed["orphaned_decisions"], 1);
         assert_eq!(parsed["low_confidence"], 3);
@@ -1427,6 +1475,7 @@ mod tests {
         assert_eq!(deserialized.hits_7d, snapshot.hits_7d);
         assert_eq!(deserialized.misses_7d, snapshot.misses_7d);
         assert_eq!(deserialized.bypasses_7d, snapshot.bypasses_7d);
+        assert_eq!(deserialized.denials_7d, snapshot.denials_7d);
         assert_eq!(deserialized.computed_at, snapshot.computed_at);
         assert!((deserialized.avg_confidence - snapshot.avg_confidence).abs() < 0.001);
         assert!((deserialized.estimated_minutes - snapshot.estimated_minutes).abs() < 0.01);
@@ -1461,6 +1510,7 @@ mod tests {
         assert_eq!(snapshot.critical_uncovered, 0);
         assert_eq!(snapshot.orphaned_decisions, 0);
         assert_eq!(snapshot.low_confidence, 0);
+        assert_eq!(snapshot.denials_7d, 0);
         // Existing fields parse correctly
         assert_eq!(snapshot.files_with_purpose, 5);
         assert_eq!(snapshot.total_files, 10);

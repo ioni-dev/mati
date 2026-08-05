@@ -869,12 +869,16 @@ impl StoreProxy {
                 let cmd = p::Command::PolicyEvaluate(p::PolicyEvaluateInput {
                     action: action.clone(),
                     actor: actor.map(str::to_string),
+                    raw_command: None,
                 });
                 match daemon_v2(root, cmd).await {
                     DaemonResult::Ok(resp) => {
                         if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
-                            serde_json::from_value(resp.get("data").cloned().unwrap_or_default())
-                                .context("daemon policy_evaluate returned invalid data")
+                            let result: p::PolicyEvaluateResult = serde_json::from_value(
+                                resp.get("data").cloned().unwrap_or_default(),
+                            )
+                            .context("daemon policy_evaluate returned invalid data")?;
+                            Ok(result.verdicts)
                         } else {
                             let error = resp
                                 .get("error")
@@ -1297,7 +1301,7 @@ async fn open_store_with_lock_retry(cwd: &Path) -> Result<Store> {
             Err(err) => {
                 // The raw SurrealKV "already locked" error sits in the
                 // cause chain; the top-level anyhow message added by
-                // `open_knowledge_tree` (`src/store/db.rs:1115`) is just
+                // `open_knowledge_tree` (`src/store/db/tree.rs:41`) is just
                 // "failed to open knowledge.db". `format!("{err}")` only
                 // renders the top-level — walk the chain via `err.chain()`
                 // so we actually see the lock-contention text.

@@ -160,6 +160,54 @@ impl PolicyMatcherSet {
             })
             .collect()
     }
+
+    /// Detect a record-only signal when an unclassified command mentions a
+    /// meaningful literal from an active host/path trigger; this is
+    /// intentionally false-positive because raw text alone cannot prove use.
+    pub fn detect_unclassified_literal_bypass(
+        &self,
+        action: &Action,
+        raw_command: &str,
+    ) -> Option<&str> {
+        if is_known_action_tool(&action.tool) {
+            return None;
+        }
+        self.policies.iter().find_map(|compiled| {
+            if matches!(compiled.policy.stage, PolicyStage::Off) {
+                return None;
+            }
+            let trigger = &compiled.policy.trigger;
+            let host_literal = trigger.host_glob.as_deref().and_then(longest_literal_run);
+            let path_literal = trigger
+                .target_path_glob
+                .as_deref()
+                .and_then(longest_literal_run);
+            [host_literal, path_literal]
+                .into_iter()
+                .flatten()
+                .any(|literal| raw_command.contains(literal))
+                .then_some(compiled.key.as_str())
+        })
+    }
+}
+
+fn longest_literal_run(pattern: &str) -> Option<&str> {
+    let mut best: Option<&str> = None;
+    let mut start = 0;
+    for (index, character) in pattern.char_indices() {
+        if matches!(character, '*' | '?' | '[' | ']' | '{' | '}') {
+            let literal = &pattern[start..index];
+            if best.is_none_or(|current| literal.len() > current.len()) {
+                best = Some(literal);
+            }
+            start = index + character.len_utf8();
+        }
+    }
+    let literal = &pattern[start..];
+    if best.is_none_or(|current| literal.len() > current.len()) {
+        best = Some(literal);
+    }
+    best.filter(|literal| literal.len() >= 4)
 }
 
 #[cfg(test)]
@@ -241,6 +289,87 @@ mod tests {
         assert!(set
             .matches(&action(Some("db.dev.internal"), &[]))
             .is_empty());
+    }
+
+    #[test]
+    fn unclassified_literal_bypass_detection_is_record_only() {
+        let set = PolicyMatcherSet::from_policies([(
+            "policy:prod".into(),
+            policy(
+                "Production",
+                PolicyTrigger {
+                    tool: Some("db_client".into()),
+                    host_glob: Some("*prod-codex*".into()),
+                    ..Default::default()
+                },
+            ),
+        )])
+        .unwrap();
+        let unclassified = Action {
+            tool: "unknown".into(),
+            target_path: None,
+            host: None,
+            argv: vec![],
+            files: vec![],
+        };
+        assert_eq!(
+            set.detect_unclassified_literal_bypass(
+                &unclassified,
+                r#"db_client=psql; "$db_client" -h db.prod-codex.internal -c 'SELECT 1'"#,
+            ),
+            Some("policy:prod")
+        );
+        assert_eq!(
+            set.detect_unclassified_literal_bypass(
+                &unclassified,
+                r#"db_client=psql; "$db_client" -h db.dev.internal -c 'SELECT 1'"#,
+            ),
+            None
+        );
+        assert_eq!(
+            set.detect_unclassified_literal_bypass(
+                &action(Some("db.prod-codex.internal"), &[]),
+                "psql -h db.prod-codex.internal -c select",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unclassified_literal_bypass_skips_off_and_short_literals() {
+        let off = PolicyRecord {
+            stage: PolicyStage::Off,
+            ..policy(
+                "Off",
+                PolicyTrigger {
+                    host_glob: Some("*prod-codex*".into()),
+                    ..Default::default()
+                },
+            )
+        };
+        let short = policy(
+            "Short",
+            PolicyTrigger {
+                host_glob: Some("*abc*".into()),
+                ..Default::default()
+            },
+        );
+        let set = PolicyMatcherSet::from_policies([
+            ("policy:off".into(), off),
+            ("policy:short".into(), short),
+        ])
+        .unwrap();
+        let action = Action {
+            tool: "unknown".into(),
+            target_path: None,
+            host: None,
+            argv: vec![],
+            files: vec![],
+        };
+        assert_eq!(
+            set.detect_unclassified_literal_bypass(&action, "db.prod-codex.internal abc"),
+            None
+        );
     }
 
     #[test]

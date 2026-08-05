@@ -83,12 +83,12 @@ fn init_rs_resolves_store_imports() {
 #[test]
 fn tools_rs_resolves_graph_import() {
     let (index, files) = mati_src_index();
-    let resolved = resolved_imports_for("src/mcp/tools.rs", &files, &index);
+    let resolved = resolved_imports_for("src/mcp/tools/mod.rs", &files, &index);
 
-    // tools.rs imports from crate::graph, crate::store, super::server, etc.
+    // tools/mod.rs imports from crate::graph, crate::store, super::server, etc.
     assert!(
         !resolved.is_empty(),
-        "src/mcp/tools.rs must resolve at least one internal import"
+        "src/mcp/tools/mod.rs must resolve at least one internal import"
     );
 }
 

@@ -11,7 +11,7 @@
 //! at every tier because it is a CLI call per candidate, not a reasoning pass.
 //!
 //! Surfaced to the agent via the `enrichment_depth_hint` field on `mem_get`
-//! responses for `file:` keys (`src/mcp/handlers.rs::handle_mem_get`).
+//! responses for `file:` keys (`src/mcp/handlers/reads.rs::handle_mem_get`).
 //!
 //! Pure synchronous scoring — no I/O. Mirrors the pattern of
 //! `src/health/quality.rs`.
