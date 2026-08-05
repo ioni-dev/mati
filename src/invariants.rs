@@ -23,13 +23,28 @@ use std::path::{Path, PathBuf};
 /// verbatim, so including it would make every scan self-referential.
 const THIS_FILE: &str = "src/invariants.rs";
 
-/// Every `.rs` file under `src/`, as `(repo-relative path, contents)`, sorted.
+/// Every `.rs` file under `src/`, as `(repo-relative path, contents)`, sorted,
+/// EXCLUDING files that only ever compile under `cfg(test)`.
 ///
 /// `src/` — not the whole repo — because that is what ships: the `mati` binary
 /// (`src/main.rs` + `src/cli/`) and the `mati_core` library. `benches/`,
 /// `tests/` and `scripts/` are developer-only and are not linked into the
-/// released artifact.
+/// released artifact. A file declared as `#[cfg(test)] mod <name>;` in its
+/// parent — e.g. `src/store/db/tests.rs`, via `#[cfg(test)] mod tests;` in
+/// `src/store/db/mod.rs` — doesn't ship either, for the same reason; see
+/// [`test_only_files`].
 fn rust_sources() -> Vec<(String, String)> {
+    let mut out = raw_rust_sources();
+    let hidden = test_only_files(&out);
+    out.retain(|(path, _)| !hidden.contains(path));
+    out
+}
+
+/// Every `.rs` file under `src/` (except this one), unfiltered — includes
+/// files [`rust_sources`] hides as test-only. Exists so the self-checks on
+/// [`test_only_files`]'s stated limits can inspect the files it hides, not
+/// just the ones it doesn't.
+fn raw_rust_sources() -> Vec<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.join("src")];
@@ -57,6 +72,205 @@ fn rust_sources() -> Vec<(String, String)> {
     }
     out.sort();
     out
+}
+
+/// Files reachable ONLY through a `#[cfg(test)] mod <name>;` declaration —
+/// the separate-file form, not the inline `#[cfg(test)] mod <name> { ... }`
+/// block [`production_lines`] already skips within a single file.
+///
+/// Detected as a plain two-line text pattern: a line that is exactly
+/// `#[cfg(test)]`, immediately followed by a line that is exactly
+/// `mod <ident>;`. Resolved to a path with [`module_file_candidates`] and
+/// kept only if that path is actually present in `all`.
+///
+/// # What this does not see
+///
+/// - **Split attributes or extra lines between `#[cfg(test)]` and `mod`**
+///   (e.g. a doc comment, or `#[cfg(test)]` on its own line followed by
+///   `#[allow(dead_code)]` then `mod x;`) are not recognized — the pattern is
+///   exactly two adjacent lines. None of today's `#[cfg(test)] mod <name>;`
+///   declarations are split this way (checked in
+///   `every_cfg_test_mod_declaration_is_the_two_line_form` below); a future
+///   one that is would silently fall back to being scanned as production
+///   code, same as before this function existed.
+/// - **Does not recurse.** A hidden file that itself declares a further
+///   SEPARATE-FILE submodule (`mod x;`) would need that submodule to carry
+///   its own `#[cfg(test)]` gate to be caught, since [`rust_sources`] only
+///   calls this once over the top-level file list. None of today's hidden
+///   files does (checked below). An INLINE `mod x { ... }` inside a hidden
+///   file — grouping related tests, e.g. — needs nothing further: it isn't a
+///   separate file, so it's already covered by hiding the one it's in.
+/// - **A `#[cfg(test)]`-gated inline block still relies on [`production_lines`]**,
+///   not this function — this only handles the separate-file form.
+fn test_only_files(all: &[(String, String)]) -> std::collections::BTreeSet<String> {
+    let mut hidden = std::collections::BTreeSet::new();
+    for (file, src) in all {
+        let lines: Vec<&str> = src.lines().collect();
+        for i in 0..lines.len().saturating_sub(1) {
+            if lines[i].trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let Some(name) = lines[i + 1]
+                .trim()
+                .strip_prefix("mod ")
+                .and_then(|s| s.strip_suffix(';'))
+            else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            for candidate in module_file_candidates(file, name) {
+                if all.iter().any(|(p, _)| *p == candidate) {
+                    hidden.insert(candidate);
+                }
+            }
+        }
+    }
+    hidden
+}
+
+/// The path(s) Rust's module resolution would consider for `mod <name>;`
+/// declared from `file`, per the standard 2018+ rule: `src/lib.rs` and
+/// `src/main.rs` resolve siblings in `src/`; `.../mod.rs` resolves siblings
+/// in its own directory; any other `.../foo.rs` resolves siblings under
+/// `.../foo/`.
+fn module_file_candidates(file: &str, name: &str) -> Vec<String> {
+    let dir = if file == "src/lib.rs" || file == "src/main.rs" {
+        "src".to_string()
+    } else if let Some(d) = file.strip_suffix("/mod.rs") {
+        d.to_string()
+    } else {
+        file.strip_suffix(".rs").unwrap_or(file).to_string()
+    };
+    vec![format!("{dir}/{name}.rs"), format!("{dir}/{name}/mod.rs")]
+}
+
+/// Pins the two stated limits of [`test_only_files`] against the actual tree,
+/// so a future file that breaks either assumption fails loudly here instead
+/// of silently falling back to being scanned as production code.
+#[cfg(test)]
+mod test_only_files_checks {
+    use super::{module_file_candidates, raw_rust_sources, test_only_files};
+
+    /// Limit 1: every `#[cfg(test)]` immediately followed (within 5 lines) by
+    /// a separate-file `mod <ident>;` declaration is followed *immediately*
+    /// (line i+1, no gap) — the exact shape [`test_only_files`] matches.
+    ///
+    /// The 5-line lookahead is generous on purpose: it exists only to catch a
+    /// split form should one appear, not because 5 is significant.
+    #[test]
+    fn every_cfg_test_mod_declaration_is_the_two_line_form() {
+        let mut split_forms = Vec::new();
+        for (file, src) in raw_rust_sources() {
+            let lines: Vec<&str> = src.lines().collect();
+            for i in 0..lines.len() {
+                if lines[i].trim() != "#[cfg(test)]" {
+                    continue;
+                }
+                let is_mod_decl = |l: &str| {
+                    let l = l.trim();
+                    l.strip_prefix("mod ")
+                        .and_then(|s| s.strip_suffix(';'))
+                        .is_some()
+                };
+                let adjacent = lines.get(i + 1).is_some_and(|l| is_mod_decl(l));
+                if adjacent {
+                    continue;
+                }
+                for l in lines.iter().skip(i + 2).take(4) {
+                    if is_mod_decl(l) {
+                        split_forms.push(format!("{file}:{}", i + 1));
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            split_forms.is_empty(),
+            "SPLIT #[cfg(test)] mod DECLARATION(S) — test_only_files() only \
+             matches the immediate two-line form and would silently miss \
+             these, scanning the file they gate as production code:\n\
+             {split_forms:#?}"
+        );
+    }
+
+    /// Limit 2: no file [`test_only_files`] hides declares a SEPARATE-FILE
+    /// submodule of its own (`mod <ident>;`) — the hiding is one level deep
+    /// and does not recurse.
+    ///
+    /// An inline `mod <ident> { ... }` inside an already-hidden file is fine
+    /// and common (e.g. a nested `mod some_scenario { ... }` grouping related
+    /// `#[test]` fns within `tests.rs`) — it declares no new *file*, so there
+    /// is nothing further for [`rust_sources`] to fail to hide.
+    #[test]
+    fn no_hidden_file_declares_a_further_submodule() {
+        let all = raw_rust_sources();
+        let hidden = test_only_files(&all);
+        let mut nested = Vec::new();
+        for (file, src) in &all {
+            if !hidden.contains(file) {
+                continue;
+            }
+            for (lineno, line) in src.lines().enumerate() {
+                let l = line.trim();
+                let Some(rest) = l.strip_prefix("mod ") else {
+                    continue;
+                };
+                if rest.trim_end().ends_with(';') {
+                    nested.push(format!("{file}:{}: {l}", lineno + 1));
+                }
+            }
+        }
+        assert!(
+            nested.is_empty(),
+            "HIDDEN FILE DECLARES A FURTHER FILE — test_only_files() does not \
+             recurse, so a submodule of a hidden file is scanned as \
+             production code unless it carries its own #[cfg(test)] gate:\n\
+             {nested:#?}"
+        );
+    }
+
+    /// Sanity check: the detector actually fires on the tree as it stands
+    /// today, so the two tests above aren't vacuously true over an empty set.
+    #[test]
+    fn at_least_the_known_hidden_files_are_detected() {
+        let all = raw_rust_sources();
+        let hidden = test_only_files(&all);
+        for expected in [
+            "src/mcp/write_path_equivalence.rs",
+            "src/hooks/compliance.rs",
+            "src/store/db/tests.rs",
+            "src/mcp/dispatch_v2/tests.rs",
+        ] {
+            assert!(
+                hidden.contains(expected),
+                "expected {expected} to be detected as test-only; \
+                 test_only_files() returned {hidden:#?}"
+            );
+        }
+    }
+
+    /// [`module_file_candidates`] resolves both module-file shapes correctly.
+    #[test]
+    fn module_file_candidates_resolves_both_shapes() {
+        assert_eq!(
+            module_file_candidates("src/lib.rs", "invariants"),
+            vec!["src/invariants.rs", "src/invariants/mod.rs"]
+        );
+        assert_eq!(
+            module_file_candidates("src/store/db/mod.rs", "tests"),
+            vec!["src/store/db/tests.rs", "src/store/db/tests/mod.rs"]
+        );
+        assert_eq!(
+            module_file_candidates("src/mcp/dispatch_v2/mod.rs", "tests"),
+            vec![
+                "src/mcp/dispatch_v2/tests.rs",
+                "src/mcp/dispatch_v2/tests/mod.rs"
+            ]
+        );
+    }
 }
 
 /// Source lines that are compiled into the shipped binary, as
@@ -393,71 +607,63 @@ mod gotcha_write_sites {
              no prefix guard",
         ),
         (
-            "src/mcp/dispatch_v2.rs",
+            "src/mcp/dispatch_v2/session.rs",
             "dispatch_session_side",
             Class::Bypass,
             "ConsultationHit bumps access_count on input.key and re-puts the \
              record; gotchas are the primary consultation target",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/gotcha.rs",
             "upsert_commit_once",
             Class::Bypass,
             "v2 gotcha upsert — needs record + file links + audit in one \
              transact_knowledge, which gotcha_ops does not offer",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/gotcha.rs",
             "confirm_commit_once",
             Class::Bypass,
             "v2 gotcha confirm — same single-transaction requirement",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/gotcha.rs",
             "tombstone_commit_once",
             Class::Bypass,
             "v2 gotcha tombstone — same single-transaction requirement",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/file.rs",
             "handle_file_reparse",
             Class::NonGotcha,
             "writes the file_key returned by reparse_staged, built as \
              format!(\"file:{rel_path}\")",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/decision_devnote.rs",
             "handle_dev_note_upsert",
             Class::NonGotcha,
             "rejects any key that is not dev_note:-prefixed before writing",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/reads.rs",
             "handle_mem_get",
             Class::Bypass,
             "read path: the spawned task re-puts the fetched record with an \
              incremented access_count, and the fetched key is usually a gotcha",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/reads.rs",
             "handle_mem_bootstrap",
             Class::NonGotcha,
             "writes file:<path> records assembled for the bootstrap packet",
         ),
         (
-            "src/mcp/handlers.rs",
+            "src/mcp/handlers/record_import.rs",
             "handle_record_import",
             Class::Bypass,
             "import prefix allowlist includes \"gotcha:\"; accepted records are \
              emitted as PutRecord { key: r.key }",
-        ),
-        (
-            "src/mcp/write_path_equivalence.rs",
-            "seed_verbatim",
-            Class::Bypass,
-            "test fixture, #[cfg(test)] only: seeds a gotcha whose \
-             affected_files predate path normalization, which is exactly what \
-             apply_gotcha_write would rewrite on the way in",
         ),
         (
             "src/mcp/server.rs",
@@ -467,7 +673,7 @@ mod gotcha_write_sites {
              validation; the `confirm` command writes a confirmed GotchaRecord",
         ),
         (
-            "src/store/db.rs",
+            "src/store/db/crud.rs",
             "transact_knowledge",
             Class::NonGotcha,
             "the write primitive itself — it dispatches KnowledgeWriteOp, it \

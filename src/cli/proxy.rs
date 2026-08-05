@@ -1297,7 +1297,7 @@ async fn open_store_with_lock_retry(cwd: &Path) -> Result<Store> {
             Err(err) => {
                 // The raw SurrealKV "already locked" error sits in the
                 // cause chain; the top-level anyhow message added by
-                // `open_knowledge_tree` (`src/store/db.rs:1115`) is just
+                // `open_knowledge_tree` (`src/store/db/tree.rs:41`) is just
                 // "failed to open knowledge.db". `format!("{err}")` only
                 // renders the top-level — walk the chain via `err.chain()`
                 // so we actually see the lock-contention text.

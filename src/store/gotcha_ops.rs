@@ -18,11 +18,19 @@
 //!
 //! The v2 protocol handlers in `mcp::handlers` stage knowledge-tree writes
 //! (gotcha record + file-link updates + audit) in a single atomic
-//! `transact_knowledge` call. Graph edge writes remain best-effort.
+//! `transact_knowledge` call. Graph edge writes remain best-effort — both
+//! paths call [`sync_has_gotcha_edges`] for the edge diff itself, but each
+//! caller owns the dirty-marker guard around it (see "Cancellation safety"
+//! below), so a failed edge write is equally visible to `mati repair --fast`
+//! regardless of transport.
 //!
 //! The functions below are retained for the CLI direct-store path and as
-//! building blocks. Their ordering is chosen to minimize damage from a
-//! mid-operation failure:
+//! building blocks — [`stage_file_link_update`], [`sync_has_gotcha_edges`]
+//! and [`invalidate_consultation_receipts`] are also called directly by
+//! `mcp::handlers`, so the file-link mutation, edge sync and receipt
+//! invalidation logic itself is not duplicated even though each transport
+//! stages and commits it differently. Their ordering is chosen to minimize
+//! damage from a mid-operation failure:
 //!
 //! 1. **Record write first** — the gotcha record is the source of truth. If
 //!    later steps fail, the record exists and a future mutation or manual
@@ -533,34 +541,11 @@ pub async fn apply_gotcha_write(
         crate::store::repair::mark_dirty(store, key, &format!("link sync failed: {e}")).await;
     }
 
-    // 4 + 5. Graph edges — best-effort
-    let old_set: HashSet<&str> = sync_old_files.iter().map(String::as_str).collect();
-    let new_set: HashSet<&str> = new_files.iter().map(String::as_str).collect();
-
-    let ts = now_secs().to_le_bytes();
-    for file_path in &new_set {
-        if !old_set.contains(*file_path) {
-            let file_key = format!("file:{file_path}");
-            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
-            if let Err(e) = store.put_raw(&edge_key, &ts).await {
-                tracing::warn!("gotcha_write: edge add failed for {file_key} → {key}: {e}");
-                secondary_failed = true;
-                crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}"))
-                    .await;
-            }
-        }
-    }
-    for file_path in &old_set {
-        if !new_set.contains(*file_path) {
-            let file_key = format!("file:{file_path}");
-            let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
-            if let Err(e) = store.delete(&edge_key).await {
-                tracing::warn!("gotcha_write: edge remove failed for {file_key} → {key}: {e}");
-                secondary_failed = true;
-                crate::store::repair::mark_dirty(store, key, &format!("edge remove failed: {e}"))
-                    .await;
-            }
-        }
+    // 4 + 5. Graph edges — best-effort. Runs while the pre-armed guard from
+    // 2a is still set, so the marker stays continuously armed from the
+    // record commit through the last derived write.
+    if !sync_has_gotcha_edges(store, key, sync_old_files, new_files).await {
+        secondary_failed = true;
     }
 
     // Disarm the cancellation guard if every secondary write succeeded AND
@@ -702,25 +687,17 @@ pub async fn apply_gotcha_tombstone(
         .await;
     }
 
-    // 3. Remove graph edges — best-effort
-    for file_path in affected_files {
-        let file_key = format!("file:{file_path}");
-        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key).to_key();
-        if let Err(e) = store.delete(&edge_key).await {
-            tracing::warn!("gotcha_tombstone: edge remove failed for {file_key} → {key}: {e}");
-            secondary_failed = true;
-            crate::store::repair::mark_dirty(
-                store,
-                key,
-                &format!("tombstone edge remove failed: {e}"),
-            )
-            .await;
-        }
+    // 3. Remove graph edges — best-effort. Runs while the pre-armed guard
+    // from 1a is still set, so the marker stays continuously armed from the
+    // tombstone commit through the last derived write.
+    if !sync_has_gotcha_edges(store, key, affected_files, &[]).await {
+        secondary_failed = true;
     }
 
-    // Disarm the cancellation guard if every secondary write returned cleanly.
-    // See `clear_dirty_key_if_solo` for the conditions under which it is safe
-    // to clear; if another key is concurrently flagged we leave the marker set.
+    // Disarm the cancellation guard if every secondary write returned
+    // cleanly. See `clear_dirty_key_if_solo` for the conditions under which
+    // it is safe to clear; if another key is concurrently flagged we leave
+    // the marker set.
     if !secondary_failed {
         crate::store::repair::clear_dirty_key_if_solo(store, key).await;
     }
@@ -804,21 +781,23 @@ pub async fn apply_gotcha_confirm(
         crate::store::repair::mark_dirty(store, key, &format!("link sync failed: {e}")).await;
     }
 
-    // Graph edges — best-effort.
-    let ts = now_secs().to_le_bytes();
-    for file_path in affected_files {
-        let file_key = format!("file:{file_path}");
-        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, key.as_str()).to_key();
-        if let Err(e) = store.put_raw(&edge_key, &ts).await {
-            tracing::warn!("gotcha_confirm: edge add failed for {file_key} → {key}: {e}");
-            secondary_failed = true;
-            crate::store::repair::mark_dirty(store, key, &format!("edge add failed: {e}")).await;
-        }
+    // Graph edges — best-effort. Runs while the pre-armed guard above is
+    // still set, so the marker stays continuously armed from the record
+    // commit through the last derived write.
+    if !sync_has_gotcha_edges(store, key, &[], affected_files).await {
+        secondary_failed = true;
     }
 
     if !secondary_failed {
         crate::store::repair::clear_dirty_key_if_solo(store, key).await;
     }
+
+    // Drop stale consultation receipts so the next hook re-checks this rule
+    // instead of trusting a receipt minted before it was confirmed. Mirrors
+    // `mcp::handlers::handle_gotcha_confirm` — without this, the direct-store
+    // confirm path is silently non-enforcing for any file already consulted
+    // this session.
+    invalidate_consultation_receipts(store, affected_files).await;
 
     Ok(())
 }
@@ -866,57 +845,10 @@ async fn update_file_gotcha_key(
     // the caller's best-effort dirty-marker path and needs `mati repair`.
     const MAX_RETRIES: usize = 4;
     for attempt in 0..MAX_RETRIES {
-        let Some(mut record) = store.get(&file_key).await? else {
-            // File record doesn't exist yet — a file `init` never indexed
-            // (e.g. `mati gotcha add newfile.rs` / `mem_set` before re-init).
-            // Create-on-write: persist a minimal layer-0 file stub carrying this
-            // gotcha key so the read gate — which keys on
-            // `file_record.payload.gotcha_keys` (hooks/decide.rs) — enforces
-            // IMMEDIATELY. Without this the gotcha is silently inert until the
-            // next `mati init` section 8c back-fill. init/reparse later merge
-            // real analysis and preserve gotcha_keys (reparse.rs).
-            if add {
-                let now = now_secs();
-                let mut stub = Record::layer0_file_stub(
-                    file_key.clone(),
-                    crate::store::stable_device_id(),
-                    1,
-                    now,
-                );
-                let mut fr = FileRecord::layer0_stub(
-                    file_path,
-                    vec![],
-                    vec![],
-                    vec![],
-                    0,
-                    0,
-                    0,
-                    None,
-                    false,
-                    0,
-                    now,
-                );
-                fr.gotcha_keys = vec![gotcha_key.to_string()];
-                stub.payload = serde_json::to_value(&fr).ok();
-                store.put(&file_key, &stub).await?;
-            }
+        let existing = store.get(&file_key).await?;
+        let Some(record) = stage_file_link_update(existing, file_path, gotcha_key, add) else {
             return Ok(());
         };
-
-        let changed = if add {
-            add_gotcha_key(&mut record, gotcha_key)
-        } else {
-            remove_gotcha_key(&mut record, gotcha_key)
-        };
-
-        if !changed {
-            return Ok(());
-        }
-
-        let now = now_secs();
-        record.updated_at = now;
-        record.version.logical_clock += 1;
-        record.version.wall_clock = now;
 
         match store.put(&file_key, &record).await {
             Ok(()) => return Ok(()),
@@ -934,6 +866,71 @@ async fn update_file_gotcha_key(
     }
 
     Ok(())
+}
+
+/// Build the file-record mutation for one `add`/`remove` of `gotcha_key` on
+/// `file_path`, given the caller's most recent read of `file:<path>`
+/// (`None` when the file was never indexed). Returns the record to persist,
+/// or `None` if nothing changed. Pure — the caller decides how and when to
+/// persist the result, which is what lets the direct-store path (write
+/// immediately, retry on conflict) and the daemon path (stage into
+/// `transact_knowledge`) share this without sharing a transaction model.
+///
+/// A missing file gets a fresh Layer 0 stub on `add` so the gotcha enforces
+/// immediately instead of waiting for the next `mati init` — see
+/// `update_file_gotcha_key`'s create-on-write note.
+pub(crate) fn stage_file_link_update(
+    existing: Option<Record>,
+    file_path: &str,
+    gotcha_key: &str,
+    add: bool,
+) -> Option<Record> {
+    let now = now_secs();
+
+    let mut record = match existing {
+        Some(r) => r,
+        None => {
+            if !add {
+                return None;
+            }
+            let mut stub = Record::layer0_file_stub(
+                format!("file:{file_path}"),
+                crate::store::stable_device_id(),
+                1,
+                now,
+            );
+            let mut fr = FileRecord::layer0_stub(
+                file_path,
+                vec![],
+                vec![],
+                vec![],
+                0,
+                0,
+                0,
+                None,
+                false,
+                0,
+                now,
+            );
+            fr.gotcha_keys = vec![gotcha_key.to_string()];
+            stub.payload = serde_json::to_value(&fr).ok();
+            return Some(stub);
+        }
+    };
+
+    let changed = if add {
+        add_gotcha_key(&mut record, gotcha_key)
+    } else {
+        remove_gotcha_key(&mut record, gotcha_key)
+    };
+    if !changed {
+        return None;
+    }
+
+    record.updated_at = now;
+    record.version.logical_clock += 1;
+    record.version.wall_clock = now;
+    Some(record)
 }
 
 fn add_gotcha_key(record: &mut Record, gotcha_key: &str) -> bool {
@@ -987,7 +984,71 @@ fn remove_gotcha_key(record: &mut Record, gotcha_key: &str) -> bool {
     arr.len() != before
 }
 
+// ── Graph edges ───────────────────────────────────────────────────────────────
+
+/// Best-effort `HasGotcha` edge sync (cross-tree, so it can never share a
+/// transaction with the knowledge-tree record — see the module-level doc).
+///
+/// Adds edges for files in `new_files` not in `old_files`, removes edges for
+/// files in `old_files` not in `new_files`. Returns `true` if every write
+/// succeeded. Does **not** own the dirty-marker guard — the caller's guard
+/// must already be armed before this runs and stay armed until it returns,
+/// so cancellation mid-loop is covered too; see the module doc's
+/// "Cancellation safety" section. On a write failure this still calls
+/// `mark_dirty` itself, since that failure is the explicit branch the guard
+/// is a backstop for, not a substitute for it.
+pub async fn sync_has_gotcha_edges(
+    store: &Store,
+    gotcha_key: &str,
+    old_files: &[String],
+    new_files: &[String],
+) -> bool {
+    let old_set: HashSet<&str> = old_files.iter().map(String::as_str).collect();
+    let new_set: HashSet<&str> = new_files.iter().map(String::as_str).collect();
+
+    let mut failed = false;
+    let ts = now_secs().to_le_bytes();
+
+    for file_path in new_set.difference(&old_set) {
+        let file_key = format!("file:{file_path}");
+        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, gotcha_key).to_key();
+        if let Err(e) = store.put_raw(&edge_key, &ts).await {
+            tracing::warn!("gotcha_edges: add failed for {file_key} → {gotcha_key}: {e}");
+            failed = true;
+            crate::store::repair::mark_dirty(store, gotcha_key, &format!("edge add failed: {e}"))
+                .await;
+        }
+    }
+    for file_path in old_set.difference(&new_set) {
+        let file_key = format!("file:{file_path}");
+        let edge_key = Edge::new(&file_key, EdgeKind::HasGotcha, gotcha_key).to_key();
+        if let Err(e) = store.delete(&edge_key).await {
+            tracing::warn!("gotcha_edges: remove failed for {file_key} → {gotcha_key}: {e}");
+            failed = true;
+            crate::store::repair::mark_dirty(
+                store,
+                gotcha_key,
+                &format!("edge remove failed: {e}"),
+            )
+            .await;
+        }
+    }
+
+    !failed
+}
+
 // ── Confirmation propagation ─────────────────────────────────────────────────
+
+/// Drop stale `session:consulted:file:<path>` receipts for a newly-confirmed
+/// gotcha. A receipt minted before confirmation predates the rule; leaving it
+/// in place would let an agent bypass the pre-read/pre-bash hook and act on
+/// the file without ever seeing the rule it just gained.
+pub async fn invalidate_consultation_receipts(store: &Store, affected_files: &[String]) {
+    for file_path in affected_files {
+        let consulted_key = format!("session:consulted:file:{file_path}");
+        let _ = store.delete(&consulted_key).await;
+    }
+}
 
 /// Increment `confirmation_count` on all file records linked to a confirmed gotcha.
 ///

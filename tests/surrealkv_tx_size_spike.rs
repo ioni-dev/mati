@@ -89,7 +89,7 @@ async fn surrealkv_single_transaction_size_ceiling() {
 async fn try_single_transaction(n: usize) -> Result<u128, String> {
     let dir = TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
 
-    // Identical options to `open_knowledge_tree` at src/store/db.rs:1107.
+    // Identical options to `open_knowledge_tree` in src/store/db/tree.rs.
     let opts = Options::new()
         .with_path(dir.path().join("knowledge.db"))
         .with_versioning(true, 0)

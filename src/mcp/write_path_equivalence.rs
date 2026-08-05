@@ -455,12 +455,14 @@ fn assert_divergences(scenario: &str, d: &BTreeMap<String, (String, String)>, ex
 
 /// Divergences on a **create** (`mati gotcha add`, `is_new = true`).
 ///
-/// - `dirty_marker` — `gotcha_ops` pre-arms and clears a cancellation guard,
-///   leaving a clean marker behind; the handler has no dirty-marker path at
-///   all, so its best-effort edge writes fail invisibly to
-///   `mati repair --fast`. Only visible against a virgin store: once any
-///   `gotcha_ops` write has run, the marker record exists on both sides.
-/// - `audit_knowledge_rows` — only the handler writes `audit:knowledge:*`.
+/// `audit_knowledge_rows` — only the handler writes `audit:knowledge:*`.
+///
+/// `dirty_marker` used to split here: `gotcha_ops` pre-armed and cleared a
+/// cancellation guard around its best-effort work, leaving a clean marker
+/// behind, while the handler's edge sync had no dirty-marker path of its own
+/// — a failed edge write there was invisible to `mati repair --fast`. Both
+/// callers now pre-arm before `gotcha_ops::sync_has_gotcha_edges` and clear
+/// on its `true` return, so the marker converges on both sides.
 ///
 /// `payload.confirmed`, `payload.confirmed_content` and
 /// `confidence.confirmation_count` used to split here. `GotchaDraftInput` now
@@ -471,7 +473,7 @@ fn assert_divergences(scenario: &str, d: &BTreeMap<String, (String, String)>, ex
 /// Quality does **not** split: `quality::analyze` reads rule, reason, value
 /// and tags, none of which the handler rewrites, so its recomputation lands
 /// on the same score the CLI already stored.
-const CREATE_DIVERGENCES: &[&str] = &["dirty_marker", "audit_knowledge_rows"];
+const CREATE_DIVERGENCES: &[&str] = &["audit_knowledge_rows"];
 
 /// Divergences on an **edit** (`mati gotcha edit`, `is_new = false`).
 ///
@@ -517,12 +519,16 @@ const EDIT_OF_TOMBSTONED_KEY_DIVERGENCES: &[&str] = &[
 
 /// Divergences on **confirm** (`mati gotcha confirm`).
 ///
-/// `consultation_receipts` — the handler drops
+/// Only the one-sided v2 audit row is left.
+///
+/// `consultation_receipts` used to split here: the handler dropped
 /// `session:consulted:file:<path>` for every affected file so the next hook
-/// re-blocks; `apply_gotcha_confirm` leaves the stale receipt in place,
+/// re-blocks, while `apply_gotcha_confirm` left the stale receipt in place —
 /// letting an agent act on the file without ever seeing the newly-confirmed
-/// rule.
-const CONFIRM_DIVERGENCES: &[&str] = &["consultation_receipts", "audit_knowledge_rows"];
+/// rule. `apply_gotcha_confirm` now calls the shared
+/// `gotcha_ops::invalidate_consultation_receipts` too, so the direct-store
+/// confirm path is no longer silently non-enforcing.
+const CONFIRM_DIVERGENCES: &[&str] = &["audit_knowledge_rows"];
 
 /// Divergences on **confirm of a legacy record** whose `affected_files` were
 /// stored before path normalization existed.
@@ -533,12 +539,14 @@ const CONFIRM_DIVERGENCES: &[&str] = &["consultation_receipts", "audit_knowledge
 /// on the key the read gate looks up. That closes the silent-non-enforcement
 /// case ARCHITECTURE.md section 22 calls out under "Path normalization".
 ///
-/// Only the two whole-path differences are left, both shared with every other
-/// scenario: the CLI's dirty-marker guard and the handler's v2 audit row.
+/// Only the one-sided v2 audit row is left, shared with every other scenario.
+/// `dirty_marker` used to split here for the same reason it did on
+/// [`CREATE_DIVERGENCES`] — both callers now arm the same cancellation guard
+/// around `gotcha_ops::sync_has_gotcha_edges`.
 ///
 /// No receipt is seeded here, so `consultation_receipts` does not appear —
 /// that difference is covered by [`CONFIRM_DIVERGENCES`].
-const CONFIRM_LEGACY_DIVERGENCES: &[&str] = &["dirty_marker", "audit_knowledge_rows"];
+const CONFIRM_LEGACY_DIVERGENCES: &[&str] = &["audit_knowledge_rows"];
 
 /// Divergences on **tombstone** (`mati gotcha delete`).
 ///

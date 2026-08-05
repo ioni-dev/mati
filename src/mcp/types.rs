@@ -138,7 +138,7 @@ mod tests {
     /// Regression: the `mem_set` tool schema previously advertised `file:*`
     /// as a writable key pattern and `File` as a valid category, with a full
     /// `FileRecord` payload shape documented — none of which
-    /// `build_mem_set_command` (src/mcp/tools.rs) has ever accepted; every
+    /// `build_mem_set_command` (src/mcp/tools/mem_set_command.rs) has ever accepted; every
     /// `file:` write is rejected. The schema must not promise what the
     /// implementation refuses.
     #[test]

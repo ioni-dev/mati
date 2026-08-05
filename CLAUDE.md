@@ -44,7 +44,7 @@ src/
   search/     tantivy BM25 index
   analysis/   Layer 0 static analysis (tree-sitter parser, git, blast_radius, clusters)
   health/     confidence / quality / staleness / gaps / onboarding scoring
-  hooks/      pure enforcement decision (decide.rs) + per-agent adapters
+  hooks/      pure enforcement decision (decide/) + per-agent adapters
   scaffold/   files written by `mati init`
 ```
 

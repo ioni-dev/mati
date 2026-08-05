@@ -572,7 +572,7 @@ pub async fn session_clear_consults(store: &Store) -> Result<()> {
 ///
 /// `repo_root` is the project root; the git root is discovered upward from it.
 /// Called from both daemon socket handlers — `mcp::server::socket_dispatch` and
-/// `mcp::dispatch_v2::dispatch_session_side` — on SessionEnd.
+/// `mcp::dispatch_v2::session::dispatch_session_side` — on SessionEnd.
 ///
 /// Every step is fail-open: staleness runs on the SessionEnd path, and a git
 /// fault must not cost the session its archive, its promotions, or its receipt
