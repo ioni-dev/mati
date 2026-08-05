@@ -220,6 +220,40 @@ impl Drop for ChildGuard {
     }
 }
 
+/// A short `MATI_HOME` under `/tmp`, removed on drop.
+///
+/// `TempDir` will not do here. The daemon binds `$MATI_HOME/<slug>/mati.sock`
+/// and macOS rejects Unix socket paths over 104 bytes, which the standard temp
+/// location blows past — the daemon then silently fails to bind and every
+/// timing measures the fail-open path instead. Dropping removes the store even
+/// when the test panics, so a failing run does not leave one behind.
+#[cfg(unix)]
+struct ShortHome(PathBuf);
+
+#[cfg(unix)]
+impl ShortHome {
+    fn new(tag: &str) -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let path = PathBuf::from(format!("/tmp/m9-{tag}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create short MATI_HOME");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ShortHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Test
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -710,12 +744,8 @@ fn session_harvest_deadline_terminates_the_process() {
     let bin = mati_bin();
     let (repo_dir, home_dir) = setup_repo();
     let repo = repo_dir.path();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before Unix epoch")
-        .as_nanos();
-    let mati_home = PathBuf::from(format!("/tmp/m9-sh-{}-{nonce}", std::process::id()));
-    std::fs::create_dir_all(&mati_home).expect("create short MATI_HOME");
+    let home_guard = ShortHome::new("sh");
+    let mati_home = home_guard.path().to_path_buf();
 
     let init = run_with_mati_home(
         &bin,
@@ -827,4 +857,162 @@ fn session_harvest_deadline_terminates_the_process() {
         "missing SessionEnd timeout evidence in fail_open.log: {log}"
     );
     eprintln!("[session-harvest deadline] exited at {elapsed:?} with daemon response withheld");
+}
+
+/// Each synchronous lifecycle hook must fail open against a real stalled UDS.
+///
+/// This drives the production binary and the production command path. Before
+/// the deadlines, pre-compact and post-compact waited for the daemon's 10s
+/// response timeout; subagent-context took about 4.1s through StoreProxy's
+/// retry path before falling back. The per-hook upper bounds therefore fail
+/// against the pre-fix binary rather than asserting against a copied wrapper.
+#[cfg(unix)]
+#[test]
+fn blocking_lifecycle_hooks_terminate_and_log_against_stalled_daemon() {
+    let cases = [
+        (
+            "session-flush",
+            // Named for the command, not a hook: pre-compact.sh and stop.sh
+            // both run `mati session-flush`, so a hook-shaped label would
+            // record every Stop-hook stall as PreCompact.
+            "session-flush",
+            "<session-flush>",
+            "session flush exceeded internal deadline",
+            5000_u64,
+            7000_u64,
+        ),
+        (
+            "session-clear-consults",
+            "post-compact",
+            "<session-clear-consults>",
+            "post-compact receipt cleanup exceeded internal deadline",
+            3000_u64,
+            4500_u64,
+        ),
+        (
+            "subagent-context",
+            "subagent-start",
+            "<subagent-context>",
+            "subagent context exceeded internal deadline",
+            3000_u64,
+            4500_u64,
+        ),
+    ];
+
+    for (command, hook, rel_path, reason, deadline_ms, upper_bound_ms) in cases {
+        let bin = mati_bin();
+        let (repo_dir, home_dir) = setup_repo();
+        let repo = repo_dir.path();
+        let home_guard = ShortHome::new("bl");
+        let mati_home = home_guard.path().to_path_buf();
+
+        let init = run_with_mati_home(
+            &bin,
+            repo,
+            home_dir.path(),
+            &mati_home,
+            &["init", "--no-hooks"],
+        );
+        assert_eq!(init.code, 0, "mati init failed: {}", init.stderr);
+
+        let project_root = std::fs::read_dir(&mati_home)
+            .expect("read MATI_HOME")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .expect("init did not create a project store");
+        let socket_path = project_root.join("mati.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("bind stalled daemon socket");
+        let accepted = Arc::new(AtomicBool::new(false));
+        let stop_listener = Arc::new(AtomicBool::new(false));
+        let accepted_for_thread = Arc::clone(&accepted);
+        let stop_for_thread = Arc::clone(&stop_listener);
+        let listener_thread = thread::spawn(move || {
+            listener
+                .set_nonblocking(true)
+                .expect("set listener nonblocking");
+            while !stop_for_thread.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        accepted_for_thread.store(true, Ordering::Release);
+                        while !stop_for_thread.load(Ordering::Acquire) {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("stalled daemon listener failed: {error}"),
+                }
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let mut child = Command::new(&bin)
+            .args([command])
+            .current_dir(repo)
+            .env("HOME", home_dir.path())
+            .env("MATI_HOME", &mati_home)
+            .env("MATI_DISABLE_AUTO_SPAWN", "1")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn lifecycle hook");
+
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll lifecycle hook") {
+                break status;
+            }
+            if start.elapsed() > Duration::from_millis(upper_bound_ms) {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .expect("wait for timed-out lifecycle hook");
+                stop_listener.store(true, Ordering::Release);
+                let _ = listener_thread.join();
+                panic!(
+                    "{command} did not exit within {upper_bound_ms}ms; stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        let elapsed = start.elapsed();
+        child
+            .wait_with_output()
+            .expect("collect lifecycle hook output");
+        stop_listener.store(true, Ordering::Release);
+        listener_thread.join().expect("listener thread");
+
+        assert!(
+            accepted.load(Ordering::Acquire),
+            "{command} never reached the stalled socket"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(deadline_ms - 500),
+            "{command} exited after {elapsed:?}, before its internal deadline could fire"
+        );
+        assert!(
+            elapsed < Duration::from_millis(upper_bound_ms),
+            "{command} exceeded its fail-open bound: {elapsed:?}"
+        );
+        assert_eq!(status.code(), Some(0), "{command} timeout must fail open");
+
+        let log =
+            std::fs::read_to_string(mati_home.join("fail_open.log")).unwrap_or_else(|error| {
+                panic!("{command} timeout did not write fail_open.log: {error}")
+            });
+        assert!(
+            log.lines().any(|line| {
+                line.contains(&format!("hook={hook}"))
+                    && line.contains(&format!("file={rel_path}"))
+                    && line.contains(reason)
+            }),
+            "missing {hook} timeout evidence in fail_open.log: {log}"
+        );
+        eprintln!("[{hook} deadline] exited at {elapsed:?} with daemon response withheld");
+    }
 }

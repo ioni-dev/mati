@@ -28,6 +28,13 @@ use serde_json::Value;
 /// cache (first call after an install or a reboot). At `3` that cold case put
 /// the internal deadline at ~3.5s, past the ceiling, so the host killed the
 /// process before it could write the fail-open entry the deadline exists for.
+///
+/// The non-enforcement blocking hooks use their own budgets: pre-compact gets
+/// 5000ms for one durable session transaction, while post-compact and
+/// subagent-start get 3000ms for best-effort cleanup/context work. Their
+/// scaffold backstops are 7s, 5s, and 5s respectively: even cold startup is
+/// about 1050ms before the internal timer starts, so 5000 + 1050 < 7000 and
+/// 3000 + 1050 < 5000. This leaves the hooks time to log fail-open evidence.
 const SETTINGS_JSON: &str = r#"{
   "hooks": {
     "PreToolUse": [
@@ -101,7 +108,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/pre-compact.sh"
+            "command": ".claude/hooks/pre-compact.sh",
+            "timeout": 7
           }
         ]
       }
@@ -111,7 +119,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/post-compact.sh"
+            "command": ".claude/hooks/post-compact.sh",
+            "timeout": 5
           }
         ]
       }
@@ -132,7 +141,8 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/subagent-start.sh"
+            "command": ".claude/hooks/subagent-start.sh",
+            "timeout": 5
           }
         ]
       }

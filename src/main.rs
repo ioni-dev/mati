@@ -432,13 +432,22 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::SessionCheckConsultedRecent { key, ttl_secs } => {
             cli::hooks::run_session_check_consulted_recent(&key, ttl_secs).await
         }
-        Commands::SessionFlush => cli::hooks::run_session_flush().await,
+        Commands::SessionFlush => match cli::hooks::run_session_flush().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
         Commands::SessionHarvest => match cli::hooks::run_session_harvest().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },
-        Commands::SessionClearConsults => cli::hooks::run_session_clear_consults().await,
-        Commands::SubagentContext => cli::subagent_context::run_subagent_context().await,
+        Commands::SessionClearConsults => match cli::hooks::run_session_clear_consults().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
+        Commands::SubagentContext => match cli::subagent_context::run_subagent_context().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
         Commands::DocCapture { path } => cli::hooks::run_doc_capture(&path).await,
         Commands::EditHook { path } => cli::hooks::run_edit_hook(&path).await,
         Commands::Reparse { path } => cli::reparse::run(&path).await,

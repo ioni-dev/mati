@@ -14,12 +14,36 @@
 //! use `StoreProxy` which has daemon-first, store-fallback semantics.
 
 use anyhow::Result;
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
 use crate::cli::hook_decide::{log_fail_open_named, HookRunOutcome};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Run a blocking hook operation with a fail-open deadline.
+///
+/// The timeout drops only the client-side future. The daemon serves each
+/// connection independently, so abandoning the response wait cannot interrupt
+/// another hook or corrupt the daemon's state.
+pub(crate) async fn run_with_deadline<F>(
+    hook: &str,
+    rel_path: &str,
+    deadline_ms: u64,
+    reason: &str,
+    operation: F,
+) -> Result<HookRunOutcome>
+where
+    F: Future<Output = Result<()>>,
+{
+    match tokio::time::timeout(Duration::from_millis(deadline_ms), operation).await {
+        Ok(result) => result.map(|()| HookRunOutcome::Continue),
+        Err(_) => {
+            log_fail_open_named(hook, rel_path, reason);
+            Ok(HookRunOutcome::Terminate(0))
+        }
+    }
+}
 
 /// Fire-and-forget with a typed v2 Command. Preferred for mutation/side-effecting calls.
 async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
@@ -181,8 +205,28 @@ pub async fn run_log_prompt_nudge(key: &str) -> Result<()> {
     .await
 }
 
-pub async fn run_session_flush() -> Result<()> {
-    hook_fire_v2(mati_core::mcp::protocol::Command::SessionFlush).await
+pub async fn run_session_flush() -> Result<HookRunOutcome> {
+    // SessionFlush is one durable transaction, not an enforcement read gate.
+    // Allow 5000ms for a slow store commit or daemon scheduling, still half of
+    // the old 10s transport stall (10000 - 5000 = 5000ms saved) and long
+    // enough to avoid cargo-culting the 2500ms read deadline onto a
+    // persistence path. The timer starts after startup; with no 4s ceiling,
+    // startup is not added to a host budget here.
+    const SESSION_FLUSH_DEADLINE_MS: u64 = 5000;
+
+    // Named for the command, not a hook: both pre-compact.sh and stop.sh run
+    // `mati session-flush`, so a hook-shaped label would misattribute every
+    // Stop-hook stall to PreCompact. 5000ms clears both — pre-compact's 7s
+    // ceiling with startup (5000 + 1050 < 7000), and Stop, which is async and
+    // has no ceiling at all.
+    run_with_deadline(
+        "session-flush",
+        "<session-flush>",
+        SESSION_FLUSH_DEADLINE_MS,
+        "session flush exceeded internal deadline",
+        hook_fire_v2(mati_core::mcp::protocol::Command::SessionFlush),
+    )
+    .await
 }
 
 pub async fn run_session_harvest() -> Result<HookRunOutcome> {
@@ -195,26 +239,32 @@ pub async fn run_session_harvest() -> Result<HookRunOutcome> {
     // it can: the staleness scan gates on record *start*, not completion.
     const SESSION_END_DEADLINE_MS: u64 = 2500;
 
-    match tokio::time::timeout(
-        Duration::from_millis(SESSION_END_DEADLINE_MS),
+    run_with_deadline(
+        "session-end",
+        "<session-harvest>",
+        SESSION_END_DEADLINE_MS,
+        "session harvest exceeded internal deadline",
         hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest),
     )
     .await
-    {
-        Ok(result) => result.map(|()| HookRunOutcome::Continue),
-        Err(_) => {
-            log_fail_open_named(
-                "session-end",
-                "<session-harvest>",
-                "session harvest exceeded internal deadline",
-            );
-            Ok(HookRunOutcome::Terminate(0))
-        }
-    }
 }
 
-pub async fn run_session_clear_consults() -> Result<()> {
-    hook_fire_v2(mati_core::mcp::protocol::Command::SessionClearConsults).await
+pub async fn run_session_clear_consults() -> Result<HookRunOutcome> {
+    // Clearing receipts is a best-effort scan/delete after compaction. It is
+    // not on the enforcement ceiling, but 3000ms bounds a large receipt set
+    // without making the advisory cleanup wait through the 10s transport cap
+    // (10000 - 3000 = 7000ms saved). The timer starts after startup, and there
+    // is no 4s host ceiling to subtract startup from.
+    const POST_COMPACT_DEADLINE_MS: u64 = 3000;
+
+    run_with_deadline(
+        "post-compact",
+        "<session-clear-consults>",
+        POST_COMPACT_DEADLINE_MS,
+        "post-compact receipt cleanup exceeded internal deadline",
+        hook_fire_v2(mati_core::mcp::protocol::Command::SessionClearConsults),
+    )
+    .await
 }
 
 /// Combined log-hit + reparse in a single daemon round-trip.
