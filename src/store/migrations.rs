@@ -765,7 +765,11 @@ async fn apply_v3_repair_codeowners_gotchas(store: &Store) -> Result<Vec<OwnedKn
                 Some(files),
             ),
             None => (
-                crate::store::gotcha_ops::tombstoned_copy(&record, now),
+                crate::store::gotcha_ops::tombstoned_copy(
+                    &record,
+                    crate::store::record::TombstoneReason::MigrationRepair,
+                    now,
+                ),
                 None,
             ),
         };
@@ -1155,7 +1159,10 @@ mod tests {
         let migrated = store.get(key).await.unwrap().unwrap();
         assert!(matches!(
             migrated.lifecycle,
-            RecordLifecycle::Tombstoned { .. }
+            RecordLifecycle::Tombstoned {
+                reason: crate::store::record::TombstoneReason::MigrationRepair,
+                ..
+            }
         ));
         assert!(!crate::store::repair::check_gotcha_indexes(&store)
             .await

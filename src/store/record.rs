@@ -522,9 +522,13 @@ impl ConfidenceScore {
 #[serde(rename_all = "snake_case")]
 pub enum TombstoneReason {
     FileDeleted,
-    FileRenamed { new_path: String },
+    FileRenamed {
+        new_path: String,
+    },
     ManualDeletion,
     Superseded,
+    /// Retired by a schema migration, not by anyone's decision.
+    MigrationRepair,
 }
 
 /// Current lifecycle state of a record.
@@ -1600,6 +1604,7 @@ mod tests {
             },
             TombstoneReason::ManualDeletion,
             TombstoneReason::Superseded,
+            TombstoneReason::MigrationRepair,
         ];
         for reason in &reasons {
             assert_serde_roundtrip(reason);

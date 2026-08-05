@@ -287,12 +287,9 @@ pub(crate) fn with_normalized_affected_files(record: &Record, files: &[String]) 
 
 /// A tombstoned copy of `record`, version bumped. Callers own the write and
 /// the derived-index cleanup that has to follow it.
-pub(crate) fn tombstoned_copy(record: &Record, at: u64) -> Record {
+pub(crate) fn tombstoned_copy(record: &Record, reason: TombstoneReason, at: u64) -> Record {
     let mut out = record.clone();
-    out.lifecycle = RecordLifecycle::Tombstoned {
-        reason: TombstoneReason::ManualDeletion,
-        at,
-    };
+    out.lifecycle = RecordLifecycle::Tombstoned { reason, at };
     out.updated_at = at;
     out.version.logical_clock += 1;
     out.version.wall_clock = at;
@@ -602,7 +599,7 @@ pub async fn apply_gotcha_tombstone(
                     exemplar_snapshot = Some((gr.rule, gr.reason, gr.severity));
                 }
             }
-            let record = tombstoned_copy(&record, now_secs());
+            let record = tombstoned_copy(&record, TombstoneReason::ManualDeletion, now_secs());
             store.put(key, &record).await?;
         }
         None => anyhow::bail!("record not found: {key}"),
