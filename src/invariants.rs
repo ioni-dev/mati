@@ -583,7 +583,7 @@ mod gotcha_write_sites {
             "write_candidates",
             Class::Bypass,
             "onboarding::build_candidates emits gotcha:codeowners:* and \
-             gotcha:marker:* keys",
+             gotcha:marker:* keys with concrete affected file paths",
         ),
         (
             "src/health/staleness.rs",
@@ -731,9 +731,9 @@ mod gotcha_write_sites {
             "src/store/migrations.rs",
             "as_write_op",
             Class::Bypass,
-            "its only producer, apply_v2_unconfirm_auto_derived_gotchas, \
-             scans gotcha:cochange:/revert:/ownership: and rewrites those \
-             records with confirmed = false",
+            "its producers, apply_v2_unconfirm_auto_derived_gotchas and \
+             apply_v3_repair_codeowners_gotchas, stage canonical gotcha writes \
+             inside the migration transaction",
         ),
         (
             "src/store/negative_exemplar.rs",

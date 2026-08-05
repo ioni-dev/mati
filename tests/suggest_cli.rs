@@ -12,12 +12,14 @@ fn suggest_dry_run_proposes_codeowners_and_marker_candidates() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     std::fs::create_dir_all(root.join(".github")).unwrap();
-    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("src/payments")).unwrap();
     std::fs::write(
         root.join(".github/CODEOWNERS"),
         "src/payments/** @pay-team\n",
     )
     .unwrap();
+    // The pattern only yields a candidate if it owns a real file.
+    std::fs::write(root.join("src/payments/stripe.rs"), "fn charge() {}\n").unwrap();
     std::fs::write(
         root.join("src/main.rs"),
         "fn main() {\n    // DO NOT REMOVE: load-bearing init order\n}\n",

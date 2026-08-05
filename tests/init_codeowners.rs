@@ -51,6 +51,9 @@ fn init_proposes_codeowners_candidate_idempotently() {
         "src/payments/** @pay-team\n",
     )
     .unwrap();
+    // The pattern only yields a candidate if it owns a real file.
+    std::fs::create_dir_all(dir.join("src/payments")).unwrap();
+    std::fs::write(dir.join("src/payments/stripe.rs"), "fn charge() {}\n").unwrap();
     std::fs::write(dir.join("README.md"), "x").unwrap();
     git(dir, &["add", "-A"]);
     git(dir, &["commit", "-qm", "init"]);

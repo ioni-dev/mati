@@ -285,6 +285,20 @@ pub(crate) fn with_normalized_affected_files(record: &Record, files: &[String]) 
     Some(out)
 }
 
+/// A tombstoned copy of `record`, version bumped. Callers own the write and
+/// the derived-index cleanup that has to follow it.
+pub(crate) fn tombstoned_copy(record: &Record, at: u64) -> Record {
+    let mut out = record.clone();
+    out.lifecycle = RecordLifecycle::Tombstoned {
+        reason: TombstoneReason::ManualDeletion,
+        at,
+    };
+    out.updated_at = at;
+    out.version.logical_clock += 1;
+    out.version.wall_clock = at;
+    out
+}
+
 // ── Confirm-time content stamp ───────────────────────────────────────────────
 
 /// Read the SHA-256 content digest a `file:*` record already carries.
@@ -580,7 +594,7 @@ pub async fn apply_gotcha_tombstone(
     // (step 1c below) needs them.
     let mut exemplar_snapshot: Option<(String, String, crate::store::Priority)> = None;
     match store.get(key).await? {
-        Some(mut record) => {
+        Some(record) => {
             if let Some(ref payload) = record.payload {
                 if let Ok(gr) =
                     serde_json::from_value::<crate::store::GotchaRecord>(payload.clone())
@@ -588,14 +602,7 @@ pub async fn apply_gotcha_tombstone(
                     exemplar_snapshot = Some((gr.rule, gr.reason, gr.severity));
                 }
             }
-            let now = now_secs();
-            record.lifecycle = RecordLifecycle::Tombstoned {
-                reason: TombstoneReason::ManualDeletion,
-                at: now,
-            };
-            record.updated_at = now;
-            record.version.logical_clock += 1;
-            record.version.wall_clock = now;
+            let record = tombstoned_copy(&record, now_secs());
             store.put(key, &record).await?;
         }
         None => anyhow::bail!("record not found: {key}"),

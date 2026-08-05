@@ -692,8 +692,13 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
 
     // ── 8c. CODEOWNERS ownership candidates (idea 2.2) ───────────────────────
+    let repo_files: Vec<String> = file_record_structs
+        .iter()
+        .filter_map(|record| record.key.strip_prefix("file:").map(str::to_string))
+        .collect();
     let codeowners_record_structs =
-        build_codeowners_candidates(&root, &store, device_id, logical_clock, now).await;
+        build_codeowners_candidates(&root, &store, &repo_files, device_id, logical_clock, now)
+            .await;
 
     // Combine all records
     let all_records: Vec<Record> = claude_import
@@ -1602,6 +1607,7 @@ async fn migrate_renamed_gotchas(
 async fn build_codeowners_candidates(
     root: &std::path::Path,
     store: &Store,
+    repo_files: &[String],
     device_id: Uuid,
     clock_start: u64,
     now: u64,
@@ -1611,7 +1617,8 @@ async fn build_codeowners_candidates(
         return Vec::new();
     };
     let rules = onboarding::parse_codeowners(&content);
-    let candidates = onboarding::codeowners_candidates(&rules, device_id, clock_start, now);
+    let candidates =
+        onboarding::codeowners_candidates(&rules, repo_files, device_id, clock_start, now);
     if candidates.is_empty() {
         return Vec::new();
     }

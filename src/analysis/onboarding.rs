@@ -9,6 +9,7 @@
 //! construction take string content and emit [`Record`]s; file discovery and
 //! store I/O live in the `mati suggest` CLI command.
 
+use globset::{GlobBuilder, GlobSetBuilder};
 use uuid::Uuid;
 
 use crate::store::record::{
@@ -32,6 +33,9 @@ const MAX_LINE_LEN: usize = 400;
 
 /// Cap total marker candidates so a large repo can't flood `mati review`.
 pub const MAX_MARKER_CANDIDATES: usize = 200;
+
+/// Cap the number of concrete files attached to one CODEOWNERS candidate.
+pub const MAX_CODEOWNERS_AFFECTED_FILES: usize = 50;
 
 // ── CODEOWNERS ────────────────────────────────────────────────────────────────
 
@@ -143,9 +147,66 @@ fn candidate_record(
     rec
 }
 
+/// Translate a CODEOWNERS pattern into a glob. Gitignore semantics: a leading
+/// `/` only anchors, a trailing `/` means "everything under", and a pattern
+/// with no `/` at all matches at any depth.
+fn codeowners_glob_pattern(pattern: &str) -> String {
+    let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+    if pattern == "*" {
+        return "**".to_string();
+    }
+    if pattern.ends_with('/') {
+        return format!("{pattern}**");
+    }
+    if pattern.contains('/') {
+        pattern.to_string()
+    } else {
+        format!("**/{pattern}")
+    }
+}
+
+/// Expand one CODEOWNERS pattern into the concrete repo-relative paths it
+/// owns. `None` when nothing matches or the match set exceeds
+/// [`MAX_CODEOWNERS_AFFECTED_FILES`] — both mean "not a per-file gotcha".
+pub(crate) fn expand_codeowners_pattern(
+    pattern: &str,
+    repo_files: &[String],
+) -> Option<Vec<String>> {
+    // A pattern that names a directory owns everything under it, and nothing
+    // in the pattern says which it is — so match the path and its subtree.
+    let base = codeowners_glob_pattern(pattern);
+    let subtree = format!("{base}/**");
+    let mut builder = GlobSetBuilder::new();
+    for expr in [base.as_str(), subtree.as_str()] {
+        builder.add(
+            GlobBuilder::new(expr)
+                .literal_separator(false)
+                .build()
+                .ok()?,
+        );
+    }
+    let globset = builder.build().ok()?;
+
+    let mut matches: Vec<String> = repo_files
+        .iter()
+        .filter(|path| globset.is_match(path))
+        .cloned()
+        .collect();
+    matches.sort();
+    matches.dedup();
+    if matches.is_empty() || matches.len() > MAX_CODEOWNERS_AFFECTED_FILES {
+        None
+    } else {
+        Some(matches)
+    }
+}
+
 /// Candidate records from CODEOWNERS rules (ownership coordination gotchas).
+/// A rule whose pattern does not expand to a bounded set of real files is
+/// dropped: `affected_files` must hold paths the `file:*` index can match.
 pub fn codeowners_candidates(
     rules: &[OwnerRule],
+    repo_files: &[String],
     device_id: Uuid,
     clock_start: u64,
     now: u64,
@@ -153,7 +214,8 @@ pub fn codeowners_candidates(
     rules
         .iter()
         .enumerate()
-        .map(|(i, r)| {
+        .filter_map(|(i, r)| {
+            let affected_files = expand_codeowners_pattern(&r.pattern, repo_files)?;
             let owners = r.owners.join(", ");
             let rule = format!(
                 "`{}` is owned by {} (CODEOWNERS) — coordinate changes with them.",
@@ -161,17 +223,17 @@ pub fn codeowners_candidates(
             );
             let reason = format!("Listed in CODEOWNERS: {} → {}.", r.pattern, owners);
             let key = format!("gotcha:codeowners:{}", r.pattern);
-            candidate_record(
+            Some(candidate_record(
                 key,
                 rule,
                 reason,
                 Priority::Normal,
-                vec![r.pattern.clone()],
+                affected_files,
                 vec!["codeowners".into(), "auto-generated".into()],
                 device_id,
                 clock_start + i as u64,
                 now,
-            )
+            ))
         })
         .collect()
 }
@@ -224,8 +286,11 @@ pub fn build_candidates(
 
     if let Some(content) = codeowners {
         let rules = parse_codeowners(content);
-        let recs = codeowners_candidates(&rules, device_id, clock, now);
-        clock += recs.len() as u64;
+        let repo_files: Vec<String> = files.iter().map(|(path, _)| path.clone()).collect();
+        let recs = codeowners_candidates(&rules, &repo_files, device_id, clock, now);
+        // Clocks are assigned by rule index, so skipped rules leave gaps —
+        // advance past every rule, not just the ones that produced a record.
+        clock += rules.len() as u64;
         out.extend(recs);
     }
 
@@ -292,13 +357,78 @@ let normal = 2;\n";
     #[test]
     fn codeowners_candidates_are_unconfirmed_gotchas_keyed_by_pattern() {
         let rules = parse_codeowners("src/payments/** @pay-team\n");
-        let recs = codeowners_candidates(&rules, dev(), 0, 100);
+        let repo_files = vec![
+            "src/payments/card.rs".to_string(),
+            "src/payments/wallet.rs".to_string(),
+        ];
+        let recs = codeowners_candidates(&rules, &repo_files, dev(), 0, 100);
         assert_eq!(recs.len(), 1);
         assert!(is_unconfirmed_gotcha(&recs[0]));
         assert_eq!(recs[0].key, "gotcha:codeowners:src/payments/**");
         let g: GotchaRecord = serde_json::from_value(recs[0].payload.clone().unwrap()).unwrap();
-        assert_eq!(g.affected_files, vec!["src/payments/**"]);
+        assert_eq!(
+            g.affected_files,
+            vec![
+                "src/payments/card.rs".to_string(),
+                "src/payments/wallet.rs".to_string()
+            ]
+        );
         assert!(!g.confirmed);
+    }
+
+    #[test]
+    fn codeowners_patterns_translate_to_globs() {
+        let cases = [
+            ("*", "**"),
+            ("docs/", "docs/**"),
+            ("/build/logs/", "build/logs/**"),
+            ("src/payments/**", "src/payments/**"),
+            ("*.js", "**/*.js"),
+            ("docs/API.md", "docs/API.md"),
+        ];
+        for (pattern, expected) in cases {
+            assert_eq!(codeowners_glob_pattern(pattern), expected);
+        }
+    }
+
+    #[test]
+    fn codeowners_expansion_matches_scoped_paths_and_skips_empty() {
+        let files = vec![
+            "docs/API.md".to_string(),
+            "docs/guide.md".to_string(),
+            "src/docs/guide.md".to_string(),
+            "src/main.rs".to_string(),
+        ];
+        assert_eq!(
+            expand_codeowners_pattern("docs/", &files),
+            Some(vec!["docs/API.md".to_string(), "docs/guide.md".to_string()])
+        );
+        assert_eq!(expand_codeowners_pattern("missing/*.rs", &files), None);
+        // A bare name carries no trailing slash, but still owns its subtree —
+        // and, being unanchored, every `docs` directory at any depth.
+        assert_eq!(
+            expand_codeowners_pattern("docs", &files),
+            Some(vec![
+                "docs/API.md".to_string(),
+                "docs/guide.md".to_string(),
+                "src/docs/guide.md".to_string()
+            ])
+        );
+        let rules = parse_codeowners("missing/*.rs @team\n");
+        assert!(codeowners_candidates(&rules, &files, dev(), 0, 100).is_empty());
+    }
+
+    #[test]
+    fn codeowners_expansion_skips_over_cap_and_repo_wide_star() {
+        let files: Vec<String> = (0..=MAX_CODEOWNERS_AFFECTED_FILES)
+            .map(|i| format!("src/f{i}.rs"))
+            .collect();
+        assert_eq!(expand_codeowners_pattern("src/**", &files), None);
+        assert_eq!(expand_codeowners_pattern("*", &files), None);
+        let over_cap = parse_codeowners("src/** @team\n");
+        let repo_wide = parse_codeowners("* @team\n");
+        assert!(codeowners_candidates(&over_cap, &files, dev(), 0, 100).is_empty());
+        assert!(codeowners_candidates(&repo_wide, &files, dev(), 0, 100).is_empty());
     }
 
     #[test]
@@ -334,5 +464,13 @@ let normal = 2;\n";
         let clocks: std::collections::HashSet<u64> =
             recs.iter().map(|r| r.version.logical_clock).collect();
         assert_eq!(clocks.len(), recs.len());
+
+        let codeowners = recs
+            .iter()
+            .find(|r| r.key == "gotcha:codeowners:src/**")
+            .unwrap();
+        let gotcha: GotchaRecord =
+            serde_json::from_value(codeowners.payload.clone().unwrap()).unwrap();
+        assert_eq!(gotcha.affected_files, vec!["src/auth.rs"]);
     }
 }

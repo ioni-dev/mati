@@ -1029,6 +1029,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codeowners_candidate_write_has_no_index_drift() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        for path in ["src/payments/card.rs", "src/payments/wallet.rs"] {
+            store
+                .put(&format!("file:{path}"), &make_file(path, &[]))
+                .await
+                .unwrap();
+        }
+
+        let rules = crate::analysis::onboarding::parse_codeowners("src/payments/** @team\n");
+        let repo_files = vec![
+            "src/payments/card.rs".to_string(),
+            "src/payments/wallet.rs".to_string(),
+        ];
+        let candidate = crate::analysis::onboarding::codeowners_candidates(
+            &rules,
+            &repo_files,
+            uuid::Uuid::nil(),
+            1,
+            1_000_000,
+        )
+        .pop()
+        .unwrap();
+        let gotcha = candidate
+            .payload_as::<GotchaRecord>()
+            .expect("candidate must carry a GotchaRecord");
+
+        crate::store::gotcha_ops::apply_gotcha_write(
+            &store,
+            &candidate,
+            &[],
+            &gotcha.affected_files,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let report = check_gotcha_indexes(&store).await.unwrap();
+        assert!(!report.has_drift());
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn check_detects_missing_file_link() {
         let dir = tempfile::TempDir::new().unwrap();
         let store = Store::open(dir.path()).await.unwrap();

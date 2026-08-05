@@ -27,7 +27,9 @@
 //!   a new forward step to revert.
 //! - Each migration step + its version bump + its history row commit in
 //!   **one atomic transaction**. A crash mid-migration leaves the on-disk
-//!   state at `version=N` or `version=N+1` — never half.
+//!   state at `version=N` or `version=N+1` — never half. A step that also
+//!   writes an Eventual-durability tree is the exception: that tree cannot
+//!   join the Immediate transaction, so the step must converge on re-run.
 //! - Migrations are **idempotent**. Re-running on the same state must produce
 //!   the same result. The version gate prevents re-runs; idempotence keeps
 //!   us safe on crash-resume replays.
@@ -58,6 +60,7 @@
 //!    (v_N-1→v_N with planted data), idempotent re-run, partial-state resume.
 //! 5. Never edit a shipped `apply_vN` body after release. Issue v(N+1).
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,7 +75,7 @@ use super::record::{
 
 /// Highest schema version this binary understands. Bump when adding a
 /// migration; never decrement.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Key holding the persisted schema version. `system:` keys route to
 /// `Durability::Immediate` (fsync) per [`crate::store::Durability::for_key`],
@@ -224,6 +227,7 @@ pub async fn migrate(store: &Store) -> Result<()> {
         let extra_ops = match next {
             1 => apply_v1_baseline(store).await?,
             2 => apply_v2_unconfirm_auto_derived_gotchas(store).await?,
+            3 => apply_v3_repair_codeowners_gotchas(store).await?,
             n => anyhow::bail!(
                 "unknown schema migration v{n} — this is a build bug: \
                  CURRENT_SCHEMA_VERSION was bumped without a matching apply_vN arm"
@@ -707,7 +711,135 @@ async fn apply_v2_unconfirm_auto_derived_gotchas(store: &Store) -> Result<Vec<Ow
             record.version.wall_clock = now;
 
             let key = record.key.clone();
-            ops.push(OwnedKnowledgeOp::PutRecord { key, record });
+            ops.push(OwnedKnowledgeOp::PutRecord {
+                key,
+                record: Box::new(record),
+            });
+        }
+    }
+
+    Ok(ops)
+}
+
+async fn apply_v3_repair_codeowners_gotchas(store: &Store) -> Result<Vec<OwnedKnowledgeOp>> {
+    let file_keys = store.scan_keys("file:").await?;
+    let repo_files: Vec<String> = file_keys
+        .iter()
+        .filter_map(|key| key.strip_prefix("file:").map(str::to_string))
+        .collect();
+    let indexed: HashSet<&str> = repo_files.iter().map(String::as_str).collect();
+    let file_records = store.scan_prefix("file:").await?;
+    let graph_keys = store.scan_keys("graph:edge:").await?;
+    let now = now_secs();
+    let mut ops = Vec::new();
+    let mut changed: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+
+    for record in store.scan_prefix("gotcha:codeowners:").await? {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        let Some(gotcha) = record.payload_as::<GotchaRecord>() else {
+            continue;
+        };
+        // An entry with no `file:*` record can never be linked, so the derived
+        // indexes can never converge. That covers a raw glob, a bare directory
+        // name, and a path that has since gone away.
+        if gotcha
+            .affected_files
+            .iter()
+            .all(|path| indexed.contains(path.as_str()))
+        {
+            continue;
+        }
+
+        let pattern = record
+            .key
+            .strip_prefix("gotcha:codeowners:")
+            .unwrap_or_default();
+        let replacement =
+            crate::analysis::onboarding::expand_codeowners_pattern(pattern, &repo_files);
+        let (record, desired_files) = match replacement {
+            Some(files) => (
+                crate::store::gotcha_ops::with_normalized_affected_files(&record, &files)
+                    .unwrap_or_else(|| record.clone()),
+                Some(files),
+            ),
+            None => (
+                crate::store::gotcha_ops::tombstoned_copy(&record, now),
+                None,
+            ),
+        };
+        changed.insert(record.key.clone(), desired_files);
+        ops.push(OwnedKnowledgeOp::PutRecord {
+            key: record.key.clone(),
+            record: Box::new(record),
+        });
+    }
+
+    if changed.is_empty() {
+        return Ok(ops);
+    }
+
+    let mut existing_graph_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for graph_key in &graph_keys {
+        let Some(edge) = crate::graph::edges::Edge::from_key(graph_key) else {
+            continue;
+        };
+        if edge.kind != crate::graph::edges::EdgeKind::HasGotcha {
+            continue;
+        }
+        let Some(file_path) = edge.from.strip_prefix("file:") else {
+            continue;
+        };
+        if changed.contains_key(&edge.to) {
+            existing_graph_files
+                .entry(edge.to)
+                .or_default()
+                .push(file_path.to_string());
+        }
+    }
+    for (gotcha_key, desired_files) in &changed {
+        let old_files = existing_graph_files
+            .get(gotcha_key)
+            .cloned()
+            .unwrap_or_default();
+        let new_files = desired_files.clone().unwrap_or_default();
+        // Graph edges are Eventual and cannot join the Immediate op transaction.
+        // Keep this write outside `ops`; the step must converge when re-run.
+        if !crate::store::gotcha_ops::sync_has_gotcha_edges(
+            store, gotcha_key, &old_files, &new_files,
+        )
+        .await
+        {
+            anyhow::bail!("failed to reconcile CODEOWNERS graph edges for {gotcha_key}");
+        }
+    }
+
+    for file_record in file_records {
+        let Some(path) = file_record.key.strip_prefix("file:").map(str::to_string) else {
+            continue;
+        };
+        let mut staged = file_record;
+        let mut changed_file = false;
+        for (gotcha_key, desired_files) in &changed {
+            let should_link = desired_files
+                .as_ref()
+                .is_some_and(|files| files.iter().any(|file| file == &path));
+            if let Some(next) = crate::store::gotcha_ops::stage_file_link_update(
+                Some(staged.clone()),
+                &path,
+                gotcha_key,
+                should_link,
+            ) {
+                staged = next;
+                changed_file = true;
+            }
+        }
+        if changed_file {
+            ops.push(OwnedKnowledgeOp::PutRecord {
+                key: staged.key.clone(),
+                record: Box::new(staged),
+            });
         }
     }
 
@@ -719,7 +851,7 @@ async fn apply_v2_unconfirm_auto_derived_gotchas(store: &Store) -> Result<Vec<Ow
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum OwnedKnowledgeOp {
-    PutRecord { key: String, record: Record },
+    PutRecord { key: String, record: Box<Record> },
 }
 
 impl OwnedKnowledgeOp {
@@ -727,7 +859,7 @@ impl OwnedKnowledgeOp {
         match self {
             Self::PutRecord { key, record } => KnowledgeWriteOp::PutRecord {
                 key: key.as_str(),
-                record,
+                record: record.as_ref(),
             },
         }
     }
@@ -924,6 +1056,113 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn v3_expands_codeowners_globs_and_cleans_indexes() {
+        let (store, _dir) = legacy_store().await;
+        for path in ["src/a.rs", "src/b.rs"] {
+            let file =
+                Record::layer0_file_stub(format!("file:{path}"), uuid::Uuid::nil(), 1, 1_000_000);
+            store.put(&file.key, &file).await.unwrap();
+        }
+
+        let key = "gotcha:codeowners:src/**";
+        let mut record = make_auto_gotcha(key, false);
+        let mut gotcha = record.payload_as::<GotchaRecord>().unwrap();
+        gotcha.affected_files = vec!["src/**".to_string()];
+        record.payload = serde_json::to_value(&gotcha).ok();
+        store.put(key, &record).await.unwrap();
+
+        let junk_edge = crate::graph::edges::Edge::new(
+            "file:src/**",
+            crate::graph::edges::EdgeKind::HasGotcha,
+            key,
+        )
+        .to_key();
+        store
+            .put_raw(&junk_edge, &1u64.to_le_bytes())
+            .await
+            .unwrap();
+
+        migrate(&store).await.unwrap();
+
+        let migrated = store.get(key).await.unwrap().unwrap();
+        let migrated_gotcha = migrated.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(
+            migrated_gotcha.affected_files,
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        let report = crate::store::repair::check_gotcha_indexes(&store)
+            .await
+            .unwrap();
+        assert!(!report.has_drift());
+        assert!(store.get(&junk_edge).await.unwrap().is_none());
+
+        let before = store.get(key).await.unwrap().unwrap();
+        migrate(&store).await.unwrap();
+        let after = store.get(key).await.unwrap().unwrap();
+        assert_eq!(before.version, after.version);
+        assert_eq!(before.payload, after.payload);
+
+        // The version gate makes the `migrate` above a no-op, so it proves
+        // nothing about the step body. Replay the body directly.
+        let replay = apply_v3_repair_codeowners_gotchas(&store).await.unwrap();
+        assert!(replay.is_empty(), "v3 body must be idempotent on replay");
+    }
+
+    /// A bare directory name carries no glob metacharacter, so detecting drift
+    /// by scanning for `*` misses it. It is still unlinkable.
+    #[tokio::test]
+    async fn v3_repairs_a_bare_directory_pattern() {
+        let (store, _dir) = legacy_store().await;
+        let file = Record::layer0_file_stub("file:docs/api.md", uuid::Uuid::nil(), 1, 1_000_000);
+        store.put(&file.key, &file).await.unwrap();
+
+        let key = "gotcha:codeowners:docs";
+        let mut record = make_auto_gotcha(key, false);
+        let mut gotcha = record.payload_as::<GotchaRecord>().unwrap();
+        gotcha.affected_files = vec!["docs".to_string()];
+        record.payload = serde_json::to_value(&gotcha).ok();
+        store.put(key, &record).await.unwrap();
+
+        migrate(&store).await.unwrap();
+
+        let migrated = store.get(key).await.unwrap().unwrap();
+        let migrated_gotcha = migrated.payload_as::<GotchaRecord>().unwrap();
+        assert_eq!(migrated_gotcha.affected_files, vec!["docs/api.md"]);
+        assert!(!crate::store::repair::check_gotcha_indexes(&store)
+            .await
+            .unwrap()
+            .has_drift());
+    }
+
+    /// Nothing to expand against means the record can never be linked, so it
+    /// is tombstoned rather than left as permanent drift.
+    #[tokio::test]
+    async fn v3_tombstones_a_pattern_that_matches_nothing() {
+        let (store, _dir) = legacy_store().await;
+        let file = Record::layer0_file_stub("file:src/a.rs", uuid::Uuid::nil(), 1, 1_000_000);
+        store.put(&file.key, &file).await.unwrap();
+
+        let key = "gotcha:codeowners:vendor/**";
+        let mut record = make_auto_gotcha(key, false);
+        let mut gotcha = record.payload_as::<GotchaRecord>().unwrap();
+        gotcha.affected_files = vec!["vendor/**".to_string()];
+        record.payload = serde_json::to_value(&gotcha).ok();
+        store.put(key, &record).await.unwrap();
+
+        migrate(&store).await.unwrap();
+
+        let migrated = store.get(key).await.unwrap().unwrap();
+        assert!(matches!(
+            migrated.lifecycle,
+            RecordLifecycle::Tombstoned { .. }
+        ));
+        assert!(!crate::store::repair::check_gotcha_indexes(&store)
+            .await
+            .unwrap()
+            .has_drift());
+    }
+
     // ── Industry-standard production-grade features ─────────────────────────
 
     #[tokio::test]
@@ -947,9 +1186,9 @@ mod tests {
 
         migrate(&store).await.unwrap();
 
-        // History should have one row per migration step (v1 + v2).
+        // History should have one row per migration step (v1 + v2 + v3).
         let history_keys = store.scan_keys(HISTORY_PREFIX).await.unwrap();
-        assert_eq!(history_keys.len(), 2, "expected v1 + v2 history rows");
+        assert_eq!(history_keys.len(), 3, "expected v1 + v2 + v3 history rows");
 
         // v2 row should record both rewrites.
         let v2_record = store.get(&history_key(2)).await.unwrap().unwrap();
@@ -995,7 +1234,7 @@ mod tests {
         // Plant a stale sentinel (started long ago, fake pid).
         let stale = Record {
             payload: serde_json::to_value(&MigrationSentinelPayload {
-                target_version: 2,
+                target_version: CURRENT_SCHEMA_VERSION,
                 started_at: 1, // very old
                 pid: 999_999,
                 mati_binary_version: "0.0.1-stale".into(),
@@ -1050,7 +1289,7 @@ mod tests {
         let backup = store
             .root
             .join("backups")
-            .join("pre-v2")
+            .join(format!("pre-v{CURRENT_SCHEMA_VERSION}"))
             .join("knowledge.db");
         assert!(
             backup.exists(),
@@ -1192,7 +1431,7 @@ mod tests {
     #[tokio::test]
     async fn migration_emits_phase_events_in_correct_order() {
         // Real upgrade path: legacy_store starts at version 0 with data,
-        // so `migrate` runs snapshot + apply_v1 + apply_v2 + end. The
+        // so `migrate` runs snapshot + apply_v1 + apply_v2 + apply_v3 + end. The
         // event sequence is the canonical contract consumed by
         // `wait_for_ready` in `mcp::daemon_lifecycle`.
         let (store, _dir) = legacy_store().await;
@@ -1205,12 +1444,15 @@ mod tests {
         // Expected sequence (one apply pair per migration version applied):
         //   begin → snapshot_complete → apply_begin(v1) → apply_complete(v1)
         //                            → apply_begin(v2) → apply_complete(v2)
+        //                            → apply_begin(v3) → apply_complete(v3)
         //                            → end
         assert_eq!(
             phases,
             vec![
                 "begin",
                 "snapshot_complete",
+                "apply_begin",
+                "apply_complete",
                 "apply_begin",
                 "apply_complete",
                 "apply_begin",
