@@ -25,7 +25,7 @@
 //! regardless of transport.
 //!
 //! The functions below are retained for the CLI direct-store path and as
-//! building blocks — [`stage_file_link_update`], [`sync_has_gotcha_edges`]
+//! building blocks — `stage_file_link_update`, [`sync_has_gotcha_edges`]
 //! and [`invalidate_consultation_receipts`] are also called directly by
 //! `mcp::handlers`, so the file-link mutation, edge sync and receipt
 //! invalidation logic itself is not duplicated even though each transport
