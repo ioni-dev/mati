@@ -14,8 +14,10 @@
 //! use `StoreProxy` which has daemon-first, store-fallback semantics.
 
 use anyhow::Result;
+use std::time::Duration;
 
 use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+use crate::cli::hook_decide::{log_fail_open_named, HookRunOutcome};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -183,8 +185,32 @@ pub async fn run_session_flush() -> Result<()> {
     hook_fire_v2(mati_core::mcp::protocol::Command::SessionFlush).await
 }
 
-pub async fn run_session_harvest() -> Result<()> {
-    hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest).await
+pub async fn run_session_harvest() -> Result<HookRunOutcome> {
+    // The scaffold kills SessionEnd at 4s. Startup elapses BEFORE this timer
+    // starts (~115ms warm, ~1050ms on a binary not yet page-cached), so it is
+    // subtracted from the ceiling, not spent inside the deadline: 4000 - 1050
+    // leaves ~2950ms. 2500 matches `HOOK_DEADLINE_MS` and keeps 450ms back.
+    // The harvest needs ~2250ms of that — a 2000ms staleness budget plus the
+    // round trip — so the deadline fires only when the budget overruns, which
+    // it can: the staleness scan gates on record *start*, not completion.
+    const SESSION_END_DEADLINE_MS: u64 = 2500;
+
+    match tokio::time::timeout(
+        Duration::from_millis(SESSION_END_DEADLINE_MS),
+        hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest),
+    )
+    .await
+    {
+        Ok(result) => result.map(|()| HookRunOutcome::Continue),
+        Err(_) => {
+            log_fail_open_named(
+                "session-end",
+                "<session-harvest>",
+                "session harvest exceeded internal deadline",
+            );
+            Ok(HookRunOutcome::Terminate(0))
+        }
+    }
 }
 
 pub async fn run_session_clear_consults() -> Result<()> {

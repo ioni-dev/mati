@@ -25,6 +25,13 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+#[cfg(unix)]
+use std::thread;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -88,6 +95,30 @@ fn run_with_stdin(
         .wait_with_output()
         .expect("failed to wait for mati process");
 
+    RunResult {
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        code: out.status.code().unwrap_or(-1),
+    }
+}
+
+/// Run a real mati binary with an explicit short MATI_HOME.
+#[cfg(unix)]
+fn run_with_mati_home(
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    mati_home: &Path,
+    args: &[&str],
+) -> RunResult {
+    let out = Command::new(bin)
+        .args(args)
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", mati_home)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run mati");
     RunResult {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
         stderr: String::from_utf8_lossy(&out.stderr).to_string(),
@@ -654,4 +685,146 @@ fn hook_deadline_terminates_the_process() {
     );
 
     eprintln!("[deadline] exited at {elapsed:?} with stdin still open -- correct");
+}
+
+/// SessionEnd must terminate after its internal deadline, even when the real
+/// binary is blocked in the daemon round trip.
+///
+/// The listener is deliberately a silent daemon substitute: it accepts the
+/// actual v2 request and never writes a response. Removing the production
+/// deadline makes this test wait for daemon_v2's 10s transport timeout, so it
+/// fails on the 7s upper bound rather than passing through an invented wrapper.
+#[cfg(unix)]
+#[test]
+fn session_harvest_deadline_terminates_the_process() {
+    const DEADLINE_MS: u64 = 2500;
+    const UPPER_BOUND_MS: u64 = 7000;
+    /// The scaffold ceiling from `scaffold::settings`, in ms. The internal
+    /// deadline is worthless if the host kills the process first, and the
+    /// margin is easy to spend by accident: startup elapses before the
+    /// deadline starts counting, so a value chosen by adding startup to the
+    /// budget rather than subtracting it from the ceiling overshoots. That
+    /// mistake measured 4234ms here on a cold binary.
+    const SCAFFOLD_CEILING_MS: u64 = 4000;
+
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos();
+    let mati_home = PathBuf::from(format!("/tmp/m9-sh-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&mati_home).expect("create short MATI_HOME");
+
+    let init = run_with_mati_home(
+        &bin,
+        repo,
+        home_dir.path(),
+        &mati_home,
+        &["init", "--no-hooks"],
+    );
+    assert_eq!(init.code, 0, "mati init failed: {}", init.stderr);
+
+    let project_root = std::fs::read_dir(&mati_home)
+        .expect("read MATI_HOME")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("init did not create a project store");
+    let socket_path = project_root.join("mati.sock");
+    let listener =
+        std::os::unix::net::UnixListener::bind(&socket_path).expect("bind stalled daemon socket");
+    let accepted = Arc::new(AtomicBool::new(false));
+    let stop_listener = Arc::new(AtomicBool::new(false));
+    let accepted_for_thread = Arc::clone(&accepted);
+    let stop_for_thread = Arc::clone(&stop_listener);
+    let listener_thread = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("set listener nonblocking");
+        while !stop_for_thread.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    accepted_for_thread.store(true, Ordering::Release);
+                    while !stop_for_thread.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("stalled daemon listener failed: {error}"),
+            }
+        }
+    });
+
+    let start = std::time::Instant::now();
+    let mut child = Command::new(&bin)
+        .args(["session-harvest"])
+        .current_dir(repo)
+        .env("HOME", home_dir.path())
+        .env("MATI_HOME", &mati_home)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn mati session-harvest");
+
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll session-harvest") {
+            break status;
+        }
+        if start.elapsed() > Duration::from_millis(UPPER_BOUND_MS) {
+            let _ = child.kill();
+            let _ = child.wait();
+            stop_listener.store(true, Ordering::Release);
+            let _ = listener_thread.join();
+            panic!(
+                "session-harvest did not exit within {UPPER_BOUND_MS}ms; stderr: {}",
+                child
+                    .stderr
+                    .take()
+                    .and_then(|mut stderr| {
+                        let mut text = String::new();
+                        std::io::Read::read_to_string(&mut stderr, &mut text).ok()?;
+                        Some(text)
+                    })
+                    .unwrap_or_default()
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let elapsed = start.elapsed();
+    stop_listener.store(true, Ordering::Release);
+    listener_thread.join().expect("listener thread");
+
+    assert!(
+        accepted.load(Ordering::Acquire),
+        "the child never reached the stalled socket"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(DEADLINE_MS - 500),
+        "exited after {elapsed:?}, before the internal deadline could fire"
+    );
+    assert!(
+        elapsed < Duration::from_millis(SCAFFOLD_CEILING_MS),
+        "took {elapsed:?}, at or past the {SCAFFOLD_CEILING_MS}ms scaffold ceiling — \
+         the host would kill the process before the deadline could fail open, \
+         so no fail_open.log entry would ever be written"
+    );
+    assert_eq!(status.code(), Some(0), "timeout must fail open");
+
+    let log = std::fs::read_to_string(mati_home.join("fail_open.log"))
+        .expect("SessionEnd timeout did not write fail_open.log");
+    assert!(
+        log.lines().any(|line| {
+            line.contains("hook=session-end")
+                && line.contains("file=<session-harvest>")
+                && line.contains("session harvest exceeded internal deadline")
+        }),
+        "missing SessionEnd timeout evidence in fail_open.log: {log}"
+    );
+    eprintln!("[session-harvest deadline] exited at {elapsed:?} with daemon response withheld");
 }

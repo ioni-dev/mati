@@ -1489,20 +1489,30 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
 // ── Fail-open telemetry ─────────────────────────────────────────────────────
 
 fn log_fail_open(rel_path: &str, reason: &str) {
+    log_fail_open_named("hook-decide", rel_path, reason);
+}
+
+/// Record a fail-open event for a hook that uses the shared hook lifecycle.
+pub(crate) fn log_fail_open_named(hook: &str, rel_path: &str, reason: &str) {
     eprintln!("[mati] WARNING: enforcement bypassed for {rel_path} — {reason}");
     if let Some(log_dir) = mati_core::store::mati_home_opt() {
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join("fail_open.log");
-        log_fail_open_at(&log_path, rel_path, reason);
+        log_fail_open_at_named(&log_path, hook, rel_path, reason);
     }
 }
 
 /// Append one entry to `fail_open.log`. Format MUST match the parser in
 /// `cli::stats::parse_iso_timestamp` — the round-trip is covered by
 /// `fail_open_log_round_trip_writer_reader` in `cli::stats`'s test module.
+#[allow(dead_code)] // The direct writer is exercised by the stats round-trip test.
 pub(super) fn log_fail_open_at(log_path: &Path, rel_path: &str, reason: &str) {
+    log_fail_open_at_named(log_path, "hook-decide", rel_path, reason);
+}
+
+fn log_fail_open_at_named(log_path: &Path, hook: &str, rel_path: &str, reason: &str) {
     let now = iso_utc_now();
-    let entry = format!("{now} FAIL_OPEN hook=hook-decide file={rel_path} reason={reason}\n");
+    let entry = format!("{now} FAIL_OPEN hook={hook} file={rel_path} reason={reason}\n");
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
