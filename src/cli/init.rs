@@ -2332,6 +2332,7 @@ mod tests {
     /// Lay out `files` under a fresh tempdir so the planner's disk probes see a
     /// real tree. Returns the root.
     fn scratch_tree(files: &[&str]) -> tempfile::TempDir {
+        crate::cli::ensure_test_home();
         let dir = tempfile::TempDir::new().unwrap();
         for f in files {
             let p = dir.path().join(f);

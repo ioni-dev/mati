@@ -2335,6 +2335,7 @@ mod tests {
     }
 
     async fn assert_main_thread_receipt_is_global(key: &str) {
+        crate::cli::ensure_test_home();
         let dir = tempfile::tempdir().unwrap();
         let store = mati_core::store::Store::open(dir.path()).await.unwrap();
         let actor = receipt_actor(None, Some("session-main"));
@@ -2375,6 +2376,7 @@ mod tests {
     /// satisfy the gate for anyone else.
     #[tokio::test]
     async fn subagent_receipt_stays_actor_scoped() {
+        crate::cli::ensure_test_home();
         let dir = tempfile::tempdir().unwrap();
         let store = mati_core::store::Store::open(dir.path()).await.unwrap();
         let key = "schema:orders";

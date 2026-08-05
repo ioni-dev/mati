@@ -102,3 +102,22 @@ impl Drop for DaemonGuard {
             .output();
     }
 }
+
+#[test]
+fn integration_tests_never_use_real_mati_home() {
+    let resolved = mati_home();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let real_mati = home.join(".mati");
+        assert_ne!(
+            resolved,
+            real_mati,
+            "integration test resolved to the real ~/.mati ({})",
+            real_mati.display()
+        );
+    }
+    assert_eq!(
+        std::env::var_os("MATI_HOME").map(PathBuf::from),
+        Some(resolved),
+        "integration tests must export MATI_HOME for spawned mati processes"
+    );
+}

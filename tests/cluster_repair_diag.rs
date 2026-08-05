@@ -28,12 +28,15 @@ use std::path::PathBuf;
 use mati_core::analysis::clusters::ClusterIndex;
 use mati_core::store::Store;
 
+mod common;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 #[tokio::test]
 async fn repair_pairs_record_matches_persisted_cluster_index() {
+    common::isolate_mati_home();
     let store = match Store::open(&repo_root()).await {
         Ok(s) => s,
         Err(e) => {
