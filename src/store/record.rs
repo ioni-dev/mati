@@ -882,8 +882,25 @@ pub enum PolicyStage {
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptSource {
     DbIntrospection,
+    HookContext,
     MemGet,
 }
+
+/// Receipt sources a Codex session can actually produce.
+///
+/// `DbIntrospection` is absent on purpose and is a platform limit, not a gap to
+/// close: Codex's `PostToolUse` payload carries no exit status — its published
+/// schema types `tool_response` as unconstrained and defines no status field —
+/// so mati cannot tell a successful introspection from one that exited 127, and
+/// deliberately does not mint. A block policy accepting only sources outside
+/// this list can never be satisfied in a Codex session.
+///
+/// Both the hook-time degrade and the authoring-time warning read this, so the
+/// two can never disagree about what Codex can attest to. Keep it in step with
+/// the mint sites: `HookContext` belongs here because `fire_events` runs on the
+/// Codex pre-bash and apply-patch paths.
+pub const CODEX_PRODUCIBLE_SOURCES: &[ReceiptSource] =
+    &[ReceiptSource::MemGet, ReceiptSource::HookContext];
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFreshness {

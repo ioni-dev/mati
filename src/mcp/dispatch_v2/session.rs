@@ -345,6 +345,7 @@ pub(super) async fn dispatch_session_side(
                 &input.key,
                 input.actor.as_deref(),
                 input.capture_fingerprint,
+                input.source,
             )
             .await
             {

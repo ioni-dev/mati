@@ -54,38 +54,55 @@ pub struct HookDecideArgs {
     pub variant: HookVariant,
 }
 
+/// The result of running a hook inside the async runtime.
+///
+/// A timeout must terminate the process before Tokio waits for the blocking
+/// stdin reader to finish, but returning this outcome keeps the decision path
+/// testable. The binary entry point turns `Terminate` into the actual process
+/// exit after this future has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookRunOutcome {
+    Continue,
+    Terminate(i32),
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 /// Outer end-to-end deadline for the hook process.
 ///
-/// Claude Code SIGKILLs the hook subprocess at 3000ms wall-clock. SIGKILL
-/// bypasses every internal `log_fail_open` call, leaving operators blind to
-/// wedged-daemon spikes — the exact failure mode `fail_open.log` exists to
-/// surface. This ceiling fires ~500ms before SIGKILL so we get one clean
-/// fail-open log entry + an allow stdout before Claude reaps us.
+/// The scaffold registers these hooks with `"timeout": 4` (seconds — see
+/// `scaffold::settings`), and the host kills the subprocess at that ceiling.
+/// That kill bypasses every internal `log_fail_open` call, leaving operators
+/// blind to wedged-daemon spikes — the exact failure mode `fail_open.log`
+/// exists to surface. This deadline fires first so we get one clean fail-open
+/// log entry + an allow stdout before the host reaps us.
+///
+/// It must clear the ceiling *including* startup, which happens before this
+/// timer begins: ~115ms warm, ~1050ms on a cold binary. 2500 + 1050 = ~3.5s
+/// against a 4s ceiling.
 const HOOK_DEADLINE_MS: u64 = 2500;
 
-pub async fn run(args: HookDecideArgs) -> Result<()> {
+pub async fn run(args: HookDecideArgs) -> Result<HookRunOutcome> {
     let variant = args.variant;
     match tokio::time::timeout(Duration::from_millis(HOOK_DEADLINE_MS), run_inner(args)).await {
-        Ok(inner_result) => inner_result,
+        Ok(inner_result) => inner_result.map(|()| HookRunOutcome::Continue),
         Err(_elapsed) => {
             // Internal deadline exceeded. We don't know which path stalled
             // (path may not even have been extracted yet), so log with the
             // sentinel "<unknown>" — still better than no entry at all.
             log_fail_open("<unknown>", "hook process exceeded internal deadline");
             emit_allow(variant);
-            Ok(())
+            Ok(HookRunOutcome::Terminate(0))
         }
     }
 }
 
 async fn run_inner(args: HookDecideArgs) -> Result<()> {
-    // 1. Read stdin (tool input JSON from hook protocol). MUST be async: the
-    // outer HOOK_DEADLINE_MS timeout can only fire at an await point, so a
-    // blocking std::io read (e.g. a caller that never closes the pipe) would
-    // ride straight past the internal deadline to Claude Code's 3000ms
-    // SIGKILL — skipping the fail-open log entry the deadline exists to write.
+    // 1. Read stdin (tool input JSON from hook protocol) asynchronously so
+    // the outer HOOK_DEADLINE_MS timeout can observe a still-open pipe. Tokio
+    // may keep the underlying blocking reader alive after cancellation; the
+    // timeout path therefore exits the process explicitly after flushing its
+    // fail-open log and allow response.
     let mut input_str = String::new();
     tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut input_str).await?;
     let input: serde_json::Value =
@@ -464,8 +481,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 governed_tool,
                 agent_id,
                 "<policy>",
-                policy_block_exempt(args.variant, &input),
                 raw_command,
+                PolicyEvaluationOptions {
+                    introspection_exemption: policy_block_exempt(args.variant, &input),
+                    codex_agent: matches!(
+                        args.variant,
+                        HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch
+                    ),
+                },
             )
             .await
             {
@@ -543,10 +566,16 @@ async fn run_fileless_policy(
         "db_client",
         agent_id,
         "<fileless-bash>",
-        policy_block_exempt(variant, input),
         input
             .pointer("/tool_input/command")
             .and_then(|value| value.as_str()),
+        PolicyEvaluationOptions {
+            introspection_exemption: policy_block_exempt(variant, input),
+            codex_agent: matches!(
+                variant,
+                HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch
+            ),
+        },
     )
     .await
     else {
@@ -573,14 +602,20 @@ async fn run_fileless_policy(
 ///
 /// `None` is both the non-governed result and the fail-open result. Callers
 /// must preserve their existing decision when it is returned for composition.
+#[derive(Clone, Copy)]
+struct PolicyEvaluationOptions {
+    introspection_exemption: bool,
+    codex_agent: bool,
+}
+
 async fn evaluate_governed_policy(
     mati_root: Option<&Path>,
     action: &decide::Action,
     governed_tool: &str,
     agent_id: Option<&str>,
     failure_path: &str,
-    introspection_exemption: bool,
     raw_command: Option<&str>,
+    options: PolicyEvaluationOptions,
 ) -> Option<(Decision, Vec<HookEvent>)> {
     if action.tool != governed_tool && action.tool != "unknown" {
         return None;
@@ -596,7 +631,11 @@ async fn evaluate_governed_policy(
     let evaluation =
         policy_verdicts_for_action(mati_root, action, agent_id, failure_path, raw_command).await?;
     let strict = evaluation.verdicts.iter().any(|verdict| verdict.strict);
-    let core_verdicts = policy_core_verdicts(&evaluation.verdicts, introspection_exemption);
+    let core_verdicts = policy_core_verdicts(
+        &evaluation.verdicts,
+        options.introspection_exemption,
+        options.codex_agent,
+    );
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
     let mut events: Vec<HookEvent> = result
         .events
@@ -619,6 +658,7 @@ async fn evaluate_governed_policy(
 fn policy_core_verdicts(
     verdicts: &[mati_core::mcp::protocol::PolicyVerdict],
     introspection_exemption: bool,
+    codex_agent: bool,
 ) -> Vec<decide::PolicyVerdict> {
     verdicts
         .iter()
@@ -629,11 +669,52 @@ fn policy_core_verdicts(
             {
                 return None;
             }
+            let no_accepted_sources = verdict.via.is_empty();
+            let codex_unfulfillable = codex_agent
+                && !verdict
+                    .via
+                    .iter()
+                    .any(|source| mati_core::store::CODEX_PRODUCIBLE_SOURCES.contains(source));
+            let unfulfillable = matches!(verdict.stage, mati_core::store::PolicyStage::Enforce)
+                && matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                && (no_accepted_sources || codex_unfulfillable);
             Some(decide::PolicyVerdict {
                 key: verdict.key.clone(),
-                rule: verdict.rule.clone(),
+                rule: if unfulfillable {
+                    let accepted = if no_accepted_sources {
+                        "no sources".to_string()
+                    } else {
+                        verdict
+                            .via
+                            .iter()
+                            .map(|source| format!("{source:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    if no_accepted_sources {
+                        format!(
+                            concat!(
+                                "mati: policy {} cannot be satisfied because requires.via accepts {}; ",
+                                "this policy is steering only here"
+                            ),
+                            verdict.key, accepted
+                        )
+                    } else {
+                        format!(
+                            concat!(
+                                "mati: policy {} cannot be satisfied in Codex because it accepts only {}; ",
+                                "Codex can mint mem_get and hook_context receipts but cannot attest ",
+                                "to those sources, so this policy is steering only here"
+                            ),
+                            verdict.key, accepted
+                        )
+                    }
+                } else {
+                    verdict.rule.clone()
+                },
                 requires_key: verdict.requires_key.clone(),
                 block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                    && !unfulfillable
                     && (!introspection_exemption || verdict.satisfied),
                 satisfied: verdict.satisfied,
                 stage: verdict.stage,
@@ -1026,6 +1107,7 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: None,
+            source: Some(mati_core::store::ReceiptSource::MemGet),
         },
     );
     let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
@@ -1103,6 +1185,7 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
                     session_id: session_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
                     decision_basis_hash: None,
+                    source: Some(mati_core::store::ReceiptSource::DbIntrospection),
                 },
             ),
         )
@@ -1351,8 +1434,11 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                 "path",
                 agent_id,
                 "<apply-patch-policy>",
-                policy_block_exempt(variant, input),
                 None,
+                PolicyEvaluationOptions {
+                    introspection_exemption: policy_block_exempt(variant, input),
+                    codex_agent: true,
+                },
             )
             .await
             {
@@ -1472,25 +1558,38 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
 // ── Fail-open telemetry ─────────────────────────────────────────────────────
 
 fn log_fail_open(rel_path: &str, reason: &str) {
+    log_fail_open_named("hook-decide", rel_path, reason);
+}
+
+/// Record a fail-open event for a hook that uses the shared hook lifecycle.
+pub(crate) fn log_fail_open_named(hook: &str, rel_path: &str, reason: &str) {
     eprintln!("[mati] WARNING: enforcement bypassed for {rel_path} — {reason}");
     if let Some(log_dir) = mati_core::store::mati_home_opt() {
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join("fail_open.log");
-        log_fail_open_at(&log_path, rel_path, reason);
+        log_fail_open_at_named(&log_path, hook, rel_path, reason);
     }
 }
 
 /// Append one entry to `fail_open.log`. Format MUST match the parser in
 /// `cli::stats::parse_iso_timestamp` — the round-trip is covered by
 /// `fail_open_log_round_trip_writer_reader` in `cli::stats`'s test module.
+#[allow(dead_code)] // The direct writer is exercised by the stats round-trip test.
 pub(super) fn log_fail_open_at(log_path: &Path, rel_path: &str, reason: &str) {
+    log_fail_open_at_named(log_path, "hook-decide", rel_path, reason);
+}
+
+fn log_fail_open_at_named(log_path: &Path, hook: &str, rel_path: &str, reason: &str) {
     let now = iso_utc_now();
-    let entry = format!("{now} FAIL_OPEN hook=hook-decide file={rel_path} reason={reason}\n");
+    let entry = format!("{now} FAIL_OPEN hook={hook} file={rel_path} reason={reason}\n");
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, entry.as_bytes())?;
+            std::io::Write::flush(&mut f)
+        });
 }
 
 /// UTC timestamp in ISO 8601 format `YYYY-MM-DDTHH:MM:SSZ`.
@@ -1642,6 +1741,9 @@ fn session_command(
             session_id: sid(),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: basis(),
+            // The hook pushed the record into the agent's context. Preserve
+            // that provenance so policies can distinguish it from mem_get.
+            source: Some(mati_core::store::ReceiptSource::HookContext),
         }),
         HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::Miss,
@@ -1780,6 +1882,7 @@ fn emit_allow(variant: HookVariant) {
     if let Some(json) = allow_output(variant) {
         println!("{json}");
     }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 // emit_decision, emit_claude_decision, and emit_codex_pre_bash_decision
@@ -2247,6 +2350,7 @@ mod tests {
                 strict: true,
             }],
             true,
+            false,
         );
         let result = decide::evaluate_policy_verdicts(&verdicts, true);
         assert_eq!(result.decision, Decision::Allow);
@@ -2258,6 +2362,77 @@ mod tests {
             .events
             .iter()
             .any(|event| matches!(event, HookEvent::PolicyConsulted { .. })));
+    }
+
+    #[test]
+    fn codex_policy_without_a_producible_source_degrades_to_steering() {
+        let verdicts = policy_core_verdicts(
+            &[mati_core::mcp::protocol::PolicyVerdict {
+                key: "policy:db-schema".into(),
+                stage: mati_core::store::PolicyStage::Enforce,
+                mode: mati_core::store::PolicyMode::Block,
+                rule: "Inspect the schema first.".into(),
+                reason: "Production schemas drift.".into(),
+                severity: mati_core::store::Priority::High,
+                requires_key: "schema:orders".into(),
+                satisfied: false,
+                via: vec![mati_core::store::ReceiptSource::DbIntrospection],
+                strict: true,
+            }],
+            false,
+            true,
+        );
+        let result = decide::evaluate_policy_verdicts(&verdicts, true);
+        assert!(
+            matches!(result.decision, Decision::Advisory { ref context } if context.contains("cannot be satisfied in Codex"))
+        );
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, HookEvent::PolicyConsultBlocked { .. })));
+    }
+
+    /// A Codex policy that names a source Codex CAN mint must keep blocking.
+    ///
+    /// `HookContext` is produced on the Codex pre-bash and apply-patch paths
+    /// (`fire_events` runs there), so degrading it would silently switch off an
+    /// enforceable policy. Written because the first version of the check asked
+    /// only whether `via` contained `MemGet`, which was true when there were
+    /// two variants and wrong the moment a third was added.
+    #[test]
+    fn codex_policy_naming_a_producible_source_still_blocks() {
+        for via in [
+            vec![mati_core::store::ReceiptSource::HookContext],
+            vec![
+                mati_core::store::ReceiptSource::DbIntrospection,
+                mati_core::store::ReceiptSource::HookContext,
+            ],
+        ] {
+            let verdicts = policy_core_verdicts(
+                &[mati_core::mcp::protocol::PolicyVerdict {
+                    key: "policy:db-schema".into(),
+                    stage: mati_core::store::PolicyStage::Enforce,
+                    mode: mati_core::store::PolicyMode::Block,
+                    rule: "Inspect the schema first.".into(),
+                    reason: "Production schemas drift.".into(),
+                    severity: mati_core::store::Priority::High,
+                    requires_key: "schema:orders".into(),
+                    satisfied: false,
+                    via: via.clone(),
+                    strict: true,
+                }],
+                false,
+                true,
+            );
+            assert!(
+                verdicts[0].block,
+                "via {via:?} is producible in Codex and must still block"
+            );
+            assert_eq!(
+                verdicts[0].rule, "Inspect the schema first.",
+                "a policy that still blocks must keep its own rule text"
+            );
+        }
     }
 
     #[test]
@@ -2334,13 +2509,31 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn hook_context_hit_records_hook_context_source() {
+        let Some(mati_core::mcp::protocol::Command::ConsultationHit(input)) = session_command(
+            &HookEvent::Hit {
+                key: "file:src/main.rs".into(),
+            },
+            None,
+            None,
+            None,
+        ) else {
+            panic!("HookEvent::Hit must mint a consultation receipt")
+        };
+        assert_eq!(
+            input.source,
+            Some(mati_core::store::ReceiptSource::HookContext)
+        );
+    }
+
     async fn assert_main_thread_receipt_is_global(key: &str) {
         crate::cli::ensure_test_home();
         let dir = tempfile::tempdir().unwrap();
         let store = mati_core::store::Store::open(dir.path()).await.unwrap();
         let actor = receipt_actor(None, Some("session-main"));
         let staged = mati_core::store::session::consultation_receipt_staged_for_store(
-            &store, key, actor, false,
+            &store, key, actor, false, None,
         )
         .await
         .unwrap();
@@ -2384,7 +2577,7 @@ mod tests {
         assert_eq!(actor, Some("agent-a"));
 
         let staged = mati_core::store::session::consultation_receipt_staged_for_store(
-            &store, key, actor, false,
+            &store, key, actor, false, None,
         )
         .await
         .unwrap();
@@ -2961,25 +3154,30 @@ mod tests {
     //
     // Mirrors the production wrapper in `run()`: when the inner future
     // exceeds the deadline, the wrapper must produce an allow output and
-    // log a fail-open entry. We can't drive the real `run()` from a unit
-    // test (it reads stdin and may spawn daemons), so we test the deadline
-    // shape directly using the same `tokio::time::timeout` + `emit_allow`
-    // path the production code takes.
+    // return an explicit termination outcome. We can't drive the real `run()`
+    // from a unit test (it reads stdin and may spawn daemons), so we test the
+    // deadline shape directly using the same `tokio::time::timeout` +
+    // `emit_allow` path the production code takes.
 
-    async fn run_with_deadline<F>(deadline_ms: u64, variant: HookVariant, inner: F) -> Result<()>
+    async fn run_with_deadline<F>(
+        deadline_ms: u64,
+        variant: HookVariant,
+        inner: F,
+    ) -> Result<HookRunOutcome>
     where
         F: std::future::Future<Output = Result<()>>,
     {
         match tokio::time::timeout(Duration::from_millis(deadline_ms), inner).await {
-            Ok(inner_result) => inner_result,
+            Ok(inner_result) => inner_result.map(|()| HookRunOutcome::Continue),
             Err(_elapsed) => {
                 // Match the production wrapper exactly. We don't write to
                 // the real fail_open.log here — production code does, and
                 // testing that side effect would require touching the home
                 // dir. The load-bearing assertion is "completes within
-                // budget + emits allow", not "wrote to disk".
+                // budget + emits allow + requests termination", not "wrote
+                // to disk".
                 emit_allow(variant);
-                Ok(())
+                Ok(HookRunOutcome::Terminate(0))
             }
         }
     }
@@ -3005,10 +3203,11 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        // The wrapper must absorb the timeout into Ok(()).
+        // The wrapper must absorb the timeout into an explicit allow-and-exit
+        // outcome without exiting the unit-test process.
         assert!(
-            result.is_ok(),
-            "deadline wrapper must never propagate Err on timeout, got: {result:?}"
+            matches!(result, Ok(HookRunOutcome::Terminate(0))),
+            "deadline wrapper must request allow exit on timeout, got: {result:?}"
         );
 
         // The wrapper must complete close to the deadline, not after the
@@ -3024,7 +3223,8 @@ mod tests {
             "wrapper took {elapsed:?} — must wait at least the deadline ({deadline_ms}ms) before timing out"
         );
 
-        // The production wrapper calls `emit_allow(variant)` on timeout.
+        // The production wrapper calls `emit_allow(variant)` on timeout and
+        // uses exit code 0, which is allow for both hook protocols.
         // We can't capture process stdout from a unit test, so we verify
         // the contract by re-checking the exact JSON shape `emit_allow`
         // produces for the Claude variants — a regression there would also

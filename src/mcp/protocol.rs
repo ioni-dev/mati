@@ -795,6 +795,12 @@ pub struct ConsultationHitInput {
     /// Subagent agent_id when present (fallback attribution).
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// How the consultation happened, recorded onto the receipt. `None` when
+    /// the caller's path is unattributed — see
+    /// `store::session::ConsultationReceipt::source`. Defaulted so an older
+    /// hook binary talking to a newer daemon still mints.
+    #[serde(default)]
+    pub source: Option<crate::store::ReceiptSource>,
     /// SHA-256 of the gotcha state in force when the receipt was minted.
     #[serde(default)]
     pub decision_basis_hash: Option<String>,
@@ -1798,6 +1804,7 @@ mod tests {
                     session_id: None,
                     agent_id: None,
                     decision_basis_hash: None,
+                    source: None,
                 }),
             ),
             ("session_flush", Command::SessionFlush),

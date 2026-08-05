@@ -368,7 +368,7 @@ pub async fn ensure_daemon(mati_root: &Path) -> bool {
                     // exclusive SurrealKV Store lock when our new spawn
                     // calls `Store::open()` — a deadlock.
                     //
-                    // 2s budget: well within the 3000ms hook timeout
+                    // 2s budget: well within the 4s hook timeout
                     // (Phase 4 readiness poll adds ~800ms; 2s here keeps
                     // total recovery latency under the ceiling).
                     let stale_pid = super::metadata::read_metadata(mati_root).map(|m| m.pid);

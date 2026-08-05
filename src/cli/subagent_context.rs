@@ -2,6 +2,8 @@ use anyhow::Result;
 
 use mati_core::store::RecordLifecycle;
 
+use super::hook_decide::HookRunOutcome;
+use super::hooks::run_with_deadline;
 use super::proxy::StoreProxy;
 use super::stats::gotcha_health;
 
@@ -11,7 +13,26 @@ use super::stats::gotcha_health;
 /// and prints the hookSpecificOutput JSON that Claude Code expects for a
 /// SubagentStart hook.  Fail-open: if the store cannot be opened, prints
 /// nothing and exits 0 so the subagent always spawns.
-pub async fn run_subagent_context() -> Result<()> {
+pub async fn run_subagent_context() -> Result<HookRunOutcome> {
+    // This hook emits advisory context only; enforcement still runs on the
+    // subagent's tool calls. Three seconds bounds the daemon ping/scan path
+    // while giving it more room than a pre-read gate, without inheriting the
+    // daemon's 10s response timeout for an informational message
+    // (10000 - 3000 = 7000ms saved). The timer starts after startup, and there
+    // is no 4s host ceiling to subtract startup from.
+    const SUBAGENT_START_DEADLINE_MS: u64 = 3000;
+
+    run_with_deadline(
+        "subagent-start",
+        "<subagent-context>",
+        SUBAGENT_START_DEADLINE_MS,
+        "subagent context exceeded internal deadline",
+        run_subagent_context_inner(),
+    )
+    .await
+}
+
+async fn run_subagent_context_inner() -> Result<()> {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(_) => return Ok(()),

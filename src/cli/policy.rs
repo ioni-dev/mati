@@ -430,6 +430,12 @@ async fn set_stage(key: &str, stage: PolicyStage) -> Result<()> {
         .payload_as::<PolicyRecord>()
         .ok_or_else(|| anyhow::anyhow!("'{key}' is not a policy record"))?;
     policy.stage = stage;
+    if stage == PolicyStage::Enforce {
+        let has_backing = has_backing_record(&proxy, &policy.requires.key).await?;
+        for warning in mati_core::store::policy_ops::author_warnings(&policy, has_backing) {
+            eprintln!("{warning}");
+        }
+    }
     let result = proxy
         .policy_write(
             mati_core::mcp::protocol::PolicyWriteOp::Stage,

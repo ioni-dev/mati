@@ -30,5 +30,5 @@ pub use record::{
     PolicyRequires, PolicyStage, PolicyTrigger, Priority, QualityScore, QualitySignal, QualityTier,
     ReceiptSource, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry,
     StaleReviewPayload, StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind,
-    TombstoneReason,
+    TombstoneReason, CODEX_PRODUCIBLE_SOURCES,
 };

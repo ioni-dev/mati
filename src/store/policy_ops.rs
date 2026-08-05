@@ -94,6 +94,24 @@ pub fn key_is_writable(key: &str) -> bool {
 
 pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<String> {
     let mut warnings = Vec::new();
+    if policy.mode == super::record::PolicyMode::Block && policy.requires.via.is_empty() {
+        warnings.push(
+            "warning: block policy has an empty requires.via; no receipt source can satisfy it."
+                .into(),
+        );
+    } else if policy.mode == super::record::PolicyMode::Block
+        && !policy
+            .requires
+            .via
+            .iter()
+            .any(|source| super::record::CODEX_PRODUCIBLE_SOURCES.contains(source))
+    {
+        warnings.push(
+            "warning: Codex cannot produce any accepted receipt source for this block policy; "
+                .to_string()
+                + "Codex will steer it with a diagnostic instead of denying an unsatisfiable action."
+        );
+    }
     if policy.trigger.tool.as_deref() == Some("file_read") {
         warnings.push(
             "warning: policy trigger tool 'file_read' has no enforcing adapter; Bash file reads are governed by gotchas, so this policy will never be evaluated. Use a gotcha for reads or a db_client/path policy for an adapter-backed action.".into(),

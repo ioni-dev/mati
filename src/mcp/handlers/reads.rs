@@ -124,6 +124,7 @@ pub(crate) async fn handle_mem_get(
         record
             .as_ref()
             .and_then(crate::store::session::record_content_fingerprint),
+        Some(crate::store::ReceiptSource::MemGet),
     ) {
         Ok(r) => r,
         Err(e) => {

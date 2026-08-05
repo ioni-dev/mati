@@ -29,7 +29,9 @@ mod tests {
     use mati_core::analysis::parser::parse_file;
     use mati_core::analysis::walker::{Language, Walker};
     use mati_core::graph::{EdgeKind, Graph};
-    use mati_core::health::staleness::{apply_reparse_staleness, ReparseDiff, StalenessAnalyzer};
+    use mati_core::health::staleness::{
+        apply_reparse_staleness, ReparseDiff, StalenessAnalyzer, ANALYZE_TIME_BUDGET_MS,
+    };
     use mati_core::mcp::tools::assemble_context_packet;
     use mati_core::store::record::{
         Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, QualityTier, Record,
@@ -382,9 +384,16 @@ mod tests {
             report.scanned
         );
 
+        // This is the analyzer's standalone performance bound, not the
+        // SessionEnd scaffold ceiling. `analyze_all` stops starting work at
+        // ANALYZE_TIME_BUDGET_MS; allow 1000ms for the final writes and
+        // scheduler overhead after that deadline, preserving the old 3s
+        // bound while tying it to the budget it actually guards.
+        let analyze_all_bound_ms = ANALYZE_TIME_BUDGET_MS + 1000;
         assert!(
-            elapsed.as_secs() < 3,
-            "analyze_all exceeded 3-second budget: took {:.2}s",
+            elapsed.as_millis() < u128::from(analyze_all_bound_ms),
+            "analyze_all exceeded its {}ms budget plus 1000ms completion margin: took {:.2}s",
+            ANALYZE_TIME_BUDGET_MS,
             elapsed.as_secs_f64()
         );
 
@@ -418,8 +427,11 @@ mod tests {
     /// that used to run one record for seconds past a spent budget, because
     /// `ANALYZE_TIME_BUDGET_MS` gated only when a record *started*.
     ///
-    /// The ceiling is the SessionEnd hook's: Claude Code SIGKILLs at 3000ms and
-    /// non-staleness harvest work costs ~330ms, so the pass has ~2170ms.
+    /// The ceiling is the SessionEnd hook's: a 4s scaffold timeout, less
+    /// ~1050ms of cold-binary startup and ~330ms of non-staleness harvest
+    /// work, leaves ~2620ms for the pass against its 2000ms budget. Unlike
+    /// the read gate, SessionEnd has no internal deadline — the scaffold
+    /// timeout is its only bound, so an overrun here is a hard kill.
     #[tokio::test]
     #[ignore] // touches disk and git extensively
     async fn smoke_staleness_analyzer_budget_holds_with_stale_git_baselines() {

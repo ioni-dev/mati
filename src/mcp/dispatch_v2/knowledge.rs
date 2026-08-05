@@ -263,19 +263,21 @@ pub(super) async fn dispatch_policy_evaluate(
             crate::store::PolicyMode::Steer => true,
             crate::store::PolicyMode::Block => {
                 let check = if fingerprint {
-                    sess::check_consulted_recent_fingerprinted(
+                    sess::check_consulted_recent_fingerprinted_with_sources(
                         store,
                         &requires_key,
                         ttl_secs,
                         input.actor.as_deref(),
+                        &via,
                     )
                     .await
                 } else {
-                    sess::check_consulted_recent(
+                    sess::check_consulted_recent_with_sources(
                         store,
                         &requires_key,
                         ttl_secs,
                         input.actor.as_deref(),
+                        &via,
                     )
                     .await
                 };
