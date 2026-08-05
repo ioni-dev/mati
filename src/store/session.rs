@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
-    RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload,
+    Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, ReceiptSource,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload,
     StalenessScore, StalenessTier, Store,
 };
 use crate::health::staleness::StalenessAnalyzer;
@@ -160,6 +160,18 @@ pub struct ConsultationReceipt {
     /// authorizes. `None` on receipts written before the field existed.
     #[serde(default)]
     pub id: Option<String>,
+    /// How the consultation happened. Policy `requires.via` names the sources a
+    /// policy accepts, but satisfaction currently checks only that a receipt
+    /// exists — so this is recorded and not yet read. It is recorded now
+    /// because provenance cannot be reconstructed after the fact.
+    ///
+    /// `None` on receipts written before the field existed, and on mints whose
+    /// source is neither variant: hook context injection, `mati log-hit`, and
+    /// the `StoreProxy` path. Those are left unset rather than guessed — an
+    /// invented provenance is worse than an absent one, and the gap is the
+    /// reason the vocabulary needs widening before `via` can be enforced.
+    #[serde(default)]
+    pub source: Option<ReceiptSource>,
 }
 
 /// A consultation receipt staged for write, carrying the id that links it to
@@ -290,13 +302,14 @@ fn receipt_key(key: &str, actor: Option<&str>) -> String {
 /// When `actor` is `Some`, writes an actor-scoped key `session:consulted:<actor>:<key>`
 /// alongside the global key path. Pass `None` for all existing callers (global).
 pub fn consultation_receipt_staged(key: &str, actor: Option<&str>) -> Result<StagedReceipt> {
-    consultation_receipt_staged_with_fingerprint(key, actor, None)
+    consultation_receipt_staged_with_fingerprint(key, actor, None, None)
 }
 
 pub fn consultation_receipt_staged_with_fingerprint(
     key: &str,
     actor: Option<&str>,
     fingerprint: Option<String>,
+    source: Option<ReceiptSource>,
 ) -> Result<StagedReceipt> {
     let consulted_key = receipt_key(key, actor);
     let id = uuid::Uuid::now_v7().to_string();
@@ -304,6 +317,7 @@ pub fn consultation_receipt_staged_with_fingerprint(
     record.payload = Some(serde_json::to_value(ConsultationReceipt {
         fingerprint,
         id: Some(id.clone()),
+        source,
     })?);
     let bytes = rmp_serde::to_vec_named(&record)
         .with_context(|| format!("failed to serialize consulted receipt for {consulted_key}"))?;
@@ -329,6 +343,7 @@ pub async fn consultation_receipt_staged_for_store(
     key: &str,
     actor: Option<&str>,
     capture_fingerprint: bool,
+    source: Option<ReceiptSource>,
 ) -> Result<StagedReceipt> {
     let fingerprint = if capture_fingerprint {
         store
@@ -340,7 +355,7 @@ pub async fn consultation_receipt_staged_for_store(
     } else {
         None
     };
-    consultation_receipt_staged_with_fingerprint(key, actor, fingerprint)
+    consultation_receipt_staged_with_fingerprint(key, actor, fingerprint, source)
 }
 
 /// Compute the session:current flush record WITHOUT persisting.
@@ -378,8 +393,10 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     let agg_key = today_key("analytics:hit_");
     upsert_daily_agg(store, &agg_key, key).await?;
 
-    // 2. Mark as consulted for session tracking
-    let staged = consultation_receipt_staged_for_store(store, key, None, true).await?;
+    // 2. Mark as consulted for session tracking. No source: this is the direct
+    // store path behind `StoreProxy::log_hit`, reached from CLI commands whose
+    // consultation is neither a `mem_get` nor an introspection.
+    let staged = consultation_receipt_staged_for_store(store, key, None, true, None).await?;
     let receipt: Record = rmp_serde::from_slice(&staged.bytes)
         .context("failed to deserialize staged consultation receipt")?;
     store.put(&staged.key, &receipt).await?;
@@ -957,6 +974,59 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = Store::open(dir.path()).await.expect("open store");
         (dir, store)
+    }
+
+    // ── receipt provenance ───────────────────────────────────────────────────
+
+    /// The source reaches the stored payload, not just the argument list.
+    ///
+    /// Reads back through the same serialization the store uses, so a receipt
+    /// that records provenance in memory but drops it on write fails here.
+    #[test]
+    fn receipt_records_the_source_it_was_minted_with() {
+        for source in [ReceiptSource::MemGet, ReceiptSource::DbIntrospection] {
+            let staged = consultation_receipt_staged_with_fingerprint(
+                "decision:x",
+                None,
+                None,
+                Some(source),
+            )
+            .expect("stage receipt");
+            let record: Record = rmp_serde::from_slice(&staged.bytes).expect("deserialize record");
+            let receipt = record
+                .payload_as::<ConsultationReceipt>()
+                .expect("receipt payload");
+            assert_eq!(
+                receipt.source,
+                Some(source),
+                "minted with {source:?} but stored {:?}",
+                receipt.source
+            );
+        }
+    }
+
+    /// An unset source stays unset. Guards the deliberate choice at the mint
+    /// sites that cannot name their provenance — a default would invent one.
+    #[test]
+    fn receipt_without_a_source_stays_none() {
+        let staged = consultation_receipt_staged_with_fingerprint("decision:x", None, None, None)
+            .expect("stage receipt");
+        let record: Record = rmp_serde::from_slice(&staged.bytes).expect("deserialize record");
+        let receipt = record
+            .payload_as::<ConsultationReceipt>()
+            .expect("receipt payload");
+        assert_eq!(receipt.source, None);
+    }
+
+    /// Receipts written before the field existed must still load. They are the
+    /// majority of any store upgrading into this change.
+    #[test]
+    fn legacy_receipt_payload_deserializes_with_no_source() {
+        let legacy = serde_json::json!({ "fingerprint": null, "id": "01890000-0000-7000-8000-000000000000" });
+        let receipt: ConsultationReceipt =
+            serde_json::from_value(legacy).expect("legacy receipt must still parse");
+        assert_eq!(receipt.source, None);
+        assert!(receipt.id.is_some(), "unrelated fields must survive");
     }
 
     // ── session_harvest ──────────────────────────────────────────────────────

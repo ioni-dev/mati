@@ -1043,6 +1043,7 @@ async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: None,
+            source: Some(mati_core::store::ReceiptSource::MemGet),
         },
     );
     let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
@@ -1120,6 +1121,7 @@ async fn run_post_bash_introspection(input: &serde_json::Value) -> Result<()> {
                     session_id: session_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
                     decision_basis_hash: None,
+                    source: Some(mati_core::store::ReceiptSource::DbIntrospection),
                 },
             ),
         )
@@ -1672,6 +1674,9 @@ fn session_command(
             session_id: sid(),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: basis(),
+            // Hook context injection is neither variant. Left unset rather
+            // than guessed; see ConsultationReceipt::source.
+            source: None,
         }),
         HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::Miss,
@@ -2371,7 +2376,7 @@ mod tests {
         let store = mati_core::store::Store::open(dir.path()).await.unwrap();
         let actor = receipt_actor(None, Some("session-main"));
         let staged = mati_core::store::session::consultation_receipt_staged_for_store(
-            &store, key, actor, false,
+            &store, key, actor, false, None,
         )
         .await
         .unwrap();
@@ -2415,7 +2420,7 @@ mod tests {
         assert_eq!(actor, Some("agent-a"));
 
         let staged = mati_core::store::session::consultation_receipt_staged_for_store(
-            &store, key, actor, false,
+            &store, key, actor, false, None,
         )
         .await
         .unwrap();

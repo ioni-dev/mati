@@ -505,6 +505,9 @@ impl StoreProxy {
                         session_id: None,
                         agent_id: None,
                         decision_basis_hash: None,
+                        // Mirrors the Direct arm above, which also records no
+                        // source. See ConsultationReceipt::source.
+                        source: None,
                     },
                 );
                 match daemon_v2(root, cmd).await {

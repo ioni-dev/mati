@@ -141,6 +141,9 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
         session_id: None,
         agent_id: None,
         decision_basis_hash: None,
+        // `mati log-hit` is a generic hook-script entry point; the caller does
+        // not say how the record was consulted. See ConsultationReceipt::source.
+        source: None,
     }))
     .await
 }

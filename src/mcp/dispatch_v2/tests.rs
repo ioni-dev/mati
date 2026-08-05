@@ -496,6 +496,7 @@ async fn one_mem_get_counts_as_one_consultation() {
         session_id: Some("sess-e2e".into()),
         agent_id: None,
         decision_basis_hash: None,
+        source: None,
     }));
     assert!(matches!(
         dispatch_v2(&graph, &ctx, hit).await,
@@ -545,6 +546,7 @@ async fn v2_session_clear_consults_deletes_receipts_silently() {
             session_id: None,
             agent_id: None,
             decision_basis_hash: None,
+            source: None,
         }));
         assert!(matches!(
             dispatch_v2(&graph, &ctx, req).await,
@@ -633,6 +635,7 @@ async fn v2_audit_entry_contains_peer_identity() {
         session_id: None,
         agent_id: None,
         decision_basis_hash: None,
+        source: None,
     }));
     let request_id = req.id;
     let _ = dispatch_v2(&graph, &ctx, req).await;
@@ -803,6 +806,7 @@ fn no_mutation_or_side_effecting_read_reaches_v1_bridge() {
             session_id: None,
             agent_id: None,
             decision_basis_hash: None,
+            source: None,
         }),
         Command::SessionFlush,
         Command::SessionHarvest,
@@ -1500,6 +1504,7 @@ async fn receipt_id_links_a_mint_to_the_allow_it_authorizes() {
         session_id: None,
         agent_id: None,
         decision_basis_hash: None,
+        source: None,
     }));
     assert!(matches!(
         dispatch_v2(&graph, &ctx, mint).await,
