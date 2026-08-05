@@ -10,12 +10,17 @@
 //!
 //! # Running
 //!
-//! This test is `#[ignore]`d by default -- it spawns daemon processes, writes to
-//! disk, and is slower than unit tests. Run it explicitly:
+//! The lifecycle tests are `#[ignore]`d by default -- they spawn daemon
+//! processes, write to disk, and are slower than unit tests. Run them
+//! explicitly:
 //!
 //! ```sh
 //! cargo test --test hook_decide_integration -- --ignored --nocapture
 //! ```
+//!
+//! `hook_deadline_terminates_the_process` is not ignored. It spawns no daemon
+//! and needs no repo, and the regression it pins is invisible to a suite that
+//! skips it.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -554,4 +559,99 @@ fn hook_decide_denies_gotcha_through_symlink() {
     eprintln!("[wi20] claude-pre-read through symlink: deny -- correct");
 
     eprintln!("[wi20] all symlink-bypass assertions passed");
+}
+
+/// The internal deadline must end the process, not merely decide.
+///
+/// `run_inner` reads stdin through Tokio's blocking reader. When
+/// `HOOK_DEADLINE_MS` fires mid-read the timeout branch writes its fail-open
+/// allow, but the runtime will not shut down while that reader is outstanding.
+/// The process therefore used to live until stdin reached EOF — measured at
+/// 4028ms against a 2500ms deadline — and a hook runner waiting on exit stalls
+/// for all of it. `HookRunOutcome::Terminate` exists to cut that short.
+///
+/// This holds stdin open and never closes it, so the pre-fix binary does not
+/// exit at all and the test fails on the upper bound.
+///
+/// Not `#[ignore]`d, unlike the rest of this file: it spawns no daemon and
+/// needs no git repo, and an ignored test would not have caught the regression
+/// it exists to pin.
+#[test]
+fn hook_deadline_terminates_the_process() {
+    // Mirrors `cli::hook_decide::HOOK_DEADLINE_MS`, which is private.
+    const DEADLINE_MS: u64 = 2500;
+    // Generous enough to absorb a cold binary load (~1s measured) without
+    // reaching the EOF-tracking failure mode, which never exits at all.
+    const UPPER_BOUND_MS: u64 = 8000;
+
+    let bin = mati_bin();
+    let repo_dir = TempDir::new().expect("create repo dir");
+    let home_dir = TempDir::new().expect("create home dir");
+
+    let mut child = Command::new(&bin)
+        .args(["hook-decide", "claude-pre-read"])
+        .current_dir(repo_dir.path())
+        .env("HOME", home_dir.path())
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn mati hook-decide");
+
+    let mut stdin = child.stdin.take().expect("child stdin");
+    stdin
+        .write_all(br#"{"tool_name":"Read","tool_input":{"file_path":"src/main.rs"}}"#)
+        .expect("write hook payload");
+    stdin.flush().expect("flush hook payload");
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if start.elapsed() > Duration::from_millis(UPPER_BOUND_MS) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "hook-decide did not exit within {UPPER_BOUND_MS}ms with stdin held open. \
+                 The internal deadline decided but the process kept running until EOF — \
+                 the failure HookRunOutcome::Terminate fixes."
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let elapsed = start.elapsed();
+
+    // Held until here so the pipe cannot close early and hand the process an
+    // EOF, which would let it exit through the normal path and pass vacuously.
+    drop(stdin);
+
+    assert!(
+        elapsed >= Duration::from_millis(DEADLINE_MS - 500),
+        "exited after {elapsed:?}, before the {DEADLINE_MS}ms deadline could fire — \
+         the process died early rather than failing open on schedule"
+    );
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the deadline must fail open: exit 0 is allow for both hook protocols, \
+         and exit 2 would turn a timeout into a deny"
+    );
+
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read as _;
+        out.read_to_string(&mut stdout).expect("read child stdout");
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or(serde_json::json!({}));
+    assert_eq!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str()),
+        Some("allow"),
+        "the deadline must emit its allow before exiting, not just exit.\nstdout: {stdout}"
+    );
+
+    eprintln!("[deadline] exited at {elapsed:?} with stdin still open -- correct");
 }
