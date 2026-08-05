@@ -835,19 +835,21 @@ impl StoreProxy {
                         PolicyMode::Steer => true,
                         PolicyMode::Block => {
                             if policy.requires.freshness.fingerprint {
-                                mati_core::store::session::check_consulted_recent_fingerprinted(
+                                mati_core::store::session::check_consulted_recent_fingerprinted_with_sources(
                                     store,
                                     &policy.requires.key,
                                     policy.requires.freshness.ttl_secs,
                                     actor,
+                                    &policy.requires.via,
                                 )
                                 .await?
                             } else {
-                                mati_core::store::session::check_consulted_recent(
+                                mati_core::store::session::check_consulted_recent_with_sources(
                                     store,
                                     &policy.requires.key,
                                     policy.requires.freshness.ttl_secs,
                                     actor,
+                                    &policy.requires.via,
                                 )
                                 .await?
                             }
@@ -1509,9 +1511,20 @@ mod tests {
             )
             .await
             .unwrap();
-        mati_core::store::session::log_hit(&store, key)
-            .await
-            .unwrap();
+        // Mint as MemGet, the source this policy's `requires.via` accepts.
+        // `log_hit` records no source and therefore satisfies nothing — it was
+        // usable here only while satisfaction ignored `via`.
+        let staged = mati_core::store::session::consultation_receipt_staged_for_store(
+            &store,
+            key,
+            None,
+            true,
+            Some(mati_core::store::ReceiptSource::MemGet),
+        )
+        .await
+        .unwrap();
+        let receipt: mati_core::store::Record = rmp_serde::from_slice(&staged.bytes).unwrap();
+        store.put(&staged.key, &receipt).await.unwrap();
         let policy = mati_core::store::PolicyRecord {
             name: "Fingerprint query".into(),
             rule: "Consult current schema.".into(),

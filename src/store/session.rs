@@ -161,15 +161,12 @@ pub struct ConsultationReceipt {
     #[serde(default)]
     pub id: Option<String>,
     /// How the consultation happened. Policy `requires.via` names the sources a
-    /// policy accepts, but satisfaction currently checks only that a receipt
-    /// exists — so this is recorded and not yet read. It is recorded now
-    /// because provenance cannot be reconstructed after the fact.
+    /// policy accepts, and satisfaction compares this value with that list.
     ///
     /// `None` on receipts written before the field existed, and on mints whose
-    /// source is neither variant: hook context injection, `mati log-hit`, and
-    /// the `StoreProxy` path. Those are left unset rather than guessed — an
-    /// invented provenance is worse than an absent one, and the gap is the
-    /// reason the vocabulary needs widening before `via` can be enforced.
+    /// source is not attributable: `mati log-hit` and the `StoreProxy` path.
+    /// Those are left unset rather than guessed — an invented provenance is
+    /// worse than an absent one.
     #[serde(default)]
     pub source: Option<ReceiptSource>,
 }
@@ -505,6 +502,33 @@ pub async fn check_consulted_recent(
     Ok(age <= ttl_secs)
 }
 
+/// Return true only when a recent receipt records one of the policy's accepted
+/// consultation sources. A missing source is deliberately not accepted: it is
+/// legacy or unattributed evidence, not evidence for a named channel.
+pub async fn check_consulted_recent_with_sources(
+    store: &Store,
+    key: &str,
+    ttl_secs: u64,
+    actor: Option<&str>,
+    accepted_sources: &[ReceiptSource],
+) -> Result<bool> {
+    let consulted_key = receipt_key(key, actor);
+    let Some(record) = store.get(&consulted_key).await? else {
+        return Ok(false);
+    };
+    if now_secs().saturating_sub(record.updated_at) > ttl_secs {
+        return Ok(false);
+    }
+    let payload = record
+        .payload
+        .ok_or_else(|| anyhow::anyhow!("consultation receipt {consulted_key} has no payload"))?;
+    let receipt: ConsultationReceipt = serde_json::from_value(payload)
+        .with_context(|| format!("invalid consultation receipt payload at {consulted_key}"))?;
+    Ok(receipt
+        .source
+        .is_some_and(|source| accepted_sources.contains(&source)))
+}
+
 /// Return true only when a recent receipt carries the current record's
 /// fingerprint. Store faults propagate as errors so the caller can fail open;
 /// swallowing them into `false` would fail closed and deny on a mati outage.
@@ -528,6 +552,45 @@ pub async fn check_consulted_recent_fingerprinted(
         return Ok(false);
     };
     // A store read fault must remain an Err so hook callers fail open, never Ok(false).
+    let current = store
+        .get(key)
+        .await?
+        .and_then(|record| record_content_fingerprint(&record));
+    Ok(current.is_some_and(|current| current == stored))
+}
+
+/// Return true only when a recent, fingerprint-valid receipt records one of
+/// the policy's accepted consultation sources.
+pub async fn check_consulted_recent_fingerprinted_with_sources(
+    store: &Store,
+    key: &str,
+    ttl_secs: u64,
+    actor: Option<&str>,
+    accepted_sources: &[ReceiptSource],
+) -> Result<bool> {
+    let consulted_key = receipt_key(key, actor);
+    let Some(receipt_record) = store.get(&consulted_key).await? else {
+        return Ok(false);
+    };
+    if now_secs().saturating_sub(receipt_record.updated_at) > ttl_secs {
+        return Ok(false);
+    }
+    let payload = receipt_record
+        .payload
+        .ok_or_else(|| anyhow::anyhow!("consultation receipt {consulted_key} has no payload"))?;
+    let receipt: ConsultationReceipt = serde_json::from_value(payload)
+        .with_context(|| format!("invalid consultation receipt payload at {consulted_key}"))?;
+    if !receipt
+        .source
+        .is_some_and(|source| accepted_sources.contains(&source))
+    {
+        return Ok(false);
+    }
+    let Some(stored) = receipt.fingerprint else {
+        return Ok(false);
+    };
+    // A store read fault must remain an Err so hook callers fail open, never
+    // Ok(false).
     let current = store
         .get(key)
         .await?
@@ -984,7 +1047,11 @@ mod tests {
     /// that records provenance in memory but drops it on write fails here.
     #[test]
     fn receipt_records_the_source_it_was_minted_with() {
-        for source in [ReceiptSource::MemGet, ReceiptSource::DbIntrospection] {
+        for source in [
+            ReceiptSource::MemGet,
+            ReceiptSource::DbIntrospection,
+            ReceiptSource::HookContext,
+        ] {
             let staged = consultation_receipt_staged_with_fingerprint(
                 "decision:x",
                 None,
@@ -1027,6 +1094,84 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy receipt must still parse");
         assert_eq!(receipt.source, None);
         assert!(receipt.id.is_some(), "unrelated fields must survive");
+    }
+
+    #[tokio::test]
+    async fn source_aware_recent_check_requires_an_accepted_source() {
+        let (_dir, store) = temp_store().await;
+        let key = "decision:source-aware";
+
+        for source in [
+            ReceiptSource::MemGet,
+            ReceiptSource::DbIntrospection,
+            ReceiptSource::HookContext,
+        ] {
+            let staged =
+                consultation_receipt_staged_with_fingerprint(key, None, None, Some(source))
+                    .expect("stage receipt");
+            let record: Record = rmp_serde::from_slice(&staged.bytes).expect("receipt record");
+            store
+                .put(&staged.key, &record)
+                .await
+                .expect("write receipt");
+            assert!(
+                check_consulted_recent_with_sources(&store, key, 900, None, &[source])
+                    .await
+                    .expect("check receipt"),
+                "{source:?} should satisfy a policy accepting it"
+            );
+            let other = match source {
+                ReceiptSource::MemGet => ReceiptSource::DbIntrospection,
+                ReceiptSource::DbIntrospection => ReceiptSource::HookContext,
+                ReceiptSource::HookContext => ReceiptSource::MemGet,
+            };
+            assert!(
+                !check_consulted_recent_with_sources(&store, key, 900, None, &[other])
+                    .await
+                    .expect("check receipt"),
+                "{source:?} must not satisfy a policy accepting only {other:?}"
+            );
+        }
+
+        let staged = consultation_receipt_staged_with_fingerprint(key, None, None, None)
+            .expect("stage unattributed receipt");
+        let record: Record = rmp_serde::from_slice(&staged.bytes).expect("receipt record");
+        store
+            .put(&staged.key, &record)
+            .await
+            .expect("write receipt");
+        assert!(!check_consulted_recent_with_sources(
+            &store,
+            key,
+            900,
+            None,
+            &[
+                ReceiptSource::MemGet,
+                ReceiptSource::DbIntrospection,
+                ReceiptSource::HookContext
+            ]
+        )
+        .await
+        .expect("check unattributed receipt"));
+
+        let mut legacy = session_record(&format!("session:consulted:{key}"), String::new());
+        legacy.payload = Some(serde_json::json!({
+            "fingerprint": null,
+            "id": "01890000-0000-7000-8000-000000000000"
+        }));
+        store
+            .put(&legacy.key, &legacy)
+            .await
+            .expect("write legacy receipt");
+        assert!(!check_consulted_recent_with_sources(
+            &store,
+            key,
+            900,
+            None,
+            &[ReceiptSource::MemGet]
+        )
+        .await
+        .expect("check legacy receipt"));
     }
 
     // ── session_harvest ──────────────────────────────────────────────────────

@@ -242,10 +242,21 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     );
 
     {
+        // Mint as MemGet, the source this policy's `requires.via` accepts.
+        // `log_hit` records no source and therefore satisfies nothing — it was
+        // usable here only while satisfaction ignored `via`.
         let g = graph.read().await;
-        crate::store::session::log_hit(g.store(), "schema:orders")
-            .await
-            .unwrap();
+        let staged = crate::store::session::consultation_receipt_staged_for_store(
+            g.store(),
+            "schema:orders",
+            None,
+            false,
+            Some(crate::store::ReceiptSource::MemGet),
+        )
+        .await
+        .unwrap();
+        let receipt: crate::store::Record = rmp_serde::from_slice(&staged.bytes).unwrap();
+        g.store().put(&staged.key, &receipt).await.unwrap();
     }
     let second = evaluate().await;
     let Response::Ok { data, .. } = second else {
@@ -272,6 +283,96 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
     let verdicts = result.verdicts;
     assert!(verdicts.is_empty());
+}
+
+#[tokio::test]
+async fn policies_sharing_requires_key_respect_different_via_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+    let action = crate::hooks::decide::normalize_action(
+        Some("psql -h db.prod.internal -c 'SELECT 1'"),
+        None,
+    );
+    let make_policy = |via| PolicyRecord {
+        name: "Shared schema requirement".into(),
+        rule: "Consult the schema first.".into(),
+        reason: "Production schemas drift because deployments change.".into(),
+        scope: "repo".into(),
+        mode: PolicyMode::Block,
+        trigger: PolicyTrigger {
+            tool: Some("db_client".into()),
+            host_glob: Some("*prod*".into()),
+            target_path_glob: None,
+        },
+        requires: PolicyRequires {
+            key: "schema:shared".into(),
+            via,
+            freshness: PolicyFreshness {
+                ttl_secs: 900,
+                fingerprint: false,
+            },
+        },
+        stage: crate::store::PolicyStage::Enforce,
+        severity: StorePriority::High,
+        created_by: "test".into(),
+    };
+    for (key, via) in [
+        ("policy:shared-mem", vec![ReceiptSource::MemGet]),
+        ("policy:shared-db", vec![ReceiptSource::DbIntrospection]),
+    ] {
+        assert!(matches!(
+            dispatch_v2(
+                &graph,
+                &ctx,
+                make_request(Command::PolicyWrite(PolicyWriteInput {
+                    op: PolicyWriteOp::Create,
+                    key: key.into(),
+                    policy: Some(make_policy(via)),
+                    stage: None,
+                })),
+            )
+            .await,
+            Response::Ok { .. }
+        ));
+    }
+
+    let mint = make_request(Command::ConsultationHit(ConsultationHitInput {
+        key: "schema:shared".into(),
+        capture_fingerprint: false,
+        actor: None,
+        session_id: None,
+        agent_id: None,
+        decision_basis_hash: None,
+        source: Some(ReceiptSource::MemGet),
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, mint).await,
+        Response::Ok { .. }
+    ));
+
+    let Response::Ok { data, .. } = dispatch_v2(
+        &graph,
+        &ctx,
+        make_request(Command::PolicyEvaluate(PolicyEvaluateInput {
+            action,
+            actor: None,
+            raw_command: None,
+        })),
+    )
+    .await
+    else {
+        panic!("policy evaluation should succeed")
+    };
+    let result: PolicyEvaluateResult = serde_json::from_value(data).unwrap();
+    let verdicts = result
+        .verdicts
+        .into_iter()
+        .map(|verdict| (verdict.key, verdict.satisfied))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(verdicts.get("policy:shared-mem"), Some(&true));
+    assert_eq!(verdicts.get("policy:shared-db"), Some(&false));
 }
 
 #[tokio::test]

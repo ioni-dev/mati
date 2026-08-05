@@ -481,8 +481,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 governed_tool,
                 agent_id,
                 "<policy>",
-                policy_block_exempt(args.variant, &input),
                 raw_command,
+                PolicyEvaluationOptions {
+                    introspection_exemption: policy_block_exempt(args.variant, &input),
+                    codex_agent: matches!(
+                        args.variant,
+                        HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch
+                    ),
+                },
             )
             .await
             {
@@ -560,10 +566,16 @@ async fn run_fileless_policy(
         "db_client",
         agent_id,
         "<fileless-bash>",
-        policy_block_exempt(variant, input),
         input
             .pointer("/tool_input/command")
             .and_then(|value| value.as_str()),
+        PolicyEvaluationOptions {
+            introspection_exemption: policy_block_exempt(variant, input),
+            codex_agent: matches!(
+                variant,
+                HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch
+            ),
+        },
     )
     .await
     else {
@@ -590,14 +602,20 @@ async fn run_fileless_policy(
 ///
 /// `None` is both the non-governed result and the fail-open result. Callers
 /// must preserve their existing decision when it is returned for composition.
+#[derive(Clone, Copy)]
+struct PolicyEvaluationOptions {
+    introspection_exemption: bool,
+    codex_agent: bool,
+}
+
 async fn evaluate_governed_policy(
     mati_root: Option<&Path>,
     action: &decide::Action,
     governed_tool: &str,
     agent_id: Option<&str>,
     failure_path: &str,
-    introspection_exemption: bool,
     raw_command: Option<&str>,
+    options: PolicyEvaluationOptions,
 ) -> Option<(Decision, Vec<HookEvent>)> {
     if action.tool != governed_tool && action.tool != "unknown" {
         return None;
@@ -613,7 +631,11 @@ async fn evaluate_governed_policy(
     let evaluation =
         policy_verdicts_for_action(mati_root, action, agent_id, failure_path, raw_command).await?;
     let strict = evaluation.verdicts.iter().any(|verdict| verdict.strict);
-    let core_verdicts = policy_core_verdicts(&evaluation.verdicts, introspection_exemption);
+    let core_verdicts = policy_core_verdicts(
+        &evaluation.verdicts,
+        options.introspection_exemption,
+        options.codex_agent,
+    );
     let result = decide::evaluate_policy_verdicts(&core_verdicts, strict);
     let mut events: Vec<HookEvent> = result
         .events
@@ -636,6 +658,7 @@ async fn evaluate_governed_policy(
 fn policy_core_verdicts(
     verdicts: &[mati_core::mcp::protocol::PolicyVerdict],
     introspection_exemption: bool,
+    codex_agent: bool,
 ) -> Vec<decide::PolicyVerdict> {
     verdicts
         .iter()
@@ -646,11 +669,52 @@ fn policy_core_verdicts(
             {
                 return None;
             }
+            let no_accepted_sources = verdict.via.is_empty();
+            let codex_unfulfillable = codex_agent
+                && !verdict
+                    .via
+                    .iter()
+                    .any(|source| mati_core::store::CODEX_PRODUCIBLE_SOURCES.contains(source));
+            let unfulfillable = matches!(verdict.stage, mati_core::store::PolicyStage::Enforce)
+                && matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                && (no_accepted_sources || codex_unfulfillable);
             Some(decide::PolicyVerdict {
                 key: verdict.key.clone(),
-                rule: verdict.rule.clone(),
+                rule: if unfulfillable {
+                    let accepted = if no_accepted_sources {
+                        "no sources".to_string()
+                    } else {
+                        verdict
+                            .via
+                            .iter()
+                            .map(|source| format!("{source:?}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    if no_accepted_sources {
+                        format!(
+                            concat!(
+                                "mati: policy {} cannot be satisfied because requires.via accepts {}; ",
+                                "this policy is steering only here"
+                            ),
+                            verdict.key, accepted
+                        )
+                    } else {
+                        format!(
+                            concat!(
+                                "mati: policy {} cannot be satisfied in Codex because it accepts only {}; ",
+                                "Codex can mint mem_get and hook_context receipts but cannot attest ",
+                                "to those sources, so this policy is steering only here"
+                            ),
+                            verdict.key, accepted
+                        )
+                    }
+                } else {
+                    verdict.rule.clone()
+                },
                 requires_key: verdict.requires_key.clone(),
                 block: matches!(verdict.mode, mati_core::store::PolicyMode::Block)
+                    && !unfulfillable
                     && (!introspection_exemption || verdict.satisfied),
                 satisfied: verdict.satisfied,
                 stage: verdict.stage,
@@ -1370,8 +1434,11 @@ async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                 "path",
                 agent_id,
                 "<apply-patch-policy>",
-                policy_block_exempt(variant, input),
                 None,
+                PolicyEvaluationOptions {
+                    introspection_exemption: policy_block_exempt(variant, input),
+                    codex_agent: true,
+                },
             )
             .await
             {
@@ -1674,9 +1741,9 @@ fn session_command(
             session_id: sid(),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: basis(),
-            // Hook context injection is neither variant. Left unset rather
-            // than guessed; see ConsultationReceipt::source.
-            source: None,
+            // The hook pushed the record into the agent's context. Preserve
+            // that provenance so policies can distinguish it from mem_get.
+            source: Some(mati_core::store::ReceiptSource::HookContext),
         }),
         HookEvent::Miss { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::Miss,
@@ -2283,6 +2350,7 @@ mod tests {
                 strict: true,
             }],
             true,
+            false,
         );
         let result = decide::evaluate_policy_verdicts(&verdicts, true);
         assert_eq!(result.decision, Decision::Allow);
@@ -2294,6 +2362,77 @@ mod tests {
             .events
             .iter()
             .any(|event| matches!(event, HookEvent::PolicyConsulted { .. })));
+    }
+
+    #[test]
+    fn codex_policy_without_a_producible_source_degrades_to_steering() {
+        let verdicts = policy_core_verdicts(
+            &[mati_core::mcp::protocol::PolicyVerdict {
+                key: "policy:db-schema".into(),
+                stage: mati_core::store::PolicyStage::Enforce,
+                mode: mati_core::store::PolicyMode::Block,
+                rule: "Inspect the schema first.".into(),
+                reason: "Production schemas drift.".into(),
+                severity: mati_core::store::Priority::High,
+                requires_key: "schema:orders".into(),
+                satisfied: false,
+                via: vec![mati_core::store::ReceiptSource::DbIntrospection],
+                strict: true,
+            }],
+            false,
+            true,
+        );
+        let result = decide::evaluate_policy_verdicts(&verdicts, true);
+        assert!(
+            matches!(result.decision, Decision::Advisory { ref context } if context.contains("cannot be satisfied in Codex"))
+        );
+        assert!(!result
+            .events
+            .iter()
+            .any(|event| matches!(event, HookEvent::PolicyConsultBlocked { .. })));
+    }
+
+    /// A Codex policy that names a source Codex CAN mint must keep blocking.
+    ///
+    /// `HookContext` is produced on the Codex pre-bash and apply-patch paths
+    /// (`fire_events` runs there), so degrading it would silently switch off an
+    /// enforceable policy. Written because the first version of the check asked
+    /// only whether `via` contained `MemGet`, which was true when there were
+    /// two variants and wrong the moment a third was added.
+    #[test]
+    fn codex_policy_naming_a_producible_source_still_blocks() {
+        for via in [
+            vec![mati_core::store::ReceiptSource::HookContext],
+            vec![
+                mati_core::store::ReceiptSource::DbIntrospection,
+                mati_core::store::ReceiptSource::HookContext,
+            ],
+        ] {
+            let verdicts = policy_core_verdicts(
+                &[mati_core::mcp::protocol::PolicyVerdict {
+                    key: "policy:db-schema".into(),
+                    stage: mati_core::store::PolicyStage::Enforce,
+                    mode: mati_core::store::PolicyMode::Block,
+                    rule: "Inspect the schema first.".into(),
+                    reason: "Production schemas drift.".into(),
+                    severity: mati_core::store::Priority::High,
+                    requires_key: "schema:orders".into(),
+                    satisfied: false,
+                    via: via.clone(),
+                    strict: true,
+                }],
+                false,
+                true,
+            );
+            assert!(
+                verdicts[0].block,
+                "via {via:?} is producible in Codex and must still block"
+            );
+            assert_eq!(
+                verdicts[0].rule, "Inspect the schema first.",
+                "a policy that still blocks must keep its own rule text"
+            );
+        }
     }
 
     #[test]
@@ -2368,6 +2507,24 @@ mod tests {
             mati_core::store::ReceiptSource::MemGet,
             mati_core::store::ReceiptSource::DbIntrospection,
         ]));
+    }
+
+    #[test]
+    fn hook_context_hit_records_hook_context_source() {
+        let Some(mati_core::mcp::protocol::Command::ConsultationHit(input)) = session_command(
+            &HookEvent::Hit {
+                key: "file:src/main.rs".into(),
+            },
+            None,
+            None,
+            None,
+        ) else {
+            panic!("HookEvent::Hit must mint a consultation receipt")
+        };
+        assert_eq!(
+            input.source,
+            Some(mati_core::store::ReceiptSource::HookContext)
+        );
     }
 
     async fn assert_main_thread_receipt_is_global(key: &str) {

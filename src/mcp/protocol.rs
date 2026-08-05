@@ -796,8 +796,8 @@ pub struct ConsultationHitInput {
     #[serde(default)]
     pub agent_id: Option<String>,
     /// How the consultation happened, recorded onto the receipt. `None` when
-    /// the caller's path is neither a `mem_get` nor a schema introspection —
-    /// see `store::session::ConsultationReceipt::source`. Defaulted so an older
+    /// the caller's path is unattributed — see
+    /// `store::session::ConsultationReceipt::source`. Defaulted so an older
     /// hook binary talking to a newer daemon still mints.
     #[serde(default)]
     pub source: Option<crate::store::ReceiptSource>,
