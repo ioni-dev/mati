@@ -666,7 +666,7 @@ mod gotcha_write_sites {
              emitted as PutRecord { key: r.key }",
         ),
         (
-            "src/mcp/server.rs",
+            "src/mcp/server/dispatch.rs",
             "socket_dispatch",
             Class::Bypass,
             "the `put` command writes req.args[\"key\"] with no namespace \
@@ -693,19 +693,19 @@ mod gotcha_write_sites {
             "same key_for() -> analytics:extraction:<slug>",
         ),
         (
-            "src/store/gotcha_ops.rs",
+            "src/store/gotcha_ops/mutation.rs",
             "apply_gotcha_write",
             Class::Sanctioned,
             "the centralized create/edit path",
         ),
         (
-            "src/store/gotcha_ops.rs",
+            "src/store/gotcha_ops/mutation.rs",
             "apply_gotcha_tombstone",
             Class::Sanctioned,
             "the centralized tombstone path",
         ),
         (
-            "src/store/gotcha_ops.rs",
+            "src/store/gotcha_ops/mutation.rs",
             "apply_gotcha_confirm",
             Class::Sanctioned,
             "the centralized confirm path",
@@ -995,7 +995,7 @@ mod gotcha_write_sites {
         assert!(
             sanctioned
                 .iter()
-                .all(|(file, _, _, _)| *file == "src/store/gotcha_ops.rs"),
+                .all(|(file, _, _, _)| file.starts_with("src/store/gotcha_ops/")),
             "only store::gotcha_ops may be classified Sanctioned"
         );
     }
