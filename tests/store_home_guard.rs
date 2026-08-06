@@ -11,15 +11,16 @@ struct Function {
 fn store_open_without_isolation(path: &Path, source_text: &str) -> Option<String> {
     // Production code under `src/cli` opens stores legitimately, so only the
     // test module is in scope there. Integration test files are all test code.
+    let masked = mask_comments(source_text);
     let source = if path.starts_with("src/cli") {
-        test_module_source(source_text)?
+        test_module_source(&masked)?
     } else if path.starts_with("tests") {
-        source_text.to_string()
+        masked.clone()
     } else {
         return None;
     };
 
-    let store_names = store_type_names(source_text);
+    let store_names = store_type_names(&masked);
     let functions = find_functions(&source);
     let mut visiting = vec![false; functions.len()];
     for (index, function) in functions.iter().enumerate() {
@@ -30,6 +31,32 @@ fn store_open_without_isolation(path: &Path, source_text: &str) -> Option<String
         }
     }
     None
+}
+
+/// Blank every comment, preserving byte offsets.
+///
+/// Both halves of this guard are substring searches over function bodies, so a
+/// comment reading `// call ensure_test_home() later` satisfied the isolation
+/// check and hid a real leak. Spaces keep every later byte offset valid, so the
+/// isolation-before-open ordering in `function_isolated` still holds. Newlines
+/// survive so a masked block comment does not join the lines around it.
+fn mask_comments(source: &str) -> String {
+    let tree = parse_rust(source);
+    let mut masked = source.as_bytes().to_vec();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "line_comment" | "block_comment") {
+            for byte in &mut masked[node.byte_range()] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    String::from_utf8(masked).expect("masking replaces whole bytes, so UTF-8 stays valid")
 }
 
 fn parse_rust(source: &str) -> tree_sitter::Tree {
@@ -415,5 +442,37 @@ fn mati_subprocess_without_mati_home_fails_in_a_test_process() {
     assert!(
         output_text.contains("MATI_HOME"),
         "missing MATI_HOME failure in output: {output_text}"
+    );
+}
+
+#[test]
+fn source_guard_ignores_isolation_named_only_in_a_comment() {
+    let source = r#"
+        #[tokio::test]
+        async fn opens_store() {
+            // TODO: call ensure_test_home() here someday
+            let _ = Store::open(path).await;
+        }
+    "#;
+    assert_eq!(
+        store_open_without_isolation(Path::new("tests/synthetic.rs"), source),
+        Some("opens_store".to_string()),
+        "a comment must not satisfy the isolation check"
+    );
+}
+
+#[test]
+fn source_guard_ignores_a_commented_out_store_open() {
+    let source = r#"
+        #[tokio::test]
+        async fn harmless() {
+            // let _ = Store::open(path).await;
+            println!("no store here");
+        }
+    "#;
+    assert_eq!(
+        store_open_without_isolation(Path::new("tests/synthetic.rs"), source),
+        None,
+        "a commented-out store open must not be flagged"
     );
 }
