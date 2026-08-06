@@ -666,7 +666,7 @@ mod gotcha_write_sites {
              emitted as PutRecord { key: r.key }",
         ),
         (
-            "src/mcp/server.rs",
+            "src/mcp/server/dispatch.rs",
             "socket_dispatch",
             Class::Bypass,
             "the `put` command writes req.args[\"key\"] with no namespace \
