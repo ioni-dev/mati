@@ -1527,7 +1527,7 @@ async fn session_log_codex_shell_miss_records_bypass_enforcement_event() {
     );
 
     // Sanity: the CLI label that `mati history --enforcement` would show
-    // for this event is "bypass" (per src/store/enforcement.rs:1000).
+    // for this event is "bypass" (per src/store/enforcement/metrics.rs:256-257).
     assert_eq!(
         crate::store::enforcement::event_type_label(&evt.event_type),
         "bypass"

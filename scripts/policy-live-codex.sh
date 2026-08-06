@@ -139,7 +139,7 @@ Report PASS/FAIL with actual output and status. Do not call mem_get unless told.
    is captured — that is expected, NOT a failure; do not stop on the line count.
    Report each top-level key set and tool_input key set verbatim. STOP ONLY if a
    file is genuinely absent or empty, or if tool_input has no "command" key.
-   mati reads the patch text from tool_input.command (src/cli/hook_decide.rs);
+   mati reads the patch text from tool_input.command (src/cli/hook_decide/flows.rs:333-339);
    without that key run_apply_patch fails open and every patch is ungated, and
    that finding outranks every later result. Observing tool_input keys
    ["command"] is the EXPECTED shape — it matches smoke-policy.sh's
