@@ -70,13 +70,13 @@ fn total_resolved_imports(
 #[test]
 fn init_rs_resolves_store_imports() {
     let (index, files) = mati_src_index();
-    let resolved = resolved_imports_for("src/cli/init.rs", &files, &index);
+    let resolved = resolved_imports_for("src/cli/init/run.rs", &files, &index);
 
     // init.rs has `use super::*` (resolves to src/cli/mod.rs or similar)
     // and `use super::colors` etc.
     assert!(
         !resolved.is_empty(),
-        "src/cli/init.rs must resolve at least one internal import, got none"
+        "src/cli/init/run.rs must resolve at least one internal import, got none"
     );
 }
 

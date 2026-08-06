@@ -536,7 +536,7 @@ mod gotcha_write_sites {
     /// it is and why — that is the entire point of the test.
     const INVENTORY: &[(&str, &str, Class, &str)] = &[
         (
-            "src/cli/init.rs",
+            "src/cli/init/run.rs",
             "run",
             Class::Bypass,
             "Layer 0 batch write: gotcha:cochange:*, gotcha:revert:*, \
