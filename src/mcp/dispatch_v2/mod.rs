@@ -398,7 +398,7 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                 store,
                 crate::store::enforcement::EnforcementEventType::EnforcementConfigChanged {
                     setting: input.setting.clone(),
-                    old_value: String::new(),
+                    old_value: input.old_value.clone(),
                     new_value: input.new_value.clone(),
                 },
                 crate::store::enforcement::SubjectKind::Config,

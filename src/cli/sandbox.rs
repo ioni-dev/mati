@@ -368,7 +368,7 @@ pub async fn run(args: SandboxArgs) -> Result<()> {
 /// The project root that `affected_files` are relative to and where `.claude`
 /// lives — the nearest ancestor with a `.claude` or `.git` marker, NOT the
 /// `~/.mati/<slug>` store dir. Falls back to the canonical cwd.
-fn repo_root_for(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn repo_root_for(cwd: &Path) -> Result<PathBuf> {
     let start = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut dir: &Path = &start;
     loop {
@@ -429,7 +429,7 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
 }
 
 /// Scan the store → absolute deny rules, plus out-of-repo skips and warnings.
-async fn compute_rules(
+pub(crate) async fn compute_rules(
     store: &StoreProxy,
     repo_root: &Path,
 ) -> Result<(SandboxRules, BTreeSet<String>, Vec<String>)> {

@@ -950,6 +950,7 @@ fn daemon_data_rejects_error_envelope() {
 fn only_pre_read_force_allows() {
     use HookVariant::*;
     for variant in [
+        ClaudeConfigChange,
         ClaudePreRead,
         ClaudePreEdit,
         ClaudePreBash,
@@ -961,6 +962,11 @@ fn only_pre_read_force_allows() {
     ] {
         // 1. The fail-open / no-path allow output.
         match variant {
+            ClaudeConfigChange => assert_eq!(
+                allow_output(variant),
+                Some(r#"{"decision":"allow"}"#),
+                "ConfigChange uses its separate top-level decision shape"
+            ),
             ClaudePreRead => assert!(
                 allow_output(variant).is_some(),
                 "read gate keeps its no-op allow"

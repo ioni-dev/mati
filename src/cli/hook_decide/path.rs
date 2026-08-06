@@ -49,6 +49,7 @@ fn contains_unexpanded_glob(s: &str) -> bool {
 
 pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<String> {
     match variant {
+        HookVariant::ClaudeConfigChange => None,
         HookVariant::ClaudePreRead | HookVariant::ClaudePreEdit => {
             // Structured path from Claude Code. Read/Edit/Write use `file_path`;
             // NotebookEdit uses `notebook_path`. We check both (plus a legacy

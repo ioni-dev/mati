@@ -8,6 +8,7 @@ pub mod codex_pre_bash;
 pub mod codex_session_start;
 pub mod codex_stop;
 pub mod codex_user_prompt;
+pub mod config_change;
 pub mod decide;
 pub mod policy_match;
 pub mod post_bash;

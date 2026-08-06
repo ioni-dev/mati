@@ -157,6 +157,18 @@ const SETTINGS_JSON: &str = r#"{
           }
         ]
       }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "user_settings|project_settings|local_settings|policy_settings|skills",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/config-change.sh",
+            "timeout": 4
+          }
+        ]
+      }
     ]
   },
   "mcpServers": {
@@ -173,6 +185,7 @@ const SETTINGS_JSON: &str = r#"{
 /// Each script is a Rust string constant defined in `crate::hooks::*`.
 /// Replaces the pass-through stubs from M-06-J with real hook logic (M-09).
 pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
+    ("config-change.sh", crate::hooks::config_change::SCRIPT),
     ("pre-read.sh", crate::hooks::pre_read::SCRIPT),
     ("pre-edit.sh", crate::hooks::pre_edit::SCRIPT),
     ("pre-bash.sh", crate::hooks::pre_bash::SCRIPT),
@@ -189,6 +202,12 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
     ("post-bash.sh", crate::hooks::post_bash::SCRIPT),
 ];
+
+/// Return the exact project settings template whose hook registrations are
+/// checked by the pure ConfigChange invariant logic.
+pub fn settings_template() -> Value {
+    serde_json::from_str(SETTINGS_JSON).expect("mati scaffold settings template is valid JSON")
+}
 
 /// Outcome of the hook installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +298,21 @@ fn mati_server_json() -> Value {
 /// If the file doesn't exist, writes the full settings. If it exists,
 /// parses it, replaces only the `hooks` and `mcpServers` keys, and writes
 /// back — preserving all other user settings.
+/// Merge mati's entries back into a settings file that lost them.
+///
+/// The `ConfigChange` guard calls this after detecting tamper. Claude Code
+/// writes the settings file before asking the hook, so blocking alone leaves the
+/// stripped file on disk and the next session starts with no enforcement.
+/// Repairing closes that: the merge adds only mati's own entries and leaves
+/// every other hook and setting untouched.
+///
+/// Idempotent by construction — `write_if_changed` means a repair that already
+/// satisfies the invariant writes nothing, so the repair cannot drive an endless
+/// write / `ConfigChange` / repair cycle.
+pub fn restore_mati_entries(path: &Path) -> Result<()> {
+    merge_hooks_into_settings(path)
+}
+
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
     // Bare command name (portable across machines) plus a captured MATI_HOME
@@ -463,7 +497,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 12),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 13),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -477,6 +511,7 @@ mod tests {
         assert!(parsed["hooks"]["SessionEnd"].is_array());
         assert!(parsed["hooks"]["SubagentStart"].is_array());
         assert!(parsed["hooks"]["Stop"].is_array());
+        assert!(parsed["hooks"]["ConfigChange"].is_array());
         // MCP server registered with portable bare command.
         let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
         assert_eq!(cmd, "mati", "command must be bare 'mati' for portability");

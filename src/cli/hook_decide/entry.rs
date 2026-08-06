@@ -4,6 +4,10 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookVariant {
+    /// Claude Code `ConfigChange`: verify mati's registrations in the new
+    /// settings content and use the platform's top-level decision object.
+    #[value(name = "claude-config-change")]
+    ClaudeConfigChange,
     ClaudePreRead,
     /// Claude PreToolUse(Edit|Write|NotebookEdit): gate file *edits*. Uses
     /// `consulted_recent` (a recent-consultation TTL, matching the Codex
@@ -110,6 +114,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     if args.variant == HookVariant::ClaudePostBash {
         return run_post_bash_introspection(&input).await;
+    }
+
+    if args.variant == HookVariant::ClaudeConfigChange {
+        return run_config_change(&input).await;
     }
 
     // 1b. Parse agent_id: present only in subagent hook payloads.
