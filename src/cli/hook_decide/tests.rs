@@ -465,6 +465,39 @@ fn extract_path_still_accepts_real_path_with_digits() {
     );
 }
 
+#[test]
+fn extract_path_rejects_unexpanded_shell_variable() {
+    let input = json!({"tool_input": {"command": "cat $F"}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_rejects_unexpanded_shell_variable_path() {
+    let input = json!({"tool_input": {"command": "cat $SP/t_memset.txt"}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_rejects_unexpanded_shell_glob() {
+    let input = json!({"tool_input": {"command": "cat *.rs"}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_rejects_bare_current_directory() {
+    let input = json!({"tool_input": {"command": "cat ."}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_keeps_bare_directory_looking_token() {
+    let input = json!({"tool_input": {"command": "cat src"}});
+    assert_eq!(
+        extract_path(&input, HookVariant::CodexPreBash),
+        Some("src".into())
+    );
+}
+
 // ── platform_events ─────────────────────────────────────────────────
 
 #[test]
@@ -836,95 +869,53 @@ fn e2e_gotcha_error_fails_open() {
     assert_eq!(result.decision, Decision::Allow);
 }
 
-// ── Outer deadline wrapper ──────────────────────────────────────────
-//
-// Mirrors the production wrapper in `run()`: when the inner future
-// exceeds the deadline, the wrapper must produce an allow output and
-// return an explicit termination outcome. We can't drive the real `run()`
-// from a unit test (it reads stdin and may spawn daemons), so we test the
-// deadline shape directly using the same `tokio::time::timeout` +
-// `emit_allow` path the production code takes.
-
-async fn run_with_deadline<F>(
-    deadline_ms: u64,
-    variant: HookVariant,
-    inner: F,
-) -> Result<HookRunOutcome>
-where
-    F: std::future::Future<Output = Result<()>>,
-{
-    match tokio::time::timeout(Duration::from_millis(deadline_ms), inner).await {
-        Ok(inner_result) => inner_result.map(|()| HookRunOutcome::Continue),
-        Err(_elapsed) => {
-            // Match the production wrapper exactly. We don't write to
-            // the real fail_open.log here — production code does, and
-            // testing that side effect would require touching the home
-            // dir. The load-bearing assertion is "completes within
-            // budget + emits allow + requests termination", not "wrote
-            // to disk".
-            emit_allow(variant);
-            Ok(HookRunOutcome::Terminate(0))
-        }
-    }
-}
-
 #[tokio::test]
-async fn outer_deadline_emits_allow_on_timeout() {
+async fn deadline_logs_and_terminates_on_timeout() {
     use std::time::Instant;
 
-    // Use a small real deadline + a long inner sleep. We assert the
-    // wrapper returns close to `deadline_ms`, not after `inner_sleep_ms`.
-    // This proves `timeout` actually fires before the inner future
-    // completes. The deadline is small so the test stays fast — the
-    // production constant (HOOK_DEADLINE_MS = 2500) is verified
-    // separately by the wrapper's structure, not by waiting 2.5s here.
+    crate::cli::ensure_test_home();
     let deadline_ms = 100u64;
     let inner_sleep_ms = 5_000u64;
+    let hook = "deadline-test";
+    let rel_path = "timeout.rs";
+    let reason = "deadline test stalled";
 
     let start = Instant::now();
-    let result = run_with_deadline(deadline_ms, HookVariant::ClaudePreRead, async move {
-        tokio::time::sleep(Duration::from_millis(inner_sleep_ms)).await;
-        Ok(())
-    })
-    .await;
+    let result =
+        crate::cli::hooks::run_with_deadline(hook, rel_path, deadline_ms, reason, async move {
+            tokio::time::sleep(Duration::from_millis(inner_sleep_ms)).await;
+            Ok(())
+        })
+        .await;
     let elapsed = start.elapsed();
 
-    // The wrapper must absorb the timeout into an explicit allow-and-exit
-    // outcome without exiting the unit-test process.
     assert!(
         matches!(result, Ok(HookRunOutcome::Terminate(0))),
-        "deadline wrapper must request allow exit on timeout, got: {result:?}"
+        "deadline wrapper must terminate on timeout, got: {result:?}"
     );
 
-    // The wrapper must complete close to the deadline, not after the
-    // inner sleep. Generous upper bound to tolerate CI scheduler noise,
-    // but well below `inner_sleep_ms` so timeout-vs-completion is
-    // unambiguous.
     assert!(
-            elapsed < Duration::from_millis(deadline_ms + 400),
-            "wrapper took {elapsed:?} — should fire near deadline ({deadline_ms}ms), not wait for inner sleep ({inner_sleep_ms}ms)"
-        );
+        elapsed < Duration::from_millis(deadline_ms + 400),
+        "wrapper took {elapsed:?} — should fire near deadline ({deadline_ms}ms), not wait for inner sleep ({inner_sleep_ms}ms)"
+    );
     assert!(
-            elapsed >= Duration::from_millis(deadline_ms),
-            "wrapper took {elapsed:?} — must wait at least the deadline ({deadline_ms}ms) before timing out"
-        );
+        elapsed >= Duration::from_millis(deadline_ms),
+        "wrapper took {elapsed:?} — must wait at least the deadline ({deadline_ms}ms) before timing out"
+    );
 
-    // The production wrapper calls `emit_allow(variant)` on timeout and
-    // uses exit code 0, which is allow for both hook protocols.
-    // We can't capture process stdout from a unit test, so we verify
-    // the contract by re-checking the exact JSON shape `emit_allow`
-    // produces for the Claude variants — a regression there would also
-    // break this test's expectations.
-    let allow_json =
-        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#;
-    let parsed: serde_json::Value =
-        serde_json::from_str(allow_json).expect("allow JSON shape must parse");
-    assert_eq!(
-        parsed
-            .pointer("/hookSpecificOutput/permissionDecision")
-            .and_then(|v| v.as_str()),
-        Some("allow"),
-        "deadline path must produce permissionDecision=allow"
+    // The production wrapper records the fail-open event; unlike the
+    // hook-decide process wrapper, it does not emit protocol output.
+    let log_path = mati_core::store::mati_home_opt()
+        .expect("test home must be configured")
+        .join("fail_open.log");
+    let log = std::fs::read_to_string(log_path).expect("deadline must write fail_open.log");
+    assert!(
+        log.lines().any(|line| {
+            line.contains(
+                "FAIL_OPEN hook=deadline-test file=timeout.rs reason=deadline test stalled",
+            )
+        }),
+        "deadline log entry missing from fail_open.log: {log}"
     );
 }
 
@@ -1787,4 +1778,15 @@ fn mandate_preserves_existing_deny() {
         }
         _ => panic!("expected the pre-existing Deny to survive"),
     }
+}
+
+#[test]
+fn extract_path_keeps_bracketed_route_files() {
+    // Next.js dynamic routes: `app/[slug]/page.tsx`, `pages/[id].tsx`.
+    // Ordinary indexed files, not globs.
+    let input = json!({"tool_input": {"command": "cat app/[slug]/page.tsx"}});
+    assert_eq!(
+        extract_path(&input, HookVariant::CodexPreBash).as_deref(),
+        Some("app/[slug]/page.tsx")
+    );
 }
