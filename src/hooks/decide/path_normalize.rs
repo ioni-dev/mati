@@ -16,6 +16,12 @@ pub fn normalize_path(file_path: &str, repo_root: Option<&str>) -> String {
         None => file_path,
     };
 
+    // Still absolute here means the path is outside the repo. Keep it absolute:
+    // splitting on '/' drops the leading empty component, and rejoining without
+    // it mints a key like `file:Users/ioni/x` that looks repo-relative, matches
+    // no record, and lands in the miss aggregate as a path that never existed.
+    let absolute = stripped.starts_with('/');
+
     let mut components: Vec<&str> = Vec::new();
     for part in stripped.split('/') {
         match part {
@@ -31,9 +37,10 @@ pub fn normalize_path(file_path: &str, repo_root: Option<&str>) -> String {
         }
     }
 
-    if components.is_empty() {
-        ".".to_string()
-    } else {
-        components.join("/")
+    match (components.is_empty(), absolute) {
+        (true, true) => "/".to_string(),
+        (true, false) => ".".to_string(),
+        (false, true) => format!("/{}", components.join("/")),
+        (false, false) => components.join("/"),
     }
 }
