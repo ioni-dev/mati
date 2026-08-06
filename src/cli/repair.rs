@@ -115,7 +115,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
 
         // Phase: recompute cluster index from the persisted source-of-truth
         // pairs record (`analytics:co_change_pairs`). Init writes this record
-        // alongside `cluster:index` (see `src/cli/init.rs` Phase 10b-ii).
+        // alongside `cluster:index` (see `src/cli/init/run.rs:983-1025` Phase 10b-ii).
         //
         // History (DECISIONS.md ADR-021): a previous implementation here
         // reconstructed pairs from CoChanges graph edges with a synthetic

@@ -260,7 +260,7 @@ mod tests {
         assert!(window.contains('e'));
     }
 
-    /// The real shape from `src/cli/hook_decide.rs` that the flat substring
+    /// The real shape from `src/cli/hook_decide/events_output.rs:365-370` that the flat substring
     /// match rejected: one sentence wrapped across two doc-comment lines.
     #[test]
     fn quote_wrapped_across_doc_comment_lines_matches() {
