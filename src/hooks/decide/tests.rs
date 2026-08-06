@@ -308,8 +308,35 @@ fn normalize_already_relative() {
 fn normalize_no_repo_root() {
     assert_eq!(
         normalize_path("/abs/path/file.rs", None),
-        "abs/path/file.rs"
+        "/abs/path/file.rs"
     );
+}
+
+#[test]
+fn normalize_keeps_out_of_repo_paths_absolute() {
+    // A read outside the repo used to lose its leading slash, minting
+    // `file:Users/ioni/...` — a key shaped like a repo-relative path that
+    // matches no record and pollutes the daily miss aggregate.
+    assert_eq!(
+        normalize_path(
+            "/Users/ioni/.codex/skills/mati/SKILL.md",
+            Some("/Users/ioni/Documents/mati")
+        ),
+        "/Users/ioni/.codex/skills/mati/SKILL.md"
+    );
+}
+
+#[test]
+fn normalize_collapses_dots_in_out_of_repo_paths() {
+    assert_eq!(
+        normalize_path("/var/tmp/./a/b/../c.rs", Some("/repo")),
+        "/var/tmp/a/c.rs"
+    );
+}
+
+#[test]
+fn normalize_bare_root_stays_root() {
+    assert_eq!(normalize_path("/", None), "/");
 }
 
 #[test]
