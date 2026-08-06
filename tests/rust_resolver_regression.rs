@@ -118,11 +118,11 @@ fn explain_rs_resolves_super_colors() {
 #[test]
 fn show_rs_resolves_super_colors() {
     let (index, files) = mati_src_index();
-    let resolved = resolved_imports_for("src/cli/show.rs", &files, &index);
+    let resolved = resolved_imports_for("src/cli/show/mod.rs", &files, &index);
 
     assert!(
         resolved.iter().any(|r| r.contains("colors")),
-        "src/cli/show.rs must resolve super::colors, got: {resolved:?}"
+        "src/cli/show/mod.rs must resolve super::colors, got: {resolved:?}"
     );
 }
 
