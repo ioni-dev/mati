@@ -19,11 +19,12 @@ fn store_open_without_isolation(path: &Path, source_text: &str) -> Option<String
         return None;
     };
 
+    let store_names = store_type_names(source_text);
     let functions = find_functions(&source);
     let mut visiting = vec![false; functions.len()];
     for (index, function) in functions.iter().enumerate() {
-        if first_store_open(&function.body).is_some()
-            && !function_isolated(index, &functions, &mut visiting)
+        if first_store_open(&function.body, &store_names).is_some()
+            && !function_isolated(index, &functions, &store_names, &mut visiting)
         {
             return Some(function.name.clone());
         }
@@ -47,6 +48,50 @@ fn find_functions(source: &str) -> Vec<Function> {
     let mut functions = Vec::new();
     collect_functions(tree.root_node(), source, &mut functions);
     functions
+}
+
+fn store_type_names(source: &str) -> Vec<String> {
+    let tree = parse_rust(source);
+    let mut names = vec!["Store".to_string()];
+    collect_store_type_names(tree.root_node(), source, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_store_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    if node.kind() == "use_declaration" {
+        let declaration = node.utf8_text(source.as_bytes()).unwrap();
+        if let Some((path, alias)) = declaration
+            .trim()
+            .trim_start_matches("use ")
+            .trim_end_matches(';')
+            .rsplit_once(" as ")
+        {
+            if path.ends_with("::Store") {
+                names.push(alias.to_string());
+            }
+        }
+    }
+
+    if node.kind() == "type_item"
+        && node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(source.as_bytes()).ok())
+            .is_some_and(|type_name| type_name.trim().ends_with("Store"))
+    {
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+        {
+            names.push(name.to_string());
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_store_type_names(child, source, names);
+    }
 }
 
 /// Body of `mod tests`, or `None` when the file has none. Found through the
@@ -98,21 +143,65 @@ fn collect_functions(node: Node<'_>, source: &str, functions: &mut Vec<Function>
     }
 }
 
-fn first_store_open(body: &str) -> Option<usize> {
-    ["Store::open(", "Store::open_and_rebuild("]
+fn first_store_open(body: &str, store_names: &[String]) -> Option<usize> {
+    let direct = store_names
         .iter()
-        .filter_map(|needle| body.find(needle))
-        .min()
+        .flat_map(|name| {
+            [
+                format!("{name}::open("),
+                format!("{name}::open_and_rebuild("),
+            ]
+        })
+        .filter_map(|needle| body.find(&needle))
+        .min();
+    direct.or_else(|| first_store_function_pointer(body, store_names))
 }
 
-fn function_isolated(index: usize, functions: &[Function], visiting: &mut [bool]) -> bool {
+fn first_store_function_pointer(body: &str, store_names: &[String]) -> Option<usize> {
+    fn find_binding(node: Node<'_>, body: &str, store_names: &[String]) -> Option<usize> {
+        if node.kind() == "let_declaration" {
+            let pattern = node
+                .child_by_field_name("pattern")
+                .and_then(|pattern| pattern.utf8_text(body.as_bytes()).ok())
+                .map(str::trim);
+            let value = node
+                .child_by_field_name("value")
+                .and_then(|value| value.utf8_text(body.as_bytes()).ok())
+                .map(str::trim);
+            if let (Some(pattern), Some(value)) = (pattern, value) {
+                let is_store_function = store_names.iter().any(|name| {
+                    value == format!("{name}::open") || value == format!("{name}::open_and_rebuild")
+                });
+                if is_store_function && body[node.end_byte()..].contains(&format!("{pattern}(")) {
+                    return Some(node.start_byte());
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .find_map(|child| find_binding(child, body, store_names));
+        found
+    }
+
+    let tree = parse_rust(body);
+    find_binding(tree.root_node(), body, store_names)
+}
+
+fn function_isolated(
+    index: usize,
+    functions: &[Function],
+    store_names: &[String],
+    visiting: &mut [bool],
+) -> bool {
     if visiting[index] {
         return false;
     }
     visiting[index] = true;
 
     let function = &functions[index];
-    let store_position = first_store_open(&function.body);
+    let store_position = first_store_open(&function.body, store_names);
     let isolation_position = ["common::isolate_mati_home", "ensure_test_home"]
         .iter()
         .filter_map(|needle| function.body.find(needle))
@@ -126,7 +215,7 @@ fn function_isolated(index: usize, functions: &[Function], visiting: &mut [bool]
         };
         helper_index != index
             && store_position.is_none_or(|store| call_position < store)
-            && function_isolated(helper_index, functions, visiting)
+            && function_isolated(helper_index, functions, store_names, visiting)
     });
 
     visiting[index] = false;
@@ -237,5 +326,52 @@ fn source_guard_rejects_open_and_rebuild_without_isolation() {
     assert_eq!(
         store_open_without_isolation(Path::new("tests/synthetic.rs"), source),
         Some("rebuilds_store".to_string())
+    );
+}
+
+#[test]
+fn source_guard_rejects_store_alias_without_isolation() {
+    let source = r#"
+        use mati_core::store::Store as S;
+
+        #[tokio::test]
+        async fn opens_store() {
+            let _ = S::open(path).await;
+        }
+    "#;
+    assert_eq!(
+        store_open_without_isolation(Path::new("tests/synthetic.rs"), source),
+        Some("opens_store".to_string())
+    );
+}
+
+#[test]
+fn source_guard_rejects_store_type_alias_without_isolation() {
+    let source = r#"
+        type Db = Store;
+
+        #[tokio::test]
+        async fn opens_store() {
+            let _ = Db::open(path).await;
+        }
+    "#;
+    assert_eq!(
+        store_open_without_isolation(Path::new("tests/synthetic.rs"), source),
+        Some("opens_store".to_string())
+    );
+}
+
+#[test]
+fn source_guard_rejects_store_function_pointer_without_isolation() {
+    let source = r#"
+        #[tokio::test]
+        async fn opens_store() {
+            let f = Store::open;
+            let _ = f(path).await;
+        }
+    "#;
+    assert_eq!(
+        store_open_without_isolation(Path::new("tests/synthetic.rs"), source),
+        Some("opens_store".to_string())
     );
 }
