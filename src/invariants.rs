@@ -586,14 +586,14 @@ mod gotcha_write_sites {
              gotcha:marker:* keys with concrete affected file paths",
         ),
         (
-            "src/health/staleness.rs",
+            "src/health/staleness/reparse.rs",
             "cascade_staleness_to_gotchas",
             Class::Bypass,
             "writes gotcha_record under gotcha_key to cascade file staleness \
              onto the linked gotchas",
         ),
         (
-            "src/health/staleness.rs",
+            "src/health/staleness/analyzer.rs",
             "analyze_until",
             Class::Bypass,
             "batch-rescores every namespace in STALENESS_PREFIXES, which \
