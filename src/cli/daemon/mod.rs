@@ -211,19 +211,20 @@ mod stop;
 #[cfg(test)]
 mod tests;
 
-#[allow(unused_imports)]
 use lifecycle::kill_and_wait;
-#[allow(unused_imports)]
 use lifecycle::{
     check_starting_peer_active, classify_daemon, format_sentinel, kill_mati_serve_processes,
-    project_root, read_tail, recorded_serve_pids, send_sigkill_only, send_sigterm_only,
-    serve_pids_to_kill, wait_for_files_removed, wall_secs, DaemonState, ExitOutcome,
-    RECORDED_SERVE_SCAN_MAX_BYTES,
+    project_root, send_sigkill_only, send_sigterm_only, wait_for_files_removed, wall_secs,
+    DaemonState, ExitOutcome,
 };
 pub use lifecycle::{mati_root_for, parse_sentinel, read_pid_file, STARTING_STALE_SECS};
-#[allow(unused_imports)]
+#[cfg(test)]
+use lifecycle::{
+    read_tail, recorded_serve_pids, serve_pids_to_kill, RECORDED_SERVE_SCAN_MAX_BYTES,
+};
+#[cfg(test)]
+use serve::daemon_get;
 use serve::serve_loop_graceful;
-#[allow(unused_imports)]
-pub use serve::{daemon_get, daemon_result, daemon_v2};
+pub use serve::{daemon_result, daemon_v2};
 pub use start::run_daemon_start;
 pub use stop::{run_daemon_status, run_daemon_stop};

@@ -127,13 +127,12 @@ pub use links::sync_gotcha_file_links;
 pub use mutation::{
     apply_gotcha_confirm, apply_gotcha_tombstone, apply_gotcha_write, ensure_gotcha_key_available,
 };
-#[allow(unused_imports)]
+#[cfg(test)]
 use normalization::resolve_lenient;
 pub use normalization::{
     normalize_affected_file, normalize_affected_files, normalize_affected_files_with_root,
 };
 pub(crate) use normalization::{tombstoned_copy, with_normalized_affected_files};
-#[allow(unused_imports)]
 use stamping::payload_is_confirmed;
 pub use stamping::{confirm_content_stamp, content_hash_of, set_confirm_stamp};
 

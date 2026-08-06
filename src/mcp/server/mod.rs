@@ -81,8 +81,9 @@ pub(crate) use dispatch::socket_dispatch;
 pub use promotion::{IDLE_CHECK_INTERVAL_SECS, IDLE_SHUTDOWN_SECS};
 pub use proxy::serve;
 pub(crate) use proxy::{proxy_daemon_result, proxy_daemon_result_no_spawn, proxy_daemon_v2};
-#[allow(unused_imports)]
-use socket::{build_v1_dispatch_ctx, PROTOCOL_VERSION};
+use socket::build_v1_dispatch_ctx;
+#[cfg(test)]
+use socket::PROTOCOL_VERSION;
 pub use socket::{
     socket_handle_connection, Shutdown, AUTO_DRAIN_TIMEOUT, MAX_CONCURRENT_CONNECTIONS,
     UNIX_SOCK_PATH_MAX,
