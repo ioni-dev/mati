@@ -465,6 +465,39 @@ fn extract_path_still_accepts_real_path_with_digits() {
     );
 }
 
+#[test]
+fn extract_path_rejects_unexpanded_shell_variable() {
+    let input = json!({"tool_input": {"command": "cat $F"}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_rejects_unexpanded_shell_variable_path() {
+    let input = json!({"tool_input": {"command": "cat $SP/t_memset.txt"}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_rejects_unexpanded_shell_glob() {
+    let input = json!({"tool_input": {"command": "cat *.rs"}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_rejects_bare_current_directory() {
+    let input = json!({"tool_input": {"command": "cat ."}});
+    assert_eq!(extract_path(&input, HookVariant::CodexPreBash), None);
+}
+
+#[test]
+fn extract_path_keeps_bare_directory_looking_token() {
+    let input = json!({"tool_input": {"command": "cat src"}});
+    assert_eq!(
+        extract_path(&input, HookVariant::CodexPreBash),
+        Some("src".into())
+    );
+}
+
 // ── platform_events ─────────────────────────────────────────────────
 
 #[test]

@@ -2,17 +2,55 @@ use super::*;
 
 // ── Path extraction ─────────────────────────────────────────────────────────
 
-/// Reject `extract_file_path` results that cannot be a file path: shell
-/// redirection fragments (`2>/dev/null`, `>>`, `2>&1`) or a multi-line blob
+/// Reject `extract_file_path` results that cannot be a concrete file path:
+/// shell redirection fragments (`2>/dev/null`, `>>`, `2>&1`), unexpanded
+/// variables/globs, the bare current-directory token, or a multi-line blob
 /// (the classifier grabbed an entire quoted command, not one argument).
 /// These pollute the `analytics:miss_*` aggregate that feeds `mati status`'s
-/// hit rate. Only rejects; never widens what counts as a real path.
+/// hit rate. Shell syntax cannot be a concrete `file:` record, and `.` is a
+/// directory entry, not a file record. Only rejects; never widens what counts
+/// as a real path.
 pub(super) fn looks_like_file_path(s: &str) -> bool {
-    if s.is_empty() || s.contains('\n') || s.contains('\r') {
+    if s.is_empty() || s.contains('\n') || s.contains('\r') || s == "." {
         return false;
     }
     let trimmed = s.trim_start_matches(|c: char| c.is_ascii_digit());
-    !trimmed.starts_with('>') && !trimmed.starts_with('<') && !trimmed.starts_with('|')
+    if trimmed.starts_with('>') || trimmed.starts_with('<') || trimmed.starts_with('|') {
+        return false;
+    }
+
+    !contains_shell_variable(s) && !contains_unexpanded_glob(s)
+}
+
+fn contains_shell_variable(s: &str) -> bool {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '$'
+            && chars.next().is_some_and(|next| {
+                next == '{'
+                    || next.is_ascii_alphanumeric()
+                    || matches!(next, '_' | '?' | '#' | '@' | '*' | '!')
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_unexpanded_glob(s: &str) -> bool {
+    if s.contains('*') || s.contains('?') {
+        return true;
+    }
+    let mut in_bracket = false;
+    for c in s.chars() {
+        match c {
+            '[' => in_bracket = true,
+            ']' if in_bracket => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<String> {
