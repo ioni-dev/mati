@@ -173,7 +173,47 @@ pub(crate) async fn run_config_change(input: &serde_json::Value) -> Result<()> {
         )
         .await;
         emit_config_decision(ConfigDecision::Allow);
+    } else if std::env::var_os("MATI_ALLOW_HOOK_REMOVAL").is_some_and(|value| value == "1") {
+        // Deliberate removal. Record it and get out of the way — an anti-tamper
+        // control with no sanctioned exit is a control users route around.
+        for violation in &violations {
+            record_config_change(
+                &cwd,
+                &violation.setting,
+                &violation.old_value,
+                &violation.new_value,
+                "config_change_removal_authorized",
+            )
+            .await;
+        }
+        emit_config_decision(ConfigDecision::Allow);
     } else {
+        // Repair before blocking. Claude Code writes the file before asking, so
+        // a block alone leaves the stripped file on disk and the next session
+        // starts unenforced. Project settings only: restoring sandbox entries in
+        // settings.local.json means recompiling rules, which has its own
+        // preview-and-drift semantics and must not happen from a hook.
+        if matches!(kind, ConfigFileKind::Project) {
+            match mati_core::scaffold::settings::restore_mati_entries(&expected_path) {
+                Ok(()) => {
+                    record_config_change(
+                        &cwd,
+                        &expected_path.to_string_lossy(),
+                        "<stripped>",
+                        "<restored>",
+                        "config_change_entries_restored",
+                    )
+                    .await;
+                }
+                // Fail open on the repair, not on the decision: the block below
+                // still stands and the tamper is still recorded.
+                Err(error) => log_fail_open_named(
+                    "config-change",
+                    file_path,
+                    &format!("could not restore mati entries: {error}"),
+                ),
+            }
+        }
         block_config_change(&cwd, violations).await;
     }
     Ok(())

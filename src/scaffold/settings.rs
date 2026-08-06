@@ -298,6 +298,21 @@ fn mati_server_json() -> Value {
 /// If the file doesn't exist, writes the full settings. If it exists,
 /// parses it, replaces only the `hooks` and `mcpServers` keys, and writes
 /// back — preserving all other user settings.
+/// Merge mati's entries back into a settings file that lost them.
+///
+/// The `ConfigChange` guard calls this after detecting tamper. Claude Code
+/// writes the settings file before asking the hook, so blocking alone leaves the
+/// stripped file on disk and the next session starts with no enforcement.
+/// Repairing closes that: the merge adds only mati's own entries and leaves
+/// every other hook and setting untouched.
+///
+/// Idempotent by construction — `write_if_changed` means a repair that already
+/// satisfies the invariant writes nothing, so the repair cannot drive an endless
+/// write / `ConfigChange` / repair cycle.
+pub fn restore_mati_entries(path: &Path) -> Result<()> {
+    merge_hooks_into_settings(path)
+}
+
 fn merge_hooks_into_settings(path: &Path) -> Result<()> {
     let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
     // Bare command name (portable across machines) plus a captured MATI_HOME

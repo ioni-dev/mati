@@ -54,50 +54,60 @@ pub fn project_violations(actual: &Value, expected: &Value) -> Vec<ConfigViolati
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let actual_entry = actual_entries.and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry_matches(expected_entry, entry))
-            });
+            // Every entry sharing this matcher, not just the first. Users add
+            // their own hooks beside mati's under the same matcher, and taking
+            // only the first meant mati's entry looked repointed to the user's
+            // command — a block that repair could never satisfy.
+            let matching_entries: Vec<&Value> = actual_entries
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| entry_matches(expected_entry, entry))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             for expected_hook in expected_hooks {
                 let expected_command = expected_hook
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or("<invalid-scaffold-command>");
-                let setting = format!("hooks.{event_name}.{expected_command}");
+                // `hooks.<event>[<command>]`, not a dotted join: mati's commands
+                // are dotfile paths, so joining with `.` produced
+                // `hooks.PreToolUse..claude/hooks/pre-read.sh` in a hash-chained
+                // audit record that mati-cloud reads.
+                let setting = format!("hooks.{event_name}[{expected_command}]");
                 let expected_type = expected_hook
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("command");
 
-                let actual_hook = actual_entry.and_then(|entry| {
+                let hooks_of = |entry: &&Value| {
                     entry
                         .get("hooks")
                         .and_then(Value::as_array)
-                        .and_then(|hooks| {
-                            hooks.iter().find(|hook| {
-                                hook.get("type").and_then(Value::as_str) == Some(expected_type)
-                                    && hook.get("command").and_then(Value::as_str)
-                                        == Some(expected_command)
-                            })
-                        })
+                        .cloned()
+                        .unwrap_or_default()
+                };
+
+                let actual_hook = matching_entries.iter().flat_map(hooks_of).find(|hook| {
+                    hook.get("type").and_then(Value::as_str) == Some(expected_type)
+                        && hook.get("command").and_then(Value::as_str) == Some(expected_command)
                 });
 
                 let Some(actual_hook) = actual_hook else {
-                    let found = actual_entry
-                        .and_then(|entry| entry.get("hooks"))
-                        .and_then(Value::as_array)
-                        .and_then(|hooks| {
-                            hooks.iter().find_map(|hook| {
-                                (hook.get("type").and_then(Value::as_str) == Some(expected_type))
-                                    .then(|| {
-                                        hook.get("command")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("<invalid-command>")
-                                            .to_string()
-                                    })
-                            })
+                    let found = matching_entries
+                        .iter()
+                        .flat_map(hooks_of)
+                        .find_map(|hook| {
+                            (hook.get("type").and_then(Value::as_str) == Some(expected_type)).then(
+                                || {
+                                    hook.get("command")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("<invalid-command>")
+                                        .to_string()
+                                },
+                            )
                         })
                         .unwrap_or_else(|| "<removed>".to_string());
                     violations.push(ConfigViolation::new(setting, expected_command, found));
@@ -189,6 +199,57 @@ fn value_label(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A user's own hook sitting beside mati's under the same matcher must not
+    /// read as mati's entry being repointed. Taking only the first matching
+    /// entry reported `<mati command> changed to /my/own/hook.sh`, and no repair
+    /// could ever satisfy it — the guard blocked every settings change forever.
+    #[test]
+    fn user_hook_beside_mati_under_the_same_matcher_is_not_a_violation() {
+        let expected = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".claude/hooks/pre-bash.sh", "timeout": 4}]
+                }]
+            }
+        });
+        let actual = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "/my/own/hook.sh"}]
+                }, {
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": ".claude/hooks/pre-bash.sh", "timeout": 4}]
+                }]
+            }
+        });
+        assert_eq!(
+            project_violations(&actual, &expected),
+            Vec::new(),
+            "mati's entry is present in a later group; a user hook alongside is not tamper"
+        );
+    }
+
+    /// The audit `setting` field is read downstream, so it must not carry the
+    /// double dot that joining an event name to a dotfile command produced.
+    #[test]
+    fn violation_setting_label_has_no_double_dot() {
+        let expected = json!({
+            "hooks": {"PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": ".claude/hooks/pre-bash.sh"}]
+            }]}
+        });
+        let violations = project_violations(&json!({"hooks": {}}), &expected);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            !violations[0].setting.contains(".."),
+            "setting label must not contain `..`, got {}",
+            violations[0].setting
+        );
+    }
 
     fn project_expected() -> Value {
         json!({
