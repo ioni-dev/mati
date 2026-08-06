@@ -38,19 +38,13 @@ fn contains_shell_variable(s: &str) -> bool {
     false
 }
 
+/// `*` and `?` only. A `[...]` bracket class is NOT treated as a glob: routing
+/// conventions put real files at `app/[slug]/page.tsx` and `pages/[id].tsx`, so
+/// rejecting brackets would skip the read gate on every dynamic route in a
+/// Next.js repo. `*` and `?` are legal in a POSIX filename but do not appear in
+/// practice, and no shipped framework generates them.
 fn contains_unexpanded_glob(s: &str) -> bool {
-    if s.contains('*') || s.contains('?') {
-        return true;
-    }
-    let mut in_bracket = false;
-    for c in s.chars() {
-        match c {
-            '[' => in_bracket = true,
-            ']' if in_bracket => return true,
-            _ => {}
-        }
-    }
-    false
+    s.contains('*') || s.contains('?')
 }
 
 pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> Option<String> {

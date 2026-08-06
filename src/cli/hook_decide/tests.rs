@@ -1779,3 +1779,14 @@ fn mandate_preserves_existing_deny() {
         _ => panic!("expected the pre-existing Deny to survive"),
     }
 }
+
+#[test]
+fn extract_path_keeps_bracketed_route_files() {
+    // Next.js dynamic routes: `app/[slug]/page.tsx`, `pages/[id].tsx`.
+    // Ordinary indexed files, not globs.
+    let input = json!({"tool_input": {"command": "cat app/[slug]/page.tsx"}});
+    assert_eq!(
+        extract_path(&input, HookVariant::CodexPreBash).as_deref(),
+        Some("app/[slug]/page.tsx")
+    );
+}
