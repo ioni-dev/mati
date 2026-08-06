@@ -40,11 +40,11 @@ pub(crate) async fn build_codeowners_candidates(
 /// One auto-generated gotcha derived from a co-change signal.
 pub(crate) struct CoChangeGotcha {
     /// The store key: `gotcha:cochange:{source}|{target}`
-    pub(crate) key: String,
+    pub(super) key: String,
     /// Repo-relative path of the file this gotcha attaches to.
-    pub(crate) source_path: String,
+    pub(super) source_path: String,
     /// The fully-built Record, ready for `put_batch`.
-    pub(crate) record: Record,
+    pub(super) record: Record,
 }
 
 /// Derive directional co-change gotchas from git history signals.
@@ -171,11 +171,11 @@ pub(crate) fn build_cochange_gotchas(
 /// One auto-generated gotcha stub derived from a revert signal.
 pub(crate) struct RevertGotcha {
     /// The store key: `gotcha:revert:{path}`
-    pub(crate) key: String,
+    pub(super) key: String,
     /// Repo-relative path of the file this gotcha attaches to.
-    pub(crate) source_path: String,
+    pub(super) source_path: String,
     /// The fully-built Record, ready for `put_batch`.
-    pub(crate) record: Record,
+    pub(super) record: Record,
 }
 
 /// Derive revert-instability gotcha stubs from git history signals.
@@ -271,11 +271,11 @@ pub(crate) fn build_revert_gotchas(
 /// One auto-generated gotcha stub derived from an ownership concentration signal.
 pub(crate) struct OwnershipGotcha {
     /// The store key: `gotcha:ownership:{path}`
-    pub(crate) key: String,
+    pub(super) key: String,
     /// Repo-relative path of the file this gotcha attaches to.
-    pub(crate) source_path: String,
+    pub(super) source_path: String,
     /// The fully-built Record, ready for `put_batch`.
-    pub(crate) record: Record,
+    pub(super) record: Record,
 }
 
 /// Derive ownership-concentration gotcha stubs from git history signals.

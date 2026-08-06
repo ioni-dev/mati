@@ -68,8 +68,8 @@ pub(crate) async fn run_fileless_policy(
 /// must preserve their existing decision when it is returned for composition.
 #[derive(Clone, Copy)]
 pub(crate) struct PolicyEvaluationOptions {
-    pub(crate) introspection_exemption: bool,
-    pub(crate) codex_agent: bool,
+    pub(super) introspection_exemption: bool,
+    pub(super) codex_agent: bool,
 }
 
 pub(crate) async fn evaluate_governed_policy(

@@ -9,41 +9,41 @@ pub(crate) const SECS_PER_DAY: f64 = 86_400.0;
 pub(crate) const TIME_STALE_DAYS: f64 = 90.0;
 
 /// Weight for the time-based staleness factor.
-pub(crate) const TIME_WEIGHT: f32 = 0.20;
+pub(super) const TIME_WEIGHT: f32 = 0.20;
 
 /// Weight for the git-based staleness factor.
-pub(crate) const GIT_WEIGHT: f32 = 0.35;
+pub(super) const GIT_WEIGHT: f32 = 0.35;
 
 /// Weight for the semantic staleness factor (v0.1: always 0.0).
 #[allow(dead_code)]
-pub(crate) const SEMANTIC_WEIGHT: f32 = 0.25;
+pub(super) const SEMANTIC_WEIGHT: f32 = 0.25;
 
 /// Weight for the dependency staleness factor.
-pub(crate) const DEP_WEIGHT: f32 = 0.10;
+pub(super) const DEP_WEIGHT: f32 = 0.10;
 
 /// Weight multiplier for the cascade staleness factor.
-pub(crate) const CASCADE_WEIGHT_FACTOR: f32 = 0.10;
+pub(super) const CASCADE_WEIGHT_FACTOR: f32 = 0.10;
 
 /// Maximum commits examined during a revwalk before bailing out.
-pub(crate) const GIT_REVWALK_LIMIT: usize = 2000;
+pub(super) const GIT_REVWALK_LIMIT: usize = 2000;
 
 /// When revwalk hits the cap without finding the since-SHA, assume this many
 /// commits have occurred (conservative staleness signal).
 pub(crate) const GIT_CAP_HIT_COMMITS: u32 = 3;
 
 /// Maximum number of recompute signals to preserve from reparse (M-12).
-pub(crate) const MAX_RECOMPUTE_SIGNALS: usize = 10;
+pub(super) const MAX_RECOMPUTE_SIGNALS: usize = 10;
 
 /// Time budget for `analyze_all` in milliseconds. After this, stop processing
 /// new records and write out whatever was computed.
 pub const ANALYZE_TIME_BUDGET_MS: u64 = 2000;
 
 /// Record key prefixes that the analyzer scans.
-pub(crate) const STALENESS_PREFIXES: &[&str] =
+pub(super) const STALENESS_PREFIXES: &[&str] =
     &["file:", "gotcha:", "decision:", "dep:", "dev_note:"];
 
 /// 24 hours in seconds — window for reparse signal preservation.
-pub(crate) const REPARSE_WINDOW_SECS: u64 = 86_400;
+pub(super) const REPARSE_WINDOW_SECS: u64 = 86_400;
 
 // ── StalenessReport ─────────────────────────────────────────────────────────
 
@@ -72,17 +72,17 @@ pub struct StalenessAnalyzer {
     /// takes `&self` across `await` points. Without the `Mutex` the resulting
     /// future is `!Send` and cannot run inside the daemon's spawned socket task.
     /// The guard is never held across an `await` — see [`Self::git_factor_for`].
-    pub(crate) repo: Option<Mutex<git2::Repository>>,
+    pub(super) repo: Option<Mutex<git2::Repository>>,
     /// Directory that relative `file:` record paths resolve against. Never the
     /// process CWD: the daemon inherits its CWD from whichever hook spawned it,
     /// and a wrong root would report every tracked file as deleted.
-    pub(crate) root: PathBuf,
+    pub(super) root: PathBuf,
     /// True when [`Self::root`] is a git worktree root. `FileDeleted` — the only
     /// signal that reaches Tombstone, which switches enforcement off for a file —
     /// is never asserted without it.
-    pub(crate) root_from_git: bool,
-    pub(crate) now: u64,
-    pub(crate) head_commit: Option<String>,
+    pub(super) root_from_git: bool,
+    pub(super) now: u64,
+    pub(super) head_commit: Option<String>,
 }
 
 impl StalenessAnalyzer {
@@ -118,7 +118,7 @@ impl StalenessAnalyzer {
 
     /// Test-only constructor that allows injecting a fixed `now` timestamp.
     #[cfg(test)]
-    pub(crate) fn new_with_now(repo_path: &Path, now: u64) -> Self {
+    pub(super) fn new_with_now(repo_path: &Path, now: u64) -> Self {
         Self::open_at(repo_path, now)
     }
 
@@ -146,7 +146,7 @@ impl StalenessAnalyzer {
     /// behind it recompute only on a pass that happens to finish `file:` — luck,
     /// not a bound. The cursor carries the position over, so coverage advances
     /// every harvest whatever the budget reached.
-    pub(crate) async fn analyze_until(
+    pub(super) async fn analyze_until(
         &self,
         store: &Store,
         deadline: Instant,
@@ -302,7 +302,7 @@ impl StalenessAnalyzer {
     /// factor consults it: its revwalk is the sole unbounded-by-wall-clock step
     /// here, and it stops mid-walk rather than letting one record run the pass
     /// past its budget. See [`Self::count_commits_since`].
-    pub(crate) async fn compute_staleness(
+    pub(super) async fn compute_staleness(
         &self,
         record: &mut Record,
         store: &Store,
@@ -472,7 +472,7 @@ impl StalenessAnalyzer {
     /// Synchronous on purpose: the `MutexGuard` must not survive into
     /// [`Self::compute_staleness`], which awaits after this returns.
     /// A poisoned lock yields no git signal rather than a panic.
-    pub(crate) fn git_factor_for(
+    pub(super) fn git_factor_for(
         &self,
         key: &str,
         last_record_sha: &str,
@@ -493,7 +493,7 @@ impl StalenessAnalyzer {
     /// 2. If changed, revwalk to count commits since stored SHA.
     ///
     /// When `last_record_sha` is empty, set baseline (return 0.0 + HEAD SHA).
-    pub(crate) fn git_factor(
+    pub(super) fn git_factor(
         &self,
         repo: &git2::Repository,
         path: &str,
@@ -554,7 +554,7 @@ impl StalenessAnalyzer {
     /// deep history costs seconds — longer than the whole pass budget, inside a
     /// single record. The outer loop only gates when a record *starts*, so
     /// without this the pass overshoots by however long the walk takes.
-    pub(crate) fn count_commits_since(
+    pub(super) fn count_commits_since(
         &self,
         repo: &git2::Repository,
         path: &str,

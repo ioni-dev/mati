@@ -24,23 +24,23 @@ pub(crate) fn is_auto_gotcha(key: &str) -> bool {
 /// A planned `affected_files` rewrite for one gotcha.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RenameMigration {
-    pub(crate) key: String,
+    pub(super) key: String,
     /// `affected_files` exactly as stored — what `sync_gotcha_file_links` needs
     /// in order to unlink the old `file:*` records, legacy spellings included.
-    pub(crate) old_files: Vec<String>,
+    pub(super) old_files: Vec<String>,
     /// The rewritten list, normalized through the write-side normalizer.
-    pub(crate) new_files: Vec<String>,
+    pub(super) new_files: Vec<String>,
     /// The (old, new) pairs this record actually followed.
-    pub(crate) followed: Vec<(String, String)>,
+    pub(super) followed: Vec<(String, String)>,
 }
 
 /// One applied migration, for the init summary.
 pub(crate) struct AppliedRename {
-    pub(crate) key: String,
-    pub(crate) followed: Vec<(String, String)>,
+    pub(super) key: String,
+    pub(super) followed: Vec<(String, String)>,
     /// The gotcha compiles into the sandbox deny floor (`cli::sandbox`), whose
     /// materialized copy still names the old path.
-    pub(crate) sandbox_tagged: bool,
+    pub(super) sandbox_tagged: bool,
 }
 
 /// Plan the `affected_files` rewrites implied by `renames`. Pure apart from the

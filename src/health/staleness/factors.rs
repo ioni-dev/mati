@@ -83,7 +83,7 @@ pub(crate) fn dep_factor(
     ratio.min(1.0)
 }
 
-pub(crate) fn dep_lookup_keys(import: &str) -> Vec<String> {
+pub(super) fn dep_lookup_keys(import: &str) -> Vec<String> {
     let mut keys = Vec::new();
 
     if let Some(crate_name) = import
@@ -108,14 +108,14 @@ pub(crate) fn dep_lookup_keys(import: &str) -> Vec<String> {
     keys
 }
 
-pub(crate) fn push_dep_key(keys: &mut Vec<String>, ecosystem: &str, name: &str) {
+pub(super) fn push_dep_key(keys: &mut Vec<String>, ecosystem: &str, name: &str) {
     let key = format!("dep:{ecosystem}:{name}");
     if !keys.contains(&key) {
         keys.push(key);
     }
 }
 
-pub(crate) fn npm_package_name(import: &str) -> Option<&str> {
+pub(super) fn npm_package_name(import: &str) -> Option<&str> {
     if import.is_empty()
         || import.starts_with('.')
         || import.starts_with('/')
@@ -136,7 +136,7 @@ pub(crate) fn npm_package_name(import: &str) -> Option<&str> {
     }
 }
 
-pub(crate) fn go_module_candidates(import: &str) -> Vec<String> {
+pub(super) fn go_module_candidates(import: &str) -> Vec<String> {
     if import.is_empty()
         || import.starts_with('.')
         || import.starts_with('/')
@@ -157,7 +157,7 @@ pub(crate) fn go_module_candidates(import: &str) -> Vec<String> {
     modules
 }
 
-pub(crate) fn first_path_segment(import: &str) -> Option<&str> {
+pub(super) fn first_path_segment(import: &str) -> Option<&str> {
     import
         .split('/')
         .next()

@@ -32,7 +32,7 @@ pub(crate) fn blob_sha_at_commit(
 /// Count recent commits touching a file path, with a total iteration limit
 /// for consistent merge-commit handling.
 #[allow(dead_code)]
-pub(crate) fn count_recent_commits(repo: &git2::Repository, path: &str, limit: usize) -> u32 {
+pub(super) fn count_recent_commits(repo: &git2::Repository, path: &str, limit: usize) -> u32 {
     let head_oid = match repo.head().ok().and_then(|h| h.target()) {
         Some(oid) => oid,
         None => return 0,

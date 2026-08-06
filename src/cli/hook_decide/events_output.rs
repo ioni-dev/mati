@@ -385,20 +385,20 @@ pub(crate) fn escape_json_string(s: &str) -> String {
 #[derive(Debug)]
 pub(crate) struct AdapterResult {
     /// Platform-specific stdout (JSON for Claude, empty for Codex allow).
-    pub(crate) stdout: String,
+    pub(super) stdout: String,
     /// Platform-specific stderr (only Codex deny).
-    pub(crate) stderr: String,
+    pub(super) stderr: String,
     /// Exit code (2 for Codex deny, 0 otherwise).
-    pub(crate) exit_code: i32,
+    pub(super) exit_code: i32,
     /// Events to fire (already platform-filtered).
-    pub(crate) events: Vec<HookEvent>,
+    pub(super) events: Vec<HookEvent>,
     /// Digest of the gotcha state this decision was made on, stamped onto the
     /// enforcement events as `decision_basis_hash`. `None` when the file has
     /// no gotchas — there is no rule state to prove.
-    pub(crate) basis_hash: Option<String>,
+    pub(super) basis_hash: Option<String>,
     /// The semantic decision (used by tests via Debug).
     #[allow(dead_code)]
-    pub(crate) decision: Decision,
+    pub(super) decision: Decision,
 }
 
 // ── Floor consult mandate (enterprise governance overlay) ────────────────────

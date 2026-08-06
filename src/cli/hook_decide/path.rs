@@ -7,7 +7,7 @@ use super::*;
 /// (the classifier grabbed an entire quoted command, not one argument).
 /// These pollute the `analytics:miss_*` aggregate that feeds `mati status`'s
 /// hit rate. Only rejects; never widens what counts as a real path.
-pub(crate) fn looks_like_file_path(s: &str) -> bool {
+pub(super) fn looks_like_file_path(s: &str) -> bool {
     if s.is_empty() || s.contains('\n') || s.contains('\r') {
         return false;
     }
@@ -137,7 +137,7 @@ pub(crate) fn canonical_rel_path(
 /// hook process resolves a bare relative shell argument. Same rule
 /// `canonical_rel_path` uses for `abs_access`, without the symlink
 /// resolution — an existence check doesn't need it.
-pub(crate) fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
+pub(super) fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
     let raw = Path::new(accessed_path);
     if raw.is_absolute() {
         raw.to_path_buf()

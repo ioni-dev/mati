@@ -23,22 +23,22 @@ pub(crate) const MAX_REPARSE_INCREMENT: f32 = 0.4;
 pub(crate) const MAX_REPARSE_STALENESS: f32 = 0.69;
 
 /// Staleness increment per entry point change.
-pub(crate) const ENTRY_POINT_WEIGHT: f32 = 0.15;
+pub(super) const ENTRY_POINT_WEIGHT: f32 = 0.15;
 
 /// Staleness increment per import change.
-pub(crate) const IMPORT_WEIGHT: f32 = 0.10;
+pub(super) const IMPORT_WEIGHT: f32 = 0.10;
 
 /// Staleness increment when TODOs change.
-pub(crate) const TODOS_WEIGHT: f32 = 0.05;
+pub(super) const TODOS_WEIGHT: f32 = 0.05;
 
 /// Staleness increment per unsafe block change.
-pub(crate) const UNSAFE_WEIGHT: f32 = 0.10;
+pub(super) const UNSAFE_WEIGHT: f32 = 0.10;
 
 /// Staleness increment per unwrap change.
-pub(crate) const UNWRAP_WEIGHT: f32 = 0.05;
+pub(super) const UNWRAP_WEIGHT: f32 = 0.05;
 
 /// Staleness increment cascaded to linked gotchas.
-pub(crate) const CASCADE_WEIGHT: f32 = 0.10;
+pub(super) const CASCADE_WEIGHT: f32 = 0.10;
 
 /// Diff between old and new file analysis — drives staleness signals.
 #[derive(Debug, Clone)]

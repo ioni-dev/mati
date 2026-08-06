@@ -214,7 +214,7 @@ pub struct EnforcementEventWriter {
     prev_hash: String,
     /// Agent session (Claude Code `session_id`) to attribute written events to,
     /// for per-actor audit (schema_version 2). `None` unless set before `write`.
-    pub(crate) agent_session: Option<String>,
+    pub(super) agent_session: Option<String>,
 }
 
 impl EnforcementEventWriter {
