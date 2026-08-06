@@ -157,6 +157,18 @@ const SETTINGS_JSON: &str = r#"{
           }
         ]
       }
+    ],
+    "ConfigChange": [
+      {
+        "matcher": "user_settings|project_settings|local_settings|policy_settings|skills",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/config-change.sh",
+            "timeout": 4
+          }
+        ]
+      }
     ]
   },
   "mcpServers": {
@@ -173,6 +185,7 @@ const SETTINGS_JSON: &str = r#"{
 /// Each script is a Rust string constant defined in `crate::hooks::*`.
 /// Replaces the pass-through stubs from M-06-J with real hook logic (M-09).
 pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
+    ("config-change.sh", crate::hooks::config_change::SCRIPT),
     ("pre-read.sh", crate::hooks::pre_read::SCRIPT),
     ("pre-edit.sh", crate::hooks::pre_edit::SCRIPT),
     ("pre-bash.sh", crate::hooks::pre_bash::SCRIPT),
@@ -189,6 +202,12 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
     ("post-bash.sh", crate::hooks::post_bash::SCRIPT),
 ];
+
+/// Return the exact project settings template whose hook registrations are
+/// checked by the pure ConfigChange invariant logic.
+pub fn settings_template() -> Value {
+    serde_json::from_str(SETTINGS_JSON).expect("mati scaffold settings template is valid JSON")
+}
 
 /// Outcome of the hook installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,7 +482,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 12),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 13),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -477,6 +496,7 @@ mod tests {
         assert!(parsed["hooks"]["SessionEnd"].is_array());
         assert!(parsed["hooks"]["SubagentStart"].is_array());
         assert!(parsed["hooks"]["Stop"].is_array());
+        assert!(parsed["hooks"]["ConfigChange"].is_array());
         // MCP server registered with portable bare command.
         let cmd = parsed["mcpServers"]["mati"]["command"].as_str().unwrap();
         assert_eq!(cmd, "mati", "command must be bare 'mati' for portability");

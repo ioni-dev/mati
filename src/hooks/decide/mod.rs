@@ -5,6 +5,7 @@
 //! protocol-specific output (Claude JSON, Codex exit codes).
 
 mod classification;
+mod config_change;
 mod envelope;
 mod json_helpers;
 mod path_extraction;
@@ -18,6 +19,7 @@ pub use classification::effective_command_for_fuzzing;
 pub use classification::{
     classify_command, is_known_action_tool, is_schema_introspection, KNOWN_ACTION_TOOLS,
 };
+pub use config_change::{local_violations, project_violations, ConfigViolation};
 pub use envelope::{extract_apply_patch_files, MAX_APPLY_PATCH_FILES};
 pub use json_helpers::has_file_deleted_signal;
 pub use path_extraction::{extract_file_path, extract_file_paths, normalize_action};

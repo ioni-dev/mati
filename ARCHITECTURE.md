@@ -142,9 +142,11 @@ mati/
 │       │   ├── path_extraction.rs  # file-path extraction from shell commands
 │       │   ├── envelope.rs         # apply_patch envelope parsing
 │       │   ├── path_normalize.rs   # lexical path normalization
-│       │   └── json_helpers.rs     # payload readers used by evaluate()
+│       │   ├── json_helpers.rs     # payload readers used by evaluate()
+│       │   └── config_change.rs    # ConfigChange invariant checks
 │       ├── pre_read.rs      # pre-read hook adapter
 │       ├── pre_bash.rs      # pre-bash hook adapter
+│       ├── config_change.rs # ConfigChange anti-tamper hook adapter
 │       └── compliance.rs    # compliance event recording
 ```
 
@@ -540,6 +542,52 @@ Because the envelope gives mati the exact target path, edit gating is not affect
 It fails open on every uncertainty: unparseable patch, unreachable daemon, per-file lookup error, more than `MAX_APPLY_PATCH_FILES = 50` touched files, or an older binary that does not recognize the variant. Blocking all edits by mistake would be worse than missing one gotcha. The wrapper script in `codex_pre_apply_patch.rs` enforces that bias by treating only `exit 2` with a `mati:` message as a real deny.
 
 Coverage depends on platform support. `apply_patch` gating rests on a documented Codex contract, not on an implementation quirk: Codex's `PreToolUse` "can intercept Bash, file edits performed through `apply_patch`, MCP tool calls, and other local function tools," and reports `tool_name: "apply_patch"` for patch operations (matchers also accept `Edit` and `Write` as aliases). Codex now carries near-full hook parity with Claude Code — `SessionStart`, `SessionEnd`, `SubagentStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`, `UserPromptSubmit`, `SubagentStop`, `Stop` — and supports `updatedInput` for rewriting a Bash or `apply_patch` call without blocking it. mati does not use `updatedInput`: silently rewriting a call the agent believes it issued is a correctness hazard, and the gates here are meant to deny or defer, never to substitute. What Codex does not fire hooks for is its native file-read tool, so reads are gated only through the shell path. Claude Code edits are covered primarily by the read gate, transitively: Claude Code's own read-before-edit rule forces a prior read, which the read gate gates — and a *naive* blind edit is stopped by Claude Code's "File must be read first" guard *before any PreToolUse hook runs* (confirmed by live test 2026-06-18: a blind Edit yielded Claude Code's built-in guard, not a mati deny; enforcement came from the read gate). The `claude-pre-edit` hook (the `ClaudePreEdit` adapter, PreToolUse on `Edit`/`Write`/`NotebookEdit`) is therefore a BACKSTOP, not the primary blocker: keyed on `consulted_recent` (TTL, like the Codex `apply_patch` edit gate), it denies via `permissionDecision: deny` only an edit whose consultation has gone stale, or one that satisfied read-before-edit via a shell read the best-effort pre-bash path missed (e.g. `cat "$VAR"`; `egrep`/`fgrep` are now detected). Non-deny outcomes defer to the normal permission flow (edits are permission-required, unlike reads, so emitting `allow` would suppress the user's edit prompt). The `consulted_recent` keying is load-bearing: with the read gate's persistent `consulted`, the edit gate would never fire, since the forced read always consults first.
+
+### 10.4 ConfigChange enforcement self-integrity (F1)
+
+Claude Code sends `ConfigChange` after it has written the proposed new settings
+file. The payload is deliberately small and carries no old value and no diff:
+
+```json
+{
+  "session_id": "…",
+  "transcript_path": "…",
+  "cwd": "…",
+  "prompt_id": "…",
+  "hook_event_name": "ConfigChange",
+  "source": "project_settings",
+  "file_path": "/repo/.claude/settings.json"
+}
+```
+
+`claude-config-change` reads `file_path` and performs an invariant check over
+the new JSON. For the exact project `.claude/settings.json` path it compares
+mati's command registrations against the scaffold template, including the
+guard's own `ConfigChange` entry. It requires the registered command, event
+matcher, hook type, and timeout; a timeout at least the scaffold's 4-second
+value is accepted, so a legitimate increase remains valid. For the exact local
+`.claude/settings.local.json` path it compares the current sandbox compiler's
+repo-owned `denyRead`/`denyWrite` entries and leaves unrelated user entries
+alone. A missing or repointed entry, an empty `hooks` object, or a removed
+event array yields a block. Each violation records the existing
+`EnforcementConfigChanged` event with `subject_kind: Config`; no ninth event
+type is introduced.
+
+The output is a top-level `{"decision":"block","reason":"…"}` or
+`{"decision":"allow"}` object. It is not the older
+`hookSpecificOutput.permissionDecision` wrapper. `user_settings` and `skills`
+are allowed without project-entry checks. `policy_settings` is recorded and
+allowed because Claude Code does not permit this hook to block that source.
+An unrelated path is allowed even when its source name is `project_settings` or
+`local_settings`. Malformed JSON, unreadable files, and other I/O errors fail
+open and are logged; `NotFound` is distinct and is treated as removal of a
+mati-owned settings file. The check is stateless, so successive changes have
+no ordering assumption.
+
+This guard acts only on in-session adoption. Claude Code has already written the
+new file, and a block does not roll that write back; quitting and restarting
+adopts the changed file. The result is “not adopted this session, and
+recorded,” not durable file protection.
 
 ### Sandbox floor (L3, opt-in)
 

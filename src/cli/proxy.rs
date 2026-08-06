@@ -980,6 +980,7 @@ impl StoreProxy {
                 use mati_core::mcp::protocol as p;
                 let cmd = p::Command::SandboxAudit(p::SandboxAuditInput {
                     setting: SETTING.to_string(),
+                    old_value: String::new(),
                     new_value: new_value.to_string(),
                     reason: reason.to_string(),
                 });

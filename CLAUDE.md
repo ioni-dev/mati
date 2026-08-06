@@ -94,10 +94,12 @@ derived indexes (best-effort, dirty-marker on failure). `mati repair` rebuilds
 and verifies; `--check` detects drift (CI, exits non-zero); `--fast` drains the
 dirty queue only.
 
-**Hook output protocol is strict.** Hooks write JSON to stdout with a
-`hookSpecificOutput` wrapper. `permissionDecision` must be `"allow"` or
-`"deny"` — nothing else. mati's scaffold sets a 4-second hook timeout; all logic
-must finish within it.
+**Hook output protocol is strict.** PreToolUse/PostToolUse hooks write JSON to
+stdout with the established `hookSpecificOutput` wrapper. `permissionDecision`
+must be `"allow"` or `"deny"` — nothing else. The Claude Code `ConfigChange`
+hook is the documented exception: it reads a top-level `{"decision": ...}`
+object. mati's scaffold sets a 4-second hook timeout; all logic must finish
+within it.
 
 ---
 

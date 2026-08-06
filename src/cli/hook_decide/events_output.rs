@@ -64,6 +64,7 @@ pub(crate) fn platform_events(
     events: Vec<HookEvent>,
 ) -> Vec<HookEvent> {
     match variant {
+        HookVariant::ClaudeConfigChange => Vec::new(),
         HookVariant::CodexPreBash | HookVariant::CodexPreApplyPatch => events
             .into_iter()
             .filter_map(|e| match e {
@@ -297,7 +298,9 @@ pub(crate) fn session_command(
 
 // ── Platform output ─────────────────────────────────────────────────────────
 
-/// The force-allow JSON, emitted ONLY for the Claude read gate.
+/// The no-op allow JSON for the Claude read gate and ConfigChange's separate
+/// top-level allow shape. Only the read gate uses the permissionDecision
+/// wrapper below.
 ///
 /// INVARIANT (do not widen): `permissionDecision:"allow"` bypasses Claude
 /// Code's permission system entirely. Read/Glob/Grep are no-permission tools,
@@ -310,6 +313,7 @@ pub(crate) fn session_command(
 /// ClaudePreEdit output tests.
 pub(crate) fn allow_output(variant: HookVariant) -> Option<&'static str> {
     match variant {
+        HookVariant::ClaudeConfigChange => Some(r#"{"decision":"allow"}"#),
         HookVariant::ClaudePreRead => Some(
             r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}"#,
         ),
@@ -632,6 +636,7 @@ pub(crate) fn format_decision(
     _rel_path: &str,
 ) -> (String, String, i32) {
     match variant {
+        HookVariant::ClaudeConfigChange => (String::new(), String::new(), 0),
         HookVariant::ClaudePreRead => {
             let stdout = format_claude_output(decision);
             (stdout, String::new(), 0)

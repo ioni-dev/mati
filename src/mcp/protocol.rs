@@ -842,6 +842,11 @@ pub struct ConfigSetInput {
 #[serde(deny_unknown_fields)]
 pub struct SandboxAuditInput {
     pub setting: String,
+    /// Value mati expected before the observed configuration change. Older
+    /// clients may omit this because sandbox audits historically had no
+    /// before-value; the guard supplies it for ConfigChange events.
+    #[serde(default)]
+    pub old_value: String,
     pub new_value: String,
     pub reason: String,
 }
