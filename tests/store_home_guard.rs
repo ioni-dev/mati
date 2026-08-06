@@ -375,3 +375,45 @@ fn source_guard_rejects_store_function_pointer_without_isolation() {
         Some("opens_store".to_string())
     );
 }
+
+#[tokio::test]
+async fn store_open_without_mati_home_fails_in_a_test_process() {
+    let previous_home = std::env::var_os("MATI_HOME");
+    std::env::remove_var("MATI_HOME");
+
+    let result = mati_core::store::Store::open(Path::new(env!("CARGO_MANIFEST_DIR"))).await;
+    let error = result
+        .err()
+        .expect("Store::open must reject an unset MATI_HOME in tests")
+        .to_string();
+
+    if let Some(home) = previous_home {
+        std::env::set_var("MATI_HOME", home);
+    }
+
+    assert!(error.contains("MATI_HOME"), "unexpected error: {error}");
+}
+
+#[test]
+fn mati_subprocess_without_mati_home_fails_in_a_test_process() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mati"))
+        .arg("status")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_remove("MATI_HOME")
+        .output()
+        .expect("run mati without MATI_HOME");
+    let output_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !output.status.success(),
+        "mati status unexpectedly succeeded"
+    );
+    assert!(
+        output_text.contains("MATI_HOME"),
+        "missing MATI_HOME failure in output: {output_text}"
+    );
+}

@@ -130,6 +130,16 @@ pub fn mati_home_opt() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MATI_HOME").filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(dir));
     }
+    // Library unit tests already have their dedicated `cfg(test)` redirect
+    // below. Integration tests link this library without `cfg(test)`, so the
+    // opt-in check is intentionally compiled into that path instead.
+    #[cfg(not(test))]
+    if std::env::var_os("MATI_REQUIRE_EXPLICIT_HOME")
+        .and_then(|value| value.into_string().ok())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+    {
+        return None;
+    }
     // In this crate's own unit tests, never write into the developer's real
     // `~/.mati`: redirect the whole footprint to a per-process temp dir. This
     // is compiled only into the lib's `--test` build, so production and the

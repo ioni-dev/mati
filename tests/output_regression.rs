@@ -7,7 +7,7 @@
 //! Design principles:
 //! - Assert on structural elements (section headers, guidance phrases), not exact counts/timing
 //! - All commands run in non-TTY mode (piped stdout), so ANSI codes are stripped automatically
-//! - Each test uses an isolated HOME + tempdir git repo for full store isolation
+//! - Each test uses an isolated MATI_HOME + tempdir git repo for full store isolation
 //! - Tests are fast: tiny repos, no network, no LLM calls
 //!
 //! # Running
@@ -37,12 +37,13 @@ fn mati_bin() -> PathBuf {
         .join("mati")
 }
 
-/// Run mati with the given args, isolating HOME to `home` and CWD to `repo`.
+/// Run mati with the given args, isolating MATI_HOME and HOME to `home`, and CWD to `repo`.
 fn run(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> (String, String, bool) {
     let out = Command::new(bin)
         .args(args)
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .env("NO_COLOR", "1") // belt-and-suspenders: some CLIs respect this
         .output()
         .expect("failed to run mati");
@@ -62,7 +63,7 @@ fn run(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> (String, String, 
 fn setup_repo() -> (TempDir, TempDir, common::DaemonGuard) {
     let repo_dir = TempDir::new().expect("create repo dir");
     let home_dir = TempDir::new().expect("create home dir");
-    let daemon_guard = common::DaemonGuard::for_home(repo_dir.path(), home_dir.path());
+    let daemon_guard = common::DaemonGuard::for_mati_home(repo_dir.path(), home_dir.path());
     let repo = repo_dir.path();
 
     // git init + configure identity

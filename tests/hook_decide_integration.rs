@@ -49,12 +49,13 @@ fn mati_bin() -> PathBuf {
         .join("mati")
 }
 
-/// Run mati with the given args, isolating HOME to `home` and CWD to `repo`.
+/// Run mati with the given args, isolating MATI_HOME and HOME to `home`, and CWD to `repo`.
 fn run(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> RunResult {
     let out = Command::new(bin)
         .args(args)
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .env("NO_COLOR", "1")
         .output()
         .expect("failed to run mati");
@@ -65,7 +66,7 @@ fn run(bin: &Path, repo: &Path, home: &Path, args: &[&str]) -> RunResult {
     }
 }
 
-/// Run mati with piped stdin, isolating HOME and CWD.
+/// Run mati with piped stdin, isolating MATI_HOME, HOME, and CWD.
 fn run_with_stdin(
     bin: &Path,
     repo: &Path,
@@ -77,6 +78,7 @@ fn run_with_stdin(
         .args(args)
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -327,6 +329,7 @@ fn hook_decide_deny_then_allow_after_consultation() {
         .args(["daemon", "start"])
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -532,6 +535,7 @@ fn hook_decide_denies_gotcha_through_symlink() {
         .args(["daemon", "start"])
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -657,6 +661,7 @@ fn hook_deadline_terminates_the_process() {
         .args(["hook-decide", "claude-pre-read"])
         .current_dir(repo_dir.path())
         .env("HOME", home_dir.path())
+        .env("MATI_HOME", home_dir.path())
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

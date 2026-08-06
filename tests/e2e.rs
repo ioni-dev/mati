@@ -34,7 +34,7 @@ fn e2e_full_lifecycle() {
     // Locate the mati binary — cargo test puts it in the same target dir
     let mati = cargo_bin("mati");
 
-    // Fresh HOME for store isolation: each test run starts with an empty ~/.mati/
+    // Fresh MATI_HOME/HOME for store isolation: each test run starts empty.
     let home_dir = TempDir::new().expect("create temp home");
     let home = home_dir.path();
 
@@ -528,7 +528,7 @@ fn e2e_full_lifecycle() {
     // ═══════════════════════════════════════════════════════════════════════════
     // Iteration 6 — MCP tools against the populated store
     // ═══════════════════════════════════════════════════════════════════════════
-    // Spawn `mati serve` with the same HOME/CWD as all prior steps so it opens
+    // Spawn `mati serve` with the same MATI_HOME/HOME/CWD as all prior steps so it opens
     // the same store.  Then drive mem_get / mem_query / mem_bootstrap over the
     // real JSON-RPC stdio transport and verify results against real knowledge.
     {
@@ -568,6 +568,7 @@ fn e2e_full_lifecycle() {
             .arg("serve")
             .current_dir(&repo)
             .env("HOME", home)
+            .env("MATI_HOME", home)
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -2194,6 +2195,7 @@ fn h_run(mati: &Path, repo: &Path, home: &Path, args: &[&str]) -> RunResult {
         .args(args)
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .env("NO_COLOR", "1")
         .output()
         .expect("failed to spawn mati");
@@ -2212,6 +2214,7 @@ fn h_run_stdin(mati: &Path, repo: &Path, home: &Path, args: &[&str], input: &str
         .args(args)
         .current_dir(repo)
         .env("HOME", home)
+        .env("MATI_HOME", home)
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

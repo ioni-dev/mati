@@ -35,3 +35,8 @@ nt = "nextest run"
 #   `force = false` means an explicit env override always wins.
 [env]
 RUST_TEST_THREADS = { value = "1", force = false }
+# Integration tests link the library without `cfg(test)`, so make an unset
+# MATI_HOME fail before the normal `~/.mati` fallback can be reached. Cargo
+# supplies this to test binaries and their subprocesses; direct `mati`
+# invocations do not inherit Cargo's environment.
+MATI_REQUIRE_EXPLICIT_HOME = { value = "1", force = false }
