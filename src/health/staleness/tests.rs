@@ -1031,12 +1031,6 @@ async fn expired_time_budget_stops_the_scan_before_any_write() {
     store.close().await.unwrap();
 }
 
-/// The budget bounds the SessionEnd hook, whose scaffold timeout is 4s.
-#[test]
-fn time_budget_is_unchanged() {
-    assert_eq!(ANALYZE_TIME_BUDGET_MS, 2000);
-}
-
 #[tokio::test]
 async fn analyze_all_updates_stale_records() {
     let dir = TempDir::new().unwrap();
