@@ -391,6 +391,13 @@ pub struct SessionLogInput {
     pub decision_basis_hash: Option<String>,
 }
 
+/// Exact payload received from Claude Code's InstructionsLoaded hook.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructionsLoadedInput {
+    pub payload: crate::hooks::decide::InstructionsLoadedPayload,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyShadowObserveInput {

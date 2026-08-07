@@ -80,6 +80,7 @@ pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> O
         // it uses tool_input.key directly, not a file path.
         HookVariant::ClaudePostMemGet => None,
         HookVariant::ClaudePostBash => None,
+        HookVariant::ClaudeInstructionsLoaded => None,
     }
 }
 

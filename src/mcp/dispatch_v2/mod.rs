@@ -218,6 +218,7 @@ fn is_session_side(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::SessionLog(_)
+            | Command::InstructionsLoaded(_)
             | Command::ConsultationHit(_)
             | Command::PolicyShadowObserve(_)
             | Command::SessionFlush

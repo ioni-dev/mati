@@ -19,6 +19,12 @@ pub(super) async fn dispatch_session_side(
     let target_key = req.cmd.target_key().to_string();
 
     match &req.cmd {
+        Command::InstructionsLoaded(input) => {
+            match sess::record_instructions_loaded(store, &input.payload).await {
+                Ok(_) => Response::ok(request_id, serde_json::Value::Null),
+                Err(error) => Response::err(request_id, ErrorCode::StoreError, error.to_string()),
+            }
+        }
         Command::PolicyShadowObserve(input) => {
             match sess::record_shadow_observation(
                 store,

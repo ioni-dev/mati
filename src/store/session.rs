@@ -69,6 +69,30 @@ pub fn analytics_record(key: &str, value: String) -> Record {
     r
 }
 
+/// Build the eventual record for one Claude Code `InstructionsLoaded` event.
+pub fn instructions_loaded_record(
+    key: &str,
+    payload: &crate::hooks::decide::InstructionsLoadedPayload,
+) -> Result<Record> {
+    let mut record = session_record(key, payload.file_path.clone());
+    record.payload = Some(serde_json::to_value(payload)?);
+    Ok(record)
+}
+
+/// Persist one Claude Code `InstructionsLoaded` payload.
+///
+/// The `hook_event:` key namespace routes through `Store::put` to the
+/// Eventual/session tree. Recording is best-effort at the hook adapter.
+pub async fn record_instructions_loaded(
+    store: &Store,
+    payload: &crate::hooks::decide::InstructionsLoadedPayload,
+) -> Result<String> {
+    let key = format!("hook_event:instructions_loaded:{}", uuid::Uuid::now_v7());
+    let record = instructions_loaded_record(&key, payload)?;
+    store.put(&key, &record).await?;
+    Ok(key)
+}
+
 /// Daily aggregation record value.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct DailyAgg {
@@ -1037,6 +1061,32 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = Store::open(dir.path()).await.expect("open store");
         (dir, store)
+    }
+
+    #[test]
+    fn instructions_loaded_record_preserves_the_captured_payload() {
+        let payload = crate::hooks::decide::InstructionsLoadedPayload {
+            session_id: "session-123".into(),
+            transcript_path: "/tmp/transcript.jsonl".into(),
+            cwd: "/repo".into(),
+            hook_event_name: "InstructionsLoaded".into(),
+            file_path: "/repo/.claude/rules/safety.md".into(),
+            memory_type: "Project".into(),
+            load_reason: "session_start".into(),
+        };
+        let record = instructions_loaded_record("hook_event:instructions_loaded:test", &payload)
+            .expect("record should serialize");
+
+        assert_eq!(record.key, "hook_event:instructions_loaded:test");
+        assert_eq!(record.value, payload.file_path);
+        assert_eq!(
+            record.payload_as::<crate::hooks::decide::InstructionsLoadedPayload>(),
+            Some(payload)
+        );
+        assert_eq!(
+            crate::store::Durability::for_key(&record.key),
+            crate::store::Durability::Eventual
+        );
     }
 
     // ── receipt provenance ───────────────────────────────────────────────────
