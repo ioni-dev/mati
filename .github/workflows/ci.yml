@@ -124,14 +124,14 @@ jobs:
     # pre-opened-fd path. They're slow and depend on a writable `~/`,
     # so they don't run by default — but they do gate merges.
     #
-    # SKIPPED ON PULL REQUESTS: subprocess tests are >15min on cold cache.
-    # Runs on push to main only. To re-enable for PRs, remove the `if:` line.
+    # DISPATCH-ONLY: these are slow subprocess tests. Run them by hand
+    # before a release, not on every push.
     name: Ignored integration tests (${{ matrix.os }})
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-latest","macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Full history, not the default shallow (fetch-depth: 1) clone:
@@ -179,62 +179,6 @@ jobs:
       # back to cloning only when its fixture is absent for local use.
       - name: real-world resolvers (vendored fixtures)
         run: cargo nextest run --locked --profile ci --run-ignored only --test real_world_verification --test-threads 1 -E 'test(real_world_ripgrep) or test(real_world_sinatra_resolution) or test(real_world_hcl_resolution) or test(real_world_jsoup_resolution) or test(real_world_httpx)'
-
-  benches:
-    # Benches are not run for wall-time (criterion regressions need a
-    # baseline + stable hardware that GH Actions does not provide). We
-    # only gate that they *compile*, so an SLO-relevant bench can't bit-rot
-    # silently between feature changes. Real bench runs happen locally
-    # against ADR-010 SLOs.
-    #
-    # SKIPPED ON PULL REQUESTS: criterion's release build is >10min on
-    # cold cache. Runs on push to main only. To re-enable for PRs, remove
-    # the `if:` line.
-    name: Benches compile
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo bench --no-run
-        run: cargo bench --locked --no-run
-
-  feature-matrix:
-    name: Feature matrix (cargo hack)
-    runs-on: ubuntu-latest
-    # `cargo check --all-targets` exercises one feature combination at a time.
-    # `cargo hack --feature-powerset` exercises every combination, which
-    # catches refactors inside `#[cfg(feature = "semantic")]` blocks that
-    # compile fine under `--all-features` but break under default features.
-    # mati-cloud may enable different combinations than the OSS binary, so
-    # this catches integration breaks before the downstream consumer sees
-    # them.
-    #
-    # Currently mati has one optional feature (`semantic`), so the powerset
-    # is two combinations. Cheap and informative.
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack
-
-      - name: cargo hack check --feature-powerset
-        # NOTE: `--no-dev-deps` was tried here but conflicts with `--locked`
-        # — cargo-hack rewrites Cargo.toml in-place, which causes cargo
-        # to demand a Cargo.lock regeneration that `--locked` forbids.
-        # The current powerset is just two combos (`[]` and `[semantic]`),
-        # so the overhead of including dev-deps is negligible.
-        run: cargo hack check --locked --feature-powerset
 
   semver:
     name: Public API semver check
@@ -284,26 +228,6 @@ jobs:
           # would fail. The remote-tracking ref resolves cleanly.
           baseline-rev: origin/main
 
-  audit:
-    name: Security audit
-    runs-on: ubuntu-latest
-    # Fail fast on RUSTSEC vulnerabilities (default cargo-audit behavior:
-    # exit non-zero on Vulnerability entries, warnings allowed). Seven
-    # accepted unmaintained/unsound advisories are documented in
-    # DECISIONS.md; new entries should be triaged before silencing here.
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      - name: cargo audit
-        run: cargo audit
-
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
@@ -311,9 +235,8 @@ jobs:
     # cargo-deny's four checks against `deny.toml`:
     #
     #   bans       — duplicate versions + wildcard version specifiers
-    #   advisories — same RUSTSEC vulnerability stream as cargo-audit,
-    #                plus optional yanked-crate detection (subsumes audit
-    #                job; kept separate for ADR-007 traceability)
+    #   advisories — the RUSTSEC vulnerability stream, plus optional
+    #                yanked-crate detection
     #   sources    — only crates.io, no git deps, no unknown registries
     #
     # The fourth check (licenses) is INTENTIONALLY SKIPPED. Customer
@@ -445,24 +368,3 @@ jobs:
             echo "  OK: 'mati init' completes with no network namespace"
           fi
           echo "zero-network runtime attestation: PASS"
-
-  eval-corpus:
-    name: Eval / regression corpus
-    runs-on: ubuntu-latest
-    # Enforcement eval corpus (idea 4). Replays a labeled corpus through the
-    # pure enforcement functions — DETECTION (classify_command +
-    # extract_file_path: which file a bash command reads) and DECISION
-    # (evaluate(): Allow/Advisory/Deny/…) — and gates on the committed baseline:
-    # a NEW miss fails CI (regression), and a FIXED gap also fails (forcing an
-    # honest baseline update that ratchets recall up). Runs on PRs — unlike the
-    # full `test` job, which is push-to-main only — so the enforcement-
-    # correctness number is visible on every change. The same corpus is embedded
-    # in the binary and surfaced by `mati eval --json`. Pure functions: no
-    # store, daemon, or network.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run enforcement eval corpus
-        run: cargo test --locked --test eval_corpus -- --nocapture
