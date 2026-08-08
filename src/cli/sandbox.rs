@@ -948,18 +948,35 @@ async fn run_clear() -> Result<()> {
     let store = StoreProxy::open(&cwd).await.ok();
     let domain_universe = match &store {
         Some(s) => scan_domain_universe(s).await,
-        None => {
-            // Without the corpus every domain looks like the user's, so clear
-            // would drop the paths, keep the domains, and report a full clear.
-            eprintln!("warning: store unavailable — sandbox.network.deniedDomains left in place");
-            BTreeSet::new()
-        }
+        None => BTreeSet::new(),
     };
     let cleared = clear_from_settings(existing, &repo_root, &domain_universe);
     write_settings_atomic(&path, &cleared)?;
     if let Some(store) = &store {
         audit_sandbox(store, "clear", &SandboxRules::default()).await;
     }
+
+    // Without the corpus every domain looks like the user's, so any domain left
+    // in the file may still be mati's. Report the partial clear it was.
+    let unresolved_domains = if store.is_none() {
+        settings_array(&cleared, &["sandbox", "network"], "deniedDomains").map_or(0, Vec::len)
+    } else {
+        0
+    };
+    if unresolved_domains > 0 {
+        println!(
+            "Partial clear: removed mati-managed (in-repo) sandbox deny/credentials rules from {}",
+            path.display()
+        );
+        eprintln!(
+            "store unavailable — {unresolved_domains} sandbox.network.deniedDomains entr{} left \
+             in place; deciding ownership needs the policy corpus. Re-run with the store \
+             reachable (`mati daemon stop` clears a wedged daemon) to finish.",
+            if unresolved_domains == 1 { "y" } else { "ies" }
+        );
+        std::process::exit(1);
+    }
+
     println!(
         "Cleared mati-managed (in-repo) sandbox deny/credentials/network rules from {}",
         path.display()
