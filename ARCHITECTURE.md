@@ -566,12 +566,26 @@ mati's command registrations against the scaffold template, including the
 guard's own `ConfigChange` entry. It requires the registered command, event
 matcher, hook type, and timeout; a timeout at least the scaffold's 4-second
 value is accepted, so a legitimate increase remains valid. For the exact local
-`.claude/settings.local.json` path it compares the current sandbox compiler's
-repo-owned `denyRead`/`denyWrite` entries and leaves unrelated user entries
-alone. A missing or repointed entry, an empty `hooks` object, or a removed
-event array yields a block. Each violation records the existing
+`.claude/settings.local.json` path it compares every surface the sandbox
+compiler writes — `sandbox.filesystem.denyRead`/`denyWrite`,
+`sandbox.credentials.files`, and `sandbox.network.deniedDomains` — and leaves
+unrelated user entries alone. A credential entry is checked on mode as well as
+path, since downgrading `deny` to `mask` leaves the path in place and weakens
+the protection. A missing or repointed entry, an empty `hooks` object, or a
+removed event array yields a block. Each violation records the existing
 `EnforcementConfigChanged` event with `subject_kind: Config`; no ninth event
 type is introduced.
+
+Ownership decides what the guard may require and what it may name. Filesystem
+denies and credential files carry a path, so containment under the canonical
+repo root decides. A denied domain carries none, so the `db_client` host-glob
+universe — every glob the policy corpus has authored, enforcing or not — stands
+in for it, the same boundary `mati sandbox compile` uses to merge and clear that
+array. Ownership also bounds the reported `new_value`: when mati's entry is gone
+the guard names another mati-owned entry if one is there and `<removed>`
+otherwise, never a user entry the user did not touch. The audit log is
+hash-chained and mati-cloud reports on it, so a violation must not assert a
+change that did not happen.
 
 The output is a top-level `{"decision":"block","reason":"…"}` or
 `{"decision":"allow"}` object. It is not the older
@@ -621,7 +635,9 @@ The adapter reuses the existing `FileReparse` command, so the write keeps its au
 
 The hook gates above cover the agent's *tool* surface; they cannot reach the shell's *subprocess* surface beyond best-effort command parsing (`cat "$VAR"`, a `python` script, a symlink). For a small crown-jewel tier, `mati sandbox` compiles an **OS-level floor** that closes that gap: confirmed gotchas tagged `crown-jewel` (and `sandbox-deny-read` for secrets) become `sandbox.filesystem.denyWrite`/`denyRead` entries in `.claude/settings.local.json`, enforced by Claude Code's sandbox (Seatbelt on macOS, bubblewrap on Linux/WSL2) across the shell *and every subprocess it spawns*. For a crown-jewel file the shell path is then denied at the OS level, leaving the consultation-gated Read/Edit tools as the only way the agent can touch it (L1 + L3 compose to "reachable only via the gate").
 
-Design invariants (each verified — see `MATI-SOTA-ARCHITECTURE.md` L3): explicit-tag-only, never severity-derived; **absolute canonical paths** (CC's `./` resolution is undocumented, so a relative deny could silently fail to match — a live Seatbelt + Claude Code test confirmed absolute paths enforce and resist symlink bypass); mati owns only the `denyRead`/`denyWrite` entries under the repo root, preserving the user's `~/`/out-of-repo denies via CC's documented array-union + deny-wins across scopes; out-of-repo paths are skipped so a gotcha can never deny `~`/`/etc`; preview-default and reversible (`clear`/`unprotect`); a drift guard refuses to silently remove a protection whose tag was dropped. mati never writes `sandbox.enabled` — enablement is the user's (`/sandbox`) or the Enterprise managed-settings tier's. Commands: `mati sandbox protect <file> [--read]`, `unprotect <file>`, `compile [--apply]`, `clear`.
+Design invariants (each verified — see `MATI-SOTA-ARCHITECTURE.md` L3): explicit-tag-only, never severity-derived; **absolute canonical paths** (CC's `./` resolution is undocumented, so a relative deny could silently fail to match — a live Seatbelt + Claude Code test confirmed absolute paths enforce and resist symlink bypass); mati owns only the `denyRead`/`denyWrite` entries under the repo root, preserving the user's `~/`/out-of-repo denies via CC's documented array-union + deny-wins across scopes; out-of-repo paths are skipped so a gotcha can never deny `~`/`/etc`; preview-default and reversible (`clear`/`unprotect`); a drift guard refuses to silently remove a protection whose tag was dropped. mati never writes `sandbox.enabled` — enablement is the user's (`/sandbox`) or the Enterprise managed-settings tier's. Commands: `mati sandbox protect <file> [--read] [--secret deny|mask]`, `unprotect <file>`, `compile [--apply]`, `clear`.
+
+Two later surfaces extend the same floor and the same ownership rule. A gotcha tagged `secret-deny`/`secret-mask` compiles into `sandbox.credentials.files` as `{mode, path}`, still owned by repo-root containment. An enforcing (`stage: enforce`, `mode: block`) `db_client` policy with a `host_glob` compiles into `sandbox.network.deniedDomains`, owned instead by membership in the `db_client` host-glob universe, because a domain has no path. `clear` therefore needs the policy corpus to remove a domain: with the store unreachable it warns and leaves the domains in place rather than reporting a clear it did not perform.
 
 ---
 

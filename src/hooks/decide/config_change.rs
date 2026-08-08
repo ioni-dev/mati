@@ -4,6 +4,9 @@
 //! runs. These functions therefore compare that value with mati's expected
 //! registrations; they never attempt to compute a diff or infer an old value.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
 use serde_json::Value;
 
 /// A single mati-owned configuration invariant that was absent or altered.
@@ -134,48 +137,159 @@ pub fn project_violations(actual: &Value, expected: &Value) -> Vec<ConfigViolati
     violations
 }
 
+/// The sandbox floor `mati sandbox compile` currently produces, as the guard
+/// expects to find it in `.claude/settings.local.json`.
+///
+/// Ownership differs per surface. Filesystem denies and credential files carry
+/// a path, so containment under `repo_root` decides. A denied domain carries
+/// none, so `domain_universe` — every `db_client` host glob the policy corpus
+/// has named — stands in for it.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedFloor<'a> {
+    pub repo_root: &'a Path,
+    pub deny_read: &'a BTreeSet<String>,
+    pub deny_write: &'a BTreeSet<String>,
+    pub credentials_deny: &'a BTreeSet<String>,
+    pub credentials_mask: &'a BTreeSet<String>,
+    pub denied_domains: &'a BTreeSet<String>,
+    pub domain_universe: &'a BTreeSet<String>,
+}
+
 /// Check the dynamic sandbox entries that mati materializes in
-/// `.claude/settings.local.json`. Entries outside the repository remain user
-/// owned and are not judged here.
-pub fn local_violations(
-    actual: &Value,
-    expected_deny_read: &[String],
-    expected_deny_write: &[String],
-) -> Vec<ConfigViolation> {
+/// `.claude/settings.local.json`: filesystem denies, credential files, and
+/// denied domains. Entries mati does not own remain the user's and are neither
+/// required nor reported.
+pub fn local_violations(actual: &Value, expected: &ExpectedFloor<'_>) -> Vec<ConfigViolation> {
     let mut violations = Vec::new();
-    check_local_array(actual, "denyRead", expected_deny_read, &mut violations);
-    check_local_array(actual, "denyWrite", expected_deny_write, &mut violations);
+    check_deny_array(
+        actual,
+        "denyRead",
+        expected.repo_root,
+        expected.deny_read,
+        &mut violations,
+    );
+    check_deny_array(
+        actual,
+        "denyWrite",
+        expected.repo_root,
+        expected.deny_write,
+        &mut violations,
+    );
+    check_credentials(actual, expected, &mut violations);
+    check_denied_domains(actual, expected, &mut violations);
     violations
 }
 
-fn check_local_array(
+fn check_deny_array(
     actual: &Value,
     key: &str,
-    expected: &[String],
+    repo_root: &Path,
+    expected: &BTreeSet<String>,
     violations: &mut Vec<ConfigViolation>,
 ) {
     let actual_values = actual
         .pointer(&format!("/sandbox/filesystem/{key}"))
         .and_then(Value::as_array);
     for expected_value in expected {
-        let present = actual_values
-            .map(|values| {
-                values
-                    .iter()
-                    .any(|value| value.as_str() == Some(expected_value))
+        if actual_values.is_some_and(|values| contains_str(values, expected_value)) {
+            continue;
+        }
+        // Only another mati-owned entry can be what this one was changed to.
+        // Naming a user's out-of-repo deny would write a change the user never
+        // made into a hash-chained audit log that mati-cloud reports on.
+        let found = actual_values
+            .and_then(|values| {
+                values.iter().filter_map(Value::as_str).find(|value| {
+                    Path::new(value).starts_with(repo_root) && !expected.contains(*value)
+                })
             })
-            .unwrap_or(false);
-        if !present {
-            let found = actual_values
-                .and_then(|values| values.iter().find_map(Value::as_str))
-                .unwrap_or("<removed>");
+            .unwrap_or("<removed>");
+        violations.push(ConfigViolation::new(
+            format!("sandbox.filesystem.{key}"),
+            expected_value,
+            found,
+        ));
+    }
+}
+
+fn check_credentials(
+    actual: &Value,
+    expected: &ExpectedFloor<'_>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let files = actual
+        .pointer("/sandbox/credentials/files")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for (mode, paths) in [
+        ("deny", expected.credentials_deny),
+        ("mask", expected.credentials_mask),
+    ] {
+        for path in paths {
+            let same_path =
+                |entry: &&Value| entry.get("path").and_then(Value::as_str) == Some(path.as_str());
+            let intact = files.iter().any(|entry| {
+                same_path(&entry) && entry.get("mode").and_then(Value::as_str) == Some(mode)
+            });
+            if intact {
+                continue;
+            }
+            // The mode is half the protection, so a downgrade counts: the entry
+            // is still there and the path still matches, but `deny` refuses the
+            // read outright where `mask` only substitutes a sentinel.
+            let found = files
+                .iter()
+                .find(same_path)
+                .map(|entry| {
+                    format!(
+                        "mode={}",
+                        entry
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<invalid>")
+                    )
+                })
+                .unwrap_or_else(|| "<removed>".to_string());
             violations.push(ConfigViolation::new(
-                format!("sandbox.filesystem.{key}"),
-                expected_value,
+                format!("sandbox.credentials.files[{mode}]"),
+                path,
                 found,
             ));
         }
     }
+}
+
+fn check_denied_domains(
+    actual: &Value,
+    expected: &ExpectedFloor<'_>,
+    violations: &mut Vec<ConfigViolation>,
+) {
+    let actual_domains = actual
+        .pointer("/sandbox/network/deniedDomains")
+        .and_then(Value::as_array);
+    for domain in expected.denied_domains {
+        if actual_domains.is_some_and(|values| contains_str(values, domain)) {
+            continue;
+        }
+        let found = actual_domains
+            .and_then(|values| {
+                values.iter().filter_map(Value::as_str).find(|value| {
+                    expected.domain_universe.contains(*value)
+                        && !expected.denied_domains.contains(*value)
+                })
+            })
+            .unwrap_or("<removed>");
+        violations.push(ConfigViolation::new(
+            "sandbox.network.deniedDomains",
+            domain,
+            found,
+        ));
+    }
+}
+
+fn contains_str(values: &[Value], needle: &str) -> bool {
+    values.iter().any(|value| value.as_str() == Some(needle))
 }
 
 fn entry_matches(expected: &Value, actual: &Value) -> bool {
@@ -349,32 +463,233 @@ mod tests {
         assert!(project_violations(&valid_project(), &project_expected()).is_empty());
     }
 
+    fn set(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// Builds an `ExpectedFloor` over borrowed sets. Every field defaults to
+    /// empty, so a test names only the surface it is about.
+    #[derive(Default)]
+    struct Floor {
+        deny_read: BTreeSet<String>,
+        deny_write: BTreeSet<String>,
+        credentials_deny: BTreeSet<String>,
+        credentials_mask: BTreeSet<String>,
+        denied_domains: BTreeSet<String>,
+        domain_universe: BTreeSet<String>,
+    }
+
+    impl Floor {
+        fn expected(&self) -> ExpectedFloor<'_> {
+            ExpectedFloor {
+                repo_root: Path::new("/repo"),
+                deny_read: &self.deny_read,
+                deny_write: &self.deny_write,
+                credentials_deny: &self.credentials_deny,
+                credentials_mask: &self.credentials_mask,
+                denied_domains: &self.denied_domains,
+                domain_universe: &self.domain_universe,
+            }
+        }
+    }
+
     #[test]
     fn local_entries_allow_user_entries_and_deny_missing_or_repointed_entries() {
-        let expected_read = vec!["/repo/secret.txt".to_string()];
-        let expected_write = vec!["/repo/src/lib.rs".to_string()];
+        let floor = Floor {
+            deny_read: set(&["/repo/secret.txt"]),
+            deny_write: set(&["/repo/src/lib.rs"]),
+            ..Floor::default()
+        };
         let valid = json!({"sandbox": {"filesystem": {
             "denyRead": ["/user/entry", "/repo/secret.txt"],
             "denyWrite": ["/repo/src/lib.rs", "/user/other"]
         }}});
-        assert!(local_violations(&valid, &expected_read, &expected_write).is_empty());
+        assert!(local_violations(&valid, &floor.expected()).is_empty());
 
         let removed = json!({"sandbox": {"filesystem": {
             "denyRead": [], "denyWrite": ["/repo/src/lib.rs"]
         }}});
-        assert!(!local_violations(&removed, &expected_read, &expected_write).is_empty());
+        assert!(!local_violations(&removed, &floor.expected()).is_empty());
 
         let repointed = json!({"sandbox": {"filesystem": {
             "denyRead": ["/repo/other.txt"], "denyWrite": ["/repo/src/lib.rs"]
         }}});
-        let violations = local_violations(&repointed, &expected_read, &expected_write);
+        let violations = local_violations(&repointed, &floor.expected());
         assert!(violations.iter().any(|v| v.new_value == "/repo/other.txt"));
+    }
+
+    /// A user's out-of-repo deny is not what mati's entry "changed to". Naming
+    /// it would put a change the user never made into the audit chain.
+    #[test]
+    fn removed_deny_beside_a_user_entry_reports_removed_not_the_user_entry() {
+        let floor = Floor {
+            deny_read: set(&["/repo/secret.txt"]),
+            ..Floor::default()
+        };
+        let actual = json!({"sandbox": {"filesystem": {"denyRead": ["~/.ssh", "/elsewhere/x"]}}});
+        let violations = local_violations(&actual, &floor.expected());
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].new_value, "<removed>");
     }
 
     #[test]
     fn empty_expected_local_floor_allows_empty_or_missing_sandbox() {
-        assert!(local_violations(&json!({}), &[], &[]).is_empty());
-        assert!(local_violations(&json!({"sandbox": {"filesystem": {}}}), &[], &[]).is_empty());
+        let floor = Floor::default();
+        assert!(local_violations(&json!({}), &floor.expected()).is_empty());
+        assert!(
+            local_violations(&json!({"sandbox": {"filesystem": {}}}), &floor.expected()).is_empty()
+        );
+    }
+
+    fn credentials(entries: Value) -> Value {
+        json!({"sandbox": {"credentials": {"files": entries}}})
+    }
+
+    #[test]
+    fn intact_credentials_entries_allow_and_preserve_user_entries() {
+        let floor = Floor {
+            credentials_deny: set(&["/repo/vault/prod.pem"]),
+            credentials_mask: set(&["/repo/.env"]),
+            ..Floor::default()
+        };
+        let actual = credentials(json!([
+            {"mode": "mask", "path": "~/.aws/credentials"},
+            {"mode": "deny", "path": "/repo/vault/prod.pem"},
+            {"mode": "mask", "path": "/repo/.env"}
+        ]));
+        assert!(local_violations(&actual, &floor.expected()).is_empty());
+    }
+
+    #[test]
+    fn removed_credentials_entry_denies() {
+        let floor = Floor {
+            credentials_deny: set(&["/repo/vault/prod.pem"]),
+            ..Floor::default()
+        };
+        let actual = credentials(json!([{"mode": "mask", "path": "~/.aws/credentials"}]));
+        let violations = local_violations(&actual, &floor.expected());
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].setting, "sandbox.credentials.files[deny]");
+        assert_eq!(violations[0].old_value, "/repo/vault/prod.pem");
+        assert_eq!(violations[0].new_value, "<removed>");
+
+        // Whole array gone, whole block gone, whole file empty — all removal.
+        assert!(
+            !local_violations(&json!({"sandbox": {"credentials": {}}}), &floor.expected())
+                .is_empty()
+        );
+        assert!(!local_violations(&json!({}), &floor.expected()).is_empty());
+    }
+
+    /// Downgrading `deny` to `mask` leaves an entry at the same path, so a
+    /// path-only check reads it as intact. It is not: `deny` refuses the read.
+    #[test]
+    fn downgraded_credentials_mode_denies_and_reports_the_new_mode() {
+        let floor = Floor {
+            credentials_deny: set(&["/repo/vault/prod.pem"]),
+            ..Floor::default()
+        };
+        let actual = credentials(json!([{"mode": "mask", "path": "/repo/vault/prod.pem"}]));
+        let violations = local_violations(&actual, &floor.expected());
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].new_value, "mode=mask");
+    }
+
+    #[test]
+    fn repointed_credentials_path_denies() {
+        let floor = Floor {
+            credentials_mask: set(&["/repo/.env"]),
+            ..Floor::default()
+        };
+        let actual = credentials(json!([{"mode": "mask", "path": "/repo/.env.decoy"}]));
+        let violations = local_violations(&actual, &floor.expected());
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].setting, "sandbox.credentials.files[mask]");
+        assert_eq!(violations[0].new_value, "<removed>");
+    }
+
+    fn domains(entries: Value) -> Value {
+        json!({"sandbox": {"network": {"deniedDomains": entries}}})
+    }
+
+    #[test]
+    fn intact_denied_domain_allows_beside_a_user_domain() {
+        let floor = Floor {
+            denied_domains: set(&["*.prod.internal"]),
+            domain_universe: set(&["*.prod.internal", "*.staging.internal"]),
+            ..Floor::default()
+        };
+        let actual = domains(json!(["user-added.example.com", "*.prod.internal"]));
+        assert!(local_violations(&actual, &floor.expected()).is_empty());
+    }
+
+    #[test]
+    fn removed_denied_domain_denies() {
+        let floor = Floor {
+            denied_domains: set(&["*.prod.internal"]),
+            domain_universe: set(&["*.prod.internal"]),
+            ..Floor::default()
+        };
+        let violations = local_violations(&domains(json!([])), &floor.expected());
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].setting, "sandbox.network.deniedDomains");
+        assert_eq!(violations[0].old_value, "*.prod.internal");
+        assert_eq!(violations[0].new_value, "<removed>");
+        assert!(!local_violations(&json!({}), &floor.expected()).is_empty());
+    }
+
+    /// A domain has no path, so ownership comes from the policy corpus. A user
+    /// domain left in the array is not the value mati's entry was changed to.
+    #[test]
+    fn removed_domain_beside_a_user_domain_reports_removed() {
+        let floor = Floor {
+            denied_domains: set(&["*.prod.internal"]),
+            domain_universe: set(&["*.prod.internal", "*.staging.internal"]),
+            ..Floor::default()
+        };
+        let actual = domains(json!(["user-added.example.com"]));
+        let violations = local_violations(&actual, &floor.expected());
+        assert_eq!(violations[0].new_value, "<removed>");
+
+        // A glob the policy corpus authored IS a repoint, and is named as one.
+        let actual = domains(json!(["user-added.example.com", "*.staging.internal"]));
+        let violations = local_violations(&actual, &floor.expected());
+        assert_eq!(violations[0].new_value, "*.staging.internal");
+    }
+
+    /// Every surface at once: stripping the whole sandbox block must produce a
+    /// violation for each entry mati compiled, not just the filesystem ones.
+    #[test]
+    fn stripping_the_whole_sandbox_block_denies_on_every_surface() {
+        let floor = Floor {
+            deny_read: set(&["/repo/secret.txt"]),
+            deny_write: set(&["/repo/src/lib.rs"]),
+            credentials_deny: set(&["/repo/vault/prod.pem"]),
+            credentials_mask: set(&["/repo/.env"]),
+            denied_domains: set(&["*.prod.internal"]),
+            domain_universe: set(&["*.prod.internal"]),
+        };
+        let violations = local_violations(&json!({"other": true}), &floor.expected());
+        assert_eq!(violations.len(), 5);
+        let settings: Vec<&str> = violations.iter().map(|v| v.setting.as_str()).collect();
+        assert!(settings.contains(&"sandbox.filesystem.denyRead"));
+        assert!(settings.contains(&"sandbox.filesystem.denyWrite"));
+        assert!(settings.contains(&"sandbox.credentials.files[deny]"));
+        assert!(settings.contains(&"sandbox.credentials.files[mask]"));
+        assert!(settings.contains(&"sandbox.network.deniedDomains"));
+        assert!(violations.iter().all(|v| v.new_value == "<removed>"));
+    }
+
+    /// mati owning nothing on a surface means the user's entries there are
+    /// theirs. Extra entries are not tamper and must not block.
+    #[test]
+    fn user_only_credentials_and_domains_are_never_judged() {
+        let floor = Floor::default();
+        let actual = json!({"sandbox": {
+            "credentials": {"files": [{"mode": "deny", "path": "~/.aws/credentials"}]},
+            "network": {"deniedDomains": ["user-added.example.com"]}
+        }});
+        assert!(local_violations(&actual, &floor.expected()).is_empty());
     }
 
     #[test]

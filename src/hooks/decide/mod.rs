@@ -21,7 +21,7 @@ pub use classification::effective_command_for_fuzzing;
 pub use classification::{
     classify_command, is_known_action_tool, is_schema_introspection, KNOWN_ACTION_TOOLS,
 };
-pub use config_change::{local_violations, project_violations, ConfigViolation};
+pub use config_change::{local_violations, project_violations, ConfigViolation, ExpectedFloor};
 pub use envelope::{extract_apply_patch_files, MAX_APPLY_PATCH_FILES};
 pub use file_changed::{parse_file_changed, FileChangedPayload};
 pub use instructions_loaded::{parse_instructions_loaded, InstructionsLoadedPayload};

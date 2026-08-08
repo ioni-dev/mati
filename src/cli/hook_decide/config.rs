@@ -142,7 +142,7 @@ pub(crate) async fn run_config_change(input: &serde_json::Value) -> Result<()> {
                     return Ok(());
                 }
             };
-            let (expected, _skipped, _domain_universe, _warnings) =
+            let (expected, _skipped, domain_universe, _warnings) =
                 match super::sandbox::compute_rules(&store, &repo_root).await {
                     Ok(result) => result,
                     Err(error) => {
@@ -157,8 +157,15 @@ pub(crate) async fn run_config_change(input: &serde_json::Value) -> Result<()> {
                 };
             decide::local_violations(
                 &settings,
-                &expected.deny_read.iter().cloned().collect::<Vec<_>>(),
-                &expected.deny_write.iter().cloned().collect::<Vec<_>>(),
+                &decide::ExpectedFloor {
+                    repo_root: &repo_root,
+                    deny_read: &expected.deny_read,
+                    deny_write: &expected.deny_write,
+                    credentials_deny: &expected.credentials_deny,
+                    credentials_mask: &expected.credentials_mask,
+                    denied_domains: &expected.denied_domains,
+                    domain_universe: &domain_universe,
+                },
             )
         }
     };
