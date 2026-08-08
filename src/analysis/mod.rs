@@ -7,6 +7,7 @@ use std::collections::HashSet;
 
 use crate::store::record::FileRecord;
 
+pub mod auto_memory;
 pub mod blast_radius;
 pub mod claude_md;
 pub mod clusters;
@@ -21,6 +22,7 @@ pub mod reparse;
 pub mod resolvers;
 pub mod walker;
 
+pub use auto_memory::{auto_memory_dir, import_auto_memory, AutoMemoryImport};
 pub use claude_md::{import_claude_md, ClaudeMdImport};
 pub use deps::{
     dep_display_name_from_key, dep_record_key, parse_dep_key, parse_dependencies, DepEcosystem,

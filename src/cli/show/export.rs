@@ -72,10 +72,19 @@ async fn export_md(store: &StoreProxy) -> Result<String> {
 // ── run_import (M-08-N) ─────────────────────────────────────────────────────
 
 pub async fn run_import(args: ImportArgs) -> Result<()> {
+    if args.auto_memory {
+        return run_import_auto_memory().await;
+    }
+
     let cwd = std::env::current_dir()?;
     let proxy = super::proxy::StoreProxy::open(&cwd).await?;
 
-    let path = &args.file;
+    // clap enforces file XOR --auto-memory (`required_unless_present` /
+    // `conflicts_with`), so this arm always has a file.
+    let path = args
+        .file
+        .as_ref()
+        .expect("clap requires --file unless --auto-memory is set");
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
@@ -107,6 +116,84 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
         }
     }
     proxy.close().await?;
+    Ok(())
+}
+
+// ── run_import_auto_memory (F10) ─────────────────────────────────────────────
+
+/// Import Claude Code's auto-memory directory (`~/.claude/projects/<slug>/memory/`)
+/// as `confirmed: false` gotcha candidates.
+///
+/// Never overwrites an existing `gotcha:auto-memory-*` key: a record already
+/// in the store means either a prior import already wrote it, or a developer
+/// has since confirmed, edited, or deleted it through `mati review` — a
+/// re-run must not silently undo that. This makes the command idempotent:
+/// running it twice with no store changes in between imports 0 the second
+/// time.
+pub async fn run_import_auto_memory() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let dir = mati_core::analysis::auto_memory_dir(&cwd)?;
+
+    let device_id = mati_core::store::stable_device_id();
+    let import = mati_core::analysis::import_auto_memory(&dir, device_id, 1)?;
+
+    if import.records.is_empty() && import.skipped_files.is_empty() {
+        println!("No auto-memory directory found at {}.", dir.display());
+        println!("(Claude Code creates one automatically once it writes its first memory.)");
+        return Ok(());
+    }
+
+    let proxy = super::proxy::StoreProxy::open(&cwd).await?;
+
+    let result: Result<(u64, u64, usize)> = async {
+        let existing: std::collections::HashSet<String> = proxy
+            .scan_prefix("gotcha:")
+            .await?
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+
+        let mut seen_this_run = std::collections::HashSet::new();
+        let mut new_records = Vec::with_capacity(import.records.len());
+        let mut already_present: usize = 0;
+        for record in import.records {
+            if existing.contains(&record.key) || !seen_this_run.insert(record.key.clone()) {
+                already_present += 1;
+                continue;
+            }
+            new_records.push(record);
+        }
+
+        let (imported, rejected) = import_records_resilient(&proxy, &new_records).await;
+        Ok((imported as u64, rejected as u64, already_present))
+    }
+    .await;
+
+    let (imported, rejected, already_present) = proxy.close_with_result(result).await?;
+
+    println!(
+        "Imported {imported} auto-memory candidate{} from {}.",
+        if imported == 1 { "" } else { "s" },
+        dir.display()
+    );
+    if already_present > 0 {
+        println!("  {already_present} already imported previously (skipped, unchanged).");
+    }
+    if rejected > 0 {
+        println!("  {rejected} rejected by the store.");
+    }
+    if !import.skipped_files.is_empty() {
+        println!(
+            "  {} memory file(s) skipped (unreadable or empty):",
+            import.skipped_files.len()
+        );
+        for (path, reason) in &import.skipped_files {
+            println!("    {}: {reason}", path.display());
+        }
+    }
+    if imported > 0 {
+        println!("Run `mati review` to confirm candidates and activate hook enforcement.");
+    }
     Ok(())
 }
 
