@@ -76,7 +76,13 @@ pub struct ExportArgs {
 #[derive(Args)]
 pub struct ImportArgs {
     /// Path to CLAUDE.md or JSON file
-    pub file: PathBuf,
+    #[arg(required_unless_present = "auto_memory")]
+    pub file: Option<PathBuf>,
+
+    /// Import Claude Code's auto-memory directory for this project
+    /// (~/.claude/projects/<slug>/memory/) as unconfirmed gotcha candidates
+    #[arg(long, conflicts_with = "file")]
+    pub auto_memory: bool,
 }
 
 // ── run_show ──────────────────────────────────────────────────────────────────
