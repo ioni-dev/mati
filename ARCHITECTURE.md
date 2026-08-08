@@ -639,6 +639,8 @@ Design invariants (each verified — see `MATI-SOTA-ARCHITECTURE.md` L3): explic
 
 Two later surfaces extend the same floor and the same ownership rule. A gotcha tagged `secret-deny`/`secret-mask` compiles into `sandbox.credentials.files` as `{mode, path}`, still owned by repo-root containment. An enforcing (`stage: enforce`, `mode: block`) `db_client` policy with a `host_glob` compiles into `sandbox.network.deniedDomains`, owned instead by membership in the `db_client` host-glob universe, because a domain has no path. `clear` therefore needs the policy corpus to remove a domain: with the store unreachable it leaves the domains in place, and when any remain it reports a partial clear naming how many and exits 1, rather than reporting a clear it did not perform. No domain left behind means nothing was missed, so that case still reports a full clear and exits 0.
 
+Every `mati sandbox` mutation — `protect`, `unprotect`, `compile --apply`, `clear` — records an `EnforcementConfigChanged` event under `sandbox.floor` with reason `sandbox_<action>`. This works in both store modes: direct mode writes the event, and socket mode sends `Command::SandboxAudit` so a daemon holding the store records it. `clear` is the one exception, and only when the store is unreachable: no store, no event.
+
 ---
 
 ## 10a. Local Policy Engine

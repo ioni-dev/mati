@@ -918,9 +918,9 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
 
 /// Best-effort audit: record the sandbox-floor change as an
 /// `EnforcementConfigChanged` event in the hash-chained log (L4 attribution).
-/// Records in direct mode — the usual case for this admin command. When a daemon
-/// holds the store (an active agent session), it is skipped; socket-mode
-/// recording is a documented follow-up.
+/// `StoreProxy::record_sandbox_audit` covers both modes — direct mode writes the
+/// event, socket mode sends `Command::SandboxAudit` so a daemon holding the
+/// store still records it.
 async fn audit_sandbox(store: &StoreProxy, action: &str, abs: &SandboxRules) {
     let new_value = format!(
         "{} denyWrite + {} denyRead + {} credentials + {} deniedDomains",
