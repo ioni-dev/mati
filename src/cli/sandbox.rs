@@ -30,7 +30,9 @@ use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use mati_core::store::{GotchaRecord, Record, RecordLifecycle};
+use mati_core::store::{
+    GotchaRecord, PolicyMode, PolicyRecord, PolicyStage, Record, RecordLifecycle,
+};
 
 use super::proxy::StoreProxy;
 
@@ -38,12 +40,19 @@ use super::proxy::StoreProxy;
 /// - `crown-jewel`: shell / subprocess cannot WRITE the file (protect critical
 ///   logic from out-of-gate modification). Reads still work.
 /// - `sandbox-deny-read`: additionally, the shell cannot READ the file (secrets).
+/// - `secret-deny`: the file compiles into `sandbox.credentials.files` with
+///   `mode: "deny"` — the shell/subprocess cannot read it at all.
+/// - `secret-mask`: same target, `mode: "mask"` — Claude Code substitutes a
+///   sentinel value for the real content (requires `sandbox.network.tlsTerminate`
+///   for the proxy to actually inject; without it the file just fails to read).
 ///
 /// Visible to `cli::init`, whose rename migration warns when it re-keys a
 /// gotcha that compiles into the floor: the already-materialized
 /// settings.local.json still names the pre-rename path.
 pub(super) const TAG_DENY_WRITE: &str = "crown-jewel";
 pub(super) const TAG_DENY_READ: &str = "sandbox-deny-read";
+pub(super) const TAG_SECRET_DENY: &str = "secret-deny";
+pub(super) const TAG_SECRET_MASK: &str = "secret-mask";
 
 #[derive(Args, Debug)]
 pub struct SandboxArgs {
@@ -80,22 +89,34 @@ pub struct ProtectArgs {
     /// Also deny shell *reads* (for secrets), not just writes.
     #[arg(long)]
     pub read: bool,
+    /// Compile into `sandbox.credentials.files` instead: "deny" refuses reads
+    /// outright, "mask" lets Claude Code substitute a sentinel value.
+    #[arg(long, value_parser = ["deny", "mask"])]
+    pub secret: Option<String>,
     /// Confirm when the gotcha also covers other files (the tag is per-gotcha).
     #[arg(long)]
     pub yes: bool,
 }
 
 /// Sandbox filesystem deny rules. Paths are repo-relative after `compile_relative`
-/// and absolute-canonical after `resolve_rules`.
+/// and absolute-canonical after `resolve_rules`. `denied_domains` are never
+/// path-resolved — they are host globs, not filesystem paths.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SandboxRules {
     pub deny_read: BTreeSet<String>,
     pub deny_write: BTreeSet<String>,
+    pub credentials_deny: BTreeSet<String>,
+    pub credentials_mask: BTreeSet<String>,
+    pub denied_domains: BTreeSet<String>,
 }
 
 impl SandboxRules {
     pub fn is_empty(&self) -> bool {
-        self.deny_read.is_empty() && self.deny_write.is_empty()
+        self.deny_read.is_empty()
+            && self.deny_write.is_empty()
+            && self.credentials_deny.is_empty()
+            && self.credentials_mask.is_empty()
+            && self.denied_domains.is_empty()
     }
 }
 
@@ -118,7 +139,9 @@ pub fn compile_relative<'a>(gotchas: impl Iterator<Item = GotchaSel<'a>>) -> San
         }
         let deny_write = g.tags.iter().any(|t| t == TAG_DENY_WRITE);
         let deny_read = g.tags.iter().any(|t| t == TAG_DENY_READ);
-        if !deny_write && !deny_read {
+        let secret_deny = g.tags.iter().any(|t| t == TAG_SECRET_DENY);
+        let secret_mask = g.tags.iter().any(|t| t == TAG_SECRET_MASK);
+        if !deny_write && !deny_read && !secret_deny && !secret_mask {
             continue;
         }
         for f in g.files {
@@ -130,11 +153,88 @@ pub fn compile_relative<'a>(gotchas: impl Iterator<Item = GotchaSel<'a>>) -> San
                 rules.deny_write.insert(rel.clone());
             }
             if deny_read {
-                rules.deny_read.insert(rel);
+                rules.deny_read.insert(rel.clone());
+            }
+            if secret_deny {
+                rules.credentials_deny.insert(rel.clone());
+            }
+            if secret_mask {
+                rules.credentials_mask.insert(rel);
             }
         }
     }
     rules
+}
+
+/// Owned scan-result tuple: (active, stage, mode, tool, host_glob).
+type PolicyItem = (
+    bool,
+    PolicyStage,
+    PolicyMode,
+    Option<String>,
+    Option<String>,
+);
+
+/// One policy's network-relevant fields, mirroring `GotchaSel`.
+pub struct PolicyDomainSel<'a> {
+    pub active: bool,
+    pub stage: PolicyStage,
+    pub mode: PolicyMode,
+    pub tool: Option<&'a str>,
+    pub host_glob: Option<&'a str>,
+}
+
+/// Pure: select `db_client` block-policy host globs that are currently
+/// enforcing. Mirrors `compile_relative`'s gating — Active lifecycle, and here
+/// `stage == Enforce` stands in for "confirmed": an authored-but-not-staged
+/// policy gets no OS floor, same as an unconfirmed gotcha gets no deny.
+pub fn compile_domains_relative<'a>(
+    policies: impl Iterator<Item = PolicyDomainSel<'a>>,
+) -> BTreeSet<String> {
+    let mut domains = BTreeSet::new();
+    for p in policies {
+        if !p.active
+            || !matches!(p.stage, PolicyStage::Enforce)
+            || !matches!(p.mode, PolicyMode::Block)
+        {
+            continue;
+        }
+        if p.tool != Some("db_client") {
+            continue;
+        }
+        if let Some(glob) = p.host_glob {
+            let g = glob.trim();
+            if !g.is_empty() {
+                domains.insert(g.to_string());
+            }
+        }
+    }
+    domains
+}
+
+/// The full universe of `db_client` host globs any policy in the store has
+/// ever named, active or tombstoned, enforcing or not. This is the ownership
+/// boundary for `sandbox.network.deniedDomains`: a domain has no filesystem
+/// path to test `starts_with(repo_root)` against, so ownership is instead "did
+/// some policy in this store ever author this glob" — the policy corpus is the
+/// manifest, mirroring how a gotcha's canonical record already outranks its
+/// derived file-link index elsewhere in this codebase.
+pub fn db_client_host_glob_universe<'a>(
+    policies: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
+) -> BTreeSet<String> {
+    let mut universe = BTreeSet::new();
+    for (tool, host_glob) in policies {
+        if tool != Some("db_client") {
+            continue;
+        }
+        if let Some(glob) = host_glob {
+            let g = glob.trim();
+            if !g.is_empty() {
+                universe.insert(g.to_string());
+            }
+        }
+    }
+    universe
 }
 
 /// Clean repo-relative form: forward slashes, no leading `./` or `/`.
@@ -194,29 +294,27 @@ pub(super) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
 
 /// Resolve relative rules to absolute paths under `repo_root`; return the
 /// absolute rules plus any paths skipped for resolving outside the repo.
+/// `denied_domains` pass through untouched — they are host globs, not paths.
 fn resolve_rules(repo_root: &Path, rel: &SandboxRules) -> (SandboxRules, BTreeSet<String>) {
     let mut abs = SandboxRules::default();
     let mut skipped = BTreeSet::new();
-    for r in &rel.deny_write {
-        match resolve_under_repo(repo_root, r) {
-            Some(p) => {
-                abs.deny_write.insert(p.to_string_lossy().into_owned());
-            }
-            None => {
-                skipped.insert(r.clone());
-            }
-        }
-    }
-    for r in &rel.deny_read {
-        match resolve_under_repo(repo_root, r) {
-            Some(p) => {
-                abs.deny_read.insert(p.to_string_lossy().into_owned());
-            }
-            None => {
-                skipped.insert(r.clone());
+    let mut resolve_into = |rels: &BTreeSet<String>, into: &mut BTreeSet<String>| {
+        for r in rels {
+            match resolve_under_repo(repo_root, r) {
+                Some(p) => {
+                    into.insert(p.to_string_lossy().into_owned());
+                }
+                None => {
+                    skipped.insert(r.clone());
+                }
             }
         }
-    }
+    };
+    resolve_into(&rel.deny_write, &mut abs.deny_write);
+    resolve_into(&rel.deny_read, &mut abs.deny_read);
+    resolve_into(&rel.credentials_deny, &mut abs.credentials_deny);
+    resolve_into(&rel.credentials_mask, &mut abs.credentials_mask);
+    abs.denied_domains = rel.denied_domains.clone();
     (abs, skipped)
 }
 
@@ -229,22 +327,56 @@ fn is_mati_owned(entry: &str, repo_root: &Path) -> bool {
 }
 
 /// Merge mati's absolute deny rules into a settings object, owning only entries
-/// under `repo_root` and preserving everything else. Pure.
-fn apply_into_settings(mut root: Value, repo_root: &Path, abs: &SandboxRules) -> Value {
+/// under `repo_root` (or, for domains, in `domain_universe`) and preserving
+/// everything else. Pure.
+fn apply_into_settings(
+    mut root: Value,
+    repo_root: &Path,
+    abs: &SandboxRules,
+    domain_universe: &BTreeSet<String>,
+) -> Value {
     {
         let sandbox = ensure_child(&mut root, "sandbox");
         let fs = ensure_child(sandbox, "filesystem");
         set_owned_array(fs, "denyWrite", repo_root, &abs.deny_write);
         set_owned_array(fs, "denyRead", repo_root, &abs.deny_read);
     }
+    {
+        let sandbox = ensure_child(&mut root, "sandbox");
+        let creds = ensure_child(sandbox, "credentials");
+        set_owned_credential_files(
+            creds,
+            repo_root,
+            &abs.credentials_deny,
+            &abs.credentials_mask,
+        );
+    }
+    {
+        let sandbox = ensure_child(&mut root, "sandbox");
+        let net = ensure_child(sandbox, "network");
+        set_owned_domains(net, domain_universe, &abs.denied_domains);
+    }
     root
 }
 
-/// Remove mati-owned (under-repo) entries from the sandbox deny arrays. Pure.
-fn clear_from_settings(mut root: Value, repo_root: &Path) -> Value {
+/// Remove mati-owned entries from the sandbox deny/credentials/network blocks.
+/// Pure. `domain_universe` still must be passed — a domain has no path to test
+/// `starts_with(repo_root)` against, so clearing needs the same ownership
+/// lookup `apply` uses, computed from the current policy corpus.
+fn clear_from_settings(
+    mut root: Value,
+    repo_root: &Path,
+    domain_universe: &BTreeSet<String>,
+) -> Value {
     if let Some(fs) = nav_mut(&mut root, &["sandbox", "filesystem"]) {
         set_owned_array(fs, "denyWrite", repo_root, &BTreeSet::new());
         set_owned_array(fs, "denyRead", repo_root, &BTreeSet::new());
+    }
+    if let Some(creds) = nav_mut(&mut root, &["sandbox", "credentials"]) {
+        set_owned_credential_files(creds, repo_root, &BTreeSet::new(), &BTreeSet::new());
+    }
+    if let Some(net) = nav_mut(&mut root, &["sandbox", "network"]) {
+        set_owned_domains(net, domain_universe, &BTreeSet::new());
     }
     root
 }
@@ -269,6 +401,70 @@ fn set_owned_array(fs: &mut Value, key: &str, repo_root: &Path, mati: &BTreeSet<
         map.remove(key);
     } else {
         map.insert(key.to_string(), Value::Array(kept));
+    }
+}
+
+/// Rewrite `credentials.files` to `(existing entries NOT mati-owned) ∪ mati`.
+/// A mati-owned entry is `{"mode": ..., "path": <abs path under repo_root>}`;
+/// a malformed or non-mati-owned entry is preserved verbatim.
+fn set_owned_credential_files(
+    creds: &mut Value,
+    repo_root: &Path,
+    deny: &BTreeSet<String>,
+    mask: &BTreeSet<String>,
+) {
+    let Value::Object(map) = creds else {
+        return;
+    };
+    let mut kept: Vec<Value> = Vec::new();
+    if let Some(Value::Array(existing)) = map.get("files") {
+        for v in existing {
+            let owned = v
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| is_mati_owned(p, repo_root));
+            if !owned {
+                kept.push(v.clone());
+            }
+        }
+    }
+    for (mode, paths) in [("deny", deny), ("mask", mask)] {
+        for p in paths {
+            kept.push(serde_json::json!({ "mode": mode, "path": p }));
+        }
+    }
+    if kept.is_empty() {
+        map.remove("files");
+    } else {
+        map.insert("files".to_string(), Value::Array(kept));
+    }
+    if map.is_empty() {
+        *creds = Value::Object(Map::new());
+    }
+}
+
+/// Rewrite `network.deniedDomains` to `(existing entries NOT in domain_universe)
+/// ∪ mati`. `domain_universe` is every `db_client` host glob any policy in the
+/// store has ever named — see `db_client_host_glob_universe` — since a domain
+/// string carries no repo-root path to test ownership against.
+fn set_owned_domains(net: &mut Value, domain_universe: &BTreeSet<String>, mati: &BTreeSet<String>) {
+    let Value::Object(map) = net else {
+        return;
+    };
+    let mut kept: Vec<Value> = Vec::new();
+    if let Some(Value::Array(existing)) = map.get("deniedDomains") {
+        for v in existing {
+            match v.as_str() {
+                Some(s) if domain_universe.contains(s) => {} // drop: mati-managed, recomputed below
+                _ => kept.push(v.clone()),
+            }
+        }
+    }
+    kept.extend(mati.iter().map(|d| Value::String(d.clone())));
+    if kept.is_empty() {
+        map.remove("deniedDomains");
+    } else {
+        map.insert("deniedDomains".to_string(), Value::Array(kept));
     }
 }
 
@@ -335,6 +531,26 @@ fn validate_sandbox_shape(root: &Value) -> Result<()> {
             }
         }
     }
+    if let Some(creds) = sb.get("credentials") {
+        if !creds.is_object() {
+            bail!("settings `sandbox.credentials` is not an object");
+        }
+        if let Some(files) = creds.get("files") {
+            if !files.is_array() {
+                bail!("settings `sandbox.credentials.files` is not an array");
+            }
+        }
+    }
+    if let Some(net) = sb.get("network") {
+        if !net.is_object() {
+            bail!("settings `sandbox.network` is not an object");
+        }
+        if let Some(dd) = net.get("deniedDomains") {
+            if !dd.is_array() {
+                bail!("settings `sandbox.network.deniedDomains` is not an array");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -391,7 +607,7 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = repo_root_for(&cwd)?;
     let store = StoreProxy::open(&cwd).await?;
-    let (abs, skipped, warnings) = compute_rules(&store, &repo_root).await?;
+    let (abs, skipped, domain_universe, warnings) = compute_rules(&store, &repo_root).await?;
     for w in &warnings {
         eprintln!("warning: {w}");
     }
@@ -403,24 +619,21 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
 
     let path = settings_local_path(&repo_root);
     if args.apply {
-        materialize(&path, &repo_root, &abs, true, args.force)?;
+        materialize(&path, &repo_root, &abs, &domain_universe, true, args.force)?;
         audit_sandbox(&store, "apply", &abs).await;
         println!(
-            "Applied {} denyWrite + {} denyRead entr{} to {}",
+            "Applied {} denyWrite + {} denyRead + {} credentials + {} deniedDomains entries to {}",
             abs.deny_write.len(),
             abs.deny_read.len(),
-            if abs.deny_write.len() + abs.deny_read.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
+            abs.credentials_deny.len() + abs.credentials_mask.len(),
+            abs.denied_domains.len(),
             path.display()
         );
         enablement_hint();
     } else {
         if let Ok(existing) = read_settings(&path) {
-            for r in drifted_removals(&existing, &repo_root, &abs) {
-                eprintln!("drift: {r} is in your sandbox config but no longer has a confirmed crown-jewel gotcha — `--apply` would remove it");
+            for r in drifted_removals(&existing, &repo_root, &abs, &domain_universe) {
+                eprintln!("drift: {r} is in your sandbox config but no longer has a confirmed crown-jewel gotcha, secret tag, or enforcing db_client policy — `--apply` would remove it");
             }
         }
         print_preview(&abs, &path);
@@ -428,11 +641,17 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
     Ok(())
 }
 
-/// Scan the store → absolute deny rules, plus out-of-repo skips and warnings.
+/// Scan the store → absolute deny rules, plus out-of-repo skips, the
+/// `db_client` host-glob ownership universe, and warnings.
 pub(crate) async fn compute_rules(
     store: &StoreProxy,
     repo_root: &Path,
-) -> Result<(SandboxRules, BTreeSet<String>, Vec<String>)> {
+) -> Result<(
+    SandboxRules,
+    BTreeSet<String>,
+    BTreeSet<String>,
+    Vec<String>,
+)> {
     let records = store.scan_prefix("gotcha:").await?;
     let mut warnings = Vec::new();
     let mut items: Vec<(Vec<String>, bool, bool, Vec<String>)> = Vec::new();
@@ -442,18 +661,20 @@ pub(crate) async fn compute_rules(
             Some(g) => (g.confirmed, g.affected_files),
             None => (false, Vec::new()),
         };
-        let tagged = r
-            .tags
-            .iter()
-            .any(|t| t == TAG_DENY_WRITE || t == TAG_DENY_READ);
+        let tagged = r.tags.iter().any(|t| {
+            t == TAG_DENY_WRITE
+                || t == TAG_DENY_READ
+                || t == TAG_SECRET_DENY
+                || t == TAG_SECRET_MASK
+        });
         if tagged && active && !confirmed {
             warnings.push(format!(
-                "{} is tagged crown-jewel but not confirmed — not enforced (run `mati gotcha confirm`)",
+                "{} is tagged for the sandbox floor but not confirmed — not enforced (run `mati gotcha confirm`)",
                 r.key
             ));
         } else if tagged && active && files.is_empty() {
             warnings.push(format!(
-                "{} is tagged crown-jewel but has no affected_files",
+                "{} is tagged for the sandbox floor but has no affected_files",
                 r.key
             ));
         }
@@ -465,25 +686,73 @@ pub(crate) async fn compute_rules(
         confirmed: *c,
         files: f,
     }));
-    let (abs, skipped) = resolve_rules(repo_root, &rel);
-    Ok((abs, skipped, warnings))
+    let (mut abs, skipped) = resolve_rules(repo_root, &rel);
+
+    let policies = store.scan_prefix("policy:").await?;
+    let mut policy_items: Vec<PolicyItem> = Vec::new();
+    for r in &policies {
+        let active = matches!(r.lifecycle, RecordLifecycle::Active);
+        if let Some(p) = r.payload_as::<PolicyRecord>() {
+            let db_client = p.trigger.tool.as_deref() == Some("db_client");
+            if db_client
+                && matches!(p.stage, PolicyStage::Enforce)
+                && matches!(p.mode, PolicyMode::Block)
+                && p.trigger.host_glob.is_none()
+            {
+                warnings.push(format!(
+                    "{} is an enforcing db_client block policy but has no host_glob — no domain compiled",
+                    r.key
+                ));
+            }
+            policy_items.push((active, p.stage, p.mode, p.trigger.tool, p.trigger.host_glob));
+        }
+    }
+    abs.denied_domains = compile_domains_relative(policy_items.iter().map(
+        |(active, stage, mode, tool, host_glob)| PolicyDomainSel {
+            active: *active,
+            stage: *stage,
+            mode: *mode,
+            tool: tool.as_deref(),
+            host_glob: host_glob.as_deref(),
+        },
+    ));
+    let domain_universe = db_client_host_glob_universe(
+        policy_items
+            .iter()
+            .map(|(_, _, _, tool, host_glob)| (tool.as_deref(), host_glob.as_deref())),
+    );
+
+    Ok((abs, skipped, domain_universe, warnings))
+}
+
+/// The `db_client` host-glob ownership universe, scanned fresh — used where
+/// only that (not the full rule set) is needed, e.g. `mati sandbox clear`.
+async fn scan_domain_universe(store: &StoreProxy) -> BTreeSet<String> {
+    let policies = store.scan_prefix("policy:").await.unwrap_or_default();
+    let pairs: Vec<(Option<String>, Option<String>)> = policies
+        .iter()
+        .filter_map(|r| r.payload_as::<PolicyRecord>())
+        .map(|p| (p.trigger.tool, p.trigger.host_glob))
+        .collect();
+    db_client_host_glob_universe(pairs.iter().map(|(t, h)| (t.as_deref(), h.as_deref())))
 }
 
 /// Write the rules into settings.local.json. When `guarded`, refuse to remove
-/// mati-owned entries that drifted (their crown-jewel tag is gone) unless
-/// `force` — a security floor is never silently removed.
+/// mati-owned entries that drifted (their tag or enforcing policy is gone)
+/// unless `force` — a security floor is never silently removed.
 fn materialize(
     path: &Path,
     repo_root: &Path,
     abs: &SandboxRules,
+    domain_universe: &BTreeSet<String>,
     guarded: bool,
     force: bool,
 ) -> Result<()> {
     let existing = read_settings(path)?;
-    let removals = drifted_removals(&existing, repo_root, abs);
+    let removals = drifted_removals(&existing, repo_root, abs, domain_universe);
     if guarded && !removals.is_empty() && !force {
         eprintln!(
-            "Refusing to remove {} sandbox protection(s) whose crown-jewel tag is gone:",
+            "Refusing to remove {} sandbox protection(s) whose tag or enforcing policy is gone:",
             removals.len()
         );
         for r in &removals {
@@ -494,15 +763,22 @@ fn materialize(
     for r in &removals {
         eprintln!("note: removing sandbox protection for {r}");
     }
-    let merged = apply_into_settings(existing, repo_root, abs);
+    let merged = apply_into_settings(existing, repo_root, abs, domain_universe);
     write_settings_atomic(path, &merged)
 }
 
-/// mati-owned (under-repo) entries currently in settings that `abs` would drop.
-fn drifted_removals(existing: &Value, repo_root: &Path, abs: &SandboxRules) -> BTreeSet<String> {
+/// mati-owned entries currently in settings that `abs` would drop: filesystem
+/// denies (owned by repo-root path), credential files (same), and denied
+/// domains (owned by membership in `domain_universe`).
+fn drifted_removals(
+    existing: &Value,
+    repo_root: &Path,
+    abs: &SandboxRules,
+    domain_universe: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut removed = BTreeSet::new();
     for (key, new_set) in [("denyWrite", &abs.deny_write), ("denyRead", &abs.deny_read)] {
-        let Some(arr) = settings_array(existing, key) else {
+        let Some(arr) = settings_array(existing, &["sandbox", "filesystem"], key) else {
             continue;
         };
         for s in arr.iter().filter_map(|v| v.as_str()) {
@@ -511,11 +787,36 @@ fn drifted_removals(existing: &Value, repo_root: &Path, abs: &SandboxRules) -> B
             }
         }
     }
+    if let Some(arr) = settings_array(existing, &["sandbox", "credentials"], "files") {
+        let current: BTreeSet<&String> = abs
+            .credentials_deny
+            .iter()
+            .chain(&abs.credentials_mask)
+            .collect();
+        for v in arr {
+            if let Some(p) = v.get("path").and_then(Value::as_str) {
+                if is_mati_owned(p, repo_root) && !current.contains(&p.to_string()) {
+                    removed.insert(p.to_string());
+                }
+            }
+        }
+    }
+    if let Some(arr) = settings_array(existing, &["sandbox", "network"], "deniedDomains") {
+        for s in arr.iter().filter_map(|v| v.as_str()) {
+            if domain_universe.contains(s) && !abs.denied_domains.contains(s) {
+                removed.insert(s.to_string());
+            }
+        }
+    }
     removed
 }
 
-fn settings_array<'a>(root: &'a Value, key: &str) -> Option<&'a Vec<Value>> {
-    root.get("sandbox")?.get("filesystem")?.get(key)?.as_array()
+fn settings_array<'a>(root: &'a Value, path: &[&str], key: &str) -> Option<&'a Vec<Value>> {
+    let mut cur = root;
+    for p in path {
+        cur = cur.get(p)?;
+    }
+    cur.get(key)?.as_array()
 }
 
 fn add_tags(tags: &mut Vec<String>, add: &[&str]) {
@@ -571,10 +872,11 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
         }
     }
 
-    let to_add: Vec<&str> = if args.read {
-        vec![TAG_DENY_WRITE, TAG_DENY_READ]
-    } else {
-        vec![TAG_DENY_WRITE]
+    let to_add: Vec<&str> = match args.secret.as_deref() {
+        Some("deny") => vec![TAG_SECRET_DENY],
+        Some("mask") => vec![TAG_SECRET_MASK],
+        _ if args.read => vec![TAG_DENY_WRITE, TAG_DENY_READ],
+        _ => vec![TAG_DENY_WRITE],
     };
     let mut n = 0;
     for r in &matched {
@@ -582,7 +884,15 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
             if add {
                 add_tags(&mut rec.tags, &to_add);
             } else {
-                remove_tags(&mut rec.tags, &[TAG_DENY_WRITE, TAG_DENY_READ]);
+                remove_tags(
+                    &mut rec.tags,
+                    &[
+                        TAG_DENY_WRITE,
+                        TAG_DENY_READ,
+                        TAG_SECRET_DENY,
+                        TAG_SECRET_MASK,
+                    ],
+                );
             }
             store.put(&r.key, &rec).await?;
             n += 1;
@@ -590,9 +900,9 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
     }
 
     // Re-materialize — intentional change, so the drift guard is off.
-    let (abs, _skipped, _warnings) = compute_rules(&store, &repo_root).await?;
+    let (abs, _skipped, domain_universe, _warnings) = compute_rules(&store, &repo_root).await?;
     let path = settings_local_path(&repo_root);
-    materialize(&path, &repo_root, &abs, false, true)?;
+    materialize(&path, &repo_root, &abs, &domain_universe, false, true)?;
     audit_sandbox(&store, if add { "protect" } else { "unprotect" }, &abs).await;
 
     println!(
@@ -613,9 +923,11 @@ async fn run_protect(args: ProtectArgs, add: bool) -> Result<()> {
 /// recording is a documented follow-up.
 async fn audit_sandbox(store: &StoreProxy, action: &str, abs: &SandboxRules) {
     let new_value = format!(
-        "{} denyWrite + {} denyRead",
+        "{} denyWrite + {} denyRead + {} credentials + {} deniedDomains",
         abs.deny_write.len(),
-        abs.deny_read.len()
+        abs.deny_read.len(),
+        abs.credentials_deny.len() + abs.credentials_mask.len(),
+        abs.denied_domains.len()
     );
     store
         .record_sandbox_audit(&new_value, &format!("sandbox_{action}"))
@@ -631,13 +943,20 @@ async fn run_clear() -> Result<()> {
         return Ok(());
     }
     let existing = read_settings(&path)?;
-    let cleared = clear_from_settings(existing, &repo_root);
+    // The domain-ownership universe needs the current policy corpus even
+    // though clear writes nothing derived from it — see `set_owned_domains`.
+    let store = StoreProxy::open(&cwd).await.ok();
+    let domain_universe = match &store {
+        Some(s) => scan_domain_universe(s).await,
+        None => BTreeSet::new(),
+    };
+    let cleared = clear_from_settings(existing, &repo_root, &domain_universe);
     write_settings_atomic(&path, &cleared)?;
-    if let Ok(store) = StoreProxy::open(&cwd).await {
-        audit_sandbox(&store, "clear", &SandboxRules::default()).await;
+    if let Some(store) = &store {
+        audit_sandbox(store, "clear", &SandboxRules::default()).await;
     }
     println!(
-        "Cleared mati-managed (in-repo) sandbox deny rules from {}",
+        "Cleared mati-managed (in-repo) sandbox deny/credentials/network rules from {}",
         path.display()
     );
     Ok(())
@@ -655,10 +974,11 @@ fn enablement_hint() {
 
 fn print_preview(abs: &SandboxRules, path: &Path) {
     if abs.is_empty() {
-        println!("No crown-jewel gotchas resolve to in-repo files.");
+        println!("No crown-jewel/secret gotchas or enforcing db_client policies resolve to in-repo rules.");
         println!(
-            "Tag a confirmed gotcha with `{TAG_DENY_WRITE}` (deny shell writes) or \
-             `{TAG_DENY_READ}` (deny shell reads), then `mati sandbox compile --apply`."
+            "Tag a confirmed gotcha with `{TAG_DENY_WRITE}` (deny shell writes), `{TAG_DENY_READ}` \
+             (deny shell reads), `{TAG_SECRET_DENY}`/`{TAG_SECRET_MASK}` (credentials), or enforce a \
+             db_client block policy with a host_glob, then `mati sandbox compile --apply`."
         );
         return;
     }
@@ -676,6 +996,24 @@ fn print_preview(abs: &SandboxRules, path: &Path) {
         println!("  denyRead (shell / subprocess cannot read):");
         for p in &abs.deny_read {
             println!("    {p}");
+        }
+    }
+    if !abs.credentials_deny.is_empty() {
+        println!("  credentials.files mode=deny:");
+        for p in &abs.credentials_deny {
+            println!("    {p}");
+        }
+    }
+    if !abs.credentials_mask.is_empty() {
+        println!("  credentials.files mode=mask:");
+        for p in &abs.credentials_mask {
+            println!("    {p}");
+        }
+    }
+    if !abs.denied_domains.is_empty() {
+        println!("  network.deniedDomains (from enforcing db_client policies):");
+        for d in &abs.denied_domains {
+            println!("    {d}");
         }
     }
     enablement_hint();
@@ -737,6 +1075,125 @@ mod tests {
         assert!(compile_relative([sel(&untagged, true, &f)].into_iter()).is_empty());
     }
 
+    #[test]
+    fn secret_tags_map_to_credentials_deny_and_mask() {
+        let t = sv(&["secret-deny"]);
+        let f = sv(&["vault/prod.pem"]);
+        let r = compile_relative([sel(&t, true, &f)].into_iter());
+        assert!(r.credentials_deny.contains("vault/prod.pem"));
+        assert!(r.credentials_mask.is_empty());
+
+        let t = sv(&["secret-mask"]);
+        let r = compile_relative([sel(&t, true, &f)].into_iter());
+        assert!(r.credentials_mask.contains("vault/prod.pem"));
+        assert!(r.credentials_deny.is_empty());
+    }
+
+    fn psel<'a>(
+        active: bool,
+        stage: PolicyStage,
+        mode: PolicyMode,
+        tool: Option<&'a str>,
+        host_glob: Option<&'a str>,
+    ) -> PolicyDomainSel<'a> {
+        PolicyDomainSel {
+            active,
+            stage,
+            mode,
+            tool,
+            host_glob,
+        }
+    }
+
+    #[test]
+    fn enforcing_db_client_block_with_host_glob_compiles_domain() {
+        let d = compile_domains_relative(
+            [psel(
+                true,
+                PolicyStage::Enforce,
+                PolicyMode::Block,
+                Some("db_client"),
+                Some("*.prod.internal"),
+            )]
+            .into_iter(),
+        );
+        assert!(d.contains("*.prod.internal"));
+    }
+
+    #[test]
+    fn shadow_steer_wrong_tool_or_missing_glob_compile_nothing() {
+        assert!(compile_domains_relative(
+            [psel(
+                true,
+                PolicyStage::Shadow,
+                PolicyMode::Block,
+                Some("db_client"),
+                Some("*.prod")
+            )]
+            .into_iter()
+        )
+        .is_empty());
+        assert!(compile_domains_relative(
+            [psel(
+                true,
+                PolicyStage::Enforce,
+                PolicyMode::Steer,
+                Some("db_client"),
+                Some("*.prod")
+            )]
+            .into_iter()
+        )
+        .is_empty());
+        assert!(compile_domains_relative(
+            [psel(
+                true,
+                PolicyStage::Enforce,
+                PolicyMode::Block,
+                Some("path"),
+                Some("*.prod")
+            )]
+            .into_iter()
+        )
+        .is_empty());
+        assert!(compile_domains_relative(
+            [psel(
+                true,
+                PolicyStage::Enforce,
+                PolicyMode::Block,
+                Some("db_client"),
+                None
+            )]
+            .into_iter()
+        )
+        .is_empty());
+        assert!(compile_domains_relative(
+            [psel(
+                false,
+                PolicyStage::Enforce,
+                PolicyMode::Block,
+                Some("db_client"),
+                Some("*.prod")
+            )]
+            .into_iter()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn domain_universe_includes_non_enforcing_db_client_globs() {
+        // The ownership universe is broader than the current compiled set: a
+        // shadow-stage policy's glob still belongs to mati for drift purposes.
+        let universe = db_client_host_glob_universe(
+            [
+                (Some("db_client"), Some("*.staging")),
+                (Some("path"), Some("ignored")),
+            ]
+            .into_iter(),
+        );
+        assert!(universe.contains("*.staging"));
+        assert!(!universe.contains("ignored"));
+    }
+
     // ── ownership / merge (pure transforms) ──────────────────────────────────
 
     #[test]
@@ -757,7 +1214,7 @@ mod tests {
         });
         let mut abs = SandboxRules::default();
         abs.deny_write.insert("/work/repo/src/new.rs".to_string());
-        let out = apply_into_settings(existing, repo, &abs);
+        let out = apply_into_settings(existing, repo, &abs, &BTreeSet::new());
         let dw = out["sandbox"]["filesystem"]["denyWrite"]
             .as_array()
             .unwrap();
@@ -779,8 +1236,8 @@ mod tests {
         let repo = Path::new("/work/repo");
         let mut abs = SandboxRules::default();
         abs.deny_read.insert("/work/repo/.env".to_string());
-        let once = apply_into_settings(json!({}), repo, &abs);
-        let twice = apply_into_settings(once.clone(), repo, &abs);
+        let once = apply_into_settings(json!({}), repo, &abs, &BTreeSet::new());
+        let twice = apply_into_settings(once.clone(), repo, &abs, &BTreeSet::new());
         assert_eq!(once, twice);
     }
 
@@ -793,7 +1250,7 @@ mod tests {
                 "denyRead": ["/work/repo/.env"]
             } }
         });
-        let out = clear_from_settings(existing, repo);
+        let out = clear_from_settings(existing, repo, &BTreeSet::new());
         let dw: Vec<&str> = out["sandbox"]["filesystem"]["denyWrite"]
             .as_array()
             .unwrap()
@@ -803,6 +1260,90 @@ mod tests {
         assert_eq!(dw, vec!["~/.aws"], "user entry kept, mati entry removed");
         // denyRead had only an in-repo entry → array removed entirely
         assert!(out["sandbox"]["filesystem"].get("denyRead").is_none());
+    }
+
+    #[test]
+    fn credential_files_merge_owns_by_path_preserves_foreign_entries() {
+        let repo = Path::new("/work/repo");
+        let existing = json!({
+            "sandbox": { "credentials": { "files": [
+                { "mode": "deny", "path": "/work/repo/OLD.pem" },
+                { "mode": "mask", "path": "~/.aws/credentials" }
+            ] } }
+        });
+        let mut abs = SandboxRules::default();
+        abs.credentials_deny
+            .insert("/work/repo/new.pem".to_string());
+        let out = apply_into_settings(existing, repo, &abs, &BTreeSet::new());
+        let files = out["sandbox"]["credentials"]["files"].as_array().unwrap();
+        let paths: BTreeSet<&str> = files.iter().map(|e| e["path"].as_str().unwrap()).collect();
+        assert!(
+            paths.contains("~/.aws/credentials"),
+            "foreign entry preserved"
+        );
+        assert!(
+            paths.contains("/work/repo/new.pem"),
+            "new mati entry present"
+        );
+        assert!(
+            !paths.contains("/work/repo/OLD.pem"),
+            "stale in-repo entry dropped"
+        );
+        let new_entry = files
+            .iter()
+            .find(|e| e["path"] == "/work/repo/new.pem")
+            .unwrap();
+        assert_eq!(new_entry["mode"], "deny");
+    }
+
+    #[test]
+    fn denied_domains_merge_owns_by_universe_membership() {
+        let repo = Path::new("/work/repo");
+        let existing = json!({
+            "sandbox": { "network": { "deniedDomains": ["*.old-policy.internal", "user-added.example.com"] } }
+        });
+        let mut abs = SandboxRules::default();
+        abs.denied_domains
+            .insert("*.new-policy.internal".to_string());
+        let universe: BTreeSet<String> = [
+            "*.old-policy.internal".to_string(),
+            "*.new-policy.internal".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let out = apply_into_settings(existing, repo, &abs, &universe);
+        let domains: BTreeSet<&str> = out["sandbox"]["network"]["deniedDomains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            domains.contains("user-added.example.com"),
+            "non-mati domain preserved"
+        );
+        assert!(
+            domains.contains("*.new-policy.internal"),
+            "new mati domain present"
+        );
+        assert!(
+            !domains.contains("*.old-policy.internal"),
+            "policy no longer enforcing — dropped"
+        );
+    }
+
+    #[test]
+    fn drifted_removals_covers_credentials_and_domains() {
+        let repo = Path::new("/work/repo");
+        let existing = json!({ "sandbox": {
+            "credentials": { "files": [{ "mode": "deny", "path": "/work/repo/dropped.pem" }] },
+            "network": { "deniedDomains": ["*.dropped.internal"] }
+        } });
+        let abs = SandboxRules::default();
+        let universe: BTreeSet<String> = ["*.dropped.internal".to_string()].into_iter().collect();
+        let drift = drifted_removals(&existing, repo, &abs, &universe);
+        assert!(drift.contains("/work/repo/dropped.pem"));
+        assert!(drift.contains("*.dropped.internal"));
     }
 
     #[test]
@@ -840,7 +1381,7 @@ mod tests {
         } } });
         let mut abs = SandboxRules::default();
         abs.deny_write.insert("/work/repo/still.rs".to_string());
-        let drift = drifted_removals(&existing, repo, &abs);
+        let drift = drifted_removals(&existing, repo, &abs, &BTreeSet::new());
         assert!(
             drift.contains("/work/repo/dropped.rs"),
             "tag-dropped entry flagged"
@@ -900,12 +1441,12 @@ mod tests {
         .unwrap();
         let empty = SandboxRules::default();
         // guarded + drift + not forced → refuse, and the file is left untouched
-        assert!(materialize(&path, repo, &empty, true, false).is_err());
+        assert!(materialize(&path, repo, &empty, &BTreeSet::new(), true, false).is_err());
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("/work/repo/x.rs"));
         // forced → removes the drifted entry
-        assert!(materialize(&path, repo, &empty, true, true).is_ok());
+        assert!(materialize(&path, repo, &empty, &BTreeSet::new(), true, true).is_ok());
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
             .contains("/work/repo/x.rs"));

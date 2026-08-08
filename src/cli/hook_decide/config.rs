@@ -142,7 +142,7 @@ pub(crate) async fn run_config_change(input: &serde_json::Value) -> Result<()> {
                     return Ok(());
                 }
             };
-            let (expected, _skipped, _warnings) =
+            let (expected, _skipped, _domain_universe, _warnings) =
                 match super::sandbox::compute_rules(&store, &repo_root).await {
                     Ok(result) => result,
                     Err(error) => {
