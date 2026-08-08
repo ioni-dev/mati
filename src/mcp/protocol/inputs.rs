@@ -194,6 +194,12 @@ pub enum QueryMode {
 #[serde(deny_unknown_fields)]
 pub struct MemGetInput {
     pub key: String,
+    /// Worktree (and, when a subagent, subagent) scope for the consultation
+    /// receipt this call mints. Server-populated by `mati serve` from its own
+    /// process cwd — never client-supplied through the public tool schema,
+    /// which exposes only `key`.
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

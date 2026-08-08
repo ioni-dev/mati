@@ -582,7 +582,10 @@ async fn one_mem_get_counts_as_one_consultation() {
     }
 
     // 1. The agent calls `mem_get`.
-    let mem_get = make_request(Command::MemGet(MemGetInput { key: key.into() }));
+    let mem_get = make_request(Command::MemGet(MemGetInput {
+        key: key.into(),
+        actor: None,
+    }));
     assert!(matches!(
         dispatch_v2(&graph, &ctx, mem_get).await,
         Response::Ok { .. }
@@ -913,7 +916,10 @@ fn no_mutation_or_side_effecting_read_reaches_v1_bridge() {
         Command::SessionHarvest,
         Command::SessionClearConsults,
         // Side-effecting reads.
-        Command::MemGet(MemGetInput { key: "k".into() }),
+        Command::MemGet(MemGetInput {
+            key: "k".into(),
+            actor: None,
+        }),
         Command::MemBootstrap(MemBootstrapInput {
             context_files: vec![],
         }),
@@ -1157,7 +1163,10 @@ async fn native_mem_get_empty_key_returns_error_with_rejection_audit() {
     let graph = Arc::new(tokio::sync::RwLock::new(graph));
     let ctx = test_ctx(dir.path());
 
-    let req = make_request(Command::MemGet(MemGetInput { key: "".into() }));
+    let req = make_request(Command::MemGet(MemGetInput {
+        key: "".into(),
+        actor: None,
+    }));
     let resp = dispatch_v2(&graph, &ctx, req).await;
 
     // Must return Response::Err, not Response::Ok with error payload.
@@ -1198,6 +1207,7 @@ async fn native_mem_get_returns_null_for_missing_key() {
 
     let req = make_request(Command::MemGet(MemGetInput {
         key: "file:nonexistent".into(),
+        actor: None,
     }));
     let resp = dispatch_v2(&graph, &ctx, req).await;
 
@@ -1217,6 +1227,7 @@ async fn native_mem_get_writes_session_audit_and_consultation_receipt() {
 
     let req = make_request(Command::MemGet(MemGetInput {
         key: "file:src/main.rs".into(),
+        actor: None,
     }));
     let _ = dispatch_v2(&graph, &ctx, req).await;
 
@@ -1257,6 +1268,44 @@ async fn native_mem_get_writes_session_audit_and_consultation_receipt() {
     assert!(
         k_audit.is_empty(),
         "MemGet should NOT produce knowledge-side audit"
+    );
+}
+
+/// `mati serve` stamps its own worktree tag onto every `mem_get` call as
+/// `actor` (F4/Half 1). The native handler must key the receipt on that
+/// scope, not the unscoped global key — otherwise a receipt minted by one
+/// worktree's `mati serve` would satisfy every other worktree sharing the
+/// same store.
+#[tokio::test]
+async fn native_mem_get_scopes_receipt_to_the_caller_supplied_actor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let req = make_request(Command::MemGet(MemGetInput {
+        key: "file:src/main.rs".into(),
+        actor: Some("wtA".into()),
+    }));
+    let _ = dispatch_v2(&graph, &ctx, req).await;
+
+    let g = graph.read().await;
+    assert!(
+        g.store()
+            .get("session:consulted:wtA:file:src/main.rs")
+            .await
+            .unwrap()
+            .is_some(),
+        "MemGet with actor=wtA must write the wtA-scoped receipt key"
+    );
+    assert!(
+        g.store()
+            .get("session:consulted:file:src/main.rs")
+            .await
+            .unwrap()
+            .is_none(),
+        "MemGet with actor=wtA must NOT also write the unscoped global receipt"
     );
 }
 
@@ -1372,6 +1421,7 @@ async fn version_mismatch_cannot_reach_side_effecting_read() {
         agent: None,
         cmd: Command::MemGet(MemGetInput {
             key: "file:test".into(),
+            actor: None,
         }),
     };
     let resp = dispatch_v2(&graph, &ctx, req).await;

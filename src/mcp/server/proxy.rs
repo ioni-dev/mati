@@ -67,8 +67,12 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
     );
 
     // MCP stdio proxy: every tool call forwards over UDS to the daemon.
+    // The worktree tag is computed once, here, from this process's own
+    // launch cwd — `mati serve` never changes directory afterward, so a
+    // single git2 lookup at startup is enough for the life of the session.
+    let worktree_tag = crate::store::session::worktree_scope_tag(repo_root);
     let transport = rmcp::transport::io::stdio();
-    let service = MatiServer::with_socket_root(mati_root.clone())
+    let service = MatiServer::with_socket_root(mati_root.clone(), worktree_tag)
         .serve(transport)
         .await
         .map_err(|e| anyhow::anyhow!("MCP proxy initialization failed: {e}"))

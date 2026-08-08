@@ -89,10 +89,12 @@ hook()  { ( cd "$PROJECT" && printf '%s' "$2" | "$MATI" hook-decide "$1" 2>/dev/
 codex_hook() { ( cd "$PROJECT" && printf '%s' "$2" | "$MATI" hook-decide "$1" 2>&1 ); }
 mati_p(){ ( cd "$PROJECT" && "$MATI" "$@" 2>&1 ); }
 
-# Real MCP tool call over stdio. This matters: the MCP `mem_get` handler mints
-# the GLOBAL receipt (actor=None), which is what the main-thread gate reads. The
-# post-memget hook only mints an actor-scoped receipt, so firing the hook alone
-# does NOT reproduce a real consultation.
+# Real MCP tool call over stdio. This matters: `mati serve` stamps its own
+# worktree tag onto the MCP `mem_get` call (F4/Half 1), and the gate reads the
+# same tag for the main thread — so the receipt this mints is scoped to
+# $PROJECT's worktree, not a bare global key. The post-memget hook mints an
+# additionally agent-scoped receipt, so firing the hook alone does NOT
+# reproduce a real consultation.
 mcp_call() { # $1 = tool name, $2 = arguments json
   ( cd "$PROJECT" && printf '%s\n%s\n%s\n' \
       '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
@@ -658,7 +660,10 @@ assert_has "and names the key it waits on"          "$OUT" 'schema:receipt-view'
 assert_has "with no receipt yet"                    "$OUT" 'BLOCKS every actor'
 mcp_call mem_get '{"key":"schema:receipt-view"}' >/dev/null
 OUT="$(mati_p policy receipts)"
-assert_has "after consulting, scope is reported"    "$OUT" 'satisfied for: global'
+# Scoped to $PROJECT's worktree tag (F4/Half 1), not the old bare "global"
+# label — a worktree-scoped receipt is the whole point of the fix.
+assert_has "after consulting, scope is reported"    "$OUT" $'policy:receipt-view\tenforce\tsatisfied for:'
+assert_lacks "receipt scope is worktree-tagged, not global" "$OUT" 'satisfied for: global'
 assert_has "json form carries the verdict"          "$(mati_p policy receipts --json)" 'satisfied_for'
 
 # ── 18. Fail-open ────────────────────────────────────────────────────────────

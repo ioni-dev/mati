@@ -568,7 +568,13 @@ fn command_kind_covers_all_variants() {
                 since: None,
             }),
         ),
-        ("mem_get", Command::MemGet(MemGetInput { key: "k".into() })),
+        (
+            "mem_get",
+            Command::MemGet(MemGetInput {
+                key: "k".into(),
+                actor: None,
+            }),
+        ),
         (
             "mem_bootstrap",
             Command::MemBootstrap(MemBootstrapInput {
@@ -700,7 +706,11 @@ fn command_is_mutation_classification() {
     .is_mutation());
 
     // Reads with side effects — ARE mutations (audited)
-    assert!(Command::MemGet(MemGetInput { key: "k".into() }).is_mutation());
+    assert!(Command::MemGet(MemGetInput {
+        key: "k".into(),
+        actor: None
+    })
+    .is_mutation());
     assert!(Command::MemBootstrap(MemBootstrapInput {
         context_files: vec![]
     })
@@ -851,14 +861,32 @@ fn v1_to_v2_command_handles_mem_get() {
     let mapped = v1_to_v2_command("mem_get", &serde_json::json!({ "key": "file:src/main.rs" }));
     assert_eq!(
         mapped,
-        serde_json::json!({ "type": "mem_get", "key": "file:src/main.rs" })
+        serde_json::json!({ "type": "mem_get", "key": "file:src/main.rs", "actor": null })
     );
 
     // Round-trip into a typed Command — proves the wire shape decodes
     // through `MemGetInput::deny_unknown_fields`.
     let cmd: Command = serde_json::from_value(mapped).expect("mem_get must decode as Command");
     match cmd {
-        Command::MemGet(input) => assert_eq!(input.key, "file:src/main.rs"),
+        Command::MemGet(input) => {
+            assert_eq!(input.key, "file:src/main.rs");
+            assert_eq!(input.actor, None);
+        }
+        other => panic!("expected Command::MemGet, got {:?}", other.kind()),
+    }
+}
+
+/// `mati serve` stamps its own worktree tag as `actor` (F4/Half 1) — the v1
+/// bridge must carry it through, not drop it like an ordinary unknown field.
+#[test]
+fn v1_to_v2_command_passes_mem_get_actor_through() {
+    let mapped = v1_to_v2_command(
+        "mem_get",
+        &serde_json::json!({ "key": "file:src/main.rs", "actor": "wtA" }),
+    );
+    let cmd: Command = serde_json::from_value(mapped).expect("mem_get must decode as Command");
+    match cmd {
+        Command::MemGet(input) => assert_eq!(input.actor.as_deref(), Some("wtA")),
         other => panic!("expected Command::MemGet, got {:?}", other.kind()),
     }
 }

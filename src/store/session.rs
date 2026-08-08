@@ -228,6 +228,40 @@ pub fn record_content_fingerprint(record: &Record) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+// ── Worktree-scoped receipts ─────────────────────────────────────────────────
+
+/// Identify the git worktree at `cwd` for receipt scoping.
+///
+/// Git worktrees share history (and, by extension, mati's slug and store)
+/// but not working-tree content: the same file path can hold different bytes
+/// in two worktrees of the same repo. A consultation receipt minted while
+/// operating in one worktree must not satisfy a gate checked from another.
+/// `git2::Repository::discover` resolves each worktree's own `workdir()`
+/// correctly for both sibling and nested worktree layouts — unlike a lexical
+/// `.git`-file check, which mistakes a nested worktree's `.git` pointer file
+/// for "no boundary here" and walks up into the main checkout's real `.git`
+/// directory. `None` when no git repo is discoverable; the caller then falls
+/// back to whatever scope `agent_id` alone provides.
+pub fn worktree_scope_tag(cwd: &Path) -> Option<String> {
+    let repo = git2::Repository::discover(cwd).ok()?;
+    let workdir = repo.workdir()?;
+    let canon = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
+    Some(hex::encode(&digest[..4]))
+}
+
+/// Combine the worktree tag with an optional subagent id into the single
+/// opaque scope string receipts key on. `None` only when neither is known,
+/// preserving the pre-existing unscoped global receipt outside any git repo.
+pub fn combined_actor_scope(worktree: Option<&str>, agent_id: Option<&str>) -> Option<String> {
+    match (worktree, agent_id) {
+        (Some(w), Some(a)) => Some(format!("{w}:{a}")),
+        (Some(w), None) => Some(w.to_string()),
+        (None, Some(a)) => Some(a.to_string()),
+        (None, None) => None,
+    }
+}
+
 pub async fn upsert_daily_agg(store: &Store, agg_key: &str, target_key: &str) -> Result<()> {
     let now = now_secs();
 
@@ -1778,6 +1812,116 @@ fn main() {}",
         assert_eq!(
             fr_after.purpose, "",
             "developer-curated purpose must not be overwritten by doc-capture"
+        );
+    }
+
+    // ── worktree_scope_tag ───────────────────────────────────────────────────
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// A git repo with one commit, ready for `git worktree add`.
+    fn temp_repo_for_worktrees() -> TempDir {
+        let dir = TempDir::new().expect("tempdir");
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.email", "t@t.com"]);
+        run_git(dir.path(), &["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("file.txt"), "hello").expect("write");
+        run_git(dir.path(), &["add", "-A"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    /// The common layout: `git worktree add ../feature`. The worktree's own
+    /// `.git` is a pointer *file*, not a directory, and it has no real `.git`
+    /// directory anywhere in its own ancestry (its sibling relationship to
+    /// the main checkout means walking up never reaches one either).
+    #[test]
+    fn worktree_scope_tag_differs_for_sibling_worktrees() {
+        let main = temp_repo_for_worktrees();
+        let sibling_parent = TempDir::new().expect("tempdir");
+        let wt_path = sibling_parent.path().join("wt");
+        run_git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                wt_path.to_str().unwrap(),
+                "-b",
+                "wt-branch",
+            ],
+        );
+        let main_tag = worktree_scope_tag(main.path()).expect("main tag");
+        let wt_tag = worktree_scope_tag(&wt_path).expect("worktree tag");
+        assert_ne!(
+            main_tag, wt_tag,
+            "a sibling worktree must not share the main checkout's scope"
+        );
+    }
+
+    /// The exact bug case: a worktree nested INSIDE the main repo's directory
+    /// tree (e.g. `.worktrees/<branch>`). A lexical `.git`-file check (as a
+    /// naive walk-up would do) walks past the worktree's own `.git` pointer
+    /// file and lands on the main repo's real `.git` directory, wrongly
+    /// treating the nested worktree as if it were the main checkout.
+    /// `git2::Repository::discover` must not make that mistake.
+    #[test]
+    fn worktree_scope_tag_differs_for_nested_worktree() {
+        let main = temp_repo_for_worktrees();
+        let nested = main.path().join(".worktrees").join("wt");
+        run_git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                nested.to_str().unwrap(),
+                "-b",
+                "nested-branch",
+            ],
+        );
+        let main_tag = worktree_scope_tag(main.path()).expect("main tag");
+        let nested_tag = worktree_scope_tag(&nested).expect("nested tag");
+        assert_ne!(
+            main_tag, nested_tag,
+            "a nested worktree must not share the main checkout's scope"
+        );
+    }
+
+    #[test]
+    fn worktree_scope_tag_is_stable_for_the_same_worktree() {
+        let main = temp_repo_for_worktrees();
+        let a = worktree_scope_tag(main.path());
+        let b = worktree_scope_tag(main.path());
+        assert!(a.is_some());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn worktree_scope_tag_is_none_outside_a_git_repo() {
+        let dir = TempDir::new().expect("tempdir");
+        assert_eq!(worktree_scope_tag(dir.path()), None);
+    }
+
+    #[test]
+    fn combined_actor_scope_precedence() {
+        assert_eq!(combined_actor_scope(None, None), None);
+        assert_eq!(
+            combined_actor_scope(Some("wtA"), None),
+            Some("wtA".to_string())
+        );
+        assert_eq!(
+            combined_actor_scope(None, Some("agent-a")),
+            Some("agent-a".to_string())
+        );
+        assert_eq!(
+            combined_actor_scope(Some("wtA"), Some("agent-a")),
+            Some("wtA:agent-a".to_string())
         );
     }
 }

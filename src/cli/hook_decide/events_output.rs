@@ -144,10 +144,12 @@ pub(crate) async fn fire_events(
     events: &[HookEvent],
     session_id: Option<&str>,
     agent_id: Option<&str>,
+    actor_scope: Option<&str>,
     basis_hash: Option<&str>,
 ) {
     for event in events {
-        let Some(cmd) = session_command(event, session_id, agent_id, basis_hash) else {
+        let Some(cmd) = session_command(event, session_id, agent_id, actor_scope, basis_hash)
+        else {
             continue;
         };
         // Fire-and-forget — drop silently on failure (P9).
@@ -160,10 +162,16 @@ pub(crate) async fn fire_events(
 /// Pure, so the mapping is testable: it decides which enforcement event type
 /// each outcome lands as, and it is where a Codex pre-hook BLOCK was recorded
 /// as the post-bash hook's after-the-fact bypass.
+///
+/// `agent_id` and `actor_scope` diverge on purpose: `agent_id` is bare
+/// subagent attribution (who), `actor_scope` is the worktree-combined
+/// receipt/gate scope (where the evaluation looked). Conflating them would
+/// stamp a worktree hash into the audit trail's human-readable agent field.
 pub(crate) fn session_command(
     event: &HookEvent,
     session_id: Option<&str>,
     agent_id: Option<&str>,
+    actor_scope: Option<&str>,
     basis_hash: Option<&str>,
 ) -> Option<mati_core::mcp::protocol::Command> {
     use mati_core::mcp::protocol as p;
@@ -172,11 +180,11 @@ pub(crate) fn session_command(
     let sid = || session_id.map(str::to_string);
     // Receipt scope, so the daemon can find the receipt that authorized an allow,
     // and the digest of the gotcha state this decision was made on.
-    let scope = || agent_id.map(str::to_string);
+    let scope = || actor_scope.map(str::to_string);
     let basis = || basis_hash.map(str::to_string);
     Some(match event {
         // Receipt scope must match the evaluation scope: the gate was
-        // queried with `actor = agent_id`, so the receipt minted here is
+        // queried with `actor = actor_scope`, so the receipt minted here is
         // scoped the same way. A subagent's Advisory hit must NOT mint a
         // global receipt — receipts are strictly key-scoped in the store
         // (no actor↔global fallback), and a global receipt would satisfy
@@ -184,7 +192,7 @@ pub(crate) fn session_command(
         HookEvent::Hit { key } => p::Command::ConsultationHit(p::ConsultationHitInput {
             key: key.clone(),
             capture_fingerprint: true,
-            actor: agent_id.map(str::to_string),
+            actor: scope(),
             session_id: sid(),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: basis(),

@@ -212,6 +212,7 @@ fn hook_context_hit_records_hook_context_source() {
         None,
         None,
         None,
+        None,
     ) else {
         panic!("HookEvent::Hit must mint a consultation receipt")
     };
@@ -225,9 +226,14 @@ async fn assert_main_thread_receipt_is_global(key: &str) {
     crate::cli::ensure_test_home();
     let dir = tempfile::tempdir().unwrap();
     let store = mati_core::store::Store::open(dir.path()).await.unwrap();
-    let actor = receipt_actor(None, Some("session-main"));
+    // No worktree (tempdir is not a git repo) and no agent: still global scope.
+    let actor = receipt_actor(None, None);
     let staged = mati_core::store::session::consultation_receipt_staged_for_store(
-        &store, key, actor, false, None,
+        &store,
+        key,
+        actor.as_deref(),
+        false,
+        None,
     )
     .await
     .unwrap();
@@ -251,9 +257,8 @@ async fn assert_main_thread_receipt_is_global(key: &str) {
 }
 
 /// Both mint paths derive their actor identically, so one test covers
-/// them. A session_id must not become receipt scope: the gate reads the
-/// global receipt for the main thread, so scoping by session would mint a
-/// receipt nothing ever checks and the policy would never unlock.
+/// them. With no worktree discoverable and no agent, the gate reads the
+/// global receipt for the main thread.
 #[tokio::test]
 async fn main_thread_receipt_uses_global_gate_scope() {
     assert_main_thread_receipt_is_global("schema:orders").await;
@@ -267,11 +272,15 @@ async fn subagent_receipt_stays_actor_scoped() {
     let dir = tempfile::tempdir().unwrap();
     let store = mati_core::store::Store::open(dir.path()).await.unwrap();
     let key = "schema:orders";
-    let actor = receipt_actor(Some("agent-a"), Some("session-main"));
-    assert_eq!(actor, Some("agent-a"));
+    let actor = receipt_actor(None, Some("agent-a"));
+    assert_eq!(actor.as_deref(), Some("agent-a"));
 
     let staged = mati_core::store::session::consultation_receipt_staged_for_store(
-        &store, key, actor, false, None,
+        &store,
+        key,
+        actor.as_deref(),
+        false,
+        None,
     )
     .await
     .unwrap();
@@ -333,6 +342,7 @@ fn codex_pre_hook_block_maps_to_a_block_not_a_bypass() {
         None,
         None,
         None,
+        None,
     )
     .expect("a block must be recorded");
     match cmd {
@@ -366,6 +376,7 @@ fn gate_events_carry_the_basis_hash_and_receipt_scope() {
             key: "file:src/main.rs".into(),
         },
         Some("sess-1"),
+        Some("agent-a"),
         Some("agent-a"),
         Some("deadbeef"),
     )
