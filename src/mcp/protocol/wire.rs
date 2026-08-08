@@ -37,6 +37,7 @@ impl Command {
             Self::DecisionUpsert(_) => "decision_upsert",
             Self::DevNoteUpsert(_) => "dev_note_upsert",
             Self::SessionLog(_) => "session_log",
+            Self::InstructionsLoaded(_) => "instructions_loaded",
             Self::ConsultationHit(_) => "consultation_hit",
             Self::PolicyShadowObserve(_) => "policy_shadow_observe",
             Self::SessionFlush => "session_flush",
@@ -72,6 +73,7 @@ impl Command {
             Self::DecisionUpsert(i) => &i.slug,
             Self::DevNoteUpsert(i) => i.key.as_deref().unwrap_or(""),
             Self::SessionLog(i) => &i.key,
+            Self::InstructionsLoaded(i) => &i.payload.file_path,
             Self::ConsultationHit(i) => &i.key,
             Self::PolicyShadowObserve(i) => &i.policy_key,
             Self::ConfigGet(i) => &i.key,
@@ -113,6 +115,7 @@ impl Command {
             | Self::DecisionUpsert(_)
             | Self::DevNoteUpsert(_)
             | Self::SessionLog(_)
+            | Self::InstructionsLoaded(_)
             | Self::ConsultationHit(_)
             | Self::PolicyShadowObserve(_)
             | Self::ConfigSet(_)

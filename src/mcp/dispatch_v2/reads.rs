@@ -197,6 +197,7 @@ pub(super) fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
 
         // Session-side commands are handled natively — should not reach here.
         Command::SessionLog(_)
+        | Command::InstructionsLoaded(_)
         | Command::ConsultationHit(_)
         | Command::PolicyShadowObserve(_)
         | Command::SessionFlush

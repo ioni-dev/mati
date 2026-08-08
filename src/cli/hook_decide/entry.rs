@@ -36,6 +36,10 @@ pub enum HookVariant {
     /// successful allowlisted database introspection.
     #[value(name = "claude-post-bash")]
     ClaudePostBash,
+    /// Claude Code `InstructionsLoaded`: record the exact ambient instruction
+    /// payload without emitting a hook decision.
+    #[value(name = "claude-instructions-loaded")]
+    ClaudeInstructionsLoaded,
 }
 
 #[derive(Args, Debug)]
@@ -95,9 +99,25 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // timeout path therefore exits the process explicitly after flushing its
     // fail-open log and allow response.
     let mut input_str = String::new();
-    tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut input_str).await?;
+    if let Err(error) =
+        tokio::io::AsyncReadExt::read_to_string(&mut tokio::io::stdin(), &mut input_str).await
+    {
+        if args.variant == HookVariant::ClaudeInstructionsLoaded {
+            log_fail_open_named(
+                "instructions-loaded",
+                "<ambient-context>",
+                &format!("could not read hook payload: {error}"),
+            );
+            return Ok(());
+        }
+        return Err(error.into());
+    }
     let input: serde_json::Value =
         serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
+
+    if args.variant == HookVariant::ClaudeInstructionsLoaded {
+        return run_instructions_loaded(&input).await;
+    }
 
     // apply_patch is multi-file: it parses the patch envelope and evaluates
     // every touched path, so it has its own flow rather than the single-path
@@ -528,5 +548,57 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         std::process::exit(adapter.exit_code);
     }
 
+    Ok(())
+}
+
+/// Record Claude Code's ambient instruction payload. This path deliberately
+/// never emits stdout: `InstructionsLoaded` has no permission decision.
+async fn run_instructions_loaded(input: &serde_json::Value) -> Result<()> {
+    let Some(payload) = decide::parse_instructions_loaded(input) else {
+        log_fail_open_named(
+            "instructions-loaded",
+            "<ambient-context>",
+            "payload did not match the InstructionsLoaded contract",
+        );
+        return Ok(());
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(root) => root,
+        Err(_) => {
+            log_fail_open_named(
+                "instructions-loaded",
+                &payload.file_path,
+                "cannot determine mati root",
+            );
+            return Ok(());
+        }
+    };
+    if !ensure_daemon(&mati_root).await {
+        log_fail_open_named(
+            "instructions-loaded",
+            &payload.file_path,
+            "daemon not running after auto-start",
+        );
+        return Ok(());
+    }
+
+    let command = mati_core::mcp::protocol::Command::InstructionsLoaded(
+        mati_core::mcp::protocol::InstructionsLoadedInput { payload },
+    );
+    if !matches!(
+        super::daemon::daemon_v2(&mati_root, command).await,
+        DaemonResult::Ok(_)
+    ) {
+        log_fail_open_named(
+            "instructions-loaded",
+            "<ambient-context>",
+            "daemon rejected InstructionsLoaded recording",
+        );
+    }
     Ok(())
 }

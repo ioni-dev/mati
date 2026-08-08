@@ -261,6 +261,11 @@ pub enum Command {
     #[serde(rename = "session_log")]
     SessionLog(SessionLogInput),
 
+    /// Record the exact ambient instruction file payload from Claude Code.
+    /// This is internal hook telemetry, not an MCP tool or decision.
+    #[serde(rename = "instructions_loaded")]
+    InstructionsLoaded(InstructionsLoadedInput),
+
     /// Record a consultation hit: receipt + access metrics + daily agg.
     #[serde(rename = "consultation_hit")]
     ConsultationHit(ConsultationHitInput),
