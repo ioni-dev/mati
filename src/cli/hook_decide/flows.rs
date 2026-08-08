@@ -97,13 +97,13 @@ pub(crate) async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
         .get("session_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
-    let actor = receipt_actor(agent_id, session_id);
 
     let cwd = std::env::current_dir()?;
     // Resolve the daemon slug the way the gate does (repo root, not cwd) so the
     // receipt lands in the store the gate will read. The actor scope matches the
     // gate too: agent receipts are scoped, while the main thread (no agent_id)
-    // uses the global receipt.
+    // uses the global receipt — both combined with the worktree scope so a
+    // receipt minted here cannot satisfy a gate in a different worktree.
     let repo_root = discover_repo_root(&cwd);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let mati_root = match mati_root_for(root_for_slug) {
@@ -114,11 +114,14 @@ pub(crate) async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
         return Ok(());
     }
 
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    let actor = receipt_actor(worktree.as_deref(), agent_id);
+
     let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
         mati_core::mcp::protocol::ConsultationHitInput {
             key: key.to_string(),
             capture_fingerprint: true,
-            actor: actor.map(str::to_string),
+            actor,
             session_id: session_id.map(str::to_string),
             agent_id: agent_id.map(str::to_string),
             decision_basis_hash: None,
@@ -167,17 +170,6 @@ pub(crate) async fn run_post_bash_introspection(input: &serde_json::Value) -> Re
         return Ok(());
     }
 
-    let Some(evaluation) = policy_verdicts_for_action(
-        &mati_root,
-        &action,
-        input.get("agent_id").and_then(|value| value.as_str()),
-        "<post-bash>",
-        Some(command),
-    )
-    .await
-    else {
-        return Ok(());
-    };
     let agent_id = input
         .get("agent_id")
         .and_then(|value| value.as_str())
@@ -186,6 +178,20 @@ pub(crate) async fn run_post_bash_introspection(input: &serde_json::Value) -> Re
         .get("session_id")
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty());
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    let actor_scope = receipt_actor(worktree.as_deref(), agent_id);
+
+    let Some(evaluation) = policy_verdicts_for_action(
+        &mati_root,
+        &action,
+        actor_scope.as_deref(),
+        "<post-bash>",
+        Some(command),
+    )
+    .await
+    else {
+        return Ok(());
+    };
     for verdict in evaluation.verdicts {
         if !accepts_db_introspection(&verdict.via) {
             continue;
@@ -196,7 +202,7 @@ pub(crate) async fn run_post_bash_introspection(input: &serde_json::Value) -> Re
                 mati_core::mcp::protocol::ConsultationHitInput {
                     key: verdict.requires_key,
                     capture_fingerprint: false,
-                    actor: receipt_actor(agent_id, session_id).map(str::to_string),
+                    actor: actor_scope.clone(),
                     session_id: session_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
                     decision_basis_hash: None,
@@ -252,13 +258,11 @@ async fn record_wrapped_client_miss(input: &serde_json::Value, action: &decide::
     let _ = daemon_v2(&mati_root, cmd).await;
 }
 
-/// Select the receipt scope shared by the gate and both post-tool mint paths.
-/// Session IDs remain consultation metadata, not receipt scope.
-pub(crate) fn receipt_actor<'a>(
-    agent_id: Option<&'a str>,
-    _session_id: Option<&str>,
-) -> Option<&'a str> {
-    agent_id
+/// Select the receipt scope shared by the gate and both post-tool mint paths:
+/// the worktree tag combined with the subagent id, if any. Session IDs remain
+/// consultation metadata, not receipt scope.
+pub(crate) fn receipt_actor(worktree: Option<&str>, agent_id: Option<&str>) -> Option<String> {
+    mati_core::store::session::combined_actor_scope(worktree, agent_id)
 }
 
 /// Claude's PostToolUse payloads have used both camelCase and snake_case
@@ -386,6 +390,9 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         .get("agent_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    let actor_scope =
+        mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id);
     // Enterprise consult-mandate globs — parity with the single-path flow.
     let consult_globs = consult_globset();
     // (deny key, deny reason, origin). The origin selects the message shape: a
@@ -398,7 +405,7 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         let eval_data = match daemon_result(
             &mati_root,
             "hook_evaluate",
-            serde_json::json!({ "file_key": &file_key, "include_recent": true, "actor": agent_id }),
+            serde_json::json!({ "file_key": &file_key, "include_recent": true, "actor": actor_scope.clone() }),
         )
         .await
         {
@@ -450,7 +457,7 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                 Some(&mati_root),
                 &action,
                 "path",
-                agent_id,
+                actor_scope.as_deref(),
                 "<apply-patch-policy>",
                 None,
                 PolicyEvaluationOptions {
@@ -474,7 +481,7 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
                 if let Some(canon_eval) = match daemon_result(
                     &mati_root,
                     "hook_evaluate",
-                    serde_json::json!({ "file_key": &canon_key, "include_recent": true, "actor": agent_id }),
+                    serde_json::json!({ "file_key": &canon_key, "include_recent": true, "actor": actor_scope.clone() }),
                 )
                 .await
                 {
@@ -534,7 +541,15 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
         // Firing here is what makes a non-denying policy observable at all. A
         // shadow-stage match and a satisfied block both land on this path, and
         // returning early dropped every one of them.
-        fire_events(&mati_root, &events, None, agent_id, None).await;
+        fire_events(
+            &mati_root,
+            &events,
+            None,
+            agent_id,
+            actor_scope.as_deref(),
+            None,
+        )
+        .await;
         return Ok(());
     }
     // Policy denies carry their own actionable instruction; file denies keep the
@@ -569,6 +584,14 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     // 6. Fire compliance events for the blocked files (fire-and-forget).
     // Codex apply_patch: no Claude session_id in the input; agent_id is
     // present only in subagent payloads.
-    fire_events(&mati_root, &events, None, agent_id, None).await;
+    fire_events(
+        &mati_root,
+        &events,
+        None,
+        agent_id,
+        actor_scope.as_deref(),
+        None,
+    )
+    .await;
     std::process::exit(2);
 }

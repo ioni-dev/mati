@@ -230,7 +230,7 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
         // call into this mapper today; without these arms every mem_get /
         // mem_bootstrap call against a Socket-mode `mati serve` panics the
         // rmcp task and surfaces as `Transport closed` to the client.
-        "mem_get" => json!({"type": "mem_get", "key": args["key"]}),
+        "mem_get" => json!({"type": "mem_get", "key": args["key"], "actor": args["actor"]}),
         "mem_bootstrap" => json!({
             "type": "mem_bootstrap",
             "context_files": args.get("context_files").cloned().unwrap_or_else(|| serde_json::json!([])),

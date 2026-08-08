@@ -50,14 +50,18 @@ use mem_set_command::build_mem_set_command;
 #[derive(Clone)]
 pub struct MatiServer {
     root: PathBuf,
+    /// This process's worktree scope, computed once from `mati serve`'s own
+    /// launch cwd (see `worktree_scope_tag`). `None` outside a git repo.
+    worktree_tag: Option<String>,
     pub(crate) tool_router: ToolRouter<Self>,
 }
 
 impl MatiServer {
     /// Construct a socket-backed proxy rooted at `~/.mati/<slug>/`.
-    pub fn with_socket_root(root: PathBuf) -> Self {
+    pub fn with_socket_root(root: PathBuf, worktree_tag: Option<String>) -> Self {
         Self {
             root,
+            worktree_tag,
             tool_router: Self::tool_router(),
         }
     }
@@ -139,8 +143,11 @@ impl MatiServer {
         &self,
         Parameters(params): Parameters<MemGetParams>,
     ) -> Result<String, String> {
-        self.socket_call("mem_get", json!({ "key": params.key }))
-            .await
+        self.socket_call(
+            "mem_get",
+            json!({ "key": params.key, "actor": self.worktree_tag }),
+        )
+        .await
     }
 
     /// Search the knowledge store using BM25 text search or graph traversal.

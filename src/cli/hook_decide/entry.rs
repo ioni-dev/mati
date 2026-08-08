@@ -140,10 +140,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         return run_config_change(&input).await;
     }
 
-    // 1b. Parse agent_id: present only in subagent hook payloads.
-    // Gate actor = agent_id if present, else None (NO session_id fallback).
-    // - Subagent: actor = Some(agent_id) → reads actor-scoped receipt.
-    // - Main thread: actor = None → reads global receipt (unchanged path).
+    // 1b. Parse agent_id: present only in subagent hook payloads. The gate's
+    // receipt scope (`actor_scope`, computed below once `cwd` is known) is
+    // this combined with the worktree tag — NOT agent_id alone, and NOT a
+    // session_id fallback.
     let agent_id = input
         .get("agent_id")
         .and_then(|v| v.as_str())
@@ -187,6 +187,13 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     };
     let repo_root = discover_repo_root(&cwd);
     let repo_root_str = repo_root.as_ref().and_then(|p| p.to_str());
+    // Worktree-scoped receipt key: a consultation minted while operating in
+    // one worktree must not satisfy a gate checked from another (they share
+    // history but not working-tree content). Combined with agent_id so
+    // subagent scoping composes with worktree scoping instead of replacing it.
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    let actor_scope =
+        mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id);
     // Platform limitation: bare relative paths in shell commands (e.g. `cat foo.rs`)
     // resolve against the hook process cwd, which is the repo root when set by
     // Claude Code / Codex. If the platform changes cwd semantics, relative paths
@@ -241,7 +248,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         serde_json::json!({
             "file_key": &file_key,
             "include_recent": include_recent,
-            "actor": agent_id,
+            "actor": actor_scope.clone(),
         }),
     )
     .await
@@ -315,7 +322,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 serde_json::json!({
                     "file_key": &canon_key,
                     "include_recent": include_recent,
-                    "actor": agent_id,
+                    "actor": actor_scope.clone(),
                 }),
             )
             .await
@@ -388,7 +395,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                         serde_json::json!({
                             "file_key": &extra_key,
                             "include_recent": include_recent,
-                            "actor": agent_id,
+                            "actor": actor_scope.clone(),
                         }),
                     )
                     .await
@@ -494,7 +501,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 Some(&mati_root),
                 action,
                 governed_tool,
-                agent_id,
+                actor_scope.as_deref(),
                 "<policy>",
                 raw_command,
                 PolicyEvaluationOptions {
@@ -534,6 +541,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         &adapter.events,
         session_id,
         agent_id,
+        actor_scope.as_deref(),
         adapter.basis_hash.as_deref(),
     )
     .await;

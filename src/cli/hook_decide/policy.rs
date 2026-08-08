@@ -24,11 +24,14 @@ pub(crate) async fn run_fileless_policy(
             return Ok(());
         }
     };
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    let actor_scope =
+        mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id);
     let Some((decision, events)) = evaluate_governed_policy(
         Some(&mati_root),
         action,
         "db_client",
-        agent_id,
+        actor_scope.as_deref(),
         "<fileless-bash>",
         input
             .pointer("/tool_input/command")
@@ -54,7 +57,15 @@ pub(crate) async fn run_fileless_policy(
         eprintln!("{stderr}");
     }
     let session_id = input.get("session_id").and_then(|v| v.as_str());
-    fire_events(&mati_root, &events, session_id, agent_id, None).await;
+    fire_events(
+        &mati_root,
+        &events,
+        session_id,
+        agent_id,
+        actor_scope.as_deref(),
+        None,
+    )
+    .await;
     if exit_code != 0 {
         let _ = std::io::Write::flush(&mut std::io::stderr());
         std::process::exit(exit_code);
@@ -76,7 +87,7 @@ pub(crate) async fn evaluate_governed_policy(
     mati_root: Option<&Path>,
     action: &decide::Action,
     governed_tool: &str,
-    agent_id: Option<&str>,
+    actor_scope: Option<&str>,
     failure_path: &str,
     raw_command: Option<&str>,
     options: PolicyEvaluationOptions,
@@ -93,7 +104,8 @@ pub(crate) async fn evaluate_governed_policy(
         return None;
     }
     let evaluation =
-        policy_verdicts_for_action(mati_root, action, agent_id, failure_path, raw_command).await?;
+        policy_verdicts_for_action(mati_root, action, actor_scope, failure_path, raw_command)
+            .await?;
     let strict = evaluation.verdicts.iter().any(|verdict| verdict.strict);
     let core_verdicts = policy_core_verdicts(
         &evaluation.verdicts,
@@ -190,7 +202,7 @@ pub(crate) fn policy_core_verdicts(
 pub(crate) async fn policy_verdicts_for_action(
     mati_root: &Path,
     action: &decide::Action,
-    agent_id: Option<&str>,
+    actor_scope: Option<&str>,
     failure_path: &str,
     raw_command: Option<&str>,
 ) -> Option<mati_core::mcp::protocol::PolicyEvaluateResult> {
@@ -199,7 +211,7 @@ pub(crate) async fn policy_verdicts_for_action(
         mati_core::mcp::protocol::Command::PolicyEvaluate(
             mati_core::mcp::protocol::PolicyEvaluateInput {
                 action: action.clone(),
-                actor: agent_id.map(str::to_string),
+                actor: actor_scope.map(str::to_string),
                 raw_command: raw_command.map(str::to_string),
             },
         ),

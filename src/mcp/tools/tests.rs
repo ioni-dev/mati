@@ -120,6 +120,7 @@ async fn call_mem_get(
     let ctx = handler_test_ctx();
     let input = crate::mcp::protocol::MemGetInput {
         key: key.to_string(),
+        actor: None,
     };
     let g = graph_arc.read().await;
     match crate::mcp::handlers::handle_mem_get(

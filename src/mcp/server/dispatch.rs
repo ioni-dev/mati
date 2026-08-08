@@ -35,7 +35,10 @@ pub(crate) async fn socket_dispatch(
                 Ok(p) => p,
                 Err(e) => return SocketResponse::err(format!("invalid mem_get args: {e}")),
             };
-            let input = super::protocol::MemGetInput { key: params.key };
+            let input = super::protocol::MemGetInput {
+                key: params.key,
+                actor: None,
+            };
             let ctx = build_v1_dispatch_ctx(repo_root);
             let g = graph.read().await;
             match super::handlers::handle_mem_get(

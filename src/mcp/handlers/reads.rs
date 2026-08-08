@@ -120,7 +120,7 @@ pub(crate) async fn handle_mem_get(
     // 3. Sessions-tree transaction: consultation receipt + audit.
     let receipt = match crate::store::session::consultation_receipt_staged_with_fingerprint(
         &input.key,
-        None,
+        input.actor.as_deref(),
         record
             .as_ref()
             .and_then(crate::store::session::record_content_fingerprint),
