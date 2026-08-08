@@ -1,13 +1,24 @@
 //! Auto-memory import — parse Claude Code's per-project memory directory
-//! into gotcha candidates (F10).
+//! into dev notes (F10).
 //!
 //! Claude Code writes free-form notes to
 //! `~/.claude/projects/<project-slug>/memory/`: an index file `MEMORY.md`
 //! plus one `.md` file per memory, each with `---`-delimited frontmatter and
-//! a markdown body. That channel is model-authored, unconfirmed, and
-//! unscored — this module turns each memory file into a `confirmed: false`
-//! gotcha candidate that flows through `mati review` like any other Layer 0
-//! stub. It never writes back to the source directory.
+//! a markdown body. That channel is model-authored and project-level, not
+//! file-scoped — this module turns each memory file into a `dev_note:*`
+//! record, queryable via `mem_get`/`mem_query` but never injected into
+//! bootstrap and never gated behind `mati review`. It never writes back to
+//! the source directory.
+//!
+//! Earlier versions of this importer (F10, `cacc778`) wrote
+//! `gotcha:auto-memory-*` candidates instead. That was the wrong record
+//! type: unconfirmed gotchas sit in the `mati review` queue, and
+//! confirming one makes it eligible for global bootstrap injection with no
+//! `affected_files` gate, which risked crowding out real gotchas under the
+//! bootstrap token budget. `import_auto_memory` now writes `dev_note:*`
+//! only; see [`crate::store::gotcha_ops::apply_gotcha_tombstone`] callers in
+//! `cli::show::export` for the one-time cleanup of stores that already ran
+//! the old importer.
 //!
 //! The frontmatter shape below was read directly off this project's own
 //! memory directory, not off any spec:
@@ -41,14 +52,14 @@ use anyhow::Result;
 use slugify::slugify;
 
 use crate::store::record::{
-    Category, ConfidenceScore, DeviceId, GotchaRecord, Priority, QualityScore, Record,
-    RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    Category, ConfidenceScore, DeviceId, Priority, QualityScore, Record, RecordLifecycle,
+    RecordSource, RecordVersion, StalenessScore,
 };
 
 /// Result of importing a project's auto-memory directory.
 pub struct AutoMemoryImport {
-    /// One `gotcha:auto-memory-*` candidate record per memory file that
-    /// parsed cleanly.
+    /// One `dev_note:auto-memory-*` record per memory file that parsed
+    /// cleanly.
     pub records: Vec<Record>,
     /// Files that could not be read or carried no usable content, paired
     /// with a human-readable reason. Never aborts the run.
@@ -74,7 +85,7 @@ pub fn auto_memory_dir(project_root: &Path) -> Result<PathBuf> {
         .join("memory"))
 }
 
-/// Parse every memory file in `dir` into a gotcha-candidate record.
+/// Parse every memory file in `dir` into a dev-note record.
 ///
 /// Returns an empty result (not an error) if `dir` doesn't exist — no
 /// auto-memory directory is a normal state, not a failure. `MEMORY.md`
@@ -280,12 +291,12 @@ fn memory_to_record(
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| file_stem.to_string());
     let slug = slugify!(&base_name, max_length = 60);
-    let key = format!("gotcha:auto-memory-{slug}");
+    let key = format!("dev_note:auto-memory-{slug}");
 
     let (rule, reason) = rule_and_reason(parsed);
 
     let value = if reason.is_empty() {
-        rule.clone()
+        rule
     } else {
         format!("{rule} because {reason}")
     };
@@ -295,21 +306,10 @@ fn memory_to_record(
         tags.push(format!("auto-memory:{t}"));
     }
 
-    let gotcha = GotchaRecord {
-        rule,
-        reason,
-        severity: Priority::Normal,
-        affected_files: vec![],
-        ref_url: None,
-        discovered_session: 0,
-        confirmed: false,
-        confirmed_content: Default::default(),
-    };
-
     let mut record = Record {
         key,
         value,
-        category: Category::Gotcha,
+        category: Category::DevNote,
         priority: Priority::Normal,
         tags,
         created_at: now,
@@ -328,7 +328,7 @@ fn memory_to_record(
         source: RecordSource::Import,
         confidence: ConfidenceScore::for_new_record(&RecordSource::Import),
         gap_analysis_score: 0.0,
-        payload: serde_json::to_value(&gotcha).ok(),
+        payload: None,
     };
     record.quality = crate::health::quality::analyze(&record);
     record
@@ -518,7 +518,7 @@ body text here
     // ── memory_to_record / import_auto_memory ───────────────────────────────
 
     #[test]
-    fn memory_to_record_is_unconfirmed_and_tagged() {
+    fn memory_to_record_is_a_dev_note_and_tagged() {
         let parsed = parse_memory_file(SAMPLE).unwrap();
         let record = memory_to_record(
             &parsed,
@@ -527,17 +527,15 @@ body text here
             1,
             1000,
         );
-        assert_eq!(record.category, Category::Gotcha);
-        assert!(record.key.starts_with("gotcha:auto-memory-"));
+        assert_eq!(record.category, Category::DevNote);
+        assert!(record.key.starts_with("dev_note:auto-memory-"));
         assert!(record.tags.contains(&"source:auto-memory".to_string()));
         assert!(record.tags.contains(&"auto-memory:project".to_string()));
-
-        let gotcha: GotchaRecord = record.payload_as().expect("GotchaRecord payload");
         assert!(
-            !gotcha.confirmed,
-            "auto-memory import must never auto-confirm"
+            record.payload.is_none(),
+            "dev notes carry plain text in `value`, no structured payload"
         );
-        assert!(gotcha.affected_files.is_empty());
+        assert!(record.value.contains("GitHub Actions"));
     }
 
     #[test]

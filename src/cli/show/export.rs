@@ -122,14 +122,24 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
 // ── run_import_auto_memory (F10) ─────────────────────────────────────────────
 
 /// Import Claude Code's auto-memory directory (`~/.claude/projects/<slug>/memory/`)
-/// as `confirmed: false` gotcha candidates.
+/// as `dev_note:auto-memory-*` records.
 ///
-/// Never overwrites an existing `gotcha:auto-memory-*` key: a record already
-/// in the store means either a prior import already wrote it, or a developer
-/// has since confirmed, edited, or deleted it through `mati review` — a
-/// re-run must not silently undo that. This makes the command idempotent:
-/// running it twice with no store changes in between imports 0 the second
-/// time.
+/// Never overwrites an existing `dev_note:auto-memory-*` key: a record
+/// already in the store means either a prior import already wrote it, or a
+/// developer has since edited or deleted it — a re-run must not silently
+/// undo that. This makes the command idempotent: running it twice with no
+/// store changes in between imports 0 the second time.
+///
+/// Also sweeps `gotcha:auto-memory-*` records left behind by the earlier
+/// (pre-migration) importer, which wrote this channel as unconfirmed gotcha
+/// candidates. That was the wrong record type: confirming one made it
+/// eligible for global bootstrap injection with no `affected_files` gate,
+/// which could crowd out real gotchas under the bootstrap token budget.
+/// Unconfirmed legacy records are tombstoned via
+/// [`gotcha_ops::apply_gotcha_tombstone`] — the sanctioned mutation path —
+/// on every run. A legacy record a developer already confirmed is left
+/// alone and reported instead: a developer's explicit confirmation is not
+/// something an import should silently undo.
 pub async fn run_import_auto_memory() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let dir = mati_core::analysis::auto_memory_dir(&cwd)?;
@@ -145,9 +155,9 @@ pub async fn run_import_auto_memory() -> Result<()> {
 
     let proxy = super::proxy::StoreProxy::open(&cwd).await?;
 
-    let result: Result<(u64, u64, usize)> = async {
+    let result: Result<(u64, u64, usize, usize, Vec<String>)> = async {
         let existing: std::collections::HashSet<String> = proxy
-            .scan_prefix("gotcha:")
+            .scan_prefix("dev_note:")
             .await?
             .into_iter()
             .map(|r| r.key)
@@ -165,14 +175,22 @@ pub async fn run_import_auto_memory() -> Result<()> {
         }
 
         let (imported, rejected) = import_records_resilient(&proxy, &new_records).await;
-        Ok((imported as u64, rejected as u64, already_present))
+        let (tombstoned, confirmed_keys) = sweep_legacy_gotcha_records(&proxy).await?;
+        Ok((
+            imported as u64,
+            rejected as u64,
+            already_present,
+            tombstoned,
+            confirmed_keys,
+        ))
     }
     .await;
 
-    let (imported, rejected, already_present) = proxy.close_with_result(result).await?;
+    let (imported, rejected, already_present, tombstoned, confirmed_keys) =
+        proxy.close_with_result(result).await?;
 
     println!(
-        "Imported {imported} auto-memory candidate{} from {}.",
+        "Imported {imported} auto-memory note{} from {}.",
         if imported == 1 { "" } else { "s" },
         dir.display()
     );
@@ -191,10 +209,61 @@ pub async fn run_import_auto_memory() -> Result<()> {
             println!("    {}: {reason}", path.display());
         }
     }
+    if tombstoned > 0 {
+        println!(
+            "  {tombstoned} legacy gotcha:auto-memory-* record{} from the old importer tombstoned.",
+            if tombstoned == 1 { "" } else { "s" }
+        );
+    }
+    if !confirmed_keys.is_empty() {
+        println!(
+            "  {} legacy gotcha:auto-memory-* record(s) were confirmed by a developer — left in place:",
+            confirmed_keys.len()
+        );
+        for key in &confirmed_keys {
+            println!("    {key}");
+        }
+        println!("    Review with `mati gotcha delete <key>` if no longer wanted.");
+    }
     if imported > 0 {
-        println!("Run `mati review` to confirm candidates and activate hook enforcement.");
+        println!("Run `mati ls notes` to view them.");
     }
     Ok(())
+}
+
+/// Tombstone unconfirmed `gotcha:auto-memory-*` records left by the
+/// pre-migration importer. Returns `(tombstoned_count, confirmed_keys_left_in_place)`.
+///
+/// Confirmed legacy records are never mutated here — only a developer's own
+/// `mati gotcha delete` removes those. Already-tombstoned records are
+/// skipped (nothing to do).
+async fn sweep_legacy_gotcha_records(
+    proxy: &super::proxy::StoreProxy,
+) -> Result<(usize, Vec<String>)> {
+    use mati_core::store::{GotchaRecord, RecordLifecycle};
+
+    let legacy = proxy.scan_prefix("gotcha:auto-memory-").await?;
+    let mut tombstoned = 0usize;
+    let mut confirmed_keys = Vec::new();
+
+    for record in legacy {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        let Some(gotcha) = record.payload_as::<GotchaRecord>() else {
+            continue;
+        };
+        if gotcha.confirmed {
+            confirmed_keys.push(record.key.clone());
+            continue;
+        }
+        proxy
+            .gotcha_tombstone(&record.key, &gotcha.affected_files)
+            .await?;
+        tombstoned += 1;
+    }
+
+    Ok((tombstoned, confirmed_keys))
 }
 
 /// Import records via the bulk `RecordImport` v2 command. Routes through one
