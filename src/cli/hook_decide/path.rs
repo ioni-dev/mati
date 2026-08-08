@@ -81,6 +81,9 @@ pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> O
         HookVariant::ClaudePostMemGet => None,
         HookVariant::ClaudePostBash => None,
         HookVariant::ClaudeInstructionsLoaded => None,
+        // Handled by `run_file_changed` before the single-path pipeline; its
+        // `file_path` is absolute and needs repo-relative resolution.
+        HookVariant::ClaudeFileChanged => None,
     }
 }
 

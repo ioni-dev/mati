@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Hook and MCP server registration for `.claude/settings.json`.
 ///
 /// Contains two top-level keys:
-/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / InstructionsLoaded / Stop (ARCHITECTURE.md section 10)
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / InstructionsLoaded / SessionStart / FileChanged / Stop (ARCHITECTURE.md section 10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 ///
 /// `timeout` is in SECONDS, and Claude Code's own default is 600. The `4` on the
@@ -158,6 +158,28 @@ const SETTINGS_JSON: &str = r#"{
         ]
       }
     ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/session-start.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/file-changed.sh",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
@@ -213,6 +235,8 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
         "instructions-loaded.sh",
         crate::hooks::instructions_loaded::SCRIPT,
     ),
+    ("session-start.sh", crate::hooks::session_start::SCRIPT),
+    ("file-changed.sh", crate::hooks::file_changed::SCRIPT),
     ("stop.sh", crate::hooks::claude_stop::SCRIPT),
     ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
     ("post-bash.sh", crate::hooks::post_bash::SCRIPT),
@@ -512,7 +536,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 14),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 16),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -526,6 +550,8 @@ mod tests {
         assert!(parsed["hooks"]["SessionEnd"].is_array());
         assert!(parsed["hooks"]["SubagentStart"].is_array());
         assert!(parsed["hooks"]["InstructionsLoaded"].is_array());
+        assert!(parsed["hooks"]["SessionStart"].is_array());
+        assert!(parsed["hooks"]["FileChanged"].is_array());
         assert!(parsed["hooks"]["Stop"].is_array());
         assert!(parsed["hooks"]["ConfigChange"].is_array());
         // MCP server registered with portable bare command.

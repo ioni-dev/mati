@@ -30,6 +30,7 @@ pub mod suggest;
 pub mod supervisor;
 pub mod verify_chain;
 pub mod verify_evidence;
+pub mod watch_paths;
 
 /// Redirect all mati state to a per-process temp dir for bin-crate unit tests.
 ///

@@ -7,6 +7,7 @@
 mod classification;
 mod config_change;
 mod envelope;
+mod file_changed;
 mod instructions_loaded;
 mod json_helpers;
 mod path_extraction;
@@ -22,6 +23,7 @@ pub use classification::{
 };
 pub use config_change::{local_violations, project_violations, ConfigViolation};
 pub use envelope::{extract_apply_patch_files, MAX_APPLY_PATCH_FILES};
+pub use file_changed::{parse_file_changed, FileChangedPayload};
 pub use instructions_loaded::{parse_instructions_loaded, InstructionsLoadedPayload};
 pub use json_helpers::has_file_deleted_signal;
 pub use path_extraction::{extract_file_path, extract_file_paths, normalize_action};

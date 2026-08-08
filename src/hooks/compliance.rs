@@ -29,6 +29,7 @@ use super::codex_pre_bash;
 use super::codex_session_start;
 use super::codex_stop;
 use super::codex_user_prompt;
+use super::file_changed;
 use super::post_compliance;
 use super::post_edit;
 use super::pre_bash;
@@ -36,6 +37,7 @@ use super::pre_compact;
 use super::pre_edit;
 use super::pre_read;
 use super::session_end;
+use super::session_start;
 
 // ─── Test Harness ────────────────────────────────────────────────────────────
 
@@ -213,6 +215,30 @@ impl HookTestHarness {
     fn for_session_end() -> Self {
         Self {
             script_content: session_end::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_session_start() -> Self {
+        Self {
+            script_content: session_start::SCRIPT.to_string(),
+            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
+            mock_responses: HashMap::new(),
+            exclude_binaries: Vec::new(),
+            mock_ping_exit_code: 0,
+            mock_recent_consulted: false,
+            mock_extra_cases: String::new(),
+        }
+    }
+
+    fn for_file_changed() -> Self {
+        Self {
+            script_content: file_changed::SCRIPT.to_string(),
             mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
@@ -879,6 +905,61 @@ fn codex_session_start_emits_active_sentinel() {
         output.stdout
     );
 }
+
+/// 3.05a — SessionStart passes `mati watch-paths` JSON through untouched.
+/// Claude Code starts no file watcher without it, so a mangled or wrapped
+/// payload silently disables every later FileChanged event.
+#[test]
+fn session_start_forwards_watch_paths_json() {
+    let harness = HookTestHarness::for_session_start().with_extra_mock_case(
+        r#"watch-paths) echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","watchPaths":["/repo/src/a.rs"]}}' ;;"#,
+    );
+    let output = harness.run("{}");
+    assert_eq!(output.exit_code, 0);
+    let json: serde_json::Value = serde_json::from_str(output.stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be the hook JSON verbatim: {e}, got: {}",
+            output.stdout
+        )
+    });
+    assert_eq!(
+        json["hookSpecificOutput"]["watchPaths"][0],
+        "/repo/src/a.rs"
+    );
+}
+
+/// 3.05b — A store with nothing to watch must emit nothing, not an empty
+/// object: Claude Code would treat a bare `{}` as a hook response.
+#[test]
+fn session_start_emits_nothing_when_there_is_nothing_to_watch() {
+    let harness = HookTestHarness::for_session_start();
+    let output = harness.run("{}");
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.trim().is_empty(),
+        "no watch paths must mean no stdout, got: {}",
+        output.stdout
+    );
+}
+
+/// 3.05c — FileChanged is pure recording. Any stdout would be parsed as a
+/// hook response for an event that has no decision to make.
+#[test]
+fn file_changed_emits_no_stdout() {
+    let harness = HookTestHarness::for_file_changed();
+    let output = harness
+        .run(r#"{"hook_event_name":"FileChanged","file_path":"/repo/src/a.rs","event":"change"}"#);
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        output.stdout.trim().is_empty(),
+        "FileChanged must inject nothing, got: {}",
+        output.stdout
+    );
+}
+
+// No `exclude_binary("mati")` fail-open case for these two: `build_path`
+// always prepends the dir `write_mock_mati` writes into, so the mock is found
+// regardless and the test would pass without exercising the branch.
 
 /// 3.06 — Codex user-prompt hook exits cleanly with zero injection.
 #[test]

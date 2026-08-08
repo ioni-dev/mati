@@ -1807,3 +1807,52 @@ fn extract_path_keeps_bracketed_route_files() {
         Some("app/[slug]/page.tsx")
     );
 }
+
+// ── FileChanged path resolution ─────────────────────────────────────────────
+
+/// Claude Code echoes `file_path` back in the spelling mati handed to
+/// `watchPaths`, uncanonicalized, while `cwd` is canonical. On macOS that is
+/// `/tmp` vs `/private/tmp` — the lexical compare that made F1 block nothing.
+#[test]
+fn watched_rel_path_survives_the_symlinked_tmp_prefix() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    std::fs::write(root.join("src/a.rs"), "fn main() {}").expect("write");
+
+    let watched = root.join("src/a.rs").display().to_string();
+    assert_eq!(
+        super::entry::watched_rel_path(&watched, root).as_deref(),
+        Some("src/a.rs")
+    );
+
+    // The same file reached through an uncanonicalized prefix must resolve to
+    // the same key, not fall out of the repo.
+    if let Ok(canon_root) = root.canonicalize() {
+        if canon_root != root {
+            assert_eq!(
+                super::entry::watched_rel_path(&watched, &canon_root).as_deref(),
+                Some("src/a.rs"),
+                "an uncanonicalized watch path must still resolve under a canonical root"
+            );
+        }
+    }
+}
+
+#[test]
+fn watched_rel_path_rejects_paths_outside_the_repo() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(super::entry::watched_rel_path("/etc/hosts", dir.path()).is_none());
+}
+
+/// A deleted leaf cannot canonicalize; the lexical strip must still produce
+/// the key so the record can be found.
+#[test]
+fn watched_rel_path_falls_back_for_a_missing_leaf() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let gone = dir.path().join("src/gone.rs").display().to_string();
+    assert_eq!(
+        super::entry::watched_rel_path(&gone, dir.path()).as_deref(),
+        Some("src/gone.rs")
+    );
+}

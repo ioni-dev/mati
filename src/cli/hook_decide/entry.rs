@@ -40,6 +40,10 @@ pub enum HookVariant {
     /// payload without emitting a hook decision.
     #[value(name = "claude-instructions-loaded")]
     ClaudeInstructionsLoaded,
+    /// Claude Code `FileChanged`: reparse a watched file so `content_hash` and
+    /// staleness follow the edit. No decision, no stdout.
+    #[value(name = "claude-file-changed")]
+    ClaudeFileChanged,
 }
 
 #[derive(Args, Debug)]
@@ -110,6 +114,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             );
             return Ok(());
         }
+        if args.variant == HookVariant::ClaudeFileChanged {
+            log_fail_open_named(
+                "file-changed",
+                "<watched-file>",
+                &format!("could not read hook payload: {error}"),
+            );
+            return Ok(());
+        }
         return Err(error.into());
     }
     let input: serde_json::Value =
@@ -117,6 +129,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     if args.variant == HookVariant::ClaudeInstructionsLoaded {
         return run_instructions_loaded(&input).await;
+    }
+
+    if args.variant == HookVariant::ClaudeFileChanged {
+        return run_file_changed(&input).await;
     }
 
     // apply_patch is multi-file: it parses the patch envelope and evaluates
@@ -607,6 +623,85 @@ async fn run_instructions_loaded(input: &serde_json::Value) -> Result<()> {
             "<ambient-context>",
             "daemon rejected InstructionsLoaded recording",
         );
+    }
+    Ok(())
+}
+
+/// Resolve the absolute path Claude Code's watcher reported to the repo-relative
+/// `file:*` key, or `None` when it lands outside the repo.
+///
+/// Claude Code echoes `file_path` back in the exact spelling mati handed to
+/// `watchPaths` and does not canonicalize it, so a lexical compare against a
+/// canonical root is the F1 `/tmp` vs `/private/tmp` trap again. Canonical
+/// containment is tried first; the lexical strip is the fallback for a path
+/// whose leaf no longer exists.
+pub(super) fn watched_rel_path(file_path: &str, repo_root: &Path) -> Option<String> {
+    let raw = Path::new(file_path);
+
+    let canonical = super::sandbox::canonicalize_lenient(repo_root).and_then(|root| {
+        let target = super::sandbox::canonicalize_lenient(raw)?;
+        let rel = target.strip_prefix(&root).ok()?;
+        Some(decide::normalize_path(rel.to_str()?, None))
+    });
+    if canonical.is_some() {
+        return canonical;
+    }
+
+    let rel = raw.strip_prefix(repo_root).ok()?;
+    Some(decide::normalize_path(rel.to_str()?, None))
+}
+
+/// Reparse a watched file after Claude Code's watcher reported a change.
+///
+/// Deliberately never emits stdout: `FileChanged` carries no permission
+/// decision, and the watcher discards output that is not a hook JSON object.
+async fn run_file_changed(input: &serde_json::Value) -> Result<()> {
+    let Some(payload) = decide::parse_file_changed(input) else {
+        log_fail_open_named(
+            "file-changed",
+            "<watched-file>",
+            "payload did not match the FileChanged contract",
+        );
+        return Ok(());
+    };
+    if !payload.drives_reparse() {
+        return Ok(());
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let Some(rel_path) = watched_rel_path(&payload.file_path, root_for_slug) else {
+        // Outside the repo — no `file:*` key can exist for it. Not a fault.
+        return Ok(());
+    };
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(root) => root,
+        Err(_) => {
+            log_fail_open_named("file-changed", &rel_path, "cannot determine mati root");
+            return Ok(());
+        }
+    };
+    if !ensure_daemon(&mati_root).await {
+        log_fail_open_named(
+            "file-changed",
+            &rel_path,
+            "daemon not running after auto-start",
+        );
+        return Ok(());
+    }
+
+    let command = mati_core::mcp::protocol::Command::FileReparse(
+        mati_core::mcp::protocol::FileReparseInput {
+            path: rel_path.clone(),
+        },
+    );
+    if !matches!(
+        super::daemon::daemon_v2(&mati_root, command).await,
+        DaemonResult::Ok(_)
+    ) {
+        log_fail_open_named("file-changed", &rel_path, "daemon rejected the reparse");
     }
     Ok(())
 }
