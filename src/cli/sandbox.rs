@@ -948,7 +948,12 @@ async fn run_clear() -> Result<()> {
     let store = StoreProxy::open(&cwd).await.ok();
     let domain_universe = match &store {
         Some(s) => scan_domain_universe(s).await,
-        None => BTreeSet::new(),
+        None => {
+            // Without the corpus every domain looks like the user's, so clear
+            // would drop the paths, keep the domains, and report a full clear.
+            eprintln!("warning: store unavailable — sandbox.network.deniedDomains left in place");
+            BTreeSet::new()
+        }
     };
     let cleared = clear_from_settings(existing, &repo_root, &domain_universe);
     write_settings_atomic(&path, &cleared)?;
