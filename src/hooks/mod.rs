@@ -10,6 +10,7 @@ pub mod codex_stop;
 pub mod codex_user_prompt;
 pub mod config_change;
 pub mod decide;
+pub mod file_changed;
 pub mod instructions_loaded;
 pub mod policy_match;
 pub mod post_bash;
@@ -22,6 +23,7 @@ pub mod pre_compact;
 pub mod pre_edit;
 pub mod pre_read;
 pub mod session_end;
+pub mod session_start;
 pub mod subagent_start;
 
 #[cfg(test)]

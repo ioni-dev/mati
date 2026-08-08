@@ -589,6 +589,34 @@ new file, and a block does not roll that write back; quitting and restarting
 adopts the changed file. The result is “not adopted this session, and
 recorded,” not durable file protection.
 
+### 10.5 Live freshness (F4)
+
+Staleness and drift are computed at `mati init` time. `FileChanged` gives the health system the event it is otherwise starved of: an edit updates `content_hash` and staleness incrementally, in the daemon, with no rescan. Drift is derived from `content_hash`, so `mati stale` reports a confirmed gotcha as drifted the moment its file changes.
+
+Claude Code starts no file watcher until a `SessionStart` hook returns `hookSpecificOutput.watchPaths`. `mati watch-paths` supplies it: the absolute path of every existing file named by an Active gotcha. That scope is the point — those are the files whose content can invalidate a rule that denies a read. A `file:*` record with no gotcha attached keeps its `mati init` freshness. Absolute paths, `..` escapes, and glob entries such as `src/payments/**` drop out; the set is capped at 512 with a warning naming what was dropped.
+
+The `matcher` field on a `FileChanged` hook entry is a second, static source of watch paths, resolved against the cwd. mati sets none. Matchers do not filter execution for this event — every registered `FileChanged` hook runs for every watched-file event — so a store-driven `watchPaths` and an unmatched hook entry give exact scoping.
+
+The payload, captured live from Claude Code 2.1.223:
+
+```json
+{
+  "session_id": "…",
+  "transcript_path": "…",
+  "cwd": "/private/tmp/repo",
+  "prompt_id": "…",
+  "hook_event_name": "FileChanged",
+  "file_path": "/tmp/repo/src/main.rs",
+  "event": "change"
+}
+```
+
+`file_path` is echoed back in the exact spelling mati handed to `watchPaths` and is *not* canonicalized, while `cwd` is. Comparing the two lexically is the F1 `/tmp` vs `/private/tmp` trap; `watched_rel_path` resolves both sides through `canonicalize_lenient` before stripping the root, with a lexical strip as the fallback. A path outside the repo has no `file:*` key and is dropped.
+
+`event` is a chokidar event: `add`, `change`, or `unlink`. Only `add` and `change` drive a reparse. `unlink` is deliberately ignored — it would set the `FileDeleted` staleness signal and pin the record at the `Tombstone` tier, and `apply_reparse_staleness` only saturates upward, so a save that lands as delete-then-create would suppress that file's context injection for good. Real deletions are still caught by `mati init` and `mati repair`, and step 2 of the decision matrix stats the file live before honouring the signal.
+
+The adapter reuses the existing `FileReparse` command, so the write keeps its audit entry and stays atomic. It emits no stdout: `FileChanged` carries no permission decision. Every failure — unparseable payload, missing mati root, unreachable daemon, rejected reparse — logs one `fail_open.log` entry and exits 0.
+
 ### Sandbox floor (L3, opt-in)
 
 The hook gates above cover the agent's *tool* surface; they cannot reach the shell's *subprocess* surface beyond best-effort command parsing (`cat "$VAR"`, a `python` script, a symlink). For a small crown-jewel tier, `mati sandbox` compiles an **OS-level floor** that closes that gap: confirmed gotchas tagged `crown-jewel` (and `sandbox-deny-read` for secrets) become `sandbox.filesystem.denyWrite`/`denyRead` entries in `.claude/settings.local.json`, enforced by Claude Code's sandbox (Seatbelt on macOS, bubblewrap on Linux/WSL2) across the shell *and every subprocess it spawns*. For a crown-jewel file the shell path is then denied at the OS level, leaving the consultation-gated Read/Edit tools as the only way the agent can touch it (L1 + L3 compose to "reachable only via the gate").

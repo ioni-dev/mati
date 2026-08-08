@@ -192,6 +192,9 @@ enum Commands {
     /// Emit SubagentStart hook JSON — inject mati awareness into a freshly-spawned subagent.
     #[command(hide = true, name = "subagent-context")]
     SubagentContext,
+    /// Emit SessionStart hook JSON — register the files FileChanged should report on.
+    #[command(hide = true, name = "watch-paths")]
+    WatchPaths,
     #[command(hide = true)]
     EditHook {
         /// Repo-relative file path
@@ -445,6 +448,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },
         Commands::SubagentContext => match cli::subagent_context::run_subagent_context().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
+        Commands::WatchPaths => match cli::watch_paths::run_watch_paths().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },
