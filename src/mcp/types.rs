@@ -137,7 +137,24 @@ pub struct MemSetParams {
 
 #[cfg(test)]
 mod tests {
-    use super::MemSetParams;
+    use super::{MemGetParams, MemSetParams};
+
+    /// `decision` carries `#[serde(default)]` so every existing `mem_get`
+    /// caller — which never sends it — keeps deserializing. Losing that
+    /// attribute would break every caller at once; pin it.
+    #[test]
+    fn mem_get_params_decision_defaults_false_when_absent() {
+        let params: MemGetParams = serde_json::from_str(r#"{"key":"file:src/main.rs"}"#).unwrap();
+        assert_eq!(params.key, "file:src/main.rs");
+        assert!(!params.decision);
+    }
+
+    #[test]
+    fn mem_get_params_decision_true_when_present() {
+        let params: MemGetParams =
+            serde_json::from_str(r#"{"key":"file:src/main.rs","decision":true}"#).unwrap();
+        assert!(params.decision);
+    }
 
     /// Regression: the `mem_set` tool schema previously advertised `file:*`
     /// as a writable key pattern and `File` as a valid category, with a full
