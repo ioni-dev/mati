@@ -29,6 +29,7 @@ use clap::{Args, Subcommand};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use mati_core::store::{
     GotchaRecord, PolicyMode, PolicyRecord, PolicyStage, Record, RecordLifecycle,
@@ -62,7 +63,7 @@ pub struct SandboxArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SandboxCommand {
-    /// Compile crown-jewel gotchas into sandbox deny rules (preview, or --apply).
+    /// Compile Claude denies, or prepare non-enforcing Codex profile entries.
     Compile(CompileArgs),
     /// Mark a file's confirmed gotcha crown-jewel, then write the deny floor.
     Protect(ProtectArgs),
@@ -74,12 +75,20 @@ pub enum SandboxCommand {
 
 #[derive(Args, Debug)]
 pub struct CompileArgs {
-    /// Write the rules into .claude/settings.local.json (default: preview only).
+    /// Select Codex's filesystem profile target instead of Claude settings.
+    /// Codex currently parses but does not enforce these entries.
+    #[arg(long)]
+    pub codex: bool,
+    /// Write rules (default: preview only).
     #[arg(long)]
     pub apply: bool,
     /// With --apply, allow removing protections whose crown-jewel tag is gone.
     #[arg(long)]
     pub force: bool,
+    /// Required with --codex --apply: acknowledge that Codex does not enforce
+    /// these entries and that they are written only for future enforcement.
+    #[arg(long)]
+    pub acknowledge_codex_non_enforcement: bool,
 }
 
 #[derive(Args, Debug)]
@@ -617,6 +626,10 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
         );
     }
 
+    if args.codex {
+        return run_compile_codex(&args, &repo_root, &abs, &skipped, &store).await;
+    }
+
     let path = settings_local_path(&repo_root);
     if args.apply {
         materialize(&path, &repo_root, &abs, &domain_universe, true, args.force)?;
@@ -639,6 +652,265 @@ async fn run_compile(args: CompileArgs) -> Result<()> {
         print_preview(&abs, &path);
     }
     Ok(())
+}
+
+const CODEX_PROFILE: &str = "mati";
+
+/// Codex's filesystem profile is a preparation artifact, not an enforcement
+/// floor. Keep this warning in every normal output path that names the target.
+const CODEX_NON_ENFORCEMENT_WARNING: &str =
+    "WARNING: Codex does not currently enforce filesystem deny_read/deny_write entries. ";
+
+async fn run_compile_codex(
+    args: &CompileArgs,
+    repo_root: &Path,
+    abs: &SandboxRules,
+    skipped: &BTreeSet<String>,
+    store: &StoreProxy,
+) -> Result<()> {
+    let path = codex_config_path(repo_root);
+    let codex = codex_rules(abs);
+    println!(
+        "{CODEX_NON_ENFORCEMENT_WARNING}They are written only in preparation for a future runtime that enforces them; they are not active protection."
+    );
+
+    if args.apply && !args.acknowledge_codex_non_enforcement {
+        bail!(
+            "Codex does not currently enforce these entries; refusing --codex --apply without --acknowledge-codex-non-enforcement"
+        );
+    }
+
+    if args.apply {
+        materialize_codex(&path, repo_root, &codex, args.force)?;
+        audit_sandbox(store, "apply-codex-preparation", &codex).await;
+        println!(
+            "Prepared Codex profile [permissions.{CODEX_PROFILE}] with {} deny_write + {} deny_read entries in {} (not enforced by Codex).",
+            codex.deny_write.len(),
+            codex.deny_read.len(),
+            path.display()
+        );
+    } else {
+        if let Ok(existing) = read_codex_config(&path) {
+            for r in drifted_codex_removals(&existing, repo_root, &codex) {
+                eprintln!(
+                    "drift: {r} is in the Codex preparation profile but no longer has a confirmed explicit sandbox tag — `--apply` would remove it"
+                );
+            }
+        }
+        print_codex_preview(&codex, &path, skipped);
+    }
+    Ok(())
+}
+
+fn codex_config_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".codex").join("config.toml")
+}
+
+/// Codex has no credential-mask mode. The same explicit secret tags used by
+/// Claude therefore compile to deny_read, never to a claim of masking.
+fn codex_rules(abs: &SandboxRules) -> SandboxRules {
+    let mut rules = SandboxRules {
+        deny_read: abs.deny_read.clone(),
+        deny_write: abs.deny_write.clone(),
+        ..SandboxRules::default()
+    };
+    rules.deny_read.extend(abs.credentials_deny.iter().cloned());
+    rules.deny_read.extend(abs.credentials_mask.iter().cloned());
+    rules
+}
+
+fn read_codex_config(path: &Path) -> Result<DocumentMut> {
+    if !path.exists() {
+        return Ok(DocumentMut::new());
+    }
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if body.trim().is_empty() {
+        return Ok(DocumentMut::new());
+    }
+    let doc = body.parse::<DocumentMut>().with_context(|| {
+        format!(
+            "{} is not valid TOML — fix or remove it (refusing to overwrite)",
+            path.display()
+        )
+    })?;
+    validate_codex_shape(&doc)?;
+    Ok(doc)
+}
+
+fn validate_codex_shape(doc: &DocumentMut) -> Result<()> {
+    let Some(permissions) = doc.get("permissions") else {
+        return Ok(());
+    };
+    let permissions = permissions
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("Codex config `permissions` is not a table"))?;
+    let Some(profile) = permissions.get(CODEX_PROFILE) else {
+        return Ok(());
+    };
+    let profile = profile.as_table().ok_or_else(|| {
+        anyhow::anyhow!("Codex config `permissions.{CODEX_PROFILE}` is not a table")
+    })?;
+    for key in ["deny_read", "deny_write"] {
+        let Some(item) = profile.get(key) else {
+            continue;
+        };
+        let array = item.as_array().ok_or_else(|| {
+            anyhow::anyhow!("Codex config `permissions.{CODEX_PROFILE}.{key}` is not an array")
+        })?;
+        for entry in array.iter() {
+            if entry.as_str().is_none() {
+                bail!(
+                    "Codex config `permissions.{CODEX_PROFILE}.{key}` contains a non-string entry"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn codex_profile_array(doc: &DocumentMut, key: &str) -> Result<Vec<String>> {
+    let Some(permissions) = doc.get("permissions") else {
+        return Ok(Vec::new());
+    };
+    let permissions = permissions
+        .as_table()
+        .ok_or_else(|| anyhow::anyhow!("Codex config `permissions` is not a table"))?;
+    let Some(profile) = permissions.get(CODEX_PROFILE) else {
+        return Ok(Vec::new());
+    };
+    let profile = profile.as_table().ok_or_else(|| {
+        anyhow::anyhow!("Codex config `permissions.{CODEX_PROFILE}` is not a table")
+    })?;
+    let Some(item) = profile.get(key) else {
+        return Ok(Vec::new());
+    };
+    Ok(item
+        .as_array()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Codex config `permissions.{CODEX_PROFILE}.{key}` is not an array")
+        })?
+        .iter()
+        .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+        .collect())
+}
+
+fn set_codex_owned_array(
+    profile: &mut Table,
+    key: &str,
+    repo_root: &Path,
+    entries: &BTreeSet<String>,
+) {
+    let mut kept = Array::new();
+    if let Some(existing) = profile.get(key).and_then(Item::as_array) {
+        for entry in existing.iter() {
+            if let Some(path) = entry.as_str() {
+                if !is_mati_owned(path, repo_root) {
+                    kept.push(path);
+                }
+            }
+        }
+    }
+    for entry in entries {
+        kept.push(entry.as_str());
+    }
+    profile.insert(key, value(kept));
+}
+
+fn materialize_codex(
+    path: &Path,
+    repo_root: &Path,
+    rules: &SandboxRules,
+    force: bool,
+) -> Result<()> {
+    let mut doc = read_codex_config(path)?;
+    let removals = drifted_codex_removals(&doc, repo_root, rules);
+    if !removals.is_empty() && !force {
+        eprintln!(
+            "Refusing to remove {} Codex preparation entr(y/ies) whose explicit tag is gone:",
+            removals.len()
+        );
+        for removal in &removals {
+            eprintln!("  {removal}");
+        }
+        bail!(
+            "re-add the explicit tag, or pass --force to remove them; Codex still does not enforce these entries"
+        );
+    }
+    for removal in removals {
+        eprintln!("note: removing Codex preparation entry for {removal}");
+    }
+
+    let permissions = doc
+        .entry("permissions")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("Codex config `permissions` is not a table"))?;
+    let profile = permissions
+        .entry(CODEX_PROFILE)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Codex config `permissions.{CODEX_PROFILE}` is not a table")
+        })?;
+    set_codex_owned_array(profile, "deny_read", repo_root, &rules.deny_read);
+    set_codex_owned_array(profile, "deny_write", repo_root, &rules.deny_write);
+    write_toml_atomic(path, &doc)
+}
+
+fn drifted_codex_removals(
+    doc: &DocumentMut,
+    repo_root: &Path,
+    rules: &SandboxRules,
+) -> BTreeSet<String> {
+    let mut removed = BTreeSet::new();
+    for (key, current) in [
+        ("deny_read", &rules.deny_read),
+        ("deny_write", &rules.deny_write),
+    ] {
+        if let Ok(existing) = codex_profile_array(doc, key) {
+            for entry in existing {
+                if is_mati_owned(&entry, repo_root) && !current.contains(&entry) {
+                    removed.insert(entry);
+                }
+            }
+        }
+    }
+    removed
+}
+
+fn write_toml_atomic(path: &Path, doc: &DocumentMut) -> Result<()> {
+    let dir = path.parent().context("Codex config path has no parent")?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_file_name(".config.toml.mati-tmp");
+    std::fs::write(&tmp, doc.to_string().as_bytes())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    Ok(())
+}
+
+fn print_codex_preview(rules: &SandboxRules, path: &Path, skipped: &BTreeSet<String>) {
+    println!(
+        "Codex preparation preview — nothing written. `--codex --apply` writes to {} only with --acknowledge-codex-non-enforcement.",
+        path.display()
+    );
+    if rules.deny_write.is_empty() && rules.deny_read.is_empty() {
+        println!("No explicitly tagged confirmed paths resolve to in-repo Codex deny entries.");
+    }
+    if !rules.deny_write.is_empty() {
+        println!("  [permissions.{CODEX_PROFILE}].deny_write (not enforced by Codex):");
+        for path in &rules.deny_write {
+            println!("    {path}");
+        }
+    }
+    if !rules.deny_read.is_empty() {
+        println!("  [permissions.{CODEX_PROFILE}].deny_read (not enforced by Codex):");
+        for path in &rules.deny_read {
+            println!("    {path}");
+        }
+    }
+    if !skipped.is_empty() {
+        println!("Out-of-repo paths were skipped; Codex preparation remains repo-clamped.");
+    }
 }
 
 /// Scan the store → absolute deny rules, plus out-of-repo skips, the

@@ -129,7 +129,7 @@ enum Commands {
     // ── Infrastructure ───────────────────────────────────────────────────
     /// Install or update agent hooks without a full re-init (safe while daemon is running)
     Hooks(cli::init::HooksArgs),
-    /// Compile crown-jewel gotchas into a Claude Code sandbox deny floor (L3)
+    /// Compile Claude denies or prepare Codex entries (Codex does not currently enforce them)
     Sandbox(cli::sandbox::SandboxArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
