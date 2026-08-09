@@ -123,6 +123,16 @@ impl MatiServer {
         })
     }
 
+    /// Actor scope for a `decision:true` hook_evaluate call, matching the
+    /// shell hook's `receipt_actor(worktree, agent_id)` (src/cli/hook_decide/
+    /// flows.rs) exactly. `${agent_id}` interpolates to `""` on the main
+    /// thread (verified live), never absent, so an empty string is treated
+    /// the same as no agent — not as a literal empty-string actor.
+    fn decision_actor(&self, agent_id: Option<&str>) -> Option<String> {
+        let agent_id = agent_id.filter(|s| !s.is_empty());
+        crate::store::session::combined_actor_scope(self.worktree_tag.as_deref(), agent_id)
+    }
+
     fn hook_allow() -> String {
         json!({
             "hookSpecificOutput": {
@@ -195,13 +205,14 @@ impl MatiServer {
         Parameters(params): Parameters<MemGetParams>,
     ) -> Result<String, String> {
         if params.decision {
+            let actor = self.decision_actor(params.agent_id.as_deref());
             let eval = self
                 .socket_call(
                     "hook_evaluate",
                     json!({
                         "file_key": params.key,
                         "include_recent": false,
-                        "actor": self.worktree_tag,
+                        "actor": actor,
                     }),
                 )
                 .await;

@@ -2207,3 +2207,51 @@ fn hook_decision_body_allows_when_gotcha_does_not_qualify() {
     let body = MatiServer::hook_decision_body(eval);
     assert_eq!(body, MatiServer::hook_allow());
 }
+
+// ── decision actor scope (F11 second half) ──────────────────────────────
+//
+// Verified live against the release binary, not guessed: registering the
+// mcp_tool hook's `input` with `"agent_id": "${agent_id}"` and logging what
+// the probe MCP server actually received showed `"agent_id": ""` for a
+// main-thread Read and a real subagent id (e.g. "aef36aa9aa07ebc82") for a
+// Task-spawned subagent's Read. Before this fix, `decision_actor` did not
+// exist and `mem_get`'s decision branch sent `self.worktree_tag` alone —
+// reproduced live: after the main thread consulted (minting a receipt at
+// the bare worktree scope), an uninvolved subagent's `decision:true` call
+// returned `allow` even though that subagent never called mem_get itself.
+// `combined_actor_scope`'s own combination logic is covered by
+// `combined_actor_scope_precedence` in src/store/session.rs; these tests
+// pin `decision_actor`'s empty-string handling and its call shape, which is
+// the new surface this fix adds.
+
+#[test]
+fn decision_actor_treats_interpolated_empty_agent_id_as_none() {
+    let server =
+        MatiServer::with_socket_root(std::path::PathBuf::new(), Some("wt-tag".to_string()));
+    // "${agent_id}" interpolates to "" on the main thread, never absent.
+    assert_eq!(server.decision_actor(Some("")), Some("wt-tag".to_string()));
+    assert_eq!(server.decision_actor(None), Some("wt-tag".to_string()));
+}
+
+#[test]
+fn decision_actor_combines_worktree_and_subagent_id() {
+    let server =
+        MatiServer::with_socket_root(std::path::PathBuf::new(), Some("wt-tag".to_string()));
+    assert_eq!(
+        server.decision_actor(Some("agentA")),
+        Some("wt-tag:agentA".to_string())
+    );
+}
+
+#[test]
+fn decision_actor_distinguishes_two_subagents() {
+    let server =
+        MatiServer::with_socket_root(std::path::PathBuf::new(), Some("wt-tag".to_string()));
+    // The pre-fix bug: both calls sent the same bare worktree actor, so one
+    // subagent's receipt (or the main thread's) satisfied every other
+    // subagent's gate. Distinct agent ids must now produce distinct scopes.
+    assert_ne!(
+        server.decision_actor(Some("agentA")),
+        server.decision_actor(Some("agentB"))
+    );
+}

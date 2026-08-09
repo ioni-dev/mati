@@ -13,9 +13,19 @@ pub struct MemGetParams {
     /// Namespaced record key (e.g. "file:src/main.rs", "gotcha:inference-async").
     pub key: String,
     /// Prototype mode for Claude's `mcp_tool` hook: return hook JSON instead
-    /// of the record body. Normal callers leave this false.
+    /// of the record body. Normal callers leave this false. Not part of the
+    /// public schema — mati's own scaffold writes it into the hook's `input`,
+    /// the model never supplies it.
     #[serde(default)]
+    #[schemars(skip)]
     pub decision: bool,
+    /// Subagent id, present only when the calling `mcp_tool` hook fired for a
+    /// subagent's tool call (`${agent_id}` interpolation resolves empty on the
+    /// main thread). Combined with the worktree tag for receipt scoping, same
+    /// as the shell hook path. Not part of the public schema.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub agent_id: Option<String>,
 }
 
 /// Parameters for the `mem_query` tool.
@@ -154,6 +164,52 @@ mod tests {
         let params: MemGetParams =
             serde_json::from_str(r#"{"key":"file:src/main.rs","decision":true}"#).unwrap();
         assert!(params.decision);
+    }
+
+    #[test]
+    fn mem_get_params_agent_id_defaults_none_when_absent() {
+        let params: MemGetParams = serde_json::from_str(r#"{"key":"file:src/main.rs"}"#).unwrap();
+        assert_eq!(params.agent_id, None);
+    }
+
+    #[test]
+    fn mem_get_params_agent_id_present_when_sent() {
+        let params: MemGetParams = serde_json::from_str(
+            r#"{"key":"file:src/main.rs","decision":true,"agent_id":"agentA"}"#,
+        )
+        .unwrap();
+        assert_eq!(params.agent_id.as_deref(), Some("agentA"));
+    }
+
+    /// `decision` and `agent_id` are scaffold-only: mati's own hook `input`
+    /// writes them, the model never should. `#[schemars(skip)]` keeps both
+    /// deserializable while dropping them from the generated tool schema —
+    /// verified against the emitted schema, not assumed from the attribute
+    /// name (schemars_derive's own "skip" handling was checked against the
+    /// pinned 1.2.1 source: it excludes the field from `properties` without
+    /// touching the separate `#[derive(Deserialize)]` impl above).
+    #[test]
+    fn mem_get_schema_hides_decision_and_agent_id() {
+        let schema = schemars::schema_for!(MemGetParams);
+        let value = serde_json::to_value(&schema).expect("schema serializes");
+        let properties = value
+            .get("properties")
+            .expect("schema has a properties object")
+            .as_object()
+            .expect("properties is an object");
+
+        assert!(
+            properties.contains_key("key"),
+            "key must remain in the schema"
+        );
+        assert!(
+            !properties.contains_key("decision"),
+            "decision must not appear in the public schema, got: {properties:?}"
+        );
+        assert!(
+            !properties.contains_key("agent_id"),
+            "agent_id must not appear in the public schema, got: {properties:?}"
+        );
     }
 
     /// Regression: the `mem_set` tool schema previously advertised `file:*`
