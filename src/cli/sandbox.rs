@@ -1760,4 +1760,202 @@ mod tests {
         assert_eq!(repo_root_for(&repo).unwrap(), repo_c);
         std::fs::remove_dir_all(&base).ok();
     }
+
+    // ── Codex target (F2) ─────────────────────────────────────────────────────
+
+    #[test]
+    fn codex_rules_folds_credentials_into_deny_read_never_write() {
+        let mut abs = SandboxRules::default();
+        abs.deny_write.insert("/repo/src/fraud.rs".to_string());
+        abs.deny_read.insert("/repo/src/secret.rs".to_string());
+        abs.credentials_deny
+            .insert("/repo/vault/prod.pem".to_string());
+        abs.credentials_mask
+            .insert("/repo/vault/mask.pem".to_string());
+
+        let codex = codex_rules(&abs);
+        assert_eq!(
+            codex.deny_write,
+            BTreeSet::from(["/repo/src/fraud.rs".to_string()])
+        );
+        assert_eq!(
+            codex.deny_read,
+            BTreeSet::from([
+                "/repo/src/secret.rs".to_string(),
+                "/repo/vault/prod.pem".to_string(),
+                "/repo/vault/mask.pem".to_string(),
+            ]),
+            "Codex has no mask mode — both secret tags fold into deny_read"
+        );
+        assert!(
+            codex.credentials_deny.is_empty() && codex.credentials_mask.is_empty(),
+            "codex rules never carry a credentials field"
+        );
+    }
+
+    #[test]
+    fn codex_rules_inherit_out_of_repo_skip_from_shared_resolution() {
+        let base = std::env::temp_dir().join(format!("mati-sbx-codex-skip-{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let mut rel = SandboxRules::default();
+        rel.deny_write.insert("../escape.rs".to_string());
+        rel.deny_write.insert("src/in.rs".to_string());
+        let (abs, skipped) = resolve_rules(&repo, &rel);
+        let codex = codex_rules(&abs);
+
+        assert!(
+            skipped.contains("../escape.rs"),
+            "out-of-repo path recorded as skipped, same as the Claude target"
+        );
+        assert_eq!(codex.deny_write.len(), 1);
+        assert!(
+            codex
+                .deny_write
+                .iter()
+                .all(|p| Path::new(p).starts_with(&repo)),
+            "codex rules only ever see repo-clamped paths"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn validate_codex_shape_rejects_malformed_and_accepts_valid() {
+        let ok = "[permissions.mati]\ndeny_read = [\"x\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(validate_codex_shape(&ok).is_ok());
+
+        let no_permissions = "".parse::<DocumentMut>().unwrap();
+        assert!(validate_codex_shape(&no_permissions).is_ok());
+
+        let bad_permissions = "permissions = \"x\"\n".parse::<DocumentMut>().unwrap();
+        assert!(validate_codex_shape(&bad_permissions).is_err());
+
+        let bad_profile = "[permissions]\nmati = \"x\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(validate_codex_shape(&bad_profile).is_err());
+
+        let bad_array = "[permissions.mati]\ndeny_read = \"x\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(validate_codex_shape(&bad_array).is_err());
+
+        let bad_entry = "[permissions.mati]\ndeny_read = [1]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(validate_codex_shape(&bad_entry).is_err());
+    }
+
+    #[test]
+    fn read_codex_config_rejects_unparsable_toml_on_disk() {
+        let dir = std::env::temp_dir().join(format!("mati-sbx-codex-parse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "not valid toml [[[").unwrap();
+        assert!(read_codex_config(&path).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drifted_codex_removals_flags_dropped_tag_only() {
+        let repo = Path::new("/work/repo");
+        let doc =
+            "[permissions.mati]\ndeny_write = [\"/work/repo/still.rs\", \"/work/repo/dropped.rs\", \"~/.ssh\"]\n"
+                .parse::<DocumentMut>()
+                .unwrap();
+        let mut rules = SandboxRules::default();
+        rules.deny_write.insert("/work/repo/still.rs".to_string());
+        let drift = drifted_codex_removals(&doc, repo, &rules);
+        assert!(
+            drift.contains("/work/repo/dropped.rs"),
+            "tag-dropped entry flagged"
+        );
+        assert!(
+            !drift.contains("/work/repo/still.rs"),
+            "still-protected not flagged"
+        );
+        assert!(!drift.contains("~/.ssh"), "user entry never flagged");
+    }
+
+    #[test]
+    fn materialize_codex_preserves_foreign_keys_and_out_of_repo_entries() {
+        let dir = std::env::temp_dir().join(format!("mati-sbx-codex-mat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Path::new("/work/repo");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[permissions.mati]\ncustom_note = \"keep me\"\ndeny_read = [\"~/.ssh/id_rsa\", \"/work/repo/OLD.pem\"]\n",
+        )
+        .unwrap();
+
+        let mut rules = SandboxRules::default();
+        rules.deny_write.insert("/work/repo/src/new.rs".to_string());
+
+        materialize_codex(&path, repo, &rules, true).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let doc = body.parse::<DocumentMut>().unwrap();
+        let profile = doc["permissions"]["mati"].as_table().unwrap();
+        assert_eq!(
+            profile.get("custom_note").and_then(Item::as_str),
+            Some("keep me"),
+            "a pre-existing, unrelated key in the profile table survives a write"
+        );
+        let deny_read: Vec<&str> = profile
+            .get("deny_read")
+            .and_then(Item::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            deny_read.contains(&"~/.ssh/id_rsa"),
+            "out-of-repo entry preserved"
+        );
+        assert!(
+            !deny_read.contains(&"/work/repo/OLD.pem"),
+            "stale in-repo entry dropped (tag gone)"
+        );
+        let deny_write: Vec<&str> = profile
+            .get("deny_write")
+            .and_then(Item::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(deny_write, vec!["/work/repo/src/new.rs"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn materialize_codex_guard_blocks_drift_unless_forced() {
+        let dir = std::env::temp_dir().join(format!("mati-sbx-codex-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Path::new("/work/repo");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[permissions.mati]\ndeny_write = [\"/work/repo/x.rs\"]\n",
+        )
+        .unwrap();
+        let empty = SandboxRules::default();
+        // guarded + drift + not forced → refuse, file left untouched
+        assert!(materialize_codex(&path, repo, &empty, false).is_err());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("/work/repo/x.rs"));
+        // forced → removes the drifted entry
+        assert!(materialize_codex(&path, repo, &empty, true).is_ok());
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("/work/repo/x.rs"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

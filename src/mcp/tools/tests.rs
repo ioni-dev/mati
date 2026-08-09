@@ -2121,3 +2121,89 @@ fn mem_set_socket_handles_codex_string_payload() {
         _ => panic!("expected GotchaUpsert"),
     }
 }
+
+// ── hook decision body (F11 — mcp_tool prototype transport) ────────────────
+
+#[test]
+fn hook_allow_emits_expected_shape() {
+    let body = MatiServer::hook_allow();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        })
+    );
+}
+
+#[test]
+fn hook_decision_body_denies_for_qualifying_confirmed_gotcha() {
+    // Shape matches hooks::decide's own EnforcementInput fixtures
+    // (make_file_record / make_gotcha in hooks/decide/tests.rs): confirmed
+    // gotcha, confidence >= 0.6, quality >= 0.4 — the ARCHITECTURE.md 10.1 gate.
+    let eval = serde_json::json!({
+        "file_key": "file:src/danger.rs",
+        "file_record": {
+            "value": "danger module",
+            "confidence": { "value": 0.9 },
+            "quality": { "value": 0.9 },
+            "staleness": { "value": 0.1, "tier": "fresh" },
+            "payload": { "gotcha_keys": ["gotcha:danger"] }
+        },
+        "gotcha_records": {
+            "gotcha:danger": {
+                "value": "Never bypass the danger check",
+                "confidence": { "value": 0.8 },
+                "quality": { "value": 0.8 },
+                "payload": { "confirmed": true }
+            }
+        },
+        "consulted": false
+    });
+    let body = MatiServer::hook_decision_body(eval);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    // Exact reason text from hooks::decide::evaluate's Deny arm.
+    assert_eq!(
+        v["hookSpecificOutput"]["permissionDecisionReason"],
+        "[mati] Confirmed gotcha on src/danger.rs — \
+         call mem_get(\"file:src/danger.rs\") and read the record \
+         before accessing this file."
+    );
+}
+
+#[test]
+fn hook_decision_body_allows_when_no_record() {
+    let body = MatiServer::hook_decision_body(serde_json::json!({ "file_key": "file:none.rs" }));
+    assert_eq!(body, MatiServer::hook_allow());
+}
+
+#[test]
+fn hook_decision_body_allows_when_gotcha_does_not_qualify() {
+    // Confirmed, but confidence (0.4) is below the 0.6 threshold — must allow.
+    let eval = serde_json::json!({
+        "file_key": "file:src/weak.rs",
+        "file_record": {
+            "value": "weak module",
+            "confidence": { "value": 0.9 },
+            "quality": { "value": 0.9 },
+            "staleness": { "value": 0.1, "tier": "fresh" },
+            "payload": { "gotcha_keys": ["gotcha:weak"] }
+        },
+        "gotcha_records": {
+            "gotcha:weak": {
+                "value": "Some weak rule",
+                "confidence": { "value": 0.4 },
+                "quality": { "value": 0.8 },
+                "payload": { "confirmed": true }
+            }
+        },
+        "consulted": false
+    });
+    let body = MatiServer::hook_decision_body(eval);
+    assert_eq!(body, MatiServer::hook_allow());
+}

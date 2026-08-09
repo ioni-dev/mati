@@ -857,6 +857,85 @@ mod tests {
     }
 
     #[test]
+    fn settings_template_default_has_only_command_hooks() {
+        let settings = settings_template_with_mcp(false);
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre.len(),
+            3,
+            "shell hooks only — pre-read, pre-bash, pre-edit"
+        );
+        for entry in pre {
+            for hook in entry["hooks"].as_array().unwrap() {
+                assert_eq!(
+                    hook["type"], "command",
+                    "no mcp_tool entry unless mcp_tool is requested"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_template_with_mcp_tool_adds_registration_beside_shell_hook() {
+        let settings = settings_template_with_mcp(true);
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre.len(),
+            4,
+            "the mcp_tool entry is additive, not a replacement"
+        );
+        // Shell pre-read is still first and unchanged.
+        assert_eq!(pre[0]["matcher"], "Read|Glob|Grep");
+        assert_eq!(pre[0]["hooks"][0]["type"], "command");
+        assert_eq!(pre[0]["hooks"][0]["command"], ".claude/hooks/pre-read.sh");
+
+        // Grounded against `mati hooks --claude --claude-mcp-tool`'s actual
+        // written settings.json.
+        let mcp_entry = &pre[3];
+        assert_eq!(mcp_entry["matcher"], "Read|Glob|Grep");
+        let hook = &mcp_entry["hooks"][0];
+        assert_eq!(hook["type"], "mcp_tool");
+        assert_eq!(hook["server"], "mati");
+        assert_eq!(hook["tool"], "mem_get");
+        assert_eq!(hook["input"]["key"], "file:${tool_input.file_path}");
+        assert_eq!(hook["input"]["decision"], true);
+        assert_eq!(hook["timeout"], 4);
+    }
+
+    #[test]
+    fn entry_is_owned_mcp_tool_recognizes_own_entry_not_a_foreign_one() {
+        let owned = serde_json::json!({
+            "matcher": "Read|Glob|Grep",
+            "hooks": [{
+                "type": "mcp_tool",
+                "server": "mati",
+                "tool": "mem_get",
+                "input": { "key": "file:${tool_input.file_path}", "decision": true }
+            }]
+        });
+        assert!(entry_is_owned_mcp_tool(&owned));
+
+        // Negative twin: a user's own mcp_tool entry for an unrelated
+        // server/tool must not be claimed as mati's.
+        let foreign = serde_json::json!({
+            "matcher": "Read",
+            "hooks": [{
+                "type": "mcp_tool",
+                "server": "other-server",
+                "tool": "some_tool"
+            }]
+        });
+        assert!(!entry_is_owned_mcp_tool(&foreign));
+
+        // A plain command hook is not an mcp_tool entry at all.
+        let command = serde_json::json!({
+            "matcher": "Read",
+            "hooks": [{ "type": "command", "command": ".claude/hooks/pre-read.sh" }]
+        });
+        assert!(!entry_is_owned_mcp_tool(&command));
+    }
+
+    #[test]
     fn claude_hook_scripts_prepend_hooks_dir_to_path() {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
