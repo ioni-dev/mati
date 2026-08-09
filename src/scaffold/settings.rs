@@ -263,7 +263,8 @@ fn settings_template_with_mcp(mcp_tool: bool) -> Value {
                     "tool": "mem_get",
                     "input": {
                         "key": "file:${tool_input.file_path}",
-                        "decision": true
+                        "decision": true,
+                        "agent_id": "${agent_id}"
                     },
                     "timeout": 4
                 }]
@@ -899,6 +900,9 @@ mod tests {
         assert_eq!(hook["tool"], "mem_get");
         assert_eq!(hook["input"]["key"], "file:${tool_input.file_path}");
         assert_eq!(hook["input"]["decision"], true);
+        // F11 second half: agent_id must be interpolated too so the mcp_tool
+        // path can compute the same actor scope as the shell hook.
+        assert_eq!(hook["input"]["agent_id"], "${agent_id}");
         assert_eq!(hook["timeout"], 4);
     }
 
