@@ -615,6 +615,16 @@ fn settings_local_path(repo_root: &Path) -> PathBuf {
 async fn run_compile(args: CompileArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = repo_root_for(&cwd)?;
+    if args.codex {
+        println!(
+            "{CODEX_NON_ENFORCEMENT_WARNING}They are written only in preparation for a future runtime that enforces them; they are not active protection."
+        );
+        if args.apply && !args.acknowledge_codex_non_enforcement {
+            bail!(
+                "Codex does not currently enforce these entries; refusing --codex --apply without --acknowledge-codex-non-enforcement"
+            );
+        }
+    }
     let store = StoreProxy::open(&cwd).await?;
     let (abs, skipped, domain_universe, warnings) = compute_rules(&store, &repo_root).await?;
     for w in &warnings {
@@ -670,16 +680,6 @@ async fn run_compile_codex(
 ) -> Result<()> {
     let path = codex_config_path(repo_root);
     let codex = codex_rules(abs);
-    println!(
-        "{CODEX_NON_ENFORCEMENT_WARNING}They are written only in preparation for a future runtime that enforces them; they are not active protection."
-    );
-
-    if args.apply && !args.acknowledge_codex_non_enforcement {
-        bail!(
-            "Codex does not currently enforce these entries; refusing --codex --apply without --acknowledge-codex-non-enforcement"
-        );
-    }
-
     if args.apply {
         materialize_codex(&path, repo_root, &codex, args.force)?;
         audit_sandbox(store, "apply-codex-preparation", &codex).await;
