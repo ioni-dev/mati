@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::graph::edges::EdgeKind;
 use crate::graph::Graph;
+use crate::hooks::decide::{self, Decision, EnforcementInput};
 use crate::store::record::{
     Category, ContextPacket, FileRecord, GotchaRecord, Priority, QualityTier, Record,
     RecordLifecycle, StaleReviewPayload, StalenessTier,
@@ -121,6 +122,56 @@ impl MatiServer {
             None => return Err(json!({ "error": "daemon response missing data" }).to_string()),
         })
     }
+
+    fn hook_allow() -> String {
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow"
+            }
+        })
+        .to_string()
+    }
+
+    fn hook_decision_body(eval: serde_json::Value) -> String {
+        let file_key = eval
+            .get("file_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file:unknown");
+        let rel_path = file_key.strip_prefix("file:").unwrap_or(file_key);
+        let gotcha_records = eval
+            .get("gotcha_records")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let input = EnforcementInput {
+            rel_path: rel_path.to_string(),
+            file_record: eval.get("file_record").filter(|v| !v.is_null()).cloned(),
+            gotcha_records,
+            already_consulted: eval
+                .get("consulted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            file_exists: None,
+        };
+        let reason = match decide::evaluate(&input).decision {
+            Decision::Deny { reason, .. } => Some(reason),
+            _ => None,
+        };
+        match reason {
+            Some(reason) => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason
+                }
+            })
+            .to_string(),
+            None => Self::hook_allow(),
+        }
+    }
 }
 
 #[tool_router]
@@ -143,6 +194,24 @@ impl MatiServer {
         &self,
         Parameters(params): Parameters<MemGetParams>,
     ) -> Result<String, String> {
+        if params.decision {
+            let eval = self
+                .socket_call(
+                    "hook_evaluate",
+                    json!({
+                        "file_key": params.key,
+                        "include_recent": false,
+                        "actor": self.worktree_tag,
+                    }),
+                )
+                .await;
+            return Ok(
+                match eval.and_then(|body| serde_json::from_str(&body).map_err(|e| e.to_string())) {
+                    Ok(data) => Self::hook_decision_body(data),
+                    Err(_) => Self::hook_allow(),
+                },
+            );
+        }
         self.socket_call(
             "mem_get",
             json!({ "key": params.key, "actor": self.worktree_tag }),

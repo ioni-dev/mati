@@ -12,6 +12,10 @@ use serde::Deserialize;
 pub struct MemGetParams {
     /// Namespaced record key (e.g. "file:src/main.rs", "gotcha:inference-async").
     pub key: String,
+    /// Prototype mode for Claude's `mcp_tool` hook: return hook JSON instead
+    /// of the record body. Normal callers leave this false.
+    #[serde(default)]
+    pub decision: bool,
 }
 
 /// Parameters for the `mem_query` tool.

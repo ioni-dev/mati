@@ -1,4 +1,5 @@
 use super::*;
+use mati_core::scaffold::settings::install_hooks_with_options;
 
 // ── Scaffold installation (no store access) ─────────────────────────────────
 
@@ -72,7 +73,7 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
         }
 
         let t = Instant::now();
-        match install_hooks(root) {
+        match install_hooks_with_options(root, args.claude_mcp_tool) {
             Ok(InstallResult::Installed { missing_deps, .. }) => {
                 claude_installed = true;
                 println!(
@@ -103,6 +104,14 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                         claude_hooks.join(", ")
                     );
                     println!("    {g}.claude/CLAUDE.md              knowledge capture + enrichment instructions{r}");
+                    if args.claude_mcp_tool {
+                        println!(
+                            "    {g}experimental mcp_tool              additive prototype; shell pre-read remains the startup-independent path{r}"
+                        );
+                        eprintln!(
+                            "  WARNING: mcp_tool hooks require the Claude MCP server to be connected; they fail open and are not used as the sole enforcement path."
+                        );
+                    }
                 }
                 if !missing_deps.is_empty() {
                     eprintln!();
@@ -213,6 +222,11 @@ pub struct HooksArgs {
     /// Install or update Claude integration into .claude/
     #[arg(long)]
     pub claude: bool,
+
+    /// Also scaffold the experimental Claude mcp_tool hook transport. The
+    /// shell hook remains installed as the startup-independent path.
+    #[arg(long)]
+    pub claude_mcp_tool: bool,
 }
 
 /// Install or update agent hooks without touching the store.
@@ -231,6 +245,7 @@ pub fn run_hooks(args: HooksArgs) -> Result<()> {
         no_hooks: false,
         codex: args.codex,
         claude: args.claude,
+        claude_mcp_tool: args.claude_mcp_tool,
     };
 
     let project_name = root
