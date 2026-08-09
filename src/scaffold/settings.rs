@@ -245,7 +245,31 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
 /// Return the exact project settings template whose hook registrations are
 /// checked by the pure ConfigChange invariant logic.
 pub fn settings_template() -> Value {
-    serde_json::from_str(SETTINGS_JSON).expect("mati scaffold settings template is valid JSON")
+    settings_template_with_mcp(false)
+}
+
+fn settings_template_with_mcp(mcp_tool: bool) -> Value {
+    let mut settings: Value =
+        serde_json::from_str(SETTINGS_JSON).expect("mati scaffold settings template is valid JSON");
+    if mcp_tool {
+        settings["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .expect("PreToolUse scaffold hook list is an array")
+            .push(serde_json::json!({
+                "matcher": "Read|Glob|Grep",
+                "hooks": [{
+                    "type": "mcp_tool",
+                    "server": "mati",
+                    "tool": "mem_get",
+                    "input": {
+                        "key": "file:${tool_input.file_path}",
+                        "decision": true
+                    },
+                    "timeout": 4
+                }]
+            }));
+    }
+    settings
 }
 
 /// Outcome of the hook installation.
@@ -273,6 +297,16 @@ pub enum InstallResult {
 /// - Existing scripts are overwritten (mati owns these files).
 /// - Only proceeds if `.claude/` already exists.
 pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
+    install_hooks_with_options(project_root, false)
+}
+
+/// Install hooks with the optional mcp_tool transport prototype. The shell
+/// hook remains installed even when the prototype is enabled: MCP startup and
+/// daemon readiness are not prerequisites the enforcement path may depend on.
+pub fn install_hooks_with_options(
+    project_root: &Path,
+    mcp_tool_prototype: bool,
+) -> Result<InstallResult> {
     let claude_dir = project_root.join(".claude");
     if !claude_dir.is_dir() {
         return Ok(InstallResult::NoClaude);
@@ -280,7 +314,7 @@ pub fn install_hooks(project_root: &Path) -> Result<InstallResult> {
 
     // Merge hooks into settings.json, preserving existing user settings.
     let settings_path = claude_dir.join("settings.json");
-    merge_hooks_into_settings(&settings_path)
+    merge_hooks_into_settings(&settings_path, mcp_tool_prototype)
         .with_context(|| format!("failed to update {}", settings_path.display()))?;
 
     // Write .mcp.json to project root — Claude Code's primary MCP config location.
@@ -349,11 +383,11 @@ fn mati_server_json() -> Value {
 /// satisfies the invariant writes nothing, so the repair cannot drive an endless
 /// write / `ConfigChange` / repair cycle.
 pub fn restore_mati_entries(path: &Path) -> Result<()> {
-    merge_hooks_into_settings(path)
+    merge_hooks_into_settings(path, false)
 }
 
-fn merge_hooks_into_settings(path: &Path) -> Result<()> {
-    let mut mati_settings: Value = serde_json::from_str(SETTINGS_JSON)?;
+fn merge_hooks_into_settings(path: &Path, mcp_tool_prototype: bool) -> Result<()> {
+    let mut mati_settings = settings_template_with_mcp(mcp_tool_prototype);
     // Bare command name (portable across machines) plus a captured MATI_HOME
     // env when set — see `mati_server_json`.
     mati_settings["mcpServers"]["mati"] = mati_server_json();
@@ -417,9 +451,24 @@ fn merge_hooks(root: &mut serde_json::Map<String, Value>, mati_hooks: &Value) {
             continue;
         };
 
-        existing_entries.retain(|entry| !entry_contains_owned_command(entry, &owned_commands));
+        existing_entries.retain(|entry| {
+            !entry_contains_owned_command(entry, &owned_commands) && !entry_is_owned_mcp_tool(entry)
+        });
         existing_entries.extend(mati_entries.clone());
     }
+}
+
+fn entry_is_owned_mcp_tool(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("type").and_then(Value::as_str) == Some("mcp_tool")
+                    && hook.get("server").and_then(Value::as_str) == Some("mati")
+                    && hook.get("tool").and_then(Value::as_str) == Some("mem_get")
+            })
+        })
 }
 
 fn mati_hook_commands(entries: &[Value]) -> Vec<String> {

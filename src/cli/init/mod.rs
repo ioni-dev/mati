@@ -15,9 +15,7 @@ use mati_core::graph::edges::EdgeKind;
 use mati_core::graph::Graph;
 use mati_core::scaffold::codex::CodexInstallResult;
 use mati_core::scaffold::settings::InstallResult;
-use mati_core::scaffold::{
-    install_codex, install_hooks, write_claude_md_stub, write_mati_enrich_command,
-};
+use mati_core::scaffold::{install_codex, write_claude_md_stub, write_mati_enrich_command};
 use mati_core::store::{
     derive_slug, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
     Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
@@ -64,4 +62,9 @@ pub struct InitArgs {
     /// (auto-detected if .claude/ exists and no flag is given)
     #[arg(long)]
     pub claude: bool,
+
+    /// Also scaffold the experimental Claude mcp_tool hook transport. The
+    /// shell hook remains installed as the startup-independent path.
+    #[arg(long)]
+    pub claude_mcp_tool: bool,
 }
