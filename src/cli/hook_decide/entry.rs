@@ -197,17 +197,20 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         }
     };
 
-    // 3. Resolve repo root via git2 (no subprocess).
+    // 3. Resolve repo identity via git2 (no subprocess) — one discover call,
+    // shared below by repo_root, the worktree tag, and the daemon slug, so
+    // the three can never name different repos (WI: repo-root unification).
     let Ok(cwd) = std::env::current_dir() else {
         return Ok(());
     };
-    let repo_root = discover_repo_root(&cwd);
+    let repo_ident = mati_core::store::RepoIdent::discover(&cwd);
+    let repo_root = discover_repo_root_for(&repo_ident);
     let repo_root_str = repo_root.as_ref().and_then(|p| p.to_str());
     // Worktree-scoped receipt key: a consultation minted while operating in
     // one worktree must not satisfy a gate checked from another (they share
     // history but not working-tree content). Combined with agent_id so
     // subagent scoping composes with worktree scoping instead of replacing it.
-    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    let worktree = mati_core::store::session::worktree_scope_tag_for(&repo_ident);
     let actor_scope =
         mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id);
     // Platform limitation: bare relative paths in shell commands (e.g. `cat foo.rs`)
@@ -220,9 +223,8 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // symlink's real target so the gate still fires.
     let rel_path = decide::normalize_path(&raw_path, repo_root_str);
 
-    // 4. Resolve mati root (for daemon socket). Use repo_root for consistent slug.
-    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
-    let mati_root = match mati_root_for(root_for_slug) {
+    // 4. Resolve mati root (for daemon socket), from the same repo_ident.
+    let mati_root = match mati_root_for_ident(&repo_ident, &cwd) {
         Ok(r) => r,
         Err(_) => {
             log_fail_open(&rel_path, "cannot determine mati root");
@@ -589,9 +591,8 @@ async fn run_instructions_loaded(input: &serde_json::Value) -> Result<()> {
     let Ok(cwd) = std::env::current_dir() else {
         return Ok(());
     };
-    let repo_root = discover_repo_root(&cwd);
-    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
-    let mati_root = match mati_root_for(root_for_slug) {
+    let repo_ident = mati_core::store::RepoIdent::discover(&cwd);
+    let mati_root = match mati_root_for_ident(&repo_ident, &cwd) {
         Ok(root) => root,
         Err(_) => {
             log_fail_open_named(
@@ -670,13 +671,14 @@ async fn run_file_changed(input: &serde_json::Value) -> Result<()> {
     let Ok(cwd) = std::env::current_dir() else {
         return Ok(());
     };
-    let repo_root = discover_repo_root(&cwd);
+    let repo_ident = mati_core::store::RepoIdent::discover(&cwd);
+    let repo_root = discover_repo_root_for(&repo_ident);
     let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
     let Some(rel_path) = watched_rel_path(&payload.file_path, root_for_slug) else {
         // Outside the repo — no `file:*` key can exist for it. Not a fault.
         return Ok(());
     };
-    let mati_root = match mati_root_for(root_for_slug) {
+    let mati_root = match mati_root_for_ident(&repo_ident, &cwd) {
         Ok(root) => root,
         Err(_) => {
             log_fail_open_named("file-changed", &rel_path, "cannot determine mati root");

@@ -82,11 +82,10 @@ pub fn normalize_affected_files(files: &[String]) -> Vec<String> {
 
 /// Resolve the repo root the way the read gate does.
 ///
-/// Mirrors `cli::hook_decide::discover_repo_root`: `git2::Repository::discover`
-/// on the process cwd, with git2's occasional trailing separator stripped so
-/// the prefix match inside `normalize_path` lines up. Every process that writes
-/// gotchas (CLI, `mati daemon`, `mati serve`) runs with its cwd inside the
-/// repo, so cwd discovery gets the same answer the gate gets.
+/// Mirrors `cli::hook_decide::discover_repo_root`: [`crate::store::RepoIdent::discover`]
+/// on the process cwd. Every process that writes gotchas (CLI, `mati daemon`,
+/// `mati serve`) runs with its cwd inside the repo, so cwd discovery gets the
+/// same answer the gate gets.
 ///
 /// The result is then resolved through symlinks to match the entries, which
 /// [`normalize_affected_files`] resolves for the same reason. On Unix this is
@@ -98,8 +97,8 @@ pub fn normalize_affected_files(files: &[String]) -> Vec<String> {
 /// falls back to as well.
 fn discover_repo_root() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    let repo = git2::Repository::discover(&cwd).ok()?;
-    let root = repo.workdir()?.to_str()?.trim_end_matches('/');
+    let root = crate::store::RepoIdent::discover(&cwd).workdir?;
+    let root = root.to_str()?;
     Some(resolve_lenient(root).unwrap_or_else(|| root.to_string()))
 }
 

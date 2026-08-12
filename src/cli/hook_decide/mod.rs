@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::cli::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
+use crate::cli::daemon::{
+    daemon_result, daemon_v2, mati_root_for, mati_root_for_ident, DaemonResult,
+};
 use mati_core::hooks::decide::{self, Decision, EnforcementInput, HookEvent};
 
 mod config;
@@ -37,7 +39,8 @@ pub(super) use flows::{
     ensure_daemon, run_apply_patch, run_post_bash, run_post_bash_introspection, run_post_memget,
 };
 pub(super) use path::{
-    canonical_rel_path, discover_repo_root, extract_path, file_exists_for_deleted_signal,
+    canonical_rel_path, discover_repo_root, discover_repo_root_for, extract_path,
+    file_exists_for_deleted_signal,
 };
 pub(super) use policy::{
     evaluate_governed_policy, merge_policy_result, policy_block_exempt, policy_verdicts_for_action,

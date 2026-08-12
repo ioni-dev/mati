@@ -97,9 +97,9 @@ impl StalenessAnalyzer {
     /// Open the analyzer. `repo_path` is the project root, or any directory
     /// inside it — the git root is discovered upward from there.
     ///
-    /// If no git repo is found, or if the discovered repo disagrees with the
-    /// root the store's slug was keyed on, the analyzer proceeds with
-    /// git_factor = 0.0 and asserts no deletions.
+    /// If no git repo is found there, or the one found is bare (no working
+    /// tree), the analyzer proceeds with git_factor = 0.0 and asserts no
+    /// deletions.
     pub fn new(repo_path: &Path) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -110,20 +110,21 @@ impl StalenessAnalyzer {
     }
 
     fn open_at(repo_path: &Path, now: u64) -> Self {
-        // The root the store's slug was keyed on. Records were written relative
-        // to this, so this is what they must resolve against.
-        let root = crate::store::slug_root(repo_path);
+        // One discover call for both the identity (root) and the live repo
+        // handle this analyzer holds for git operations — see
+        // `RepoIdent::discover_with_repo`.
+        let (ident, discovered) = RepoIdent::discover_with_repo(repo_path);
 
-        // `discover` resolves a `.git` gitlink and `slug_root` does not, so a
-        // submodule or linked worktree makes the two name different repos —
-        // the store is the parent's, the tree is the child's, and every record
-        // path misses. Ground the analyzer only when they agree.
-        let discovered = git2::Repository::discover(repo_path).ok();
-        let workdir = discovered
-            .as_ref()
-            .and_then(|r| r.workdir())
-            .and_then(|w| std::fs::canonicalize(w).ok());
-        let grounded = workdir.as_deref() == Some(root.as_path());
+        // The root the store's slug was keyed on. Records were written
+        // relative to this, so this is what they must resolve against.
+        // `slug_root` is `ident.workdir` — the same value the daemon's own
+        // slug derivation falls back to — so a submodule or linked worktree
+        // can no longer name a different repo than the one `ident` just
+        // discovered: they are the same discovery. Grounded means "a real
+        // working tree was found here", not "two independent computations
+        // happened to agree".
+        let root = ident.slug_root(repo_path);
+        let grounded = ident.workdir.is_some();
 
         let repo = grounded.then_some(discovered).flatten();
         let head_commit = repo.as_ref().and_then(head_commit_sha);

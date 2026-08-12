@@ -20,7 +20,7 @@ use crate::store::record::{
     Category, FileRecord, GotchaRecord, Record, RecordLifecycle, StalenessScore, StalenessSignal,
     StalenessTier,
 };
-use crate::store::Store;
+use crate::store::{RepoIdent, Store};
 
 /// Where a budget-truncated scan stopped, so the next one resumes there.
 ///

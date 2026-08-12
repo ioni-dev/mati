@@ -8,10 +8,13 @@ pub async fn run_daemon_start() -> Result<()> {
     let startup_t0 = std::time::Instant::now();
 
     let cwd = std::env::current_dir()?;
-    // Compute mati_root separately so we can write the starting sentinel before
-    // Store::open (which may fail). The sentinel tells `mati init` that a daemon
-    // is starting and the store lock may be held imminently.
-    let mati_root = mati_root_for(&cwd)?;
+    // One discover call grounds both `mati_root` (the slug) and `repo_root`
+    // (below) in the same git identity. Computed separately from Store::open
+    // so we can write the starting sentinel before it (which may fail). The
+    // sentinel tells `mati init` that a daemon is starting and the store
+    // lock may be held imminently.
+    let repo_ident = RepoIdent::discover(&cwd);
+    let mati_root = mati_root_for_ident(&repo_ident, &cwd)?;
 
     // 1. Ensure runtime directory exists with correct permissions (0700).
     mati_core::mcp::metadata::ensure_runtime_dir(&mati_root)?;
@@ -96,14 +99,12 @@ pub async fn run_daemon_start() -> Result<()> {
         let _ = std::fs::remove_file(&starting_path);
     };
 
-    let repo_root = Arc::new(std::fs::canonicalize(&cwd).inspect_err(|e| {
-        mati_core::mcp::metadata::record_lifecycle_event(
-            &mati_root,
-            "serve_failed",
-            &format!("canonicalize cwd: {e}"),
-        );
-        cleanup_sentinel();
-    })?);
+    // Git-grounded, not raw cwd: `repo_ident.slug_root` is the same value
+    // `mati_root`'s slug falls back to when the repo has no remote, so this
+    // can never name a different repo than the store it just resolved —
+    // unlike a bare `canonicalize(cwd)`, which knows nothing about gitlinks
+    // (submodules, linked worktrees) and previously could.
+    let repo_root = Arc::new(repo_ident.slug_root(&cwd));
 
     // Phase: opening_store. Migration (if pending) runs inside Store::open and
     // emits its own granular events; see `src/store/migrations.rs::migrate`.

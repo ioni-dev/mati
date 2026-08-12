@@ -91,23 +91,25 @@ pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> O
 
 /// Discover the git repo root via git2. Returns `None` for bare repos or
 /// when not inside a git repository. No subprocess spawned.
-///
-/// Note: `repo.workdir()` may return a path with a trailing separator
-/// (e.g. `/path/to/repo/`). We strip it so that `derive_slug()` produces
-/// the same hash as `std::env::current_dir()` (which omits it). Without
-/// this, repos without a remote URL get different slugs from `hook-decide`
-/// vs `mati init`/`mati daemon`, causing daemon socket discovery to fail.
 pub(crate) fn discover_repo_root(cwd: &Path) -> Option<PathBuf> {
-    git2::Repository::discover(cwd).ok().and_then(|repo| {
-        // Strip the trailing separator that git2's workdir() sometimes adds.
-        // `to_str` (NOT `to_string_lossy`): a non-UTF-8 root would be
-        // silently rewritten with U+FFFD — a valid-looking but WRONG path,
-        // producing a wrong slug and wrong store keys (a permanent, silent
-        // gate miss). Returning None instead falls back to cwd-based
-        // resolution, which is at least honest about not knowing the root.
-        let root = repo.workdir()?.to_str()?.trim_end_matches('/');
-        Some(PathBuf::from(root))
-    })
+    discover_repo_root_for(&mati_core::store::RepoIdent::discover(cwd))
+}
+
+/// [`discover_repo_root`] for a caller that already discovered a
+/// [`mati_core::store::RepoIdent`] this invocation — avoids a second
+/// `git2::Repository::discover` call for the same repo (see
+/// `entry::run_inner`).
+///
+/// `to_str` (NOT `to_string_lossy`): a non-UTF-8 root would be silently
+/// rewritten with U+FFFD — a valid-looking but WRONG path, producing a wrong
+/// slug and wrong store keys (a permanent, silent gate miss). Returning
+/// `None` instead falls back to cwd-based resolution, which is at least
+/// honest about not knowing the root. `RepoIdent` already strips the
+/// trailing separator git2's `workdir()` sometimes adds, so `derive_slug()`
+/// hashes the same string `std::env::current_dir()` would produce.
+pub(crate) fn discover_repo_root_for(ident: &mati_core::store::RepoIdent) -> Option<PathBuf> {
+    let root = ident.workdir.as_ref()?.to_str()?;
+    Some(PathBuf::from(root))
 }
 
 /// WI-20: compute the CANONICAL repo-relative key for the symlink-bypass

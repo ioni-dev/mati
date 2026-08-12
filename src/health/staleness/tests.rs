@@ -861,8 +861,7 @@ async fn missing_file_is_not_tombstoned_without_a_git_root() {
 
 /// Build a repo at `parent` with a child directory whose `.git` is a gitlink
 /// *file* rather than a directory — the on-disk shape of a submodule and of a
-/// linked worktree. `git2` resolves the link; `slug_root`'s `.git/config` walk
-/// does not, and lands on `parent`.
+/// linked worktree. `git2` resolves the link to the child's own root.
 fn make_gitlink_child(parent: &Path) -> PathBuf {
     git2::Repository::init(parent).unwrap();
     let child = parent.join("sub");
@@ -880,24 +879,26 @@ fn make_gitlink_child(parent: &Path) -> PathBuf {
     child
 }
 
-/// The store is keyed on the slug root, so records were written relative to
-/// it. When `git2` names a different repo the analyzer is pointed at a tree
-/// the records do not describe, and must assert nothing.
+/// The store's slug and the analyzer's root now derive from the same
+/// [`crate::store::RepoIdent`] discovery, so a gitlink child (submodule or
+/// linked worktree) is grounded to ITSELF, not the parent — the fix for the
+/// 43-of-43 tombstone storm, where a daemon whose CWD sat inside a submodule
+/// opened the parent's store while resolving paths against the child's tree.
 #[tokio::test]
-async fn a_gitlink_child_is_not_grounded() {
+async fn a_gitlink_child_is_grounded_to_itself() {
     let dir = TempDir::new().unwrap();
     let child = make_gitlink_child(dir.path());
 
     let analyzer = StalenessAnalyzer::new_with_now(&child, 2_000_000);
 
     assert!(
-        !analyzer.root_from_git,
-        "slug root and git workdir name different repos"
+        analyzer.root_from_git,
+        "the child has its own working tree — git2 must ground it"
     );
     assert_eq!(
         analyzer.root,
-        std::fs::canonicalize(dir.path()).unwrap(),
-        "root must be the one the store's slug was keyed on"
+        std::fs::canonicalize(&child).unwrap(),
+        "root must be the child's own workdir, not the parent's"
     );
 }
 
@@ -915,10 +916,12 @@ async fn a_plain_repo_is_grounded() {
     assert_eq!(analyzer.root, std::fs::canonicalize(dir.path()).unwrap());
 }
 
-/// An ungrounded root sees every path as missing. It must not turn that into
-/// a deletion — that is the 43-of-43 tombstone storm.
+/// Grounded to itself (see the test above), the child can now correctly
+/// detect a path missing from ITS OWN tree — before the fix this analysis
+/// was permanently disabled for any submodule or linked worktree, because
+/// the analyzer could never ground to a child in the first place.
 #[tokio::test]
-async fn a_gitlink_child_asserts_no_deletions() {
+async fn a_gitlink_child_asserts_deletions_in_its_own_tree() {
     let dir = TempDir::new().unwrap();
     let child = make_gitlink_child(dir.path());
     let store = Store::open(dir.path()).await.unwrap();
@@ -932,8 +935,8 @@ async fn a_gitlink_child_asserts_no_deletions() {
         .await
         .unwrap();
 
-    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
-    assert!(!record
+    assert_eq!(record.staleness.tier, StalenessTier::Tombstone);
+    assert!(record
         .staleness
         .signals
         .iter()
@@ -942,9 +945,10 @@ async fn a_gitlink_child_asserts_no_deletions() {
     store.close().await.unwrap();
 }
 
-/// An ungrounded root cannot clear a standing `FileDeleted` either — it
-/// cannot prove the file exists. Leave the record exactly as it stands
-/// rather than letting the factor formula quietly de-escalate it.
+/// The gitlink child is grounded to itself now, but `src/gone.rs` genuinely
+/// does not exist in its own tree either, so a standing `FileDeleted` is
+/// correctly left in place — same outcome as the pre-fix "ungrounded, so
+/// leave it alone" case, for a different and now more precise reason.
 #[tokio::test]
 async fn an_ungrounded_root_leaves_a_standing_deletion_alone() {
     let dir = TempDir::new().unwrap();

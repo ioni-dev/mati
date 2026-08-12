@@ -21,7 +21,7 @@ mod tree;
 mod tests;
 
 pub use history::HistoryEntry;
-pub use slug::{derive_slug, slug_root};
+pub use slug::{derive_slug, slug_root, RepoIdent};
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

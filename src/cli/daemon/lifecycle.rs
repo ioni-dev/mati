@@ -73,7 +73,15 @@ pub(super) fn check_starting_peer_active(mati_root: &Path) -> bool {
 /// Public so `hooks.rs` and `init.rs` can compute the socket/PID path without
 /// duplicating the slug derivation logic.
 pub fn mati_root_for(cwd: &Path) -> Result<PathBuf> {
-    let slug = derive_slug(cwd);
+    mati_root_for_ident(&RepoIdent::discover(cwd), cwd)
+}
+
+/// [`mati_root_for`] for a caller that already discovered a [`RepoIdent`]
+/// this invocation — avoids a second `git2::Repository::discover` call for
+/// the same repo (see `cli::hook_decide::entry::run_inner` and
+/// `run_daemon_start`).
+pub fn mati_root_for_ident(ident: &RepoIdent, fallback: &Path) -> Result<PathBuf> {
+    let slug = ident.slug(fallback);
     // Single source of truth for the mati root — honors `$MATI_HOME` so the
     // daemon socket/root resolves to the same place `Store::open` writes.
     Ok(mati_core::store::mati_home()?.join(slug))

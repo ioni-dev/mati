@@ -564,6 +564,25 @@ fn slug_differs_for_different_paths() {
     assert_ne!(a, b, "distinct paths must produce distinct slugs");
 }
 
+/// Pins the property that matters most: this repo's own slug must not move.
+/// A slug change silently strands the existing store — `mati status` goes
+/// empty with no explanation. This repo's slug is `7b63ddee` =
+/// SHA-256(`https://github.com/ioni-dev/mati.git`)[..4], and its `.git` is a
+/// real directory (the common case, not a gitlink). If this fails, the slug
+/// algorithm moved and the change must stop here, not land.
+#[test]
+fn this_repos_own_slug_is_pinned() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert_eq!(derive_slug(manifest_dir), "7b63ddee");
+}
+
+/// A real repo (not a hand-rolled `.git/config`) with a real remote, set via
+/// `git2` the way `git remote add` would.
+fn init_repo_with_remote(dir: &Path, url: &str) {
+    let repo = git2::Repository::init(dir).unwrap();
+    repo.remote("origin", url).unwrap();
+}
+
 #[test]
 fn slug_uses_remote_url_not_local_path() {
     // Verify the slug is actually derived from the URL, not the filesystem path.
@@ -575,13 +594,7 @@ fn slug_uses_remote_url_not_local_path() {
     };
 
     let dir = tempfile::TempDir::new().unwrap();
-    let git_dir = dir.path().join(".git");
-    std::fs::create_dir_all(&git_dir).unwrap();
-    std::fs::write(
-        git_dir.join("config"),
-        format!("[remote \"origin\"]\n\turl = {url}\n"),
-    )
-    .unwrap();
+    init_repo_with_remote(dir.path(), url);
 
     let actual_slug = derive_slug(dir.path());
     assert_eq!(
@@ -606,13 +619,7 @@ fn slug_uses_remote_url_not_local_path() {
 fn slug_is_stable_for_identical_remote_urls() {
     let make_repo = |url: &str| {
         let dir = tempfile::TempDir::new().unwrap();
-        let git_dir = dir.path().join(".git");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::write(
-            git_dir.join("config"),
-            format!("[remote \"origin\"]\n\turl = {url}\n"),
-        )
-        .unwrap();
+        init_repo_with_remote(dir.path(), url);
         (derive_slug(dir.path()), dir)
     };
     let (slug_a, _dir_a) = make_repo("https://github.com/example/same-repo.git");
@@ -627,13 +634,7 @@ fn slug_is_stable_for_identical_remote_urls() {
 fn slug_differs_for_different_remote_urls() {
     let make_repo = |url: &str| {
         let dir = tempfile::TempDir::new().unwrap();
-        let git_dir = dir.path().join(".git");
-        std::fs::create_dir_all(&git_dir).unwrap();
-        std::fs::write(
-            git_dir.join("config"),
-            format!("[remote \"origin\"]\n\turl = {url}\n"),
-        )
-        .unwrap();
+        init_repo_with_remote(dir.path(), url);
         (derive_slug(dir.path()), dir)
     };
     let (slug_a, _dir_a) = make_repo("https://github.com/org/repo-alpha.git");
@@ -642,6 +643,174 @@ fn slug_differs_for_different_remote_urls() {
         slug_a, slug_b,
         "different remote URLs must produce different slugs"
     );
+}
+
+#[test]
+fn slug_of_a_real_repo_without_a_remote_hashes_the_same_workdir_slug_root_returns() {
+    let dir = tempfile::TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+
+    let root = slug_root(dir.path());
+    let expected = {
+        let input = root.to_string_lossy().into_owned();
+        let digest = Sha256::digest(input.as_bytes());
+        hex::encode(&digest[..4])
+    };
+    assert_eq!(
+        derive_slug(dir.path()),
+        expected,
+        "the no-remote fallback must hash exactly what slug_root returns"
+    );
+}
+
+/// A `.git` that is itself a symlink: verified against `git2` 0.21 (not
+/// assumed), `repo.workdir()` resolves fully through it — it returns the
+/// symlink's target directory, not the directory the repo was accessed
+/// from. libgit2 exposes no un-resolved alternative, so hashing
+/// `workdir()` (per the fix's design) ends up hashing the TARGET here, and
+/// a repo reached through a symlinked `.git` shares its slug with the
+/// target's own directory. That is arguably correct (one underlying git
+/// storage location, one identity) even though it means the "keeps its
+/// current slug" framing does not hold for this specific shape — flagged
+/// in the change that introduced this test, not silently assumed.
+#[cfg(unix)]
+#[test]
+fn slug_of_a_repo_whose_git_is_a_symlink_matches_the_targets_own_slug() {
+    let workdir = tempfile::TempDir::new().unwrap();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    git2::Repository::init(elsewhere.path()).unwrap();
+
+    std::os::unix::fs::symlink(elsewhere.path().join(".git"), workdir.path().join(".git")).unwrap();
+
+    assert_eq!(
+        derive_slug(workdir.path()),
+        derive_slug(elsewhere.path()),
+        "workdir() resolves through a symlinked .git to the target, so both \
+         access paths must hash to the same slug"
+    );
+    // And neither leaks unrelated git-internal layout: the shared slug is
+    // exactly the hash of the (resolved) workdir, matching slug_root.
+    assert_eq!(
+        derive_slug(workdir.path()),
+        derive_slug(&slug_root(workdir.path()))
+    );
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed in {dir:?}");
+}
+
+/// A git repo with a remote and one commit, ready for `git worktree add`.
+fn temp_repo_with_remote_for_worktrees(url: &str) -> TempDir {
+    let dir = TempDir::new().expect("tempdir");
+    run_git(dir.path(), &["init", "-q"]);
+    run_git(dir.path(), &["config", "user.email", "t@t.com"]);
+    run_git(dir.path(), &["config", "user.name", "t"]);
+    run_git(dir.path(), &["remote", "add", "origin", url]);
+    std::fs::write(dir.path().join("file.txt"), "hello").expect("write");
+    run_git(dir.path(), &["add", "-A"]);
+    run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+    dir
+}
+
+/// Linked worktrees share history (and `commondir`), so they must share a
+/// slug — and therefore a store — while each still resolves record paths
+/// against its own physical checkout.
+#[test]
+fn slug_is_shared_by_an_external_linked_worktree() {
+    let main = temp_repo_with_remote_for_worktrees("https://github.com/example/wt-repo.git");
+    let sibling_parent = TempDir::new().expect("tempdir");
+    let wt_path = sibling_parent.path().join("wt");
+    run_git(
+        main.path(),
+        &[
+            "worktree",
+            "add",
+            wt_path.to_str().unwrap(),
+            "-b",
+            "wt-branch",
+        ],
+    );
+
+    assert_eq!(
+        derive_slug(main.path()),
+        derive_slug(&wt_path),
+        "a linked worktree must share the main checkout's slug"
+    );
+    assert_ne!(
+        slug_root(main.path()),
+        slug_root(&wt_path),
+        "but each worktree still resolves record paths against its own workdir"
+    );
+}
+
+/// The nested case: a worktree living inside the main checkout's own
+/// directory tree (e.g. `.worktrees/<branch>`). Must share the slug for the
+/// same reason as the external case above.
+#[test]
+fn slug_is_shared_by_a_worktree_nested_inside_the_main_checkout() {
+    let main = temp_repo_with_remote_for_worktrees("https://github.com/example/nested-wt.git");
+    let nested = main.path().join(".worktrees").join("wt");
+    run_git(
+        main.path(),
+        &[
+            "worktree",
+            "add",
+            nested.to_str().unwrap(),
+            "-b",
+            "nested-branch",
+        ],
+    );
+
+    assert_eq!(derive_slug(main.path()), derive_slug(&nested));
+}
+
+/// A bare repo has no working tree. `slug_root` must fall back to the bare
+/// repo's OWN location and never walk past it into an enclosing repo — a
+/// bare clone nested under an unrelated working repo must not inherit that
+/// repo's slug or store.
+#[test]
+fn slug_root_of_a_bare_repo_falls_back_to_its_own_path_not_an_ancestor() {
+    let parent = TempDir::new().unwrap();
+    init_repo_with_remote(parent.path(), "https://github.com/example/parent.git");
+
+    let bare = parent.path().join("bare.git");
+    git2::Repository::init_bare(&bare).unwrap();
+
+    assert_eq!(
+        slug_root(&bare),
+        std::fs::canonicalize(&bare).unwrap(),
+        "a bare repo's slug_root must be its own location"
+    );
+    assert_ne!(
+        derive_slug(&bare),
+        derive_slug(parent.path()),
+        "a bare repo without its own remote must not collide with an \
+         enclosing repo's slug"
+    );
+}
+
+/// A bare mirror with its own remote gets the same slug a working clone of
+/// that remote would — the bare/non-bare distinction only matters for
+/// `slug_root` (no working tree to resolve paths against).
+#[test]
+fn slug_of_a_bare_repo_with_a_remote_hashes_the_remote() {
+    let dir = TempDir::new().unwrap();
+    let url = "https://github.com/example/bare-mirror.git";
+    git2::Repository::init_bare(dir.path()).unwrap();
+    let mut cfg = git2::Config::open(&dir.path().join("config")).unwrap();
+    cfg.set_str("remote.origin.url", url).unwrap();
+
+    let expected = {
+        let digest = Sha256::digest(url.as_bytes());
+        hex::encode(&digest[..4])
+    };
+    assert_eq!(derive_slug(dir.path()), expected);
 }
 
 // ─── prefix_end edge cases ─────────────────────────────────────────────────
@@ -966,7 +1135,11 @@ fn slug_with_git_config_but_no_url_line_falls_back_to_path() {
     let dir = tempfile::TempDir::new().unwrap();
     let git_dir = dir.path().join(".git");
     std::fs::create_dir_all(&git_dir).unwrap();
-    // Valid .git/config, but no `url =` line — read_remote_url returns None.
+    // A hand-rolled `.git/config` with no HEAD/objects/refs is not a repo
+    // git2 recognizes at all (confirmed: even the `git` CLI refuses it) — so
+    // this hits the same "no repo found" fallback as no `.git` whatsoever,
+    // not the "repo found, no remote" branch (see the real-repo variant of
+    // this test above).
     std::fs::write(
         git_dir.join("config"),
         "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n",
@@ -974,15 +1147,16 @@ fn slug_with_git_config_but_no_url_line_falls_back_to_path() {
     .unwrap();
 
     let slug = derive_slug(dir.path());
-    // derive_slug canonicalizes first (resolves /var → /private/var on macOS)
-    // before falling back to the path hash, so the expected input must match.
     let expected = {
         let canon = std::fs::canonicalize(dir.path()).unwrap();
         let input = canon.to_string_lossy().into_owned();
         let digest = Sha256::digest(input.as_bytes());
         hex::encode(&digest[..4])
     };
-    assert_eq!(slug, expected, "no url= line must fall back to path hash");
+    assert_eq!(
+        slug, expected,
+        "an unrecognizable .git must fall back to the canonicalized path hash"
+    );
 }
 
 #[test]
@@ -999,26 +1173,77 @@ fn slug_with_no_git_dir_falls_back_to_path() {
     assert_eq!(slug, expected);
 }
 
-/// A `.git` *file* — the on-disk shape of a submodule and of a linked
-/// worktree — is not a boundary to this walk, so both the slug and
-/// `slug_root` resolve to the parent repo. That is the documented behaviour,
-/// not an accident: `StalenessAnalyzer` relies on it to detect that `git2`
-/// disagrees with it. Change this and the analyzer's guard goes quiet.
-#[test]
-fn slug_root_walks_past_a_gitlink_file_to_the_parent() {
-    let dir = TempDir::new().unwrap();
-    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-    std::fs::write(dir.path().join(".git").join("config"), "[core]\n").unwrap();
-
-    let child = dir.path().join("sub");
+/// The on-disk shape of a submodule (and of a linked worktree): `.git` is a
+/// FILE containing `gitdir: <path>`, not a directory. Mirrors
+/// `health::staleness::tests::make_gitlink_child`.
+fn make_gitlink_child(parent: &Path) -> PathBuf {
+    git2::Repository::init(parent).unwrap();
+    let child = parent.join("sub");
     std::fs::create_dir_all(&child).unwrap();
-    std::fs::write(child.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+
+    let child_git = git2::Repository::init(&child).unwrap().path().to_path_buf();
+    let moved = parent.join(".git").join("modules").join("sub");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&child_git, &moved).unwrap();
+    std::fs::write(child.join(".git"), format!("gitdir: {}\n", moved.display())).unwrap();
+
+    let mut cfg = git2::Config::open(&moved.join("config")).unwrap();
+    cfg.set_str("core.worktree", child.to_str().unwrap())
+        .unwrap();
+    child
+}
+
+/// This is the bug this fix removes: a `.git` FILE (submodule / linked
+/// worktree shape) used to walk past the gitlink to the parent's real
+/// `.git/config`, so the child's slug and `slug_root` silently named the
+/// PARENT repo. `git2::Repository::discover` resolves the gitlink correctly
+/// — the child now gets its own root.
+#[test]
+fn slug_root_of_a_gitlink_child_is_the_child_itself() {
+    let dir = TempDir::new().unwrap();
+    let child = make_gitlink_child(dir.path());
 
     assert_eq!(
         slug_root(&child),
-        std::fs::canonicalize(dir.path()).unwrap()
+        std::fs::canonicalize(&child).unwrap(),
+        "slug_root must resolve to the child's own workdir, not the parent's"
     );
-    assert_eq!(derive_slug(&child), derive_slug(dir.path()));
+}
+
+/// A submodule's private `.git/modules/<name>/config` carries its own
+/// remote, distinct from the parent's, so it gets its OWN slug — the fix
+/// for the `file:*` key collision: a submodule's `file:src/lib.rs` and the
+/// parent's must never land in the same store.
+#[test]
+fn slug_differs_for_a_submodule_with_its_own_remote() {
+    let dir = TempDir::new().unwrap();
+    let child = make_gitlink_child(dir.path());
+
+    let mut parent_cfg = git2::Config::open(&dir.path().join(".git").join("config")).unwrap();
+    parent_cfg
+        .set_str("remote.origin.url", "https://github.com/example/parent.git")
+        .unwrap();
+
+    let mut child_cfg = git2::Config::open(
+        &dir.path()
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("config"),
+    )
+    .unwrap();
+    child_cfg
+        .set_str(
+            "remote.origin.url",
+            "https://github.com/example/child-submodule.git",
+        )
+        .unwrap();
+
+    assert_ne!(
+        derive_slug(dir.path()),
+        derive_slug(&child),
+        "a submodule with its own remote must get its own slug, not the parent's"
+    );
 }
 
 // ─── prefix_end: invalid UTF-8 after increment ────────────────────────────

@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, ReceiptSource,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload,
-    StalenessScore, StalenessTier, Store,
+    Record, RecordLifecycle, RecordSource, RecordVersion, RepoIdent, StaleReviewEntry,
+    StaleReviewPayload, StalenessScore, StalenessTier, Store,
 };
 use crate::health::staleness::StalenessAnalyzer;
 
@@ -243,9 +243,15 @@ pub fn record_content_fingerprint(record: &Record) -> Option<String> {
 /// directory. `None` when no git repo is discoverable; the caller then falls
 /// back to whatever scope `agent_id` alone provides.
 pub fn worktree_scope_tag(cwd: &Path) -> Option<String> {
-    let repo = git2::Repository::discover(cwd).ok()?;
-    let workdir = repo.workdir()?;
-    let canon = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    worktree_scope_tag_for(&RepoIdent::discover(cwd))
+}
+
+/// [`worktree_scope_tag`] for a caller that already discovered a
+/// [`RepoIdent`] this invocation — avoids a second `git2::Repository::discover`
+/// call for the same repo (see `cli::hook_decide::entry::run_inner`).
+pub fn worktree_scope_tag_for(ident: &RepoIdent) -> Option<String> {
+    let workdir = ident.workdir.as_ref()?;
+    let canon = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.clone());
     let digest = Sha256::digest(canon.to_string_lossy().as_bytes());
     Some(hex::encode(&digest[..4]))
 }

@@ -66,7 +66,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use mati_core::graph::Graph;
 use mati_core::hooks::policy_match::PolicyMatcherSet;
-use mati_core::store::{derive_slug, Store};
+use mati_core::store::{RepoIdent, Store};
 
 // ── CLI subcommand types ──────────────────────────────────────────────────────
 
@@ -217,7 +217,9 @@ use lifecycle::{
     project_root, send_sigkill_only, send_sigterm_only, wait_for_files_removed, wall_secs,
     DaemonState, ExitOutcome,
 };
-pub use lifecycle::{mati_root_for, parse_sentinel, read_pid_file, STARTING_STALE_SECS};
+pub use lifecycle::{
+    mati_root_for, mati_root_for_ident, parse_sentinel, read_pid_file, STARTING_STALE_SECS,
+};
 #[cfg(test)]
 use lifecycle::{
     read_tail, recorded_serve_pids, serve_pids_to_kill, RECORDED_SERVE_SCAN_MAX_BYTES,
