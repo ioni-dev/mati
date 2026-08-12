@@ -180,54 +180,6 @@ jobs:
       - name: real-world resolvers (vendored fixtures)
         run: cargo nextest run --locked --profile ci --run-ignored only --test real_world_verification --test-threads 1 -E 'test(real_world_ripgrep) or test(real_world_sinatra_resolution) or test(real_world_hcl_resolution) or test(real_world_jsoup_resolution) or test(real_world_httpx)'
 
-  semver:
-    name: Public API semver check
-    runs-on: ubuntu-latest
-    # DISABLED pre-publish: cargo-semver-checks needs a meaningful baseline
-    # to compare against. Pre-1.0 the project is allowed to make breaking
-    # changes within 0.x.y; pre-publish there is no crates.io baseline and
-    # no git tag to compare to. Per-PR comparison against `origin/main`
-    # produces noise (PRs that legitimately break pre-1.0 API would fail)
-    # without a corresponding consumer that pins to versions.
-    #
-    # Re-enable when:
-    #   - The crate is published to crates.io (set `version-tag-prefix: v`
-    #     and remove `baseline-rev`), OR
-    #   - A `v0.1.0` git tag exists (change `baseline-rev: origin/main` to
-    #     `baseline-rev: v0.1.0`).
-    #
-    # Remove the `if: false` below to re-enable.
-    if: false
-    # `mati_core` is consumed by the enterprise binary (mati-cloud) as a
-    # Cargo crate. An accidental breaking change to the public API surface
-    # without a major-version bump forces downstream rework. This job
-    # compares the PR's `mati_core` API against the `main` branch and fails
-    # if it finds a violation.
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # cargo-semver-checks needs the baseline ref's history to compare
-          # against, not just the current commit.
-          fetch-depth: 0
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: cargo semver-checks (vs main)
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          # Cargo *package* name (not the [lib] name). The lib `mati_core`
-          # lives inside the `mati` package; the action looks up packages
-          # by their `[package].name` field.
-          package: mati
-          # `origin/main` rather than `main`: on PR runs GitHub Actions
-          # checks out the PR head, so the bare name `main` is not a
-          # local ref. `fetch-depth: 0` populates `origin/main` but does
-          # not create a local `main` branch, so `git rev-parse main^{tree}`
-          # would fail. The remote-tracking ref resolves cleanly.
-          baseline-rev: origin/main
-
   supply-chain:
     name: Supply chain (cargo-deny)
     runs-on: ubuntu-latest
