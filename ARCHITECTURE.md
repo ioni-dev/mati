@@ -1049,6 +1049,8 @@ The scan walks `STALENESS_PREFIXES` in order and each prefix in key order, so an
 
 The budget bounds when the scan *starts* a record, not how long one takes. A single `count_commits_since` revwalk can run to `GIT_REVWALK_LIMIT` (2000 commits), so a pass can overshoot the budget by one record's cost — measured at up to ~800ms on a 493-commit repo. Bounding per-record git cost is the open follow-up.
 
+A pass that newly tombstones more than `MAX_TOMBSTONE_RATIO` (0.5) of what it scanned is discarded whole: nothing is written, the cursor stays put, and the report returns zeros so it still describes persisted reality. Passes under `MIN_TOMBSTONE_SAMPLE` (20) records skip the check, since at that size a genuine cleanup and a broken pass are the same shape. The trigger is real, not theoretical — on 2026-08-04 a pass on this repo's own store put 368 of 387 records into Tombstone in one go, which switched injection off repo-wide with nothing but an INFO line to show for it. `root_from_git` already guards the deletion assertion that produces that shape; the ratio bounds the blast radius if that guard is ever wrong. The whole pass is discarded rather than the deletions alone, because a root that cannot be trusted for an existence check cannot be trusted for the git factor either.
+
 Sync merge rule, planned for v0.2: `Tombstone > Liability > Stale > Aging > Fresh`, meaning higher severity wins. There is no sync or conflict resolution in v0.1.
 
 Staleness propagation happens during `mati init`. Staleness scores are propagated through `Imports` edges. A file whose upstream dependency has high staleness inherits partial staleness through `propagated_staleness` in `FileRecord`.

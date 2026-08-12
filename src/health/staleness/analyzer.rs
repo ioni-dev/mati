@@ -38,6 +38,14 @@ pub(super) const MAX_RECOMPUTE_SIGNALS: usize = 10;
 /// new records and write out whatever was computed.
 pub const ANALYZE_TIME_BUDGET_MS: u64 = 2000;
 
+/// Share of a pass's scanned records that may newly reach Tombstone before the
+/// pass is discarded rather than written.
+pub(super) const MAX_TOMBSTONE_RATIO: f32 = 0.5;
+
+/// Smallest pass the ratio check applies to. Below this a genuine deletion
+/// sweep and a broken pass are the same shape.
+pub(super) const MIN_TOMBSTONE_SAMPLE: u32 = 20;
+
 /// Record key prefixes that the analyzer scans.
 pub(super) const STALENESS_PREFIXES: &[&str] =
     &["file:", "gotcha:", "decision:", "dep:", "dev_note:"];
@@ -265,6 +273,27 @@ impl StalenessAnalyzer {
                     report.updated += 1;
                 }
             }
+        }
+
+        // Most of the store tombstoned means a broken root, not a repo. Discard
+        // the whole pass — that root is not trustworthy for the git factor either.
+        if report.scanned >= MIN_TOMBSTONE_SAMPLE
+            && report.tombstoned as f32 > report.scanned as f32 * MAX_TOMBSTONE_RATIO
+        {
+            tracing::error!(
+                scanned = report.scanned,
+                tombstoned = report.tombstoned,
+                root = %self.root.display(),
+                root_from_git = self.root_from_git,
+                "staleness analyze_all: tombstone ratio above {MAX_TOMBSTONE_RATIO}, pass discarded"
+            );
+            return Ok(StalenessReport {
+                scanned: report.scanned,
+                updated: 0,
+                tombstoned: 0,
+                liability: 0,
+                stale: 0,
+            });
         }
 
         // Batch write all updates.

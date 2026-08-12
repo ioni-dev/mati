@@ -1,4 +1,5 @@
 use super::*;
+use crate::health::staleness::analyzer::MIN_TOMBSTONE_SAMPLE;
 use crate::store::record::*;
 use tempfile::TempDir;
 
@@ -1089,6 +1090,107 @@ async fn analyze_all_skips_non_active() {
 
     // Record was scanned but not updated because it's tombstoned.
     assert_eq!(report.updated, 0);
+
+    store.close().await.unwrap();
+}
+
+// ── tombstone circuit breaker tests ─────────────────────────────────────
+
+/// Seed `missing` records naming files that do not exist plus `present`
+/// records whose files do, under a git-proven root. Returns the store dir.
+async fn seed_deletion_mix(store: &Store, dir: &Path, now: u64, missing: u32, present: u32) {
+    git2::Repository::init(dir).unwrap();
+    let old = now - (60 * 86_400);
+    for i in 0..missing {
+        let mut record = make_record_at(&format!("file:src/gone_{i}.rs"), old, 0);
+        record.lifecycle = RecordLifecycle::Active;
+        store.put(&record.key, &record).await.unwrap();
+    }
+    for i in 0..present {
+        let name = format!("here_{i}.rs");
+        std::fs::write(dir.join(&name), "fn main() {}").unwrap();
+        let mut record = make_record_at(&format!("file:{name}"), old, 0);
+        record.lifecycle = RecordLifecycle::Active;
+        store.put(&record.key, &record).await.unwrap();
+    }
+}
+
+/// A pass that tombstones past the ratio writes nothing at all — not the
+/// deletions, and not the other records it computed alongside them. This is
+/// the 2026-08-04 shape: 368 of 387 records tombstoned in one pass, which
+/// switched enforcement off repo-wide.
+#[tokio::test]
+async fn a_pass_over_the_tombstone_ratio_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    seed_deletion_mix(&store, dir.path(), now, 30, 2).await;
+    let before = store.get("file:src/gone_0.rs").await.unwrap().unwrap();
+
+    let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+    assert!(analyzer.root_from_git, "the deletion path needs a git root");
+    let report = analyzer.analyze_all(&store).await.unwrap();
+
+    assert_eq!(report.updated, 0, "discarded pass persisted nothing");
+    assert_eq!(report.tombstoned, 0, "report must match persisted reality");
+    assert!(report.scanned >= 32, "the scan itself still ran");
+
+    let after = store.get("file:src/gone_0.rs").await.unwrap().unwrap();
+    assert_eq!(after.staleness.tier, before.staleness.tier);
+    assert_eq!(after.version.logical_clock, before.version.logical_clock);
+
+    store.close().await.unwrap();
+}
+
+/// Below the ratio the breaker stays out of the way — deletions persist.
+/// Without this, the test above would pass on an analyzer that never writes.
+#[tokio::test]
+async fn deletions_under_the_ratio_still_persist() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    seed_deletion_mix(&store, dir.path(), now, 10, 25).await;
+
+    let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+    let report = analyzer.analyze_all(&store).await.unwrap();
+
+    assert_eq!(report.tombstoned, 10);
+    assert!(report.updated >= 10);
+    let after = store.get("file:src/gone_0.rs").await.unwrap().unwrap();
+    assert_eq!(after.staleness.tier, StalenessTier::Tombstone);
+
+    store.close().await.unwrap();
+}
+
+/// A pass smaller than the sample floor is not evidence of anything, so the
+/// ratio does not apply to it — a store whose every file record is a deletion
+/// is a normal cleanup at that size.
+#[tokio::test]
+async fn a_pass_below_the_sample_floor_skips_the_ratio() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let below_floor = MIN_TOMBSTONE_SAMPLE - 1;
+    seed_deletion_mix(&store, dir.path(), now, below_floor, 0).await;
+
+    let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+    let report = analyzer.analyze_all(&store).await.unwrap();
+
+    assert_eq!(report.tombstoned, below_floor);
+    let after = store.get("file:src/gone_0.rs").await.unwrap().unwrap();
+    assert_eq!(after.staleness.tier, StalenessTier::Tombstone);
 
     store.close().await.unwrap();
 }
