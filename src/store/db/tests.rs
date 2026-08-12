@@ -999,6 +999,28 @@ fn slug_with_no_git_dir_falls_back_to_path() {
     assert_eq!(slug, expected);
 }
 
+/// A `.git` *file* — the on-disk shape of a submodule and of a linked
+/// worktree — is not a boundary to this walk, so both the slug and
+/// `slug_root` resolve to the parent repo. That is the documented behaviour,
+/// not an accident: `StalenessAnalyzer` relies on it to detect that `git2`
+/// disagrees with it. Change this and the analyzer's guard goes quiet.
+#[test]
+fn slug_root_walks_past_a_gitlink_file_to_the_parent() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join(".git").join("config"), "[core]\n").unwrap();
+
+    let child = dir.path().join("sub");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(child.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+
+    assert_eq!(
+        slug_root(&child),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
+    assert_eq!(derive_slug(&child), derive_slug(dir.path()));
+}
+
 // ─── prefix_end: invalid UTF-8 after increment ────────────────────────────
 
 #[test]

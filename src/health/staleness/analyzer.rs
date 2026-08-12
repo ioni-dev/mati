@@ -97,8 +97,9 @@ impl StalenessAnalyzer {
     /// Open the analyzer. `repo_path` is the project root, or any directory
     /// inside it — the git root is discovered upward from there.
     ///
-    /// If no git repo is found, the analyzer proceeds with git_factor = 0.0 and
-    /// asserts no deletions.
+    /// If no git repo is found, or if the discovered repo disagrees with the
+    /// root the store's slug was keyed on, the analyzer proceeds with
+    /// git_factor = 0.0 and asserts no deletions.
     pub fn new(repo_path: &Path) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -109,16 +110,28 @@ impl StalenessAnalyzer {
     }
 
     fn open_at(repo_path: &Path, now: u64) -> Self {
-        let repo = git2::Repository::discover(repo_path).ok();
-        let head_commit = repo.as_ref().and_then(head_commit_sha);
-        let workdir = repo
+        // The root the store's slug was keyed on. Records were written relative
+        // to this, so this is what they must resolve against.
+        let root = crate::store::slug_root(repo_path);
+
+        // `discover` resolves a `.git` gitlink and `slug_root` does not, so a
+        // submodule or linked worktree makes the two name different repos —
+        // the store is the parent's, the tree is the child's, and every record
+        // path misses. Ground the analyzer only when they agree.
+        let discovered = git2::Repository::discover(repo_path).ok();
+        let workdir = discovered
             .as_ref()
-            .and_then(|r| r.workdir().map(Path::to_path_buf));
+            .and_then(|r| r.workdir())
+            .and_then(|w| std::fs::canonicalize(w).ok());
+        let grounded = workdir.as_deref() == Some(root.as_path());
+
+        let repo = grounded.then_some(discovered).flatten();
+        let head_commit = repo.as_ref().and_then(head_commit_sha);
 
         Self {
             repo: repo.map(Mutex::new),
-            root_from_git: workdir.is_some(),
-            root: workdir.unwrap_or_else(|| repo_path.to_path_buf()),
+            root_from_git: grounded,
+            root,
             now,
             head_commit,
         }
@@ -356,16 +369,22 @@ impl StalenessAnalyzer {
         {
             let path = record.key.strip_prefix("file:").unwrap_or(&record.key);
             if self.path_exists(path) {
-                // File was restored — clear the FileDeleted signal.
+                // File was restored — clear the FileDeleted signal. Seeing the
+                // file proves it is there whatever the root, so this direction
+                // needs no grounding.
                 record
                     .staleness
                     .signals
                     .retain(|s| !matches!(s, StalenessSignal::FileDeleted));
             } else {
-                // Still deleted — tombstone.
-                record.staleness.value = 1.0;
-                record.staleness.tier = StalenessTier::Tombstone;
-                record.staleness.computed_at = self.now;
+                // Not seeing it proves nothing without a grounded root, which
+                // cannot tell "deleted" from "wrong tree". Refresh only from
+                // one; otherwise leave the record exactly as it stands.
+                if self.root_from_git {
+                    record.staleness.value = 1.0;
+                    record.staleness.tier = StalenessTier::Tombstone;
+                    record.staleness.computed_at = self.now;
+                }
                 return Ok(());
             }
         }

@@ -859,6 +859,119 @@ async fn missing_file_is_not_tombstoned_without_a_git_root() {
     store.close().await.unwrap();
 }
 
+/// Build a repo at `parent` with a child directory whose `.git` is a gitlink
+/// *file* rather than a directory — the on-disk shape of a submodule and of a
+/// linked worktree. `git2` resolves the link; `slug_root`'s `.git/config` walk
+/// does not, and lands on `parent`.
+fn make_gitlink_child(parent: &Path) -> PathBuf {
+    git2::Repository::init(parent).unwrap();
+    let child = parent.join("sub");
+    std::fs::create_dir_all(&child).unwrap();
+
+    let child_git = git2::Repository::init(&child).unwrap().path().to_path_buf();
+    let moved = parent.join(".git").join("modules").join("sub");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&child_git, &moved).unwrap();
+    std::fs::write(child.join(".git"), format!("gitdir: {}\n", moved.display())).unwrap();
+
+    let mut cfg = git2::Config::open(&moved.join("config")).unwrap();
+    cfg.set_str("core.worktree", child.to_str().unwrap())
+        .unwrap();
+    child
+}
+
+/// The store is keyed on the slug root, so records were written relative to
+/// it. When `git2` names a different repo the analyzer is pointed at a tree
+/// the records do not describe, and must assert nothing.
+#[tokio::test]
+async fn a_gitlink_child_is_not_grounded() {
+    let dir = TempDir::new().unwrap();
+    let child = make_gitlink_child(dir.path());
+
+    let analyzer = StalenessAnalyzer::new_with_now(&child, 2_000_000);
+
+    assert!(
+        !analyzer.root_from_git,
+        "slug root and git workdir name different repos"
+    );
+    assert_eq!(
+        analyzer.root,
+        std::fs::canonicalize(dir.path()).unwrap(),
+        "root must be the one the store's slug was keyed on"
+    );
+}
+
+/// The control for the test above: a plain repo agrees with itself, so the
+/// guard must not fire. Without this, the assertion above would pass on an
+/// analyzer that is never grounded.
+#[tokio::test]
+async fn a_plain_repo_is_grounded() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+
+    let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
+
+    assert!(analyzer.root_from_git);
+    assert_eq!(analyzer.root, std::fs::canonicalize(dir.path()).unwrap());
+}
+
+/// An ungrounded root sees every path as missing. It must not turn that into
+/// a deletion — that is the 43-of-43 tombstone storm.
+#[tokio::test]
+async fn a_gitlink_child_asserts_no_deletions() {
+    let dir = TempDir::new().unwrap();
+    let child = make_gitlink_child(dir.path());
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_file_record_with_staleness(0.0);
+    record.key = "file:src/definitely_nonexistent_mati_xyz.rs".to_string();
+
+    let analyzer = StalenessAnalyzer::new_with_now(&child, 2_000_000);
+    analyzer
+        .compute_staleness(&mut record, &store, &HashMap::new(), far_deadline())
+        .await
+        .unwrap();
+
+    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+    assert!(!record
+        .staleness
+        .signals
+        .iter()
+        .any(|s| matches!(s, StalenessSignal::FileDeleted)));
+
+    store.close().await.unwrap();
+}
+
+/// An ungrounded root cannot clear a standing `FileDeleted` either — it
+/// cannot prove the file exists. Leave the record exactly as it stands
+/// rather than letting the factor formula quietly de-escalate it.
+#[tokio::test]
+async fn an_ungrounded_root_leaves_a_standing_deletion_alone() {
+    let dir = TempDir::new().unwrap();
+    let child = make_gitlink_child(dir.path());
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_file_record_with_staleness(1.0);
+    record.key = "file:src/gone.rs".to_string();
+    record.staleness.signals.push(StalenessSignal::FileDeleted);
+    record.staleness.tier = StalenessTier::Tombstone;
+
+    let analyzer = StalenessAnalyzer::new_with_now(&child, 2_000_000);
+    analyzer
+        .compute_staleness(&mut record, &store, &HashMap::new(), far_deadline())
+        .await
+        .unwrap();
+
+    assert_eq!(record.staleness.tier, StalenessTier::Tombstone);
+    assert!(record
+        .staleness
+        .signals
+        .iter()
+        .any(|s| matches!(s, StalenessSignal::FileDeleted)));
+
+    store.close().await.unwrap();
+}
+
 /// Relative record paths resolve against the analyzer's root, not the
 /// process CWD. The daemon inherits its CWD from whichever hook spawned it.
 #[tokio::test]

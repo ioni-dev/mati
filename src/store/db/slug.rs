@@ -10,6 +10,23 @@ use super::*;
 ///
 /// Returns the first 8 hex characters of the SHA-256 digest.
 pub fn derive_slug(repo_root: &Path) -> String {
+    let git_root = slug_root(repo_root);
+
+    let input =
+        read_remote_url(&git_root).unwrap_or_else(|| git_root.to_string_lossy().into_owned());
+
+    let digest = Sha256::digest(input.as_bytes());
+    hex::encode(&digest[..4]) // 4 bytes = 8 hex chars
+}
+
+/// The repo root [`derive_slug`] keys on, for callers that must resolve
+/// repo-relative record paths against the same root the store was named for.
+///
+/// Note this is not `git2`'s answer: the walk below tests for a `.git/config`
+/// *file*, so a submodule or linked worktree — where `.git` is itself a file —
+/// resolves to the parent repo instead. A caller that needs both answers must
+/// compare them rather than assume they agree.
+pub fn slug_root(repo_root: &Path) -> PathBuf {
     // Canonicalize first so `/tmp/...` and `/private/tmp/...` (macOS symlink),
     // trailing-slash variants, and `./foo` vs `foo` all resolve to the same
     // path before hashing. Without this every CLI invocation that resolves
@@ -22,13 +39,7 @@ pub fn derive_slug(repo_root: &Path) -> String {
     // subdirectory of the repo produces the same slug as one from the root.
     // Pre-fix, `mati show` from `src/store/` and `mati serve` from the repo
     // root produced different slugs whenever the subdir lacked a `.git/`.
-    let git_root = walk_up_for_git_root(&canon).unwrap_or_else(|| canon.clone());
-
-    let input =
-        read_remote_url(&git_root).unwrap_or_else(|| git_root.to_string_lossy().into_owned());
-
-    let digest = Sha256::digest(input.as_bytes());
-    hex::encode(&digest[..4]) // 4 bytes = 8 hex chars
+    walk_up_for_git_root(&canon).unwrap_or(canon)
 }
 
 /// Walk `start` and its ancestors looking for a directory that contains a
