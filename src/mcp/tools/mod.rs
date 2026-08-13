@@ -190,15 +190,21 @@ impl MatiServer {
     ///
     /// Returns the JSON-serialised record, or "null" if not found.
     ///
-    /// Note: `read_only_hint = true` is set because mem_get does not modify
-    /// knowledge content. However, it does write consultation receipts
-    /// (session:consulted:*) synchronously — these are critical for hook
-    /// enforcement (deny → mem_get → allow cycle) — and defers access_count
-    /// and analytics writes to a background task.
+    /// Not read-only: every call mints a `session:consulted:*` receipt
+    /// synchronously, and a later hook reads that receipt to allow an edit it
+    /// would otherwise deny. A client that prefetched this tool because it
+    /// looked read-only would unlock the edit gate on every file it touched.
+    /// `destructive_hint` must be stated, not omitted — an omitted
+    /// `destructiveHint` defaults to true, and these writes only append.
     #[rmcp::tool(
         name = "mem_get",
         description = "Look up one mati knowledge record by key. Before reading a file directly, call this with \"file:<path>\" and use the record instead when it is confirmed and high-confidence.",
-        annotations(read_only_hint = true)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub(crate) async fn mem_get(
         &self,
@@ -234,10 +240,14 @@ impl MatiServer {
     ///
     /// Modes: "text" (default) for full-text BM25, "graph" for 1-hop traversal.
     /// Text mode returns a JSON array. Graph mode returns a grouped JSON object.
+    ///
+    /// The only tool here that writes nothing at all. `destructive_hint` and
+    /// `idempotent_hint` are deliberately unset — the spec says both are
+    /// meaningful only when `read_only_hint` is false.
     #[rmcp::tool(
         name = "mem_query",
         description = "Search the mati knowledge store, or read local enforcement telemetry. Knowledge modes: \"text\" (BM25 full-text), \"tag\" (filter by tag), \"graph\" (1-hop traversal from a seed key), \"dir_gotchas\" (confirmed gotchas whose affected_files sit under a directory path). Telemetry modes (read-only): \"policy_observations\", \"policy_activity\" (optional `since` in days), \"analytics\". `limit` is clamped to 50 in every mode; a larger value returns 50 results, not an error.",
-        annotations(read_only_hint = true)
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     pub(crate) async fn mem_query(
         &self,
@@ -254,10 +264,21 @@ impl MatiServer {
     ///
     /// Gathers stage, gotchas, file records, and decisions within a 2,000-token budget.
     /// Returns a markdown injection string for Claude.
+    ///
+    /// Not read-only: each call writes an audit record and a daily aggregate,
+    /// and bumps `last_accessed` on every context file. `last_accessed` feeds
+    /// `staleness::time_factor`, so the next SessionEnd sweep scores those
+    /// records fresher — and the staleness tier gates injection. It never mints
+    /// a consultation receipt; see `handle_mem_bootstrap` for why.
     #[rmcp::tool(
         name = "mem_bootstrap",
         description = "Assemble a compact context packet for the current coding session from relevant gotchas, file records, and decisions. Call this at session start.",
-        annotations(read_only_hint = true)
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub(crate) async fn mem_bootstrap(
         &self,
@@ -281,7 +302,8 @@ impl MatiServer {
         annotations(
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false
+            idempotent_hint = false,
+            open_world_hint = false
         )
     )]
     pub(crate) async fn mem_set(

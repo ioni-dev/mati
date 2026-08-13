@@ -209,22 +209,57 @@ fn mcp_stdio_all_four_tools() {
         tool_names.len()
     );
 
-    // Read tools must have readOnlyHint annotation
+    // Annotations must match traced behavior. mem_query is the only pure read;
+    // mem_get and mem_bootstrap write receipts/audit/analytics. destructiveHint
+    // is pinned on every write tool because an OMITTED destructiveHint defaults
+    // to true — leaving it unset would advertise mem_get as destructive.
     for tool in tools {
         let name = tool["name"].as_str().unwrap_or("");
-        let read_only = tool
-            .get("annotations")
-            .and_then(|a| a.get("readOnlyHint"))
-            .and_then(|v| v.as_bool());
+        let ann = tool.get("annotations");
+        let hint = |field: &str| ann.and_then(|a| a.get(field)).and_then(|v| v.as_bool());
+
+        // Zero-network invariant, stated at the protocol level.
+        assert_eq!(
+            hint("openWorldHint"),
+            Some(false),
+            "{name} must have openWorldHint=false"
+        );
+
         match name {
-            "mem_get" | "mem_query" | "mem_bootstrap" => {
-                assert_eq!(read_only, Some(true), "{name} must have readOnlyHint=true");
+            "mem_query" => {
+                assert_eq!(
+                    hint("readOnlyHint"),
+                    Some(true),
+                    "mem_query writes nothing — readOnlyHint=true"
+                );
+            }
+            "mem_get" | "mem_bootstrap" => {
+                assert_eq!(
+                    hint("readOnlyHint"),
+                    Some(false),
+                    "{name} writes on every call — readOnlyHint=false"
+                );
+                assert_eq!(
+                    hint("destructiveHint"),
+                    Some(false),
+                    "{name} only appends — destructiveHint must be pinned, not omitted"
+                );
+                assert_eq!(
+                    hint("idempotentHint"),
+                    Some(false),
+                    "{name} appends a new audit row per call — idempotentHint=false"
+                );
             }
             "mem_set" => {
                 assert_eq!(
-                    read_only,
+                    hint("readOnlyHint"),
                     Some(false),
                     "mem_set must have readOnlyHint=false"
+                );
+                assert_eq!(
+                    hint("destructiveHint"),
+                    Some(true),
+                    "mem_set tombstones and overwrites — destructiveHint=true"
                 );
             }
             _ => {}
