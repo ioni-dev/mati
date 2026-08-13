@@ -183,6 +183,36 @@ fn verify_chain_detects_linkage_break_from_deleted_event() {
 }
 
 #[test]
+fn verify_chain_reports_a_skipped_event_as_unknown_schema_not_tampering() {
+    // Same event vector as the deleted-event case above — a gap at seq 2. The
+    // only difference is that the scan reported seq 2 as JSON it could not
+    // parse, which is what a newer writer's event looks like to this binary.
+    // That must not read as tampering in a signed audit.
+    let mut events = chained(3);
+    events.remove(1);
+    let v = verify_chain_with_skips(&events, &[2]);
+    assert_eq!(v.linkage_breaks, 0, "version skew is not a linkage break");
+    assert_eq!(v.unknown_schema, 1);
+    assert_eq!(v.tampered_events, 0);
+    assert_eq!(v.breaks.len(), 1);
+    assert_eq!(v.breaks[0].kind, ChainBreakKind::UnknownSchema);
+    // Still not "valid": unverifiable is not the same as verified.
+    assert!(!v.is_valid());
+}
+
+#[test]
+fn verify_chain_skips_outside_the_gap_do_not_excuse_a_deletion() {
+    // A skip must explain *this* gap. One at an unrelated seq leaves the
+    // deletion classified as a linkage break.
+    let mut events = chained(3);
+    events.remove(1);
+    let v = verify_chain_with_skips(&events, &[99]);
+    assert_eq!(v.linkage_breaks, 1);
+    assert_eq!(v.unknown_schema, 0);
+    assert!(!v.is_valid());
+}
+
+#[test]
 fn verify_chain_ignores_retention_pruned_prefix() {
     let mut events = chained(3);
     events.remove(0); // prune the earliest event (seq 1)

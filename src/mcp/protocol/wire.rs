@@ -20,6 +20,7 @@ impl Command {
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
             Self::MemQuery(_) => "mem_query",
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
+            Self::ScanEnforcementEventsWithSkips(_) => "scan_enforcement_events_with_skips",
             Self::ScanEnforcementEventsSinceMs(_) => "scan_enforcement_events_since_ms",
             Self::ConfigGet(_) => "config_get",
             Self::ConfigSet(_) => "config_set",
@@ -83,6 +84,7 @@ impl Command {
             | Self::Metrics
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
+            | Self::ScanEnforcementEventsWithSkips(_)
             | Self::ScanEnforcementEventsSinceMs(_)
             | Self::SessionFlush
             | Self::SessionHarvest
@@ -215,6 +217,11 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
         }),
         "scan_enforcement_events" => json!({
             "type": "scan_enforcement_events",
+            "since_seq": args.get("since_seq").and_then(|v| v.as_u64()).unwrap_or(0),
+            "until_seq": args.get("until_seq").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
+        }),
+        "scan_enforcement_events_with_skips" => json!({
+            "type": "scan_enforcement_events_with_skips",
             "since_seq": args.get("since_seq").and_then(|v| v.as_u64()).unwrap_or(0),
             "until_seq": args.get("until_seq").and_then(|v| v.as_u64()).unwrap_or(u64::MAX),
         }),

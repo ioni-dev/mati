@@ -34,9 +34,12 @@ pub async fn run(args: VerifyChainArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proxy = StoreProxy::open(&cwd).await?;
 
-    let events = proxy.scan_enforcement_events(0, u64::MAX).await?;
+    let scan = proxy
+        .scan_enforcement_events_with_skips(0, u64::MAX)
+        .await?;
+    let events = scan.events;
     let total = events.len();
-    let result = enforcement::verify_chain(&events);
+    let result = enforcement::verify_chain_with_skips(&events, &scan.skipped_seqs);
 
     if args.json {
         let mut out = serde_json::json!({

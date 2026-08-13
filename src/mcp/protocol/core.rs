@@ -186,6 +186,12 @@ pub enum Command {
     #[serde(rename = "scan_enforcement_events")]
     ScanEnforcementEvents(ScanEnforcementEventsInput),
 
+    /// As `scan_enforcement_events`, but the response also carries the seq
+    /// numbers whose JSON failed to parse. Chain verification needs those to
+    /// tell an unreadable event from a deleted one.
+    #[serde(rename = "scan_enforcement_events_with_skips")]
+    ScanEnforcementEventsWithSkips(ScanEnforcementEventsInput),
+
     /// Time-bounded enforcement scan used by policy activity reporting.
     #[serde(rename = "scan_enforcement_events_since_ms")]
     ScanEnforcementEventsSinceMs(ScanEnforcementEventsSinceMsInput),

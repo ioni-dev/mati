@@ -322,8 +322,10 @@ pub enum ChainBreakKind {
     /// The stored `event_hash` does not match a fresh `compute_hash()` — the
     /// event body was altered after recording.
     Tampered,
-    /// The event's `schema_version` is newer than this binary understands, so
-    /// its canonical form cannot be reproduced for verification.
+    /// This binary cannot verify the event: either its `schema_version` is
+    /// newer than it understands, or its stored JSON did not deserialize at all
+    /// and the scan reported the seq as skipped. Not evidence of tampering — an
+    /// event a newer writer produced reads this way on an older reader.
     UnknownSchema,
 }
 
@@ -371,8 +373,9 @@ pub struct ChainVerification {
     /// `event_hash`. The earliest surviving event is never counted, so a
     /// legitimately retention-pruned prefix is not a break.
     pub linkage_breaks: usize,
-    /// Events with a `schema_version` newer than this binary understands. Their
-    /// canonical form cannot be reproduced, so they are reported, not verified.
+    /// Events this binary cannot verify: a `schema_version` newer than it
+    /// understands, or a gap the scan attributed to JSON it could not parse.
+    /// Reported, not verified — and never counted as tampering.
     pub unknown_schema: usize,
     /// Every located break, in seq order. Empty when the chain is intact.
     pub breaks: Vec<ChainBreak>,
@@ -397,6 +400,20 @@ impl ChainVerification {
 /// every consumer verifies against one source of truth for the frozen hash
 /// contract.
 pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
+    verify_chain_with_skips(events, &[])
+}
+
+/// [`verify_chain`], told which seq numbers the scan could not parse.
+///
+/// A skipped event is missing from `events`, so its successor's `prev_hash`
+/// matches nothing present. That is byte-for-byte the signature of a deleted
+/// event, and only the scan knows the difference: it saw the key and failed to
+/// read it. Gaps explained by `skipped_seqs` are reported as `UnknownSchema`,
+/// not `Linkage`, so version skew does not read as tampering in a signed audit.
+pub fn verify_chain_with_skips(
+    events: &[EnforcementEvent],
+    skipped_seqs: &[u64],
+) -> ChainVerification {
     let mut sorted: Vec<&EnforcementEvent> = events.iter().collect();
     sorted.sort_by_key(|e| e.seq_no);
 
@@ -407,9 +424,16 @@ pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
         // Linkage uses the stored hashes, so it is schema-independent.
         if let Some(p) = prev {
             if e.prev_hash != p.event_hash {
-                result.linkage_breaks += 1;
+                let explained_by_skip = skipped_seqs.iter().any(|s| *s > p.seq_no && *s < e.seq_no);
+                let kind = if explained_by_skip {
+                    result.unknown_schema += 1;
+                    ChainBreakKind::UnknownSchema
+                } else {
+                    result.linkage_breaks += 1;
+                    ChainBreakKind::Linkage
+                };
                 result.breaks.push(ChainBreak {
-                    kind: ChainBreakKind::Linkage,
+                    kind,
                     seq_no: e.seq_no,
                     recorded_at_ms: e.recorded_at_ms,
                     event_type: event_type_label(&e.event_type).to_string(),

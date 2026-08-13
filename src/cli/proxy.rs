@@ -241,22 +241,30 @@ impl StoreProxy {
         }
     }
 
-    /// Read enforcement events. Routes through the daemon when running so the
-    /// CLI does not require exclusive store access.
-    pub async fn scan_enforcement_events(
+    /// Read enforcement events along with the seq numbers the daemon could not
+    /// parse. Routes through the daemon when running so the CLI does not
+    /// require exclusive store access.
+    ///
+    /// Chain verification needs both halves: without the skips, a gap left by
+    /// an unreadable event is indistinguishable from a deleted one. The daemon
+    /// still serves the older bare-array `scan_enforcement_events` command for
+    /// CLIs built before this one.
+    pub async fn scan_enforcement_events_with_skips(
         &self,
         since_seq: u64,
         until_seq: u64,
-    ) -> Result<Vec<mati_core::store::enforcement::EnforcementEvent>> {
+    ) -> Result<mati_core::store::enforcement::EnforcementEventsWithSkips> {
         match &self.inner {
             ProxyInner::Direct(s) => {
-                mati_core::store::enforcement::scan_enforcement_events(s, since_seq, until_seq)
-                    .await
+                mati_core::store::enforcement::scan_enforcement_events_with_skips(
+                    s, since_seq, until_seq,
+                )
+                .await
             }
             ProxyInner::Socket { root } => {
                 match daemon_result(
                     root,
-                    "scan_enforcement_events",
+                    "scan_enforcement_events_with_skips",
                     json!({ "since_seq": since_seq, "until_seq": until_seq }),
                 )
                 .await
@@ -264,14 +272,17 @@ impl StoreProxy {
                     DaemonResult::Ok(v) => {
                         let data = &v["data"];
                         if data.is_null() {
-                            Ok(vec![])
+                            Ok(Default::default())
                         } else {
                             Ok(serde_json::from_value(data.clone()).context(
-                                "proxy scan_enforcement_events: failed to deserialize events",
+                                "proxy scan_enforcement_events_with_skips: failed to deserialize scan",
                             )?)
                         }
                     }
-                    other => Err(socket_read_error("scan_enforcement_events", other)),
+                    other => Err(socket_read_error(
+                        "scan_enforcement_events_with_skips",
+                        other,
+                    )),
                 }
             }
         }

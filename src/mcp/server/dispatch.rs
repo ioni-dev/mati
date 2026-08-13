@@ -636,6 +636,36 @@ pub(crate) async fn socket_dispatch(
             }
         }
 
+        // Same scan, but the response keeps the seq numbers whose JSON this
+        // binary could not parse. `scan_enforcement_events` above stays a bare
+        // array so an older CLI keeps working against a newer daemon.
+        "scan_enforcement_events_with_skips" => {
+            let since_seq = req
+                .args
+                .get("since_seq")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let until_seq = req
+                .args
+                .get("until_seq")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(u64::MAX);
+            let g = graph.read().await;
+            match crate::store::enforcement::scan_enforcement_events_with_skips(
+                g.store(),
+                since_seq,
+                until_seq,
+            )
+            .await
+            {
+                Ok(scan) => match serde_json::to_value(&scan) {
+                    Ok(val) => SocketResponse::ok(val),
+                    Err(e) => SocketResponse::err(format!("serialize: {e}")),
+                },
+                Err(e) => SocketResponse::err(format!("store: {e}")),
+            }
+        }
+
         "scan_enforcement_events_since_ms" => {
             let since_ms = req
                 .args

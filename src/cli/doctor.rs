@@ -599,14 +599,16 @@ async fn collect_chain_check(cwd: &Path) -> CheckResult {
             };
         }
     };
-    let events = proxy
-        .scan_enforcement_events(0, u64::MAX)
+    let scan = proxy
+        .scan_enforcement_events_with_skips(0, u64::MAX)
         .await
         .unwrap_or_default();
     let _ = proxy.close().await;
 
+    let events = scan.events;
     let total = events.len();
-    let result = mati_core::store::enforcement::verify_chain(&events);
+    let result =
+        mati_core::store::enforcement::verify_chain_with_skips(&events, &scan.skipped_seqs);
     if result.is_valid() {
         CheckResult {
             section: "integrity",

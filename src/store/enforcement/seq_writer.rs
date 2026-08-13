@@ -384,17 +384,48 @@ impl EnforcementEventWriter {
 // Store scan helpers
 // ─────────────────────────────────────────────
 
+/// Events in a seq range, plus the seq numbers this binary could not parse.
+///
+/// A skipped event is absent from `events`, so its successor's `prev_hash`
+/// points at a hash no present event carries. Without `skipped_seqs` that is
+/// indistinguishable from a deleted event, and
+/// [`verify_chain`](super::verify_chain) reports it as tampering.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnforcementEventsWithSkips {
+    pub events: Vec<EnforcementEvent>,
+    /// Seq numbers present in the store whose JSON failed to deserialize —
+    /// most often an event type written by a newer binary.
+    pub skipped_seqs: Vec<u64>,
+}
+
 /// Read enforcement events within a seq_no range [since, until] inclusive.
 ///
 /// Returns events in seq_no order. Events outside the range or with
-/// corrupt JSON are skipped with a warning.
+/// corrupt JSON are skipped with a warning. Callers that verify chain
+/// integrity want [`scan_enforcement_events_with_skips`] instead — this
+/// signature cannot report what it dropped.
 pub async fn scan_enforcement_events(
     store: &Store,
     since_seq: u64,
     until_seq: u64,
 ) -> Result<Vec<EnforcementEvent>> {
+    Ok(
+        scan_enforcement_events_with_skips(store, since_seq, until_seq)
+            .await?
+            .events,
+    )
+}
+
+/// [`scan_enforcement_events`], but reporting the seq numbers it could not
+/// parse so a caller can tell an unreadable event from a deleted one.
+pub async fn scan_enforcement_events_with_skips(
+    store: &Store,
+    since_seq: u64,
+    until_seq: u64,
+) -> Result<EnforcementEventsWithSkips> {
     let keys = store.scan_keys(EVENT_PREFIX).await?;
     let mut events = Vec::new();
+    let mut skipped_seqs = Vec::new();
 
     let start = keys.partition_point(|key| {
         key.strip_prefix(EVENT_PREFIX)
@@ -421,13 +452,18 @@ pub async fn scan_enforcement_events(
                 Ok(event) => events.push(event),
                 Err(e) => {
                     tracing::warn!(key, "skipping corrupt enforcement event: {e}");
+                    skipped_seqs.push(seq);
                 }
             }
         }
     }
 
     events.sort_by_key(|e| e.seq_no);
-    Ok(events)
+    skipped_seqs.sort_unstable();
+    Ok(EnforcementEventsWithSkips {
+        events,
+        skipped_seqs,
+    })
 }
 
 /// Result of a time-bounded enforcement scan. The oldest timestamp is kept
