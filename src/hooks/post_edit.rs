@@ -7,14 +7,25 @@ pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 # mati post-edit hook — edit activity tracking + doc comment capture
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-mkdir -p "${HOME}/.mati" 2>/dev/null || true
+# The root mati_home_opt() resolves — $MATI_HOME wins, ~/.mati is the default.
+# Writing to a different root than the reader would make every fail-open
+# record below invisible to `mati stats`.
+MATI_DIR="${MATI_HOME:-${HOME}/.mati}"
+mkdir -p "$MATI_DIR" 2>/dev/null || true
+
+# Record a bypass in the same shape cli::hook_decide::log_fail_open_named
+# writes, so shell and Rust fail-opens read back as one series.
+# Args: hook, file, reason.
+mati_fail_open() {
+  echo "[mati] WARNING: enforcement bypassed for $2 — $3" >&2
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$1 file=$2 reason=$3" >> "$MATI_DIR/fail_open.log"; } 2>/dev/null || true
+}
 
 INPUT=$(cat)
 
 # Guard: jq required
-if ! command -v jq &>/dev/null; then
-  echo "[mati] missing jq — enforcement bypassed" >&2
-  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$(basename "$0") reason=missing_deps" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+if ! command -v jq >/dev/null 2>&1; then
+  mati_fail_open "$(basename "$0")" "<unparsed>" "jq not on PATH - edit tracking and doc capture skipped"
   exit 0
 fi
 

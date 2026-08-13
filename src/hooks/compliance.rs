@@ -371,7 +371,7 @@ esac
         let essential_bins = [
             "bash", "cat", "echo", "printf", "sed", "grep", "awk", "test", "env", "command", "jq",
             "bc", "which", "dirname", "basename", "rm", "mkdir", "touch", "true", "false", "expr",
-            "tr", "sort", "cut", "wc",
+            "tr", "sort", "cut", "wc", "date",
         ];
 
         // Search standard system directories for each binary
@@ -413,6 +413,9 @@ esac
             .arg(script_path.to_str().expect("script path not valid UTF-8"))
             .env("PATH", path)
             .env("HOME", self.mock_dir.path())
+            // Distinct from HOME on purpose: a hook that writes telemetry to
+            // $HOME/.mati writes where `mati stats` does not read.
+            .env("MATI_HOME", self.mati_home())
             .current_dir(self.mock_dir.path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -442,6 +445,16 @@ esac
             exit_code,
             json,
         }
+    }
+
+    /// The mati root the hook is given, i.e. what `mati_home_opt()` resolves.
+    fn mati_home(&self) -> PathBuf {
+        self.mock_dir.path().join("mati_home")
+    }
+
+    /// Contents of `fail_open.log` under the mati root, `""` if never written.
+    fn fail_open_log(&self) -> String {
+        std::fs::read_to_string(self.mati_home().join("fail_open.log")).unwrap_or_default()
     }
 
     /// Read the log file written by mock mati's log-miss/log-hit commands.
@@ -864,6 +877,101 @@ fn post_edit_invokes_doc_capture_and_edit_hook() {
         harness.wait_for_log_contains_timeout("edit-hook src/main.rs", bg_timeout),
         "post-edit should invoke edit-hook, log: {}",
         harness.read_log()
+    );
+}
+
+/// Assert one `fail_open.log` line carries every field `cli::stats`'s scanner
+/// and a human reader need: an ISO timestamp it can parse, the FAIL_OPEN
+/// marker, and the hook/file/reason triple the Rust writer emits.
+fn assert_canonical_fail_open_line(log: &str, reason_fragment: &str) {
+    let line = log
+        .lines()
+        .find(|l| l.contains("FAIL_OPEN"))
+        .unwrap_or_else(|| panic!("no FAIL_OPEN line recorded, log: {log:?}"));
+    let ts = line.split_whitespace().next().unwrap_or("");
+    // `cli::stats::parse_iso_timestamp` needs >= 19 chars of YYYY-MM-DDTHH:MM:SSZ.
+    assert!(
+        ts.len() >= 19 && ts.as_bytes()[10] == b'T' && ts.ends_with('Z'),
+        "timestamp must be the ISO shape cli::stats parses, got {ts:?}"
+    );
+    for field in ["hook=", "file=", "reason="] {
+        assert!(
+            line.contains(field),
+            "fail-open line is missing {field} — drifted from log_fail_open_named: {line:?}"
+        );
+    }
+    assert!(
+        line.contains(reason_fragment),
+        "fail-open line must name the cause {reason_fragment:?}: {line:?}"
+    );
+}
+
+/// 3.02a — no jq means post-edit tracks nothing. The skip must be recorded
+/// under $MATI_HOME, the root `mati stats` scans, or an installation with no
+/// jq looks identical to a working one.
+#[test]
+fn post_edit_records_fail_open_when_jq_is_missing() {
+    let harness = HookTestHarness::for_post_edit().exclude_binary("jq");
+    let input = serde_json::json!({
+        "tool_input": { "file_path": "src/main.rs", "content": "/// Doc\nfn main() {}\n" }
+    })
+    .to_string();
+    let output = harness.run(&input);
+
+    assert_eq!(output.exit_code, 0, "a missing dependency must fail open");
+    assert_canonical_fail_open_line(&harness.fail_open_log(), "jq not on PATH");
+    assert!(
+        output.stderr.contains("enforcement bypassed"),
+        "the skip must warn on stderr, got: {}",
+        output.stderr
+    );
+    assert!(
+        !harness.mock_dir.path().join(".mati/fail_open.log").exists(),
+        "the record must follow $MATI_HOME, not $HOME/.mati"
+    );
+    assert!(
+        !harness.read_log().contains("edit-hook"),
+        "no jq means no edit tracking — that is the skip being recorded"
+    );
+}
+
+/// 3.01a — same for post-read compliance: with no jq the whole consultation
+/// check is skipped, so the skip itself is the only thing left to record.
+#[test]
+fn post_compliance_records_fail_open_when_jq_is_missing() {
+    let harness = HookTestHarness::for_post_compliance().exclude_binary("jq");
+    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
+
+    assert_eq!(output.exit_code, 0, "a missing dependency must fail open");
+    assert_canonical_fail_open_line(&harness.fail_open_log(), "jq not on PATH");
+    assert!(
+        output.stderr.contains("enforcement bypassed"),
+        "the skip must warn on stderr, got: {}",
+        output.stderr
+    );
+    assert!(
+        !harness.mock_dir.path().join(".mati/fail_open.log").exists(),
+        "the record must follow $MATI_HOME, not $HOME/.mati"
+    );
+    assert!(
+        !harness.read_log().contains("log-compliance-miss"),
+        "no jq means no compliance check — that is the skip being recorded"
+    );
+}
+
+/// 3.01b — the daemon-unreachable bypass uses the same writer, so it must
+/// produce the same canonical record instead of a second ad-hoc format.
+#[test]
+fn post_compliance_records_canonical_fail_open_when_daemon_is_down() {
+    let harness = HookTestHarness::for_post_compliance().with_ping_failure();
+    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
+
+    assert_eq!(output.exit_code, 0);
+    assert_canonical_fail_open_line(&harness.fail_open_log(), "daemon not running");
+    assert!(
+        harness.fail_open_log().contains("file=src/main.rs"),
+        "the daemon bypass knows the path — it must name it: {}",
+        harness.fail_open_log()
     );
 }
 
