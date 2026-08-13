@@ -1615,6 +1615,47 @@ fn no_policy_verdicts_allow() {
     assert!(result.events.is_empty());
 }
 
+/// The deny returned by a mixed pass must carry the FIRST blocking verdict's
+/// own key and reason. `evaluate_policy_verdicts` accumulates the deny while
+/// steer and satisfied-block branches keep writing to the same pass, so a
+/// regression there hands the adapter a deny pointing at the wrong policy —
+/// or, before the deny was carried as plain fields, panicked the hook.
+#[test]
+fn policy_deny_carries_the_first_blocking_verdicts_key_and_reason() {
+    let mut first = policy(true, false, "Consult A first.");
+    first.key = "policy:first".into();
+    first.requires_key = "schema:a".into();
+    let mut steer = policy(false, true, "Steer this action.");
+    steer.key = "policy:steer".into();
+    let mut second = policy(true, false, "Consult B first.");
+    second.key = "policy:second".into();
+    second.requires_key = "schema:b".into();
+
+    let result = evaluate_policy_verdicts(&[first, steer, second], true);
+
+    match &result.decision {
+        Decision::Deny {
+            file_key,
+            reason,
+            origin,
+        } => {
+            assert_eq!(file_key, "policy:first");
+            assert_eq!(*origin, DenyOrigin::Policy);
+            assert!(
+                reason.contains("policy:first") && reason.contains("schema:a"),
+                "deny reason must name the blocking policy and its receipt key: {reason}"
+            );
+        }
+        other => panic!("mixed pass must deny, got {other:?}"),
+    }
+    assert_eq!(
+        result.events,
+        vec![HookEvent::PolicyConsultBlocked {
+            key: "policy:first".into()
+        }]
+    );
+}
+
 #[test]
 fn known_action_tools_are_distinguished_from_unknown_tools() {
     assert!(is_known_action_tool("db_client"));

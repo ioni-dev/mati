@@ -207,9 +207,18 @@ pub struct PolicyVerdict {
 /// A non-strict block degrades to steering; a satisfied block records the
 /// receipt-backed allow. Existing decisions are never lowered by this layer.
 pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> EnforcementResult {
+    /// The first enforcing block of this pass, carried as the deny's own
+    /// fields instead of a `Decision`. A `Decision` here can hold a variant
+    /// the deny path cannot honor, and the only recovery from that in a hook
+    /// is a panic — which is neither a deny nor a recorded allow.
+    struct PolicyDeny {
+        key: String,
+        reason: String,
+    }
+
     let mut context = Vec::new();
     let mut events = Vec::new();
-    let mut denied = None;
+    let mut denied: Option<PolicyDeny> = None;
 
     for verdict in verdicts {
         // The matcher already excludes Off; this defensive no-op prevents an
@@ -234,13 +243,12 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             continue;
         }
         if verdict.block && !verdict.satisfied && strict {
-            denied.get_or_insert_with(|| Decision::Deny {
-                file_key: verdict.key.clone(),
+            denied.get_or_insert_with(|| PolicyDeny {
+                key: verdict.key.clone(),
                 reason: format!(
                     "mati: policy {} blocked this action. Consult first: mem_get(\"{}\")",
                     verdict.key, verdict.requires_key
                 ),
-                origin: DenyOrigin::Policy,
             });
         } else if verdict.block && verdict.satisfied {
             events.push(HookEvent::PolicyConsulted {
@@ -254,11 +262,7 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
         }
     }
 
-    if let Some(decision) = denied {
-        let denied_key = match &decision {
-            Decision::Deny { file_key, .. } => file_key.clone(),
-            _ => unreachable!(),
-        };
+    if let Some(deny) = denied {
         // Keep shadow observations recorded in this same pass. A developer can
         // stage one policy to shadow while another enforces, and discarding the
         // observation because something else denied would make the rollout
@@ -272,8 +276,15 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             .into_iter()
             .filter(|event| matches!(event, HookEvent::PolicyShadowObserved { .. }))
             .collect();
-        events.push(DenyOrigin::Policy.deny_event(denied_key));
-        return EnforcementResult { decision, events };
+        events.push(DenyOrigin::Policy.deny_event(deny.key.clone()));
+        return EnforcementResult {
+            decision: Decision::Deny {
+                file_key: deny.key,
+                reason: deny.reason,
+                origin: DenyOrigin::Policy,
+            },
+            events,
+        };
     }
     if !context.is_empty() {
         return EnforcementResult {
