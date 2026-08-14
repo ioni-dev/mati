@@ -61,6 +61,10 @@ async fn crash_recovery_runs_auto_drain_on_serve_boot() {
     let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project path");
     common::isolate_mati_home(); // in-process Store::open + spawned child both honor MATI_HOME
 
+    // `mati serve` spawns the daemon detached, so ChildGuard only reaches the
+    // proxy. Declared after `project_temp` so it drops first, cwd still alive.
+    let _daemon_guard = common::DaemonGuard::for_mati_home(&project, common::mati_home());
+
     // ── 1. Pre-stage drift + dirty marker via direct Store access. ───────
     // Simulates the on-disk state left behind after an unclean shutdown
     // (panic, SIGKILL): a gotcha targets [B, C], but file A still

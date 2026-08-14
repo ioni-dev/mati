@@ -56,6 +56,10 @@ async fn metrics_snapshot_reflects_dispatch_traffic() {
     let project_temp = TempDir::new().expect("project tempdir");
     let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
     common::isolate_mati_home(); // spawned children inherit; store stays out of ~/.mati
+
+    // `mati serve` spawns the daemon detached, so ChildGuard only reaches the
+    // proxy. Declared after `project_temp` so it drops first, cwd still alive.
+    let _daemon_guard = common::DaemonGuard::for_mati_home(&project, common::mati_home());
     let bin = env!("CARGO_BIN_EXE_mati");
 
     // ── 1. Spawn mati serve. ──────────────────────────────────────────────
