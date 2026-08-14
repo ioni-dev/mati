@@ -1,5 +1,11 @@
 use super::*;
 
+/// Printed after every stop that actually signals a process. `ensure_daemon`
+/// runs on every hook, so a stop is not an enforcement hold and must not read
+/// like one.
+const RESPAWN_NOTE: &str =
+    "  it comes back on the next hook call — this is not an enforcement pause";
+
 /// Stop a running daemon authoritatively: classify the on-disk state, send
 /// SIGTERM (with optional SIGKILL escalation), wait for exit, and clean up
 /// any residual sock/pid files. Returns Ok(()) only when the daemon is
@@ -157,6 +163,7 @@ async fn kill_flow(
             anyhow::bail!("failed to send SIG{signal_label} to pid {pid}");
         }
         println!("mati daemon: SIG{signal_label} sent (pid {pid}); not waiting");
+        println!("{RESPAWN_NOTE}");
         mati_core::mcp::metadata::record_lifecycle_event(
             root,
             "stop_end",
@@ -193,6 +200,7 @@ async fn kill_flow(
             println!(
                 "mati daemon: stopped (pid {pid}, owner={owner_label}, took {elapsed_ms}ms, signal={signal_label})"
             );
+            println!("{RESPAWN_NOTE}");
             mati_core::mcp::metadata::record_lifecycle_event(
                 root,
                 "stop_end",
@@ -218,6 +226,7 @@ async fn kill_flow(
             println!(
                 "mati daemon: force-killed (pid {pid}, owner={owner_label}, took {elapsed_ms}ms, signal=KILL)"
             );
+            println!("{RESPAWN_NOTE}");
             mati_core::mcp::metadata::record_lifecycle_event(
                 root,
                 "stop_end",
