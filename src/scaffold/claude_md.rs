@@ -112,28 +112,33 @@ intent. Apply all four stages per file.
    calibrate AGAINST proposing similar rules. If `count` is 0,
    skip the negative block. Record whether the block was actually
    used — controls the `with-neg-exemplars` tag in Stage 4.
-4. **SOTA path** (replaces the LLM file scan — preferred): call
-   `mati extract-signals --file <path>` via Bash for deterministic,
-   AST-aware signal extraction across all 12 supported languages.
-   Returns JSON
+4. **AST seeding**: call `mati extract-signals --file <path>` via Bash
+   for deterministic, AST-aware signal extraction across all 12
+   supported languages. Returns JSON
    `{ file, language, signal_count, signals: [{ file_line, tier,
-      kind, evidence }, ...] }`. If `signal_count > 0`, use these
-   as the candidate list and SKIP the manual file scan in Stage 2;
-   tag mem_set with `signal-source:ast` (Stage 4 step 4).
-   Otherwise fall back to the legacy LLM file scan and tag
-   `signal-source:llm`.
+      kind, evidence }, ...] }`. Treat each `file_line` as a SEED that
+   Stage 2 must examine. Seeds never replace the file scan — read the
+   file in Stage 2 at every tier, whatever `signal_count` says.
+   For `panic`, `assert`, and `unwrap_like` signals, `evidence` is a
+   bare identifier (`bail`, `expect`), not source text. A candidate
+   drafted from that alone passes Stage 3 by construction — the quote
+   is the token the extractor matched — and carries an invented
+   reason. Take `evidence_quote` from the file, not from `evidence`.
+   The extractor also misses signals inside macro bodies, which
+   tree-sitter parses as token trees.
 
 ### Tier branches (D2)
 
-| Tier      | Positive exemplars | Negative exemplars |
-| --------- | ------------------ | ------------------ |
-| fast      | no (schema only)   | no                 |
-| standard  | yes                | no                 |
-| deep      | yes                | yes                |
+| Tier      | Positive exemplars | Negative exemplars | Stage 2 file scan |
+| --------- | ------------------ | ------------------ | ----------------- |
+| fast      | no (schema only)   | no                 | yes               |
+| standard  | yes                | no                 | yes               |
+| deep      | yes                | yes                | yes               |
 
 `fast` for trivial files (LoC < 100, isolated blast, no cluster).
 `standard` is the default. `deep` adds negative exemplars for
-hotspot / signal-rich files.
+hotspot / signal-rich files. Tier gates exemplars only — it never
+gates the file scan.
 
 Stage 3 runs at every tier. It is one CLI call per candidate, not a
 reasoning pass, so tier does not gate it.
@@ -227,16 +232,19 @@ For each verified candidate:
      rule, reason, severity (from step 3)
      affected_files: [<path>]
      tags:  [\"enriched\", \"depth:<tier>\"]
-          + [\"signal-source:ast\"] (if Stage 1 step 4 used extract-signals)
-            else [\"signal-source:llm\"]
+          + [\"signal-source:ast\"] (if this candidate's file_line was
+            an extract-signals seed) else [\"signal-source:llm\"]
           + [\"with-neg-exemplars\"] (if Stage 1 step 3 used negatives)
           + ([\"severity-disputed\"] if step 3c flagged)
      confirmed: false
 
-     The `depth:<tier>` tag (D3) drives per-tier accuracy in
-     `mati doctor`. The `signal-source:*` and `with-neg-exemplars`
-     tags (SOTA-γ) drive per-config A/B so reviewers can prove the
-     SOTA pipeline outperforms the legacy LLM scan.
+     `signal-source:*` is per candidate, not per file — it records
+     which channel first surfaced the line. The `depth:<tier>` tag
+     (D3) drives per-tier accuracy in `mati doctor`.
+
+     This is attribution, not an experiment: Stage 2 sees the seeds
+     while scanning, so `signal-source:llm` candidates are not an
+     uncontaminated control.
 
 ### Notes
 

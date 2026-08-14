@@ -39,9 +39,9 @@ pub const ENRICHED_TAG: &str = "enriched";
 /// Tag-prefix that carries the depth tier (e.g. `"depth:deep"`).
 pub const DEPTH_TAG_PREFIX: &str = "depth:";
 
-/// Tag-prefix carrying the signal source used to enumerate candidates
-/// in Stage 1/2: `"signal-source:ast"` (SOTA-α/β tree-sitter pipeline)
-/// or `"signal-source:llm"` (D2-γ prompt-driven scanning). Absent on
+/// Tag-prefix carrying the channel that first surfaced this candidate's
+/// line: `"signal-source:ast"` (an `extract-signals` seed) or
+/// `"signal-source:llm"` (found only by the Stage 2 file scan). Absent on
 /// older records — treated as `Llm` for compatibility.
 pub const SIGNAL_SOURCE_TAG_PREFIX: &str = "signal-source:";
 
@@ -61,10 +61,9 @@ pub enum ExtractionOutcome {
     Tombstoned,
 }
 
-/// Source of Stage-1/2 signal enumeration. SOTA-α moved signal extraction
-/// from LLM-driven scanning to deterministic tree-sitter; this enum lets
-/// `mati doctor` A/B the two and prove the SOTA pipeline is actually
-/// producing higher-quality candidates.
+/// Which channel first surfaced a candidate's line. Attribution for
+/// tuning the extractor, not a controlled comparison: Stage 2 sees the
+/// AST seeds while scanning, so `Llm` is not an uncontaminated arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalSource {
