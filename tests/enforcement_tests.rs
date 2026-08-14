@@ -1258,6 +1258,40 @@ async fn a_quiet_log_past_the_threshold_records_a_gap() {
     );
 }
 
+/// The gap event names the enforcement mode as fact, so it must be read, not
+/// assumed. A store left on the default reports Advisory either way; only a
+/// store set to Strict shows whether the field was measured.
+#[tokio::test]
+async fn a_gap_reports_the_mode_the_store_is_actually_in() {
+    use mati_core::store::enforcement::{
+        detect_startup_gap, get_enforcement_mode, STARTUP_GAP_THRESHOLD_MS,
+    };
+
+    let (_dir, store) = temp_store().await;
+    write_and_backdate(&store, 3, 2 * 24 * 60 * 60 * 1000).await;
+
+    // Written raw: `set_enforcement_mode` records a config event, and a fresh
+    // event at the tail is exactly what makes the log look un-quiet.
+    store
+        .put_raw("enforcement:mode", b"strict")
+        .await
+        .expect("set mode");
+    assert_eq!(get_enforcement_mode(&store).await, EnforcementMode::Strict);
+
+    let event = detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+        .await
+        .expect("detect startup gap")
+        .expect("a two-day silence must be recorded");
+
+    match &event.event_type {
+        EnforcementEventType::RecordingGap {
+            enforcement_mode_during_gap,
+            ..
+        } => assert_eq!(*enforcement_mode_during_gap, EnforcementMode::Strict),
+        other => panic!("expected RecordingGap, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_log_inside_the_threshold_records_nothing() {
     use mati_core::store::enforcement::{detect_startup_gap, STARTUP_GAP_THRESHOLD_MS};

@@ -352,9 +352,13 @@ impl EnforcementEventWriter {
     /// Called by [`detect_startup_gap`](super::detect_startup_gap), which infers
     /// the window from a timestamp delta rather than reading it off a record —
     /// hence `Inferred` certainty and an `Unknown` missed-event count, neither
-    /// of which a caller can improve on. `enforcement_mode_during_gap` is
-    /// hardcoded `Advisory` and is not read from the store; the mode in force
-    /// during a window nobody was recording is not knowable either way.
+    /// of which a caller can improve on.
+    ///
+    /// `enforcement_mode_during_gap` is the mode read now. A mode change writes
+    /// an `EnforcementConfigChanged` event, and the gap is by definition a
+    /// window with no event in it, so the mode read at gap end is the one that
+    /// held across the window — unless a change landed whose event write failed,
+    /// which advisory mode swallows.
     pub async fn detect_and_record_gap(
         &mut self,
         store: &Store,
@@ -362,13 +366,14 @@ impl EnforcementEventWriter {
         gap_end_ms: u64,
         cause: GapCause,
     ) -> Result<EnforcementEvent> {
+        let mode = get_enforcement_mode(store).await;
         self.write(
             store,
             EnforcementEventType::RecordingGap {
                 gap_start_ms,
                 gap_end_ms,
                 cause,
-                enforcement_mode_during_gap: EnforcementMode::Advisory,
+                enforcement_mode_during_gap: mode,
                 missed_event_count: MissedEventCount::Unknown,
                 certainty: GapCertainty::Inferred,
             },
