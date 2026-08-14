@@ -825,6 +825,312 @@ async fn retention_prunes_old_events_and_records_prune_event() {
         assert_eq!(*oldest_pruned_seq, 1);
         assert_eq!(*newest_pruned_seq, 5);
     }
+
+    // A pruned prefix leaves the earliest survivor's prev_hash dangling, which
+    // verify_chain ignores. Anything else here would read as tampering.
+    let verification = mati_core::store::enforcement::verify_chain(&remaining);
+    assert!(
+        verification.is_valid(),
+        "chain must verify clean after a prefix prune, got {verification:?}"
+    );
+}
+
+// ─────────────────────────────────────────────
+// Test 10a: pruning is prefix-only
+// ─────────────────────────────────────────────
+
+/// A backdated event in the MIDDLE of the chain must survive.
+///
+/// `recorded_at_ms` comes from the wall clock, which can step backwards (NTP,
+/// VM resume, a manual `date`). Selecting events by timestamp would then delete
+/// a mid-chain event and leave its successor's `prev_hash` pointing at nothing
+/// — a `Linkage` break, which is the tamper signal in a signed audit.
+#[tokio::test]
+async fn retention_prunes_a_prefix_and_spares_a_backdated_mid_chain_event() {
+    use mati_core::store::enforcement::{
+        enforce_retention, set_retention_days, verify_chain, EnforcementEvent, PruneResult,
+    };
+
+    let (_dir, store) = temp_store().await;
+    set_retention_days(&store, 1).await.expect("set retention");
+
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    for i in 0..6 {
+        writer
+            .write(
+                &store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f_{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+
+    // Backdate seqs 1, 2 (a real expired prefix) and 4 (the clock-skew event).
+    let old_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let old_ms = old_ms.saturating_sub(400 * 86_400_000);
+    for seq in [1u64, 2, 4] {
+        let key = format!("enforcement:event:{:020}", seq);
+        let bytes = store
+            .get_raw_bytes(&key)
+            .await
+            .expect("read event")
+            .expect("event present");
+        let mut event = serde_json::from_slice::<EnforcementEvent>(&bytes).expect("parse event");
+        event.recorded_at_ms = old_ms;
+        store
+            .put_raw(&key, &serde_json::to_vec(&event).unwrap())
+            .await
+            .expect("patch event");
+    }
+
+    match enforce_retention(&store).await.expect("enforce retention") {
+        PruneResult::Pruned {
+            count,
+            oldest_seq,
+            newest_seq,
+        } => {
+            assert_eq!(count, 2, "the prefix stops at seq 3, which is still fresh");
+            assert_eq!(oldest_seq, 1);
+            assert_eq!(newest_seq, 2);
+        }
+        PruneResult::NothingToPrune => panic!("expected the expired prefix to be pruned"),
+    }
+
+    let remaining = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    let seqs: Vec<u64> = remaining.iter().map(|e| e.seq_no).collect();
+    assert_eq!(
+        seqs,
+        vec![3, 4, 5, 6, 7],
+        "seq 4 is backdated but mid-chain — it must survive; 7 is the prune event"
+    );
+
+    // The fixture's own patch leaves seq 4's stored hash stale, so it reads as
+    // tampered. Linkage is what this test is about, and it must be untouched.
+    let verification = verify_chain(&remaining);
+    assert_eq!(
+        verification.linkage_breaks, 0,
+        "a prefix prune must leave no gap in the chain, got {verification:?}"
+    );
+    assert_eq!(
+        verification.tampered_events, 1,
+        "only the deliberately backdated seq 4 should read as tampered"
+    );
+}
+
+// ─────────────────────────────────────────────
+// Test 10b: retention values that must prune nothing
+// ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn retention_of_zero_prunes_nothing() {
+    use mati_core::store::enforcement::{
+        enforce_retention, set_retention_days, EnforcementEvent, PruneResult,
+    };
+
+    let (_dir, store) = temp_store().await;
+    set_retention_days(&store, 0).await.expect("set retention");
+
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    for i in 0..3 {
+        writer
+            .write(
+                &store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f_{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+
+    // Every event is 400 days old: only the zero window stands between them
+    // and deletion.
+    let old_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let old_ms = old_ms.saturating_sub(400 * 86_400_000);
+    for seq in 1..=3u64 {
+        let key = format!("enforcement:event:{:020}", seq);
+        let bytes = store
+            .get_raw_bytes(&key)
+            .await
+            .expect("read event")
+            .expect("event present");
+        let mut event = serde_json::from_slice::<EnforcementEvent>(&bytes).expect("parse event");
+        event.recorded_at_ms = old_ms;
+        store
+            .put_raw(&key, &serde_json::to_vec(&event).unwrap())
+            .await
+            .expect("patch event");
+    }
+
+    assert!(
+        matches!(
+            enforce_retention(&store).await.expect("enforce retention"),
+            PruneResult::NothingToPrune
+        ),
+        "retention 0 disables pruning; it must not read as `prune everything`"
+    );
+    let remaining = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(remaining.len(), 3, "no event may be deleted, none recorded");
+}
+
+#[tokio::test]
+async fn unset_retention_falls_back_to_the_365_day_default() {
+    use mati_core::store::enforcement::{enforce_retention, get_retention_days, PruneResult};
+
+    let (_dir, store) = temp_store().await;
+    assert_eq!(
+        get_retention_days(&store).await,
+        365,
+        "an unset window must not read as 0"
+    );
+
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    writer
+        .write(
+            &store,
+            EnforcementEventType::Deny,
+            SubjectKind::File,
+            "file:fresh.rs".to_string(),
+            "claude".to_string(),
+            None,
+            "gotcha_above_threshold".to_string(),
+            None,
+        )
+        .await
+        .expect("write event");
+
+    assert!(matches!(
+        enforce_retention(&store).await.expect("enforce retention"),
+        PruneResult::NothingToPrune
+    ));
+    let remaining = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(remaining.len(), 1);
+}
+
+// ─────────────────────────────────────────────
+// Test 10c: `mati repair --check` is read-only
+// ─────────────────────────────────────────────
+
+/// `--check` is the CI gate. It must never delete audit evidence, however far
+/// past the retention window the events are.
+#[tokio::test]
+async fn repair_check_prunes_nothing() {
+    use mati_core::store::enforcement::{set_retention_days, EnforcementEvent};
+
+    common::isolate_mati_home();
+    let dir = TempDir::new().expect("tempdir");
+    // The child resolves its own cwd, which macOS canonicalizes to
+    // /private/var/...; a divergent path would derive a different store slug.
+    let repo = dir.path().canonicalize().expect("canonicalize tempdir");
+    // Declared after `dir` so it drops first and stops the daemon while its cwd
+    // still exists.
+    let _daemon_guard = common::DaemonGuard::for_mati_home(&repo, common::mati_home());
+
+    let store = Store::open(&repo).await.expect("open store");
+    set_retention_days(&store, 1).await.expect("set retention");
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    for i in 0..3 {
+        writer
+            .write(
+                &store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f_{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+    let old_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let old_ms = old_ms.saturating_sub(400 * 86_400_000);
+    for seq in 1..=3u64 {
+        let key = format!("enforcement:event:{:020}", seq);
+        let bytes = store
+            .get_raw_bytes(&key)
+            .await
+            .expect("read event")
+            .expect("event present");
+        let mut event = serde_json::from_slice::<EnforcementEvent>(&bytes).expect("parse event");
+        event.recorded_at_ms = old_ms;
+        store
+            .put_raw(&key, &serde_json::to_vec(&event).unwrap())
+            .await
+            .expect("patch event");
+    }
+    store.close().await.expect("close store");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mati"))
+        .args(["repair", "--check", "--json"])
+        .current_dir(&repo)
+        .output()
+        .expect("run mati repair --check");
+    assert!(
+        out.status.success(),
+        "mati repair --check exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--check` proxied through the daemon it spawned, which holds the store
+    // lock for its 30min idle window. Stop it so this test-only direct read can
+    // take the lock; production never opens the store behind a live daemon.
+    let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_mati"))
+        .args(["daemon", "stop"])
+        .current_dir(&repo)
+        .output()
+        .expect("run mati daemon stop");
+    assert!(
+        stopped.status.success(),
+        "mati daemon stop exited {:?}: {}",
+        stopped.status.code(),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    let store = Store::open(&repo).await.expect("reopen store");
+    let remaining = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(
+        remaining.len(),
+        3,
+        "--check must leave every expired event in place"
+    );
 }
 
 // ─────────────────────────────────────────────

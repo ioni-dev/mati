@@ -1128,7 +1128,7 @@ There are 8 event types:
 | `ControlChanged`           | A gotcha was created, confirmed, updated, or deleted                                                             |
 | `EnforcementConfigChanged` | A configuration setting changed. Records old and new value.                                                      |
 | `RecordingGap`             | Crash/restart gap detected on recovery. Records cause, duration, enforcement mode during the gap, and certainty. |
-| `RetentionPruned`          | Events were pruned under enterprise retention policy                                                             |
+| `RetentionPruned`          | An oldest-first prefix of the event log was deleted past `enforcement.retention`. Records the count and the seq range. Written by `mati repair`'s full scan, after the deletion |
 
 Each event also carries:
 
@@ -1173,7 +1173,7 @@ All CLI commands write to stdout using `comfy-table` for structured output. Ther
 | `mati clusters`                    | Co-change clusters from git history                                                                                                |
 | `mati diff [range]`                | Pre-merge check: surface gotchas for files in a git diff range, such as `main..feature`                                            |
 | `mati show <key>` / `mati ls`      | Browse records. `mati history` is an alias for time-ordered listing.                                                               |
-| `mati repair`                      | Reconcile derived indexes against canonical records                                                                                |
+| `mati repair`                      | Reconcile derived indexes against canonical records, and prune enforcement events past `enforcement.retention` (section 25.3)       |
 | `mati repair --check`              | Detect index drift without writing. CI-safe, exits non-zero.                                                                       |
 | `mati repair --fast`               | Drain dirty-marker queue only. Not a full integrity proof.                                                                         |
 | `mati doctor`                      | Aggregated health check and CI gate command                                                                                        |
@@ -1400,16 +1400,26 @@ The measured init on the 58k-file rust repo produced only 80 edges (dependency e
 
 ### 25.3 Event log length
 
-`enforcement:event:*` is append-only and hash-chained, stored in `knowledge.db` (Immediate durability by default — `src/store/durability.rs`). `enforce_retention` (`src/store/enforcement/retention.rs:18-23`) is the only prune logic that exists, and it has no production caller — confirmed by `src/invariants.rs`'s caller-claim test (`every_documented_caller_claim_has_a_caller`, `src/invariants.rs:1305`), which names `enforce_retention` as the sanctioned exception rather than a bug to fix. There is no working prune path today, full stop; do not wire one up to silence that test (`src/invariants.rs:1335`) — that's a behavior change and needs its own review.
+`enforcement:event:*` is append-only and hash-chained, stored in `knowledge.db` (Immediate durability by default — `src/store/durability.rs`). `enforce_retention` (`src/store/enforcement/retention.rs`) is the only prune logic that exists. It ran nowhere in production until it was wired into `mati repair`'s full scan (`prune_expired_events`, `src/cli/repair.rs`); before that the log grew without bound.
+
+The prune is deliberately narrow, because the thing it deletes is audit evidence:
+
+- **Prefix only.** It walks event keys in seq order and stops at the first event still inside the window — and also at the first key it cannot read or parse, so every deleted key is individually proven expired. `verify_chain` ignores the earliest survivor's dangling `prev_hash` (`src/store/enforcement/models_chain.rs`), so a pruned prefix verifies clean. A hole anywhere else is a `ChainBreakKind::Linkage` — the tamper signal. Selecting by timestamp alone, which the original code did, punches that hole the first time the wall clock steps backwards.
+- **Full scan only.** `mati repair --check` returns before the write path and `--fast` runs `RepairMode::Fast`; neither deletes anything. `mati repair` (full) also refuses to run while the daemon holds the store, so no writer is appending during the prune.
+- **Never on a read or hook path.** Hooks run under `HOOK_DEADLINE_MS` and fail open; a deletion pass there would be both slow and unreviewable.
+- **Zero disables it.** `get_retention_days` returns the 365-day default for an unset or unparseable setting, never 0, and a retention of 0 is read as "do not prune" rather than "prune everything".
+- **The deletion is attested.** A `RetentionPruned` event is recorded after the deletion, so it links to the newest surviving event. A pruned prefix is invisible to `verify_chain` by design, which makes that event the only trace the prune happened — so `enforce_retention` fails loudly rather than returning success if it cannot be written (advisory mode otherwise swallows event-write failures).
+
+Not addressed: deletion is one `Store::delete` per key at Immediate durability, so a very long expired prefix costs one fsync per event. `mati repair` is an offline maintenance command, so this is latency, not a correctness problem.
 
 Both consumers that need the full chain call `scan_enforcement_events(store, 0, u64::MAX)` unconditionally (`src/store/enforcement/seq_writer.rs:387-431`): `mati verify-chain` (`src/cli/verify_chain.rs:37`) and `mati history --enforcement`, even with `--limit` (`src/cli/show/history.rs:41`). That's one key scan, then one separate `get_raw_bytes` call per event — each opens its own read-only transaction (`src/store/db/crud.rs:439-446`) — one JSON deserialize per event, and, for `verify-chain`, one SHA-256 recompute per event to check tamper and linkage (`src/store/enforcement/models_chain.rs:407-449`). `--limit N` on `mati history --enforcement` filters *after* loading everything (`src/cli/show/history.rs:20-123`); it does not bound the scan.
 
 This is the one place in the codebase that never got the equivalent of the fix already applied to `StalenessAnalyzer::analyze_all`: a resumable cursor plus a hard 2000ms deadline (`ANALYZE_TIME_BUDGET_MS`, `src/health/staleness/analyzer.rs:37-39`, `src/health/staleness/analyzer.rs:130-228` onward), added specifically because an unbounded full scan doesn't hold up at scale. The enforcement scan path never got that treatment.
 
-Measured: this repo's live store recorded 204 enforcement events in a 30-day window that's effectively one active dev-day (`mati stats`) — a burst rate from heavy tool use, an upper bound rather than a steady-state number. **Unmeasured** beyond that: nothing in this repo has run `verify-chain` or `mati history --enforcement` against a chain with more than a few hundred events, so the point where the per-event transaction-plus-JSON-plus-SHA-256 cost turns into seconds rather than milliseconds is a derived guess, not a benchmark. What's certain: this is the only one of the three limits in this section with zero mitigation in the code today — no cursor, no deadline, no working prune.
+Measured: this repo's live store recorded 204 enforcement events in a 30-day window that's effectively one active dev-day (`mati stats`) — a burst rate from heavy tool use, an upper bound rather than a steady-state number. **Unmeasured** beyond that: nothing in this repo has run `verify-chain` or `mati history --enforcement` against a chain with more than a few hundred events, so the point where the per-event transaction-plus-JSON-plus-SHA-256 cost turns into seconds rather than milliseconds is a derived guess, not a benchmark. The prune now bounds the log, but only as far back as the retention window and only when someone runs `mati repair`; the scan paths still have no cursor and no deadline.
 
 ### 25.4 What breaks first
 
-1. **Event log** breaks first. It has no natural throttle (unlike `HasGotcha` edges, gated by human confirmation), no cache shield (unlike `stats`/`status`), no resumable-scan fix (unlike staleness analysis), and no prune path at all — `enforce_retention` exists and has never been called in production.
+1. **Event log** breaks first. It has no natural throttle (unlike `HasGotcha` edges, gated by human confirmation), no cache shield (unlike `stats`/`status`), and no resumable-scan fix (unlike staleness analysis). The prune (section 25.3) caps it at the retention window, but only on a manual `mati repair`, so a store nobody maintains still grows without bound.
 2. **Store size** is next. Growth is real and permanent (no compaction under indefinite retention), but self-limited by edit churn rather than repo size, and most day-to-day commands are cache-backed and stay fast regardless of store size.
 3. **Graph edges** last. All three edge-generating paths are structurally bounded — by commit size, by file/import count, or by a manual confirmation step — so reaching a count that threatens the 15s/60s daemon-readiness ceiling needs a scale of monorepo this tool hasn't been pointed at yet.

@@ -18,7 +18,10 @@ use super::proxy::StoreProxy;
                   File links (gotcha_keys) and graph edges are materialized views — if they\n\
                   drift from the canonical gotcha records, this command rebuilds them.\n\n\
                   Drift is detected automatically and surfaced in `mati status`.\n\
-                  Use --check in CI to fail the build on index inconsistency."
+                  Use --check in CI to fail the build on index inconsistency.\n\n\
+                  The full scan also deletes enforcement events older than\n\
+                  `enforcement.retention` (default 365 days) and records a\n\
+                  RetentionPruned event. --check and --fast never delete anything."
 )]
 pub struct RepairArgs {
     /// Check for drift without making changes (exits non-zero if drift exists, CI-ready)
@@ -63,6 +66,13 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     } else {
         RepairMode::Full
     };
+
+    // Full scan only, and ahead of the "nothing to repair" early return below:
+    // the event log expires on its own clock, not on index drift. --check
+    // returned above and --fast is Fast mode, so neither reaches this.
+    if mode == RepairMode::Full {
+        prune_expired_events(&store, args.json).await?;
+    }
 
     // Show pre-repair state for full mode
     if mode == RepairMode::Full && !args.json {
@@ -223,6 +233,33 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         print_repair_report(&report, use_color);
     }
 
+    Ok(())
+}
+
+/// Delete enforcement events past the configured retention window.
+///
+/// The only destructive step in `mati repair` that touches canonical data, so
+/// it always says what it removed. `enforce_retention` deletes an oldest-first
+/// prefix, which `mati verify-chain` still reads as intact; the
+/// `RetentionPruned` event it appends is the record that the deletion happened.
+async fn prune_expired_events(store: &Store, json: bool) -> Result<()> {
+    use mati_core::store::enforcement::{enforce_retention, PruneResult};
+
+    match enforce_retention(store).await? {
+        PruneResult::NothingToPrune => {}
+        PruneResult::Pruned {
+            count,
+            oldest_seq,
+            newest_seq,
+        } => {
+            if !json {
+                println!(
+                    "  Enforcement events pruned: {count} (seq {oldest_seq}-{newest_seq}) \
+                     past the retention window."
+                );
+            }
+        }
+    }
     Ok(())
 }
 

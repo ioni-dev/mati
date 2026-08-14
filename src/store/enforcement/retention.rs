@@ -18,34 +18,62 @@ pub enum PruneResult {
 /// Prune enforcement events older than the configured retention period
 /// and record a RetentionPruned event for the deletion.
 ///
-/// Nothing in production calls this — the only caller is a test. Until it is
-/// wired into `mati init` or `mati repair`, the event log grows without bound.
+/// Called by `mati repair`'s full scan, which holds the store exclusively —
+/// never from a read path, a hook, or `--check`/`--fast`.
+///
+/// Deletes an oldest-first **prefix** and nothing else. The walk stops at the
+/// first event still inside the window, and also at the first key this binary
+/// cannot read or parse, so every deleted key is individually proven expired.
+/// [`verify_chain`] ignores the earliest survivor's dangling `prev_hash`, so a
+/// pruned prefix verifies clean; a hole anywhere else reads as
+/// [`ChainBreakKind::Linkage`] — the tamper signal. Selecting by timestamp
+/// alone would punch that hole the first time the wall clock stepped backwards.
+///
+/// A retention of `0` disables pruning. An unset or unparseable setting reads
+/// as the 365-day default (`get_retention_days`), never as zero.
 pub async fn enforce_retention(store: &Store) -> Result<PruneResult> {
     let retention_days = get_retention_days(store).await;
-    let cutoff_ms = now_ms().saturating_sub(retention_days * 86_400_000);
-
-    let all_events = scan_enforcement_events(store, 0, u64::MAX).await?;
-    let old_events: Vec<&EnforcementEvent> = all_events
-        .iter()
-        .filter(|e| e.recorded_at_ms < cutoff_ms)
-        .collect();
-
-    if old_events.is_empty() {
+    if retention_days == 0 {
         return Ok(PruneResult::NothingToPrune);
     }
+    let cutoff_ms = now_ms().saturating_sub(retention_days.saturating_mul(86_400_000));
 
-    let count = old_events.len() as u64;
-    let oldest_seq = old_events.first().expect("checked non-empty above").seq_no;
-    let newest_seq = old_events.last().expect("checked non-empty above").seq_no;
-
-    // Delete the old events
-    for event in &old_events {
-        let key = format!("{EVENT_PREFIX}{:020}", event.seq_no);
-        store.delete(&key).await?;
+    // Zero-padded keys sort in seq order, so this walk is the chain order.
+    let keys = store.scan_keys(EVENT_PREFIX).await?;
+    let mut expired: Vec<(String, u64)> = Vec::new();
+    for key in &keys {
+        let Some(seq) = key
+            .strip_prefix(EVENT_PREFIX)
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            break;
+        };
+        let Ok(Some(bytes)) = store.get_raw_bytes(key).await else {
+            break;
+        };
+        let Ok(event) = serde_json::from_slice::<EnforcementEvent>(&bytes) else {
+            break;
+        };
+        if event.recorded_at_ms >= cutoff_ms {
+            break;
+        }
+        expired.push((key.clone(), seq));
     }
 
-    // Record the prune as an event
-    record_event(
+    if expired.is_empty() {
+        return Ok(PruneResult::NothingToPrune);
+    }
+    let oldest_seq = expired.first().expect("checked non-empty above").1;
+    let newest_seq = expired.last().expect("checked non-empty above").1;
+    let count = expired.len() as u64;
+
+    for (key, _) in &expired {
+        store.delete(key).await?;
+    }
+
+    // After the deletion, so the prune event links to the newest SURVIVING
+    // event rather than to one this run is about to remove.
+    let recorded = record_event(
         store,
         EnforcementEventType::RetentionPruned {
             pruned_count: count,
@@ -60,6 +88,16 @@ pub async fn enforce_retention(store: &Store) -> Result<PruneResult> {
         None,
     )
     .await?;
+
+    // Advisory mode swallows event-write failures. Here that would leave a
+    // deletion no one can see: a pruned prefix is invisible to `verify_chain`
+    // by design, so the RetentionPruned event is the only trace it happened.
+    if recorded.is_none() {
+        anyhow::bail!(
+            "pruned {count} enforcement events (seq {oldest_seq}-{newest_seq}) but could not \
+             record the RetentionPruned event — the deletion is unattested"
+        );
+    }
 
     Ok(PruneResult::Pruned {
         count,
