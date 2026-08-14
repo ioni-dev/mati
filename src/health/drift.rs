@@ -11,10 +11,11 @@
 //!
 //! Nothing here writes. Drift is a pure comparison between
 //! [`GotchaRecord::confirmed_content`] (written once, by the confirm paths in
-//! [`crate::store::gotcha_ops`]) and the `content_hash` `mati init` already
-//! stores on each `file:*` record. Both values exist before this module runs,
-//! so detection costs one map lookup per affected file and adds nothing to
-//! `mati init`.
+//! [`crate::store::gotcha_ops`]) and the digest each affected file hashes to
+//! on disk right now. Both sides read the working tree, so drift is
+//! independent of how stale the `file:*` index happens to be — a developer who
+//! edits a file and then confirms is not reported the moment the next rescan
+//! catches up.
 //!
 //! It deliberately stays out of the staleness composite. Two reasons:
 //!
@@ -35,7 +36,8 @@
 //! enforced. A drifted gotcha keeps denying reads, which is the point: the
 //! rule is more likely to matter, not less, once the code moved.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,38 +55,57 @@ pub struct DriftedGotcha {
     pub drifted_files: Vec<String>,
 }
 
-/// Build the `path → content_hash` map drift compares against, from `file:*`
-/// records the caller has already scanned.
+/// Build the `path → digest` map [`detect_drift`] compares against, hashing
+/// each file on disk under `repo_root`.
 ///
-/// Files with no stored digest are omitted, which makes them unknown rather
-/// than drifted.
-pub fn current_content_hashes(file_records: &[Record]) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(file_records.len());
-    for record in file_records {
-        let Some(path) = record.key.strip_prefix("file:") else {
-            continue;
-        };
-        if let Some(hash) = crate::store::gotcha_ops::content_hash_of(record) {
-            out.insert(path.to_string(), hash);
-        }
+/// `repo_root` is the root the store's slug was keyed on
+/// ([`crate::store::slug_root`]), the same root the confirm paths stamp
+/// against. `Store::root` is `~/.mati/<slug>` and resolves nothing.
+///
+/// Only the files some active, confirmed, stamped gotcha actually names are
+/// hashed, and each is hashed once however many rules share it — a few hundred
+/// files at most, not the repo. Paths that cannot be read are omitted, which
+/// makes them unknown rather than drifted.
+pub fn disk_content_hashes(repo_root: &Path, gotcha_records: &[Record]) -> HashMap<String, String> {
+    let mut wanted: HashSet<String> = HashSet::new();
+    for gotcha in gotcha_records.iter().filter_map(reportable_gotcha) {
+        wanted.extend(gotcha.affected_files);
     }
-    out
+
+    wanted
+        .into_iter()
+        .filter_map(|path| {
+            crate::store::gotcha_ops::disk_content_hash(repo_root, &path).map(|hash| (path, hash))
+        })
+        .collect()
+}
+
+/// The gotcha payload of a record [`detect_drift`] will actually compare, or
+/// `None` for one it skips. Shared so the hashing pass above and the
+/// comparison below can never disagree about which files matter.
+fn reportable_gotcha(record: &Record) -> Option<GotchaRecord> {
+    if !matches!(record.lifecycle, RecordLifecycle::Active) {
+        return None;
+    }
+    let gotcha = record.payload_as::<GotchaRecord>()?;
+    (gotcha.confirmed && !gotcha.confirmed_content.is_empty()).then_some(gotcha)
 }
 
 /// Find the confirmed gotchas whose affected files have changed since they
 /// were confirmed.
 ///
-/// Pure — no I/O, no mutation. Both inputs come from scans the caller already
-/// performs.
+/// Pure — no I/O, no mutation. The digests come from
+/// [`disk_content_hashes`], which the caller runs first.
 ///
 /// A file is drifted only when *both* digests are known and they differ. That
 /// makes every "unknown" case a non-report:
 ///
 /// - a record confirmed before the stamp existed (`confirmed_content` empty),
-/// - a glob entry such as `src/payments/**`, which has no `file:*` record,
+/// - a glob entry such as `src/payments/**`, which names no file,
 /// - a path re-keyed by the rename migration, whose stamp is under the old
 ///   spelling (a rename is not a content change),
-/// - a file `mati init` could not parse, which carries no `content_hash`.
+/// - a path with nothing readable on disk. A deleted file is the staleness
+///   analyzer's `FileDeleted` signal, never drift.
 ///
 /// Unconfirmed gotchas are skipped outright: they are Layer 0 candidates that
 /// nobody vouched for, so there is no sign-off for the code to have drifted
@@ -96,15 +117,9 @@ pub fn detect_drift(
     let mut out: Vec<DriftedGotcha> = Vec::new();
 
     for record in gotcha_records {
-        if !matches!(record.lifecycle, RecordLifecycle::Active) {
-            continue;
-        }
-        let Some(gotcha) = record.payload_as::<GotchaRecord>() else {
+        let Some(gotcha) = reportable_gotcha(record) else {
             continue;
         };
-        if !gotcha.confirmed || gotcha.confirmed_content.is_empty() {
-            continue;
-        }
 
         let drifted_files: Vec<String> = gotcha
             .affected_files
@@ -309,20 +324,99 @@ mod tests {
         assert!(detect_drift(&[g], &hashes(&[("src/old.rs", "CHANGED")])).is_empty());
     }
 
-    #[test]
-    fn current_content_hashes_reads_file_records() {
-        let mut file = gotcha("file:src/a.rs", &[], true, BTreeMap::new());
-        file.category = Category::File;
-        file.payload = Some(serde_json::json!({ "path": "src/a.rs", "content_hash": "h9" }));
-        let mut unparsed = file.clone();
-        unparsed.key = "file:src/b.bin".into();
-        unparsed.payload = Some(serde_json::json!({ "path": "src/b.bin" }));
+    /// Writes `contents` to `<dir>/<rel>`, creating parents.
+    fn write_file(dir: &std::path::Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
 
-        let map = current_content_hashes(&[file, unparsed]);
-        assert_eq!(map.get("src/a.rs"), Some(&"h9".to_string()));
-        assert!(
-            !map.contains_key("src/b.bin"),
-            "a file with no digest must stay unknown"
+    /// The digest the confirm paths stamp, for a file that exists on disk.
+    fn disk_hash(dir: &std::path::Path, rel: &str) -> String {
+        crate::store::gotcha_ops::disk_content_hash(dir, rel).expect("file must be readable")
+    }
+
+    #[test]
+    fn disk_content_hashes_reads_the_working_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_file(dir.path(), "src/a.rs", "fn a() {}\n");
+        let g = gotcha(
+            "gotcha:a",
+            &["src/a.rs", "src/gone.rs", "src/payments/**"],
+            true,
+            stamp(&[("src/a.rs", "whatever")]),
         );
+
+        let map = disk_content_hashes(dir.path(), &[g]);
+        assert_eq!(
+            map.get("src/a.rs"),
+            Some(&disk_hash(dir.path(), "src/a.rs"))
+        );
+        assert!(
+            !map.contains_key("src/gone.rs") && !map.contains_key("src/payments/**"),
+            "a path with nothing readable on disk must stay unknown"
+        );
+    }
+
+    /// The whole point of hashing disk on both sides: a `file:*` record frozen
+    /// at the pre-edit digest cannot make a rule confirmed against the current
+    /// code look drifted. There is no file record here at all — drift never
+    /// reads one.
+    #[test]
+    fn stamp_taken_from_disk_is_not_drifted_however_stale_the_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_file(dir.path(), "src/a.rs", "fn a() { edited(); }\n");
+        let g = gotcha(
+            "gotcha:a",
+            &["src/a.rs"],
+            true,
+            stamp(&[("src/a.rs", &disk_hash(dir.path(), "src/a.rs"))]),
+        );
+
+        let found = detect_drift(&[g], &disk_content_hashes(dir.path(), &[]));
+        assert!(
+            found.is_empty(),
+            "confirming against the file on disk must read clean; got {found:?}"
+        );
+    }
+
+    /// The other half: edit the file after confirmation and it is drifted,
+    /// again without any `file:*` record being involved.
+    #[test]
+    fn editing_the_file_after_confirmation_is_drift() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_file(dir.path(), "src/a.rs", "fn a() {}\n");
+        let at_confirm = disk_hash(dir.path(), "src/a.rs");
+        write_file(dir.path(), "src/a.rs", "fn a() { changed(); }\n");
+
+        let g = gotcha(
+            "gotcha:a",
+            &["src/a.rs"],
+            true,
+            stamp(&[("src/a.rs", &at_confirm)]),
+        );
+        let found = detect_drift(
+            std::slice::from_ref(&g),
+            &disk_content_hashes(dir.path(), std::slice::from_ref(&g)),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].drifted_files, vec!["src/a.rs".to_string()]);
+    }
+
+    /// Deleting a file is the staleness analyzer's `FileDeleted`, not drift.
+    #[test]
+    fn deleted_file_is_never_drift() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g = gotcha(
+            "gotcha:a",
+            &["src/gone.rs"],
+            true,
+            stamp(&[("src/gone.rs", "hash-before-deletion")]),
+        );
+        let found = detect_drift(
+            std::slice::from_ref(&g),
+            &disk_content_hashes(dir.path(), std::slice::from_ref(&g)),
+        );
+        assert!(found.is_empty(), "a deleted file must not report as drift");
     }
 }

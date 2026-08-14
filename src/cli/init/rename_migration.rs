@@ -177,6 +177,7 @@ pub(crate) async fn migrate_renamed_gotchas(
         // carries the dirty-marker cancellation guard.
         if let Err(e) = mati_core::store::gotcha_ops::apply_gotcha_write(
             store,
+            root,
             rec,
             &plan.old_files,
             &plan.new_files,

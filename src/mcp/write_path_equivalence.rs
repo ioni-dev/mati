@@ -51,14 +51,14 @@ enum Path {
     Daemon,
 }
 
-fn test_ctx() -> RequestContext {
+fn test_ctx(repo_root: &std::path::Path) -> RequestContext {
     RequestContext {
         peer: PeerContext {
             uid: 501,
             pid: Some(4242),
         },
         daemon_session: uuid::Uuid::nil(),
-        repo_root: std::path::PathBuf::new(),
+        repo_root: repo_root.to_path_buf(),
         policy_matcher: std::sync::Arc::new(tokio::sync::RwLock::new(
             crate::hooks::policy_match::PolicyMatcherSet::empty(),
         )),
@@ -73,15 +73,18 @@ fn test_ctx() -> RequestContext {
 async fn drive_write(
     path: Path,
     store: &Store,
+    repo_root: &std::path::Path,
     record: &Record,
     old_files: &[String],
     new_files: &[String],
     is_new: bool,
 ) -> Result<(), String> {
     match path {
-        Path::Direct => gotcha_ops::apply_gotcha_write(store, record, old_files, new_files, is_new)
-            .await
-            .map_err(|e| e.to_string()),
+        Path::Direct => {
+            gotcha_ops::apply_gotcha_write(store, repo_root, record, old_files, new_files, is_new)
+                .await
+                .map_err(|e| e.to_string())
+        }
         Path::Daemon => {
             let gotcha = record
                 .payload_as::<GotchaRecord>()
@@ -112,7 +115,7 @@ async fn drive_write(
                 source,
                 confirmed: gotcha.confirmed,
             };
-            handlers::handle_gotcha_upsert(store, &test_ctx(), uuid::Uuid::nil(), &input)
+            handlers::handle_gotcha_upsert(store, &test_ctx(repo_root), uuid::Uuid::nil(), &input)
                 .await
                 .map(|_| ())
                 .map_err(|(code, msg)| format!("{code:?}: {msg}"))
@@ -123,7 +126,12 @@ async fn drive_write(
 /// Mirror of `cli::gotcha::confirm_gotcha`, including the record mutation the
 /// CLI performs before handing the Direct arm its record and the
 /// `propagate_confirmation` call it makes afterwards.
-async fn drive_confirm(path: Path, store: &Store, key: &str) -> Result<(), String> {
+async fn drive_confirm(
+    path: Path,
+    store: &Store,
+    repo_root: &std::path::Path,
+    key: &str,
+) -> Result<(), String> {
     let mut record = store
         .get(key)
         .await
@@ -166,7 +174,7 @@ async fn drive_confirm(path: Path, store: &Store, key: &str) -> Result<(), Strin
 
     match path {
         Path::Direct => {
-            gotcha_ops::apply_gotcha_confirm(store, &record, &affected_files)
+            gotcha_ops::apply_gotcha_confirm(store, repo_root, &record, &affected_files)
                 .await
                 .map_err(|e| e.to_string())?;
             // `StoreProxy::propagate_confirmation`: Direct arm only — the
@@ -177,7 +185,7 @@ async fn drive_confirm(path: Path, store: &Store, key: &str) -> Result<(), Strin
             let input = protocol::GotchaConfirmInput {
                 key: key.to_string(),
             };
-            handlers::handle_gotcha_confirm(store, &test_ctx(), uuid::Uuid::nil(), &input)
+            handlers::handle_gotcha_confirm(store, &test_ctx(repo_root), uuid::Uuid::nil(), &input)
                 .await
                 .map_err(|(code, msg)| format!("{code:?}: {msg}"))?;
         }
@@ -187,7 +195,12 @@ async fn drive_confirm(path: Path, store: &Store, key: &str) -> Result<(), Strin
 
 /// Mirror of `StoreProxy::gotcha_tombstone`, including the CLI's read of
 /// `affected_files` off the record before the call.
-async fn drive_tombstone(path: Path, store: &Store, key: &str) -> Result<(), String> {
+async fn drive_tombstone(
+    path: Path,
+    store: &Store,
+    repo_root: &std::path::Path,
+    key: &str,
+) -> Result<(), String> {
     let affected: Vec<String> = store
         .get(key)
         .await
@@ -204,10 +217,15 @@ async fn drive_tombstone(path: Path, store: &Store, key: &str) -> Result<(), Str
             let input = protocol::GotchaTombstoneInput {
                 key: key.to_string(),
             };
-            handlers::handle_gotcha_tombstone(store, &test_ctx(), uuid::Uuid::nil(), &input)
-                .await
-                .map(|_| ())
-                .map_err(|(code, msg)| format!("{code:?}: {msg}"))
+            handlers::handle_gotcha_tombstone(
+                store,
+                &test_ctx(repo_root),
+                uuid::Uuid::nil(),
+                &input,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|(code, msg)| format!("{code:?}: {msg}"))
         }
     }
 }
@@ -609,8 +627,7 @@ fn manual_add_record(key: &str, rule: &str, reason: &str, files: &[&str]) -> Rec
     record
 }
 
-/// A Layer 0 file record, as `mati init` writes it, carrying a content digest
-/// so `confirm_content_stamp` has something to read.
+/// A Layer 0 file record, as `mati init` writes it, carrying a content digest.
 fn file_record(path: &str) -> Record {
     let now = now_secs();
     let mut fr = crate::store::record::FileRecord::layer0_stub(
@@ -637,10 +654,14 @@ fn file_record(path: &str) -> Record {
     rec
 }
 
-/// Seed a Layer 0 `file:*` record. The key is bound to a `format!` with a
+/// Seed a Layer 0 `file:*` record and the file itself, so the confirm paths
+/// have something on disk to stamp. The key is bound to a `format!` with a
 /// literal prefix so `invariants::gotcha_write_sites` can prove this write can
 /// never name a gotcha.
-async fn seed_file(store: &Store, path: &str) {
+async fn seed_file(store: &Store, repo_root: &std::path::Path, path: &str) {
+    let on_disk = repo_root.join(path);
+    std::fs::create_dir_all(on_disk.parent().expect("path has a parent")).expect("seed dirs");
+    std::fs::write(&on_disk, format!("// {path}\n")).expect("seed file bytes");
     let file_key = format!("file:{path}");
     store
         .put(&file_key, &file_record(path))
@@ -665,7 +686,7 @@ async fn compare<F, Fut>(
     body: F,
 ) -> BTreeMap<String, (String, String)>
 where
-    F: Fn(Path, Store) -> Fut,
+    F: Fn(Path, Store, std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = Store>,
 {
     let baseline = now_secs();
@@ -673,7 +694,7 @@ where
     for path in [Path::Direct, Path::Daemon] {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let store = Store::open(dir.path()).await.expect("open store");
-        let store = body(path, store).await;
+        let store = body(path, store, dir.path().to_path_buf()).await;
         snaps.push(snapshot(&store, gotcha_key, watched, baseline).await);
         store.close().await.expect("close store");
     }
@@ -689,12 +710,20 @@ const REASON: &str =
 
 #[tokio::test]
 async fn create_paths_diverge_only_where_pinned() {
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         let record = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
-        drive_write(path, &store, &record, &[], &["src/a.rs".into()], true)
-            .await
-            .expect("create");
+        drive_write(
+            path,
+            &store,
+            &repo_root,
+            &record,
+            &[],
+            &["src/a.rs".into()],
+            true,
+        )
+        .await
+        .expect("create");
         store
     })
     .await;
@@ -704,13 +733,13 @@ async fn create_paths_diverge_only_where_pinned() {
 #[tokio::test]
 async fn create_with_multiple_affected_files_diverges_only_where_pinned() {
     let files = ["src/a.rs", "src/b.rs", "src/c.rs"];
-    let d = compare(&files, KEY, |path, store| async move {
+    let d = compare(&files, KEY, |path, store, repo_root| async move {
         for f in files {
-            seed_file(&store, f).await;
+            seed_file(&store, &repo_root, f).await;
         }
         let record = manual_add_record(KEY, RULE, REASON, &files);
         let new: Vec<String> = files.iter().map(|s| s.to_string()).collect();
-        drive_write(path, &store, &record, &[], &new, true)
+        drive_write(path, &store, &repo_root, &record, &[], &new, true)
             .await
             .expect("create");
         store
@@ -725,16 +754,24 @@ async fn create_below_quality_gate_diverges_only_where_pinned() {
     // `quality::analyze` scores it low. The CLI would refuse it at
     // `below_quality_gate`, but neither write path has a gate of its own, so
     // this asks what each one *stores* when handed a weak record.
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         let record = manual_add_record(KEY, "be careful", "it breaks", &["src/a.rs"]);
         assert!(
             crate::health::quality::below_quality_gate(&record.quality),
             "fixture must sit below the quality gate for this test to mean anything"
         );
-        drive_write(path, &store, &record, &[], &["src/a.rs".into()], true)
-            .await
-            .expect("create");
+        drive_write(
+            path,
+            &store,
+            &repo_root,
+            &record,
+            &[],
+            &["src/a.rs".into()],
+            true,
+        )
+        .await
+        .expect("create");
         store
     })
     .await;
@@ -747,17 +784,26 @@ async fn create_on_existing_slug_diverges_only_where_pinned() {
     // `apply_gotcha_write` refuses (`ensure_gotcha_key_available`);
     // `handle_gotcha_upsert` overwrites. Both outcomes are captured in the
     // snapshot, so the diff shows the whole record, not just an error string.
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         let first = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
-        gotcha_ops::apply_gotcha_write(&store, &first, &[], &["src/a.rs".into()], true)
+        gotcha_ops::apply_gotcha_write(&store, &repo_root, &first, &[], &["src/a.rs".into()], true)
             .await
             .expect("seed");
 
         let second = manual_add_record(KEY, "Always close the store handle", REASON, &["src/a.rs"]);
         // Deliberately ignored: Direct errors, Daemon succeeds. The
         // divergence we care about is what ends up in the store.
-        let _ = drive_write(path, &store, &second, &[], &["src/a.rs".into()], true).await;
+        let _ = drive_write(
+            path,
+            &store,
+            &repo_root,
+            &second,
+            &[],
+            &["src/a.rs".into()],
+            true,
+        )
+        .await;
         store
     })
     .await;
@@ -784,37 +830,49 @@ async fn create_on_existing_slug_diverges_only_where_pinned() {
 
 #[tokio::test]
 async fn edit_paths_diverge_only_where_pinned() {
-    let d = compare(&["src/a.rs", "src/b.rs"], KEY, |path, store| async move {
-        for f in ["src/a.rs", "src/b.rs"] {
-            seed_file(&store, f).await;
-        }
-        let original = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
-        gotcha_ops::apply_gotcha_write(&store, &original, &[], &["src/a.rs".into()], true)
+    let d = compare(
+        &["src/a.rs", "src/b.rs"],
+        KEY,
+        |path, store, repo_root| async move {
+            for f in ["src/a.rs", "src/b.rs"] {
+                seed_file(&store, &repo_root, f).await;
+            }
+            let original = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
+            gotcha_ops::apply_gotcha_write(
+                &store,
+                &repo_root,
+                &original,
+                &[],
+                &["src/a.rs".into()],
+                true,
+            )
             .await
             .expect("seed");
 
-        // `mati gotcha edit`: same key, new rule text, file set moves a -> b.
-        let mut edited = store.get(KEY).await.unwrap().unwrap();
-        let mut g = edited.payload_as::<GotchaRecord>().unwrap();
-        g.rule = "Always close the store handle".into();
-        g.affected_files = vec!["src/b.rs".into()];
-        edited.value = format!("{} because {}", g.rule, g.reason);
-        edited.payload = serde_json::to_value(&g).ok();
-        edited.version.logical_clock += 1;
-        edited.quality = crate::health::quality::analyze(&edited);
+            // `mati gotcha edit`: same key, new rule text, file set moves a -> b.
+            let mut edited = store.get(KEY).await.unwrap().unwrap();
+            let mut g = edited.payload_as::<GotchaRecord>().unwrap();
+            g.rule = "Always close the store handle".into();
+            g.affected_files = vec!["src/b.rs".into()];
+            edited.value = format!("{} because {}", g.rule, g.reason);
+            edited.payload = serde_json::to_value(&g).ok();
+            edited.version.logical_clock += 1;
+            edited.quality = crate::health::quality::analyze(&edited);
 
-        drive_write(
-            path,
-            &store,
-            &edited,
-            &["src/a.rs".into()],
-            &["src/b.rs".into()],
-            false,
-        )
-        .await
-        .expect("edit");
-        store
-    })
+            drive_write(
+                path,
+                &store,
+                &repo_root,
+                &edited,
+                &["src/a.rs".into()],
+                &["src/b.rs".into()],
+                false,
+            )
+            .await
+            .expect("edit");
+            store
+        },
+    )
     .await;
     assert_divergences("edit", &d, EDIT_DIVERGENCES);
 }
@@ -829,12 +887,19 @@ async fn edit_of_a_tombstoned_key_un_tombstones_on_both_paths() {
     // invisible to `mem_get` — while `handle_gotcha_upsert` (Daemon) has
     // always reset it to `Active`. This asserts the one field that must no
     // longer split: `record.lifecycle`.
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         let original = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
-        gotcha_ops::apply_gotcha_write(&store, &original, &[], &["src/a.rs".into()], true)
-            .await
-            .expect("seed");
+        gotcha_ops::apply_gotcha_write(
+            &store,
+            &repo_root,
+            &original,
+            &[],
+            &["src/a.rs".into()],
+            true,
+        )
+        .await
+        .expect("seed");
         gotcha_ops::apply_gotcha_tombstone(&store, KEY, &["src/a.rs".into()])
             .await
             .expect("tombstone");
@@ -850,6 +915,7 @@ async fn edit_of_a_tombstoned_key_un_tombstones_on_both_paths() {
         drive_write(
             path,
             &store,
+            &repo_root,
             &edited,
             &["src/a.rs".into()],
             &["src/a.rs".into()],
@@ -875,8 +941,8 @@ async fn edit_of_a_tombstoned_key_un_tombstones_on_both_paths() {
 
 #[tokio::test]
 async fn confirm_paths_diverge_only_where_pinned() {
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         // Seed an unconfirmed record, the state `mati review` confirms from.
         let mut record = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
         let mut g = record.payload_as::<GotchaRecord>().unwrap();
@@ -884,16 +950,25 @@ async fn confirm_paths_diverge_only_where_pinned() {
         record.payload = serde_json::to_value(&g).ok();
         record.source = RecordSource::ClaudeEnrich;
         record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
-        gotcha_ops::apply_gotcha_write(&store, &record, &[], &["src/a.rs".into()], true)
-            .await
-            .expect("seed");
+        gotcha_ops::apply_gotcha_write(
+            &store,
+            &repo_root,
+            &record,
+            &[],
+            &["src/a.rs".into()],
+            true,
+        )
+        .await
+        .expect("seed");
         // A receipt minted before confirmation — the bypass token the daemon
         // path invalidates and the direct path does not.
         crate::store::session::log_hit(&store, "file:src/a.rs")
             .await
             .expect("seed receipt");
 
-        drive_confirm(path, &store, KEY).await.expect("confirm");
+        drive_confirm(path, &store, &repo_root, KEY)
+            .await
+            .expect("confirm");
         store
     })
     .await;
@@ -902,8 +977,8 @@ async fn confirm_paths_diverge_only_where_pinned() {
 
 #[tokio::test]
 async fn confirm_of_legacy_unnormalized_paths_diverges_only_where_pinned() {
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         // Written before path normalization existed: `./src/a.rs` never
         // matches `file:src/a.rs`, so the rule is inert until something
         // re-keys it.
@@ -916,7 +991,9 @@ async fn confirm_of_legacy_unnormalized_paths_diverges_only_where_pinned() {
         record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
         seed_verbatim(&store, &record).await;
 
-        drive_confirm(path, &store, KEY).await.expect("confirm");
+        drive_confirm(path, &store, &repo_root, KEY)
+            .await
+            .expect("confirm");
         store
     })
     .await;
@@ -933,7 +1010,8 @@ async fn confirm_of_legacy_unnormalized_paths_diverges_only_where_pinned() {
 async fn daemon_confirm_re_keys_a_legacy_gotcha_into_the_read_gate() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = Store::open(dir.path()).await.expect("open store");
-    seed_file(&store, "src/a.rs").await;
+    let repo_root = dir.path();
+    seed_file(&store, repo_root, "src/a.rs").await;
 
     let mut record = manual_add_record(KEY, RULE, REASON, &["./src/a.rs"]);
     let mut g = record.payload_as::<GotchaRecord>().unwrap();
@@ -944,7 +1022,7 @@ async fn daemon_confirm_re_keys_a_legacy_gotcha_into_the_read_gate() {
     record.confidence = ConfidenceScore::for_new_record(&RecordSource::ClaudeEnrich);
     seed_verbatim(&store, &record).await;
 
-    drive_confirm(Path::Daemon, &store, KEY)
+    drive_confirm(Path::Daemon, &store, repo_root, KEY)
         .await
         .expect("confirm");
 
@@ -986,17 +1064,19 @@ async fn daemon_confirm_re_keys_a_legacy_gotcha_into_the_read_gate() {
 #[tokio::test]
 async fn tombstone_paths_diverge_only_where_pinned() {
     let files = ["src/a.rs", "src/b.rs"];
-    let d = compare(&files, KEY, |path, store| async move {
+    let d = compare(&files, KEY, |path, store, repo_root| async move {
         for f in files {
-            seed_file(&store, f).await;
+            seed_file(&store, &repo_root, f).await;
         }
         let record = manual_add_record(KEY, RULE, REASON, &files);
         let new: Vec<String> = files.iter().map(|s| s.to_string()).collect();
-        gotcha_ops::apply_gotcha_write(&store, &record, &[], &new, true)
+        gotcha_ops::apply_gotcha_write(&store, &repo_root, &record, &[], &new, true)
             .await
             .expect("seed");
 
-        drive_tombstone(path, &store, KEY).await.expect("tombstone");
+        drive_tombstone(path, &store, &repo_root, KEY)
+            .await
+            .expect("tombstone");
         store
     })
     .await;
@@ -1008,17 +1088,25 @@ async fn enriched_tag_extraction_row_matches_on_both_paths() {
     // `/mati-enrich` writes gotchas tagged "enriched"; both paths carry their
     // own copy of the `write_on_extraction` hook. This pins that the two
     // copies still produce the same `analytics:extraction:*` row.
-    let d = compare(&["src/a.rs"], KEY, |path, store| async move {
-        seed_file(&store, "src/a.rs").await;
+    let d = compare(&["src/a.rs"], KEY, |path, store, repo_root| async move {
+        seed_file(&store, &repo_root, "src/a.rs").await;
         let mut record = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
         record.tags = vec![
             "enriched".into(),
             "depth:deep".into(),
             "signal-source:ast".into(),
         ];
-        drive_write(path, &store, &record, &[], &["src/a.rs".into()], true)
-            .await
-            .expect("create");
+        drive_write(
+            path,
+            &store,
+            &repo_root,
+            &record,
+            &[],
+            &["src/a.rs".into()],
+            true,
+        )
+        .await
+        .expect("create");
         store
     })
     .await;
@@ -1041,12 +1129,20 @@ async fn enriched_tag_extraction_row_matches_on_both_paths() {
 async fn direct_edit_of_tombstoned_key_restores_links_and_edges() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let store = Store::open(dir.path()).await.expect("open store");
-    seed_file(&store, "src/a.rs").await;
+    let repo_root = dir.path();
+    seed_file(&store, repo_root, "src/a.rs").await;
 
     let original = manual_add_record(KEY, RULE, REASON, &["src/a.rs"]);
-    gotcha_ops::apply_gotcha_write(&store, &original, &[], &["src/a.rs".into()], true)
-        .await
-        .expect("seed");
+    gotcha_ops::apply_gotcha_write(
+        &store,
+        repo_root,
+        &original,
+        &[],
+        &["src/a.rs".into()],
+        true,
+    )
+    .await
+    .expect("seed");
     gotcha_ops::apply_gotcha_tombstone(&store, KEY, &["src/a.rs".into()])
         .await
         .expect("tombstone");
@@ -1064,6 +1160,7 @@ async fn direct_edit_of_tombstoned_key_restores_links_and_edges() {
 
     gotcha_ops::apply_gotcha_write(
         &store,
+        repo_root,
         &edited,
         &["src/a.rs".into()],
         &["src/a.rs".into()],

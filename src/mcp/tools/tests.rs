@@ -70,6 +70,7 @@ fn make_gotcha_record(key: &str, rule: &str, confirmed: bool, quality_value: f32
 /// the mem_set request/response envelope itself.
 async fn seed_gotcha_for_graph_test(
     store: &Store,
+    repo_root: &std::path::Path,
     key: &str,
     rule: &str,
     affected_files: &[String],
@@ -86,9 +87,16 @@ async fn seed_gotcha_for_graph_test(
     };
     let mut record = make_record(key, rule, Category::Gotcha, 0.5);
     record.payload = serde_json::to_value(&gotcha).ok();
-    crate::store::gotcha_ops::apply_gotcha_write(store, &record, &[], affected_files, true)
-        .await
-        .expect("seed gotcha write must succeed");
+    crate::store::gotcha_ops::apply_gotcha_write(
+        store,
+        repo_root,
+        &record,
+        &[],
+        affected_files,
+        true,
+    )
+    .await
+    .expect("seed gotcha write must succeed");
 }
 
 // ── γ-C3a helpers: handler-level test entry points ───────────────────────
@@ -1700,6 +1708,7 @@ async fn test_graph_mode_respects_global_limit() {
     for i in 0..5 {
         seed_gotcha_for_graph_test(
             &store,
+            dir.path(),
             &format!("gotcha:limit-test-{i}"),
             &format!("Limit rule {i}"),
             &["src/graph_limit.rs".to_string()],
@@ -1746,6 +1755,7 @@ async fn test_graph_mode_limit_zero_returns_empty() {
     // Write one gotcha so there's something to return if limit is ignored.
     seed_gotcha_for_graph_test(
         &store,
+        dir.path(),
         "gotcha:zero-limit-test",
         "Zero limit test",
         &["src/zero.rs".to_string()],
@@ -1793,6 +1803,7 @@ async fn test_graph_mode_traverses_from_gotcha_seed() {
 
     seed_gotcha_for_graph_test(
         &store,
+        dir.path(),
         "gotcha:reverse-traversal-test",
         "Reverse traversal rule",
         &["src/graph_reverse.rs".to_string()],

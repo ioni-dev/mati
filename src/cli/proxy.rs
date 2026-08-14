@@ -12,7 +12,7 @@ use serde_json::json;
 use mati_core::store::db::HistoryEntry;
 use mati_core::store::{Record, Store};
 
-use super::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
+use super::daemon::{daemon_result, daemon_v2, mati_root_for_ident, DaemonResult};
 
 #[allow(clippy::large_enum_variant)]
 enum ProxyInner {
@@ -22,6 +22,11 @@ enum ProxyInner {
 
 pub struct StoreProxy {
     inner: ProxyInner,
+    /// The root repo-relative record paths resolve against — git's own
+    /// workdir, the same value the store's slug was keyed on. Not the process
+    /// cwd (which may be a subdirectory) and not `Store::root` (which is
+    /// `~/.mati/<slug>`).
+    repo_root: PathBuf,
 }
 
 impl StoreProxy {
@@ -38,7 +43,11 @@ impl StoreProxy {
     /// across users' home directories when they run `mati status`,
     /// `mati ls`, etc. from non-mati paths.
     pub async fn open(cwd: &Path) -> Result<Self> {
-        let root = mati_root_for(cwd)?;
+        // One discover call grounds both the mati root (the slug) and the repo
+        // root in the same git identity, the way `run_daemon_start` does.
+        let ident = mati_core::store::RepoIdent::discover(cwd);
+        let repo_root = ident.slug_root(cwd);
+        let root = mati_root_for_ident(&ident, cwd)?;
 
         // Fast path: a daemon already answers. All access proxies to it — the
         // daemon is the sole owner of the store's exclusive lock.
@@ -46,6 +55,7 @@ impl StoreProxy {
             DaemonResult::Ok(_) => {
                 return Ok(Self {
                     inner: ProxyInner::Socket { root },
+                    repo_root,
                 });
             }
             // The socket exists but this process is forbidden from connecting —
@@ -90,6 +100,7 @@ impl StoreProxy {
         if mati_core::mcp::daemon_lifecycle::ensure_daemon(&root).await {
             return Ok(Self {
                 inner: ProxyInner::Socket { root },
+                repo_root,
             });
         }
 
@@ -108,6 +119,7 @@ impl StoreProxy {
                 if let DaemonResult::Ok(_) = daemon_result(&root, "ping", json!({})).await {
                     return Ok(Self {
                         inner: ProxyInner::Socket { root },
+                        repo_root,
                     });
                 }
                 // The daemon exited mid-retry — no longer the lock holder, so
@@ -136,6 +148,7 @@ impl StoreProxy {
         let store = open_store_with_lock_retry(cwd).await?;
         Ok(Self {
             inner: ProxyInner::Direct(store),
+            repo_root,
         })
     }
 
@@ -157,6 +170,11 @@ impl StoreProxy {
             ProxyInner::Direct(s) => Some(s),
             ProxyInner::Socket { .. } => None,
         }
+    }
+
+    /// The root repo-relative record paths resolve against.
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
     }
 
     /// Read the write-sequence counter. This is a plain filesystem read — no lock needed.
@@ -705,7 +723,12 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(store) => {
                 mati_core::store::gotcha_ops::apply_gotcha_write(
-                    store, record, old_files, new_files, is_new,
+                    store,
+                    &self.repo_root,
+                    record,
+                    old_files,
+                    new_files,
+                    is_new,
                 )
                 .await
             }
@@ -956,8 +979,13 @@ impl StoreProxy {
     ) -> Result<()> {
         match &self.inner {
             ProxyInner::Direct(store) => {
-                mati_core::store::gotcha_ops::apply_gotcha_confirm(store, record, affected_files)
-                    .await
+                mati_core::store::gotcha_ops::apply_gotcha_confirm(
+                    store,
+                    &self.repo_root,
+                    record,
+                    affected_files,
+                )
+                .await
             }
             ProxyInner::Socket { .. } => Ok(()),
         }
@@ -1452,6 +1480,7 @@ mod tests {
             inner: ProxyInner::Socket {
                 root: dir.path().to_path_buf(),
             },
+            repo_root: dir.path().to_path_buf(),
         };
 
         let err = proxy.get("file:missing").await.unwrap_err();
@@ -1493,6 +1522,7 @@ mod tests {
             .unwrap();
         let proxy = StoreProxy {
             inner: ProxyInner::Direct(store),
+            repo_root: dir.path().to_path_buf(),
         };
         let action = mati_core::hooks::decide::Action {
             tool: "db_client".into(),
@@ -1565,6 +1595,7 @@ mod tests {
             .unwrap();
         let proxy = StoreProxy {
             inner: ProxyInner::Direct(store),
+            repo_root: dir.path().to_path_buf(),
         };
         let action = mati_core::hooks::decide::Action {
             tool: "db_client".into(),
@@ -1588,6 +1619,7 @@ mod tests {
             inner: ProxyInner::Socket {
                 root: dir.path().to_path_buf(),
             },
+            repo_root: dir.path().to_path_buf(),
         };
 
         let err = proxy.scan_prefix("file:").await.unwrap_err();
@@ -1603,6 +1635,7 @@ mod tests {
             inner: ProxyInner::Socket {
                 root: dir.path().to_path_buf(),
             },
+            repo_root: dir.path().to_path_buf(),
         };
 
         let err = proxy.scan_keys("graph:edge:").await.unwrap_err();
@@ -1719,6 +1752,7 @@ mod tests {
 
         let proxy = StoreProxy {
             inner: ProxyInner::Direct(store),
+            repo_root: dir.path().to_path_buf(),
         };
 
         // The raw edge key must be visible through the RepairReader.
@@ -1744,6 +1778,7 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
         let proxy = StoreProxy {
             inner: ProxyInner::Direct(store),
+            repo_root: dir.path().to_path_buf(),
         };
 
         proxy
@@ -1767,6 +1802,7 @@ mod tests {
             inner: ProxyInner::Socket {
                 root: dir.path().to_path_buf(),
             },
+            repo_root: dir.path().to_path_buf(),
         };
 
         let record = Record::layer0_file_stub("dummy", uuid::Uuid::new_v4(), 1, 0);
@@ -1794,6 +1830,7 @@ mod tests {
             inner: ProxyInner::Socket {
                 root: dir.path().to_path_buf(),
             },
+            repo_root: dir.path().to_path_buf(),
         };
 
         // Should succeed without trying to write analytics:* through put().

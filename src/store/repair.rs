@@ -1059,6 +1059,7 @@ mod tests {
 
         crate::store::gotcha_ops::apply_gotcha_write(
             &store,
+            dir.path(),
             &candidate,
             &[],
             &gotcha.affected_files,

@@ -536,7 +536,8 @@ async fn gotcha_crud_records_control_changed_events() {
         RecordSource, RecordVersion, StalenessScore,
     };
 
-    let (_dir, store) = temp_store().await;
+    let (dir, store) = temp_store().await;
+    let repo_root = dir.path();
 
     // Helper to build a gotcha record
     let make_gotcha = |key: &str, confirmed: bool| -> Record {
@@ -578,21 +579,34 @@ async fn gotcha_crud_records_control_changed_events() {
 
     // 1. Create a gotcha → ControlChanged::Created
     let record = make_gotcha("gotcha:test-crud", false);
-    apply_gotcha_write(&store, &record, &[], &["src/test.rs".into()], true)
-        .await
-        .expect("create gotcha");
+    apply_gotcha_write(
+        &store,
+        repo_root,
+        &record,
+        &[],
+        &["src/test.rs".into()],
+        true,
+    )
+    .await
+    .expect("create gotcha");
 
     // 2. Confirm the gotcha → ControlChanged::Confirmed
     let confirmed_record = make_gotcha("gotcha:test-crud", true);
-    apply_gotcha_confirm(&store, &confirmed_record, &["src/test.rs".into()])
-        .await
-        .expect("confirm gotcha");
+    apply_gotcha_confirm(
+        &store,
+        repo_root,
+        &confirmed_record,
+        &["src/test.rs".into()],
+    )
+    .await
+    .expect("confirm gotcha");
 
     // 3. Update the gotcha → ControlChanged::Updated
     let mut record2 = make_gotcha("gotcha:test-crud", true);
     record2.value = "updated rule".into();
     apply_gotcha_write(
         &store,
+        repo_root,
         &record2,
         &["src/test.rs".into()],
         &["src/test.rs".into()],
@@ -1155,7 +1169,7 @@ async fn gotcha_add_on_unindexed_file_wires_read_gate() {
         RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
     };
 
-    let (_dir, store) = temp_store().await;
+    let (dir, store) = temp_store().await;
     let file = "src/never_indexed_by_init.rs";
     let gkey = "gotcha:never-bypass-the-gate";
 
@@ -1195,7 +1209,7 @@ async fn gotcha_add_on_unindexed_file_wires_read_gate() {
     };
 
     // Exactly what `mati gotcha add <file>` does for a brand-new file.
-    apply_gotcha_write(&store, &record, &[], &[file.to_string()], true)
+    apply_gotcha_write(&store, dir.path(), &record, &[], &[file.to_string()], true)
         .await
         .expect("write gotcha");
 

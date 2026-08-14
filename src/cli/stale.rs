@@ -6,7 +6,7 @@ use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
 use serde::{Deserialize, Serialize};
 
-use mati_core::health::drift::{current_content_hashes, detect_drift, DriftedGotcha};
+use mati_core::health::drift::{detect_drift, disk_content_hashes, DriftedGotcha};
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, Priority, QualityScore, Record, RecordLifecycle,
     RecordSource, RecordVersion, StalenessScore, StalenessSignal, StalenessTier, Store,
@@ -91,7 +91,11 @@ fn cache_record(value: String) -> Record {
 /// written and their staleness tiers are accurate. On cold init the stale list
 /// is always empty, so this writes a trivially small record that lets the very
 /// first post-init `mati stale` hit the cache (O(1)).
-pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
+pub async fn seed_stale_cache(
+    store: &Store,
+    repo_root: &std::path::Path,
+    records: &[Record],
+) -> Result<()> {
     let write_seq = store.read_write_seq();
     let mut stale: Vec<Record> = records
         .iter()
@@ -108,13 +112,12 @@ pub async fn seed_stale_cache(store: &Store, records: &[Record]) -> Result<()> {
             .partial_cmp(&effective_staleness(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    // Cold init rewrote every file record, so `records` carries the current
-    // digest for every path. The gotchas do need a scan: a confirmed gotcha
-    // written in an earlier session is not part of this run's output, and
-    // seeding the cache without it would hide real drift behind a cache hit
-    // until the next store write. One prefix scan on the cold path only.
+    // The gotchas need a scan: a confirmed gotcha written in an earlier session
+    // is not part of this run's output, and seeding the cache without it would
+    // hide real drift behind a cache hit until the next store write. One prefix
+    // scan on the cold path only.
     let gotchas = store.scan_prefix("gotcha:").await.unwrap_or_default();
-    let drift = detect_drift(&gotchas, &current_content_hashes(records));
+    let drift = detect_drift(&gotchas, &disk_content_hashes(repo_root, &gotchas));
     let entry = StaleCache {
         write_seq,
         records: stale,
@@ -210,10 +213,10 @@ pub async fn run(args: StaleArgs) -> Result<()> {
         proxy.scan_prefix("dev_note:"),
     )?;
 
-    // Content drift, from the two scans already in hand — no extra store reads
-    // and no hashing: `confirmed_content` was stamped at confirm time and
-    // `content_hash` at the last `mati init`.
-    let drift = detect_drift(&gotchas, &current_content_hashes(&files));
+    // Content drift. Both sides are disk digests — `confirmed_content` hashed
+    // at confirm time, the current side hashed here — so a stale `file:*` index
+    // can neither hide drift nor invent it.
+    let drift = detect_drift(&gotchas, &disk_content_hashes(proxy.repo_root(), &gotchas));
 
     let mut stale: Vec<Record> = gotchas
         .into_iter()

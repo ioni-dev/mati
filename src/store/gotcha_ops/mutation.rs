@@ -37,8 +37,13 @@ pub async fn ensure_gotcha_key_available(store: &Store, key: &str) -> Result<()>
 /// tore down every link and edge, so the caller's `old_files` no longer
 /// describes what the indexes hold, and diffing against it would no-op on an
 /// unchanged `affected_files`, leaving the resurrected record unlinked.
+///
+/// `repo_root` is the root the store's slug was keyed on
+/// ([`crate::store::slug_root`]) — what a confirmed record's content stamp is
+/// hashed against.
 pub async fn apply_gotcha_write(
     store: &Store,
+    repo_root: &Path,
     record: &Record,
     old_files: &[String],
     new_files: &[String],
@@ -78,7 +83,7 @@ pub async fn apply_gotcha_write(
     // a content change. Layer 0 stubs, `mem_set` upserts and review edits all
     // write `confirmed: false`, so this is inert on every bulk path.
     if is_new && payload_is_confirmed(staged.as_ref().unwrap_or(record)) {
-        let stamp = confirm_content_stamp(store, new_files).await;
+        let stamp = confirm_content_stamp(repo_root, new_files);
         let mut owned = staged.take().unwrap_or_else(|| record.clone());
         set_confirm_stamp(&mut owned, &stamp);
         staged = Some(owned);
@@ -335,16 +340,18 @@ pub async fn apply_gotcha_tombstone(
 /// until `mati repair` — which now reports it as a stale file link and clears
 /// it, per the derived-index model in [`super::repair`].
 ///
-/// Confirming also stamps each affected file's current content digest onto the
+/// Confirming also stamps each affected file's on-disk content digest onto the
 /// record (see [`confirm_content_stamp`]), which is what makes re-confirming a
-/// drifted gotcha clear its drift.
+/// drifted gotcha clear its drift. `repo_root` is the root the store's slug was
+/// keyed on ([`crate::store::slug_root`]) — what those files resolve against.
 pub async fn apply_gotcha_confirm(
     store: &Store,
+    repo_root: &Path,
     record: &Record,
     affected_files: &[String],
 ) -> Result<()> {
     let affected_files = &normalize_affected_files(affected_files);
-    let stamp = confirm_content_stamp(store, affected_files).await;
+    let stamp = confirm_content_stamp(repo_root, affected_files);
     let mut stamped =
         with_normalized_affected_files(record, affected_files).unwrap_or_else(|| record.clone());
     set_confirm_stamp(&mut stamped, &stamp);

@@ -797,7 +797,16 @@ pub(crate) async fn socket_dispatch(
 
             {
                 let g = graph.read().await;
-                match apply_gotcha_write(g.store(), &record, &old_files, &new_files, is_new).await {
+                match apply_gotcha_write(
+                    g.store(),
+                    repo_root,
+                    &record,
+                    &old_files,
+                    &new_files,
+                    is_new,
+                )
+                .await
+                {
                     Ok(()) => {}
                     Err(e) => return SocketResponse::err(format!("{e}")),
                 }

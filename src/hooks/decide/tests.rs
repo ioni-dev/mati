@@ -1987,11 +1987,11 @@ mod gate_never_silently_disables {
     ///
     /// `eval_drifted_gotcha_still_denies` above pins the same rule against
     /// a synthetic payload; this one proves the two modules agree on the
-    /// record shape, so a change to `confirmed_content` / `content_hash`
-    /// cannot make drift detection and enforcement drift apart.
+    /// record shape, so a change to `confirmed_content` cannot make drift
+    /// detection and enforcement drift apart.
     #[test]
     fn drift_detected_by_health_drift_still_denies() {
-        use crate::health::drift::{current_content_hashes, detect_drift};
+        use crate::health::drift::{detect_drift, disk_content_hashes};
         use crate::store::record::{
             Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record,
             RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
@@ -2025,6 +2025,12 @@ mod gate_never_silently_disables {
             }
         }
 
+        // The rule was confirmed against a `src/main.rs` that no longer exists;
+        // the one on disk below hashes to something else.
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(repo.path().join("src/main.rs"), "fn main() { changed(); }").unwrap();
+
         let mut stamp = BTreeMap::new();
         stamp.insert("src/main.rs".to_string(), "STAMPED_AT_CONFIRM".to_string());
         let mut gotcha_record = base("gotcha:test");
@@ -2052,7 +2058,7 @@ mod gate_never_silently_disables {
 
         // 1. The drift detector must actually see this as drifted,
         //    otherwise step 2 proves nothing.
-        let hashes = current_content_hashes(std::slice::from_ref(&file_record));
+        let hashes = disk_content_hashes(repo.path(), std::slice::from_ref(&gotcha_record));
         let drifted = detect_drift(std::slice::from_ref(&gotcha_record), &hashes);
         assert_eq!(
             drifted.len(),

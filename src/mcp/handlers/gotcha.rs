@@ -196,7 +196,7 @@ async fn upsert_commit_once(
     // earns the drift baseline `mati gotcha confirm` would have written.
     if confirmed && is_new {
         gotcha.confirmed_content =
-            crate::store::gotcha_ops::confirm_content_stamp(store, affected_files).await;
+            crate::store::gotcha_ops::confirm_content_stamp(&ctx.repo_root, affected_files);
     }
 
     let mut record = match existing {
@@ -445,14 +445,13 @@ async fn confirm_commit_once(
     let mut file_updates = compute_file_link_updates(store, key, &[], &affected_files).await;
     apply_confirmation_propagation(store, &affected_files, &mut file_updates).await;
 
-    // Stamp the content digest each affected file currently carries, so a later
-    // change to that file is reportable as content drift. The direct-store path
-    // does this inside `gotcha_ops::apply_gotcha_confirm`; this handler commits
-    // its own `transact_knowledge` and never calls it, so it carries the stamp
-    // itself — same as the `affected_files` normalization split. Recomputed from
-    // records already read above, so no file is opened and nothing is re-hashed.
-    // Must run before the record is staged below.
-    let stamp = crate::store::gotcha_ops::confirm_content_stamp(store, &affected_files).await;
+    // Stamp the digest each affected file hashes to on disk, so a later change
+    // to that file is reportable as content drift. The direct-store path does
+    // this inside `gotcha_ops::apply_gotcha_confirm`; this handler commits its
+    // own `transact_knowledge` and never calls it, so it carries the stamp
+    // itself — same as the `affected_files` normalization split. Must run
+    // before the record is staged below.
+    let stamp = crate::store::gotcha_ops::confirm_content_stamp(&ctx.repo_root, &affected_files);
     crate::store::gotcha_ops::set_confirm_stamp(&mut record, &stamp);
 
     // Atomic: gotcha record + file-link updates + confirmation propagation + audit.

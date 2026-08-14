@@ -843,7 +843,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
         {
             tracing::warn!("stats snapshot seed failed (non-fatal): {e}");
         }
-        if let Err(e) = super::stale::seed_stale_cache(&store, &all_records).await {
+        if let Err(e) = super::stale::seed_stale_cache(&store, &root, &all_records).await {
             tracing::warn!("stale cache seed failed (non-fatal): {e}");
         }
     }

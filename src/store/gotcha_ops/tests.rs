@@ -158,7 +158,7 @@ async fn apply_write_adds_file_links_and_edges() {
     let record = make_gotcha_record("gotcha:test", &["src/a.rs", "src/b.rs"]);
     let files = vec!["src/a.rs".into(), "src/b.rs".into()];
 
-    apply_gotcha_write(&store, &record, &[], &files, true)
+    apply_gotcha_write(&store, dir.path(), &record, &[], &files, true)
         .await
         .unwrap();
 
@@ -187,9 +187,16 @@ async fn apply_write_rejects_collision_when_is_new() {
     store.put("gotcha:dup", &record).await.unwrap();
 
     let record2 = make_gotcha_record("gotcha:dup", &["src/b.rs"]);
-    let err = apply_gotcha_write(&store, &record2, &[], &["src/b.rs".into()], true)
-        .await
-        .unwrap_err();
+    let err = apply_gotcha_write(
+        &store,
+        dir.path(),
+        &record2,
+        &[],
+        &["src/b.rs".into()],
+        true,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("already exists"));
 
     store.close().await.unwrap();
@@ -211,7 +218,7 @@ async fn apply_write_edit_moves_links_between_files() {
 
     // Initial write targeting src/a.rs
     let record = make_gotcha_record("gotcha:move", &["src/a.rs"]);
-    apply_gotcha_write(&store, &record, &[], &["src/a.rs".into()], true)
+    apply_gotcha_write(&store, dir.path(), &record, &[], &["src/a.rs".into()], true)
         .await
         .unwrap();
 
@@ -219,6 +226,7 @@ async fn apply_write_edit_moves_links_between_files() {
     let record2 = make_gotcha_record("gotcha:move", &["src/b.rs"]);
     apply_gotcha_write(
         &store,
+        dir.path(),
         &record2,
         &["src/a.rs".into()],
         &["src/b.rs".into()],
@@ -259,7 +267,7 @@ async fn apply_tombstone_cleans_links_and_edges() {
     // Write gotcha first
     let record = make_gotcha_record("gotcha:del", &["src/a.rs", "src/b.rs"]);
     let files = vec!["src/a.rs".into(), "src/b.rs".into()];
-    apply_gotcha_write(&store, &record, &[], &files, true)
+    apply_gotcha_write(&store, dir.path(), &record, &[], &files, true)
         .await
         .unwrap();
 
@@ -414,9 +422,16 @@ async fn enriched_gotcha_lifecycle_flips_extraction_outcome() {
     let mut record = make_gotcha_record("gotcha:enriched-rule", &["src/cli/repair.rs"]);
     record.tags = vec!["enriched".into(), "depth:deep".into()];
 
-    apply_gotcha_write(&store, &record, &[], &["src/cli/repair.rs".into()], true)
-        .await
-        .unwrap();
+    apply_gotcha_write(
+        &store,
+        dir.path(),
+        &record,
+        &[],
+        &["src/cli/repair.rs".into()],
+        true,
+    )
+    .await
+    .unwrap();
 
     // After write, ExtractionRecord must exist with outcome=Pending,
     // depth=Deep, file_path set.
@@ -436,7 +451,7 @@ async fn enriched_gotcha_lifecycle_flips_extraction_outcome() {
     assert!(extraction.outcome_at.is_none());
 
     // Confirm → outcome must flip to Confirmed.
-    apply_gotcha_confirm(&store, &record, &["src/cli/repair.rs".into()])
+    apply_gotcha_confirm(&store, dir.path(), &record, &["src/cli/repair.rs".into()])
         .await
         .unwrap();
     let rec = store
@@ -451,9 +466,16 @@ async fn enriched_gotcha_lifecycle_flips_extraction_outcome() {
     // Now write + tombstone another enriched gotcha — outcome flips to Tombstoned.
     let mut t_record = make_gotcha_record("gotcha:tombstone-me", &["src/cli/init.rs"]);
     t_record.tags = vec!["enriched".into(), "depth:fast".into()];
-    apply_gotcha_write(&store, &t_record, &[], &["src/cli/init.rs".into()], true)
-        .await
-        .unwrap();
+    apply_gotcha_write(
+        &store,
+        dir.path(),
+        &t_record,
+        &[],
+        &["src/cli/init.rs".into()],
+        true,
+    )
+    .await
+    .unwrap();
     apply_gotcha_tombstone(&store, "gotcha:tombstone-me", &["src/cli/init.rs".into()])
         .await
         .unwrap();
@@ -473,9 +495,16 @@ async fn enriched_gotcha_lifecycle_flips_extraction_outcome() {
     // Untagged gotcha must NOT produce an ExtractionRecord.
     let untagged = make_gotcha_record("gotcha:manual-add", &["src/foo.rs"]);
     // tags vec is empty by default in make_gotcha_record
-    apply_gotcha_write(&store, &untagged, &[], &["src/foo.rs".into()], true)
-        .await
-        .unwrap();
+    apply_gotcha_write(
+        &store,
+        dir.path(),
+        &untagged,
+        &[],
+        &["src/foo.rs".into()],
+        true,
+    )
+    .await
+    .unwrap();
     assert!(store
         .get(&key_for("gotcha:manual-add"))
         .await
@@ -488,30 +517,36 @@ async fn enriched_gotcha_lifecycle_flips_extraction_outcome() {
 // ── confirm-time content stamp ───────────────────────────────────────
 //
 // The stamp is the baseline `health::drift` compares against. It is
-// written only by the confirm paths, reuses the digest already on the
-// file record, and never touches a score.
+// written only by the confirm paths, hashes each affected file as it
+// stands on disk, and never touches a score.
+
+/// Write `contents` to `<dir>/<rel>`, creating parents.
+fn write_source(dir: &std::path::Path, rel: &str, contents: &str) {
+    let path = dir.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+/// The digest `confirm_content_stamp` produces for a file on disk.
+fn disk_hash(dir: &std::path::Path, rel: &str) -> String {
+    disk_content_hash(dir, rel).expect("file must be readable")
+}
 
 #[tokio::test]
 async fn confirm_stamps_the_current_file_digest() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v1"),
-        )
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
 
     let record = make_gotcha_record("gotcha:stamped", &["src/a.rs"]);
-    apply_gotcha_confirm(&store, &record, &["src/a.rs".into()])
+    apply_gotcha_confirm(&store, dir.path(), &record, &["src/a.rs".into()])
         .await
         .unwrap();
 
     let stored = store.get("gotcha:stamped").await.unwrap().unwrap();
     assert_eq!(
         stored_stamp(&stored).get("src/a.rs"),
-        Some(&"hash-v1".to_string())
+        Some(&disk_hash(dir.path(), "src/a.rs"))
     );
 
     // Stamping must not disturb anything the read gate reads. Quality and
@@ -529,47 +564,38 @@ async fn confirm_stamps_the_current_file_digest() {
     store.close().await.unwrap();
 }
 
-/// Multi-file gotchas get one entry per affected file. A file with no
-/// indexed digest (unparsed file, glob, path not yet walked) is simply
-/// absent — the reader treats that as unknown, never as drift.
+/// Multi-file gotchas get one entry per affected file. A path with nothing
+/// readable on disk (a glob, a file not written yet) is simply absent — the
+/// reader treats that as unknown, never as drift.
 #[tokio::test]
-async fn confirm_stamps_each_affected_file_and_skips_unindexed_ones() {
+async fn confirm_stamps_each_affected_file_and_skips_unreadable_ones() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-a"),
-        )
-        .await
-        .unwrap();
-    store
-        .put(
-            "file:src/b.rs",
-            &make_file_record_hashed("src/b.rs", "hash-b"),
-        )
-        .await
-        .unwrap();
-    // Indexed but never parsed — no content_hash on the payload.
-    store
-        .put("file:src/c.bin", &make_file_record("src/c.bin"))
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
+    write_source(dir.path(), "src/b.rs", "fn b() {}\n");
 
-    let files: Vec<String> = ["src/a.rs", "src/b.rs", "src/c.bin", "src/payments/**"]
+    let files: Vec<String> = ["src/a.rs", "src/b.rs", "src/gone.rs", "src/payments/**"]
         .iter()
         .map(|s| s.to_string())
         .collect();
     let record = make_gotcha_record(
         "gotcha:multi",
-        &["src/a.rs", "src/b.rs", "src/c.bin", "src/payments/**"],
+        &["src/a.rs", "src/b.rs", "src/gone.rs", "src/payments/**"],
     );
-    apply_gotcha_confirm(&store, &record, &files).await.unwrap();
+    apply_gotcha_confirm(&store, dir.path(), &record, &files)
+        .await
+        .unwrap();
 
     let stamp = stored_stamp(&store.get("gotcha:multi").await.unwrap().unwrap());
-    assert_eq!(stamp.get("src/a.rs"), Some(&"hash-a".to_string()));
-    assert_eq!(stamp.get("src/b.rs"), Some(&"hash-b".to_string()));
-    assert_eq!(stamp.len(), 2, "unindexed paths must not be stamped");
+    assert_eq!(
+        stamp.get("src/a.rs"),
+        Some(&disk_hash(dir.path(), "src/a.rs"))
+    );
+    assert_eq!(
+        stamp.get("src/b.rs"),
+        Some(&disk_hash(dir.path(), "src/b.rs"))
+    );
+    assert_eq!(stamp.len(), 2, "unreadable paths must not be stamped");
 
     store.close().await.unwrap();
 }
@@ -579,49 +605,80 @@ async fn confirm_stamps_each_affected_file_and_skips_unindexed_ones() {
 /// the comparison moves.
 #[tokio::test]
 async fn reconfirm_restamps_and_clears_drift() {
-    use crate::health::drift::{current_content_hashes, detect_drift};
+    use crate::health::drift::{detect_drift, disk_content_hashes};
 
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v1"),
-        )
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
 
     let record = make_gotcha_record("gotcha:curated", &["src/a.rs"]);
-    apply_gotcha_confirm(&store, &record, &["src/a.rs".into()])
+    apply_gotcha_confirm(&store, dir.path(), &record, &["src/a.rs".into()])
         .await
         .unwrap();
 
-    // `mati init` re-hashes the edited file.
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v2"),
-        )
-        .await
-        .unwrap();
+    // The developer edits the file.
+    write_source(dir.path(), "src/a.rs", "fn a() { changed(); }\n");
 
     let gotchas = store.scan_prefix("gotcha:").await.unwrap();
-    let files = store.scan_prefix("file:").await.unwrap();
-    let drifted = detect_drift(&gotchas, &current_content_hashes(&files));
+    let drifted = detect_drift(&gotchas, &disk_content_hashes(dir.path(), &gotchas));
     assert_eq!(drifted.len(), 1, "edited file must report drift");
     assert_eq!(drifted[0].drifted_files, vec!["src/a.rs".to_string()]);
 
     // Developer re-reads and re-confirms.
     let current = store.get("gotcha:curated").await.unwrap().unwrap();
-    apply_gotcha_confirm(&store, &current, &["src/a.rs".into()])
+    apply_gotcha_confirm(&store, dir.path(), &current, &["src/a.rs".into()])
         .await
         .unwrap();
 
     let gotchas = store.scan_prefix("gotcha:").await.unwrap();
-    let files = store.scan_prefix("file:").await.unwrap();
     assert!(
-        detect_drift(&gotchas, &current_content_hashes(&files)).is_empty(),
+        detect_drift(&gotchas, &disk_content_hashes(dir.path(), &gotchas)).is_empty(),
         "re-confirming must re-stamp the current digest and clear the drift"
+    );
+
+    store.close().await.unwrap();
+}
+
+/// The defect this stamp path was moved to disk for: a developer edits a
+/// file and confirms a rule against the edited code while the `file:*`
+/// record still carries the pre-edit digest. That confirmation is honest,
+/// so it must not report drift — not now, and not once a rescan finally
+/// refreshes the file record.
+#[tokio::test]
+async fn confirming_against_edited_code_is_not_drift_behind_a_stale_index() {
+    use crate::health::drift::{detect_drift, disk_content_hashes};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
+    let indexed_at_init = disk_hash(dir.path(), "src/a.rs");
+    store
+        .put(
+            "file:src/a.rs",
+            &make_file_record_hashed("src/a.rs", &indexed_at_init),
+        )
+        .await
+        .unwrap();
+
+    // Edit, then confirm. No rescan runs, so `file:src/a.rs` still says
+    // `indexed_at_init`.
+    write_source(dir.path(), "src/a.rs", "fn a() { edited(); }\n");
+    let record = make_gotcha_record("gotcha:fresh-eyes", &["src/a.rs"]);
+    apply_gotcha_confirm(&store, dir.path(), &record, &["src/a.rs".into()])
+        .await
+        .unwrap();
+
+    let stored = store.get("gotcha:fresh-eyes").await.unwrap().unwrap();
+    assert_eq!(
+        stored_stamp(&stored).get("src/a.rs"),
+        Some(&disk_hash(dir.path(), "src/a.rs")),
+        "the stamp must be the edited file, not the digest the index still holds"
+    );
+
+    let gotchas = store.scan_prefix("gotcha:").await.unwrap();
+    assert!(
+        detect_drift(&gotchas, &disk_content_hashes(dir.path(), &gotchas)).is_empty(),
+        "a rule confirmed against the code as it stands is not drifted"
     );
 
     store.close().await.unwrap();
@@ -635,30 +692,38 @@ async fn reconfirm_restamps_and_clears_drift() {
 async fn new_confirmed_write_stamps_and_unconfirmed_does_not() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v1"),
-        )
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
 
     let confirmed = make_gotcha_record("gotcha:added", &["src/a.rs"]);
-    apply_gotcha_write(&store, &confirmed, &[], &["src/a.rs".into()], true)
-        .await
-        .unwrap();
+    apply_gotcha_write(
+        &store,
+        dir.path(),
+        &confirmed,
+        &[],
+        &["src/a.rs".into()],
+        true,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         stored_stamp(&store.get("gotcha:added").await.unwrap().unwrap()).get("src/a.rs"),
-        Some(&"hash-v1".to_string())
+        Some(&disk_hash(dir.path(), "src/a.rs"))
     );
 
     let mut candidate = make_gotcha_record("gotcha:candidate", &["src/a.rs"]);
     if let Some(obj) = candidate.payload.as_mut().and_then(|p| p.as_object_mut()) {
         obj.insert("confirmed".into(), serde_json::Value::Bool(false));
     }
-    apply_gotcha_write(&store, &candidate, &[], &["src/a.rs".into()], true)
-        .await
-        .unwrap();
+    apply_gotcha_write(
+        &store,
+        dir.path(),
+        &candidate,
+        &[],
+        &["src/a.rs".into()],
+        true,
+    )
+    .await
+    .unwrap();
     assert!(
         stored_stamp(&store.get("gotcha:candidate").await.unwrap().unwrap()).is_empty(),
         "an unconfirmed candidate has no human sign-off to stamp"
@@ -674,31 +739,21 @@ async fn new_confirmed_write_stamps_and_unconfirmed_does_not() {
 async fn edit_does_not_restamp_a_confirmed_gotcha() {
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v1"),
-        )
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
+    let at_confirm = disk_hash(dir.path(), "src/a.rs");
 
     let record = make_gotcha_record("gotcha:edited", &["src/a.rs"]);
-    apply_gotcha_confirm(&store, &record, &["src/a.rs".into()])
+    apply_gotcha_confirm(&store, dir.path(), &record, &["src/a.rs".into()])
         .await
         .unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v2"),
-        )
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() { changed(); }\n");
 
     // Re-write the record the way `mati gotcha edit` does — payload carried
     // forward, `is_new = false`.
     let edited = store.get("gotcha:edited").await.unwrap().unwrap();
     apply_gotcha_write(
         &store,
+        dir.path(),
         &edited,
         &["src/a.rs".into()],
         &["src/a.rs".into()],
@@ -709,7 +764,7 @@ async fn edit_does_not_restamp_a_confirmed_gotcha() {
 
     assert_eq!(
         stored_stamp(&store.get("gotcha:edited").await.unwrap().unwrap()).get("src/a.rs"),
-        Some(&"hash-v1".to_string()),
+        Some(&at_confirm),
         "an edit must not silently re-baseline a drifted rule"
     );
 
@@ -721,17 +776,11 @@ async fn edit_does_not_restamp_a_confirmed_gotcha() {
 /// no `confirmed_content` key so it exercises the actual serde default.
 #[tokio::test]
 async fn pre_upgrade_record_has_no_stamp_and_is_not_drifted() {
-    use crate::health::drift::{current_content_hashes, detect_drift};
+    use crate::health::drift::{detect_drift, disk_content_hashes};
 
     let dir = tempfile::TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
-    store
-        .put(
-            "file:src/a.rs",
-            &make_file_record_hashed("src/a.rs", "hash-v2"),
-        )
-        .await
-        .unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
 
     let mut legacy = make_gotcha_record("gotcha:legacy", &["src/a.rs"]);
     legacy.payload = Some(serde_json::json!({
@@ -751,9 +800,9 @@ async fn pre_upgrade_record_has_no_stamp_and_is_not_drifted() {
     assert!(gotcha.confirmed);
     assert!(gotcha.confirmed_content.is_empty());
 
-    let files = store.scan_prefix("file:").await.unwrap();
+    let hashes = disk_content_hashes(dir.path(), std::slice::from_ref(&stored));
     assert!(
-        detect_drift(&[stored], &current_content_hashes(&files)).is_empty(),
+        detect_drift(&[stored], &hashes).is_empty(),
         "no stamp must read as unknown, never as drifted"
     );
 
@@ -894,9 +943,16 @@ async fn apply_write_normalizes_affected_files_before_linking() {
         .unwrap();
 
     let record = make_gotcha_record("gotcha:dotslash", &["./src/a.rs"]);
-    apply_gotcha_write(&store, &record, &[], &["./src/a.rs".into()], true)
-        .await
-        .unwrap();
+    apply_gotcha_write(
+        &store,
+        dir.path(),
+        &record,
+        &[],
+        &["./src/a.rs".into()],
+        true,
+    )
+    .await
+    .unwrap();
 
     let a = store.get("file:src/a.rs").await.unwrap().unwrap();
     assert!(file_gotcha_keys(&a).contains(&"gotcha:dotslash".to_string()));
@@ -925,7 +981,7 @@ async fn apply_write_leaves_normalized_affected_files_untouched() {
 
     let record = make_gotcha_record("gotcha:clean", &["src/a.rs", "src/payments/**"]);
     let files = vec!["src/a.rs".to_string(), "src/payments/**".to_string()];
-    apply_gotcha_write(&store, &record, &[], &files, true)
+    apply_gotcha_write(&store, dir.path(), &record, &[], &files, true)
         .await
         .unwrap();
 

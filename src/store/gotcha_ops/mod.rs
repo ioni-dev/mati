@@ -77,6 +77,7 @@
 //! See [`super::repair`] for the full consistency model.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -134,6 +135,6 @@ pub use normalization::{
 };
 pub(crate) use normalization::{tombstoned_copy, with_normalized_affected_files};
 use stamping::payload_is_confirmed;
-pub use stamping::{confirm_content_stamp, content_hash_of, set_confirm_stamp};
+pub use stamping::{confirm_content_stamp, disk_content_hash, set_confirm_stamp};
 
 // ── Tests ────────────────────────────────────────────────────────────────────

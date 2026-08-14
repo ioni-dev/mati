@@ -1087,7 +1087,16 @@ async fn gotcha_confirm_stamps_content_hash_on_the_daemon_path() {
     let graph = Arc::new(tokio::sync::RwLock::new(graph));
     let ctx = test_ctx(dir.path());
 
-    // Seed a file record carrying the digest `mati init` computes.
+    // The stamp comes from the working tree, so the file has to exist on disk.
+    // The `file:*` record carries a deliberately wrong digest: if confirm ever
+    // regresses to reading the index, this test fails instead of passing on a
+    // value that agrees by accident.
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.rs"), b"fn a() {}\n").unwrap();
+    let on_disk = format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(b"fn a() {}\n")
+    );
     {
         let g = graph.read().await;
         let mut file = crate::store::record::Record::layer0_file_stub(
@@ -1142,8 +1151,8 @@ async fn gotcha_confirm_stamps_content_hash_on_the_daemon_path() {
     assert!(gotcha.confirmed);
     assert_eq!(
         gotcha.confirmed_content.get("src/a.rs"),
-        Some(&"hash-v1".to_string()),
-        "daemon confirm must stamp the file's current digest"
+        Some(&on_disk),
+        "daemon confirm must stamp the file's current on-disk digest"
     );
     // Confirmation must not weaken anything the read gate reads. Confidence
     // is set to the DeveloperManual base by the handler; quality is whatever

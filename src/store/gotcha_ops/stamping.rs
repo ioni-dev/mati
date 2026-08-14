@@ -1,22 +1,26 @@
+use sha2::{Digest, Sha256};
+
 use super::*;
 
 // ── Confirm-time content stamp ───────────────────────────────────────────────
 
-/// Read the SHA-256 content digest a `file:*` record already carries.
+/// The SHA-256 digest of the file at `repo_root/path`, as it stands on disk.
 ///
-/// Returns `None` for a record with no payload, no `content_hash` (a file
-/// indexed before content hashing existed, or a language Layer 0 does not
-/// parse), or a hash stored as something other than a string. Reads the JSON
-/// key directly rather than deserializing a whole
-/// [`crate::store::FileRecord`] — one field is wanted and the rest of that
-/// struct is comparatively expensive to build.
-pub fn content_hash_of(file_record: &Record) -> Option<String> {
-    file_record
-        .payload
-        .as_ref()?
-        .get("content_hash")?
-        .as_str()
-        .map(str::to_string)
+/// Lowercase hex over the raw bytes — byte-for-byte the form
+/// `analysis::parser::analyze_file_bytes` writes into a `file:*` record's
+/// `content_hash`, so a stamp taken here and a digest taken there are
+/// comparable.
+///
+/// `repo_root` must be the root the store's slug was keyed on
+/// ([`crate::store::slug_root`]), never `Store::root` (which is
+/// `~/.mati/<slug>`) and never the process cwd.
+///
+/// `None` for anything that is not a readable file: a glob entry such as
+/// `src/payments/**`, a deleted path, an unreadable one. Every caller treats
+/// that as "unknown", never as drift.
+pub fn disk_content_hash(repo_root: &Path, path: &str) -> Option<String> {
+    let bytes = std::fs::read(repo_root.join(path)).ok()?;
+    Some(format!("{:x}", Sha256::digest(&bytes)))
 }
 
 /// Collect the confirm-time content stamp for `affected_files`.
@@ -27,29 +31,24 @@ pub fn content_hash_of(file_record: &Record) -> Option<String> {
 /// stronger claim than "this record is old". See
 /// [`crate::store::GotchaRecord::confirmed_content`].
 ///
-/// Reuses the digest `mati init` already computed and stored on the file
-/// record — no file is opened and nothing is hashed a second time. Paths with
-/// no file record or no stored digest (globs, unparsed files, a path added
-/// before the next init) are simply omitted; the reader treats a missing
-/// entry as "unknown", never as drift.
+/// Hashes the working tree, not the `file:*` index. The index only refreshes
+/// on a rescan, so stamping from it baselines a developer who edits a file and
+/// then confirms against the *pre-edit* code: the record reads clean until the
+/// next `mati init` refreshes that file record, then reports drift the human
+/// already resolved. Reading disk on both sides makes drift mean "the code
+/// changed since a human confirmed the rule", independent of index freshness.
 ///
-/// Store-read failures are swallowed for the same reason: an unstamped entry
-/// under-reports drift, which is the safe direction. Confirmation must not
-/// fail because a file record could not be read.
-pub async fn confirm_content_stamp(
-    store: &Store,
+/// Unreadable paths are omitted, and read failures are swallowed: an unstamped
+/// entry under-reports drift, which is the safe direction. Confirmation must
+/// not fail because a file could not be read.
+pub fn confirm_content_stamp(
+    repo_root: &Path,
     affected_files: &[String],
 ) -> BTreeMap<String, String> {
-    let mut stamp = BTreeMap::new();
-    for path in affected_files {
-        let file_key = format!("file:{path}");
-        if let Ok(Some(file_record)) = store.get(&file_key).await {
-            if let Some(hash) = content_hash_of(&file_record) {
-                stamp.insert(path.clone(), hash);
-            }
-        }
-    }
-    stamp
+    affected_files
+        .iter()
+        .filter_map(|path| disk_content_hash(repo_root, path).map(|hash| (path.clone(), hash)))
+        .collect()
 }
 
 /// Whether a gotcha record's payload says the rule is developer-confirmed.

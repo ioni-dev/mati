@@ -283,7 +283,7 @@ Stored under `gotcha:<slug>`. Like `FileRecord`, it is attached to the base `Rec
 | `affected_files` | Canonical source of truth for which files this gotcha applies to                        |
 | `ref_url`        | Optional link to the incident or PR that produced this rule                             |
 | `confirmed`      | `false` means Layer 0 candidate stub, never injected. `true` means developer-validated. |
-| `confirmed_content` | SHA-256 of each affected file at the moment the rule was last confirmed (`<path>` -> hex). Baseline for content drift; see section 17.1. |
+| `confirmed_content` | SHA-256 of each affected file **on disk** at the moment the rule was last confirmed (`<path>` -> hex). Baseline for content drift; see section 17.1. |
 
 `confirmed: false` records exist as graph nodes and gap signals. They are not used in hook enforcement. A gotcha can trigger a deny only when `confirmed: true`, `confidence >= 0.6`, and `quality >= 0.4`.
 
@@ -605,7 +605,7 @@ recorded,” not durable file protection.
 
 ### 10.5 Live freshness (F4)
 
-Staleness and drift are computed at `mati init` time. `FileChanged` gives the health system the event it is otherwise starved of: an edit updates `content_hash` and staleness incrementally, in the daemon, with no rescan. Drift is derived from `content_hash`, so `mati stale` reports a confirmed gotcha as drifted the moment its file changes.
+Staleness is computed at `mati init` time. `FileChanged` gives the health system the event it is otherwise starved of: an edit updates `content_hash` and staleness incrementally, in the daemon, with no rescan. Drift needs no event at all — it hashes the working tree on demand — so `mati stale` reports a confirmed gotcha as drifted the moment its file changes.
 
 Claude Code starts no file watcher until a `SessionStart` hook returns `hookSpecificOutput.watchPaths`. `mati watch-paths` supplies it: the absolute path of every existing file named by an Active gotcha. That scope is the point — those are the files whose content can invalidate a rule that denies a read. A `file:*` record with no gotcha attached keeps its `mati init` freshness. Absolute paths, `..` escapes, and glob entries such as `src/payments/**` drop out; the set is capped at 512 with a warning naming what was dropped.
 
@@ -1067,10 +1067,14 @@ the rule? A stale gotcha is dusty; a drifted one may be wrong.
 
 The confirm paths (`gotcha_ops::apply_gotcha_confirm` for direct-store runs,
 `mcp::handlers::handle_gotcha_confirm` for the daemon) stamp
-`GotchaRecord.confirmed_content` with the `content_hash` each affected `file:*`
-record already carries. A gotcha is drifted when a stamped path's current hash
-differs. `health::drift` computes this as a pure comparison of two values that
-already exist, so it adds no work to `mati init` and opens no files.
+`GotchaRecord.confirmed_content` with the SHA-256 each affected file hashes to
+**on disk**. A gotcha is drifted when a stamped path hashes differently later.
+Both sides read the working tree, never the `file:*` index: the index refreshes
+only on a rescan, so stamping from it would baseline a developer who edits a
+file and then confirms against the pre-edit code, and report drift the human
+already resolved. `health::drift::disk_content_hashes` hashes only the files a
+confirmed, stamped gotcha names — a few hundred at most — and
+`detect_drift` stays a pure comparison over that map.
 
 Drift is **reported, never enforced**. It is not a `StalenessSignal` and carries
 no weight in the formula above, deliberately:
@@ -1090,8 +1094,10 @@ A drifted gotcha keeps denying reads. Re-confirming (`mati gotcha confirm
 curation loop. `mati stale` lists drifted gotchas in their own block, and
 `mati doctor`'s `knowledge/freshness` check appends the count.
 
-Absence of a stamp — a record confirmed before the field existed, a glob entry,
-a file with no `content_hash` — reads as *unknown*, never as drifted.
+Absence of a digest on either side — a record confirmed before the field
+existed, a glob entry, a path with nothing readable on disk — reads as
+*unknown*, never as drifted. A deleted file is the staleness analyzer's
+`FileDeleted` signal, not drift.
 
 ---
 
