@@ -191,6 +191,8 @@ After the gamma refactor, mati runs as two separate processes.
 | `--include-mcp`         | Also kills the `mati serve` processes attached to this store. Their MCP sessions die.          |
 | `--force --include-mcp` | Sends SIGKILL to the daemon, then SIGKILL to this store's serves.                              |
 
+A stop is not an enforcement hold. Every hook path calls `ensure_daemon`, so the daemon is back within one tool call. There is no stay-down flag, because a hold is a deliberate enforcement outage. `mati daemon stop` says so on every path that signals a process.
+
 `--include-mcp` is scoped to the target store. `pgrep -f "mati serve"` enumerates candidates, but a proxy's command line is a bare `mati serve`, its CWD may be `/` (Codex), and it holds no long-lived socket — nothing on the process identifies the store. The association only exists where the proxy wrote it: `serve_start pid=<n> owner=proxy` in that store's `lifecycle.log`. The kill list is the intersection of that record with the running set, and skipped processes are reported. Under-inclusive on purpose — a truncated log means a proxy survives, which is the right way to fail.
 
 ### 4.2 State-aware daemon readiness
