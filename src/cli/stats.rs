@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use mati_core::health::{gaps, onboarding};
 use mati_core::store::{
-    Category, ConfidenceScore, FileRecord, Priority, QualityScore, Record, RecordLifecycle,
-    RecordSource, RecordVersion, StalenessScore, StalenessTier, Store,
+    Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, Record,
+    RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessTier, Store,
 };
 
 use super::colors;
@@ -103,15 +103,11 @@ pub(crate) struct GotchaHealth {
     pub(crate) stale_or_worse: u64,
 }
 
-/// A gotcha counts as confirmed unless its payload explicitly says
-/// `confirmed: false` (missing / non-bool → confirmed). Mirrors the Review-backlog
-/// definition so every confirmed count in `mati stats` agrees.
+/// A gotcha counts as confirmed only when its payload parses as a
+/// `GotchaRecord` that says so — the same predicate the enforcement paths use,
+/// so a record this returns `true` for is one that can actually gate.
 pub(crate) fn gotcha_is_confirmed(r: &Record) -> bool {
-    r.payload
-        .as_ref()
-        .and_then(|p| p.get("confirmed"))
-        .and_then(|v| v.as_bool())
-        != Some(false)
+    r.payload_as::<GotchaRecord>().is_some_and(|g| g.confirmed)
 }
 
 /// Compute [`GotchaHealth`] from already-scanned, active gotcha records.

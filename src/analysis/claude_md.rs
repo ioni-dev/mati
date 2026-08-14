@@ -4,11 +4,9 @@
 //! each section to a [`Record`] with the correct [`Category`] based on the
 //! heading text.
 //!
-//! Section-to-category mapping (from ARCHITECTURE.md section 12.1):
+//! Section-to-category mapping:
 //!
 //! ```text
-//! "## Gotchas" / "## Known Issues"          → Category::Gotcha
-//! "## Architecture" / "## Overview"         → Category::DevNote
 //! "## Decisions" / "## ADR"                 → Category::Decision
 //! "## Current Sprint" / "## Status"         → Category::Stage
 //! All others                                → Category::DevNote
@@ -128,14 +126,17 @@ fn parse_sections(content: &str) -> Vec<ParsedSection> {
 
 /// Map a `## ` heading to a record category.
 ///
-/// Matching is case-insensitive and uses keyword containment — "## Known
-/// Gotchas and Issues" matches both "gotcha" and "issue" patterns.
+/// Matching is case-insensitive and uses keyword containment — "## Sprint
+/// Status" matches the stage patterns.
+///
+/// A "## Gotchas" heading maps to [`Category::DevNote`], not
+/// [`Category::Gotcha`]: every enforcement link is file-keyed, and a markdown
+/// heading carries no file paths, so a `gotcha:` record minted here could
+/// never gate a read.
 fn heading_to_category(heading: &str) -> Category {
     let lower = heading.to_lowercase();
 
-    if lower.contains("gotcha") || lower.contains("known issue") || lower.contains("known bug") {
-        Category::Gotcha
-    } else if lower.contains("decision") || lower.contains("adr") {
+    if lower.contains("decision") || lower.contains("adr") {
         Category::Decision
     } else if lower.contains("sprint")
         || lower.contains("status")
@@ -305,12 +306,14 @@ Real content.
 
     // ── heading_to_category ─────────────────────────────────────────────────
 
+    /// Import can never populate `affected_files` from a heading, so a
+    /// `gotcha:` record minted here would be permanently unenforceable.
     #[test]
-    fn heading_gotchas_maps_to_gotcha() {
-        assert_eq!(heading_to_category("Gotchas"), Category::Gotcha);
-        assert_eq!(heading_to_category("Known Issues"), Category::Gotcha);
-        assert_eq!(heading_to_category("Known Gotchas"), Category::Gotcha);
-        assert_eq!(heading_to_category("known bug list"), Category::Gotcha);
+    fn heading_gotchas_maps_to_dev_note() {
+        assert_eq!(heading_to_category("Gotchas"), Category::DevNote);
+        assert_eq!(heading_to_category("Known Issues"), Category::DevNote);
+        assert_eq!(heading_to_category("Known Gotchas"), Category::DevNote);
+        assert_eq!(heading_to_category("known bug list"), Category::DevNote);
     }
 
     #[test]
@@ -340,7 +343,7 @@ Real content.
 
     #[test]
     fn heading_case_insensitive() {
-        assert_eq!(heading_to_category("GOTCHAS"), Category::Gotcha);
+        assert_eq!(heading_to_category("GOTCHAS"), Category::DevNote);
         assert_eq!(heading_to_category("decisions"), Category::Decision);
         assert_eq!(heading_to_category("CURRENT SPRINT"), Category::Stage);
     }
@@ -454,13 +457,13 @@ Rust + tokio.
         assert_eq!(import.records.len(), 4);
 
         // Check categories.
-        assert_eq!(import.records[0].category, Category::Gotcha);
+        assert_eq!(import.records[0].category, Category::DevNote);
         assert_eq!(import.records[1].category, Category::Decision);
         assert_eq!(import.records[2].category, Category::Stage);
         assert_eq!(import.records[3].category, Category::DevNote);
 
         // Check keys use correct prefixes.
-        assert!(import.records[0].key.starts_with("gotcha:claude-md-"));
+        assert!(import.records[0].key.starts_with("dev_note:claude-md-"));
         assert!(import.records[1].key.starts_with("decision:claude-md-"));
         assert!(import.records[2].key.starts_with("stage:claude-md-"));
         assert!(import.records[3].key.starts_with("dev_note:claude-md-"));
