@@ -1126,10 +1126,259 @@ async fn repair_check_prunes_nothing() {
     let remaining = scan_enforcement_events(&store, 0, u64::MAX)
         .await
         .expect("scan");
+    // Count the seeded seqs, not the total: the daemon this spawned also
+    // recorded a startup gap, since these events are 400 days old.
+    let survivors: Vec<u64> = remaining
+        .iter()
+        .map(|e| e.seq_no)
+        .filter(|s| (1..=3).contains(s))
+        .collect();
     assert_eq!(
-        remaining.len(),
-        3,
+        survivors,
+        vec![1, 2, 3],
         "--check must leave every expired event in place"
+    );
+}
+
+// ─────────────────────────────────────────────
+// Test 10d: startup gap detection
+// ─────────────────────────────────────────────
+
+/// Write `count` Deny events and backdate every one of them by `age_ms`,
+/// re-chaining as it goes so the fixture leaves a chain that verifies clean —
+/// a stale `event_hash` would read as tampering and mask what these tests
+/// assert.
+async fn write_and_backdate(store: &Store, count: u64, age_ms: u64) {
+    use mati_core::store::enforcement::EnforcementEvent;
+
+    let mut writer = EnforcementEventWriter::new(store)
+        .await
+        .expect("create writer");
+    for i in 0..count {
+        writer
+            .write(
+                store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f_{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+
+    let old_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let old_ms = old_ms.saturating_sub(age_ms);
+    let mut prev_hash = String::new();
+    for seq in 1..=count {
+        let key = format!("enforcement:event:{:020}", seq);
+        let bytes = store
+            .get_raw_bytes(&key)
+            .await
+            .expect("read event")
+            .expect("event present");
+        let mut event = serde_json::from_slice::<EnforcementEvent>(&bytes).expect("parse event");
+        event.recorded_at_ms = old_ms;
+        event.prev_hash = prev_hash;
+        event.event_hash = event.compute_hash();
+        prev_hash = event.event_hash.clone();
+        store
+            .put_raw(&key, &serde_json::to_vec(&event).unwrap())
+            .await
+            .expect("patch event");
+    }
+}
+
+/// A window with no daemon is a window with no enforcement. If it goes
+/// unrecorded, an audit artifact asserting completeness over it is false.
+#[tokio::test]
+async fn a_quiet_log_past_the_threshold_records_a_gap() {
+    use mati_core::store::enforcement::{
+        detect_startup_gap, verify_chain, GapCause, STARTUP_GAP_THRESHOLD_MS,
+    };
+
+    let (_dir, store) = temp_store().await;
+    let two_days_ms = 2 * 24 * 60 * 60 * 1000;
+    write_and_backdate(&store, 3, two_days_ms).await;
+
+    let event = detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+        .await
+        .expect("detect startup gap")
+        .expect("a two-day silence must be recorded");
+
+    assert_eq!(event.seq_no, 4);
+    assert_eq!(event.subject_kind, SubjectKind::System);
+    assert_eq!(event.decision_reason_code, "recording_gap_detected");
+    match &event.event_type {
+        EnforcementEventType::RecordingGap {
+            gap_start_ms,
+            gap_end_ms,
+            cause,
+            enforcement_mode_during_gap,
+            missed_event_count,
+            certainty,
+        } => {
+            assert!(
+                gap_end_ms.saturating_sub(*gap_start_ms) >= two_days_ms,
+                "the gap must span from the last event to now"
+            );
+            // Nothing in the store distinguishes a crash from an idle weekend.
+            assert_eq!(*cause, GapCause::Unknown);
+            assert_eq!(*enforcement_mode_during_gap, EnforcementMode::Advisory);
+            assert_eq!(*missed_event_count, MissedEventCount::Unknown);
+            assert_eq!(*certainty, GapCertainty::Inferred);
+        }
+        other => panic!("expected RecordingGap, got {other:?}"),
+    }
+
+    let all = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(all.len(), 4);
+    let verification = verify_chain(&all);
+    assert!(
+        verification.is_valid(),
+        "the gap event must link to the event it reports the gap after, got {verification:?}"
+    );
+
+    // The gap event is now the newest, and it is fresh. A restart must not
+    // report the same silence twice.
+    assert!(
+        detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+            .await
+            .expect("detect startup gap")
+            .is_none(),
+        "a recorded gap must not be re-reported on the next start"
+    );
+}
+
+#[tokio::test]
+async fn a_log_inside_the_threshold_records_nothing() {
+    use mati_core::store::enforcement::{detect_startup_gap, STARTUP_GAP_THRESHOLD_MS};
+
+    let (_dir, store) = temp_store().await;
+    // Longer than the daemon's 30-minute idle shutdown, so this is exactly the
+    // ordinary restart the threshold exists to keep out of the log.
+    write_and_backdate(&store, 3, 8 * 60 * 60 * 1000).await;
+
+    assert!(
+        detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+            .await
+            .expect("detect startup gap")
+            .is_none(),
+        "an overnight break is not a recording gap"
+    );
+    let all = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(all.len(), 3, "no event may be written");
+}
+
+/// A store that has never enforced anything has no gap to report — there is no
+/// window to be silent about.
+#[tokio::test]
+async fn an_empty_log_records_nothing() {
+    use mati_core::store::enforcement::detect_startup_gap;
+
+    let (_dir, store) = temp_store().await;
+    assert!(detect_startup_gap(&store, 0)
+        .await
+        .expect("detect startup gap")
+        .is_none());
+    assert!(scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan")
+        .is_empty());
+}
+
+/// The newest event may be unreadable — a newer binary's event type, a torn
+/// write. Detection must fall back to the newest event it CAN read rather than
+/// conclude the log is empty and skip the gap.
+#[tokio::test]
+async fn an_unreadable_newest_event_does_not_hide_the_gap() {
+    use mati_core::store::enforcement::{detect_startup_gap, STARTUP_GAP_THRESHOLD_MS};
+
+    let (_dir, store) = temp_store().await;
+    write_and_backdate(&store, 3, 2 * 24 * 60 * 60 * 1000).await;
+    store
+        .put_raw("enforcement:event:00000000000000000003", b"{not json")
+        .await
+        .expect("corrupt the newest event");
+
+    assert!(
+        detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+            .await
+            .expect("detect startup gap")
+            .is_some(),
+        "the gap must be found behind the unreadable tail"
+    );
+}
+
+/// P9: a daemon that refuses to start because it could not write an audit event
+/// is strictly worse than the missing event. The daemon must come up with the
+/// gap recorded, and the chain must still verify.
+#[tokio::test]
+async fn daemon_start_records_the_gap_and_keeps_serving() {
+    use mati_core::store::enforcement::verify_chain;
+
+    common::isolate_mati_home();
+    let dir = TempDir::new().expect("tempdir");
+    // The child resolves its own cwd, which macOS canonicalizes to
+    // /private/var/...; a divergent path would derive a different store slug.
+    let repo = dir.path().canonicalize().expect("canonicalize tempdir");
+    // Declared after `dir` so it drops first and stops the daemon while its cwd
+    // still exists.
+    let _daemon_guard = common::DaemonGuard::for_mati_home(&repo, common::mati_home());
+
+    let store = Store::open(&repo).await.expect("open store");
+    write_and_backdate(&store, 3, 2 * 24 * 60 * 60 * 1000).await;
+    store.close().await.expect("close store");
+
+    // Any store-touching command spawns the daemon through `ensure_daemon`.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mati"))
+        .args(["repair", "--check", "--json"])
+        .current_dir(&repo)
+        .output()
+        .expect("run mati repair --check");
+    assert!(
+        out.status.success(),
+        "the daemon must serve after recording a gap; mati exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The daemon holds the store lock for its 30-minute idle window. Stop it so
+    // this test-only direct read can take the lock.
+    let stopped = std::process::Command::new(env!("CARGO_BIN_EXE_mati"))
+        .args(["daemon", "stop"])
+        .current_dir(&repo)
+        .output()
+        .expect("run mati daemon stop");
+    assert!(
+        stopped.status.success(),
+        "mati daemon stop exited {:?}: {}",
+        stopped.status.code(),
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+
+    let store = Store::open(&repo).await.expect("reopen store");
+    let all = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    let gaps = all
+        .iter()
+        .filter(|e| matches!(e.event_type, EnforcementEventType::RecordingGap { .. }))
+        .count();
+    assert_eq!(gaps, 1, "daemon start must record exactly one gap: {all:?}");
+    assert!(
+        verify_chain(&all).is_valid(),
+        "the chain must still verify with a gap event in it"
     );
 }
 

@@ -140,6 +140,25 @@ pub async fn run_daemon_start() -> Result<()> {
         }
     }
 
+    // Every window with no daemon is a window with no enforcement. Best-effort:
+    // a daemon that refuses to start because it could not write an audit event
+    // is worse than the missing event (P9).
+    match mati_core::store::enforcement::detect_startup_gap(
+        &store,
+        mati_core::store::enforcement::STARTUP_GAP_THRESHOLD_MS,
+    )
+    .await
+    {
+        Ok(Some(event)) => {
+            tracing::info!(
+                "daemon: recorded RecordingGap (seq {}) — the event log was quiet past the threshold",
+                event.seq_no
+            );
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("daemon: startup gap detection failed: {e}"),
+    }
+
     // Load the graph so the daemon can handle MCP tool commands (mem_get,
     // mem_query, mem_bootstrap, mem_set) in addition to hook commands.
     // Graph::load consumes the Store — access via graph.read().await.store().

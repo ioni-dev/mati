@@ -110,32 +110,64 @@ pub async fn enforce_retention(store: &Store) -> Result<PruneResult> {
 // Gap Detection on Startup
 // ─────────────────────────────────────────────
 
-/// Check for and record gaps on writer startup.
+/// How long the event log may stay quiet before a daemon start reads it as a
+/// recording gap.
 ///
-/// If the store has events AND the last event's recorded_at_ms is older
-/// than `gap_threshold_ms`, emit a RecordingGap event. Conservative:
-/// may over-report gaps where the daemon was simply idle, but
-/// under-reporting is worse for a compliance tool.
-pub async fn detect_startup_gap(store: &Store, gap_threshold_ms: u64) -> Result<()> {
-    let events = scan_enforcement_events(store, 0, u64::MAX).await?;
-    if events.is_empty() {
-        return Ok(());
-    }
-    let last = events.last().expect("checked non-empty above");
-    let current = now_ms();
-    let age = current.saturating_sub(last.recorded_at_ms);
+/// Bounded below by the daemon's own rhythm: it idles out after
+/// `mcp::server::IDLE_SHUTDOWN_SECS` (30 min), so anything shorter than a
+/// working day records a gap on every ordinary restart — an overnight break
+/// alone would do it — and a log of those buries the outages worth finding.
+pub const STARTUP_GAP_THRESHOLD_MS: u64 = 24 * 60 * 60 * 1000;
 
-    if age > gap_threshold_ms {
-        // Route through the shared writer so the cached chain head stays in sync
-        // with this RecordingGap write.
-        let writer = shared_writer(store).await?;
-        writer
-            .lock()
-            .await
-            .detect_and_record_gap(store, last.recorded_at_ms, current, GapCause::Unknown)
-            .await?;
+/// Record a `RecordingGap` event when the daemon comes up after a window in
+/// which nothing was recorded.
+///
+/// Called by `mati daemon start`, before the graph loads.
+///
+/// Reads only the newest event. A full scan of an unbounded log sits on the
+/// cold-start path that `ensure_daemon` blocks every hook on.
+///
+/// What it reports is "no enforcement event was written between T1 and T2",
+/// which is equally true of a crash, a `mati daemon stop`, a P9 fail-open, and
+/// an idle weekend. Nothing in the store tells them apart, so the cause is
+/// [`GapCause::Unknown`] and `gap_threshold_ms` is the whole of the judgment
+/// about what counts as quiet.
+///
+/// Returns the event it recorded, or `None` when there is no gap.
+pub async fn detect_startup_gap(
+    store: &Store,
+    gap_threshold_ms: u64,
+) -> Result<Option<EnforcementEvent>> {
+    // Zero-padded keys sort in seq order, so the tail is the newest event. Skip
+    // back past any this binary cannot read rather than treat one as absent.
+    let keys = store.scan_keys(EVENT_PREFIX).await?;
+    let mut last_ms = None;
+    for key in keys.iter().rev() {
+        if let Ok(Some(bytes)) = store.get_raw_bytes(key).await {
+            if let Ok(event) = serde_json::from_slice::<EnforcementEvent>(&bytes) {
+                last_ms = Some(event.recorded_at_ms);
+                break;
+            }
+        }
     }
-    Ok(())
+    let Some(last_ms) = last_ms else {
+        return Ok(None);
+    };
+
+    let current = now_ms();
+    if current.saturating_sub(last_ms) <= gap_threshold_ms {
+        return Ok(None);
+    }
+
+    // Route through the shared writer so the cached chain head stays in sync
+    // with this RecordingGap write.
+    let writer = shared_writer(store).await?;
+    let event = writer
+        .lock()
+        .await
+        .detect_and_record_gap(store, last_ms, current, GapCause::Unknown)
+        .await?;
+    Ok(Some(event))
 }
 
 // ─────────────────────────────────────────────
