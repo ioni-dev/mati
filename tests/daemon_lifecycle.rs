@@ -154,6 +154,10 @@ async fn daemon_start_writes_lifecycle_events_and_exits_cleanly_on_sigterm() {
 async fn serve_exits_cleanly_on_sigterm_after_client_disconnect() {
     let project_temp = TempDir::new().expect("project tempdir");
     let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
+    // Unlike the `daemon start` tests, the child here is the proxy: it spawns
+    // the daemon detached, so `kill_on_drop` never reaches it. Declared after
+    // `project_temp` so it drops first, while its cwd still exists.
+    let _daemon_guard = common::DaemonGuard::for_mati_home(&project, common::mati_home());
 
     let bin = env!("CARGO_BIN_EXE_mati");
     let stderr_path = project.join("serve.stderr");
