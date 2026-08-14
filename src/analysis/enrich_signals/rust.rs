@@ -12,6 +12,10 @@
 //! - MEDIUM: `.unwrap()`, `.expect(...)` field expressions on call sites
 //! - MEDIUM: `#[allow(...)]` lint disables (via comments scanner)
 //!
+//! All three code patterns are matched twice: once on the real AST, once on
+//! the bare identifiers a `token_tree` leaves behind, so signals inside a
+//! macro body such as `thread_local! { … }` are not lost.
+//!
 //! Defensive guards (early returns with custom errors) are deliberately
 //! NOT captured — too noisy without per-context judgment. The LLM's
 //! Stage 2 critique handles that semantic call.
@@ -64,6 +68,19 @@ const RUST_QUERY_SRC: &str = r#"
       field: (field_identifier) @unwrap_call
       (#match? @unwrap_call "^(unwrap|expect)$")))
 
+  ; A macro body parses as an opaque `token_tree`, so none of the patterns
+  ; above reach inside `thread_local! { … }`, `lazy_static! { … }` or any
+  ; other block macro. A token_tree keeps only bare tokens, so match the
+  ; identifier; `followed_by` / `dot_precedes` supply the punctuation the
+  ; grammar dropped.
+  (token_tree (identifier) @tt_panic
+    (#match? @tt_panic
+      "^(panic|unreachable|todo|unimplemented|compile_error|bail|ensure)$"))
+  (token_tree (identifier) @tt_assert
+    (#match? @tt_assert "^(assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne)$"))
+  (token_tree (identifier) @tt_unwrap
+    (#match? @tt_unwrap "^(unwrap|expect)$"))
+
   ; Comments — both line and block, fed into the shared marker scanner
   (line_comment)  @comment
   (block_comment) @comment
@@ -105,6 +122,9 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let panic_macro_scoped_idx = cap_idx_for_name("panic_macro_scoped");
     let assert_macro_idx = cap_idx_for_name("assert_macro");
     let unwrap_call_idx = cap_idx_for_name("unwrap_call");
+    let tt_panic_idx = cap_idx_for_name("tt_panic");
+    let tt_assert_idx = cap_idx_for_name("tt_assert");
+    let tt_unwrap_idx = cap_idx_for_name("tt_unwrap");
     let comment_idx = cap_idx_for_name("comment");
 
     for m in cursor.matches(&RUST_QUERY, tree.root_node(), source_bytes) {
@@ -122,6 +142,15 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
                 } else if cap.index == assert_macro_idx {
                     (SignalKind::Assert, SignalTier::High)
                 } else if cap.index == unwrap_call_idx {
+                    (SignalKind::UnwrapLike, SignalTier::Medium)
+                } else if cap.index == tt_panic_idx && followed_by(source_bytes, node, b'!') {
+                    (SignalKind::Panic, SignalTier::High)
+                } else if cap.index == tt_assert_idx && followed_by(source_bytes, node, b'!') {
+                    (SignalKind::Assert, SignalTier::High)
+                } else if cap.index == tt_unwrap_idx
+                    && dot_precedes(source_bytes, node)
+                    && followed_by(source_bytes, node, b'(')
+                {
                     (SignalKind::UnwrapLike, SignalTier::Medium)
                 } else if cap.index == comment_idx {
                     if let Some(sig) = comments::scan_comment_text(&evidence, line) {
@@ -146,6 +175,23 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     }
 
     Ok(signals)
+}
+
+/// Whether `byte` immediately follows the node. A token_tree strips the
+/// punctuation off the AST, so `!` is all that separates the macro call
+/// `panic!(…)` from a binding named `panic`, and `(` all that separates
+/// `.expect(…)` from a field named `expect`.
+fn followed_by(source: &[u8], node: tree_sitter::Node, byte: u8) -> bool {
+    source.get(node.end_byte()) == Some(&byte)
+}
+
+/// Whether a `.` precedes, ignoring whitespace — a method call's receiver
+/// may sit on the previous line.
+fn dot_precedes(source: &[u8], node: tree_sitter::Node) -> bool {
+    source[..node.start_byte()]
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .is_some_and(|i| source[i] == b'.')
 }
 
 /// Whether the parent module declares this file's module behind a test gate
@@ -586,6 +632,61 @@ fn gated() {
 "#;
         let signals = extract(src).unwrap();
         assert_eq!(signals.len(), 1, "got {signals:?}");
+    }
+
+    #[test]
+    fn unwrap_inside_macro_body_detected() {
+        let src = r#"
+thread_local! {
+    static P: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&L).expect("grammar load failed");
+        p
+    });
+}
+"#;
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+        assert_eq!(signals[0].kind, SignalKind::UnwrapLike);
+        assert_eq!(signals[0].tier, SignalTier::Medium);
+        assert_eq!(signals[0].file_line, 5);
+        assert_eq!(signals[0].evidence, "expect");
+    }
+
+    #[test]
+    fn panic_and_assert_inside_macro_body_detected() {
+        let src = "lazy_static! {\n    static ref X: u8 = { assert!(ok); panic!(\"boom\") };\n}\n";
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 2, "got {signals:?}");
+        assert!(signals
+            .iter()
+            .any(|s| s.kind == SignalKind::Panic && s.evidence == "panic"));
+        assert!(signals
+            .iter()
+            .any(|s| s.kind == SignalKind::Assert && s.evidence == "assert"));
+    }
+
+    #[test]
+    fn same_named_binding_inside_macro_body_not_signaled() {
+        // `c.expect` is a field and `panic` a plain binding: neither carries
+        // the punctuation that would make it a call.
+        let src = "assert_eq!(c.expect == \"deny\", c.expect.as_str() == panic);\n";
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+        assert_eq!(signals[0].kind, SignalKind::Assert);
+    }
+
+    #[test]
+    fn macro_body_inside_test_module_excluded() {
+        let src = r#"
+#[cfg(test)]
+mod tests {
+    thread_local! {
+        static P: u8 = { panic!("boom") };
+    }
+}
+"#;
+        assert!(extract(src).unwrap().is_empty());
     }
 
     #[test]
