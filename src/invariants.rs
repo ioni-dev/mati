@@ -1254,15 +1254,19 @@ mod zero_network {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// "Called during `mati init` and `mati repair --full`."
-/// — the doc comment on `store::enforcement::enforce_retention`, which nothing
-/// outside a test has ever called.
+/// — the doc comment `store::enforcement::enforce_retention` carried while
+/// nothing outside a test called it.
 ///
 /// Five separate defects found weeks apart turned out to be one shape:
 /// documentation asserting behaviour the code does not have. `ConfidenceScore`
 /// said it was recomputed on every `mem_get`; `health::confidence::recompute`
 /// has no callers. `enforce_retention` said `mati init` and `mati repair`
-/// called it; only a test does, so the event log grows without bound. Each was
+/// called it; only a test did, so the event log grew without bound. Each was
 /// found by accident. Nothing was looking.
+///
+/// `enforce_retention` has since been given the caller its doc claimed (`mati
+/// repair`, full scan only) and the doc rewritten to match; it is kept here as
+/// the worked example, not as a live failure.
 ///
 /// This module looks. It finds every `fn` whose doc comment makes a caller
 /// claim, and asserts the function has at least one call site in production
@@ -1537,12 +1541,11 @@ mod documented_caller_claims {
             uncalled.is_empty(),
             "DOC CLAIMS A CALLER THAT DOES NOT EXIST:\n{}\n\n\
              Each of these functions is documented as being called and has no \
-             call site in src/. Fix the doc to say what is true — that is what \
-             `enforce_retention` does now. Do not wire up a caller to silence \
-             the test; that is a behaviour change and needs its own review. If \
-             the call site is real but invisible to a text scan (trait object, \
-             macro, FFI), add it to ALLOWLIST in src/invariants.rs with the \
-             reason.",
+             call site in src/. The default fix is to correct the doc to say \
+             what is true. Wiring up a caller is a behaviour change and needs \
+             its own review — do not do it to silence the test. If the call \
+             site is real but invisible to a text scan (trait object, macro, \
+             FFI), add it to ALLOWLIST in src/invariants.rs with the reason.",
             uncalled.join("\n")
         );
 
