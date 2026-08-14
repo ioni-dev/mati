@@ -347,11 +347,14 @@ impl EnforcementEventWriter {
         &self.prev_hash
     }
 
-    /// Detect gaps in the event stream and emit a RecordingGap event.
+    /// Emit a RecordingGap event for the window `gap_start_ms..gap_end_ms`.
     ///
-    /// Called on writer initialization when the seq counter is ahead of
-    /// the last stored event (indicating a crash between seq allocation
-    /// and event write).
+    /// Called by [`detect_startup_gap`](super::detect_startup_gap), which infers
+    /// the window from a timestamp delta rather than reading it off a record —
+    /// hence `Inferred` certainty and an `Unknown` missed-event count, neither
+    /// of which a caller can improve on. `enforcement_mode_during_gap` is
+    /// hardcoded `Advisory` and is not read from the store; the mode in force
+    /// during a window nobody was recording is not knowable either way.
     pub async fn detect_and_record_gap(
         &mut self,
         store: &Store,

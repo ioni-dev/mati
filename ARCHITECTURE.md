@@ -1114,7 +1114,7 @@ enforcement:event:<seq_no>
 - Each event carries a SHA-256 `event_hash` of its own canonical serialization.
 - Each event carries `prev_hash`, which is the `event_hash` of the immediately preceding event. The first event uses an empty string.
 - `seq_no` is globally unique, monotonically increasing, and persisted before the event that uses it.
-- Gaps in `seq_no` are acceptable after a crash. Recovery produces a `RecordingGap` event. Hash chain breaks indicate tampering or corruption.
+- Gaps in `seq_no` are acceptable after a crash — a seq is persisted before the event that uses it, so a crash in between leaves a hole. Nothing detects a seq hole today; `RecordingGap` is written on a time gap instead (section 18.1). Hash chain breaks indicate tampering or corruption.
 - The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 2 (v2 appends `agent_session`); v1 events still hash under the original 14-field form. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
 
 There are 8 event types:
@@ -1127,7 +1127,7 @@ There are 8 event types:
 | `BypassDetected`           | A hook bypass was detected after the fact — `codex-post-bash`, or the `FileDeleted` tombstone bypass suppressing a would-have-denied gotcha; nothing was denied |
 | `ControlChanged`           | A gotcha was created, confirmed, updated, or deleted                                                             |
 | `EnforcementConfigChanged` | A configuration setting changed. Records old and new value.                                                      |
-| `RecordingGap`             | Crash/restart gap detected on recovery. Records cause, duration, enforcement mode during the gap, and certainty. |
+| `RecordingGap`             | The event log was quiet for longer than `STARTUP_GAP_THRESHOLD_MS` when the daemon came up. Records the window, cause, enforcement mode during the gap, and certainty. Written by `mati daemon start` (section 18.1) |
 | `RetentionPruned`          | An oldest-first prefix of the event log was deleted past `enforcement.retention`. Records the count and the seq range. Written by `mati repair`'s full scan, after the deletion |
 
 Each event also carries:
@@ -1151,6 +1151,19 @@ agent_session
 All three are optional and were part of the v2 canonical layout before anything wrote them, so filling them in needs no schema bump — an event written when they were null still hashes under the layout it recorded, and both eras verify in one chain.
 
 The enforcement event log is local and owned by the developer. The enterprise tier reads it to generate signed audit artifacts. It does not add events to the log.
+
+### 18.1 Recording gaps
+
+Only a running daemon writes enforcement events. Every window in which no daemon ran — a crash, `mati daemon stop`, a wedge, an ordinary P9 fail-open — is a window the log says nothing about. A signed artifact asserting completeness over such a window is a false attestation, so the gap has to be in the log.
+
+`detect_startup_gap` (`src/store/enforcement/retention.rs`) runs on `mati daemon start`, right after the store opens and before the graph loads. It compares the newest event's `recorded_at_ms` against the wall clock and writes a `RecordingGap` when the difference exceeds `STARTUP_GAP_THRESHOLD_MS`. Until this was wired up, `RecordingGap` was never written in production at all.
+
+- **Threshold: 24 hours.** The daemon idles out after `IDLE_SHUTDOWN_SECS` (30 min), so every restart after a break already looks like 30+ minutes of silence. A shorter threshold records a gap on an overnight break, and a log of those buries the outages worth finding. A day of silence on an active repo is worth a reviewer's eye; on a dormant repo it costs one event per dormant period, not one per restart. The tradeoff is under-reporting: a three-hour crash mid-workday writes nothing.
+- **Cause is `Unknown`, certainty is `Inferred`, missed count is `Unknown`.** What the event actually asserts is "no enforcement event was written between T1 and T2", which is equally true of a crash and of a quiet weekend. Nothing in the store tells them apart, so no other `GapCause` variant can be claimed honestly.
+- **Reads the tail, not the chain.** One `scan_keys` plus one `get_raw_bytes` on the newest key. Measured on a 3161-event store: 0.35ms, against 9–20ms for the full `scan_enforcement_events` it used to run. This sits on the cold-start path that `ensure_daemon` blocks every hook on, and the log is unbounded.
+- **Best-effort.** A failure is logged to `daemon.log` and startup continues. A daemon that refuses to start because it could not write an audit event is strictly worse than the missing event (P9).
+
+Not addressed: nothing detects a `seq_no` hole, and nothing correlates the gap against `lifecycle.log`, which does know whether the last shutdown was clean. Both would narrow the cause below `Unknown`.
 
 ---
 

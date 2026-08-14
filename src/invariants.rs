@@ -1268,6 +1268,13 @@ mod zero_network {
 /// repair`, full scan only) and the doc rewritten to match; it is kept here as
 /// the worked example, not as a live failure.
 ///
+/// A sixth turned up in the same file and this scan missed it: `detect_startup_gap`
+/// said "Check for and record gaps on writer startup" and nothing started a
+/// writer, so no `RecordingGap` event was ever written in production. Its doc
+/// *described* an occasion instead of *claiming* a caller, and every phrase in
+/// the list needed a verb of invocation. "startup" was added as a phrase in its
+/// own right, which catches it. See the phrase list below.
+///
 /// This module looks. It finds every `fn` whose doc comment makes a caller
 /// claim, and asserts the function has at least one call site in production
 /// source. A doc that says "called during X" while nothing anywhere calls it is
@@ -1326,6 +1333,15 @@ mod zero_network {
 /// form "must be called on a store whose index is empty". That costs nothing —
 /// an over-matched doc only fails the test if the function *also* has no
 /// caller, and a function in that state is worth a look regardless.
+///
+/// "startup" is the one bare noun, and it is there on the same reasoning. It
+/// needs no preposition in front of it because the adjective varies — "on
+/// writer startup", "at daemon startup", "during cold startup" — and a phrase
+/// list cannot enumerate that. A doc that mentions startup at all is claiming
+/// the function runs at one, and it is the matching phrase for 9 docs in the
+/// tree today, all of which have a caller. Catching *described* rather than
+/// *claimed* invocation in general is out of reach for a text scan; this covers
+/// the one shape that has actually shipped a defect.
 #[cfg(test)]
 mod documented_caller_claims {
     use super::{declared_fn_name, fn_bodies, production_lines, rust_sources};
@@ -1362,6 +1378,7 @@ mod documented_caller_claims {
         "fires when",
         "fires after",
         "fires during",
+        "startup",
     ];
 
     /// Functions whose doc claims a caller that this scan cannot see.
