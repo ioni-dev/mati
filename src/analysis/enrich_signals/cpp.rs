@@ -3,6 +3,9 @@
 //! HIGH: `throw ...`, `abort()`, `exit(...)`, `std::terminate(...)`,
 //!       `assert(...)`, `static_assert(...)`
 //! MEDIUM: `// NOLINT`, `#pragma warning(disable ...)` via shared scanner
+//!
+//! A `#define` body parses as an opaque `preproc_arg` leaf, so it is
+//! re-parsed as a fragment via [`super::macro_body_signals`].
 
 use std::cell::RefCell;
 use std::sync::LazyLock;
@@ -25,6 +28,7 @@ const CPP_QUERY_SRC: &str = r#"
   (call_expression function: (identifier) @assert_fn
     (#match? @assert_fn "^(assert|static_assert)$")) @assert
   (comment) @comment
+  (preproc_arg) @macro_body
 "#;
 
 static CPP_QUERY: LazyLock<tree_sitter::Query> = LazyLock::new(|| {
@@ -52,6 +56,7 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
     let mut cursor = tree_sitter::QueryCursor::new();
     let cap = |n: &str| CPP_QUERY.capture_index_for_name(n).unwrap_or(u32::MAX);
     let (i_panic, i_assert, i_comment) = (cap("panic"), cap("assert"), cap("comment"));
+    let i_macro_body = cap("macro_body");
 
     for m in cursor.matches(&CPP_QUERY, tree.root_node(), bytes) {
         for c in m.captures {
@@ -79,6 +84,17 @@ pub fn extract(source: &str) -> Result<Vec<Signal>> {
                 {
                     out.push(sig);
                 }
+            } else if c.index == i_macro_body {
+                out.extend(CPP_PARSER.with(|p| {
+                    super::macro_body_signals(
+                        &mut p.borrow_mut(),
+                        &CPP_QUERY,
+                        c.node,
+                        bytes,
+                        i_panic,
+                        i_assert,
+                    )
+                }));
             }
         }
     }
@@ -103,5 +119,36 @@ mod tests {
         assert!(signals
             .iter()
             .any(|s| s.kind == SignalKind::Panic && s.evidence.contains("abort")));
+    }
+
+    #[test]
+    fn detects_assert_in_single_line_macro_body() {
+        let signals = extract("#define ASSERT_OK(x) assert((x).ok())\n").unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+        assert_eq!(signals[0].kind, SignalKind::Assert);
+        assert_eq!(signals[0].file_line, 1);
+        assert_eq!(signals[0].evidence, "assert((x).ok())");
+    }
+
+    #[test]
+    fn detects_throw_in_continued_macro_body() {
+        let src = "#define REQUIRE(c)   \\\n  do {               \\\n    if (!(c))        \\\n      throw std::runtime_error(\"bad\"); \\\n  } while (0)\n";
+        let signals = extract(src).unwrap();
+        assert_eq!(signals.len(), 1, "got {signals:?}");
+        assert_eq!(signals[0].kind, SignalKind::Panic);
+        assert_eq!(signals[0].file_line, 4);
+    }
+
+    #[test]
+    fn macro_body_without_calls_yields_nothing() {
+        assert!(extract("#define SQ(x) ((x) * (x))\n#define NOP\n")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn token_paste_macro_yields_nothing() {
+        // `a##b` re-parses as an ERROR node — it must degrade to silence.
+        assert!(extract("#define TWO(a,b) a##b\n").unwrap().is_empty());
     }
 }

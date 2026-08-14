@@ -268,6 +268,52 @@ pub(crate) fn node_text(source: &[u8], node: tree_sitter::Node) -> String {
     String::from_utf8_lossy(&source[start..end]).into_owned()
 }
 
+/// Pull `panic` and `assert` captures out of a C/C++ `#define` body.
+///
+/// tree-sitter parses a macro body as an opaque `preproc_arg` leaf, so the
+/// file-level query never reaches inside one. Re-parse the body on its own
+/// with the same grammar and query.
+///
+/// The wrapper opens on the body's first line and closes on its last, so it
+/// adds no rows: fragment row N is `body.start_position().row + N`. Backslash
+/// continuations are left in place — error recovery finds the same calls
+/// whether or not they are stripped.
+pub(crate) fn macro_body_signals(
+    parser: &mut tree_sitter::Parser,
+    query: &tree_sitter::Query,
+    body: tree_sitter::Node,
+    source: &[u8],
+    panic_idx: u32,
+    assert_idx: u32,
+) -> Vec<Signal> {
+    let fragment = format!("void _(){{ {} ;}}", node_text(source, body));
+    let Some(tree) = parser.parse(fragment.as_bytes(), None) else {
+        return Vec::new();
+    };
+    let base = body.start_position().row as u32;
+    let bytes = fragment.as_bytes();
+    let mut out = Vec::new();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    for m in cursor.matches(query, tree.root_node(), bytes) {
+        for c in m.captures {
+            let kind = if c.index == panic_idx {
+                SignalKind::Panic
+            } else if c.index == assert_idx {
+                SignalKind::Assert
+            } else {
+                continue;
+            };
+            out.push(Signal {
+                file_line: base + c.node.start_position().row as u32 + 1,
+                tier: SignalTier::High,
+                kind,
+                evidence: trim_evidence(&node_text(bytes, c.node)),
+            });
+        }
+    }
+    out
+}
+
 /// Collect byte ranges of test-only nodes, without descending into a match.
 ///
 /// Each language supplies its own `is_test` predicate; the traversal is
