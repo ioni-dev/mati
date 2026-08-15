@@ -17,8 +17,9 @@ use mati_core::scaffold::codex::CodexInstallResult;
 use mati_core::scaffold::settings::InstallResult;
 use mati_core::scaffold::{install_codex, write_claude_md_stub, write_mati_enrich_command};
 use mati_core::store::{
-    derive_slug, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessSignal, Store,
+    derive_slug, slug_root, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority,
+    QualityScore, Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    StalenessSignal, Store,
 };
 
 mod display;

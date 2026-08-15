@@ -5,7 +5,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
     };
-    let root = std::fs::canonicalize(&root)?;
+    // `--path` names a repository root, so resolve it through git the same way
+    // the slug is derived. Canonicalize first: it is what rejects a path that
+    // does not exist, which `slug_root`'s non-git fallback silently tolerates.
+    let root = slug_root(&std::fs::canonicalize(&root)?);
 
     let slug = derive_slug(&root);
     let project_name = root
