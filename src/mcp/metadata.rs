@@ -486,7 +486,7 @@ pub async fn kill_directly(pid: u32) -> KillOutcome {
     }
 
     let sigkill_start = std::time::Instant::now();
-    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, started).await {
+    if poll_until_exit(pid, SIGKILL_REAP_WINDOW, sigkill_start).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
     let sigkill_elapsed_ms = sigkill_start.elapsed().as_millis() as u64;
@@ -536,14 +536,32 @@ pub async fn kill_and_wait(pid: u32, timeout: std::time::Duration) -> KillOutcom
         timeout_secs = timeout.as_secs(),
         "process did not exit within SIGTERM budget — sending SIGKILL"
     );
+    let sigkill_start = std::time::Instant::now();
     #[cfg(unix)]
     {
         // SAFETY: SIGKILL is non-catchable; the process either exits or
         // we surface Stuck. `kill(2)` is a standard system call.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if ret != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            // ESRCH means it exited on the late SIGTERM; the poll below reports
+            // that. Any other errno means the signal never landed, and
+            // `is_pid_alive` counts EPERM as alive, so polling only stalls the
+            // same Stuck verdict by a full reap window. Matches `kill_directly`.
+            if !matches!(errno, Some(libc::ESRCH)) {
+                tracing::warn!(pid, ?errno, "kill_and_wait: SIGKILL rejected by kernel");
+                return KillOutcome::Stuck(StuckDiagnostic {
+                    pid,
+                    total_elapsed_ms: started.elapsed().as_millis() as u64,
+                    sigterm_elapsed_ms: Some(sigterm_elapsed_ms),
+                    sigkill_elapsed_ms: sigkill_start.elapsed().as_millis() as u64,
+                    initial_snapshot,
+                    final_snapshot: snapshot_pid(pid),
+                });
+            }
+        }
     }
 
-    let sigkill_start = std::time::Instant::now();
     if poll_until_exit(pid, SIGKILL_REAP_WINDOW, sigkill_start).await {
         return KillOutcome::KilledHard(started.elapsed());
     }
