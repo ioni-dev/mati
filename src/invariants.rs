@@ -781,6 +781,13 @@ mod gotcha_write_sites {
              out of the gotcha_keys array",
         ),
         (
+            "src/store/repair.rs",
+            "purge_orphaned_files",
+            Class::NonGotcha,
+            "tombstones orphans found by find_orphaned_files, which only ever \
+             yields scan_prefix(\"file:\") keys",
+        ),
+        (
             "src/store/session.rs",
             "record_shadow_observation",
             Class::NonGotcha,

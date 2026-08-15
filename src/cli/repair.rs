@@ -4,12 +4,14 @@ use anyhow::Result;
 use clap::Args;
 
 use mati_core::store::repair::{
-    check_gotcha_indexes, is_dirty, repair_gotcha_indexes, RepairMode, RepairReport,
+    check_gotcha_indexes, find_orphaned_files, is_dirty, purge_orphaned_files,
+    repair_gotcha_indexes, OrphanEntry, OrphanKind, OrphanScan, PurgeOutcome, RepairMode,
+    RepairReport,
 };
-use mati_core::store::Store;
+use mati_core::store::{RepoIdent, Store};
 
 use super::colors;
-use super::daemon::{daemon_result, mati_root_for, DaemonResult};
+use super::daemon::{daemon_result, mati_root_for_ident, DaemonResult};
 use super::proxy::StoreProxy;
 
 #[derive(Args)]
@@ -21,7 +23,9 @@ use super::proxy::StoreProxy;
                   Use --check in CI to fail the build on index inconsistency.\n\n\
                   The full scan also deletes enforcement events older than\n\
                   `enforcement.retention` (default 365 days) and records a\n\
-                  RetentionPruned event. --check and --fast never delete anything."
+                  RetentionPruned event. --check and --fast never delete anything.\n\n\
+                  The full scan also counts file records whose path is no longer in\n\
+                  the repo. It only removes them with --purge-orphans."
 )]
 pub struct RepairArgs {
     /// Check for drift without making changes (exits non-zero if drift exists, CI-ready)
@@ -32,6 +36,11 @@ pub struct RepairArgs {
     /// Use the default full scan for authoritative verification.
     #[arg(long)]
     pub fast: bool,
+
+    /// Tombstone file records whose path is no longer in the repo, and unlink
+    /// them from their gotchas. Refuses when they are most of the store.
+    #[arg(long, conflicts_with_all = ["check", "fast"])]
+    pub purge_orphans: bool,
 
     /// Output machine-readable JSON report
     #[arg(long)]
@@ -47,8 +56,12 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         return run_check(&cwd, args.json, use_color).await;
     }
 
+    // One discover call grounds the mati root and the root record paths
+    // resolve against in the same git identity.
+    let ident = RepoIdent::discover(&cwd);
+
     // Repair (write) requires exclusive direct store access.
-    let root = mati_root_for(&cwd)?;
+    let root = mati_root_for_ident(&ident, &cwd)?;
     match daemon_result(&root, "ping", serde_json::json!({})).await {
         DaemonResult::Ok(_) | DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
             anyhow::bail!(
@@ -74,6 +87,20 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         prune_expired_events(&store, args.json).await?;
     }
 
+    // Ahead of the reconcile: a purge tombstones file records, and the desired
+    // state has to be derived after that to come out consistent.
+    let orphans = if mode == RepairMode::Full {
+        let scan = find_orphaned_files(&store, &ident.slug_root(&cwd)).await?;
+        if args.purge_orphans {
+            purge_orphans(&store, &scan, &ident, args.json).await?;
+        } else if !args.json {
+            print_orphan_summary(&scan.orphans, use_color);
+        }
+        scan.orphans
+    } else {
+        vec![]
+    };
+
     // Show pre-repair state for full mode
     if mode == RepairMode::Full && !args.json {
         let pre = check_gotcha_indexes(&store).await?;
@@ -92,7 +119,8 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         }
     }
 
-    let report = repair_gotcha_indexes(&store, mode).await?;
+    let mut report = repair_gotcha_indexes(&store, mode).await?;
+    report.orphaned_files = orphans;
 
     // Phase: recompute blast radius for all file records.
     // Requires graph with Imports edges for traversal.
@@ -263,6 +291,52 @@ async fn prune_expired_events(store: &Store, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Tombstone file records whose path is no longer in the repo.
+///
+/// Refuses without a git working tree. A root that names the wrong tree fails
+/// every path, and this repo has already lost a store to two components
+/// disagreeing about which root that is — so the purge asserts a deletion only
+/// from git's own `workdir`, the same grounding the staleness analyzer requires
+/// before it tombstones anything.
+async fn purge_orphans(
+    store: &Store,
+    scan: &OrphanScan,
+    ident: &RepoIdent,
+    json: bool,
+) -> Result<()> {
+    if ident.workdir.is_none() {
+        anyhow::bail!(
+            "--purge-orphans needs a git working tree to resolve record paths against.\n\
+             git found none here, so a missing file cannot be told from a wrong root."
+        );
+    }
+
+    match purge_orphaned_files(store, scan).await? {
+        PurgeOutcome::Purged {
+            tombstoned,
+            unlinked,
+        } => {
+            if !json {
+                println!(
+                    "  Orphaned file records tombstoned: {tombstoned} \
+                     ({unlinked} gotcha links unlinked)."
+                );
+            }
+        }
+        PurgeOutcome::Refused {
+            orphans,
+            active_files,
+        } => {
+            anyhow::bail!(
+                "refusing to purge: {orphans} of {active_files} file records look orphaned.\n\
+                 That is the signature of a wrong repo root, not of a stale store. \
+                 Check that `mati status` names the repo you expect before retrying."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Read-only drift check. Runs through `StoreProxy`, which routes reads to
 /// the daemon socket when one holds the lock and falls back to a direct
 /// `Store` otherwise -- `StoreProxy` implements `RepairReader` for exactly
@@ -272,7 +346,14 @@ async fn prune_expired_events(store: &Store, json: bool) -> Result<()> {
 async fn run_check(cwd: &std::path::Path, json: bool, use_color: bool) -> Result<()> {
     let proxy = StoreProxy::open(cwd).await?;
 
-    let result = check_gotcha_indexes(&proxy).await;
+    let result = async {
+        let mut report = check_gotcha_indexes(&proxy).await?;
+        report.orphaned_files = find_orphaned_files(&proxy, proxy.repo_root())
+            .await?
+            .orphans;
+        Ok(report)
+    }
+    .await;
 
     let report = proxy.close_with_result(result).await?;
 
@@ -313,7 +394,40 @@ fn print_check_report(report: &RepairReport, use_color: bool) {
     } else {
         print_drift_summary(report, use_color);
     }
+    print_orphan_summary(&report.orphaned_files, use_color);
     println!();
+}
+
+/// Orphans are reported, never repaired: `--check` is read-only and a plain
+/// `mati repair` is non-destructive. Only `--purge-orphans` acts on them.
+fn print_orphan_summary(orphans: &[OrphanEntry], use_color: bool) {
+    if orphans.is_empty() {
+        return;
+    }
+    let (yellow, white, gray, reset) = if use_color {
+        (colors::YELLOW, colors::WHITE, colors::GRAY, colors::RESET)
+    } else {
+        ("", "", "", "")
+    };
+
+    let outside = orphans
+        .iter()
+        .filter(|o| o.kind == OrphanKind::OutsideRepo)
+        .count();
+    let deleted = orphans.len() - outside;
+
+    println!(
+        "\n  {yellow}Orphaned file records:{reset} {white}{}{reset}  \
+         {gray}({outside} outside the repo, {deleted} deleted in it){reset}",
+        orphans.len()
+    );
+    for entry in orphans.iter().take(5) {
+        println!("    {}", entry.key);
+    }
+    if orphans.len() > 5 {
+        println!("    ... and {} more", orphans.len() - 5);
+    }
+    println!("  {gray}Remove them with `mati repair --purge-orphans`.{reset}");
 }
 
 fn print_drift_summary(report: &RepairReport, use_color: bool) {

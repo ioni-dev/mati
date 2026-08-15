@@ -28,6 +28,16 @@
 //! so it gets its own class ([`RepairReport::unnormalized_paths`]) and is
 //! repaired first, before any index reconciliation.
 //!
+//! # Orphaned file records
+//!
+//! A `file:*` record whose path is no longer in the repo is not drift — the
+//! derived indexes agree with the canonical records, the file is simply gone.
+//! It still inflates every coverage denominator, so [`find_orphaned_files`]
+//! reports it, split into [`OrphanKind::OutsideRepo`] (another tree's paths)
+//! and [`OrphanKind::DeletedInRepo`] (this project's own history).
+//! [`purge_orphaned_files`] tombstones them behind `--purge-orphans`, and
+//! refuses above [`ORPHAN_PURGE_MAX_SHARE`].
+//!
 //! # Dirty markers
 //!
 //! When a best-effort secondary write fails in [`super::gotcha_ops`], the
@@ -56,13 +66,15 @@
 //! # Usage
 //!
 //! ```text
-//! mati repair          # full reconcile + verify
-//! mati repair --check  # detect drift, exit 1 if found (CI)
-//! mati repair --fast   # drain dirty queue only (opportunistic)
-//! mati repair --json   # machine-readable output
+//! mati repair                  # full reconcile + verify
+//! mati repair --check          # detect drift, exit 1 if found (CI)
+//! mati repair --fast           # drain dirty queue only (opportunistic)
+//! mati repair --purge-orphans  # also tombstone file records whose path is gone
+//! mati repair --json           # machine-readable output
 //! ```
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -72,7 +84,7 @@ use crate::graph::edges::{Edge, EdgeKind};
 use crate::store::db::Store;
 use crate::store::record::{
     Category, GotchaRecord, Priority, Record, RecordLifecycle, RecordSource, RecordVersion,
-    StalenessScore,
+    StalenessScore, TombstoneReason,
 };
 
 /// Read-only store access used by the integrity *check* paths, so they can run
@@ -125,6 +137,13 @@ pub struct RepairReport {
     /// serialized before this field existed still deserialize.
     #[serde(default)]
     pub unnormalized_paths: Vec<DriftEntry>,
+    /// `file:*` records whose path no longer resolves under the repo root.
+    /// Not drift: the derived indexes agree with the canonical records, the
+    /// records are just about files that are gone. Only `mati repair`'s full
+    /// scan and `--check` fill this in — both have a repo root to resolve
+    /// against. `#[serde(default)]` for reports written before it existed.
+    #[serde(default)]
+    pub orphaned_files: Vec<OrphanEntry>,
     pub repaired_count: usize,
     pub verification_passed: bool,
     pub dirty_marker_cleared: bool,
@@ -153,6 +172,26 @@ impl RepairReport {
 pub struct DriftEntry {
     pub gotcha_key: String,
     pub file_path: String,
+}
+
+/// Why a `file:*` record's path does not resolve in the repo. The two mean
+/// different things to whoever is deciding whether to purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrphanKind {
+    /// Absolute, or under a top-level directory this repo does not have —
+    /// another checkout's tree, indexed by a benchmark or a stray `mati init`.
+    OutsideRepo,
+    /// Repo-relative and plausible, but gone from the working tree. Real
+    /// project history: a file a refactor removed.
+    DeletedInRepo,
+}
+
+/// A `file:*` record naming a path that is not in the repo any more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanEntry {
+    pub key: String,
+    pub kind: OrphanKind,
 }
 
 /// Dirty marker payload — persisted at `DIRTY_MARKER_KEY`.
@@ -253,24 +292,28 @@ pub async fn is_dirty<R: RepairReader>(reader: &R) -> bool {
 /// Does not write anything.
 pub async fn check_gotcha_indexes<R: RepairReader>(reader: &R) -> Result<RepairReport> {
     // Phase 1: derive desired state from canonical gotcha records
-    let desired = derive_desired_state(reader).await?;
+    let mut desired = derive_desired_state(reader).await?;
 
     // Phase 2: diff against actual state
-    let (actual_file_links, scanned_files) = read_actual_file_links(reader).await?;
+    let actual = read_actual_file_links(reader).await?;
     let actual_edges = read_actual_edges(reader).await?;
+    desired.drop_tombstoned(&actual.tombstoned);
 
     let (missing_file_links, stale_file_links) =
-        diff_file_links(&desired.file_links, &actual_file_links);
+        diff_file_links(&desired.file_links, &actual.links);
     let (missing_edges, stale_edges) = diff_edges(&desired.edges, &actual_edges);
 
     Ok(RepairReport {
         scanned_gotchas: desired.scanned,
-        scanned_files,
+        scanned_files: actual.scanned,
         missing_file_links,
         stale_file_links,
         missing_edges,
         stale_edges,
         unnormalized_paths: desired.unnormalized,
+        // Needs a repo root, which a `RepairReader` does not carry — the CLI
+        // fills this in from `slug_root`.
+        orphaned_files: vec![],
         repaired_count: 0,
         verification_passed: true, // check-only: no repair to verify
         dirty_marker_cleared: false,
@@ -304,15 +347,17 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     let (unnormalized_paths, path_repairs) = repair_unnormalized_paths(store, now).await?;
 
     // Phase 1: derive desired state
-    let desired = derive_desired_state(store).await?;
+    let mut desired = derive_desired_state(store).await?;
     let scanned_gotchas = desired.scanned;
 
     // Phase 2: diff
-    let (actual_file_links, scanned_files) = read_actual_file_links(store).await?;
+    let actual = read_actual_file_links(store).await?;
     let actual_edges = read_actual_edges(store).await?;
+    desired.drop_tombstoned(&actual.tombstoned);
+    let scanned_files = actual.scanned;
 
     let (missing_file_links, stale_file_links) =
-        diff_file_links(&desired.file_links, &actual_file_links);
+        diff_file_links(&desired.file_links, &actual.links);
     let (missing_edges, stale_edges) = diff_edges(&desired.edges, &actual_edges);
 
     let total_drift =
@@ -329,6 +374,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
             missing_edges: vec![],
             stale_edges: vec![],
             unnormalized_paths,
+            orphaned_files: vec![],
             repaired_count: path_repairs,
             verification_passed: true,
             dirty_marker_cleared: true,
@@ -359,7 +405,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     }
 
     // Also clear gotcha_keys from files that should have none
-    let (actual_file_links_2, _) = read_actual_file_links(store).await?;
+    let actual_file_links_2 = read_actual_file_links(store).await?.links;
     for (file_path, actual_keys) in &actual_file_links_2 {
         if !desired.file_links.contains_key(file_path.as_str()) && !actual_keys.is_empty() {
             let file_key = format!("file:{file_path}");
@@ -408,6 +454,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
         missing_edges,
         stale_edges,
         unnormalized_paths,
+        orphaned_files: vec![],
         repaired_count: repaired,
         verification_passed,
         dirty_marker_cleared: verification_passed,
@@ -484,6 +531,129 @@ async fn repair_unnormalized_paths(store: &Store, now: u64) -> Result<(Vec<Drift
     Ok((drift, repaired))
 }
 
+// ── Orphaned file records ────────────────────────────────────────────────────
+
+/// Refuse to purge when orphans are this share of the active `file:*` records.
+///
+/// The failure this guards against is a root that names the wrong tree, which
+/// fails *every* path — its signature is ~100%. The worst rate measured on a
+/// real store is 48% (a benchmark that indexed a second repo into it). 90%
+/// sits between the two.
+pub const ORPHAN_PURGE_MAX_SHARE: f64 = 0.9;
+
+/// One orphan scan: what was found, and what it was found among.
+pub struct OrphanScan {
+    pub orphans: Vec<OrphanEntry>,
+    /// Active `file:*` records scanned — the denominator the purge guard uses.
+    pub active_files: usize,
+}
+
+/// Result of [`purge_orphaned_files`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurgeOutcome {
+    Purged {
+        tombstoned: usize,
+        unlinked: usize,
+    },
+    /// Too many orphans to be believable — see [`ORPHAN_PURGE_MAX_SHARE`].
+    Refused {
+        orphans: usize,
+        active_files: usize,
+    },
+}
+
+/// Find active `file:*` records whose path is no longer in the repo.
+///
+/// `root` must be [`crate::store::slug_root`] — the working tree the store's
+/// slug was keyed on, which is what record paths are relative to. The process
+/// cwd is not it (a command runs from subdirectories) and neither is git's
+/// discovery from an arbitrary path (a gitlink child resolves to its parent).
+pub async fn find_orphaned_files<R: RepairReader>(reader: &R, root: &Path) -> Result<OrphanScan> {
+    let mut orphans = Vec::new();
+    let mut active_files = 0usize;
+
+    for record in reader.scan_prefix("file:").await? {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        active_files += 1;
+
+        let path = record.key.strip_prefix("file:").unwrap_or_default();
+        if path.is_empty() || root.join(path).exists() {
+            continue;
+        }
+        orphans.push(OrphanEntry {
+            key: record.key.clone(),
+            kind: classify_orphan(root, path),
+        });
+    }
+
+    Ok(OrphanScan {
+        orphans,
+        active_files,
+    })
+}
+
+/// A path that leaves the repo, or sits under a top-level directory the repo
+/// does not have, came from another tree. Anything else is plausibly ours.
+///
+/// A missing file directly at the repo root has no directory to judge it by,
+/// so it reads as deleted-in-repo — the conservative side of the split.
+fn classify_orphan(root: &Path, path: &str) -> OrphanKind {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return OrphanKind::OutsideRepo;
+    }
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::ParentDir), _) => OrphanKind::OutsideRepo,
+        (Some(Component::Normal(top)), Some(_)) if !root.join(top).is_dir() => {
+            OrphanKind::OutsideRepo
+        }
+        _ => OrphanKind::DeletedInRepo,
+    }
+}
+
+/// Tombstone every orphan in `scan` and drop the derived links pointing at it.
+///
+/// Soft delete, the way gotcha deletion works: the record stays readable by
+/// key and the gotchas that named it are untouched — only the record's
+/// `gotcha_keys` entries and its `HasGotcha` edges go. `derive_desired_state`
+/// stops wanting links to a tombstoned file record, so the run verifies clean.
+pub async fn purge_orphaned_files(store: &Store, scan: &OrphanScan) -> Result<PurgeOutcome> {
+    if scan.orphans.len() as f64 > scan.active_files as f64 * ORPHAN_PURGE_MAX_SHARE {
+        return Ok(PurgeOutcome::Refused {
+            orphans: scan.orphans.len(),
+            active_files: scan.active_files,
+        });
+    }
+
+    let now = now_secs();
+    let mut tombstoned = 0usize;
+    let mut unlinked = 0usize;
+
+    for orphan in &scan.orphans {
+        let Some(mut record) = store.get(&orphan.key).await? else {
+            continue;
+        };
+        for gotcha_key in extract_gotcha_keys(&record) {
+            let edge = Edge::new(&record.key, EdgeKind::HasGotcha, &gotcha_key).to_key();
+            let _ = store.delete(&edge).await;
+            unlinked += 1;
+        }
+        set_gotcha_keys(&mut record, vec![]);
+        let dead =
+            crate::store::gotcha_ops::tombstoned_copy(&record, TombstoneReason::FileDeleted, now);
+        store.put(&dead.key, &dead).await?;
+        tombstoned += 1;
+    }
+
+    Ok(PurgeOutcome::Purged {
+        tombstoned,
+        unlinked,
+    })
+}
+
 // ── Fast repair ──────────────────────────────────────────────────────────────
 
 async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
@@ -498,6 +668,7 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
                 missing_edges: vec![],
                 stale_edges: vec![],
                 unnormalized_paths: vec![],
+                orphaned_files: vec![],
                 repaired_count: 0,
                 verification_passed: true,
                 dirty_marker_cleared: false,
@@ -599,6 +770,7 @@ async fn repair_fast(store: &Store, now: u64) -> Result<RepairReport> {
         // Fast mode never scans for unnormalized paths — that needs the full
         // `gotcha:*` walk, which is exactly what this mode exists to skip.
         unnormalized_paths: vec![],
+        orphaned_files: vec![],
         repaired_count: repaired,
         verification_passed: true,
         dirty_marker_cleared: repaired > 0,
@@ -617,6 +789,16 @@ struct DesiredState {
     /// drift in its own right — the desired state derived above still uses the
     /// stored spelling, since that is what the indexes were built from.
     unnormalized: Vec<DriftEntry>,
+}
+
+impl DesiredState {
+    /// A tombstoned `file:*` record is not a link target, the same way a
+    /// tombstoned gotcha is not a link source. Without this, purging an orphan
+    /// that carried gotcha links would read as missing-link drift forever.
+    fn drop_tombstoned(&mut self, tombstoned: &HashSet<String>) {
+        self.file_links.retain(|path, _| !tombstoned.contains(path));
+        self.edges.retain(|(path, _)| !tombstoned.contains(path));
+    }
 }
 
 /// Phase 1: build desired state from canonical gotcha records.
@@ -676,13 +858,21 @@ fn unnormalized_entries(gotcha_key: &str, affected_files: &[String]) -> Vec<Drif
         .collect()
 }
 
+/// Actual state of the file-link index: the `gotcha_keys` each file record
+/// carries, how many records were scanned, and which of their paths belong to
+/// a tombstoned record.
+struct ActualFileLinks {
+    links: HashMap<String, Vec<String>>,
+    scanned: usize,
+    tombstoned: HashSet<String>,
+}
+
 /// Read actual gotcha_keys from all file records.
-async fn read_actual_file_links<R: RepairReader>(
-    reader: &R,
-) -> Result<(HashMap<String, Vec<String>>, usize)> {
+async fn read_actual_file_links<R: RepairReader>(reader: &R) -> Result<ActualFileLinks> {
     let files = reader.scan_prefix("file:").await?;
-    let count = files.len();
-    let mut actual: HashMap<String, Vec<String>> = HashMap::new();
+    let scanned = files.len();
+    let mut links: HashMap<String, Vec<String>> = HashMap::new();
+    let mut tombstoned: HashSet<String> = HashSet::new();
 
     for record in &files {
         let path = record
@@ -690,13 +880,20 @@ async fn read_actual_file_links<R: RepairReader>(
             .strip_prefix("file:")
             .unwrap_or(&record.key)
             .to_string();
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            tombstoned.insert(path.clone());
+        }
         let keys = extract_gotcha_keys(record);
         if !keys.is_empty() {
-            actual.insert(path, keys);
+            links.insert(path, keys);
         }
     }
 
-    Ok((actual, count))
+    Ok(ActualFileLinks {
+        links,
+        scanned,
+        tombstoned,
+    })
 }
 
 /// Read actual HasGotcha edges from the graph edge store.
@@ -1301,6 +1498,155 @@ mod tests {
 
         let report = check_gotcha_indexes(&store).await.unwrap();
         assert!(report.unnormalized_paths.is_empty());
+
+        store.close().await.unwrap();
+    }
+
+    // ── Orphaned file records ────────────────────────────────────────────
+
+    /// A repo root holding one real file under `src/`, so the classifier has
+    /// a top-level directory that exists and one that does not.
+    fn seed_repo(dir: &Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn main() {}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_scan_separates_outside_repo_from_deleted_in_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_repo(dir.path());
+        let store = Store::open(dir.path()).await.unwrap();
+
+        for path in [
+            "src/a.rs",
+            "src/gone.rs",
+            "hclsyntax/parser.go",
+            "/tmp/scratchpad/notes.md",
+        ] {
+            store
+                .put(&format!("file:{path}"), &make_file(path, &[]))
+                .await
+                .unwrap();
+        }
+
+        let scan = find_orphaned_files(&store, dir.path()).await.unwrap();
+        assert_eq!(scan.active_files, 4);
+
+        let kind = |key: &str| scan.orphans.iter().find(|o| o.key == key).map(|o| o.kind);
+        assert_eq!(kind("file:src/a.rs"), None, "the file is right there");
+        assert_eq!(kind("file:src/gone.rs"), Some(OrphanKind::DeletedInRepo));
+        assert_eq!(
+            kind("file:hclsyntax/parser.go"),
+            Some(OrphanKind::OutsideRepo),
+            "a top-level directory this repo does not have"
+        );
+        assert_eq!(
+            kind("file:/tmp/scratchpad/notes.md"),
+            Some(OrphanKind::OutsideRepo)
+        );
+
+        // The scan is read-only.
+        let gone = store.get("file:src/gone.rs").await.unwrap().unwrap();
+        assert!(matches!(gone.lifecycle, RecordLifecycle::Active));
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_tombstones_orphans_and_unlinks_their_gotchas() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_repo(dir.path());
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put(
+                "gotcha:g1",
+                &make_gotcha("gotcha:g1", &["src/a.rs", "src/gone.rs"]),
+            )
+            .await
+            .unwrap();
+        store
+            .put("file:src/a.rs", &make_file("src/a.rs", &["gotcha:g1"]))
+            .await
+            .unwrap();
+        store
+            .put(
+                "file:src/gone.rs",
+                &make_file("src/gone.rs", &["gotcha:g1"]),
+            )
+            .await
+            .unwrap();
+        for path in ["file:src/a.rs", "file:src/gone.rs"] {
+            let edge = Edge::new(path, EdgeKind::HasGotcha, "gotcha:g1");
+            store
+                .put_raw(&edge.to_key(), &now_secs().to_le_bytes())
+                .await
+                .unwrap();
+        }
+
+        let scan = find_orphaned_files(&store, dir.path()).await.unwrap();
+        let outcome = purge_orphaned_files(&store, &scan).await.unwrap();
+        assert_eq!(
+            outcome,
+            PurgeOutcome::Purged {
+                tombstoned: 1,
+                unlinked: 1
+            }
+        );
+
+        let gone = store.get("file:src/gone.rs").await.unwrap().unwrap();
+        assert!(matches!(gone.lifecycle, RecordLifecycle::Tombstoned { .. }));
+        assert!(extract_gotcha_keys(&gone).is_empty());
+
+        let edges = store.scan_keys("graph:edge:").await.unwrap();
+        let dead_edge = Edge::new("file:src/gone.rs", EdgeKind::HasGotcha, "gotcha:g1").to_key();
+        assert!(!edges.contains(&dead_edge));
+
+        // The gotcha still names the purged path, and the surviving file keeps
+        // its link. The purge must not read as drift on the next check.
+        let live = store.get("file:src/a.rs").await.unwrap().unwrap();
+        assert_eq!(extract_gotcha_keys(&live), vec!["gotcha:g1".to_string()]);
+        let report = check_gotcha_indexes(&store).await.unwrap();
+        assert!(
+            !report.has_drift(),
+            "purged orphans must not read as missing links: missing_file={:?}, missing_edges={:?}",
+            report.missing_file_links.len(),
+            report.missing_edges.len(),
+        );
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_refuses_when_orphans_are_most_of_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_repo(dir.path());
+        let store = Store::open(dir.path()).await.unwrap();
+
+        // 1 real file, 19 orphans — 95%, above ORPHAN_PURGE_MAX_SHARE.
+        store
+            .put("file:src/a.rs", &make_file("src/a.rs", &[]))
+            .await
+            .unwrap();
+        for i in 0..19 {
+            let path = format!("src/gone{i}.rs");
+            store
+                .put(&format!("file:{path}"), &make_file(&path, &[]))
+                .await
+                .unwrap();
+        }
+
+        let scan = find_orphaned_files(&store, dir.path()).await.unwrap();
+        assert_eq!(
+            purge_orphaned_files(&store, &scan).await.unwrap(),
+            PurgeOutcome::Refused {
+                orphans: 19,
+                active_files: 20
+            }
+        );
+
+        let untouched = store.get("file:src/gone0.rs").await.unwrap().unwrap();
+        assert!(matches!(untouched.lifecycle, RecordLifecycle::Active));
 
         store.close().await.unwrap();
     }
