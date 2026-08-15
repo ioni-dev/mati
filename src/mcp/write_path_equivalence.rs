@@ -170,6 +170,7 @@ async fn drive_confirm(
             .payload_as::<GotchaRecord>()
             .map(|g| g.affected_files)
             .unwrap_or_default(),
+        repo_root,
     );
 
     match path {

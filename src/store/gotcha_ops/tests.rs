@@ -972,6 +972,46 @@ async fn apply_write_normalizes_affected_files_before_linking() {
     store.close().await.unwrap();
 }
 
+/// The root the caller passes is the one that gets stripped. It used to be
+/// discovered from the process cwd, so a write issued from a different tree
+/// than the store's own keyed the path to that tree instead.
+#[test]
+fn normalize_strips_the_root_it_was_given() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let entry = dir.path().join("src/a.rs").to_string_lossy().into_owned();
+    assert_eq!(
+        normalize_affected_files(&[entry], dir.path()),
+        vec!["src/a.rs"]
+    );
+}
+
+/// A confirmed write keys its path and its content stamp to the same root.
+/// While normalization discovered its own root and stamping took a threaded
+/// one, a disagreement produced a record that was confirmed, enforcing, and
+/// permanently drift-blind — with no error.
+#[tokio::test]
+async fn a_new_confirmed_gotcha_stamps_against_the_root_it_was_given() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    write_source(dir.path(), "src/a.rs", "fn a() {}\n");
+    let expected = disk_hash(dir.path(), "src/a.rs");
+
+    let entry = dir.path().join("src/a.rs").to_string_lossy().into_owned();
+    let record = make_gotcha_record("gotcha:abs", &[&entry]);
+    apply_gotcha_write(&store, dir.path(), &record, &[], &[entry], true)
+        .await
+        .unwrap();
+
+    let stored = store.get("gotcha:abs").await.unwrap().unwrap();
+    assert_eq!(
+        stored.payload_as::<GotchaRecord>().unwrap().affected_files,
+        vec!["src/a.rs".to_string()]
+    );
+    assert_eq!(stored_stamp(&stored).get("src/a.rs"), Some(&expected));
+
+    store.close().await.unwrap();
+}
+
 /// An already-correct path must round-trip byte-for-byte: the payload is
 /// not rewritten and no clone is taken.
 #[tokio::test]

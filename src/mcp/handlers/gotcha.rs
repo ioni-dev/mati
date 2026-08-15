@@ -29,7 +29,8 @@ pub(crate) async fn handle_gotcha_upsert(
     // through `gotcha_ops::apply_gotcha_write`, so the normalization there does
     // not cover it — same reason the extraction-tracking hook below is
     // duplicated. Everything downstream uses this list, never `input`'s.
-    let affected_files = crate::store::gotcha_ops::normalize_affected_files(&input.affected_files);
+    let affected_files =
+        crate::store::gotcha_ops::normalize_affected_files(&input.affected_files, &ctx.repo_root);
 
     // Read-modify-commit under bounded write-conflict retry. The daemon serves
     // writes concurrently, so a sibling enforcement-event / receipt write can
@@ -434,6 +435,7 @@ async fn confirm_commit_once(
             .payload_as::<GotchaRecord>()
             .map(|g| g.affected_files)
             .unwrap_or_default(),
+        &ctx.repo_root,
     );
     if let Some(rekeyed) =
         crate::store::gotcha_ops::with_normalized_affected_files(&record, &affected_files)

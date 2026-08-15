@@ -12,9 +12,8 @@ use super::*;
 /// added as `./src/foo.rs` or as an absolute path therefore never matched
 /// `file:src/foo.rs` and was silently inert — no denial, no warning.
 ///
-/// This is deliberately the *same* function the gate calls, with the repo root
-/// resolved the *same* way (see `discover_repo_root`). Agreeing with the read
-/// side is the whole point; a second, "smarter" normalizer here would
+/// This is deliberately the *same* function the gate calls. Agreeing with the
+/// read side is the whole point; a second, "smarter" normalizer here would
 /// reintroduce the mismatch from the other direction.
 ///
 /// Globs survive unchanged (`src/payments/**`, minted by the CODEOWNERS
@@ -51,11 +50,17 @@ pub fn normalize_affected_files_with_root(
     out
 }
 
-/// [`normalize_affected_files_with_root`] with the repo root discovered from
-/// the process cwd, and absolute entries resolved through symlinks first.
+/// [`normalize_affected_files_with_root`] against `repo_root`, with the root
+/// and any absolute entry resolved through symlinks first.
 ///
 /// Both only happen when at least one entry is absolute, so the common
 /// all-relative case does no filesystem work at all.
+///
+/// `repo_root` must be the root the store's slug was keyed on
+/// ([`crate::store::slug_root`]), never the process cwd. The caller that hands
+/// the result to [`confirm_content_stamp`] joins that same root back onto it,
+/// and a path keyed to one root joined to another hashes nothing — a confirmed,
+/// enforcing gotcha that is permanently drift-blind, with no error.
 ///
 /// Symlink resolution is what makes the prefix strip inside `normalize_path`
 /// actually match. The gate never needs it — the agent hands it a path already
@@ -64,12 +69,17 @@ pub fn normalize_affected_files_with_root(
 /// git workdir is `/private/tmp/...`, and the entry would otherwise become the
 /// nonsense relative key `tmp/repo/src/a.rs`. Resolving an already-canonical
 /// path is a no-op, so this only ever removes a mismatch.
-pub fn normalize_affected_files(files: &[String]) -> Vec<String> {
+///
+/// A non-UTF-8 root leaves absolute entries to `normalize_path`'s
+/// repo-root-less branch, which is exactly what the gate falls back to as well.
+pub fn normalize_affected_files(files: &[String], repo_root: &Path) -> Vec<String> {
     if !files.iter().any(|f| looks_absolute(f)) {
         return normalize_affected_files_with_root(files, None);
     }
 
-    let repo_root = discover_repo_root();
+    let root = repo_root
+        .to_str()
+        .map(|r| resolve_lenient(r).unwrap_or_else(|| r.to_string()));
     let resolved: Vec<String> = files
         .iter()
         .map(|f| match looks_absolute(f) {
@@ -77,29 +87,7 @@ pub fn normalize_affected_files(files: &[String]) -> Vec<String> {
             false => f.clone(),
         })
         .collect();
-    normalize_affected_files_with_root(&resolved, repo_root.as_deref())
-}
-
-/// Resolve the repo root the way the read gate does.
-///
-/// Mirrors `cli::hook_decide::discover_repo_root`: [`crate::store::RepoIdent::discover`]
-/// on the process cwd. Every process that writes gotchas (CLI, `mati daemon`,
-/// `mati serve`) runs with its cwd inside the repo, so cwd discovery gets the
-/// same answer the gate gets.
-///
-/// The result is then resolved through symlinks to match the entries, which
-/// [`normalize_affected_files`] resolves for the same reason. On Unix this is
-/// already a no-op — `current_dir()` returns a resolved path, so git2's workdir
-/// is resolved too — but relying on that is not worth the silent failure mode.
-///
-/// `None` (bare repo, not a repo, non-UTF-8 root) leaves absolute entries to
-/// `normalize_path`'s repo-root-less branch, which is exactly what the gate
-/// falls back to as well.
-fn discover_repo_root() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    let root = crate::store::RepoIdent::discover(&cwd).workdir?;
-    let root = root.to_str()?;
-    Some(resolve_lenient(root).unwrap_or_else(|| root.to_string()))
+    normalize_affected_files_with_root(&resolved, root.as_deref())
 }
 
 /// Whether an entry needs a repo root to normalize. Checked before paying for
