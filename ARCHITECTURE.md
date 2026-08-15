@@ -1298,7 +1298,9 @@ A `mem_set` write to a tombstoned `gotcha:<slug>` key revives it as `Active`, wi
 
 **Path normalization:**
 
-`affected_files` joins to `file:<rel_path>` by exact string equality, and the read gate normalizes its side with `hooks::decide::normalize_path`. Every write path normalizes with the same function and the same repo-root resolution (`git2::Repository::discover` on the process cwd, uncanonicalized), so `./src/a.rs`, an absolute path inside the repo, and `src//a.rs` all store as `src/a.rs`. Globs such as `src/payments/**` pass through untouched. A write that stores a path the gate would never produce is a silent non-enforcement bug, not a cosmetic one.
+`affected_files` joins to `file:<rel_path>` by exact string equality, and the read gate normalizes its side with `hooks::decide::normalize_path`. Every write path normalizes with the same function and against an explicit `RepoIdent::slug_root` — never the process cwd — so `./src/a.rs`, an absolute path inside the repo, and `src//a.rs` all store as `src/a.rs`. Globs such as `src/payments/**` pass through untouched. A write that stores a path the gate would never produce is a silent non-enforcement bug, not a cosmetic one.
+
+The root is a parameter (`gotcha_ops::normalize_affected_files(files, repo_root)`), threaded from the same place the caller's other root-relative work resolves: `ctx.repo_root` in the daemon handlers, `StoreProxy::repo_root()` in the CLI, `slug_root` in `mati repair`. It used to be discovered from the process cwd while `confirm_content_stamp` took a threaded root, and when the two disagreed the record came out confirmed, enforcing, and permanently drift-blind — the stamp joined a root the path was not keyed to, and read nothing. Sharing one root makes that agreement structural.
 
 **Recovery:**
 
@@ -1323,9 +1325,10 @@ A `file:*` record whose path is no longer in the repo is not drift — the deriv
 Removal is opt-in and deliberately narrow, because a wrong repo root would destroy the store:
 
 - **Reported by default, removed only by `--purge-orphans`.** `--check` returns before the write path and `--fast` runs `RepairMode::Fast`, so neither touches them. The flag `conflicts_with` both.
-- **One root, and it is `slug_root`.** Paths resolve against `RepoIdent::slug_root` — git's own `workdir`, the same field the store's slug hashes and the same root `StalenessAnalyzer` and `StoreProxy` resolve against. Not the process cwd, and not `mati init`'s `canonicalize(cwd)` (which disagrees when init runs from a subdirectory — a known open gap, section 22).
+- **One root, and it is `slug_root`.** Paths resolve against `RepoIdent::slug_root` — git's own `workdir`, the same field the store's slug hashes and the same root `StalenessAnalyzer`, `StoreProxy` and `mati init` resolve against. Not the process cwd.
 - **No git working tree, no purge.** The purge bails when `RepoIdent::workdir` is `None`, the same grounding `StalenessAnalyzer` requires before it asserts `FileDeleted`. Without a real working tree, "the file is missing" cannot be told from "the root is wrong".
 - **Mass-tombstone guard.** It refuses when orphans exceed `ORPHAN_PURGE_MAX_SHARE` (90%) of active `file:*` records. A root naming the wrong tree fails *every* path, so the wrong-root signature is ~100%; the worst rate measured on a real store is the 48% above. 90% sits between them.
+- **Above that share, `--check` says re-init, not purge.** The same threshold means the store's keys no longer describe this tree — an `init --path <subdir>` from before the root fix, a store shared with a foreign checkout, a wholesale rename. The three are indistinguishable from the orphan set alone, so the message names the condition, not the cause, and points at `mati init`. Proving specifically that the keys are subtree-relative — a single directory prefix that rescues every orphan — needs a repo walk and is not built. Orphans still are not drift, so the exit code does not change.
 - **Soft delete.** The record is tombstoned with `TombstoneReason::FileDeleted`, not deleted, and its `gotcha_keys` and `HasGotcha` edges are dropped. The gotchas themselves are untouched, still naming the path in `affected_files`. `derive_desired_state` drops link targets whose file record is tombstoned — the mirror of it skipping tombstoned gotchas as link sources — so a purged orphan does not read as missing-link drift on the next check.
 
 ---
