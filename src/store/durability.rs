@@ -68,10 +68,13 @@ impl Encoding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
     /// fsync after write. Use for all user-visible knowledge records.
-    /// Correct for: `gotcha:*`, `decision:*`, `file:*`, `stage:*`, `dev_note:*`.
+    /// Correct for: `gotcha:*`, `decision:*`, `file:*`, `stage:*`, `dev_note:*`,
+    /// `policy:*`. `policy:*` reaches this through `for_key`'s unknown-prefix
+    /// default, not an explicit branch — an explicit branch must keep it here.
     Immediate,
     /// OS write buffer only. Fast path for high-frequency internal writes.
-    /// Correct for: `session:*`, `analytics:*`, `hook_event:*`, `compliance:*`, `graph:edge:*`.
+    /// Correct for: `session:*`, `analytics:*`, `hook_event:*`, `compliance:*`,
+    /// `graph:edge:*`, `health:*`, `parse:*`, `audit:session:*`.
     Eventual,
 }
 
