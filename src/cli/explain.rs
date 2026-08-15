@@ -349,12 +349,15 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     }
 
     // ── Review / capture hints ─────────────────────────────────────────────
+    // Tombstone excluded to match `collect_candidates` — `mati review` skips
+    // those, so counting them points at an empty queue.
     let unconfirmed_count = gotchas
         .iter()
         .filter(|g| {
-            g.payload_as::<GotchaRecord>()
-                .map(|gr| !gr.confirmed)
-                .unwrap_or(false)
+            g.staleness.tier != StalenessTier::Tombstone
+                && g.payload_as::<GotchaRecord>()
+                    .map(|gr| !gr.confirmed)
+                    .unwrap_or(false)
         })
         .count();
 
@@ -404,23 +407,30 @@ fn format_gotcha_provenance(record: &Record, confirmed: bool, use_color: bool) -
     let source = source_short(&record.source);
     let conf = record.confidence.value;
 
-    let (gray, yellow, green, reset) = if use_color {
-        (colors::GRAY, colors::YELLOW, colors::GREEN, colors::RESET)
+    let (gray, yellow, green, red, reset) = if use_color {
+        (
+            colors::GRAY,
+            colors::YELLOW,
+            colors::GREEN,
+            colors::RED,
+            colors::RESET,
+        )
     } else {
-        ("", "", "", "")
+        ("", "", "", "", "")
+    };
+
+    // The header's two words. An auto stub reaches Tombstone unconfirmed, so
+    // the note cannot live inside the confirmed branch.
+    let stale_note = match record.staleness.tier {
+        StalenessTier::Stale => format!(" {yellow}stale{reset}"),
+        StalenessTier::Liability | StalenessTier::Tombstone => format!(" {red}outdated{reset}"),
+        _ => String::new(),
     };
 
     if confirmed {
-        // Confirmed records show source + confidence in green/gray
-        let stale_note = match record.staleness.tier {
-            StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone => {
-                format!(" {yellow}stale{reset}")
-            }
-            _ => String::new(),
-        };
         format!("{gray}({green}confirmed{reset}{gray}, {source}, {conf:.2}){reset}{stale_note}")
     } else {
         // Unconfirmed records are clearly advisory
-        format!("{gray}({yellow}unconfirmed{reset}{gray}, {source}, {conf:.2}){reset}")
+        format!("{gray}({yellow}unconfirmed{reset}{gray}, {source}, {conf:.2}){reset}{stale_note}")
     }
 }
