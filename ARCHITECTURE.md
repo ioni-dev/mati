@@ -1190,8 +1190,9 @@ All CLI commands write to stdout using `comfy-table` for structured output. Ther
 | `mati diff [range]`                | Pre-merge check: surface gotchas for files in a git diff range, such as `main..feature`                                            |
 | `mati show <key>` / `mati ls`      | Browse records. `mati history` is an alias for time-ordered listing.                                                               |
 | `mati repair`                      | Reconcile derived indexes against canonical records, and prune enforcement events past `enforcement.retention` (section 25.3)       |
-| `mati repair --check`              | Detect index drift without writing. CI-safe, exits non-zero.                                                                       |
+| `mati repair --check`              | Detect index drift without writing. CI-safe, exits non-zero. Also counts orphaned file records (section 22).                       |
 | `mati repair --fast`               | Drain dirty-marker queue only. Not a full integrity proof.                                                                         |
+| `mati repair --purge-orphans`      | Tombstone file records whose path is no longer in the repo (section 22)                                                            |
 | `mati doctor`                      | Aggregated health check and CI gate command                                                                                        |
 | `mati daemon start/stop/status`    | Manage the background daemon                                                                                                       |
 | `mati check`                       | Environment self-test                                                                                                              |
@@ -1307,6 +1308,25 @@ A `mem_set` write to a tombstoned `gotcha:<slug>` key revives it as `Active`, wi
 - `mati status` surfaces dirty-state warnings when drift is detected.
 
 If `gotcha_keys` and `HasGotcha` graph edges disagree with the canonical `gotcha:*` record’s `affected_files`, the gotcha record wins.
+
+**Orphaned file records:**
+
+A `file:*` record whose path is no longer in the repo is not drift — the derived indexes agree with the canonical records, the file is simply gone. Nothing removed them before, so they accumulated: this repo's own store reached 856 active `file:*` records of which 412 (48%) pointed at paths that do not exist, most of them a second repository that a `src/bin/bench_real` run indexed into it. Every one inflates the coverage denominators in `mati stats` and `mati doctor`, which `retain(Active)` their file scan.
+
+`mati repair`'s full scan and `--check` now count them (`find_orphaned_files`, `src/store/repair.rs`), split by what the path means:
+
+| Kind | What it is |
+|------|------------|
+| `outside_repo` | Absolute, escapes the root, or sits under a top-level directory this repo does not have. Another tree's paths. |
+| `deleted_in_repo` | Repo-relative and plausible, but gone from the working tree. This project's own history. |
+
+Removal is opt-in and deliberately narrow, because a wrong repo root would destroy the store:
+
+- **Reported by default, removed only by `--purge-orphans`.** `--check` returns before the write path and `--fast` runs `RepairMode::Fast`, so neither touches them. The flag `conflicts_with` both.
+- **One root, and it is `slug_root`.** Paths resolve against `RepoIdent::slug_root` — git's own `workdir`, the same field the store's slug hashes and the same root `StalenessAnalyzer` and `StoreProxy` resolve against. Not the process cwd, and not `mati init`'s `canonicalize(cwd)` (which disagrees when init runs from a subdirectory — a known open gap, section 22).
+- **No git working tree, no purge.** The purge bails when `RepoIdent::workdir` is `None`, the same grounding `StalenessAnalyzer` requires before it asserts `FileDeleted`. Without a real working tree, "the file is missing" cannot be told from "the root is wrong".
+- **Mass-tombstone guard.** It refuses when orphans exceed `ORPHAN_PURGE_MAX_SHARE` (90%) of active `file:*` records. A root naming the wrong tree fails *every* path, so the wrong-root signature is ~100%; the worst rate measured on a real store is the 48% above. 90% sits between them.
+- **Soft delete.** The record is tombstoned with `TombstoneReason::FileDeleted`, not deleted, and its `gotcha_keys` and `HasGotcha` edges are dropped. The gotchas themselves are untouched, still naming the path in `affected_files`. `derive_desired_state` drops link targets whose file record is tombstoned — the mirror of it skipping tombstoned gotchas as link sources — so a purged orphan does not read as missing-link drift on the next check.
 
 ---
 
