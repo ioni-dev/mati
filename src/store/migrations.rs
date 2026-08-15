@@ -1062,7 +1062,7 @@ mod tests {
 
     #[tokio::test]
     async fn v3_expands_codeowners_globs_and_cleans_indexes() {
-        let (store, _dir) = legacy_store().await;
+        let (store, dir) = legacy_store().await;
         for path in ["src/a.rs", "src/b.rs"] {
             let file =
                 Record::layer0_file_stub(format!("file:{path}"), uuid::Uuid::nil(), 1, 1_000_000);
@@ -1095,7 +1095,7 @@ mod tests {
             migrated_gotcha.affected_files,
             vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
         );
-        let report = crate::store::repair::check_gotcha_indexes(&store)
+        let report = crate::store::repair::check_gotcha_indexes(&store, dir.path())
             .await
             .unwrap();
         assert!(!report.has_drift());
@@ -1117,7 +1117,7 @@ mod tests {
     /// by scanning for `*` misses it. It is still unlinkable.
     #[tokio::test]
     async fn v3_repairs_a_bare_directory_pattern() {
-        let (store, _dir) = legacy_store().await;
+        let (store, dir) = legacy_store().await;
         let file = Record::layer0_file_stub("file:docs/api.md", uuid::Uuid::nil(), 1, 1_000_000);
         store.put(&file.key, &file).await.unwrap();
 
@@ -1133,17 +1133,19 @@ mod tests {
         let migrated = store.get(key).await.unwrap().unwrap();
         let migrated_gotcha = migrated.payload_as::<GotchaRecord>().unwrap();
         assert_eq!(migrated_gotcha.affected_files, vec!["docs/api.md"]);
-        assert!(!crate::store::repair::check_gotcha_indexes(&store)
-            .await
-            .unwrap()
-            .has_drift());
+        assert!(
+            !crate::store::repair::check_gotcha_indexes(&store, dir.path())
+                .await
+                .unwrap()
+                .has_drift()
+        );
     }
 
     /// Nothing to expand against means the record can never be linked, so it
     /// is tombstoned rather than left as permanent drift.
     #[tokio::test]
     async fn v3_tombstones_a_pattern_that_matches_nothing() {
-        let (store, _dir) = legacy_store().await;
+        let (store, dir) = legacy_store().await;
         let file = Record::layer0_file_stub("file:src/a.rs", uuid::Uuid::nil(), 1, 1_000_000);
         store.put(&file.key, &file).await.unwrap();
 
@@ -1164,10 +1166,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(!crate::store::repair::check_gotcha_indexes(&store)
-            .await
-            .unwrap()
-            .has_drift());
+        assert!(
+            !crate::store::repair::check_gotcha_indexes(&store, dir.path())
+                .await
+                .unwrap()
+                .has_drift()
+        );
     }
 
     // ── Industry-standard production-grade features ─────────────────────────

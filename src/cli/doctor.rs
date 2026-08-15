@@ -355,7 +355,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
                 });
             }
 
-            match mati_core::store::repair::check_gotcha_indexes(&proxy).await {
+            match mati_core::store::repair::check_gotcha_indexes(&proxy, proxy.repo_root()).await {
                 Ok(report) => {
                     if report.has_drift() {
                         let detail = format!(

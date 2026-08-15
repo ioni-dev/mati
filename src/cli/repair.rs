@@ -6,7 +6,7 @@ use clap::Args;
 use mati_core::store::repair::{
     check_gotcha_indexes, find_orphaned_files, is_dirty, purge_orphaned_files,
     repair_gotcha_indexes, OrphanEntry, OrphanKind, OrphanScan, PurgeOutcome, RepairMode,
-    RepairReport,
+    RepairReport, ORPHAN_PURGE_MAX_SHARE,
 };
 use mati_core::store::{RepoIdent, Store};
 
@@ -59,6 +59,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     // One discover call grounds the mati root and the root record paths
     // resolve against in the same git identity.
     let ident = RepoIdent::discover(&cwd);
+    let repo_root = ident.slug_root(&cwd);
 
     // Repair (write) requires exclusive direct store access.
     let root = mati_root_for_ident(&ident, &cwd)?;
@@ -90,11 +91,11 @@ pub async fn run(args: RepairArgs) -> Result<()> {
     // Ahead of the reconcile: a purge tombstones file records, and the desired
     // state has to be derived after that to come out consistent.
     let orphans = if mode == RepairMode::Full {
-        let scan = find_orphaned_files(&store, &ident.slug_root(&cwd)).await?;
+        let scan = find_orphaned_files(&store, &repo_root).await?;
         if args.purge_orphans {
             purge_orphans(&store, &scan, &ident, args.json).await?;
         } else if !args.json {
-            print_orphan_summary(&scan.orphans, use_color);
+            print_orphan_summary(&scan.orphans, scan.active_files, use_color);
         }
         scan.orphans
     } else {
@@ -103,7 +104,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
 
     // Show pre-repair state for full mode
     if mode == RepairMode::Full && !args.json {
-        let pre = check_gotcha_indexes(&store).await?;
+        let pre = check_gotcha_indexes(&store, &repo_root).await?;
         if !pre.has_drift() {
             let dirty = is_dirty(&store).await;
             if dirty {
@@ -119,7 +120,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         }
     }
 
-    let mut report = repair_gotcha_indexes(&store, mode).await?;
+    let mut report = repair_gotcha_indexes(&store, &repo_root, mode).await?;
     report.orphaned_files = orphans;
 
     // Phase: recompute blast radius for all file records.
@@ -347,20 +348,19 @@ async fn run_check(cwd: &std::path::Path, json: bool, use_color: bool) -> Result
     let proxy = StoreProxy::open(cwd).await?;
 
     let result = async {
-        let mut report = check_gotcha_indexes(&proxy).await?;
-        report.orphaned_files = find_orphaned_files(&proxy, proxy.repo_root())
-            .await?
-            .orphans;
-        Ok(report)
+        let mut report = check_gotcha_indexes(&proxy, proxy.repo_root()).await?;
+        let scan = find_orphaned_files(&proxy, proxy.repo_root()).await?;
+        report.orphaned_files = scan.orphans;
+        Ok((report, scan.active_files))
     }
     .await;
 
-    let report = proxy.close_with_result(result).await?;
+    let (report, active_files) = proxy.close_with_result(result).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_check_report(&report, use_color);
+        print_check_report(&report, active_files, use_color);
     }
 
     if report.has_drift() {
@@ -369,7 +369,7 @@ async fn run_check(cwd: &std::path::Path, json: bool, use_color: bool) -> Result
     Ok(())
 }
 
-fn print_check_report(report: &RepairReport, use_color: bool) {
+fn print_check_report(report: &RepairReport, active_files: usize, use_color: bool) {
     let (green, _yellow, blue, gray, white, bold, reset) = if use_color {
         (
             colors::GREEN,
@@ -394,13 +394,19 @@ fn print_check_report(report: &RepairReport, use_color: bool) {
     } else {
         print_drift_summary(report, use_color);
     }
-    print_orphan_summary(&report.orphaned_files, use_color);
+    print_orphan_summary(&report.orphaned_files, active_files, use_color);
     println!();
 }
 
 /// Orphans are reported, never repaired: `--check` is read-only and a plain
 /// `mati repair` is non-destructive. Only `--purge-orphans` acts on them.
-fn print_orphan_summary(orphans: &[OrphanEntry], use_color: bool) {
+///
+/// `active_files` is the denominator [`purge_orphaned_files`] refuses on. At
+/// that share the store's keys no longer describe this tree, so the summary
+/// points at a re-init instead of a purge. It cannot say why — a subtree init,
+/// a foreign checkout and a wholesale rename all look identical from the
+/// orphan set alone — but re-indexing is the remedy for all three.
+fn print_orphan_summary(orphans: &[OrphanEntry], active_files: usize, use_color: bool) {
     if orphans.is_empty() {
         return;
     }
@@ -427,7 +433,19 @@ fn print_orphan_summary(orphans: &[OrphanEntry], use_color: bool) {
     if orphans.len() > 5 {
         println!("    ... and {} more", orphans.len() - 5);
     }
-    println!("  {gray}Remove them with `mati repair --purge-orphans`.{reset}");
+
+    let wrong_root = orphans.len() as f64 > active_files as f64 * ORPHAN_PURGE_MAX_SHARE;
+    if wrong_root {
+        println!(
+            "  {yellow}Nearly every file record is orphaned.{reset} {gray}Either these keys \
+             were written against a different root — most often `mati init --path <subdir>` \
+             — or the tree moved wholesale. Re-run `mati init` from the repo root. \
+             `--purge-orphans` refuses at this share, and would delete the records rather \
+             than re-key them.{reset}"
+        );
+    } else {
+        println!("  {gray}Remove them with `mati repair --purge-orphans`.{reset}");
+    }
 }
 
 fn print_drift_summary(report: &RepairReport, use_color: bool) {

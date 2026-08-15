@@ -182,6 +182,7 @@ pub async fn run_daemon_start() -> Result<()> {
     if mati_core::store::repair::is_dirty(graph.store()).await {
         let drain_fut = mati_core::store::repair::repair_gotcha_indexes(
             graph.store(),
+            &repo_root,
             mati_core::store::repair::RepairMode::Fast,
         );
         match tokio::time::timeout(mati_core::mcp::server::AUTO_DRAIN_TIMEOUT, drain_fut).await {

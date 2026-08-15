@@ -1762,7 +1762,9 @@ mod tests {
         assert_eq!(keys, vec![edge.to_key()]);
 
         // And the doctor-level check must see a consistent store.
-        let report = check_gotcha_indexes(&proxy).await.unwrap();
+        let report = check_gotcha_indexes(&proxy, proxy.repo_root())
+            .await
+            .unwrap();
         assert!(
             !report.has_drift(),
             "false drift through StoreProxy: {report:?}"

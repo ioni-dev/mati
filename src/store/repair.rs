@@ -290,9 +290,16 @@ pub async fn is_dirty<R: RepairReader>(reader: &R) -> bool {
 
 /// Compute the diff between canonical gotcha state and derived indexes.
 /// Does not write anything.
-pub async fn check_gotcha_indexes<R: RepairReader>(reader: &R) -> Result<RepairReport> {
+///
+/// `repo_root` must be [`crate::store::slug_root`] — the root an absolute
+/// `affected_files` entry has to be stripped of before it can be recognized as
+/// unnormalized.
+pub async fn check_gotcha_indexes<R: RepairReader>(
+    reader: &R,
+    repo_root: &Path,
+) -> Result<RepairReport> {
     // Phase 1: derive desired state from canonical gotcha records
-    let mut desired = derive_desired_state(reader).await?;
+    let mut desired = derive_desired_state(reader, repo_root).await?;
 
     // Phase 2: diff against actual state
     let actual = read_actual_file_links(reader).await?;
@@ -332,7 +339,15 @@ pub enum RepairMode {
 }
 
 /// Reconcile derived indexes to match canonical gotcha state.
-pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<RepairReport> {
+///
+/// `repo_root` must be [`crate::store::slug_root`], for the same reason
+/// [`check_gotcha_indexes`] needs it. Fast mode never reads it — it drains
+/// the dirty queue against paths the canonical records already carry.
+pub async fn repair_gotcha_indexes(
+    store: &Store,
+    repo_root: &Path,
+    mode: RepairMode,
+) -> Result<RepairReport> {
     let now = now_secs();
 
     // For fast mode, only repair keys from the dirty marker queue
@@ -344,10 +359,11 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     // the read gate never produces. This has to run BEFORE the desired state is
     // derived — desired state comes from the canonical paths, so reconciling
     // first would rebuild links for the wrong spelling and undo itself.
-    let (unnormalized_paths, path_repairs) = repair_unnormalized_paths(store, now).await?;
+    let (unnormalized_paths, path_repairs) =
+        repair_unnormalized_paths(store, repo_root, now).await?;
 
     // Phase 1: derive desired state
-    let mut desired = derive_desired_state(store).await?;
+    let mut desired = derive_desired_state(store, repo_root).await?;
     let scanned_gotchas = desired.scanned;
 
     // Phase 2: diff
@@ -439,7 +455,7 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
     }
 
     // Phase 4: verify by recomputing diff
-    let verify = check_gotcha_indexes(store).await?;
+    let verify = check_gotcha_indexes(store, repo_root).await?;
     let verification_passed = !verify.has_drift();
 
     if verification_passed {
@@ -476,7 +492,11 @@ pub async fn repair_gotcha_indexes(store: &Store, mode: RepairMode) -> Result<Re
 /// Returns the drift that was found (for the report) and the number of records
 /// rewritten. The record write fails hard, matching the canonical-record rule
 /// in the module docs; the link sync is best-effort.
-async fn repair_unnormalized_paths(store: &Store, now: u64) -> Result<(Vec<DriftEntry>, usize)> {
+async fn repair_unnormalized_paths(
+    store: &Store,
+    repo_root: &Path,
+    now: u64,
+) -> Result<(Vec<DriftEntry>, usize)> {
     let mut drift: Vec<DriftEntry> = Vec::new();
     let mut repaired = 0usize;
 
@@ -488,11 +508,16 @@ async fn repair_unnormalized_paths(store: &Store, now: u64) -> Result<(Vec<Drift
             continue;
         };
 
-        let normalized = crate::store::gotcha_ops::normalize_affected_files(&gotcha.affected_files);
+        let normalized =
+            crate::store::gotcha_ops::normalize_affected_files(&gotcha.affected_files, repo_root);
         if normalized == gotcha.affected_files {
             continue;
         }
-        drift.extend(unnormalized_entries(&record.key, &gotcha.affected_files));
+        drift.extend(unnormalized_entries(
+            &record.key,
+            &gotcha.affected_files,
+            repo_root,
+        ));
 
         // Patch the array in place rather than re-serializing a GotchaRecord:
         // MCP `mem_set` merges caller payloads, so a gotcha payload can carry
@@ -802,7 +827,10 @@ impl DesiredState {
 }
 
 /// Phase 1: build desired state from canonical gotcha records.
-async fn derive_desired_state<R: RepairReader>(reader: &R) -> Result<DesiredState> {
+async fn derive_desired_state<R: RepairReader>(
+    reader: &R,
+    repo_root: &Path,
+) -> Result<DesiredState> {
     let gotchas = reader.scan_prefix("gotcha:").await?;
     let scanned = gotchas.len();
 
@@ -818,7 +846,11 @@ async fn derive_desired_state<R: RepairReader>(reader: &R) -> Result<DesiredStat
             continue;
         };
 
-        unnormalized.extend(unnormalized_entries(&record.key, &gotcha.affected_files));
+        unnormalized.extend(unnormalized_entries(
+            &record.key,
+            &gotcha.affected_files,
+            repo_root,
+        ));
 
         for file_path in &gotcha.affected_files {
             file_links
@@ -843,8 +875,12 @@ async fn derive_desired_state<R: RepairReader>(reader: &R) -> Result<DesiredStat
 /// [`crate::store::gotcha_ops::normalize_affected_files`] verbatim — either it
 /// normalized to something else (`./src/a.rs` → `src/a.rs`) or it collapsed
 /// into a duplicate of another entry.
-fn unnormalized_entries(gotcha_key: &str, affected_files: &[String]) -> Vec<DriftEntry> {
-    let normalized = crate::store::gotcha_ops::normalize_affected_files(affected_files);
+fn unnormalized_entries(
+    gotcha_key: &str,
+    affected_files: &[String],
+    repo_root: &Path,
+) -> Vec<DriftEntry> {
+    let normalized = crate::store::gotcha_ops::normalize_affected_files(affected_files, repo_root);
     if normalized == affected_files {
         return Vec::new();
     }
@@ -1217,7 +1253,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(!report.has_drift());
         assert_eq!(report.scanned_gotchas, 1);
         assert_eq!(report.scanned_files, 1);
@@ -1265,7 +1301,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(!report.has_drift());
         store.close().await.unwrap();
     }
@@ -1285,7 +1321,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(report.has_drift());
         assert_eq!(report.missing_file_links.len(), 1);
         assert_eq!(report.missing_file_links[0].gotcha_key, "gotcha:g1");
@@ -1305,7 +1341,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(report.has_drift());
         assert_eq!(report.stale_file_links.len(), 1);
         assert_eq!(report.stale_file_links[0].gotcha_key, "gotcha:deleted");
@@ -1334,7 +1370,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+        let report = repair_gotcha_indexes(&store, dir.path(), RepairMode::Full)
             .await
             .unwrap();
         assert!(report.verification_passed);
@@ -1368,7 +1404,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+        let report = repair_gotcha_indexes(&store, dir.path(), RepairMode::Full)
             .await
             .unwrap();
         assert!(report.verification_passed);
@@ -1396,7 +1432,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(report.has_drift(), "--check must exit non-zero on this");
         assert_eq!(report.unnormalized_paths.len(), 1);
         assert_eq!(report.unnormalized_paths[0].gotcha_key, "gotcha:g1");
@@ -1426,7 +1462,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(report.unnormalized_paths.is_empty());
 
         store.close().await.unwrap();
@@ -1451,7 +1487,7 @@ mod tests {
             .await
             .unwrap();
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+        let report = repair_gotcha_indexes(&store, dir.path(), RepairMode::Full)
             .await
             .unwrap();
         assert_eq!(report.unnormalized_paths.len(), 1);
@@ -1476,7 +1512,7 @@ mod tests {
         );
 
         // Idempotent: a second run finds nothing left to do.
-        let again = check_gotcha_indexes(&store).await.unwrap();
+        let again = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(!again.has_drift());
 
         store.close().await.unwrap();
@@ -1496,7 +1532,7 @@ mod tests {
         };
         store.put("gotcha:dead", &record).await.unwrap();
 
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(report.unnormalized_paths.is_empty());
 
         store.close().await.unwrap();
@@ -1606,7 +1642,7 @@ mod tests {
         // its link. The purge must not read as drift on the next check.
         let live = store.get("file:src/a.rs").await.unwrap().unwrap();
         assert_eq!(extract_gotcha_keys(&live), vec!["gotcha:g1".to_string()]);
-        let report = check_gotcha_indexes(&store).await.unwrap();
+        let report = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(
             !report.has_drift(),
             "purged orphans must not read as missing links: missing_file={:?}, missing_edges={:?}",
@@ -1726,14 +1762,14 @@ mod tests {
         assert!(marker.affected_keys.contains(&"gotcha:partial".to_string()));
 
         // Check detects the drift
-        let pre = check_gotcha_indexes(&store).await.unwrap();
+        let pre = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(pre.has_drift());
         assert_eq!(pre.missing_file_links.len(), 2);
         assert_eq!(pre.missing_edges.len(), 2);
 
         // ── Repair restores consistency ───────────────────────────────────
 
-        let report = repair_gotcha_indexes(&store, RepairMode::Full)
+        let report = repair_gotcha_indexes(&store, dir.path(), RepairMode::Full)
             .await
             .unwrap();
         assert!(report.repaired_count > 0, "repair should fix something");
@@ -1763,7 +1799,7 @@ mod tests {
         assert!(!is_dirty(&store).await);
 
         // Re-check confirms no drift remains
-        let post = check_gotcha_indexes(&store).await.unwrap();
+        let post = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(!post.has_drift());
 
         store.close().await.unwrap();
@@ -1835,7 +1871,7 @@ mod tests {
         assert!(extract_gotcha_keys(&c).contains(&"gotcha:moved".to_string()));
 
         // Full check should confirm consistency
-        let check = check_gotcha_indexes(&store).await.unwrap();
+        let check = check_gotcha_indexes(&store, dir.path()).await.unwrap();
         assert!(
             !check.has_drift(),
             "no drift should remain after fast repair: missing_file_links={}, stale_file_links={}, missing_edges={}, stale_edges={}",
@@ -1892,7 +1928,7 @@ mod tests {
             mark_dirty(&store, "gotcha:moved", "simulated partial-write").await;
 
             // Sanity: pre-shutdown state really is broken.
-            let pre = check_gotcha_indexes(&store).await.unwrap();
+            let pre = check_gotcha_indexes(&store, dir.path()).await.unwrap();
             assert!(pre.has_drift(), "drift must exist before shutdown");
             assert!(is_dirty(&store).await, "marker must be set before shutdown");
 
@@ -1910,7 +1946,7 @@ mod tests {
                 "dirty marker should survive reopen across sessions"
             );
 
-            let report = repair_gotcha_indexes(&store, RepairMode::Fast)
+            let report = repair_gotcha_indexes(&store, dir.path(), RepairMode::Fast)
                 .await
                 .unwrap();
             assert!(report.repaired_count > 0, "Fast drain must apply repairs");
@@ -1924,7 +1960,7 @@ mod tests {
                 "auto-drain should leave no dirty marker behind"
             );
 
-            let post = check_gotcha_indexes(&store).await.unwrap();
+            let post = check_gotcha_indexes(&store, dir.path()).await.unwrap();
             assert!(
                 !post.has_drift(),
                 "no drift after auto-drain: missing_file={}, stale_file={}, missing_edge={}, stale_edge={}",
