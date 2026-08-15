@@ -149,6 +149,23 @@ impl StalenessAnalyzer {
         self.root.join(path).exists()
     }
 
+    /// True when `record` is a Layer 0 stub whose every affected file is gone.
+    ///
+    /// Confirmed stubs are excluded: confirming one makes it the developer's
+    /// rule, and a rule with a dead address is theirs to re-point, not ours to
+    /// discard. A stub naming no file at all is never dead by this test.
+    fn is_dead_stub(&self, record: &Record) -> bool {
+        if !crate::store::gotcha_ops::is_auto_gotcha(&record.key) {
+            return false;
+        }
+        let Some(gotcha) = record.payload_as::<GotchaRecord>() else {
+            return false;
+        };
+        !gotcha.confirmed
+            && !gotcha.affected_files.is_empty()
+            && gotcha.affected_files.iter().all(|p| !self.path_exists(p))
+    }
+
     /// Scan all staleness-eligible prefixes, recompute scores, and batch-write
     /// updated records. Respects a 2-second time budget — partial results are
     /// written if the budget is exceeded, and the next call resumes where this
@@ -404,6 +421,19 @@ impl StalenessAnalyzer {
                 record.staleness.computed_at = self.now;
                 return Ok(());
             }
+        }
+
+        // ── Hard override: dead Layer 0 stub ────────────────────────────────
+        // A stub outlives the file it is about: `mem_bootstrap` injects the
+        // auto-derived ones unconfirmed, so one left behind by a deletion keeps
+        // advising about a path nobody can open. Gated on `root_from_git` for
+        // the reason `FileDeleted` is, and self-reversing the same way — a
+        // restored path fails the check and the score recomputes normally.
+        if self.root_from_git && self.is_dead_stub(record) {
+            record.staleness.value = 1.0;
+            record.staleness.tier = StalenessTier::Tombstone;
+            record.staleness.computed_at = self.now;
+            return Ok(());
         }
 
         // ── Hard override: FileRenamed ──────────────────────────────────────

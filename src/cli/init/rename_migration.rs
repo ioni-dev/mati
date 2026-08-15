@@ -12,15 +12,6 @@ use super::*;
 /// (`severity-disputed`, `crown-jewel`).
 pub(crate) const TAG_PATH_MIGRATED: &str = "path-migrated";
 
-/// Auto-generated Layer-0 gotchas, regenerated from fresh git signals on every
-/// init and tombstoned when their signal drops out (§8c). Their `affected_files`
-/// are already derived from current paths.
-pub(crate) fn is_auto_gotcha(key: &str) -> bool {
-    key.starts_with("gotcha:cochange:")
-        || key.starts_with("gotcha:revert:")
-        || key.starts_with("gotcha:ownership:")
-}
-
 /// A planned `affected_files` rewrite for one gotcha.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RenameMigration {

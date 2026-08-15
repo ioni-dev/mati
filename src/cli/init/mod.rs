@@ -40,7 +40,8 @@ pub(super) use generated_gotchas::{
     build_cochange_gotchas, build_codeowners_candidates, build_ownership_gotchas,
     build_revert_gotchas, stale_dependency_keys, CoChangeGotcha, OwnershipGotcha, RevertGotcha,
 };
-pub(super) use rename_migration::{is_auto_gotcha, migrate_renamed_gotchas};
+pub(super) use mati_core::store::gotcha_ops::is_auto_gotcha;
+pub(super) use rename_migration::migrate_renamed_gotchas;
 #[cfg(test)]
 pub(super) use rename_migration::{plan_rename_migrations, TAG_PATH_MIGRATED};
 

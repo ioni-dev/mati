@@ -36,6 +36,8 @@ mod mem_set_command;
 mod tests;
 
 pub use context_packet::assemble_context_packet;
+#[cfg(test)]
+pub(crate) use context_packet::is_injectable_gotcha;
 pub(crate) use context_packet::record_to_agent_json;
 
 #[cfg(test)]

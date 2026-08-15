@@ -1312,6 +1312,256 @@ async fn a_pass_below_the_sample_floor_skips_the_ratio() {
     store.close().await.unwrap();
 }
 
+// ── dead Layer 0 stub tests ─────────────────────────────────────────────
+
+/// An unconfirmed auto-derived stub at `key`, naming `files`. Quality matches
+/// what `mati init` mints, so these clear the 0.4 injection gate as real ones do.
+fn make_stub(key: &str, files: &[&str]) -> Record {
+    let mut record = make_gotcha_record(key);
+    let mut gotcha = record.payload_as::<GotchaRecord>().unwrap();
+    gotcha.confirmed = false;
+    gotcha.affected_files = files.iter().map(|f| (*f).to_string()).collect();
+    record.payload = serde_json::to_value(&gotcha).ok();
+    record.quality = QualityScore::cochange_default();
+    record
+}
+
+async fn compute_in(dir: &Path, record: &mut Record, store: &Store) {
+    StalenessAnalyzer::new_with_now(dir, 2_000_000)
+        .compute_staleness(record, store, &HashMap::new(), far_deadline())
+        .await
+        .unwrap();
+}
+
+/// The gap: `--purge-orphans` and the `FileDeleted` signal both tombstone the
+/// `file:*` record, and the stub that only ever named that path stayed Active
+/// and Fresh — still injecting through `is_injectable_gotcha`'s allowlist.
+#[tokio::test]
+async fn a_stub_whose_only_file_is_gone_is_tombstoned() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_stub("gotcha:ownership:src/gone.rs", &["src/gone.rs"]);
+    compute_in(dir.path(), &mut record, &store).await;
+
+    assert_eq!(record.staleness.tier, StalenessTier::Tombstone);
+    assert!(!crate::mcp::tools::is_injectable_gotcha(&record));
+
+    store.close().await.unwrap();
+}
+
+/// The read gate is untouched: a stub on a file that still exists scores
+/// normally and keeps injecting.
+#[tokio::test]
+async fn a_stub_on_a_live_file_still_injects() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    std::fs::write(dir.path().join("here.rs"), "fn main() {}").unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_stub("gotcha:ownership:here.rs", &["here.rs"]);
+    compute_in(dir.path(), &mut record, &store).await;
+
+    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+    assert!(crate::mcp::tools::is_injectable_gotcha(&record));
+
+    store.close().await.unwrap();
+}
+
+/// A cochange stub names a pair. One surviving path is still a live claim.
+#[tokio::test]
+async fn a_stub_with_one_surviving_file_is_not_dead() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    std::fs::write(dir.path().join("here.rs"), "fn main() {}").unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_stub(
+        "gotcha:cochange:here.rs|src/gone.rs",
+        &["here.rs", "src/gone.rs"],
+    );
+    compute_in(dir.path(), &mut record, &store).await;
+
+    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+
+    store.close().await.unwrap();
+}
+
+/// A confirmed gotcha with a dead address is knowledge to re-point, not
+/// garbage — the triage that preserved `gotcha:arm-the-dirty-marker-once-…`
+/// rather than dropping it. Confirming a stub makes it the developer's rule,
+/// so the key prefix alone must not be enough to discard it.
+#[tokio::test]
+async fn a_confirmed_gotcha_with_a_dead_path_survives() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // Same dead path, same auto key prefix — only `confirmed` differs.
+    let mut confirmed_stub = make_gotcha_record("gotcha:ownership:src/gone.rs");
+    let mut hand_written = make_gotcha_record("gotcha:arm-the-dirty-marker-once");
+    for record in [&mut confirmed_stub, &mut hand_written] {
+        let mut gotcha = record.payload_as::<GotchaRecord>().unwrap();
+        gotcha.affected_files = vec!["src/gone.rs".into()];
+        record.payload = serde_json::to_value(&gotcha).ok();
+        compute_in(dir.path(), record, &store).await;
+        assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+    }
+
+    // And unconfirmed but hand-written: not an auto key, so still out of reach.
+    let mut unconfirmed = make_stub("gotcha:arm-the-dirty-marker-once", &["src/gone.rs"]);
+    compute_in(dir.path(), &mut unconfirmed, &store).await;
+    assert_ne!(unconfirmed.staleness.tier, StalenessTier::Tombstone);
+
+    store.close().await.unwrap();
+}
+
+/// A stub naming nothing is not vacuously dead.
+#[tokio::test]
+async fn a_stub_with_no_affected_files_is_not_dead() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_stub("gotcha:ownership:src/gone.rs", &[]);
+    compute_in(dir.path(), &mut record, &store).await;
+
+    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+
+    store.close().await.unwrap();
+}
+
+/// Without a git-proven root the analyzer cannot tell "deleted" from "wrong
+/// tree", so it asserts nothing here either — the same gate `FileDeleted` sits
+/// behind, and the reason the 2026-08-05 mass tombstone must not recur.
+#[tokio::test]
+async fn a_dead_stub_is_not_tombstoned_without_a_git_root() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let analyzer = StalenessAnalyzer::new_with_now(dir.path(), 2_000_000);
+    assert!(!analyzer.root_from_git);
+
+    let mut record = make_stub("gotcha:ownership:src/gone.rs", &["src/gone.rs"]);
+    analyzer
+        .compute_staleness(&mut record, &store, &HashMap::new(), far_deadline())
+        .await
+        .unwrap();
+
+    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+
+    store.close().await.unwrap();
+}
+
+/// Self-reversing, like the `FileDeleted` override: restore the path and the
+/// stub scores normally again.
+#[tokio::test]
+async fn a_restored_file_revives_its_stub() {
+    let dir = TempDir::new().unwrap();
+    git2::Repository::init(dir.path()).unwrap();
+    std::fs::write(dir.path().join("back.rs"), "fn main() {}").unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let mut record = make_stub("gotcha:ownership:back.rs", &["back.rs"]);
+    record.staleness.value = 1.0;
+    record.staleness.tier = StalenessTier::Tombstone;
+    compute_in(dir.path(), &mut record, &store).await;
+
+    assert_ne!(record.staleness.tier, StalenessTier::Tombstone);
+    assert!(record.staleness.value < 1.0);
+
+    store.close().await.unwrap();
+}
+
+/// Seed `dead` unconfirmed stubs naming paths that do not exist, plus `present`
+/// file records whose files do, under a git-proven root.
+async fn seed_stub_mix(store: &Store, dir: &Path, now: u64, dead: u32, present: u32) {
+    git2::Repository::init(dir).unwrap();
+    for i in 0..dead {
+        let path = format!("src/gone_{i}.rs");
+        let record = make_stub(&format!("gotcha:ownership:{path}"), &[&path]);
+        store.put(&record.key, &record).await.unwrap();
+    }
+    let old = now - (60 * 86_400);
+    for i in 0..present {
+        let name = format!("here_{i}.rs");
+        std::fs::write(dir.join(&name), "fn main() {}").unwrap();
+        let mut record = make_record_at(&format!("file:{name}"), old, 0);
+        record.lifecycle = RecordLifecycle::Active;
+        store.put(&record.key, &record).await.unwrap();
+    }
+}
+
+/// The propagation rule cascades, so it answers to the same breaker the file
+/// deletions do: a pass that tombstones past the ratio writes nothing. A root
+/// naming the wrong tree fails every stub path at once, which is exactly the
+/// shape this refuses.
+#[tokio::test]
+async fn dead_stubs_over_the_tombstone_ratio_write_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    seed_stub_mix(&store, dir.path(), now, 25, 5).await;
+    let before = store
+        .get("gotcha:ownership:src/gone_0.rs")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let report = StalenessAnalyzer::new_with_now(dir.path(), now)
+        .analyze_all(&store)
+        .await
+        .unwrap();
+
+    assert_eq!(report.updated, 0, "discarded pass persisted nothing");
+    assert_eq!(report.tombstoned, 0);
+    assert!(report.scanned >= MIN_TOMBSTONE_SAMPLE);
+
+    let after = store
+        .get("gotcha:ownership:src/gone_0.rs")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.staleness.tier, before.staleness.tier);
+    assert_eq!(after.version.logical_clock, before.version.logical_clock);
+
+    store.close().await.unwrap();
+}
+
+/// Below the ratio the breaker stays out of the way. Without this, the test
+/// above would pass on a rule that never fires.
+#[tokio::test]
+async fn dead_stubs_under_the_ratio_persist() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    seed_stub_mix(&store, dir.path(), now, 5, 25).await;
+
+    let report = StalenessAnalyzer::new_with_now(dir.path(), now)
+        .analyze_all(&store)
+        .await
+        .unwrap();
+
+    assert_eq!(report.tombstoned, 5);
+    let after = store
+        .get("gotcha:ownership:src/gone_0.rs")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.staleness.tier, StalenessTier::Tombstone);
+
+    store.close().await.unwrap();
+}
+
 // ── resume cursor tests ─────────────────────────────────────────────────
 
 /// Every prefix, seeded old enough that the first computation changes the
