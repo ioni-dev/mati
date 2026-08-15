@@ -538,15 +538,8 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
 
-    // Daemon-unreachable events from fail_open.log
-    let fail_open = scan_fail_open_log(now);
-    if fail_open.count_7d > 0 {
-        let ago = format_ago(fail_open.last_ago_secs);
-        println!(
-            "    Daemon unreachable     {red}{}{reset}  {gray}(last: {ago} ago){reset}",
-            fail_open.count_7d
-        );
-    }
+    // Fail-open events from fail_open.log
+    print_fail_open(&scan_fail_open_log(now), red, gray, reset);
 
     println!();
 
@@ -1073,19 +1066,12 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
 
-    // Daemon-unreachable events from fail_open.log (always live, not cached)
+    // Fail-open events from fail_open.log (always live, not cached)
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let fail_open = scan_fail_open_log(now);
-    if fail_open.count_7d > 0 {
-        let ago = format_ago(fail_open.last_ago_secs);
-        println!(
-            "    Daemon unreachable     {red}{}{reset}  {gray}(last: {ago} ago){reset}",
-            fail_open.count_7d
-        );
-    }
+    print_fail_open(&scan_fail_open_log(now), red, gray, reset);
 
     println!();
 }
@@ -1209,12 +1195,32 @@ fn format_snapshot_date(ts: u64) -> String {
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-/// Result of scanning `~/.mati/fail_open.log` for daemon-unreachable events.
+/// Result of scanning `~/.mati/fail_open.log` for fail-open events.
 struct FailOpenStats {
     /// Number of FAIL_OPEN events in the last 7 days.
     count_7d: u64,
     /// Seconds since the most recent event (0 = no events).
     last_ago_secs: u64,
+    /// Distinct `reason=` values in the window, count-descending. A missing
+    /// daemon and a missing `jq` both fail open; only the reason tells them
+    /// apart, and the remedies are different.
+    by_reason: Vec<(String, u64)>,
+}
+
+/// Render the fail-open summary plus its per-reason breakdown. Prints nothing
+/// when the window is empty.
+fn print_fail_open(stats: &FailOpenStats, red: &str, gray: &str, reset: &str) {
+    if stats.count_7d == 0 {
+        return;
+    }
+    let ago = format_ago(stats.last_ago_secs);
+    println!(
+        "    Fail-open              {red}{}{reset}  {gray}(last: {ago} ago){reset}",
+        stats.count_7d
+    );
+    for (reason, count) in &stats.by_reason {
+        println!("      {gray}{count} \u{d7} {reason}{reset}");
+    }
 }
 
 /// Read at most `max_bytes` from the *tail* of `path`. Returns `None` if the
@@ -1266,6 +1272,7 @@ fn scan_fail_open_log(now: u64) -> FailOpenStats {
             return FailOpenStats {
                 count_7d: 0,
                 last_ago_secs: 0,
+                by_reason: Vec::new(),
             }
         }
     };
@@ -1281,6 +1288,7 @@ fn scan_fail_open_log_at(log_path: &std::path::Path, now: u64) -> FailOpenStats 
             return FailOpenStats {
                 count_7d: 0,
                 last_ago_secs: 0,
+                by_reason: Vec::new(),
             }
         }
     };
@@ -1288,6 +1296,7 @@ fn scan_fail_open_log_at(log_path: &std::path::Path, now: u64) -> FailOpenStats 
     let cutoff = now.saturating_sub(7 * 86400);
     let mut count: u64 = 0;
     let mut latest_ts: u64 = 0;
+    let mut reasons: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
 
     for line in content.lines() {
         if !line.contains("FAIL_OPEN") {
@@ -1305,6 +1314,12 @@ fn scan_fail_open_log_at(log_path: &std::path::Path, now: u64) -> FailOpenStats 
         }
         if ts >= cutoff {
             count += 1;
+            // `reason` is the last field and may contain spaces, so split from
+            // the right. A line without one predates the field.
+            let reason = line
+                .rsplit_once(" reason=")
+                .map_or("unrecorded", |(_, r)| r);
+            *reasons.entry(reason).or_default() += 1;
         }
         if ts > latest_ts {
             latest_ts = ts;
@@ -1317,9 +1332,16 @@ fn scan_fail_open_log_at(log_path: &std::path::Path, now: u64) -> FailOpenStats 
         0
     };
 
+    let mut by_reason: Vec<(String, u64)> = reasons
+        .into_iter()
+        .map(|(reason, count)| (reason.to_string(), count))
+        .collect();
+    by_reason.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
     FailOpenStats {
         count_7d: count,
         last_ago_secs: last_ago,
+        by_reason,
     }
 }
 
@@ -1600,6 +1622,32 @@ mod tests {
         assert_eq!(stats.count_7d, 3, "all 3 events fall within 7-day window");
         // Latest event was at `now - 100`.
         assert_eq!(stats.last_ago_secs, 100);
+    }
+
+    /// The whole point of the breakdown: a missing `jq` and a down daemon
+    /// both fail open, and only `reason=` tells an operator which to fix.
+    #[test]
+    fn scan_fail_open_log_splits_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fail_open.log");
+        let body = "\
+2026-04-29T12:00:00Z FAIL_OPEN hook=post-edit file=a.rs reason=jq not on PATH - edit tracking skipped\n\
+2026-04-29T12:00:01Z FAIL_OPEN hook=hook-decide file=b.rs reason=daemon not running after auto-start\n\
+2026-04-29T12:00:02Z FAIL_OPEN hook=post-edit file=c.rs reason=jq not on PATH - edit tracking skipped\n";
+        std::fs::write(&path, body).unwrap();
+
+        let now = parse_iso_timestamp("2026-04-29T12:00:02Z") + 100;
+        let stats = scan_fail_open_log_at(&path, now);
+
+        assert_eq!(stats.count_7d, 3);
+        assert_eq!(
+            stats.by_reason,
+            vec![
+                ("jq not on PATH - edit tracking skipped".to_string(), 2),
+                ("daemon not running after auto-start".to_string(), 1),
+            ],
+            "reasons sort count-descending so the dominant failure reads first"
+        );
     }
 
     /// Empty file edge case: must return zero counts cleanly.
