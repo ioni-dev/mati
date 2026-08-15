@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use mati_core::store::{
     Category, ConfidenceScore, FileRecord, GotchaRecord, Priority, QualityScore, QualityTier,
-    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,
+    Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore, StalenessTier,
 };
 
 use super::colors;
@@ -535,7 +535,16 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         .filter(|r| r.confidence.value < 0.3)
         .count();
 
-    let unconfirmed = total_gotchas - confirmed_count;
+    // Not `total_gotchas - confirmed_count`: a stub whose files are gone is
+    // Tombstone-tier but still Active, and `mati review` skips it. Counting it
+    // here would nag about work the queue will never offer.
+    let unconfirmed = gotchas
+        .iter()
+        .filter(|r| {
+            r.staleness.tier != StalenessTier::Tombstone
+                && r.payload_as::<GotchaRecord>().is_some_and(|g| !g.confirmed)
+        })
+        .count();
 
     // Compute oldest unconfirmed age for backlog visibility
     let now = std::time::SystemTime::now()

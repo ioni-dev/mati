@@ -26,7 +26,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use mati_core::analysis::blast_radius::BlastTier;
 use mati_core::health::quality;
-use mati_core::store::{FileRecord, GotchaRecord, Record, RecordLifecycle};
+use mati_core::store::{FileRecord, GotchaRecord, Record, RecordLifecycle, StalenessTier};
 
 use super::colors;
 
@@ -1020,6 +1020,11 @@ async fn collect_candidates(store: &crate::cli::proxy::StoreProxy) -> Result<Vec
         .into_iter()
         .filter(|r| {
             if !matches!(r.lifecycle, RecordLifecycle::Active) {
+                return false;
+            }
+            // A stub whose files are gone is Tombstone-tier, not lifecycle-
+            // tombstoned. Reviewing it asks about code that no longer exists.
+            if r.staleness.tier == StalenessTier::Tombstone {
                 return false;
             }
             match r.payload_as::<GotchaRecord>() {
