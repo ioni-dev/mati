@@ -125,7 +125,7 @@ fn strip_payload(payload: &serde_json::Value, category: &Category) -> serde_json
 ///    which violated the "confirmed ⇒ developer-authoritative ⇒ confidence
 ///    ≥ 0.80" schema invariant. Now we keep them `confirmed=false` and
 ///    explicitly allowlist them here so bootstrap still surfaces them.
-fn is_injectable_gotcha(r: &Record) -> bool {
+pub(crate) fn is_injectable_gotcha(r: &Record) -> bool {
     if !matches!(r.lifecycle, RecordLifecycle::Active) {
         return false;
     }
@@ -141,9 +141,9 @@ fn is_injectable_gotcha(r: &Record) -> bool {
         }
     }
     // Auto-derived Layer 0 stubs: include advisory signals even unconfirmed.
-    r.key.starts_with("gotcha:cochange:")
-        || r.key.starts_with("gotcha:revert:")
-        || r.key.starts_with("gotcha:ownership:")
+    // Same predicate the staleness analyzer tombstones dead stubs by, so what
+    // injects and what gets cleaned up cannot drift apart.
+    crate::store::gotcha_ops::is_auto_gotcha(&r.key)
 }
 
 /// Assemble a [`ContextPacket`] from the store and graph.

@@ -111,6 +111,17 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// True for the Layer 0 gotcha stubs `mati init` derives from git history.
+///
+/// These are regenerated from fresh signals on every init, so an automatic pass
+/// may discard one. Nothing outside this set is disposable: a hand-written rule
+/// is knowledge whatever became of its paths.
+pub fn is_auto_gotcha(key: &str) -> bool {
+    key.starts_with("gotcha:cochange:")
+        || key.starts_with("gotcha:revert:")
+        || key.starts_with("gotcha:ownership:")
+}
+
 mod edges;
 mod links;
 mod mutation;
