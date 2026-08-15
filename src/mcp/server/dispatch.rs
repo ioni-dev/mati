@@ -783,6 +783,7 @@ pub(crate) async fn socket_dispatch(
                     .get("new_files")
                     .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
                     .unwrap_or_default(),
+                repo_root,
             );
             let old_files: Vec<String> = req
                 .args

@@ -49,7 +49,7 @@ pub async fn apply_gotcha_write(
     new_files: &[String],
     is_new: bool,
 ) -> Result<()> {
-    let new_files = &normalize_affected_files(new_files);
+    let new_files = &normalize_affected_files(new_files, repo_root);
     let mut staged = with_normalized_affected_files(record, new_files);
 
     // A write through this function is a create or an edit of live content —
@@ -350,7 +350,7 @@ pub async fn apply_gotcha_confirm(
     record: &Record,
     affected_files: &[String],
 ) -> Result<()> {
-    let affected_files = &normalize_affected_files(affected_files);
+    let affected_files = &normalize_affected_files(affected_files, repo_root);
     let stamp = confirm_content_stamp(repo_root, affected_files);
     let mut stamped =
         with_normalized_affected_files(record, affected_files).unwrap_or_else(|| record.clone());
