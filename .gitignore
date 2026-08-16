@@ -47,3 +47,6 @@ PENDING\ WORK/
 !SECURITY.md
 
 docs/REAL_LIFE_TEST_REPORT_M11.md
+
+# Local state snapshots (checkpoint skill)
+.checkpoints/
