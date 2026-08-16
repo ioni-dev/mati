@@ -100,6 +100,7 @@ pub fn aggregate_event_counts(events: &[EnforcementEvent]) -> EnforcementEventCo
             EnforcementEventType::EnforcementConfigChanged { .. } => counts.config_changes += 1,
             EnforcementEventType::RecordingGap { .. } => counts.gaps += 1,
             EnforcementEventType::RetentionPruned { .. } => counts.retention_prunes += 1,
+            EnforcementEventType::CleanShutdown { .. } => counts.clean_shutdowns += 1,
         }
     }
     counts
@@ -132,6 +133,9 @@ pub struct EnforcementEventCounts {
     pub config_changes: u64,
     pub gaps: u64,
     pub retention_prunes: u64,
+    /// Graceful daemon exits. One per run that ended cleanly, so the count
+    /// falls short of the number of runs by exactly the crashes.
+    pub clean_shutdowns: u64,
 }
 
 /// Derived enforcement metrics (PMF/friction signals) computed from the
@@ -264,5 +268,6 @@ pub fn event_type_label(event_type: &EnforcementEventType) -> &'static str {
         EnforcementEventType::EnforcementConfigChanged { .. } => "config_changed",
         EnforcementEventType::RecordingGap { .. } => "gap",
         EnforcementEventType::RetentionPruned { .. } => "retention_pruned",
+        EnforcementEventType::CleanShutdown { .. } => "clean_shutdown",
     }
 }

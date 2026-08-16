@@ -154,6 +154,17 @@ pub enum EnforcementEventType {
         oldest_pruned_seq: u64,
         newest_pruned_seq: u64,
     },
+    /// The daemon exited gracefully. Written after in-flight handlers drain and
+    /// before the store closes, so it is the last event of its run. Its ABSENCE
+    /// at the tail is the crash signal (section 18.2) — which is why no other
+    /// process may write one on a dead daemon's behalf.
+    ///
+    /// `reason` is the shutdown reason `run_daemon_start` already names:
+    /// `signal_sigterm`, `signal_sigint`, `signal_sighup`, `idle_timeout`,
+    /// `serve_loop_exit`.
+    CleanShutdown {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +183,10 @@ pub enum GapCause {
     StoreWriteFailure,
     StoreLocked,
     CorruptionRecovery,
+    /// The previous run ended without a `CleanShutdown` terminator in a log
+    /// that has one elsewhere. Claimable only once the log is known to come
+    /// from a writer that emits them; otherwise the cause is [`Self::Unknown`].
+    UncleanShutdown,
     Unknown,
 }
 

@@ -130,7 +130,7 @@ is the operational copy. Reject if proposed here:
 
 ## What this repo DOES include that enterprise depends on
 
-- **Enforcement event recording** — hash-chained, append-only, 8 event types.
+- **Enforcement event recording** — hash-chained, append-only, 9 event types.
   mati-cloud reads these to generate signed audit PDFs. Recording here, reporting there.
 - **Store API** (`store::Store`, CRUD, graph, search) — mati-cloud opens the same store.
 - **All CLI commands** — mati-cloud shells out; it doesn't reimplement them.

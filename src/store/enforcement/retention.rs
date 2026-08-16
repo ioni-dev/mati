@@ -124,14 +124,25 @@ pub const STARTUP_GAP_THRESHOLD_MS: u64 = 24 * 60 * 60 * 1000;
 ///
 /// Called by `mati daemon start`, before the graph loads.
 ///
-/// Reads only the newest event. A full scan of an unbounded log sits on the
-/// cold-start path that `ensure_daemon` blocks every hook on.
+/// Reads only the newest event on the healthy path. A full scan of an unbounded
+/// log sits on the cold-start path that `ensure_daemon` blocks every hook on.
 ///
-/// What it reports is "no enforcement event was written between T1 and T2",
-/// which is equally true of a crash, a `mati daemon stop`, a P9 fail-open, and
-/// an idle weekend. Nothing in the store tells them apart, so the cause is
-/// [`GapCause::Unknown`] and `gap_threshold_ms` is the whole of the judgment
-/// about what counts as quiet.
+/// Three outcomes, decided by what sits at the tail:
+///
+/// - A [`EnforcementEventType::CleanShutdown`] terminator — the previous run
+///   stopped deliberately and the chain already bounds the quiet window. No gap,
+///   whatever its duration.
+/// - An ordinary event in a log that has a terminator somewhere — the previous
+///   run died. [`GapCause::UncleanShutdown`], recorded at any duration, since a
+///   crash is worth reporting whether it lasted three hours or three days.
+/// - An ordinary event in a log with no terminator at all — the log predates
+///   terminators, so absence proves nothing about how the last run ended. Falls
+///   back to [`GapCause::Unknown`] past `gap_threshold_ms`, which is then the
+///   whole of the judgment about what counts as quiet.
+///
+/// The backscan the middle case needs is the full read this function otherwise
+/// avoids, so it runs only when the tail is not a terminator: once per store at
+/// upgrade, and once per genuine crash.
 ///
 /// Returns the event it recorded, or `None` when there is no gap.
 pub async fn detect_startup_gap(
@@ -141,21 +152,42 @@ pub async fn detect_startup_gap(
     // Zero-padded keys sort in seq order, so the tail is the newest event. Skip
     // back past any this binary cannot read rather than treat one as absent.
     let keys = store.scan_keys(EVENT_PREFIX).await?;
-    let mut last_ms = None;
-    for key in keys.iter().rev() {
+    let mut newest = None;
+    for (i, key) in keys.iter().enumerate().rev() {
         if let Ok(Some(bytes)) = store.get_raw_bytes(key).await {
             if let Ok(event) = serde_json::from_slice::<EnforcementEvent>(&bytes) {
-                last_ms = Some(event.recorded_at_ms);
+                newest = Some((i, event));
                 break;
             }
         }
     }
-    let Some(last_ms) = last_ms else {
+    let Some((newest_idx, newest)) = newest else {
         return Ok(None);
     };
 
+    // A terminator at the tail says recording stopped deliberately. The window
+    // is already bounded in the chain by this event and the next one written,
+    // so it needs no RecordingGap of its own.
+    if matches!(
+        newest.event_type,
+        EnforcementEventType::CleanShutdown { .. }
+    ) {
+        return Ok(None);
+    }
+
+    // No terminator at the tail is a crash only in a log whose writer emits
+    // them. Nothing cheaper than a backscan tells that apart from a store
+    // written before terminators existed, and mislabeling every pre-upgrade
+    // store as a crash is worse than the read. This runs only off the healthy
+    // path: once per store at upgrade, and once per genuine crash.
+    let (cause, threshold_ms) = if has_terminator(store, &keys[..newest_idx]).await {
+        (GapCause::UncleanShutdown, 0)
+    } else {
+        (GapCause::Unknown, gap_threshold_ms)
+    };
+
     let current = now_ms();
-    if current.saturating_sub(last_ms) <= gap_threshold_ms {
+    if current.saturating_sub(newest.recorded_at_ms) <= threshold_ms {
         return Ok(None);
     }
 
@@ -165,9 +197,56 @@ pub async fn detect_startup_gap(
     let event = writer
         .lock()
         .await
-        .detect_and_record_gap(store, last_ms, current, GapCause::Unknown)
+        .detect_and_record_gap(store, newest.recorded_at_ms, current, cause)
         .await?;
     Ok(Some(event))
+}
+
+/// True if any readable event under `keys` is a `CleanShutdown`.
+///
+/// Newest-first, but the worst case is the whole slice: after a crash the last
+/// terminator sits behind every event the crashed run wrote.
+async fn has_terminator(store: &Store, keys: &[String]) -> bool {
+    for key in keys.iter().rev() {
+        if let Ok(Some(bytes)) = store.get_raw_bytes(key).await {
+            if let Ok(event) = serde_json::from_slice::<EnforcementEvent>(&bytes) {
+                if matches!(event.event_type, EnforcementEventType::CleanShutdown { .. }) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Write the terminator that marks a graceful daemon exit.
+///
+/// Called by `mati daemon start` after in-flight handlers drain and before the
+/// store closes, so it lands as the last event of the run. Ordering is
+/// load-bearing: a handler still draining writes enforcement events, and any
+/// event after the terminator leaves an ordinary event at the tail, which the
+/// next start reads as a crash (section 18.2).
+///
+/// Best-effort like every other write on the shutdown path. A shutdown that
+/// cannot record its terminator degrades to looking like a crash, which is the
+/// safe direction — it over-reports an outage, it never hides one.
+pub async fn record_clean_shutdown(
+    store: &Store,
+    reason: &str,
+) -> Result<Option<EnforcementEvent>> {
+    record_event(
+        store,
+        EnforcementEventType::CleanShutdown {
+            reason: reason.to_string(),
+        },
+        SubjectKind::System,
+        "enforcement:stream".to_string(),
+        "system".to_string(),
+        None,
+        "clean_shutdown".to_string(),
+        None,
+    )
+    .await
 }
 
 // ─────────────────────────────────────────────

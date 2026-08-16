@@ -1119,7 +1119,7 @@ enforcement:event:<seq_no>
 - Gaps in `seq_no` are acceptable after a crash — a seq is persisted before the event that uses it, so a crash in between leaves a hole. Nothing detects a seq hole today; `RecordingGap` is written on a time gap instead (section 18.1). Hash chain breaks indicate tampering or corruption.
 - The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 2 (v2 appends `agent_session`); v1 events still hash under the original 14-field form. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
 
-There are 8 event types:
+There are 9 event types:
 
 | Event                      | Trigger                                                                                                          |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -1131,6 +1131,7 @@ There are 8 event types:
 | `EnforcementConfigChanged` | A configuration setting changed. Records old and new value.                                                      |
 | `RecordingGap`             | The event log was quiet for longer than `STARTUP_GAP_THRESHOLD_MS` when the daemon came up. Records the window, cause, enforcement mode during the gap, and certainty. Written by `mati daemon start` (section 18.1) |
 | `RetentionPruned`          | An oldest-first prefix of the event log was deleted past `enforcement.retention`. Records the count and the seq range. Written by `mati repair`'s full scan, after the deletion |
+| `CleanShutdown`            | The daemon exited gracefully. Records the shutdown reason. Written by `mati daemon start` as the last event of its run, after the drain and before the store closes (section 18.2) |
 
 Each event also carries:
 
@@ -1160,13 +1161,53 @@ Only a running daemon writes enforcement events. Every window in which no daemon
 
 `detect_startup_gap` (`src/store/enforcement/retention.rs`) runs on `mati daemon start`, right after the store opens and before the graph loads. It compares the newest event's `recorded_at_ms` against the wall clock and writes a `RecordingGap` when the difference exceeds `STARTUP_GAP_THRESHOLD_MS`. Until this was wired up, `RecordingGap` was never written in production at all.
 
-- **Threshold: 24 hours.** The daemon idles out after `IDLE_SHUTDOWN_SECS` (30 min), so every restart after a break already looks like 30+ minutes of silence. A shorter threshold records a gap on an overnight break, and a log of those buries the outages worth finding. A day of silence on an active repo is worth a reviewer's eye; on a dormant repo it costs one event per dormant period, not one per restart. The tradeoff is under-reporting: a three-hour crash mid-workday writes nothing.
-- **Cause is `Unknown`, certainty is `Inferred`, missed count is `Unknown`.** What the event actually asserts is "no enforcement event was written between T1 and T2", which is equally true of a crash and of a quiet weekend. Nothing in the store tells them apart, so no other `GapCause` variant can be claimed honestly.
+- **Threshold: 24 hours.** The daemon idles out after `IDLE_SHUTDOWN_SECS` (30 min), so every restart after a break already looks like 30+ minutes of silence. A shorter threshold records a gap on an overnight break, and a log of those buries the outages worth finding. A day of silence on an active repo is worth a reviewer's eye; on a dormant repo it costs one event per dormant period, not one per restart. The tradeoff is under-reporting, and it now applies only to logs with no terminator in them: there, a three-hour crash mid-workday still writes nothing. Past that point the threshold governs the explained case only (section 18.2).
+- **Cause is `Unknown` unless a terminator licenses better, certainty is `Inferred`, missed count is `Unknown`.** What the event asserts on its own is "no enforcement event was written between T1 and T2", which is equally true of a crash and of a quiet weekend. In a log with no `CleanShutdown` in it, nothing tells them apart and no other `GapCause` can be claimed honestly. In a log that has one, absence of a terminator at the tail is a crash, and the cause is `UncleanShutdown` (section 18.2).
 - **The mode is read, not assumed.** `enforcement_mode_during_gap` is `get_enforcement_mode` at gap end. Changing the mode writes an `EnforcementConfigChanged` event, and a gap is by definition a window with no event in it, so the mode read at gap end is the mode that held across the window. The one hole is a change whose event write failed, which advisory mode swallows. Reconstructing the mode from the log instead would mean scanning back to the last `EnforcementConfigChanged` — and most stores have none, so the common case is the full scan the tail read exists to avoid.
-- **Reads the tail, not the chain.** One `scan_keys` plus one `get_raw_bytes` on the newest key. Measured on a 3161-event store: 0.35ms, against 9–20ms for the full `scan_enforcement_events` it used to run. This sits on the cold-start path that `ensure_daemon` blocks every hook on, and the log is unbounded.
+- **Reads the tail, not the chain.** One `scan_keys` plus one `get_raw_bytes` on the newest key. Measured on a 3161-event store: 0.35ms, against 9–20ms for the full `scan_enforcement_events` it used to run. This sits on the cold-start path that `ensure_daemon` blocks every hook on, and the log is unbounded. The one exception is the terminator backscan, which is why it is gated to the path where the tail is not a terminator (section 18.2).
 - **Best-effort.** A failure is logged to `daemon.log` and startup continues. A daemon that refuses to start because it could not write an audit event is strictly worse than the missing event (P9).
 
-Not addressed: nothing detects a `seq_no` hole, and nothing correlates the gap against `lifecycle.log`, which does know whether the last shutdown was clean. Both would narrow the cause below `Unknown`.
+Not addressed: nothing detects a `seq_no` hole. Correlating the gap against `lifecycle.log` would narrow the cause, and is rejected — see 18.2.
+
+### 18.2 Shutdown terminator
+
+The 24-hour threshold buys quiet at the cost of coverage, and every gap it writes says `GapCause::Unknown`. Both follow from the same hole: the log records what the daemon did while running, never how it stopped. A clean stop and a crash leave the same silence, so the threshold has to be set high enough that ordinary stops do not drown the crashes, which is exactly what lets a three-hour mid-workday crash write nothing.
+
+**Decision: the daemon writes a terminator event on every graceful exit.** A start that finds a terminator at the tail knows the quiet window is explained, at any duration. A start that finds an ordinary event at the tail knows the daemon died. Absence is the crash signal, and that is what makes the design cheap: a dying daemon cannot be relied on to report anything, so it is never asked to.
+
+Consequences:
+
+- **The threshold drops out for terminated logs.** A weekend of silence behind a terminator needs no `RecordingGap` at all, and a three-hour crash writes one. Coverage and noise stop trading against each other.
+- **The cause comes from the chain.** Absence of a terminator is a crash claim grounded in hashed, append-only evidence rather than in a side file. `missed_event_count` stays `Unknown` — a dead daemon counts nothing — and certainty stays `Inferred`, because the gap start is still the last recorded event's timestamp, not the moment the process died.
+- **The clean window needs no `RecordingGap` of its own.** The terminator marks where recording stopped and the next event marks where it resumed, both in the chain. A reader can bound the window from the log alone, which is all the gap event ever provided — plus a cause it could not state.
+- **The 24-hour threshold survives as the fallback for pre-terminator logs.** No store in the field has terminators, so "no terminator at the tail" cannot mean "crashed" until the log is known to be from a writer that emits them. `detect_startup_gap` resolves that from the chain, not from a flag: if the tail is a terminator, take the cheap path; otherwise scan back for one. Finding a terminator establishes the era, so the absence at the tail is a crash. Finding none means a pre-change log, and the 24-hour threshold with `GapCause::Unknown` applies exactly as it does today. The backscan is the full read this function was written to avoid, so it is gated to the path where the tail is not a terminator — once per store at upgrade, and once per genuine crash. A healthy store never pays it.
+- **Retention can prune the era away.** `enforce_retention` deletes an oldest-first prefix, so a log whose only terminators fall inside it reverts to `GapCause::Unknown` under the threshold until the next clean stop writes a fresh one. It under-claims rather than over-claims, so it is left alone.
+- **`mati daemon stop --force` records an unexplained gap.** It SIGKILLs. Not worth suppressing: force-killing a wedged daemon *is* an enforcement outage and should read as one.
+- **Cost: two additive enum variants, no `SCHEMA_VERSION` bump.** The canonical form holds `event_type` as one opaque serialized field, so a new `EnforcementEventType` variant changes no field order and no layout — v1 and v2 events keep byte-identical hashes with no v3 branch to write. `GapCause` gains `UncleanShutdown` on the same argument. The compatibility cost is real but unavoidable and unrelated to the version number: an older binary cannot deserialize either variant, so it reports the event as `UnknownSchema` and its `is_valid()` returns false. Downgrading past this change makes a sound chain read as unverifiable.
+
+**Rejected: narrowing `GapCause` from `lifecycle.log`.** The principle is that an unsigned local source never substantiates a hashed audit claim. `lifecycle.log` is plain text, appendable by any process on the machine, trimmed by line count with no age filter, and wiped unread above 64MB. It corroborates for a human reading two files side by side. It does not populate a chain field.
+
+Two objections were tested against the code and refuted:
+
+- **"A new event type makes older binaries report tampering."** It does not. An unknown enum variant fails whole-`EnforcementEvent` deserialization exactly like corrupt bytes: the seq lands in `skipped_seqs` and reports as `ChainBreakKind::UnknownSchema`, never `Tampered`. That path is the same one every `schema_version` newer than the reading binary already takes.
+- **"`mati daemon stop` could write the terminator on the daemon's behalf."** It cannot. The daemon holds the SurrealKV lock for as long as it is alive, and `StoreProxy` refuses a direct open while `daemon_pid_alive` is true. Before the kill there is no writer but the daemon; after it, no process has standing to certify that another process's exit was clean.
+
+Feasibility is established. The store is open and writable on all five graceful shutdown paths (`signal_sigint`, `signal_sigterm`, `signal_sighup`, `idle_timeout`, `serve_loop_exit`): `run_daemon_start` records `serve_shutdown` to `lifecycle.log` before it reclaims and closes the store, so a terminator write fits in the same window. `EnforcementEventWriter::detect_and_record_gap` already takes an arbitrary `GapCause`; `gap_detection_on_recovery` passes `DaemonUnreachable` through it today.
+
+Measured on one macOS machine, throwaway `MATI_HOME`, socket bind and ping verified before each trial, daemon idle:
+
+| Measurement                            | Result                                     |
+| -------------------------------------- | ------------------------------------------ |
+| SIGTERM to process exit                | 93ms (7 trials, 91.8–94.3ms)               |
+| `serve_shutdown reason=signal_sigterm` | landed 7/7                                 |
+| One fsync'd enforcement write          | 5.9–9.8ms, median 8.0ms (30 samples)       |
+| Smallest grace period that sufficed    | 1s — every trial finished unaided          |
+
+The 5s `DRAIN_TIMEOUT` and its 1s abort grace in `serve_loop_graceful` engage only with handlers in flight, so they contributed roughly 0ms to every trial above. That is also the limit of the measurement: the busy case is unmeasured. A daemon draining a live handler can approach 6s before it reaches the terminator write and may be killed first, producing a false gap. That fails in the safe direction — a missing terminator over-reports a crash, it never hides one — but it adds noise. Two related unknowns: macOS's grace period on logout or restart is not established from a primary source (`man 5 launchd.plist` says `ExitTimeOut` defaults to "system-defined", and the generated plist does not set it), and every number here comes from one machine, one disk, one idle system.
+
+**Ordering: the terminator is written after the drain**, in `run_daemon_start`, alongside the `serve_shutdown` lifecycle record and before the store is reclaimed and closed. The alternative — writing it before the drain, to shrink the window in which the process can be killed first — is unsound. `serve_loop_graceful` stops accepting once shutdown is signaled, but in-flight handlers keep running, and a handler serving a `mem_get` or a hook decision writes enforcement events. Those land after the terminator and leave an ordinary event at the tail, so the next start reads a clean stop as a crash. Worse, the terminator itself becomes false: it claims recording stopped at a point that recording demonstrably continued past.
+
+The cost of writing after the drain is bounded and fails in the safe direction. The drain ceiling is 5s plus a 1s abort grace, then the write costs ~8ms. A process killed inside that window writes no terminator and is read as a crash, which is the same outcome as a real crash and never the reverse. A false crash report is noise; a false clean-stop report is a false attestation.
 
 ---
 

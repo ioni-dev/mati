@@ -505,6 +505,27 @@ pub async fn run_daemon_start() -> Result<()> {
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     mati_core::mcp::metadata::record_lifecycle_event(&mati_root, "serve_shutdown", shutdown_reason);
+
+    // The chain-native record that this run stopped deliberately. Must be the
+    // LAST event of the run — it sits here, after `serve_loop_graceful` has
+    // drained in-flight handlers, because a handler still running writes
+    // enforcement events and any event after the terminator makes the next
+    // start read a clean stop as a crash (ARCHITECTURE.md section 18.2).
+    // Best-effort (P9): a failed write degrades to looking like a crash.
+    {
+        let store = graph.read().await;
+        match mati_core::store::enforcement::record_clean_shutdown(store.store(), shutdown_reason)
+            .await
+        {
+            Ok(Some(event)) => tracing::debug!(
+                "daemon: recorded CleanShutdown (seq {}) reason={shutdown_reason}",
+                event.seq_no
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("daemon: clean-shutdown terminator write failed: {e}"),
+        }
+    }
+
     // Reclaim exclusive ownership of the Store so we can run the full close
     // (which flushes both trees AND the search index, then releases the
     // kernel flock). If `Arc::try_unwrap` fails — which can happen briefly

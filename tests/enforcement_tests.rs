@@ -1149,8 +1149,17 @@ async fn repair_check_prunes_nothing() {
 /// a stale `event_hash` would read as tampering and mask what these tests
 /// assert.
 async fn write_and_backdate(store: &Store, count: u64, age_ms: u64) {
-    use mati_core::store::enforcement::EnforcementEvent;
+    write_events(store, count).await;
+    backdate_all(store, age_ms).await;
+}
 
+/// Append `count` Deny events through a local writer.
+///
+/// Local, not `record_event`: that routes through the process-global shared
+/// writer, which caches the chain head. [`backdate_all`] rewrites every hash,
+/// so a cached head would leave the next real write chained to a hash no event
+/// carries any more.
+async fn write_events(store: &Store, count: u64) {
     let mut writer = EnforcementEventWriter::new(store)
         .await
         .expect("create writer");
@@ -1169,15 +1178,48 @@ async fn write_and_backdate(store: &Store, count: u64, age_ms: u64) {
             .await
             .expect("write event");
     }
+}
+
+/// Append a `CleanShutdown` terminator, as a graceful daemon exit would.
+/// Local writer, for the reason in [`write_events`].
+async fn write_terminator(store: &Store, reason: &str) {
+    let mut writer = EnforcementEventWriter::new(store)
+        .await
+        .expect("create writer");
+    writer
+        .write(
+            store,
+            EnforcementEventType::CleanShutdown {
+                reason: reason.to_string(),
+            },
+            SubjectKind::System,
+            "enforcement:stream".to_string(),
+            "system".to_string(),
+            None,
+            "clean_shutdown".to_string(),
+            None,
+        )
+        .await
+        .expect("write terminator");
+}
+
+/// Age every event in the log by `age_ms`, re-chaining as it goes.
+async fn backdate_all(store: &Store, age_ms: u64) {
+    use mati_core::store::enforcement::EnforcementEvent;
 
     let old_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
     let old_ms = old_ms.saturating_sub(age_ms);
+
+    // Zero-padded keys sort in seq order, so this walks the chain front to back.
+    let keys = store
+        .scan_keys("enforcement:event:")
+        .await
+        .expect("scan event keys");
     let mut prev_hash = String::new();
-    for seq in 1..=count {
-        let key = format!("enforcement:event:{:020}", seq);
+    for key in keys {
         let bytes = store
             .get_raw_bytes(&key)
             .await
@@ -1352,6 +1394,132 @@ async fn an_unreadable_newest_event_does_not_hide_the_gap() {
             .is_some(),
         "the gap must be found behind the unreadable tail"
     );
+}
+
+/// A terminator at the tail says recording stopped deliberately, and the chain
+/// already bounds that window — this event and the next one written. So no
+/// RecordingGap belongs in it, at any duration, including well past the
+/// threshold that would otherwise record one.
+#[tokio::test]
+async fn a_terminator_at_the_tail_explains_any_silence() {
+    use mati_core::store::enforcement::{detect_startup_gap, STARTUP_GAP_THRESHOLD_MS};
+
+    let (_dir, store) = temp_store().await;
+    write_events(&store, 3).await;
+    write_terminator(&store, "signal_sigterm").await;
+    backdate_all(&store, 2 * 24 * 60 * 60 * 1000).await;
+
+    assert!(
+        detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+            .await
+            .expect("detect startup gap")
+            .is_none(),
+        "a two-day silence behind a clean shutdown is already explained"
+    );
+    let all = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(all.len(), 4, "no gap event may be written");
+}
+
+/// The point of the terminator: once a log has one, its ABSENCE at the tail is
+/// a crash, and a crash is worth recording at any duration. Three hours sits
+/// far under the 24-hour threshold, which is exactly the mid-workday outage the
+/// threshold alone drops.
+#[tokio::test]
+async fn a_missing_terminator_records_a_gap_under_the_threshold() {
+    use mati_core::store::enforcement::{
+        detect_startup_gap, verify_chain, GapCause, STARTUP_GAP_THRESHOLD_MS,
+    };
+
+    let (_dir, store) = temp_store().await;
+    write_events(&store, 2).await;
+    write_terminator(&store, "idle_timeout").await;
+    // The run after the clean stop — it never wrote a terminator of its own.
+    write_events(&store, 2).await;
+    backdate_all(&store, 3 * 60 * 60 * 1000).await;
+
+    let event = detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+        .await
+        .expect("detect startup gap")
+        .expect("an unclean exit must be recorded whatever its duration");
+
+    match &event.event_type {
+        EnforcementEventType::RecordingGap { cause, .. } => {
+            assert_eq!(*cause, GapCause::UncleanShutdown);
+        }
+        other => panic!("expected RecordingGap, got {other:?}"),
+    }
+
+    let all = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    let verification = verify_chain(&all);
+    assert!(
+        verification.is_valid(),
+        "the gap event must chain onto the run it reports, got {verification:?}"
+    );
+}
+
+/// The migration property. A log written before terminators existed has none to
+/// find, so absence at its tail proves nothing and the cause stays `Unknown`
+/// under the old threshold. Without this the first start after upgrade would
+/// report a crash on every store in the field.
+#[tokio::test]
+async fn a_log_with_no_terminator_keeps_the_old_threshold_behaviour() {
+    use mati_core::store::enforcement::{detect_startup_gap, GapCause, STARTUP_GAP_THRESHOLD_MS};
+
+    let (_dir, store) = temp_store().await;
+    write_and_backdate(&store, 3, 3 * 60 * 60 * 1000).await;
+
+    assert!(
+        detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+            .await
+            .expect("detect startup gap")
+            .is_none(),
+        "three hours in a pre-terminator log is an ordinary restart, not a crash"
+    );
+
+    // Past the threshold the same log still reports, and still cannot name the
+    // cause — the terminator era is what licenses `UncleanShutdown`.
+    backdate_all(&store, 2 * 24 * 60 * 60 * 1000).await;
+    let event = detect_startup_gap(&store, STARTUP_GAP_THRESHOLD_MS)
+        .await
+        .expect("detect startup gap")
+        .expect("a two-day silence must be recorded");
+    match &event.event_type {
+        EnforcementEventType::RecordingGap { cause, .. } => {
+            assert_eq!(*cause, GapCause::Unknown);
+        }
+        other => panic!("expected RecordingGap, got {other:?}"),
+    }
+}
+
+/// The public write path the daemon calls on graceful exit.
+#[tokio::test]
+async fn record_clean_shutdown_writes_a_terminator_that_verifies() {
+    use mati_core::store::enforcement::{record_clean_shutdown, verify_chain};
+
+    let (_dir, store) = temp_store().await;
+    write_events(&store, 2).await;
+
+    let event = record_clean_shutdown(&store, "signal_sigterm")
+        .await
+        .expect("write terminator")
+        .expect("terminator recorded");
+
+    assert_eq!(event.seq_no, 3);
+    assert_eq!(event.subject_kind, SubjectKind::System);
+    assert_eq!(event.decision_reason_code, "clean_shutdown");
+    match &event.event_type {
+        EnforcementEventType::CleanShutdown { reason } => assert_eq!(reason, "signal_sigterm"),
+        other => panic!("expected CleanShutdown, got {other:?}"),
+    }
+
+    let all = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert!(verify_chain(&all).is_valid());
 }
 
 /// P9: a daemon that refuses to start because it could not write an audit event
