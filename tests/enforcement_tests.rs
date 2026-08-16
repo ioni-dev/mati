@@ -1417,6 +1417,166 @@ async fn daemon_start_records_the_gap_and_keeps_serving() {
 }
 
 // ─────────────────────────────────────────────
+// Test 10c: unbracketed skips must still surface
+// ─────────────────────────────────────────────
+//
+// `verify_chain_with_skips` only turned a skip into a break when it sat
+// between two successfully-read events (the linkage check needs a `prev` and
+// a `current` to compare). A skip at either edge of the read range, or a run
+// of skips with no present event anywhere near them, had no such pair and
+// vanished — `is_valid()` returned true over a chain part of which was never
+// actually read.
+
+/// A skip before the oldest event this scan could read has no predecessor to
+/// pair it with; it must still surface, anchored on its own seq_no.
+#[tokio::test]
+async fn a_skip_at_the_head_is_not_invisible() {
+    use mati_core::store::enforcement::{
+        scan_enforcement_events_with_skips, verify_chain_with_skips, ChainBreakKind,
+    };
+
+    let (_dir, store) = temp_store().await;
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    for i in 0..3 {
+        writer
+            .write(
+                &store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+    store
+        .put_raw("enforcement:event:00000000000000000001", b"{not json")
+        .await
+        .expect("corrupt the oldest event");
+
+    let scan = scan_enforcement_events_with_skips(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(scan.skipped_seqs, vec![1]);
+
+    let v = verify_chain_with_skips(&scan.events, &scan.skipped_seqs);
+    assert_eq!(v.breaks.len(), 1, "the head skip must surface, got {v:?}");
+    assert_eq!(v.breaks[0].kind, ChainBreakKind::UnknownSchema);
+    assert_eq!(v.breaks[0].seq_no, 1);
+    assert_eq!(v.linkage_breaks, 0, "seq 2 and 3 still link to each other");
+    assert!(!v.is_valid());
+}
+
+/// A skip after the newest event this scan could read has no successor to
+/// pair it with; it must still surface, anchored on its own seq_no.
+#[tokio::test]
+async fn a_skip_at_the_tail_is_not_invisible() {
+    use mati_core::store::enforcement::{
+        scan_enforcement_events_with_skips, verify_chain_with_skips, ChainBreakKind,
+    };
+
+    let (_dir, store) = temp_store().await;
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    for i in 0..3 {
+        writer
+            .write(
+                &store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+    store
+        .put_raw("enforcement:event:00000000000000000003", b"{not json")
+        .await
+        .expect("corrupt the newest event");
+
+    let scan = scan_enforcement_events_with_skips(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(scan.skipped_seqs, vec![3]);
+
+    let v = verify_chain_with_skips(&scan.events, &scan.skipped_seqs);
+    assert_eq!(v.breaks.len(), 1, "the tail skip must surface, got {v:?}");
+    assert_eq!(v.breaks[0].kind, ChainBreakKind::UnknownSchema);
+    assert_eq!(v.breaks[0].seq_no, 3);
+    assert_eq!(v.linkage_breaks, 0, "seq 1 and 2 still link to each other");
+    assert!(!v.is_valid());
+}
+
+/// Two consecutive skips at the head have no present event between or before
+/// them to bracket either one — both must surface as their own break.
+#[tokio::test]
+async fn a_run_of_consecutive_skips_with_no_bracketing_survivor_all_surface() {
+    use mati_core::store::enforcement::{
+        scan_enforcement_events_with_skips, verify_chain_with_skips, ChainBreakKind,
+    };
+
+    let (_dir, store) = temp_store().await;
+    let mut writer = EnforcementEventWriter::new(&store)
+        .await
+        .expect("create writer");
+    for i in 0..4 {
+        writer
+            .write(
+                &store,
+                EnforcementEventType::Deny,
+                SubjectKind::File,
+                format!("file:f{i}.rs"),
+                "claude".to_string(),
+                None,
+                "gotcha_above_threshold".to_string(),
+                None,
+            )
+            .await
+            .expect("write event");
+    }
+    for seq in [1u64, 2] {
+        let key = format!("enforcement:event:{:020}", seq);
+        store
+            .put_raw(&key, b"{not json")
+            .await
+            .expect("corrupt event");
+    }
+
+    let scan = scan_enforcement_events_with_skips(&store, 0, u64::MAX)
+        .await
+        .expect("scan");
+    assert_eq!(scan.skipped_seqs, vec![1, 2]);
+
+    let v = verify_chain_with_skips(&scan.events, &scan.skipped_seqs);
+    assert_eq!(
+        v.breaks.len(),
+        2,
+        "both skips in the run must surface on their own, got {v:?}"
+    );
+    assert!(v
+        .breaks
+        .iter()
+        .all(|b| b.kind == ChainBreakKind::UnknownSchema));
+    assert_eq!(
+        v.breaks.iter().map(|b| b.seq_no).collect::<Vec<_>>(),
+        vec![1, 2],
+        "breaks stay in seq order"
+    );
+    assert_eq!(v.linkage_breaks, 0, "seq 3 and 4 still link to each other");
+    assert!(!v.is_valid());
+}
+
+// ─────────────────────────────────────────────
 // Test 11: Strict mode end-to-end
 // ─────────────────────────────────────────────
 

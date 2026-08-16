@@ -374,7 +374,8 @@ pub struct ChainVerification {
     /// legitimately retention-pruned prefix is not a break.
     pub linkage_breaks: usize,
     /// Events this binary cannot verify: a `schema_version` newer than it
-    /// understands, or a gap the scan attributed to JSON it could not parse.
+    /// understands, or a seq_no the scan reported as unread (anywhere in the
+    /// range, not only where it sits between two present events).
     /// Reported, not verified — and never counted as tampering.
     pub unknown_schema: usize,
     /// Every located break, in seq order. Empty when the chain is intact.
@@ -403,13 +404,18 @@ pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
     verify_chain_with_skips(events, &[])
 }
 
-/// [`verify_chain`], told which seq numbers the scan could not parse.
+/// [`verify_chain`], told which seq numbers the scan could not read.
 ///
 /// A skipped event is missing from `events`, so its successor's `prev_hash`
 /// matches nothing present. That is byte-for-byte the signature of a deleted
 /// event, and only the scan knows the difference: it saw the key and failed to
 /// read it. Gaps explained by `skipped_seqs` are reported as `UnknownSchema`,
 /// not `Linkage`, so version skew does not read as tampering in a signed audit.
+///
+/// Every seq in `skipped_seqs` surfaces as a break, whether or not it sits
+/// between two present events — one before the first present event, after the
+/// last, or with nothing present at all still counts toward `unknown_schema`,
+/// so a chain this binary could not fully read is never reported valid.
 pub fn verify_chain_with_skips(
     events: &[EnforcementEvent],
     skipped_seqs: &[u64],
@@ -418,6 +424,32 @@ pub fn verify_chain_with_skips(
     sorted.sort_by_key(|e| e.seq_no);
 
     let mut result = ChainVerification::default();
+
+    // A skip strictly between the lowest and highest present seq_no is
+    // "explained" below when its bracketing pair's linkage is checked. One
+    // before the first present event, after the last, or with no present
+    // event at all has no pair to attach to — it must still surface, anchored
+    // on its own seq_no since there is no successor to blame it on. The event
+    // itself was never read, so `recorded_at_ms`/`event_type` are placeholders.
+    let first_present = sorted.first().map(|e| e.seq_no);
+    let last_present = sorted.last().map(|e| e.seq_no);
+    for &seq in skipped_seqs {
+        let bracketed =
+            matches!((first_present, last_present), (Some(f), Some(l)) if f <= seq && seq <= l);
+        if !bracketed {
+            result.unknown_schema += 1;
+            result.breaks.push(ChainBreak {
+                kind: ChainBreakKind::UnknownSchema,
+                seq_no: seq,
+                recorded_at_ms: 0,
+                event_type: "unreadable".to_string(),
+                prev_seq_no: None,
+                prev_recorded_at_ms: None,
+                prev_event_type: None,
+            });
+        }
+    }
+
     let mut prev: Option<&EnforcementEvent> = None;
 
     for e in sorted {
@@ -476,5 +508,9 @@ pub fn verify_chain_with_skips(
         prev = Some(e);
     }
 
+    // Breaks are pushed in two passes (unbracketed skips, then the linkage
+    // scan), so the combined vec needs a final sort to keep the "in seq
+    // order" contract in `ChainVerification::breaks`'s doc comment.
+    result.breaks.sort_by_key(|b| b.seq_no);
     result
 }

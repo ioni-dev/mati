@@ -401,8 +401,11 @@ impl EnforcementEventWriter {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnforcementEventsWithSkips {
     pub events: Vec<EnforcementEvent>,
-    /// Seq numbers present in the store whose JSON failed to deserialize —
-    /// most often an event type written by a newer binary.
+    /// Seq numbers this scan could not read as an event: JSON that failed to
+    /// deserialize (most often an event type written by a newer binary), or a
+    /// key the store reported present but returned no bytes for, or an error,
+    /// on read. `verify_chain_with_skips` only needs "was this seq unread",
+    /// not why, so both reasons share one list.
     pub skipped_seqs: Vec<u64>,
 }
 
@@ -455,13 +458,23 @@ pub async fn scan_enforcement_events_with_skips(
         if seq < since_seq {
             continue;
         }
-        if let Ok(Some(bytes)) = store.get_raw_bytes(key).await {
-            match serde_json::from_slice::<EnforcementEvent>(&bytes) {
+        match store.get_raw_bytes(key).await {
+            Ok(Some(bytes)) => match serde_json::from_slice::<EnforcementEvent>(&bytes) {
                 Ok(event) => events.push(event),
                 Err(e) => {
                     tracing::warn!(key, "skipping corrupt enforcement event: {e}");
                     skipped_seqs.push(seq);
                 }
+            },
+            // The key was in the scan but has no value, or the read itself
+            // failed — either way the seq is unread, not absent.
+            Ok(None) => {
+                tracing::warn!(key, "skipping enforcement event key with no value");
+                skipped_seqs.push(seq);
+            }
+            Err(e) => {
+                tracing::warn!(key, "skipping unreadable enforcement event: {e}");
+                skipped_seqs.push(seq);
             }
         }
     }

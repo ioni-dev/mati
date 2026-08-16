@@ -203,12 +203,15 @@ fn verify_chain_reports_a_skipped_event_as_unknown_schema_not_tampering() {
 #[test]
 fn verify_chain_skips_outside_the_gap_do_not_excuse_a_deletion() {
     // A skip must explain *this* gap. One at an unrelated seq leaves the
-    // deletion classified as a linkage break.
+    // deletion classified as a linkage break — and, since seq 99 is itself
+    // beyond the newest present event (seq 3), it now surfaces on its own as
+    // an unbracketed tail skip too (previously invisible; that was Bug A).
     let mut events = chained(3);
     events.remove(1);
     let v = verify_chain_with_skips(&events, &[99]);
     assert_eq!(v.linkage_breaks, 1);
-    assert_eq!(v.unknown_schema, 0);
+    assert_eq!(v.unknown_schema, 1);
+    assert_eq!(v.breaks.len(), 2);
     assert!(!v.is_valid());
 }
 
