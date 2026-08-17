@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
-/// Which class of file-reading command was detected.
+/// Which class of file-reading or path-mutating command was detected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandClass {
     /// cat, less, head, tail, bat — file path is first non-flag arg.
@@ -55,6 +55,10 @@ pub enum CommandClass {
     GrepLike,
     /// psql, mysql, redis-cli, mongosh, sqlite3, and other governed DB clients.
     DbClientLike,
+    /// rm, mv, rmdir, shred — every positional is a target path. Normalizes to
+    /// `tool=path`, so a `target_path_glob` policy gates deletes and moves the
+    /// same way it gates edits.
+    PathMutating,
 }
 
 /// Normalized shape of an agent tool invocation for policy matching.

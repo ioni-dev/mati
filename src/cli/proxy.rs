@@ -1504,6 +1504,7 @@ mod tests {
                 tool: Some("db_client".into()),
                 host_glob: Some("*prod*".into()),
                 target_path_glob: None,
+                command_glob: None,
             },
             requires: mati_core::store::PolicyRequires {
                 key: "schema:orders".into(),
@@ -1577,6 +1578,7 @@ mod tests {
                 tool: Some("db_client".into()),
                 host_glob: Some("*prod*".into()),
                 target_path_glob: None,
+                command_glob: None,
             },
             requires: mati_core::store::PolicyRequires {
                 key: key.into(),

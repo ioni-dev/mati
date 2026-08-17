@@ -860,6 +860,14 @@ pub struct PolicyTrigger {
     pub host_glob: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_path_glob: Option<String>,
+    /// Glob matched against the normalized command tokens joined by single
+    /// spaces (`action.argv`, after wrapper stripping and `sh -c` unwrap). The
+    /// only predicate that can gate a pathless verb (`dd`, `terraform destroy`,
+    /// `git reset --hard`). Lexical and best-effort: quoting, variable
+    /// expansion, and aliases bypass it, so a block on it is a tripwire, never
+    /// a guarantee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_glob: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1266,6 +1274,7 @@ mod tests {
                 tool: Some("db_client".into()),
                 host_glob: Some("*prod*".into()),
                 target_path_glob: None,
+                command_glob: None,
             },
             requires: PolicyRequires {
                 key: "schema:orders_db".into(),

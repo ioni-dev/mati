@@ -10,7 +10,7 @@ use super::*;
 pub fn extract_file_path(cmd: &str, class: CommandClass) -> Option<String> {
     let paths = extract_file_paths(cmd, class);
     match class {
-        CommandClass::CatLike => paths.into_iter().next(),
+        CommandClass::CatLike | CommandClass::PathMutating => paths.into_iter().next(),
         CommandClass::GrepLike => paths.into_iter().next_back(),
         CommandClass::DbClientLike => paths.into_iter().next(),
     }
@@ -39,7 +39,7 @@ pub fn extract_file_paths(cmd: &str, class: CommandClass) -> Vec<String> {
     let tokens = shell_tokens(cmd_part);
 
     match class {
-        CommandClass::CatLike => positional_args(&tokens),
+        CommandClass::CatLike | CommandClass::PathMutating => positional_args(&tokens),
         CommandClass::GrepLike => {
             let positionals = positional_args(&tokens);
             if positionals.len() >= 2 {
@@ -158,6 +158,10 @@ pub fn normalize_action(command: Option<&str>, target_path: Option<&str>) -> Act
             }
             CommandClass::CatLike | CommandClass::GrepLike => {
                 action.tool = ACTION_TOOL_FILE_READ.to_string();
+                action.files.extend(extract_file_paths(command, class));
+            }
+            CommandClass::PathMutating => {
+                action.tool = ACTION_TOOL_PATH.to_string();
                 action.files.extend(extract_file_paths(command, class));
             }
         }

@@ -502,11 +502,6 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 .collect(),
             _ => Vec::new(),
         };
-        let governed_tool = if args.variant == HookVariant::ClaudePreEdit {
-            "path"
-        } else {
-            "db_client"
-        };
         for action in &policy_actions {
             // Escalate-only: stop at the first deny, and never lower an
             // existing decision. Edits already make one hook_evaluate round
@@ -515,6 +510,14 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             if matches!(adapter.decision, Decision::Deny { .. }) {
                 break;
             }
+            // Govern each action by its own category: edits and path-mutating
+            // bash commands (rm/mv/rmdir/shred → tool=path) gate on `path`, DB
+            // clients on `db_client`. Reads stay on the file gate.
+            let governed_tool = if action.tool == "path" {
+                "path"
+            } else {
+                "db_client"
+            };
             if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
                 Some(&mati_root),
                 action,
