@@ -1,14 +1,16 @@
 use super::*;
 
 pub async fn run(args: InitArgs) -> Result<()> {
-    let root = match &args.path {
+    let requested = match &args.path {
         Some(p) => p.clone(),
         None => std::env::current_dir()?,
     };
-    // `--path` names a repository root, so resolve it through git the same way
-    // the slug is derived. Canonicalize first: it is what rejects a path that
-    // does not exist, which `slug_root`'s non-git fallback silently tolerates.
-    let root = slug_root(&std::fs::canonicalize(&root)?);
+    // `--path` names a repository, not a scope: resolve it through git the same
+    // way the slug is derived, so a subdir walks up to its repo root. Canonicalize
+    // first — it is what rejects a path that does not exist, which `slug_root`'s
+    // non-git fallback silently tolerates.
+    let requested = std::fs::canonicalize(&requested)?;
+    let root = slug_root(&requested);
 
     let slug = derive_slug(&root);
     let project_name = root
@@ -18,6 +20,15 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     println!();
     println!("◈  mati — project: {}  (slug: {})", project_name, slug);
+    // A path inside a repo indexes the whole repo, not that path. Say so, so the
+    // wider scope is never silent.
+    if requested != root {
+        println!(
+            "   indexing repo root {}  (requested {})",
+            root.display(),
+            requested.display()
+        );
+    }
     println!();
 
     // ── 0. Scaffold: agent hooks (no store access needed) ───────────────
