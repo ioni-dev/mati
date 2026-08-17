@@ -131,6 +131,13 @@ cli-daemon = { max-threads = 1 }
 # is high by design.
 cli-integration = { max-threads = 2 }
 
+# output_regression run alone gives its own tests both cli-integration slots,
+# so two isolated daemon spawns contend spawn-vs-spawn and one occasionally
+# stalls past the 15s `Wedged` threshold (a cold spawn or SurrealKV open
+# starved under concurrent fsync — not real work on a 2-file repo). Serialize
+# its spawns so a lone `--test output_regression` run can't self-contend.
+output-regression = { max-threads = 1 }
+
 # ─── group assignments ───────────────────────────────────────────────────
 #
 # Nextest requires per-profile override blocks. Define once for each
@@ -154,6 +161,12 @@ test-group = 'hook-compliance'
 filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
+# Must precede the cli-integration catch-all: first matching override wins
+# per setting, and output_regression also matches that filter.
+[[profile.default.overrides]]
+filter = 'binary(output_regression)'
+test-group = 'output-regression'
+
 [[profile.default.overrides]]
 filter = '''
   kind(test)
@@ -180,6 +193,10 @@ filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
 
 [[profile.ci.overrides]]
+filter = 'binary(output_regression)'
+test-group = 'output-regression'
+
+[[profile.ci.overrides]]
 filter = '''
   kind(test)
   - binary(resolver_fixtures)
@@ -203,6 +220,10 @@ test-group = 'hook-compliance'
 [[profile.stress.overrides]]
 filter = 'test(/^cli::daemon::/)'
 test-group = 'cli-daemon'
+
+[[profile.stress.overrides]]
+filter = 'binary(output_regression)'
+test-group = 'output-regression'
 
 [[profile.stress.overrides]]
 filter = '''
