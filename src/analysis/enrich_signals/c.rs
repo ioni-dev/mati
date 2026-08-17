@@ -4,7 +4,7 @@
 //! MEDIUM: `// nolint`, `#pragma warning(disable ...)` via shared scanner
 //!
 //! A `#define` body parses as an opaque `preproc_arg` leaf, so it is
-//! re-parsed as a fragment via [`super::macro_body_signals`].
+//! re-parsed as a fragment via `macro_body_signals`.
 
 use std::cell::RefCell;
 use std::sync::LazyLock;

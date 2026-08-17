@@ -136,7 +136,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
 /// eligible for global bootstrap injection with no `affected_files` gate,
 /// which could crowd out real gotchas under the bootstrap token budget.
 /// Unconfirmed legacy records are tombstoned via
-/// [`gotcha_ops::apply_gotcha_tombstone`] — the sanctioned mutation path —
+/// [`mati_core::store::gotcha_ops::apply_gotcha_tombstone`] — the sanctioned mutation path —
 /// on every run. A legacy record a developer already confirmed is left
 /// alone and reported instead: a developer's explicit confirmation is not
 /// something an import should silently undo.
