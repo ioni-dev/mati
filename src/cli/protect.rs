@@ -71,7 +71,9 @@ pub async fn run(args: ProtectArgs) -> Result<()> {
     };
 
     let reason = args.reason.unwrap_or_else(|| {
-        format!("{glob} is protected; consult this record before editing or deleting a matching path.")
+        format!(
+            "{glob} is protected; consult this record before editing or deleting a matching path."
+        )
     });
     let decision = decision_record(&decision_key, glob, &reason);
 
