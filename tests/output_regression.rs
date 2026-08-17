@@ -665,8 +665,8 @@ fn status_shows_codex_platform_mode() {
     let repo = repo_dir.path();
     init_repo_codex(&bin, repo, home_dir.path());
 
-    let (stdout, _stderr, ok) = run(&bin, repo, home_dir.path(), &["status"]);
-    assert!(ok, "mati status should succeed");
+    let (stdout, stderr, ok) = run(&bin, repo, home_dir.path(), &["status"]);
+    assert!(ok, "mati status should succeed; stderr:\n{stderr}");
 
     assert_contains(&stdout, "Platform");
     assert_contains(&stdout, "Codex");
