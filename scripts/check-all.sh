@@ -10,7 +10,7 @@
 # Usage:
 #   scripts/check-all.sh           # run every gate, stop on first failure
 #   scripts/check-all.sh --keep    # run every gate, report at the end
-#   scripts/check-all.sh --smoke   # also run the policy engine smoke test
+#   scripts/check-all.sh --smoke   # also run the policy + resource-protection smoke tests
 #   scripts/check-all.sh --fast    # skip `cargo bench --no-run` (~11 of ~15 min)
 #
 # A full run is ~15 min, dominated by the bench compile; `--fast` drops it to
@@ -83,19 +83,27 @@ fi
 run_check "eval / regression corpus"        cargo test --locked --test eval_corpus -- --nocapture
 run_check "zero-network attestation"        zero_network_check
 
-if [[ "$RUN_SMOKE" == "true" ]]; then
-    printf '\n── policy engine smoke ─────────────────────\n'
-    scripts/smoke-policy.sh
-    smoke_rc=$?
-    if [[ $smoke_rc -eq 77 ]]; then
+# Run a smoke script that builds the binary and spawns a daemon. Exit 77 is a
+# deliberate skip (no Unix domain socket in this environment).
+run_smoke() {
+    local name="$1" script="$2"
+    printf '\n── %s ─────────────────────\n' "$name"
+    "$script"
+    local rc=$?
+    if [[ $rc -eq 77 ]]; then
         printf '  skipped: this environment cannot bind a Unix domain socket.\n'
-    elif [[ $smoke_rc -ne 0 ]]; then
-        FAILED+=("policy engine smoke")
+    elif [[ $rc -ne 0 ]]; then
+        FAILED+=("$name")
         if [[ "$KEEP_GOING" == "false" ]]; then
-            printf '\n✗ policy engine smoke FAILED. Re-run with `--keep` to see all failures.\n' >&2
+            printf '\n✗ %s FAILED. Re-run with `--keep` to see all failures.\n' "$name" >&2
             exit 1
         fi
     fi
+}
+
+if [[ "$RUN_SMOKE" == "true" ]]; then
+    run_smoke "policy engine smoke"        scripts/smoke-policy.sh
+    run_smoke "resource protection smoke"  scripts/smoke-protect.sh
 fi
 
 printf '\n'
