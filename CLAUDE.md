@@ -83,7 +83,7 @@ runtime. `mati` ships as one statically-linked binary.
 
 **Durability is split — never mix:**
 - `Immediate` (fsync): `gotcha:* decision:* file:* stage:* dev_note:* dep:*`
-  (plus `enforcement:event:*`, which defaults to Immediate)
+  (plus `policy:*` and `enforcement:event:*`, which default to Immediate)
 - `Eventual` (OS buffer): `session:* analytics:* hook_event:* compliance:*
   graph:edge:* health:* parse:* audit:session:*`
 
@@ -150,7 +150,7 @@ Key namespacing convention:
 
 ```
 gotcha:<slug>   file:<path>   decision:<slug>   stage:current
-dep:<ecosystem>:<name>   dev_note:<slug>   session:<timestamp>
+dep:<ecosystem>:<name>   dev_note:<slug>   policy:<slug>   session:<timestamp>
 analytics:<type>_<date>   graph:edge:<from>:<kind>:<to>   enforcement:event:<seq_no>
 ```
 
