@@ -216,6 +216,32 @@ fn verify_chain_skips_outside_the_gap_do_not_excuse_a_deletion() {
 }
 
 #[test]
+fn verify_chain_counts_every_skip_in_one_gap_not_the_gap() {
+    // Two unread events (seq 2 and 3) fall in the single gap between present
+    // seq 1 and seq 4. Each must count on its own — a run of skips is not one
+    // "unknown", and folding them per bracketing pair would understate how many
+    // events an audit could not read.
+    let mut events = chained(5);
+    events.retain(|e| e.seq_no != 2 && e.seq_no != 3);
+    let v = verify_chain_with_skips(&events, &[2, 3]);
+    assert_eq!(v.unknown_schema, 2, "two unread seqs, not one folded gap");
+    assert_eq!(
+        v.linkage_breaks, 0,
+        "the gap is fully explained by the skips"
+    );
+    assert_eq!(
+        v.breaks.iter().map(|b| b.seq_no).collect::<Vec<_>>(),
+        vec![2, 3],
+        "each skip surfaces on its own seq"
+    );
+    assert!(v
+        .breaks
+        .iter()
+        .all(|b| b.kind == ChainBreakKind::UnknownSchema));
+    assert!(!v.is_valid());
+}
+
+#[test]
 fn verify_chain_ignores_retention_pruned_prefix() {
     let mut events = chained(3);
     events.remove(0); // prune the earliest event (seq 1)

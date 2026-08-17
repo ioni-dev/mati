@@ -389,8 +389,8 @@ pub struct ChainVerification {
     /// legitimately retention-pruned prefix is not a break.
     pub linkage_breaks: usize,
     /// Events this binary cannot verify: a `schema_version` newer than it
-    /// understands, or a seq_no the scan reported as unread (anywhere in the
-    /// range, not only where it sits between two present events).
+    /// understands, or a seq_no the scan reported as unread. Every unread seq
+    /// counts once, wherever it sits — a run of N skips in one gap is N, not one.
     /// Reported, not verified — and never counted as tampering.
     pub unknown_schema: usize,
     /// Every located break, in seq order. Empty when the chain is intact.
@@ -427,10 +427,12 @@ pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
 /// read it. Gaps explained by `skipped_seqs` are reported as `UnknownSchema`,
 /// not `Linkage`, so version skew does not read as tampering in a signed audit.
 ///
-/// Every seq in `skipped_seqs` surfaces as a break, whether or not it sits
-/// between two present events — one before the first present event, after the
-/// last, or with nothing present at all still counts toward `unknown_schema`,
-/// so a chain this binary could not fully read is never reported valid.
+/// Every seq in `skipped_seqs` surfaces as its own break and counts once toward
+/// `unknown_schema`, wherever it sits — before the first present event, after
+/// the last, none present at all, or several inside one gap between two present
+/// events. The linkage mismatch a bracketed skip creates is suppressed there,
+/// not folded into a single tally, so a chain this binary could not fully read
+/// is never reported valid and the count reflects how many events it missed.
 pub fn verify_chain_with_skips(
     events: &[EnforcementEvent],
     skipped_seqs: &[u64],
@@ -440,29 +442,24 @@ pub fn verify_chain_with_skips(
 
     let mut result = ChainVerification::default();
 
-    // A skip strictly between the lowest and highest present seq_no is
-    // "explained" below when its bracketing pair's linkage is checked. One
-    // before the first present event, after the last, or with no present
-    // event at all has no pair to attach to — it must still surface, anchored
-    // on its own seq_no since there is no successor to blame it on. The event
-    // itself was never read, so `recorded_at_ms`/`event_type` are placeholders.
-    let first_present = sorted.first().map(|e| e.seq_no);
-    let last_present = sorted.last().map(|e| e.seq_no);
+    // Every skipped seq is an event this binary could not read; surface each on
+    // its own seq_no and count it once. A gap of N unread events is N unknown,
+    // not one — counting per bracketing pair would fold a run of skips into a
+    // single tally. The bracketing linkage mismatch a skip creates is left to
+    // the loop below, which suppresses the duplicate break for any gap a skip
+    // already explains. The event itself was never read, so `recorded_at_ms`/
+    // `event_type` are placeholders.
     for &seq in skipped_seqs {
-        let bracketed =
-            matches!((first_present, last_present), (Some(f), Some(l)) if f <= seq && seq <= l);
-        if !bracketed {
-            result.unknown_schema += 1;
-            result.breaks.push(ChainBreak {
-                kind: ChainBreakKind::UnknownSchema,
-                seq_no: seq,
-                recorded_at_ms: 0,
-                event_type: "unreadable".to_string(),
-                prev_seq_no: None,
-                prev_recorded_at_ms: None,
-                prev_event_type: None,
-            });
-        }
+        result.unknown_schema += 1;
+        result.breaks.push(ChainBreak {
+            kind: ChainBreakKind::UnknownSchema,
+            seq_no: seq,
+            recorded_at_ms: 0,
+            event_type: "unreadable".to_string(),
+            prev_seq_no: None,
+            prev_recorded_at_ms: None,
+            prev_event_type: None,
+        });
     }
 
     let mut prev: Option<&EnforcementEvent> = None;
@@ -472,22 +469,22 @@ pub fn verify_chain_with_skips(
         if let Some(p) = prev {
             if e.prev_hash != p.event_hash {
                 let explained_by_skip = skipped_seqs.iter().any(|s| *s > p.seq_no && *s < e.seq_no);
-                let kind = if explained_by_skip {
-                    result.unknown_schema += 1;
-                    ChainBreakKind::UnknownSchema
-                } else {
+                // A gap a skip already explains was surfaced and counted as an
+                // UnknownSchema break on the skip's own seq above; don't
+                // double-report it here. Only a mismatch with no skip between
+                // the pair is a genuine linkage break.
+                if !explained_by_skip {
                     result.linkage_breaks += 1;
-                    ChainBreakKind::Linkage
-                };
-                result.breaks.push(ChainBreak {
-                    kind,
-                    seq_no: e.seq_no,
-                    recorded_at_ms: e.recorded_at_ms,
-                    event_type: event_type_label(&e.event_type).to_string(),
-                    prev_seq_no: Some(p.seq_no),
-                    prev_recorded_at_ms: Some(p.recorded_at_ms),
-                    prev_event_type: Some(event_type_label(&p.event_type).to_string()),
-                });
+                    result.breaks.push(ChainBreak {
+                        kind: ChainBreakKind::Linkage,
+                        seq_no: e.seq_no,
+                        recorded_at_ms: e.recorded_at_ms,
+                        event_type: event_type_label(&e.event_type).to_string(),
+                        prev_seq_no: Some(p.seq_no),
+                        prev_recorded_at_ms: Some(p.recorded_at_ms),
+                        prev_event_type: Some(event_type_label(&p.event_type).to_string()),
+                    });
+                }
             }
         }
 
