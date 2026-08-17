@@ -80,7 +80,7 @@ pub struct ImportArgs {
     pub file: Option<PathBuf>,
 
     /// Import Claude Code's auto-memory directory for this project
-    /// (~/.claude/projects/<slug>/memory/) as dev notes
+    /// (`~/.claude/projects/<slug>/memory/`) as dev notes
     #[arg(long, conflicts_with = "file")]
     pub auto_memory: bool,
 }

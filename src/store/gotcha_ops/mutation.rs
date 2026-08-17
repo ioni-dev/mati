@@ -338,7 +338,7 @@ pub async fn apply_gotcha_tombstone(
 /// rewrites its `affected_files` into normalized form. The link sync below is
 /// additive (`old` is empty), so a link left behind at the old spelling stays
 /// until `mati repair` — which now reports it as a stale file link and clears
-/// it, per the derived-index model in [`super::repair`].
+/// it, per the derived-index model in [`crate::store::repair`].
 ///
 /// Confirming also stamps each affected file's on-disk content digest onto the
 /// record (see [`confirm_content_stamp`]), which is what makes re-confirming a
