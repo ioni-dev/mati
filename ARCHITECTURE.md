@@ -539,7 +539,8 @@ The pre-bash hook classifies shell commands before they run.
 
 - **CatLike**: `cat`, `less`, `head`, `tail`, `bat`. The file path is extracted from the first non-flag argument.
 - **GrepLike**: `grep`, `rg`, `sed`, `awk`. The file path is extracted from the last non-flag argument.
-- Anything else is not treated as a file-read operation and passes through unconditionally.
+- **PathMutating**: `rm`, `mv`, `rmdir`, `shred`. Every non-flag argument is a target path. Normalizes to `tool=path`, so a `target_path_glob` policy gates a delete or move the same way it gates an edit (section 10a.1).
+- Anything else is not treated as a governed operation and passes through unconditionally.
 
 On Claude Code, the Bash gate never emits `permissionDecision: "allow"`. Bash is a permission-required tool, so a force-allow would suppress the user's permission prompt for every command mati does not deny. Non-deny outcomes defer (empty stdout, exit 0); advisory/consulted context is injected via `additionalContext` *without* a `permissionDecision`, which Claude Code treats as "inject context, permission flow proceeds normally." Only the read gate (`Read`/`Glob`/`Grep` — no-permission tools) emits the no-op `allow`. This invariant is pinned by the `only_pre_read_force_allows` test in `cli::hook_decide`.
 
@@ -703,6 +704,8 @@ A policy has one rollout stage. `off` is never evaluated. `shadow` is evaluated 
 
 Every create, edit, stage change, and tombstone path goes through `store::policy_ops`, mirroring the gotcha discipline in section 22: the canonical record is written first and fails hard, and the `ControlChanged` event follows best-effort. `mati policy enable` and `disable` are aliases for setting the stage to `enforce` and `off`. Policies have no derived index, so they need no dirty-marker or repair reconciliation.
 
+`mati protect <glob>` is sugar over this authoring path for the common case of guarding a repo path. It writes a `policy:protect-<slug>` (trigger `{ tool: "path", target_path_glob }`, `mode: block`, `via: [mem_get]`) plus the backing `decision:protect-<slug>` the agent consults to unlock one, in a single command. It defaults to `shadow` (`--enable` promotes to `enforce`, `--steer` warns instead of blocks) and upserts on re-run. A plain path or a `<base>/**` glob expands to `{ <base>, <base>/** }` so the policy gates deleting the directory itself, not only its contents, without over-matching a sibling; a glob with its own metacharacters is used verbatim.
+
 The approval control depends on Bash remaining permission-required; blanket-allowlisting `mati` in Bash permissions removes that human approval step and lets an agent run `mati policy stage <slug> enforce` directly. Every lifecycle change still writes a `ControlChanged` event to the hash-chained log, so removal remains detectable even when it is not prevented.
 
 `off` is the only stage an agent can write. `shadow` and `enforce` belong to the developer. `mem_set` forces any other stage in an agent payload down to `off`, and refuses to edit or delete a policy that is not already `off`. An agent can draft a policy but cannot make one act, and cannot quietly rewrite one the developer is midway through reviewing. That holds for `mem_set` only. The Bash caveat above still applies to the CLI.
@@ -757,16 +760,18 @@ Event collection on this path is not conditional on denying. A patch that is all
 
 The path policy gate is symlink-safe. The canonical target is resolved once per path, before any gate runs, and both the gotcha gate and the policy gate evaluate the lexical key and the canonical one under the same escalate-only rule: the first deny wins and a non-deny canonical outcome never lowers the lexical decision. Editing or patching a symlink that points at a governed file therefore trips `target_path_glob` on the real target. Claude Code also refuses to write through a symlink after the policy deny has been cleared; that defense-in-depth behavior was verified against Claude Code in the live run, but it is vendor behavior that mati does not control. Codex `apply_patch` has no such guard and parses exact target paths, while the Bash path has no such guard either: a `psql -f` command naming a symlink into a governed directory is denied only because mati resolves the target. Resolving once is therefore load-bearing outside the Claude edit path and must remain there. `canonical_rel_path` returns `None` for a non-symlink, so the common path costs nothing extra.
 
-The policy adapter scope is intentional: `db_client` actions on the Bash path
-and `path` actions on Claude edits and Codex `apply_patch` are policy-governed.
-`db_client` policies enforce on both Claude and Codex Bash, for fileless and
-file-bearing commands; schema introspection is exempt so it can steer toward
-the consultation that remedies the policy. Codex denies exit 2 with a `mati:`
-instruction on stderr, while Claude denies remain `permissionDecision` JSON.
-`file_read` actions from `cat`/`grep`-class Bash commands are not policy-
-governed; the gotcha read gate already owns that surface under P1. A stored
-`file_read` policy therefore receives an author/doctor warning instead of
-silently pretending it can enforce.
+The policy adapter scope is intentional. `db_client` actions are governed on both Claude and Codex Bash, fileless and file-bearing; schema introspection is exempt so it can steer toward the consultation that remedies the policy. `path` actions are governed on Claude edits, Codex `apply_patch`, and — via the `PathMutating` class — `rm`/`mv`/`rmdir`/`shred` on the Bash path, so a `target_path_glob` policy gates deletes and moves like edits. Each Bash action is governed by its own category: `evaluate_governed_policy` keys on the action's tool, so a `db_client` action gates on `db_client` and a `path` action on `path`. `file_read` actions from `cat`/`grep`-class Bash commands are not policy-governed; the gotcha read gate already owns that surface under P1, and a stored `file_read` policy receives an author/doctor warning instead of silently pretending it can enforce. Codex denies exit 2 with a `mati:` instruction on stderr, while Claude denies remain `permissionDecision` JSON.
+
+Determinism differs by category, and the boundary must be stated honestly rather than sold as a blanket guarantee:
+
+| Governed action | Determinism |
+| --- | --- |
+| Edit/Write, Codex `apply_patch` | exact (structured target path) |
+| DB client → host | exact (parsed host) |
+| `rm`/`mv`/`rmdir`/`shred` literal path | read-gate level — the 2-5% shell-bypass miss applies (section 24) |
+| pathless verbs (`dd`, `mkfs`, `terraform destroy`, `git reset --hard`) | not governed; normalize to no path and no category |
+
+A block on a literal-path delete is a strong tripwire backed by the audit chain, not a guarantee: an unexpanded variable or process substitution slips it at the same rate `cat` does. Governing the pathless verbs is future work — a `command_glob` predicate plus verb classification, which also has to widen the pre-bash fileless path beyond `db_client`.
 
 This closes the Codex asymmetry in which `codex-post-bash` could mint
 db-introspection receipts for a `db_client` policy category that
@@ -776,7 +781,7 @@ db-introspection receipts for a `db_client` policy category that
 
 Matching is two layers, and the split is deliberate.
 
-**Normalization is code.** `decide::normalize_action` turns a raw invocation into an `Action`: `{ tool, target_path, host, argv, files }`. For bash this extends the classifier in section 10.2 with a `DbClientLike` class (`psql`, `mysql`, `redis-cli`, `mongosh`, `sqlite3`, and peers), reusing the same prefix stripping and basename reduction, so `sudo /usr/bin/psql` normalizes like `psql`. The host comes from `-h`/`--host` or a `PGHOST=`/`DATABASE_URL=` assignment. Files come from a `-f`/`--file` grammar arm. The governable categories (`db_client`, `file_read`, `path`) are a bounded set in code, guarded by `is_known_action_tool`. Adding a category is a reviewed change.
+**Normalization is code.** `decide::normalize_action` turns a raw invocation into an `Action`: `{ tool, target_path, host, argv, files }`. For bash this extends the classifier in section 10.2 with a `DbClientLike` class (`psql`, `mysql`, `redis-cli`, `mongosh`, `sqlite3`, and peers) and a `PathMutating` class (`rm`, `mv`, `rmdir`, `shred`), reusing the same prefix stripping and basename reduction, so `sudo /usr/bin/psql` normalizes like `psql` and `sudo rm -rf x` like `rm`. The host comes from `-h`/`--host` or a `PGHOST=`/`DATABASE_URL=` assignment. `db_client` files come from a `-f`/`--file` grammar arm; `PathMutating` files are every positional (a flag cluster like `-rf` is skipped), normalized to `tool=path`. The governable categories (`db_client`, `file_read`, `path`) are a bounded set in code, guarded by `is_known_action_tool`. Adding a category is a reviewed change.
 
 **Matching is data.** A policy's `trigger` is a declarative predicate over the `Action`, for example `{ tool: "db_client", host_glob: "*prod*" }` or `{ target_path_glob: "**/*.sql" }`. Absent fields are wildcards; present fields must all match. Adding or tuning a policy never touches the decision core. That is what keeps the engine from growing a match arm per rule.
 
