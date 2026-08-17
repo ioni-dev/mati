@@ -430,9 +430,12 @@ pub fn verify_chain(events: &[EnforcementEvent]) -> ChainVerification {
 /// Every seq in `skipped_seqs` surfaces as its own break and counts once toward
 /// `unknown_schema`, wherever it sits — before the first present event, after
 /// the last, none present at all, or several inside one gap between two present
-/// events. The linkage mismatch a bracketed skip creates is suppressed there,
-/// not folded into a single tally, so a chain this binary could not fully read
-/// is never reported valid and the count reflects how many events it missed.
+/// events. A linkage mismatch is suppressed only when *every* seq missing from
+/// its gap is a skip; if a non-skipped seq is also missing, an event was
+/// deleted, and that reports as a `Linkage` break even though a skip shares the
+/// gap. So a chain this binary could not fully read is never reported valid, the
+/// count reflects how many events it missed, and a deletion hiding behind a skip
+/// still surfaces as tampering.
 pub fn verify_chain_with_skips(
     events: &[EnforcementEvent],
     skipped_seqs: &[u64],
@@ -468,11 +471,16 @@ pub fn verify_chain_with_skips(
         // Linkage uses the stored hashes, so it is schema-independent.
         if let Some(p) = prev {
             if e.prev_hash != p.event_hash {
-                let explained_by_skip = skipped_seqs.iter().any(|s| *s > p.seq_no && *s < e.seq_no);
-                // A gap a skip already explains was surfaced and counted as an
-                // UnknownSchema break on the skip's own seq above; don't
-                // double-report it here. Only a mismatch with no skip between
-                // the pair is a genuine linkage break.
+                // seq_no is allocated +1 (SeqAllocator::next), so the events
+                // missing from this gap are exactly `gap_start..e.seq_no`. The
+                // gap is fully explained only when every one of them is a skip
+                // — each was surfaced and counted as an UnknownSchema break on
+                // its own seq above, so suppress the duplicate here. If any
+                // missing seq is not a skip, an event was deleted: a real
+                // linkage break, even when another skip shares the gap.
+                let gap_start = p.seq_no + 1;
+                let explained_by_skip = gap_start < e.seq_no
+                    && (gap_start..e.seq_no).all(|s| skipped_seqs.contains(&s));
                 if !explained_by_skip {
                     result.linkage_breaks += 1;
                     result.breaks.push(ChainBreak {

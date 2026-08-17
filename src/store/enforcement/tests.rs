@@ -242,6 +242,26 @@ fn verify_chain_counts_every_skip_in_one_gap_not_the_gap() {
 }
 
 #[test]
+fn verify_chain_reports_a_deletion_hiding_behind_a_skip_in_the_same_gap() {
+    // One gap between present seq 1 and seq 4 holds two missing events: seq 2
+    // the scan could not read (a skip), and seq 3 genuinely deleted. The skip
+    // does not excuse the deletion — the gap is explained only if *every*
+    // missing seq is a skip. seq 2 counts as unknown; seq 3 surfaces as a
+    // linkage break, so a tamper hidden behind a skip is not laundered into
+    // benign version skew.
+    let mut events = chained(4);
+    events.retain(|e| e.seq_no != 2 && e.seq_no != 3);
+    let v = verify_chain_with_skips(&events, &[2]);
+    assert_eq!(v.unknown_schema, 1, "seq 2 was unreadable");
+    assert_eq!(v.linkage_breaks, 1, "seq 3 was deleted, not skipped");
+    assert!(v
+        .breaks
+        .iter()
+        .any(|b| b.kind == ChainBreakKind::Linkage && b.seq_no == 4));
+    assert!(!v.is_valid());
+}
+
+#[test]
 fn verify_chain_ignores_retention_pruned_prefix() {
     let mut events = chained(3);
     events.remove(0); // prune the earliest event (seq 1)
