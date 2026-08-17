@@ -22,9 +22,13 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UnixStream;
 use tokio::process::Command;
 
+use mati_core::store::db::Store;
 use mati_core::store::derive_slug;
+use mati_core::store::enforcement::{scan_enforcement_events, EnforcementEventType};
 
 mod common;
 
@@ -354,6 +358,145 @@ async fn daemon_start_initializes_metrics_for_doctor_internal() {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
+}
+
+/// Measures the graceful-shutdown wall clock when the drain has real in-flight
+/// handlers to wait on — the busy case the design rests on that every prior
+/// trial missed by running idle (see checkpoint `shutdown-terminator-shipped`).
+///
+/// Pins `N` handlers in-flight by opening sockets and writing a partial line
+/// (no `\n`), so each blocks in `read_line` for its 3s `READ_TIMEOUT`. SIGTERM
+/// then forces `serve_loop_graceful` to drain them under the 5s `DRAIN_TIMEOUT`.
+/// Asserts:
+///   1. exit is bounded well under any OS grace period (`< 8s`),
+///   2. the drain actually engaged (`> 500ms`, vs the ~93ms idle path),
+///   3. the `CleanShutdown` terminator is still the chain tail afterward.
+///
+/// Prints the measured wall clock on a `MEASURE` line. Run with `--nocapture`:
+///
+///     cargo test --test daemon_lifecycle -- --ignored --nocapture \
+///         busy_daemon_shutdown_drains_inflight_then_records_terminator
+#[tokio::test]
+#[ignore]
+async fn busy_daemon_shutdown_drains_inflight_then_records_terminator() {
+    const IN_FLIGHT: usize = 4;
+
+    // This test reopens the store in-process after the daemon exits; isolate
+    // MATI_HOME off the real ~/.mati (also required by the store_home_guard).
+    common::isolate_mati_home();
+
+    let project_temp = TempDir::new().expect("project tempdir");
+    let project = std::fs::canonicalize(project_temp.path()).expect("canonicalize project");
+
+    let bin = env!("CARGO_BIN_EXE_mati");
+    let stderr_path = project.join("daemon.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let mut child = Command::new(bin)
+        .arg("daemon")
+        .arg("start")
+        .current_dir(&project)
+        .env("RUST_LOG", "info")
+        .env("MATI_HOME", common::mati_home())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `mati daemon start`");
+    let pid = child.id().expect("child pid available pre-wait");
+
+    let slug = derive_slug(&project);
+    let mati_root = common::mati_home().join(&slug);
+    let lifecycle_log = mati_root.join("lifecycle.log");
+    let sock = mati_root.join("mati.sock");
+
+    if wait_for_path(&sock, READY_TIMEOUT).is_err() {
+        let _ = child.kill().await;
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!("mati.sock never appeared.\nstderr:\n{stderr}");
+    }
+    let ready = wait_for_log_event(&lifecycle_log, "serve_start", READY_TIMEOUT)
+        && wait_for_phase_ready(&lifecycle_log, READY_TIMEOUT);
+    assert!(
+        ready,
+        "daemon never reached phase=ready; contents:\n{:?}",
+        std::fs::read_to_string(&lifecycle_log).ok()
+    );
+
+    // Pin handlers in-flight: connect, write a partial line (no newline), and
+    // hold the streams so each handler blocks in `read_line` until READ_TIMEOUT.
+    let mut pinned = Vec::with_capacity(IN_FLIGHT);
+    for _ in 0..IN_FLIGHT {
+        let mut stream = UnixStream::connect(&sock)
+            .await
+            .expect("connect to daemon socket");
+        stream.write_all(b"x").await.expect("partial write");
+        stream.flush().await.expect("flush partial write");
+        pinned.push(stream);
+    }
+    // Settle so the accept loop has spawned every handler into `in_flight`
+    // before the accept loop stops. Without this the drain could see zero
+    // in-flight and the measurement would silently fall back to the idle path.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let t0 = Instant::now();
+    unsafe {
+        // SAFETY: SIGTERM to our own child — the documented graceful signal.
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let exit = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
+    let elapsed = t0.elapsed();
+    drop(pinned);
+
+    match exit {
+        Ok(Ok(_status)) => {}
+        Ok(Err(e)) => {
+            let _ = child.kill().await;
+            panic!("child wait error: {e}");
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            panic!(
+                "busy daemon did not exit within {SHUTDOWN_TIMEOUT:?} after SIGTERM\n\
+                 stderr:\n{stderr}"
+            );
+        }
+    }
+
+    println!(
+        "MEASURE busy_shutdown in_flight={IN_FLIGHT} sigterm_to_exit={:.3}s",
+        elapsed.as_secs_f64()
+    );
+
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "busy shutdown took {elapsed:?}; must stay well under any OS grace period"
+    );
+    assert!(
+        elapsed > Duration::from_millis(500),
+        "busy shutdown took only {elapsed:?} — drain never engaged, so this \
+         measured the idle path, not the busy one"
+    );
+
+    // The terminator must still land after a non-trivial drain. Reopen the
+    // released store and confirm `CleanShutdown` is the chain tail.
+    let store = Store::open(&project)
+        .await
+        .expect("reopen store after exit");
+    let events = scan_enforcement_events(&store, 0, u64::MAX)
+        .await
+        .expect("scan enforcement events");
+    let tail = events.last().expect("chain has at least one event");
+    match &tail.event_type {
+        EnforcementEventType::CleanShutdown { reason } => {
+            println!("MEASURE terminator seq={} reason={reason}", tail.seq_no);
+        }
+        other => panic!(
+            "chain tail is {other:?} (seq {}), expected CleanShutdown terminator",
+            tail.seq_no
+        ),
+    }
 }
 
 fn wait_for_phase_ready(log_path: &Path, timeout: Duration) -> bool {

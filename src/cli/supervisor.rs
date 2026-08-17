@@ -233,6 +233,13 @@ fn render_launchd(bin: &Path, project: &Path, slug: &str) -> RenderedUnit {
     </dict>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <!-- launchd's SIGTERM->SIGKILL grace on logout/restart. Default is
+         system-defined (undocumented), so set it explicitly above the
+         daemon's worst-case graceful drain (5s DRAIN_TIMEOUT + 1s abort
+         grace in cli/daemon/serve.rs); a shorter window kills the clean
+         shutdown mid-drain and loses the terminator. -->
+    <key>ExitTimeOut</key>
+    <integer>15</integer>
     <key>StandardOutPath</key>
     <string>{stdout_log}</string>
     <key>StandardErrorPath</key>
@@ -276,6 +283,9 @@ ExecStart={bin} daemon start
 WorkingDirectory={project}
 Restart=on-failure
 RestartSec=5
+# SIGTERM->SIGKILL grace on stop. systemd's default (90s) already covers the
+# daemon's worst-case drain, but set it explicitly for parity with launchd.
+TimeoutStopSec=15
 # Don't churn on persistent failures.
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -340,6 +350,9 @@ mod tests {
         assert!(unit.contents.contains("<false/>"));
         // ThrottleInterval prevents tight respawn loops.
         assert!(unit.contents.contains("<key>ThrottleInterval</key>"));
+        // ExitTimeOut bounds the SIGTERM->SIGKILL grace above the drain worst case.
+        assert!(unit.contents.contains("<key>ExitTimeOut</key>"));
+        assert!(unit.contents.contains("<integer>15</integer>"));
         // Activation command names the right plist.
         assert!(unit.activate_cmd.contains("com.mati.abcd1234.plist"));
     }
