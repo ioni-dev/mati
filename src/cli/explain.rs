@@ -4,6 +4,7 @@
 //! view: purpose, gotchas, decisions, co-change partners, stability signals,
 //! and TODOs. All data comes from the store — zero API calls, <100ms.
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 
 use anyhow::Result;
@@ -278,32 +279,49 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     }
 
     // ── Co-changes ────────────────────────────────────────────────────────────
-    let cochange_prefix = format!("gotcha:cochange:{path}|");
-    let cochange_gotchas = proxy.scan_prefix(&cochange_prefix).await?;
+    // Co-change gotchas are directional: `gotcha:cochange:{source}|{target}` is
+    // written on the file whose change-ratio crossed the threshold, and an
+    // asymmetric pair yields only that one direction. Scanning the forward
+    // prefix alone would miss a partner recorded on *its* own key, so gather
+    // both directions and ground each against the partner's file record. Paths
+    // hold no `|`, so the prefix/suffix split is unambiguous.
+    let all_cochange = proxy.scan_prefix("gotcha:cochange:").await?;
+    let partners = gather_cochange_partners(
+        all_cochange
+            .iter()
+            .filter(|cg| matches!(cg.lifecycle, RecordLifecycle::Active))
+            .map(|cg| (cg.key.as_str(), cg.value.as_str())),
+        &path,
+    );
+
     println!();
     print_section_header("Co-change partners", colors::BLUE, use_color);
-    if cochange_gotchas.is_empty() {
-        let gray = if use_color { colors::GRAY } else { "" };
-        let reset = if use_color { colors::RESET } else { "" };
+    let cyan = if use_color { colors::CYAN } else { "" };
+    let gray = if use_color { colors::GRAY } else { "" };
+    let yellow = if use_color { colors::YELLOW } else { "" };
+    let red = if use_color { colors::RED } else { "" };
+    let reset = if use_color { colors::RESET } else { "" };
+    if partners.is_empty() {
         println!("  {gray}none{reset}");
     } else {
-        for cg in &cochange_gotchas {
-            // Key format: gotcha:cochange:{source}|{target}
-            if let Some(target) = cg.key.strip_prefix(&cochange_prefix) {
-                // Extract the "N/M commits (P%)" part from the rule text for a tight display
-                let pct_hint = cg
-                    .value
-                    .split("commits (")
-                    .nth(1)
-                    .and_then(|s| s.split(')').next())
-                    .map(|p| format!("  ({p})"))
-                    .unwrap_or_default();
-                println!(
-                    "  ● {CYAN}{target}{RESET}{pct_hint}",
-                    CYAN = if use_color { colors::CYAN } else { "" },
-                    RESET = if use_color { colors::RESET } else { "" },
-                );
-            }
+        for (partner, pct) in &partners {
+            let pct_hint = pct
+                .as_deref()
+                .map(|p| format!("  ({p})"))
+                .unwrap_or_default();
+            let liveness = match proxy.get(&format!("file:{partner}")).await? {
+                Some(pr) if matches!(pr.lifecycle, RecordLifecycle::Active) => {
+                    match pr.staleness.tier {
+                        StalenessTier::Liability | StalenessTier::Tombstone => {
+                            format!("  {red}outdated{reset}")
+                        }
+                        StalenessTier::Stale => format!("  {yellow}stale{reset}"),
+                        _ => String::new(),
+                    }
+                }
+                _ => format!("  {red}(no record){reset}"),
+            };
+            println!("  ● {cyan}{partner}{reset}{pct_hint}{liveness}");
         }
     }
 
@@ -387,6 +405,43 @@ pub async fn run(args: ExplainArgs) -> Result<()> {
     Ok(())
 }
 
+/// Collect the co-change partners of `path` from both key directions.
+///
+/// Records are keyed `gotcha:cochange:{source}|{target}`. A forward record
+/// (`source == path`) carries a percentage measured against this file's own
+/// change frequency, so it is kept. A reverse record (`target == path`) was
+/// written on the partner's key; its ratio uses the partner's denominator and
+/// answers a different question, so the partner is surfaced without a pct. When
+/// both directions exist, the forward pct wins regardless of iteration order.
+///
+/// Paths contain no `|`, so the `|`-anchored prefix/suffix match cannot collide
+/// with a path that merely shares a substring.
+fn gather_cochange_partners<'a>(
+    records: impl Iterator<Item = (&'a str, &'a str)>,
+    path: &str,
+) -> BTreeMap<String, Option<String>> {
+    const PREFIX: &str = "gotcha:cochange:";
+    let forward_prefix = format!("{PREFIX}{path}|");
+    let reverse_suffix = format!("|{path}");
+    let mut partners: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (key, value) in records {
+        if let Some(target) = key.strip_prefix(&forward_prefix) {
+            let pct = value
+                .split("commits (")
+                .nth(1)
+                .and_then(|s| s.split(')').next())
+                .map(str::to_string);
+            partners.insert(target.to_string(), pct);
+        } else if let Some(source) = key
+            .strip_prefix(PREFIX)
+            .and_then(|k| k.strip_suffix(&reverse_suffix))
+        {
+            partners.entry(source.to_string()).or_insert(None);
+        }
+    }
+    partners
+}
+
 fn print_section_header(label: &str, color: &str, use_color: bool) {
     if use_color {
         println!("  {color}{label}{}", colors::RESET);
@@ -432,5 +487,74 @@ fn format_gotcha_provenance(record: &Record, confirmed: bool, use_color: bool) -
     } else {
         // Unconfirmed records are clearly advisory
         format!("{gray}({yellow}unconfirmed{reset}{gray}, {source}, {conf:.2}){reset}{stale_note}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gather_cochange_partners;
+
+    fn partners<'a>(records: &[(&'a str, &'a str)], path: &str) -> Vec<(String, Option<String>)> {
+        gather_cochange_partners(records.iter().copied(), path)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn forward_record_keeps_this_files_pct() {
+        let got = partners(
+            &[(
+                "gotcha:cochange:a.rs|b.rs",
+                "Always check `b.rs` when editing this file — changed together in 8/10 commits (80%).",
+            )],
+            "a.rs",
+        );
+        assert_eq!(got, vec![("b.rs".to_string(), Some("80%".to_string()))]);
+    }
+
+    #[test]
+    fn reverse_record_surfaces_partner_without_a_pct() {
+        // The relationship lives on the partner's key. Before the fix, scanning
+        // only the forward prefix showed "none" here.
+        let got = partners(
+            &[(
+                "gotcha:cochange:b.rs|a.rs",
+                "Always check `a.rs` when editing this file — changed together in 4/4 commits (100%).",
+            )],
+            "a.rs",
+        );
+        assert_eq!(got, vec![("b.rs".to_string(), None)]);
+    }
+
+    #[test]
+    fn forward_pct_wins_when_both_directions_exist() {
+        let both = [
+            ("gotcha:cochange:a.rs|b.rs", "… in 8/10 commits (80%)."),
+            ("gotcha:cochange:b.rs|a.rs", "… in 8/9 commits (89%)."),
+        ];
+        // Order-independent: the forward pct must win either way.
+        assert_eq!(
+            partners(&both, "a.rs"),
+            vec![("b.rs".to_string(), Some("80%".to_string()))]
+        );
+        let reversed = [both[1], both[0]];
+        assert_eq!(
+            partners(&reversed, "a.rs"),
+            vec![("b.rs".to_string(), Some("80%".to_string()))]
+        );
+    }
+
+    #[test]
+    fn substring_paths_do_not_collide() {
+        // `xa.rs` and `a.rsx` share a substring with `a.rs` but neither is a
+        // `|`-delimited segment, so neither is a partner of `a.rs`.
+        let got = partners(
+            &[
+                ("gotcha:cochange:xa.rs|b.rs", "… (50%)."),
+                ("gotcha:cochange:b.rs|a.rsx", "… (50%)."),
+            ],
+            "a.rs",
+        );
+        assert!(got.is_empty());
     }
 }
