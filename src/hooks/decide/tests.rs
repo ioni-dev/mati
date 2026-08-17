@@ -1059,10 +1059,88 @@ fn classify_reduces_absolute_path_to_basename() {
 }
 
 #[test]
-fn classify_prefix_on_non_read_stays_none() {
-    // Stripping a wrapper must not invent a read: `sudo rm` is still not one.
-    assert_eq!(classify_command("sudo rm -rf build"), None);
+fn classify_prefix_on_ungoverned_stays_none() {
+    // Stripping a wrapper must not invent a class: `ls` is not governed.
     assert_eq!(classify_command("env X=1 ls"), None);
+    assert_eq!(classify_command("sudo chmod +x build"), None);
+}
+
+#[test]
+fn classify_path_mutating_commands() {
+    for cmd in ["rm -rf build", "mv a b", "rmdir dir", "shred -u secret"] {
+        assert_eq!(
+            classify_command(cmd),
+            Some(CommandClass::PathMutating),
+            "{cmd}"
+        );
+    }
+    // Wrapper stripping applies to path-mutating commands too.
+    assert_eq!(
+        classify_command("sudo rm -rf build"),
+        Some(CommandClass::PathMutating)
+    );
+}
+
+#[test]
+fn extract_path_mutating_skips_flag_cluster() {
+    // `-rf` is skipped like any flag; the positional path survives.
+    assert_eq!(
+        extract_file_paths("rm -rf src/migrations/x", CommandClass::PathMutating),
+        vec!["src/migrations/x".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("rm -rf a b src/migrations/x", CommandClass::PathMutating),
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "src/migrations/x".to_string()
+        ]
+    );
+}
+
+#[test]
+fn path_mutating_normalizes_to_path_tool() {
+    let action = normalize_action(Some("rm -rf src/migrations/0001.sql"), None);
+    assert_eq!(action.tool, "path");
+    assert_eq!(
+        action.target_path.as_deref(),
+        Some("src/migrations/0001.sql")
+    );
+    assert!(action
+        .files
+        .contains(&"src/migrations/0001.sql".to_string()));
+}
+
+#[test]
+fn path_mutating_multi_arg_matches_target_path_glob() {
+    // A protected path in any positional position must match, not just the first.
+    use crate::store::{PolicyMode, PolicyRecord, PolicyStage, PolicyTrigger, Priority};
+    let action = normalize_action(Some("rm -rf safe.txt src/migrations/x"), None);
+    let policy = PolicyRecord {
+        name: "protect migrations".into(),
+        rule: "Consult before deleting migrations.".into(),
+        reason: "Migrations are irreversible because they alter production schema.".into(),
+        scope: "repo".into(),
+        mode: PolicyMode::Block,
+        trigger: PolicyTrigger {
+            tool: None,
+            host_glob: None,
+            target_path_glob: Some("src/migrations/**".into()),
+        },
+        requires: serde_json::from_str(
+            r#"{"key":"decision:protect-migrations","via":["mem_get"],"freshness":{"ttl_secs":900}}"#,
+        )
+        .unwrap(),
+        stage: PolicyStage::Enforce,
+        severity: Priority::High,
+        created_by: "test".into(),
+    };
+    let set = crate::hooks::policy_match::PolicyMatcherSet::from_policies([(
+        "policy:protect-migrations".into(),
+        policy,
+    )])
+    .unwrap();
+    assert!(!set.matches(&action).is_empty());
 }
 
 #[test]

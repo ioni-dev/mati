@@ -114,6 +114,8 @@ enum Commands {
     Eval(cli::eval::EvalArgs),
     /// \[Maintenance\] Verify a signed policy-floor bundle (org policy packs)
     Policy(cli::policy::PolicyArgs),
+    /// Protect a path glob — gate edits and deletes behind a consult
+    Protect(cli::protect::ProtectArgs),
     /// \[Maintenance\] Verify the enforcement audit chain — recompute every
     /// event hash and check the prev_hash linkage. Exits non-zero on any break.
     #[command(name = "verify-chain")]
@@ -349,6 +351,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Doctor(args) => cli::doctor::run(args).await,
         Commands::Eval(args) => cli::eval::run(args).await,
         Commands::Policy(args) => cli::policy::run(args).await,
+        Commands::Protect(args) => cli::protect::run(args).await,
         Commands::VerifyChain(args) => cli::verify_chain::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Sandbox(args) => cli::sandbox::run(args).await,

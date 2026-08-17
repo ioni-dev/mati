@@ -17,6 +17,7 @@ const DB_CLIENT_LIKE: &[&str] = &[
     "sqlite3",
     "sqlcmd",
 ];
+const PATH_MUTATING: &[&str] = &["rm", "mv", "rmdir", "shred"];
 
 pub(super) const ACTION_TOOL_DB_CLIENT: &str = "db_client";
 pub(super) const ACTION_TOOL_FILE_READ: &str = "file_read";
@@ -221,6 +222,11 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
     for &word in DB_CLIENT_LIKE {
         if matches_command_word(trimmed, word) {
             return Some(CommandClass::DbClientLike);
+        }
+    }
+    for &word in PATH_MUTATING {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::PathMutating);
         }
     }
     None

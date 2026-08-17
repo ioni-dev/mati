@@ -15,6 +15,7 @@ pub mod hook_decide;
 pub mod hooks;
 pub mod init;
 pub mod policy;
+pub mod protect;
 pub mod proxy;
 pub mod repair;
 pub mod reparse;
