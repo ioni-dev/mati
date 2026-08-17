@@ -11,6 +11,7 @@ pub mod explain;
 pub mod extract_signals;
 pub mod gaps;
 pub mod gotcha;
+pub mod guard;
 pub mod hook_decide;
 pub mod hooks;
 pub mod init;
