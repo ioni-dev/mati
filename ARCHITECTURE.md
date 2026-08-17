@@ -46,9 +46,9 @@ Every tool definition costs tokens on every Claude call. If a fifth tool feels n
 
 **P4: Memory must reflect developer intent.**
 
-Unconfirmed gotcha records never influence hook enforcement. They exist in the graph and can show up in `mem_bootstrap` as review candidates, but they cannot trigger Deny, and they cannot trigger the gotcha-based context injection path in section 10.1 step 4.
+Unconfirmed gotcha records never influence hook enforcement. They exist in the graph and can show up in `mem_bootstrap` as review candidates, but they cannot trigger Deny, and they cannot trigger the gotcha-based context injection path in section 10.1 step 3.
 
-The Advisory path in section 10.1 step 5 is separate. It uses the file record’s own confidence and quality scores. Those are not tied to any gotcha’s confirmation state.
+The Advisory path in section 10.1 step 6 is separate. It uses the file record’s own confidence and quality scores. Those are not tied to any gotcha’s confirmation state.
 
 _(P5 and P6 are intentionally unassigned. They were removed during the v0.1 scope reduction. The gaps remain so existing code-comment cross-references do not break.)_
 
@@ -75,79 +75,106 @@ Error messages should say what went wrong first. Tool names, module names, and i
 ```text
 mati/
 ├── src/
-│   ├── main.rs              # binary entry point, CLI dispatch
+│   ├── main.rs              # binary entry point, CLI dispatch (Commands enum)
 │   ├── lib.rs               # mati_core library root
+│   ├── policy.rs            # policy-engine core types (evaluation, floors)
+│   ├── invariants.rs        # cross-cutting runtime invariant checks
+│   ├── eval.rs              # enforcement regression corpus model
 │   ├── cli/                 # clap commands, comfy_table output
+│   ├── scaffold/            # files written by `mati init` / `mati hooks`
+│   │   ├── claude_md.rs     # CLAUDE.md scaffold
+│   │   ├── codex.rs         # Codex AGENTS.md + hook wiring
+│   │   ├── commands.rs      # slash-command scaffolds
+│   │   └── settings.rs      # .claude/settings.json hooks + 4s timeout
 │   ├── mcp/                 # MCP stdio server (rmcp) + daemon socket bridge
-│   │   ├── server.rs        # serve(), socket loop, policy consts
+│   │   ├── server/          # serve(), socket loop, dispatch, promotion, proxy
 │   │   ├── tools/           # mem_get, mem_query, mem_bootstrap, mem_set
 │   │   │   ├── mod.rs             # MatiServer + #[tool_router] impl (4 tools)
 │   │   │   ├── context_packet.rs  # mem_bootstrap assembly, shared with handlers/
 │   │   │   └── mem_set_command.rs # mem_set -> typed Command mapping
 │   │   ├── types.rs         # ContextPacket, MCP response types
-│   │   ├── protocol.rs      # v2 typed Request/Response/Command + v1/v2 mapper
+│   │   ├── protocol/        # v2 typed Request/Response/Command + v1/v2 mapper
 │   │   ├── dispatch_v2/     # v2 typed Command to handler dispatch
 │   │   │   ├── mod.rs       # entry point, request context, audit helpers
 │   │   │   ├── reads.rs     # MemQuery + side-effecting reads + v1 bridge
 │   │   │   ├── knowledge.rs # knowledge-side mutations + policy write/evaluate
 │   │   │   ├── compound.rs  # FileEditHook (per-tree atomic substeps)
 │   │   │   └── session.rs   # session-side mutations
-│   │   ├── handlers/        # handler bodies
-│   │   │   ├── mod.rs               # shared helpers (audit, retry) + re-exports
-│   │   │   ├── gotcha.rs             # GotchaUpsert/Confirm/Tombstone
-│   │   │   ├── file.rs               # FileEnrich/FileReparse/DocCapture
-│   │   │   ├── decision_devnote.rs   # DecisionUpsert/DevNoteUpsert
-│   │   │   ├── reads.rs              # MemGet/MemQuery/MemBootstrap
-│   │   │   ├── file_link.rs          # staged file-link computation
-│   │   │   └── record_import.rs      # RecordImport
+│   │   ├── handlers/        # handler bodies (gotcha, file, decision/devnote, reads, ...)
 │   │   ├── daemon_lifecycle.rs # ensure_daemon, lifecycle.log readiness (section 4.2)
+│   │   ├── daemon_log.rs    # daemon.log writer + tracing directives
+│   │   ├── metrics.rs       # MCP-side counters
 │   │   └── metadata.rs      # DaemonMetadata, panic hook, peer cred, lifecycle log
 │   ├── store/               # SurrealKV layer
-│   │   ├── db/              # knowledge.db + sessions.db init
-│   │   │   ├── mod.rs       # Store, KnowledgeWriteOp, open/lifecycle/health/internals
-│   │   │   ├── crud.rs      # get/put/scan/search/transact_knowledge
-│   │   │   ├── history.rs   # HistoryEntry, history/history_since/records_since
-│   │   │   ├── slug.rs      # derive_slug
-│   │   │   └── tree.rs      # SurrealKV Tree construction, lock error hints
+│   │   ├── db/              # knowledge.db + sessions.db init (crud, history, slug, tree)
 │   │   ├── record.rs        # Record struct + all sub-types
 │   │   ├── durability.rs    # Immediate vs Eventual write paths
-│   │   ├── gotcha_ops.rs    # centralized gotcha mutations
+│   │   ├── gotcha_ops/      # centralized gotcha mutations (edges, links, mutation, ...)
+│   │   ├── policy_ops.rs    # policy:* read/write path
 │   │   ├── repair.rs        # gotcha index reconciliation engine
-│   │   ├── enforcement.rs   # EnforcementEvent log
+│   │   ├── enforcement/     # hash-chained event log (models_chain, recording, retention, ...)
+│   │   ├── device.rs        # stable DeviceId (~/.mati/device_id)
+│   │   ├── extraction.rs    # extraction bookkeeping
+│   │   ├── migrations.rs    # on-open record migrations
+│   │   ├── negative_exemplar.rs # tombstoned-rule exemplars for enrichment
+│   │   ├── observability.rs # internal metrics surface (mati doctor --internal)
 │   │   └── session.rs       # session:* markers, harvest, consultation
 │   ├── graph/               # petgraph layer
-│   │   └── edges.rs         # EdgeKind, load/persist, traversal
+│   │   ├── graph.rs         # in-memory graph, load/persist
+│   │   └── edges.rs         # EdgeKind, traversal
 │   ├── search/              # tantivy layer
 │   │   └── index.rs         # schema, index/rebuild, BM25 query
 │   ├── analysis/            # Layer 0 static analysis
 │   │   ├── walker.rs        # ignore + rayon parallel walk
-│   │   ├── parser/          # tree-sitter multi-language parsing
+│   │   ├── parser/          # tree-sitter multi-language parsing (12 languages)
 │   │   ├── resolvers/       # per-language import resolvers
+│   │   ├── enrich_signals/  # AST signal extraction for `extract-signals` (12 languages)
 │   │   ├── edges.rs         # edge derivation from parsed files
 │   │   ├── deps.rs          # Cargo.toml / package.json / go.mod
 │   │   ├── git.rs           # git2 history mining
 │   │   ├── blast_radius.rs  # direct/transitive importer count
 │   │   ├── clusters.rs      # co-change clustering
-│   │   └── propagation.rs   # staleness propagation through import graph
+│   │   ├── propagation.rs   # staleness propagation through import graph
+│   │   ├── reparse.rs       # single-file Layer 0 re-parse
+│   │   ├── auto_memory.rs   # auto-memory extraction
+│   │   ├── claude_md.rs     # CLAUDE.md parsing/import
+│   │   └── onboarding.rs    # onboarding-signal mining
 │   ├── health/              # knowledge health system
 │   │   ├── confidence.rs    # ConfidenceScore computation
 │   │   ├── quality.rs       # QualityScore + RecordQualityAnalyzer
-│   │   ├── staleness.rs     # StalenessScore + StalenessAnalyzer
+│   │   ├── staleness/       # StalenessScore + StalenessAnalyzer (analyzer, git, reparse, ...)
 │   │   ├── gaps.rs          # KnowledgeGapAnalyzer
+│   │   ├── drift.rs         # knowledge drift scoring
+│   │   ├── enrichment.rs    # enrichment-depth hint
 │   │   └── onboarding.rs    # OnboardingScore
-│   └── hooks/               # hook decision engine
-│       ├── decide/          # pure enforcement decision, no I/O
-│       │   ├── mod.rs              # Types + Core Decision Engine (evaluate)
-│       │   ├── classification.rs   # command classification
-│       │   ├── path_extraction.rs  # file-path extraction from shell commands
-│       │   ├── envelope.rs         # apply_patch envelope parsing
-│       │   ├── path_normalize.rs   # lexical path normalization
-│       │   ├── json_helpers.rs     # payload readers used by evaluate()
-│       │   └── config_change.rs    # ConfigChange invariant checks
-│       ├── pre_read.rs      # pre-read hook adapter
-│       ├── pre_bash.rs      # pre-bash hook adapter
-│       ├── config_change.rs # ConfigChange anti-tamper hook adapter
-│       └── compliance.rs    # compliance event recording
+│   ├── hooks/               # hook decision engine + per-agent adapters
+│   │   ├── decide/          # pure enforcement decision, no I/O
+│   │   │   ├── mod.rs              # Types + Core Decision Engine (evaluate)
+│   │   │   ├── classification.rs   # command classification
+│   │   │   ├── path_extraction.rs  # file-path extraction from shell commands
+│   │   │   ├── path_normalize.rs   # lexical path normalization
+│   │   │   ├── envelope.rs         # apply_patch envelope parsing
+│   │   │   ├── json_helpers.rs     # payload readers used by evaluate()
+│   │   │   ├── config_change.rs    # ConfigChange invariant checks
+│   │   │   ├── file_changed.rs     # FileChanged signal decision
+│   │   │   └── instructions_loaded.rs # instructions-loaded decision
+│   │   ├── pre_read.rs      # Claude PreToolUse read gate
+│   │   ├── pre_bash.rs / post_bash.rs       # bash read-intercept + receipt
+│   │   ├── pre_edit.rs / post_edit.rs       # Claude edit backstop + receipt
+│   │   ├── pre_compact.rs / post_compact.rs # compaction hooks
+│   │   ├── session_start.rs / session_end.rs # session lifecycle
+│   │   ├── subagent_start.rs # inject mati awareness into subagents
+│   │   ├── claude_stop.rs   # Claude Stop hook
+│   │   ├── config_change.rs # ConfigChange anti-tamper adapter
+│   │   ├── compliance.rs / post_compliance.rs # compliance event recording
+│   │   ├── post_memget.rs   # consultation receipt after mem_get
+│   │   ├── file_changed.rs  # FileChanged adapter
+│   │   ├── instructions_loaded.rs # instructions-loaded adapter
+│   │   ├── policy_match.rs  # policy-trigger adapter
+│   │   └── codex_*.rs       # Codex adapters (pre_bash, post_bash, pre_apply_patch,
+│   │                        #   session_start, stop, user_prompt)
+│   └── bin/
+│       └── bench_real/      # second binary: real-repo benchmark harness
 ```
 
 ---
@@ -272,6 +299,8 @@ Stored under `file:<path>`. The `FileRecord` is attached to the base `Record` th
 | `blast_radius`         | Direct and transitive importer count, computed during `mati init`                         |
 | `propagated_staleness` | Staleness inherited from upstream stale sources through Imports edges                     |
 | `content_hash`         | SHA-256 of file content at the last Layer 0 scan                                          |
+| `last_author`          | Last commit author for the file, from git2 history. `None` when unavailable.              |
+| `last_modified_session` | Logical clock of the session that last wrote this record                                  |
 
 ### 5.3 GotchaRecord
 
@@ -286,6 +315,7 @@ Stored under `gotcha:<slug>`. Like `FileRecord`, it is attached to the base `Rec
 | `ref_url`        | Optional link to the incident or PR that produced this rule                             |
 | `confirmed`      | `false` means Layer 0 candidate stub, never injected. `true` means developer-validated. |
 | `confirmed_content` | SHA-256 of each affected file **on disk** at the moment the rule was last confirmed (`<path>` -> hex). Baseline for content drift; see section 17.1. |
+| `discovered_session` | Logical clock of the session that first created this gotcha                            |
 
 `confirmed: false` records exist as graph nodes and gap signals. They are not used in hook enforcement. A gotcha can trigger a deny only when `confirmed: true`, `confidence >= 0.6`, and `quality >= 0.4`.
 
@@ -356,7 +386,7 @@ Store keys follow this convention:
 ```text
 gotcha:<slug>          file:<path>           decision:<slug>
 stage:current          dep:<ecosystem>:<name> dev_note:<slug>
-session:<timestamp>    analytics:<type>_<date>
+policy:<slug>          session:<timestamp>    analytics:<type>_<date>
 graph:edge:<from>:<kind>:<to>
 enforcement:event:<seq_no>
 ```
@@ -901,8 +931,8 @@ Confidence feeds into two different paths in section 10.1.
 
 | Path                    | Condition                                                                                | Behavior                                           |
 | ----------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| Deny (section 10.1 step 4)     | attached gotcha: `confirmed = true`, `confidence >= 0.6`, `quality >= 0.4`               | Block file read; require `mem_get` consultation    |
-| Advisory (section 10.1 step 5) | file record: `confidence >= 0.3`, `quality >= 0.4`, with no gotcha confirmation required | Allow read + attach context as `additionalContext` |
+| Deny (section 10.1 step 3)     | attached gotcha: `confirmed = true`, `confidence >= 0.6`, `quality >= 0.4`               | Block file read; require `mem_get` consultation    |
+| Advisory (section 10.1 step 6) | file record: `confidence >= 0.3`, `quality >= 0.4`, with no gotcha confirmation required | Allow read + attach context as `additionalContext` |
 | No injection            | file record: `confidence < 0.3` or `quality < 0.4`                                       | Allow read unconditionally                         |
 
 ### 13.2 Quality Score
@@ -1117,7 +1147,7 @@ enforcement:event:<seq_no>
 - Each event carries `prev_hash`, which is the `event_hash` of the immediately preceding event. The first event uses an empty string.
 - `seq_no` is globally unique, monotonically increasing, and persisted before the event that uses it.
 - Gaps in `seq_no` are acceptable after a crash — a seq is persisted before the event that uses it, so a crash in between leaves a hole. Nothing detects a seq hole today; `RecordingGap` is written on a time gap instead (section 18.1). Hash chain breaks indicate tampering or corruption.
-- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 2 (v2 appends `agent_session`); v1 events still hash under the original 14-field form. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
+- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 2 (v2 appends `agent_session`); v1 events still hash under the original 14-field form (the v2 `CanonicalEvent` serializes 15 fields). Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
 
 There are 9 event types:
 
@@ -1141,6 +1171,7 @@ actor_local
 agent_type
 subject_kind
 subject_key
+canonical_subject_hash
 receipt_id
 decision_reason_code
 decision_basis_hash
@@ -1219,14 +1250,17 @@ All CLI commands write to stdout using `comfy-table` for structured output. Ther
 | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `mati init`                        | Layer 0 scan and project scaffold                                                                                                  |
 | `mati enrich [path]`               | Layer 1 enrichment through Claude                                                                                                  |
+| `mati suggest`                     | Propose gotcha candidates from existing repo artifacts (CODEOWNERS, markers)                                                        |
 | `mati gotcha add`                  | Add a gotcha interactively                                                                                                         |
 | `mati gotcha confirm <key>`        | Confirm a candidate and activate enforcement                                                                                       |
+| `mati note <text>`                 | Add a quick developer note                                                                                                          |
 | `mati review`                      | Batch confirm or tombstone candidates                                                                                              |
 | `mati status`                      | Knowledge health dashboard                                                                                                         |
 | `mati stats`                       | Coverage and onboarding score                                                                                                      |
 | `mati gaps`                        | Files with no records or low confidence                                                                                            |
 | `mati stale`                       | Records that have not been touched since a file changed                                                                            |
 | `mati explain <file>`              | File briefing: gotchas, blast radius, co-change partners, cluster membership                                                       |
+| `mati search <query>`              | Keyword search across gotchas, decisions, notes, and files                                                                         |
 | `mati clusters`                    | Co-change clusters from git history                                                                                                |
 | `mati diff [range]`                | Pre-merge check: surface gotchas for files in a git diff range, such as `main..feature`                                            |
 | `mati show <key>` / `mati ls`      | Browse records. `mati history` is an alias for time-ordered listing.                                                               |
@@ -1235,15 +1269,29 @@ All CLI commands write to stdout using `comfy-table` for structured output. Ther
 | `mati repair --fast`               | Drain dirty-marker queue only. Not a full integrity proof.                                                                         |
 | `mati repair --purge-orphans`      | Tombstone file records whose path is no longer in the repo (section 22)                                                            |
 | `mati doctor`                      | Aggregated health check and CI gate command                                                                                        |
+| `mati quality-check`               | List records by quality tier                                                                                                        |
+| `mati improve <key>`               | Re-open a record for improvement                                                                                                    |
+| `mati eval`                        | Run the enforcement regression corpus: detection/decision recall + false-positive rate against a baseline                          |
+| `mati verify-chain`                | Verify the enforcement audit chain — recompute every event hash and check `prev_hash` linkage. Exits non-zero on any break.        |
+| `mati policy <sub>`                | Author and manage local repository policies (add/edit/list/stage/enable/disable/test) and verify signed policy-floor bundles       |
+| `mati serve [--path <dir>]`        | Run as MCP stdio server for Claude/Codex agent integration. `--path` sets the project root when the host cwd differs.              |
 | `mati daemon start/stop/status`    | Manage the background daemon                                                                                                       |
+| `mati ping [--daemon-only]`        | Check daemon reachability and latency                                                                                              |
 | `mati check`                       | Environment self-test                                                                                                              |
 | `mati hooks`                       | Install pre-read and pre-bash hooks into `.claude/settings.json`, with `--claude` / `--codex` flags                                |
-| `mati reparse <file>`              | Rebuild Layer 0 record for a single file                                                                                           |
+| `mati sandbox <file>`              | Compile Claude denies / prepare Codex entries for a file                                                                            |
+| `mati verify-evidence`             | Verify a candidate gotcha's evidence quote and pattern (`/mati-enrich` Stage 3). Outputs JSON.                                      |
+| `mati extract-signals`             | Extract enrichment signals from a source file via tree-sitter (`/mati-enrich` Stage 1). Outputs JSON.                              |
 | `mati import <file>`               | Import records from a file. The `--pack` compliance-pack loader is planned/enterprise and is not in this repo.                     |
 | `mati export`                      | Export knowledge records                                                                                                           |
 | `mati enable-semantic` _(planned)_ | Not implemented as a subcommand yet. The semantic/vector search layer is currently a build-time opt-in with `--features semantic`. |
 | `mati config`                      | Show or update runtime configuration                                                                                               |
 | `mati supervisor`                  | Generate a launchd or systemd unit for the daemon                                                                                  |
+
+`mati reparse <file>` exists but is hidden from `--help` (internal; the daemon
+re-parses changed files automatically). Other internal, hidden subcommands
+(`hook-decide`, `session-*`, `log-*`, `subagent-context`, `watch-paths`,
+`prompt-context`, …) back the hook scripts and are not part of the user CLI.
 
 Color semantics:
 
@@ -1295,8 +1343,13 @@ file:*
 stage:*
 dev_note:*
 dep:*
+policy:*             (default, not in SESSION_NAMESPACES)
 enforcement:event:*  (default, not in SESSION_NAMESPACES)
 ```
+
+`policy:*` and `enforcement:event:*` reach Immediate through the unknown-prefix
+default, not an explicit branch. If an explicit `policy:` branch is ever added,
+it must stay Immediate.
 
 **Eventual, OS write buffer:**
 
