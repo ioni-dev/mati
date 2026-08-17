@@ -41,7 +41,7 @@ pub enum PolicyOpError {
     },
     #[error(
         "trigger has no predicate; an empty trigger matches every governed action. \
-         Name at least one of tool ({tools}), host_glob, or target_path_glob"
+         Name at least one of tool ({tools}), host_glob, target_path_glob, or command_glob"
     )]
     EmptyTrigger { tools: String },
 }
@@ -53,7 +53,11 @@ pub enum PolicyOpError {
 /// wildcards, so it would gate every `db_client`, `file_read` and `path` action
 /// in the repo. A rule that broad has to name the category it means.
 pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
-    if trigger.tool.is_none() && trigger.host_glob.is_none() && trigger.target_path_glob.is_none() {
+    if trigger.tool.is_none()
+        && trigger.host_glob.is_none()
+        && trigger.target_path_glob.is_none()
+        && trigger.command_glob.is_none()
+    {
         return Err(PolicyOpError::EmptyTrigger {
             tools: crate::hooks::decide::KNOWN_ACTION_TOOLS.join(", "),
         }
@@ -69,6 +73,13 @@ pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
     if let Some(pattern) = trigger.target_path_glob.as_deref() {
         Glob::new(pattern).map_err(|source| PolicyOpError::InvalidGlob {
             field: "target_path_glob",
+            pattern: pattern.to_string(),
+            source,
+        })?;
+    }
+    if let Some(pattern) = trigger.command_glob.as_deref() {
+        Glob::new(pattern).map_err(|source| PolicyOpError::InvalidGlob {
+            field: "command_glob",
             pattern: pattern.to_string(),
             source,
         })?;
@@ -533,6 +544,11 @@ mod tests {
             },
             super::super::record::PolicyTrigger {
                 target_path_glob: Some("**/*.sql".into()),
+                command_glob: None,
+                ..Default::default()
+            },
+            super::super::record::PolicyTrigger {
+                command_glob: Some("terraform destroy*".into()),
                 ..Default::default()
             },
         ] {

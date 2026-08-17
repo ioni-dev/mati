@@ -87,6 +87,7 @@ pub async fn run(args: ProtectArgs) -> Result<()> {
             tool: Some("path".into()),
             host_glob: None,
             target_path_glob: Some(target_glob.clone()),
+            command_glob: None,
         },
         requires: PolicyRequires {
             key: decision_key.clone(),
@@ -146,7 +147,7 @@ fn protect_glob(input: &str) -> String {
     format!("{{{base},{base}/**}}")
 }
 
-fn decision_record(key: &str, glob: &str, reason: &str) -> Record {
+pub(crate) fn decision_record(key: &str, glob: &str, reason: &str) -> Record {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

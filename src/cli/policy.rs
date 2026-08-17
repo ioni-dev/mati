@@ -993,6 +993,7 @@ mod tests {
                 tool: Some("db_client".into()),
                 host_glob: Some("*prod*".into()),
                 target_path_glob: None,
+                command_glob: None,
             },
             requires: serde_json::from_str(
                 r#"{"key":"schema:orders","via":["mem_get"],"freshness":{"ttl_secs":900}}"#,

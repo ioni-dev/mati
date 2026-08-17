@@ -15,6 +15,7 @@ struct CompiledPolicy {
     policy: PolicyRecord,
     host_glob: Option<GlobMatcher>,
     target_path_glob: Option<GlobMatcher>,
+    command_glob: Option<GlobMatcher>,
 }
 
 /// A set of staged, active policies with their glob predicates compiled.
@@ -96,6 +97,7 @@ impl PolicyMatcherSet {
             if policy.trigger.tool.is_none()
                 && policy.trigger.host_glob.is_none()
                 && policy.trigger.target_path_glob.is_none()
+                && policy.trigger.command_glob.is_none()
             {
                 anyhow::bail!("policy {key} has an empty trigger; it would match every action");
             }
@@ -119,11 +121,22 @@ impl PolicyMatcherSet {
                         .map(|glob| glob.compile_matcher())
                 })
                 .transpose()?;
+            let command_glob = policy
+                .trigger
+                .command_glob
+                .as_deref()
+                .map(|pattern| {
+                    Glob::new(pattern)
+                        .with_context(|| format!("invalid command_glob for policy {key}"))
+                        .map(|glob| glob.compile_matcher())
+                })
+                .transpose()?;
             compiled.push(CompiledPolicy {
                 key,
                 policy,
                 host_glob,
                 target_path_glob,
+                command_glob,
             });
         }
         Ok(Self { policies: compiled })
@@ -152,7 +165,13 @@ impl PolicyMatcherSet {
                         .chain(action.files.iter())
                         .any(|path| glob.is_match(path))
                 });
-                tool_matches && host_matches && path_matches
+                // Match the normalized command tokens joined by single spaces —
+                // the same shape `argv` carries after wrapper stripping and
+                // `sh -c` unwrap, so `sudo dd …` matches a `dd *` glob.
+                let command_matches = compiled.command_glob.as_ref().is_none_or(|glob| {
+                    !action.argv.is_empty() && glob.is_match(action.argv.join(" "))
+                });
+                tool_matches && host_matches && path_matches && command_matches
             })
             .map(|compiled| MatchedPolicy {
                 key: &compiled.key,
@@ -273,6 +292,59 @@ mod tests {
     }
 
     #[test]
+    fn command_glob_matches_pathless_verb() {
+        let set = PolicyMatcherSet::from_policies([(
+            "policy:dd".into(),
+            policy(
+                "dd",
+                PolicyTrigger {
+                    command_glob: Some("dd *".into()),
+                    ..Default::default()
+                },
+            ),
+        )])
+        .unwrap();
+        let dd = Action {
+            tool: "unknown".into(),
+            target_path: None,
+            host: None,
+            argv: vec!["dd".into(), "if=/dev/zero".into(), "of=/dev/sda".into()],
+            files: vec![],
+        };
+        assert_eq!(set.matches(&dd)[0].key, "policy:dd");
+        // `ddrescue` is a different command word: the space in `dd *` guards it.
+        let ddrescue = Action {
+            argv: vec!["ddrescue".into(), "x".into()],
+            ..dd.clone()
+        };
+        assert!(set.matches(&ddrescue).is_empty());
+        // Empty argv (an edit action) never matches a command glob.
+        let edit = Action {
+            argv: vec![],
+            ..dd.clone()
+        };
+        assert!(set.matches(&edit).is_empty());
+    }
+
+    #[test]
+    fn command_glob_matches_normalized_argv() {
+        // `sudo dd …` normalizes to argv starting `dd`, so the glob still fires.
+        let set = PolicyMatcherSet::from_policies([(
+            "policy:dd".into(),
+            policy(
+                "dd",
+                PolicyTrigger {
+                    command_glob: Some("dd *".into()),
+                    ..Default::default()
+                },
+            ),
+        )])
+        .unwrap();
+        let action = crate::hooks::decide::normalize_action(Some("sudo dd if=x of=/dev/sda"), None);
+        assert_eq!(set.matches(&action)[0].key, "policy:dd");
+    }
+
+    #[test]
     fn host_glob_matches_and_rejects_nonmatching_hosts() {
         let set = PolicyMatcherSet::from_policies([(
             "policy:prod".into(),
@@ -382,6 +454,7 @@ mod tests {
                     tool: Some("db_client".into()),
                     host_glob: Some("*prod*".into()),
                     target_path_glob: Some("**/*.sql".into()),
+                    command_glob: None,
                 },
             ),
         )])

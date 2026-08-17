@@ -1126,6 +1126,7 @@ fn path_mutating_multi_arg_matches_target_path_glob() {
             tool: None,
             host_glob: None,
             target_path_glob: Some("src/migrations/**".into()),
+            command_glob: None,
         },
         requires: serde_json::from_str(
             r#"{"key":"decision:protect-migrations","via":["mem_get"],"freshness":{"ttl_secs":900}}"#,

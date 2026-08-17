@@ -143,6 +143,7 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
             tool: Some("db_client".into()),
             host_glob: Some("*prod*".into()),
             target_path_glob: None,
+            command_glob: None,
         },
         requires: PolicyRequires {
             key: "schema:orders".into(),
@@ -305,6 +306,7 @@ async fn policies_sharing_requires_key_respect_different_via_sources() {
             tool: Some("db_client".into()),
             host_glob: Some("*prod*".into()),
             target_path_glob: None,
+            command_glob: None,
         },
         requires: PolicyRequires {
             key: "schema:shared".into(),
@@ -392,6 +394,7 @@ async fn unclassified_policy_literal_bypass_records_and_verifies_chain() {
             tool: Some("db_client".into()),
             host_glob: Some("*prod-codex*".into()),
             target_path_glob: None,
+            command_glob: None,
         },
         requires: PolicyRequires {
             key: "schema:orders".into(),
