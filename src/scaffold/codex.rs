@@ -97,7 +97,7 @@ Use `mati` as the codebase memory layer for this repository.
 **Gotcha records:**
 - Rule MUST start with an imperative verb (Always/Never/Ensure/Do not).
 - Reason MUST state causality — what breaks and why.
-- Set confirmed=false; run `mati gotcha confirm <key>` after.
+- Set confirmed=false on write; confirm via mem_set(action="confirm") — see Confirm routing below.
 
 **File enrichment:**
 - Value and purpose MUST start with a verb (Handles/Manages/Validates).
