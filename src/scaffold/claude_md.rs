@@ -37,7 +37,7 @@ When the developer says any of these:
 - \"note that down\" / \"mati note: ...\" / \"we decided to...\"
 
 Call mem_set immediately. Do not ask for confirmation.
-Single gotcha from developer request: mem_set then `mati gotcha confirm <key>`.
+Single gotcha from developer request: mem_set to write, then mem_set with action=\"confirm\" — mati prompts the developer to approve before enforcement activates.
 Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
 
 ## mati Policy Capture
@@ -77,7 +77,7 @@ source \"claude_enrich\" or \"developer_manual\" and confidence >= 0.60, skip it
 already enriched. Only re-enrich if the user explicitly passes the file path.
 
 Per-file flow: mem_get → Read file → extract purpose + gotchas → mem_set file → mem_set each gotcha.
-Single file: mem_set + `mati gotcha confirm <key>` for each gotcha.
+Single file: mem_set to write, then mem_set action=\"confirm\" for each gotcha — mati prompts the developer to approve each one.
 Directory/batch: mem_set only (confirmed=false).
 
 When enrichment is complete, print a summary:

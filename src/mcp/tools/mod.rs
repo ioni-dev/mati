@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::tool_router;
+use rmcp::service::{ElicitationError, ElicitationMode};
+use rmcp::{tool_router, Peer, RoleServer};
 use serde_json::json;
 
 use crate::graph::edges::EdgeKind;
@@ -43,6 +44,53 @@ pub(crate) use context_packet::record_to_agent_json;
 #[cfg(test)]
 use context_packet::{estimate_tokens, TOKEN_BUDGET};
 use mem_set_command::build_mem_set_command;
+
+/// Developer's in-session answer to a gotcha-confirm elicitation. The MCP
+/// client renders `confirm` as an accept/decline control; the accept action
+/// alone is not enough — the developer must set `confirm=true` to vouch for
+/// the rule (P4). Any other outcome leaves the gotcha an unconfirmed draft.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GotchaConfirmDecision {
+    /// Set true to confirm this gotcha and activate hook enforcement.
+    confirm: bool,
+}
+rmcp::elicit_safe!(GotchaConfirmDecision);
+
+/// Whether a gotcha-confirm elicitation resulted in a confirm or a rejection.
+#[derive(Debug)]
+enum ConfirmOutcome {
+    Confirm,
+    Rejected(String),
+}
+
+/// Result of looking up a gotcha before confirming it.
+#[derive(Debug)]
+enum GotchaLookup {
+    Missing,
+    Present { rule: Option<String> },
+}
+
+/// Map an elicitation outcome to a confirm-or-reject decision. Only an explicit
+/// `confirm=true` accept confirms; decline, cancel, empty content, and any
+/// transport/parse failure all reject (fail closed, P4). Pure so the branch that
+/// guards enforcement activation is testable without a live client peer.
+fn classify_confirm_elicitation(
+    key: &str,
+    outcome: Result<Option<GotchaConfirmDecision>, ElicitationError>,
+) -> ConfirmOutcome {
+    match outcome {
+        Ok(Some(decision)) if decision.confirm => ConfirmOutcome::Confirm,
+        Ok(Some(_))
+        | Ok(None)
+        | Err(ElicitationError::UserDeclined)
+        | Err(ElicitationError::UserCancelled) => ConfirmOutcome::Rejected(format!(
+            "confirmation declined; `{key}` stays an unconfirmed draft"
+        )),
+        Err(err) => ConfirmOutcome::Rejected(format!(
+            "confirmation failed: {err}; `{key}` stays an unconfirmed draft"
+        )),
+    }
+}
 
 /// The MCP server struct. After γ-C4, `mati serve` is always a thin
 /// MCP-stdio ↔ UDS proxy that forwards every tool call to a separate
@@ -98,6 +146,79 @@ impl MatiServer {
         match proxy_daemon_v2(&self.root, cmd).await {
             ProxyDaemonResult::Ok(v) => Self::format_envelope(op, v),
             other => Err(Self::socket_error(op, other)),
+        }
+    }
+
+    /// Gate a gotcha confirmation behind an in-session developer accept.
+    ///
+    /// The confirm reaches the daemon only if the developer sets `confirm=true`
+    /// in the elicitation form. A decline, a cancel, an empty response, or any
+    /// transport/parse failure leaves the gotcha an unconfirmed draft — the gate
+    /// fails closed. A client that cannot elicit is told to run the CLI instead,
+    /// so confirmation is never silently granted without a human (P4).
+    async fn confirm_gotcha_via_elicitation(
+        &self,
+        key: &str,
+        peer: Peer<RoleServer>,
+    ) -> Result<String, String> {
+        // Don't ask the developer to vouch for a gotcha that isn't there:
+        // reject a missing key before prompting, same as the daemon would.
+        let rule = match self.gotcha_lookup(key).await {
+            GotchaLookup::Missing => {
+                return Err(json!({ "error": format!("gotcha `{key}` not found") }).to_string());
+            }
+            GotchaLookup::Present { rule } => rule,
+        };
+
+        if !peer
+            .supported_elicitation_modes()
+            .contains(&ElicitationMode::Form)
+        {
+            return Err(json!({
+                "error": format!(
+                    "this MCP client cannot prompt for confirmation in-session; run `mati gotcha confirm {key}` to confirm"
+                )
+            })
+            .to_string());
+        }
+
+        let message = match rule {
+            Some(rule) => {
+                format!("Confirm gotcha `{key}` and activate hook enforcement?\n\nRule: {rule}")
+            }
+            None => format!("Confirm gotcha `{key}` and activate hook enforcement?"),
+        };
+
+        match classify_confirm_elicitation(key, peer.elicit::<GotchaConfirmDecision>(message).await)
+        {
+            ConfirmOutcome::Confirm => {
+                self.socket_call_typed(Command::GotchaConfirm(GotchaConfirmInput {
+                    key: key.to_string(),
+                }))
+                .await
+            }
+            ConfirmOutcome::Rejected(error) => Err(json!({ "error": error }).to_string()),
+        }
+    }
+
+    /// Look up a gotcha for the confirm gate: whether it exists and, if so, its
+    /// rule text for the prompt. A lookup or parse failure counts as `Missing` —
+    /// the gate then rejects rather than prompting for a record it can't read.
+    async fn gotcha_lookup(&self, key: &str) -> GotchaLookup {
+        let Ok(raw) = self.socket_call("get", json!({ "key": key })).await else {
+            return GotchaLookup::Missing;
+        };
+        if raw == "null" {
+            return GotchaLookup::Missing;
+        }
+        match serde_json::from_str::<crate::store::Record>(&raw) {
+            Ok(record) => GotchaLookup::Present {
+                rule: record
+                    .payload_as::<GotchaRecord>()
+                    .map(|gotcha| gotcha.rule)
+                    .filter(|rule| !rule.is_empty()),
+            },
+            Err(_) => GotchaLookup::Missing,
         }
     }
 
@@ -311,6 +432,7 @@ impl MatiServer {
     pub(crate) async fn mem_set(
         &self,
         Parameters(params): Parameters<MemSetParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<String, String> {
         if params.key.starts_with("policy:") {
             let slug = params.key.strip_prefix("policy:").unwrap_or(&params.key);
@@ -395,6 +517,14 @@ impl MatiServer {
                     .await;
             }
         }
+        // Confirming a gotcha activates hook enforcement, so it must reflect
+        // developer intent, not the agent's (P4). The confirm handler stamps
+        // actor "developer" unconditionally, so the human gate lives here:
+        // elicit an in-session accept/decline before dispatching the confirm.
+        if params.action == "confirm" && params.key.starts_with("gotcha:") {
+            return self.confirm_gotcha_via_elicitation(&params.key, peer).await;
+        }
+
         // Route mem_set through typed Commands via proxy_daemon_v2. The
         // legacy v1 mapper has no arms for gotcha_upsert / gotcha_confirm /
         // gotcha_tombstone / decision_upsert / dev_note_upsert / the bogus

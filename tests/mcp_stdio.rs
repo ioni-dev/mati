@@ -387,6 +387,20 @@ fn setup_mcp_server() -> (
     TempDir,
     common::DaemonGuard,
 ) {
+    // Declare elicitation so the confirm gate can prompt (P4). Tests that need
+    // a client without it use `setup_mcp_server_caps("{}")`.
+    setup_mcp_server_caps(r#"{"elicitation":{}}"#)
+}
+
+fn setup_mcp_server_caps(
+    capabilities: &str,
+) -> (
+    std::process::ChildStdin,
+    mpsc::Receiver<String>,
+    ChildGuard,
+    TempDir,
+    common::DaemonGuard,
+) {
     let project_dir = TempDir::new().expect("failed to create tempdir");
     common::isolate_mati_home(); // keep the spawned server's store out of ~/.mati
     let daemon_guard = common::DaemonGuard::for_mati_home(project_dir.path(), common::mati_home());
@@ -411,7 +425,9 @@ fn setup_mcp_server() -> (
     // initialize
     send(
         &mut stdin,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{capabilities},"clientInfo":{{"name":"test","version":"0.1"}}}}}}"#
+        ),
     );
     let init = read_until_id(&rx, 1);
     assert!(init.get("error").is_none(), "initialize failed: {init}");
@@ -446,6 +462,41 @@ fn call_tool(
         "tool {name} returned JSON-RPC error: {resp}"
     );
     extract_text(&resp)
+}
+
+/// Call `mem_set` confirm, answer the server's inbound `elicitation/create`
+/// request with `result` (the JSON for the response `result` field), then
+/// return the tool-call response text. The confirm gate blocks on the
+/// elicitation reply, so a plain `call_tool` would deadlock here.
+fn confirm_with_elicitation(
+    stdin: &mut std::process::ChildStdin,
+    rx: &mpsc::Receiver<String>,
+    id: u64,
+    key: &str,
+    result: &str,
+) -> String {
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"mem_set","arguments":{{"action":"confirm","key":"{key}"}}}}}}"#
+    );
+    send(stdin, &call);
+    loop {
+        let v = parse_json(&recv_line(rx));
+        if v.get("method").and_then(|m| m.as_str()) == Some("elicitation/create") {
+            let req_id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            send(
+                stdin,
+                &format!(r#"{{"jsonrpc":"2.0","id":{req_id},"result":{result}}}"#),
+            );
+            continue;
+        }
+        if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+            assert!(
+                v.get("error").is_none(),
+                "confirm returned JSON-RPC error: {v}"
+            );
+            return extract_text(&v);
+        }
+    }
 }
 
 // ── Test: gotcha lifecycle (write → read → confirm → read → delete → read) ──
@@ -490,13 +541,13 @@ fn mcp_stdio_gotcha_lifecycle() {
         "source should be claude_enrich: {get_text}"
     );
 
-    // Confirm it
-    let confirm_text = call_tool(
+    // Confirm it — the gate elicits; the developer accepts with confirm=true.
+    let confirm_text = confirm_with_elicitation(
         &mut stdin,
         &rx,
         12,
-        "mem_set",
-        r#"{"action":"confirm","key":"gotcha:lifecycle-test"}"#,
+        "gotcha:lifecycle-test",
+        r#"{"action":"accept","content":{"confirm":true}}"#,
     );
     assert!(
         confirm_text.contains("\"confirmed\": true") || confirm_text.contains("\"confirmed\":true"),
@@ -545,6 +596,87 @@ fn mcp_stdio_gotcha_lifecycle() {
     assert!(
         tombstoned_text == "null" || tombstoned_text.contains("null"),
         "tombstoned record should return null: {tombstoned_text}"
+    );
+}
+
+// ── Test: confirm gate — decline keeps the gotcha a draft ────────────────────
+
+#[test]
+fn mcp_stdio_confirm_decline_keeps_draft() {
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
+
+    call_tool(
+        &mut stdin,
+        &rx,
+        30,
+        "mem_set",
+        r#"{"action":"write","key":"gotcha:decline-test","value":"Rule because reason","category":"Gotcha","payload":"{\"rule\":\"Rule\",\"reason\":\"reason\",\"severity\":\"normal\",\"affected_files\":[],\"confirmed\":false}","tags":["test"],"priority":"Normal"}"#,
+    );
+
+    // Developer declines the elicitation — no confirmation reaches the daemon.
+    let declined = confirm_with_elicitation(
+        &mut stdin,
+        &rx,
+        31,
+        "gotcha:decline-test",
+        r#"{"action":"decline"}"#,
+    );
+    assert!(
+        declined.contains("declined"),
+        "decline should report declined: {declined}"
+    );
+
+    // The gotcha is still an unconfirmed draft.
+    let after = call_tool(
+        &mut stdin,
+        &rx,
+        32,
+        "mem_get",
+        r#"{"key":"gotcha:decline-test"}"#,
+    );
+    assert!(
+        after.contains("\"confirmed\": false") || after.contains("\"confirmed\":false"),
+        "declined gotcha must stay unconfirmed: {after}"
+    );
+}
+
+// ── Test: confirm gate — a client without elicitation is redirected to CLI ────
+
+#[test]
+fn mcp_stdio_confirm_without_elicitation_redirects_to_cli() {
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server_caps("{}");
+
+    call_tool(
+        &mut stdin,
+        &rx,
+        40,
+        "mem_set",
+        r#"{"action":"write","key":"gotcha:no-elicit","value":"Rule because reason","category":"Gotcha","payload":"{\"rule\":\"Rule\",\"reason\":\"reason\",\"severity\":\"normal\",\"affected_files\":[],\"confirmed\":false}","tags":["test"],"priority":"Normal"}"#,
+    );
+
+    // No elicitation capability → the gate fails closed to the CLI, no prompt.
+    let text = call_tool(
+        &mut stdin,
+        &rx,
+        41,
+        "mem_set",
+        r#"{"action":"confirm","key":"gotcha:no-elicit"}"#,
+    );
+    assert!(
+        text.contains("mati gotcha confirm"),
+        "should redirect to the CLI: {text}"
+    );
+
+    let after = call_tool(
+        &mut stdin,
+        &rx,
+        42,
+        "mem_get",
+        r#"{"key":"gotcha:no-elicit"}"#,
+    );
+    assert!(
+        after.contains("\"confirmed\": false") || after.contains("\"confirmed\":false"),
+        "gotcha must stay unconfirmed without a human accept: {after}"
     );
 }
 
