@@ -1174,6 +1174,7 @@ impl StoreProxy {
                 let cmd = mati_core::mcp::protocol::Command::GotchaConfirm(
                     mati_core::mcp::protocol::GotchaConfirmInput {
                         key: key.to_string(),
+                        via_elicitation: false,
                     },
                 );
                 match daemon_v2(root, cmd).await {

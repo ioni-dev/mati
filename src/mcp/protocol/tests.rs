@@ -600,6 +600,7 @@ fn command_kind_covers_all_variants() {
             "gotcha_confirm",
             Command::GotchaConfirm(GotchaConfirmInput {
                 key: "gotcha:t".into(),
+                via_elicitation: false,
             }),
         ),
         (
@@ -718,7 +719,8 @@ fn command_is_mutation_classification() {
 
     // Semantic mutations — ARE mutations
     assert!(Command::GotchaConfirm(GotchaConfirmInput {
-        key: "gotcha:t".into()
+        key: "gotcha:t".into(),
+        via_elicitation: false,
     })
     .is_mutation());
     assert!(Command::SessionLog(SessionLogInput {

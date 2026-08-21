@@ -70,6 +70,20 @@ enum GotchaLookup {
     Present { rule: Option<String> },
 }
 
+/// How long the confirm gate waits for the developer's elicitation answer
+/// before failing closed. Bounds the tool call so a client that declares
+/// elicitation but never answers can't wedge it. Overridable via
+/// `MATI_CONFIRM_ELICIT_TIMEOUT_MS` (ops / tests).
+const CONFIRM_ELICIT_TIMEOUT_MS: u64 = 300_000;
+
+fn confirm_elicit_timeout() -> std::time::Duration {
+    let ms = std::env::var("MATI_CONFIRM_ELICIT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(CONFIRM_ELICIT_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 /// Map an elicitation outcome to a confirm-or-reject decision. Only an explicit
 /// `confirm=true` accept confirms; decline, cancel, empty content, and any
 /// transport/parse failure all reject (fail closed, P4). Pure so the branch that
@@ -189,11 +203,14 @@ impl MatiServer {
             None => format!("Confirm gotcha `{key}` and activate hook enforcement?"),
         };
 
-        match classify_confirm_elicitation(key, peer.elicit::<GotchaConfirmDecision>(message).await)
-        {
+        let outcome = peer
+            .elicit_with_timeout::<GotchaConfirmDecision>(message, Some(confirm_elicit_timeout()))
+            .await;
+        match classify_confirm_elicitation(key, outcome) {
             ConfirmOutcome::Confirm => {
                 self.socket_call_typed(Command::GotchaConfirm(GotchaConfirmInput {
                     key: key.to_string(),
+                    via_elicitation: true,
                 }))
                 .await
             }

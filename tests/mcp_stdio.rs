@@ -680,6 +680,45 @@ fn mcp_stdio_confirm_without_elicitation_redirects_to_cli() {
     );
 }
 
+// ── Test: confirm gate — a non-answering client times out, fails closed ──────
+
+#[test]
+fn mcp_stdio_confirm_elicitation_timeout_fails_closed() {
+    // A short timeout so the test doesn't wait the 5-minute default. nextest
+    // runs each test in its own process, so this env var does not leak.
+    std::env::set_var("MATI_CONFIRM_ELICIT_TIMEOUT_MS", "400");
+    let (mut stdin, rx, _guard, _dir, _daemon_guard) = setup_mcp_server();
+
+    call_tool(
+        &mut stdin,
+        &rx,
+        60,
+        "mem_set",
+        r#"{"action":"write","key":"gotcha:wedge","value":"Rule because reason","category":"Gotcha","payload":"{\"rule\":\"Rule\",\"reason\":\"reason\",\"severity\":\"normal\",\"affected_files\":[],\"confirmed\":false}","tags":["test"],"priority":"Normal"}"#,
+    );
+
+    // Send the confirm but never answer the elicitation. `read_until_id` skips
+    // the server's `elicitation/create` request; the gate must time out and
+    // return a rejection rather than hang.
+    let text = call_tool(
+        &mut stdin,
+        &rx,
+        61,
+        "mem_set",
+        r#"{"action":"confirm","key":"gotcha:wedge"}"#,
+    );
+    assert!(
+        text.contains("unconfirmed draft") || text.contains("confirmation failed"),
+        "an unanswered elicitation must fail closed: {text}"
+    );
+
+    let after = call_tool(&mut stdin, &rx, 62, "mem_get", r#"{"key":"gotcha:wedge"}"#);
+    assert!(
+        after.contains("\"confirmed\": false") || after.contains("\"confirmed\":false"),
+        "gotcha must stay unconfirmed after a timeout: {after}"
+    );
+}
+
 // ── Test: validation gates ───────────────────────────────────────────────────
 
 #[test]
