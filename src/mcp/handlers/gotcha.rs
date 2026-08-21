@@ -333,7 +333,15 @@ pub(crate) async fn handle_gotcha_confirm(
     // consultation.
     crate::store::gotcha_ops::invalidate_consultation_receipts(store, &affected_files).await;
 
-    // Best-effort: record ControlChanged::Confirmed enforcement event.
+    // Best-effort: record ControlChanged::Confirmed enforcement event. The
+    // reason code records HOW the developer vouched: an in-session elicitation
+    // accept (they saw the rule in the prompt) is a stronger basis than a CLI
+    // or direct-mode confirm, so the audit chain distinguishes it.
+    let reason_code = if input.via_elicitation {
+        "control_confirmed_elicited"
+    } else {
+        "control_confirmed"
+    };
     if let Err(e) = crate::store::enforcement::record_event(
         store,
         crate::store::enforcement::EnforcementEventType::ControlChanged {
@@ -343,7 +351,7 @@ pub(crate) async fn handle_gotcha_confirm(
         key.clone(),
         "developer".to_string(),
         None,
-        "control_confirmed".to_string(),
+        reason_code.to_string(),
         None,
     )
     .await

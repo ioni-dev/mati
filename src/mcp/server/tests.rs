@@ -733,6 +733,7 @@ async fn proxy_daemon_v2_typed_path_handles_mem_set_mutations_no_panic() {
     let cmd = super::super::protocol::Command::GotchaConfirm(
         super::super::protocol::GotchaConfirmInput {
             key: "gotcha:test".into(),
+            via_elicitation: false,
         },
     );
     let result = super::proxy_daemon_v2(dir.path(), cmd).await;

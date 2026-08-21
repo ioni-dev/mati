@@ -869,6 +869,7 @@ fn no_mutation_or_side_effecting_read_reaches_v1_bridge() {
         }),
         Command::GotchaConfirm(GotchaConfirmInput {
             key: "gotcha:t".into(),
+            via_elicitation: false,
         }),
         Command::GotchaTombstone(GotchaTombstoneInput {
             key: "gotcha:t".into(),
@@ -951,6 +952,7 @@ async fn knowledge_side_mutation_audit_goes_to_knowledge_tree() {
     // should still produce a knowledge-tree audit entry.
     let req = make_request(Command::GotchaConfirm(GotchaConfirmInput {
         key: "gotcha:nonexistent".into(),
+        via_elicitation: false,
     }));
     let resp = dispatch_v2(&graph, &ctx, req).await;
     assert!(matches!(resp, Response::Err { .. }));
@@ -1135,6 +1137,7 @@ async fn gotcha_confirm_stamps_content_hash_on_the_daemon_path() {
 
     let confirm = make_request(Command::GotchaConfirm(GotchaConfirmInput {
         key: "gotcha:daemon-confirm".into(),
+        via_elicitation: false,
     }));
     assert!(matches!(
         dispatch_v2(&graph, &ctx, confirm).await,
@@ -1163,6 +1166,60 @@ async fn gotcha_confirm_stamps_content_hash_on_the_daemon_path() {
     // only assert it was not zeroed by the stamp write.
     assert!(stored.confidence.value >= 0.6);
     assert!(stored.quality.value > 0.0);
+}
+
+/// A confirm that came from an in-session elicitation accept records a distinct
+/// reason code, so the audit chain can tell it apart from a CLI/direct confirm.
+#[tokio::test]
+async fn daemon_confirm_via_elicitation_records_elicited_reason_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let upsert = make_request(Command::GotchaUpsert(GotchaDraftInput {
+        key: "gotcha:elicited".into(),
+        rule: "hold the write lock before touching the index".into(),
+        reason: "concurrent writers corrupt it otherwise".into(),
+        severity: Severity::High,
+        affected_files: vec![],
+        ref_url: None,
+        tags: vec![],
+        priority: Priority::Normal,
+        source: None,
+        confirmed: false,
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, upsert).await,
+        Response::Ok { .. }
+    ));
+
+    let confirm = make_request(Command::GotchaConfirm(GotchaConfirmInput {
+        key: "gotcha:elicited".into(),
+        via_elicitation: true,
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, confirm).await,
+        Response::Ok { .. }
+    ));
+
+    let g = graph.read().await;
+    let events = crate::store::enforcement::scan_enforcement_events(g.store(), 0, u64::MAX)
+        .await
+        .expect("scan");
+    let confirmed = events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.event_type,
+                crate::store::enforcement::EnforcementEventType::ControlChanged {
+                    change_kind: crate::store::enforcement::ControlChangeKind::Confirmed
+                }
+            )
+        })
+        .expect("a Confirmed control event");
+    assert_eq!(confirmed.decision_reason_code, "control_confirmed_elicited");
 }
 
 // ── Native MemGet / MemBootstrap tests ──────────────────────────────

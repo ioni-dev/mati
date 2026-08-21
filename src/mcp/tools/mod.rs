@@ -194,6 +194,7 @@ impl MatiServer {
             ConfirmOutcome::Confirm => {
                 self.socket_call_typed(Command::GotchaConfirm(GotchaConfirmInput {
                     key: key.to_string(),
+                    via_elicitation: true,
                 }))
                 .await
             }

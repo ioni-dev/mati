@@ -33,6 +33,7 @@ pub(super) fn build_mem_set_command(params: &MemSetParams) -> Result<Command, St
             }
             Ok(Command::GotchaConfirm(GotchaConfirmInput {
                 key: params.key.clone(),
+                via_elicitation: false,
             }))
         }
         "delete" => {

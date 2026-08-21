@@ -256,6 +256,13 @@ pub struct GotchaDraftInput {
 #[serde(deny_unknown_fields)]
 pub struct GotchaConfirmInput {
     pub key: String,
+    /// True when the confirm came from an in-session elicitation accept (the
+    /// developer approved a prompt showing the rule), false for a CLI or
+    /// direct-mode confirm. Drives the enforcement event's reason code so the
+    /// audit chain records the strongest confirm channel distinctly. Defaults
+    /// to false so an older client that omits it deserializes cleanly.
+    #[serde(default)]
+    pub via_elicitation: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

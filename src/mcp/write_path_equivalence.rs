@@ -185,6 +185,7 @@ async fn drive_confirm(
         Path::Daemon => {
             let input = protocol::GotchaConfirmInput {
                 key: key.to_string(),
+                via_elicitation: false,
             };
             handlers::handle_gotcha_confirm(store, &test_ctx(repo_root), uuid::Uuid::nil(), &input)
                 .await
