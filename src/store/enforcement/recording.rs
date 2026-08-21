@@ -136,12 +136,47 @@ pub async fn record_event_with_session(
     decision_basis_hash: Option<String>,
     agent_session: Option<String>,
 ) -> Result<Option<EnforcementEvent>> {
+    record_event_with_lineage(
+        store,
+        event_type,
+        subject_kind,
+        subject_key,
+        agent_type,
+        receipt_id,
+        decision_reason_code,
+        decision_basis_hash,
+        agent_session,
+        None,
+    )
+    .await
+}
+
+/// Like [`record_event_with_session`], but also records the subagent ACTOR
+/// (Claude Code Task `agent_id`) that drove the event, for one-level agent
+/// lineage (schema_version 3). `agent_session` is the spawning session, `agent_id`
+/// the subagent that acted under it — `None` on the main thread. Only the
+/// `ReceiptMinted` path that receives a `post-memget` hook payload carries both;
+/// other emitters pass `None` for `agent_id`.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_event_with_lineage(
+    store: &Store,
+    event_type: EnforcementEventType,
+    subject_kind: SubjectKind,
+    subject_key: String,
+    agent_type: String,
+    receipt_id: Option<String>,
+    decision_reason_code: String,
+    decision_basis_hash: Option<String>,
+    agent_session: Option<String>,
+    agent_id: Option<String>,
+) -> Result<Option<EnforcementEvent>> {
     let mode = get_enforcement_mode(store).await;
 
     let result = async {
         let writer = shared_writer(store).await?;
         let mut writer = writer.lock().await;
         writer.agent_session = agent_session;
+        writer.agent_id = agent_id;
         writer
             .write(
                 store,

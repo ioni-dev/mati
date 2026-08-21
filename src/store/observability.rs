@@ -321,6 +321,7 @@ mod tests {
             decision_reason_code: "policy_deny".into(),
             decision_basis_hash: None,
             agent_session: None,
+            agent_id: None,
         }
     }
 

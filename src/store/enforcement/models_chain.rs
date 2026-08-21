@@ -4,12 +4,14 @@ use super::*;
 // Constants (FROZEN for v1)
 // ─────────────────────────────────────────────
 
-/// Schema version for the enforcement event envelope. v2 adds `agent_session`,
-/// appended to the canonical form and hashed only for v2+ events; v1 events keep
-/// their original 14-field canonical layout and hashes (see `compute_hash`).
-/// Increment only when fields are added or serialization changes.
-/// Verifiers must reject events with unknown schema versions.
-pub const SCHEMA_VERSION: u8 = 2;
+/// Schema version for the enforcement event envelope. v2 appends `agent_session`
+/// (the spawning session); v3 appends `agent_id` (the subagent actor, for
+/// one-level agent lineage). Each version appends its new field at the END of the
+/// canonical form and is hashed only for events at that version or newer, so v1
+/// events keep their original 14-field layout and hashes, and v2 events keep their
+/// 15-field layout (see `compute_hash`). Increment only when fields are added or
+/// serialization changes. Verifiers must reject events with unknown schema versions.
+pub const SCHEMA_VERSION: u8 = 3;
 
 /// Hash algorithm used for event_hash and prev_hash.
 /// Frozen for v1. Do not change without incrementing SCHEMA_VERSION.
@@ -105,6 +107,16 @@ pub struct EnforcementEvent {
     /// (Codex, config changes, gaps). Added in schema_version 2; hashed only for
     /// v2+ events (see `compute_hash`).
     pub agent_session: Option<String>,
+
+    /// The subagent ACTOR that triggered this event (Claude Code Task `agent_id`).
+    /// Set only when a subagent's tool call drove the event, carried by the
+    /// `post-memget` hook payload. `None` on the main thread and on paths with no
+    /// subagent id (direct-mode CLI, plain MCP `mem_get`). Together with
+    /// `agent_session` (the spawning session) this records one-level agent
+    /// lineage — which subagent acted, under which session — the question an
+    /// enterprise audit asks. Added in schema_version 3; hashed only for v3+
+    /// events (see `compute_hash`).
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +276,30 @@ struct CanonicalEventV2<'a> {
     agent_session: Option<&'a str>,
 }
 
+/// schema_version 3 canonical form: the v2 fields followed by `agent_id`,
+/// appended at the END so v2 events (serialized via `CanonicalEventV2`) keep a
+/// byte-identical canonical form and their original hashes.
+#[derive(Serialize)]
+struct CanonicalEventV3<'a> {
+    event_id: &'a str,
+    schema_version: u8,
+    seq_no: u64,
+    recorded_at_ms: u64,
+    event_type: &'a EnforcementEventType,
+    prev_hash: &'a str,
+    installation_id: &'a str,
+    actor_local: &'a Option<ActorLocal>,
+    agent_type: &'a str,
+    subject_kind: SubjectKind,
+    subject_key: &'a str,
+    canonical_subject_hash: Option<&'a str>,
+    receipt_id: Option<&'a str>,
+    decision_reason_code: &'a str,
+    decision_basis_hash: Option<&'a str>,
+    agent_session: Option<&'a str>,
+    agent_id: Option<&'a str>,
+}
+
 impl EnforcementEvent {
     /// Compute the canonical hash of this event.
     ///
@@ -271,10 +307,35 @@ impl EnforcementEvent {
     /// This function is frozen for schema_version 1 — do not modify
     /// without incrementing SCHEMA_VERSION.
     pub fn compute_hash(&self) -> String {
-        // schema_version 1 hashes the original 14-field canonical form; v2+ hashes
-        // the 15-field form with `agent_session` appended. Branching here keeps
-        // every pre-existing v1 event's hash byte-identical (no false tamper).
-        let json = if self.schema_version >= 2 {
+        // schema_version 1 hashes the original 14-field canonical form; v2 the
+        // 15-field form with `agent_session` appended; v3+ the 16-field form with
+        // `agent_id` appended too. Each branch keeps every pre-existing event's
+        // hash byte-identical at its own version (no false tamper). Newer schemas
+        // never reach here — `verify_chain` short-circuits `schema_version >
+        // SCHEMA_VERSION` to UnknownSchema, and the writer only stamps
+        // SCHEMA_VERSION — so the `>= 3` arm serializes exactly the v3 layout.
+        let json = if self.schema_version >= 3 {
+            let canonical = CanonicalEventV3 {
+                event_id: &self.event_id,
+                schema_version: self.schema_version,
+                seq_no: self.seq_no,
+                recorded_at_ms: self.recorded_at_ms,
+                event_type: &self.event_type,
+                prev_hash: &self.prev_hash,
+                installation_id: &self.installation_id,
+                actor_local: &self.actor_local,
+                agent_type: &self.agent_type,
+                subject_kind: self.subject_kind,
+                subject_key: &self.subject_key,
+                canonical_subject_hash: self.canonical_subject_hash.as_deref(),
+                receipt_id: self.receipt_id.as_deref(),
+                decision_reason_code: &self.decision_reason_code,
+                decision_basis_hash: self.decision_basis_hash.as_deref(),
+                agent_session: self.agent_session.as_deref(),
+                agent_id: self.agent_id.as_deref(),
+            };
+            serde_json::to_string(&canonical).expect("canonical serialization must not fail")
+        } else if self.schema_version == 2 {
             let canonical = CanonicalEventV2 {
                 event_id: &self.event_id,
                 schema_version: self.schema_version,

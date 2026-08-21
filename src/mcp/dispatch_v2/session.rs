@@ -412,8 +412,12 @@ pub(super) async fn dispatch_session_side(
                 let _ = store.put(&input.key, &target_record).await;
             }
 
-            // Best-effort enforcement event: ReceiptMinted — session-attributed.
-            let _ = crate::store::enforcement::record_event_with_session(
+            // Best-effort enforcement event: ReceiptMinted — attributed with
+            // one-level agent lineage. `session_id` is the spawning session,
+            // `agent_id` the subagent actor that consulted under it (empty on the
+            // main thread → None). This is the only emitter that receives both,
+            // via the `post-memget` hook payload.
+            let _ = crate::store::enforcement::record_event_with_lineage(
                 store,
                 crate::store::enforcement::EnforcementEventType::ReceiptMinted,
                 crate::store::enforcement::SubjectKind::File,
@@ -422,7 +426,8 @@ pub(super) async fn dispatch_session_side(
                 Some(staged_receipt.id.clone()),
                 "consultation_requested".to_string(),
                 input.decision_basis_hash.clone(),
-                input.session_id.clone().or_else(|| input.agent_id.clone()),
+                input.session_id.clone(),
+                input.agent_id.clone().filter(|s| !s.is_empty()),
             )
             .await;
 

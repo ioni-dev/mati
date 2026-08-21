@@ -1154,7 +1154,7 @@ enforcement:event:<seq_no>
 - Each event carries `prev_hash`, which is the `event_hash` of the immediately preceding event. The first event uses an empty string.
 - `seq_no` is globally unique, monotonically increasing, and persisted before the event that uses it.
 - Gaps in `seq_no` are acceptable after a crash — a seq is persisted before the event that uses it, so a crash in between leaves a hole. Nothing detects a seq hole today; `RecordingGap` is written on a time gap instead (section 18.1). Hash chain breaks indicate tampering or corruption.
-- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 2 (v2 appends `agent_session`); v1 events still hash under the original 14-field form (the v2 `CanonicalEvent` serializes 15 fields). Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
+- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 3: v2 appends `agent_session`, v3 appends `agent_id`, each at the END of the layout. v1 events still hash under the original 14-field form, v2 events under the 15-field form, v3 under 16 — `compute_hash` branches on the version so every stored hash stays byte-identical. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
 
 There are 9 event types:
 
@@ -1183,13 +1183,14 @@ receipt_id
 decision_reason_code
 decision_basis_hash
 agent_session
+agent_id
 ```
 
 `installation_id` is the stable UUID generated at `mati init`. `actor_local` includes OS username and uid, and is explicitly labeled unverified. `decision_basis_hash` is the SHA-256 of the gotcha state in force at decision time — key, rule text, and confidence per gotcha, sorted by key. It is computed hook-side, where the decision is made, and only ever holds a digest of stored knowledge, never the command or tool input that triggered the gate.
 
-`receipt_id` is the `ConsultationReceipt::id` minted with the receipt: `ReceiptMinted` carries the id it minted, and the `AllowAfterReceipt` that receipt later authorizes carries the same one. `agent_session` is the Claude Code `session_id`, added in schema_version 2. Both are absent where the emitter has neither: an MCP `mem_get` carries no session id, and a deny has no receipt.
+`receipt_id` is the `ConsultationReceipt::id` minted with the receipt: `ReceiptMinted` carries the id it minted, and the `AllowAfterReceipt` that receipt later authorizes carries the same one. `agent_session` is the Claude Code `session_id` (the spawning session), added in schema_version 2. `agent_id` is the subagent actor (Claude Code Task `agent_id`), added in schema_version 3; with `agent_session` it records one-level agent lineage — which subagent acted, under which session. Only the `ReceiptMinted` path fed by the `post-memget` hook payload carries both; the main thread and the emitters with no subagent id (direct-mode CLI, plain MCP `mem_get`) leave `agent_id` null. `receipt_id` and `agent_session` are absent where the emitter has neither: an MCP `mem_get` carries no session id, and a deny has no receipt.
 
-All three are optional and were part of the v2 canonical layout before anything wrote them, so filling them in needs no schema bump — an event written when they were null still hashes under the layout it recorded, and both eras verify in one chain.
+`receipt_id`, `decision_basis_hash`, and `agent_session` were part of the v2 canonical layout before anything wrote them, so filling them in needs no schema bump — an event written when they were null still hashes under the layout it recorded, and every era verifies in one chain. `agent_id` is different: it did not exist in the v2 layout, so hashing it required the v3 bump. Attribution is per-write — the shared writer clears `agent_session`/`agent_id` after each event, so an unattributed event (e.g. a `RecordingGap`) written next never inherits the previous event's lineage.
 
 The enforcement event log is local and owned by the developer. The enterprise tier reads it to generate signed audit artifacts. It does not add events to the log.
 

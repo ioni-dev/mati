@@ -83,6 +83,7 @@ fn frozen_test_event() -> EnforcementEvent {
         decision_reason_code: "gotcha_above_threshold".to_string(),
         decision_basis_hash: Some("def456".to_string()),
         agent_session: None,
+        agent_id: None,
     }
 }
 
@@ -376,6 +377,62 @@ async fn concurrent_record_event_keeps_chain_intact() {
     );
 }
 
+#[tokio::test]
+async fn lineage_persists_and_does_not_leak_to_the_next_event() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    // A subagent consultation: spawning session + subagent actor.
+    record_event_with_lineage(
+        &store,
+        EnforcementEventType::ReceiptMinted,
+        SubjectKind::File,
+        "file:src/billing/charges.rs".to_string(),
+        "claude".to_string(),
+        Some("receipt-1".to_string()),
+        "consultation_requested".to_string(),
+        None,
+        Some("sess-1".to_string()),
+        Some("sub-1".to_string()),
+    )
+    .await
+    .expect("lineage write")
+    .expect("advisory-mode event");
+
+    // An unattributed write on the SAME shared writer must not inherit the
+    // previous event's session/agent.
+    record_event(
+        &store,
+        EnforcementEventType::Deny,
+        SubjectKind::File,
+        "file:src/other.rs".to_string(),
+        "claude".to_string(),
+        None,
+        "gotcha_above_threshold".to_string(),
+        None,
+    )
+    .await
+    .expect("plain write")
+    .expect("advisory-mode event");
+
+    let mut events = scan_enforcement_events(&store, 0, u64::MAX).await.unwrap();
+    events.sort_by_key(|e| e.seq_no);
+    assert_eq!(events.len(), 2);
+
+    // The subagent event carries the full lineage pair, stamped v3.
+    let minted = &events[0];
+    assert_eq!(minted.schema_version, SCHEMA_VERSION);
+    assert_eq!(minted.agent_session.as_deref(), Some("sess-1"));
+    assert_eq!(minted.agent_id.as_deref(), Some("sub-1"));
+
+    // The following unattributed event inherits neither.
+    let deny = &events[1];
+    assert_eq!(deny.agent_session, None, "session must not leak");
+    assert_eq!(deny.agent_id, None, "agent_id must not leak");
+
+    assert!(verify_chain(&events).is_valid());
+}
+
 #[test]
 fn aggregate_event_counts_breaks_out_control_lifecycle() {
     use EnforcementEventType::*;
@@ -442,7 +499,8 @@ fn aggregate_event_counts_empty_is_all_zero() {
 /// chain.
 #[test]
 fn populating_the_optional_fields_keeps_a_mixed_era_chain_valid() {
-    assert_eq!(SCHEMA_VERSION, 2, "these fields live in the v2 layout");
+    // These optional fields live in the v2 layout; the events below are built at
+    // schema_version 2 explicitly, so this holds regardless of SCHEMA_VERSION.
 
     // Pre-change shape: v2 event with every optional attribution left null.
     let mut before = EnforcementEvent {
@@ -926,8 +984,8 @@ fn canonical_subject_hash_is_deterministic() {
 }
 
 #[test]
-fn schema_version_is_two() {
-    assert_eq!(SCHEMA_VERSION, 2);
+fn schema_version_is_three() {
+    assert_eq!(SCHEMA_VERSION, 3);
     assert_eq!(HASH_ALGORITHM, "sha256");
 }
 
@@ -961,6 +1019,91 @@ fn v2_hash_includes_agent_session() {
         as_v1.compute_hash(),
         "v1 and v2 canonical forms must differ (14 vs 15 fields)"
     );
+}
+
+#[test]
+fn agent_id_is_hashed_for_v3_only() {
+    // A v2 event's canonical form stops at agent_session, so agent_id must not
+    // affect its hash — a v2 event written before v3 existed stays byte-identical.
+    let v2_none = EnforcementEvent {
+        schema_version: 2,
+        agent_id: None,
+        ..frozen_test_event()
+    };
+    let v2_with_agent = EnforcementEvent {
+        schema_version: 2,
+        agent_id: Some("sub-1".to_string()),
+        ..frozen_test_event()
+    };
+    assert_eq!(
+        v2_none.compute_hash(),
+        v2_with_agent.compute_hash(),
+        "the v2 canonical form must ignore agent_id"
+    );
+
+    // A v3 event hashes agent_id, so changing it changes the hash — tamper-evident
+    // lineage attribution, the same guarantee agent_session gained in v2.
+    let v3_none = EnforcementEvent {
+        schema_version: 3,
+        agent_id: None,
+        ..frozen_test_event()
+    };
+    let v3_with_agent = EnforcementEvent {
+        schema_version: 3,
+        agent_id: Some("sub-1".to_string()),
+        ..frozen_test_event()
+    };
+    assert_ne!(
+        v3_none.compute_hash(),
+        v3_with_agent.compute_hash(),
+        "the v3 canonical form must cover agent_id"
+    );
+    assert_eq!(
+        v3_with_agent.compute_hash(),
+        v3_with_agent.compute_hash(),
+        "v3 hashing is deterministic"
+    );
+
+    // The v3 form (even with agent_id=None) differs from the v2 form of the same
+    // event — 16 vs 15 fields — proving compute_hash branches into the v3 arm.
+    assert_ne!(
+        v2_none.compute_hash(),
+        v3_none.compute_hash(),
+        "v2 and v3 canonical forms must differ (15 vs 16 fields)"
+    );
+}
+
+#[test]
+fn mixed_v1_v2_v3_chain_verifies_valid() {
+    // One store can hold events written by three eras of the binary. All three
+    // must verify clean in one chain: each hashes under its own layout.
+    let mut prev = String::new();
+    let mut events = Vec::new();
+    for (seq, version, agent) in [
+        (1u64, 1u8, None),
+        (2, 2, None),
+        (3, 3, Some("sub-xyz".to_string())),
+    ] {
+        let mut e = EnforcementEvent {
+            seq_no: seq,
+            schema_version: version,
+            prev_hash: prev.clone(),
+            agent_session: agent.as_ref().map(|_| "sess-1".to_string()),
+            agent_id: agent,
+            event_hash: String::new(),
+            ..frozen_test_event()
+        };
+        e.event_hash = e.compute_hash();
+        prev = e.event_hash.clone();
+        events.push(e);
+    }
+
+    let v = verify_chain(&events);
+    assert!(v.is_valid(), "mixed-era chain must verify clean: {v:?}");
+    assert_eq!(v.checked, 3);
+    assert_eq!(v.tampered_events, 0);
+    assert_eq!(v.linkage_breaks, 0);
+    assert_eq!(v.unknown_schema, 0);
 }
 
 /// Write an event straight into the store at a given seq/timestamp,
