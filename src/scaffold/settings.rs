@@ -14,7 +14,7 @@ use serde_json::Value;
 /// Hook and MCP server registration for `.claude/settings.json`.
 ///
 /// Contains two top-level keys:
-/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / InstructionsLoaded / SessionStart / FileChanged / Stop (ARCHITECTURE.md section 10)
+/// - `hooks` — PreToolUse / PostToolUse / PreCompact / PostCompact / SessionEnd / SubagentStart / SubagentStop / InstructionsLoaded / SessionStart / FileChanged / Stop (ARCHITECTURE.md section 10)
 /// - `mcpServers` — registers `mati serve` as an MCP stdio server (M-07-I)
 ///
 /// `timeout` is in SECONDS, and Claude Code's own default is 600. The `4` on the
@@ -147,6 +147,17 @@ const SETTINGS_JSON: &str = r#"{
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/subagent-stop.sh",
+            "timeout": 4
+          }
+        ]
+      }
+    ],
     "InstructionsLoaded": [
       {
         "hooks": [
@@ -231,6 +242,7 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("post-compact.sh", crate::hooks::post_compact::SCRIPT),
     ("session-end.sh", crate::hooks::session_end::SCRIPT),
     ("subagent-start.sh", crate::hooks::subagent_start::SCRIPT),
+    ("subagent-stop.sh", crate::hooks::subagent_stop::SCRIPT),
     (
         "instructions-loaded.sh",
         crate::hooks::instructions_loaded::SCRIPT,
@@ -586,7 +598,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 16),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 17),
             other => panic!("expected Installed, got {other:?}"),
         }
 
@@ -599,6 +611,7 @@ mod tests {
         assert!(parsed["hooks"]["PostCompact"].is_array());
         assert!(parsed["hooks"]["SessionEnd"].is_array());
         assert!(parsed["hooks"]["SubagentStart"].is_array());
+        assert!(parsed["hooks"]["SubagentStop"].is_array());
         assert!(parsed["hooks"]["InstructionsLoaded"].is_array());
         assert!(parsed["hooks"]["SessionStart"].is_array());
         assert!(parsed["hooks"]["FileChanged"].is_array());

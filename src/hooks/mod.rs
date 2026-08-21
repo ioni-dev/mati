@@ -25,6 +25,7 @@ pub mod pre_read;
 pub mod session_end;
 pub mod session_start;
 pub mod subagent_start;
+pub mod subagent_stop;
 
 #[cfg(test)]
 mod compliance;

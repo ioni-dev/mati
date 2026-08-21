@@ -896,6 +896,53 @@ async fn quality_filter_poor_caveated() {
 }
 
 #[tokio::test]
+async fn recent_subagent_summary_surfaces_in_packet() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    crate::store::session::write_subagent_summary(
+        &store,
+        "Subagent read auth.rs; tokens expire after 15m.",
+        Some("agent-1"),
+        Some("general-purpose"),
+        Some("sess-x"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let graph = Graph::load(store).await.unwrap();
+    let packet = assemble_context_packet(graph.store(), &graph, &[])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        packet.recent_session.as_deref(),
+        Some("Subagent read auth.rs; tokens expire after 15m.")
+    );
+    assert!(
+        packet.injection_string.contains("## Recent Subagent"),
+        "summary must render a section: {}",
+        packet.injection_string
+    );
+    assert!(packet.injection_string.contains("tokens expire after 15m"));
+}
+
+#[tokio::test]
+async fn recent_session_absent_when_no_summary() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+
+    let graph = Graph::load(store).await.unwrap();
+    let packet = assemble_context_packet(graph.store(), &graph, &[])
+        .await
+        .unwrap();
+
+    assert!(packet.recent_session.is_none());
+    assert!(!packet.injection_string.contains("## Recent Subagent"));
+}
+
+#[tokio::test]
 async fn assemble_context_packet_with_context_files_does_graph_traversal() {
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path()).await.unwrap();

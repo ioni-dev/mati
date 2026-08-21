@@ -69,6 +69,48 @@ pub fn analytics_record(key: &str, value: String) -> Record {
     r
 }
 
+/// Key holding the most recent finished subagent's summary. A single,
+/// overwritten key: O(1) for `recent_session` to read, self-bounding (never
+/// grows), and cleared at session harvest so it stays scoped to one session.
+pub const SUBAGENT_SUMMARY_KEY: &str = "session:summary:latest";
+
+/// Max stored characters of a subagent summary. Bounds what `recent_session`
+/// can inject into the bootstrap packet.
+const SUBAGENT_SUMMARY_MAX: usize = 800;
+
+fn truncate_summary(s: &str) -> String {
+    if s.chars().count() <= SUBAGENT_SUMMARY_MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(SUBAGENT_SUMMARY_MAX).collect();
+    out.push('…');
+    out
+}
+
+/// Record a finished subagent's summary, overwriting [`SUBAGENT_SUMMARY_KEY`].
+/// Empty summaries are a no-op. Best-effort — the SubagentStop hook fails open.
+pub async fn write_subagent_summary(
+    store: &Store,
+    summary: &str,
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
+    session_id: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Result<()> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let mut record = session_record(SUBAGENT_SUMMARY_KEY, truncate_summary(trimmed));
+    record.payload = Some(serde_json::json!({
+        "agent_id": agent_id,
+        "agent_type": agent_type,
+        "session_id": session_id,
+        "transcript_path": transcript_path,
+    }));
+    store.put(SUBAGENT_SUMMARY_KEY, &record).await
+}
+
 /// Build the eventual record for one Claude Code `InstructionsLoaded` event.
 pub fn instructions_loaded_record(
     key: &str,
@@ -746,6 +788,11 @@ pub async fn session_harvest(store: &Store, repo_root: &Path) -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "staleness analysis failed"),
     }
 
+    // Drop the latest subagent summary — scoped to the session that just ended.
+    // Above the session:current guard: a session can produce subagent summaries
+    // without a main-agent flush, and the summary must not leak to the next one.
+    let _ = store.delete(SUBAGENT_SUMMARY_KEY).await;
+
     // Read session:current (written by session-flush)
     let session_rec = match store.get("session:current").await? {
         Some(r) => r,
@@ -1381,6 +1428,107 @@ mod tests {
             .expect("get")
             .expect("record");
         assert_ne!(after.staleness.tier, StalenessTier::Tombstone);
+
+        store.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn write_subagent_summary_writes_latest_key() {
+        let (_dir, store) = temp_store().await;
+
+        write_subagent_summary(
+            &store,
+            "  Read config.rs; the timeout is in millis.  ",
+            Some("agent-abc"),
+            Some("general-purpose"),
+            Some("sess-1"),
+            Some("/t/agent-abc.jsonl"),
+        )
+        .await
+        .expect("write summary");
+
+        let rec = store
+            .get(SUBAGENT_SUMMARY_KEY)
+            .await
+            .expect("get")
+            .expect("summary record exists");
+        assert_eq!(rec.value, "Read config.rs; the timeout is in millis.");
+        let payload = rec.payload.expect("payload");
+        assert_eq!(payload["agent_id"], "agent-abc");
+        assert_eq!(payload["agent_type"], "general-purpose");
+        assert_eq!(payload["session_id"], "sess-1");
+
+        store.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn write_subagent_summary_empty_is_noop() {
+        let (_dir, store) = temp_store().await;
+
+        write_subagent_summary(&store, "   \n  ", None, None, None, None)
+            .await
+            .expect("empty summary is ok");
+
+        assert!(
+            store
+                .get(SUBAGENT_SUMMARY_KEY)
+                .await
+                .expect("get")
+                .is_none(),
+            "empty summary must not write a record"
+        );
+
+        store.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn write_subagent_summary_truncates_long_input() {
+        let (_dir, store) = temp_store().await;
+
+        let long = "x".repeat(SUBAGENT_SUMMARY_MAX + 500);
+        write_subagent_summary(&store, &long, None, None, None, None)
+            .await
+            .expect("write");
+
+        let rec = store
+            .get(SUBAGENT_SUMMARY_KEY)
+            .await
+            .expect("get")
+            .expect("record");
+        // SUBAGENT_SUMMARY_MAX chars plus the ellipsis marker.
+        assert_eq!(rec.value.chars().count(), SUBAGENT_SUMMARY_MAX + 1);
+        assert!(rec.value.ends_with('…'));
+
+        store.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn session_harvest_clears_subagent_summary() {
+        let (_dir, store) = temp_store().await;
+
+        write_subagent_summary(&store, "did a thing", None, None, None, None)
+            .await
+            .expect("write");
+        assert!(store
+            .get(SUBAGENT_SUMMARY_KEY)
+            .await
+            .expect("get")
+            .is_some());
+
+        // Harvest with no git repo — still runs the archive + cleanup path.
+        let nowhere = TempDir::new().expect("tempdir");
+        session_harvest(&store, nowhere.path())
+            .await
+            .expect("harvest");
+
+        assert!(
+            store
+                .get(SUBAGENT_SUMMARY_KEY)
+                .await
+                .expect("get")
+                .is_none(),
+            "harvest must clear the subagent summary"
+        );
 
         store.close().await.expect("close");
     }

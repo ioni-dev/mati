@@ -193,6 +193,9 @@ enum Commands {
     SessionHarvest,
     #[command(hide = true)]
     SessionClearConsults,
+    /// Harvest a finished subagent's summary from the SubagentStop payload on stdin.
+    #[command(hide = true, name = "subagent-harvest")]
+    SubagentHarvest,
     /// Emit SubagentStart hook JSON — inject mati awareness into a freshly-spawned subagent.
     #[command(hide = true, name = "subagent-context")]
     SubagentContext,
@@ -450,6 +453,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },
         Commands::SessionClearConsults => match cli::hooks::run_session_clear_consults().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
+        Commands::SubagentHarvest => match cli::hooks::run_subagent_harvest().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },

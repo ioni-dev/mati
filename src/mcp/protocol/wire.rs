@@ -44,6 +44,7 @@ impl Command {
             Self::SessionFlush => "session_flush",
             Self::SessionHarvest => "session_harvest",
             Self::SessionClearConsults => "session_clear_consults",
+            Self::SubagentHarvest(_) => "subagent_harvest",
             Self::RecordImport(_) => "record_import",
         }
     }
@@ -89,6 +90,7 @@ impl Command {
             | Self::SessionFlush
             | Self::SessionHarvest
             | Self::SessionClearConsults
+            | Self::SubagentHarvest(_)
             | Self::RecordImport(_) => "",
         }
     }
@@ -125,6 +127,7 @@ impl Command {
             | Self::SessionFlush
             | Self::SessionHarvest
             | Self::SessionClearConsults
+            | Self::SubagentHarvest(_)
             | Self::RecordImport(_)
         )
     }
