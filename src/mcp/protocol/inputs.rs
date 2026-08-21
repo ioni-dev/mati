@@ -502,6 +502,30 @@ fn default_capture_fingerprint() -> bool {
     true
 }
 
+/// Input for `Command::SubagentHarvest`. Written by the `SubagentStop` hook
+/// when a Task subagent finishes: its `last_assistant_message` is the subagent's
+/// own prose summary, captured into `session:summary:latest` so `mem_bootstrap`
+/// can surface it as `recent_session`. All fields but `summary` default, so an
+/// older hook binary talking to a newer daemon still writes.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentHarvestInput {
+    /// The subagent's final assistant message — its own summary of the work.
+    pub summary: String,
+    /// Claude session_id the subagent ran under (the spawning session).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The subagent's own agent_id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Subagent type (e.g. "general-purpose").
+    #[serde(default)]
+    pub agent_type: Option<String>,
+    /// Path to the subagent's transcript, for later retrieval.
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+}
+
 /// Input for `Command::RecordImport`. Records are written verbatim into the
 /// knowledge tree, preserving every field. The daemon validates each record's
 /// key prefix against the knowledge-namespace allowlist before writing.

@@ -533,6 +533,35 @@ pub(super) async fn dispatch_session_side(
             }
         }
 
+        Command::SubagentHarvest(input) => {
+            let result = sess::write_subagent_summary(
+                store,
+                &input.summary,
+                input.agent_id.as_deref(),
+                input.agent_type.as_deref(),
+                input.session_id.as_deref(),
+                input.transcript_path.as_deref(),
+            )
+            .await;
+            let (accepted, error_code) = match &result {
+                Ok(()) => (true, None),
+                Err(_) => (false, Some(ErrorCode::StoreError)),
+            };
+            let entry = build_audit_entry(
+                ctx,
+                request_id,
+                &command_kind,
+                &target_key,
+                accepted,
+                error_code,
+            );
+            write_session_audit(store, &entry).await;
+            match result {
+                Ok(()) => Response::ok(request_id, serde_json::Value::Null),
+                Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
+            }
+        }
+
         _ => unreachable!("is_session_side guard ensures only session commands reach here"),
     }
 }

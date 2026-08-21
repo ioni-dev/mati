@@ -206,7 +206,8 @@ pub(super) fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         | Command::PolicyShadowObserve(_)
         | Command::SessionFlush
         | Command::SessionHarvest
-        | Command::SessionClearConsults => {
+        | Command::SessionClearConsults
+        | Command::SubagentHarvest(_) => {
             unreachable!("session-side commands are handled natively, not via v1 bridge")
         }
 

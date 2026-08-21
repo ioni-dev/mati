@@ -538,6 +538,24 @@ pub async fn assemble_context_packet(
         }
     }
 
+    // Recent-subagent section — the summary a finished Task subagent left
+    // behind (SubagentStop harvest). Plain-text; empty/missing → nothing shown.
+    let recent_session = store
+        .get(crate::store::session::SUBAGENT_SUMMARY_KEY)
+        .await
+        .ok()
+        .flatten()
+        .map(|record| record.value)
+        .filter(|summary| !summary.trim().is_empty());
+    if let Some(summary) = &recent_session {
+        let section = format!("## Recent Subagent\n{summary}\n");
+        let tokens = estimate_tokens(&section);
+        if used_tokens + tokens <= available_tokens {
+            sections.push(section);
+            used_tokens += tokens;
+        }
+    }
+
     // M-12-E: Passive nudge — detect hot files with no gotchas.
     // NOTE: This is a deliberate exception to P2 ("inject nothing by default").
     // Nudges are advisory suggestions, not knowledge injection, and are only
@@ -573,7 +591,7 @@ pub async fn assemble_context_packet(
         critical_gotchas,
         file_records,
         related_decisions,
-        recent_session: None,
+        recent_session,
         token_estimate,
         stale_warnings,
         unconfirmed_candidates,

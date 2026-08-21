@@ -252,6 +252,43 @@ pub async fn run_session_harvest() -> Result<HookRunOutcome> {
     .await
 }
 
+pub async fn run_subagent_harvest() -> Result<HookRunOutcome> {
+    use mati_core::mcp::protocol as p;
+    // Async turn-end hook, not on the enforcement ceiling. Bound the daemon
+    // round-trip so a slow store can't stall subagent teardown.
+    const SUBAGENT_STOP_DEADLINE_MS: u64 = 3000;
+
+    // Read the SubagentStop payload from stdin. Any read/parse failure or an
+    // empty summary is a no-op — the hook fails open and records nothing.
+    let mut buf = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).is_err() {
+        return Ok(HookRunOutcome::Terminate(0));
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&buf) else {
+        return Ok(HookRunOutcome::Terminate(0));
+    };
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let summary = field("last_assistant_message").unwrap_or_default();
+    if summary.trim().is_empty() {
+        return Ok(HookRunOutcome::Terminate(0));
+    }
+
+    run_with_deadline(
+        "subagent-stop",
+        "<subagent-harvest>",
+        SUBAGENT_STOP_DEADLINE_MS,
+        "subagent harvest exceeded internal deadline",
+        hook_fire_v2(p::Command::SubagentHarvest(p::SubagentHarvestInput {
+            summary,
+            session_id: field("session_id"),
+            agent_id: field("agent_id"),
+            agent_type: field("agent_type"),
+            transcript_path: field("agent_transcript_path"),
+        })),
+    )
+    .await
+}
+
 pub async fn run_session_clear_consults() -> Result<HookRunOutcome> {
     // Clearing receipts is a best-effort scan/delete after compaction. It is
     // not on the enforcement ceiling, but 3000ms bounds a large receipt set

@@ -452,6 +452,26 @@ fn session_harvest_decodes() {
 }
 
 #[test]
+fn subagent_harvest_decodes_with_defaults() {
+    // Only `summary` is required; the rest default to None.
+    let json = serde_json::json!({
+        "v": 2,
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "session": "660e8400-e29b-41d4-a716-446655440000",
+        "cmd": { "type": "subagent_harvest", "summary": "did the thing" }
+    });
+    let req: Request = serde_json::from_value(json).unwrap();
+    match req.cmd {
+        Command::SubagentHarvest(input) => {
+            assert_eq!(input.summary, "did the thing");
+            assert!(input.agent_id.is_none());
+            assert!(input.session_id.is_none());
+        }
+        other => panic!("expected SubagentHarvest, got {other:?}"),
+    }
+}
+
+#[test]
 fn session_clear_consults_decodes() {
     let json = serde_json::json!({
         "v": 2,

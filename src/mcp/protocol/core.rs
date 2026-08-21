@@ -292,6 +292,11 @@ pub enum Command {
     #[serde(rename = "session_clear_consults")]
     SessionClearConsults,
 
+    /// Record a finished subagent's summary (from the SubagentStop hook) into
+    /// `session:summary:latest`, read back by `mem_bootstrap` as `recent_session`.
+    #[serde(rename = "subagent_harvest")]
+    SubagentHarvest(SubagentHarvestInput),
+
     /// Bulk-import a batch of pre-built `Record`s into the knowledge tree.
     /// Bypasses the semantic upsert handlers — records are written verbatim
     /// so an `export → import` round-trip preserves every field
