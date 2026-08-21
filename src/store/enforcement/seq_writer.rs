@@ -215,6 +215,9 @@ pub struct EnforcementEventWriter {
     /// Agent session (Claude Code `session_id`) to attribute written events to,
     /// for per-actor audit (schema_version 2). `None` unless set before `write`.
     pub(super) agent_session: Option<String>,
+    /// Subagent actor (Claude Code Task `agent_id`) that drove the write, for
+    /// one-level agent lineage (schema_version 3). `None` unless set before `write`.
+    pub(super) agent_id: Option<String>,
 }
 
 impl EnforcementEventWriter {
@@ -232,6 +235,7 @@ impl EnforcementEventWriter {
             installation_id,
             prev_hash,
             agent_session: None,
+            agent_id: None,
         })
     }
 
@@ -316,6 +320,7 @@ impl EnforcementEventWriter {
             decision_reason_code,
             decision_basis_hash,
             agent_session: self.agent_session.clone(),
+            agent_id: self.agent_id.clone(),
         };
 
         // Compute and set the event hash
@@ -328,6 +333,13 @@ impl EnforcementEventWriter {
 
         // Update prev_hash for the next event in this writer's lifetime
         self.prev_hash = event.event_hash.clone();
+
+        // Attribution is per-write: clear it so a later write on this shared,
+        // long-lived writer (e.g. a `RecordingGap` from `detect_and_record_gap`,
+        // or any unattributed event) does not inherit this event's session/agent.
+        // Every attributed path sets these immediately before calling `write`.
+        self.agent_session = None;
+        self.agent_id = None;
 
         Ok(event)
     }
