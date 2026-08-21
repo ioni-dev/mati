@@ -123,7 +123,7 @@ git2 = { version = "0.21", default-features = false, features = ["vendored-opens
 
 # --- MCP stdio server (P3 — four tools hard constraint) ---
 # Rust MCP SDK, stdio transport, <10ms startup.
-rmcp = { version = "1.2.0", features = ["server", "transport-io"] }
+rmcp = { version = "1.4.0", features = ["server", "transport-io", "schemars", "elicitation"] }
 
 # --- JSON Schema generation (required by rmcp tool parameters) ---
 schemars = "1.0"

@@ -1630,6 +1630,28 @@ fn policy_payload(enabled: bool) -> serde_json::Value {
     })
 }
 
+// The confirm gate must fail closed: only an explicit `confirm=true` accept
+// activates enforcement; decline, cancel, and empty content must all reject.
+#[test]
+fn confirm_elicitation_only_confirms_on_explicit_accept() {
+    use super::{classify_confirm_elicitation, ConfirmOutcome, GotchaConfirmDecision};
+    use rmcp::service::ElicitationError;
+
+    let key = "gotcha:x";
+    let confirmed =
+        classify_confirm_elicitation(key, Ok(Some(GotchaConfirmDecision { confirm: true })));
+    assert!(matches!(confirmed, ConfirmOutcome::Confirm));
+
+    for rejected in [
+        classify_confirm_elicitation(key, Ok(Some(GotchaConfirmDecision { confirm: false }))),
+        classify_confirm_elicitation(key, Ok(None)),
+        classify_confirm_elicitation(key, Err(ElicitationError::UserDeclined)),
+        classify_confirm_elicitation(key, Err(ElicitationError::UserCancelled)),
+    ] {
+        assert!(matches!(rejected, ConfirmOutcome::Rejected(_)));
+    }
+}
+
 // `mem_set_preserves_existing_layer0_data` was removed: file: writes
 // are no longer accepted via mem_set on either backend. Layer 0
 // preservation under enrichment is now exercised by the
