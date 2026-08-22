@@ -93,6 +93,17 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Current wall-clock time as Unix milliseconds. The enforcement window uses
+/// this, not `now_secs() * 1000`: the second-floored value sits below events
+/// recorded earlier in the current second, and the scan's upper-bound `break`
+/// would drop them.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// Current-state gotcha health, computed from active `gotcha:` records.
 pub(crate) struct GotchaHealth {
     /// Active gotcha records (any confirmation state).
@@ -236,11 +247,11 @@ fn print_enforcement_section(
 /// available or the scan fails — best-effort, like the rest of `mati stats`.
 async fn enforcement_metrics_30d(
     store: &StoreProxy,
-    now_ms: u64,
 ) -> Option<(
     mati_core::store::enforcement::EnforcementEventCounts,
     mati_core::store::enforcement::DerivedEnforcementMetrics,
 )> {
+    let now_ms = now_millis();
     let since_ms = now_ms.saturating_sub(30 * 86_400_000);
     // Route through the proxy (not `direct_store()`) so metrics render whether
     // or not a daemon holds the store — the daemon is the recommended prod
@@ -276,7 +287,7 @@ async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
     gotchas.retain(|r| matches!(r.lifecycle, RecordLifecycle::Active));
     let health = gotcha_health(&gotchas);
 
-    let enforcement = match enforcement_metrics_30d(store, now * 1_000).await {
+    let enforcement = match enforcement_metrics_30d(store).await {
         Some((counts, derived)) => serde_json::json!({
             "available": true,
             "total": counts.total,
@@ -639,7 +650,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
     // 4b. Enforcement events (last 30 days)
     // ════════════════════════════════════════════════════════════════════════════
 
-    if let Some((counts, derived)) = enforcement_metrics_30d(&store, now * 1_000).await {
+    if let Some((counts, derived)) = enforcement_metrics_30d(&store).await {
         print_enforcement_section(
             &counts, &derived, bold, blue, white, red, green, yellow, gray, reset,
         );
@@ -1112,7 +1123,7 @@ async fn display_cached_stats(
     // Enforcement events are not part of the write-seq-keyed snapshot, so scan
     // them live even on a cache hit — otherwise a cached render would omit the
     // section entirely (and never show subagent spawns).
-    if let Some((counts, derived)) = enforcement_metrics_30d(store, now * 1_000).await {
+    if let Some((counts, derived)) = enforcement_metrics_30d(store).await {
         print_enforcement_section(
             &counts, &derived, bold, blue, white, red, green, yellow, gray, reset,
         );
