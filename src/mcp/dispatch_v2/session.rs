@@ -562,6 +562,32 @@ pub(super) async fn dispatch_session_side(
             }
         }
 
+        Command::SubagentSpawned(input) => {
+            // Presence is meaningless without the subagent's identity — no-op if
+            // absent, mirroring the empty-summary guard in SubagentHarvest.
+            let Some(agent_id) = input.agent_id.clone().filter(|a| !a.is_empty()) else {
+                return Response::ok(request_id, serde_json::Value::Null);
+            };
+            let reason = match input.agent_type.as_deref().filter(|t| !t.is_empty()) {
+                Some(t) => format!("subagent_spawned:{t}"),
+                None => "subagent_spawned".to_string(),
+            };
+            let _ = crate::store::enforcement::record_event_with_lineage(
+                store,
+                crate::store::enforcement::EnforcementEventType::SubagentSpawned,
+                crate::store::enforcement::SubjectKind::System,
+                agent_id.clone(),
+                "claude".to_string(),
+                None,
+                reason,
+                None,
+                input.session_id.clone(),
+                Some(agent_id),
+            )
+            .await;
+            Response::ok(request_id, serde_json::Value::Null)
+        }
+
         _ => unreachable!("is_session_side guard ensures only session commands reach here"),
     }
 }

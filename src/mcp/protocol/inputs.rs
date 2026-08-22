@@ -526,6 +526,25 @@ pub struct SubagentHarvestInput {
     pub transcript_path: Option<String>,
 }
 
+/// Input for `Command::SubagentSpawned`. Written by the `SubagentStart` hook:
+/// records a subagent's presence as a hash-chained enforcement event so the audit
+/// can attribute a subagent that spawned and never consulted. `agent_id` is
+/// required in practice (the presence is meaningless without it); the recorder
+/// no-ops when it is absent. All fields default for hook/daemon version skew.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentSpawnedInput {
+    /// The spawned subagent's own agent_id.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// The spawning session_id.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Subagent type (e.g. "general-purpose"), preserved for audit scoring.
+    #[serde(default)]
+    pub agent_type: Option<String>,
+}
+
 /// Input for `Command::RecordImport`. Records are written verbatim into the
 /// knowledge tree, preserving every field. The daemon validates each record's
 /// key prefix against the knowledge-namespace allowlist before writing.

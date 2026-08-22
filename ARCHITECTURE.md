@@ -1156,7 +1156,7 @@ enforcement:event:<seq_no>
 - Gaps in `seq_no` are acceptable after a crash — a seq is persisted before the event that uses it, so a crash in between leaves a hole. Nothing detects a seq hole today; `RecordingGap` is written on a time gap instead (section 18.1). Hash chain breaks indicate tampering or corruption.
 - The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 3: v2 appends `agent_session`, v3 appends `agent_id`, each at the END of the layout. v1 events still hash under the original 14-field form, v2 events under the 15-field form, v3 under 16 — `compute_hash` branches on the version so every stored hash stays byte-identical. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered.
 
-There are 9 event types:
+There are 10 event types:
 
 | Event                      | Trigger                                                                                                          |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -1169,6 +1169,7 @@ There are 9 event types:
 | `RecordingGap`             | The event log was quiet for longer than `STARTUP_GAP_THRESHOLD_MS` when the daemon came up. Records the window, cause, enforcement mode during the gap, and certainty. Written by `mati daemon start` (section 18.1) |
 | `RetentionPruned`          | An oldest-first prefix of the event log was deleted past `enforcement.retention`. Records the count and the seq range. Written by `mati repair`'s full scan, after the deletion |
 | `CleanShutdown`            | The daemon exited gracefully. Records the shutdown reason. Written by `mati daemon start` as the last event of its run, after the drain and before the store closes (section 18.2) |
+| `SubagentSpawned`          | A Task subagent was spawned (Claude Code `SubagentStart`). Records presence — `agent_session` + `agent_id` — independent of any consult, so the audit can attribute a subagent that spawned and never consulted. `subject_kind` is `System`, `subject_key` the agent_id. A new event TYPE at schema_version 3, no bump (section 24) |
 
 Each event also carries:
 

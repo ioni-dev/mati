@@ -1074,19 +1074,32 @@ fn agent_id_is_hashed_for_v3_only() {
 }
 
 #[test]
-fn mixed_v1_v2_v3_chain_verifies_valid() {
-    // One store can hold events written by three eras of the binary. All three
-    // must verify clean in one chain: each hashes under its own layout.
+fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
+    // One store can hold events written by three eras of the binary, plus a
+    // SubagentSpawned (a new event TYPE at v3 — no schema bump, rides the v3
+    // layout). All must verify clean in one chain.
     let mut prev = String::new();
     let mut events = Vec::new();
-    for (seq, version, agent) in [
-        (1u64, 1u8, None),
-        (2, 2, None),
-        (3, 3, Some("sub-xyz".to_string())),
+    for (seq, version, ty, agent) in [
+        (1u64, 1u8, EnforcementEventType::Deny, None),
+        (2, 2, EnforcementEventType::Deny, None),
+        (
+            3,
+            3,
+            EnforcementEventType::Deny,
+            Some("sub-xyz".to_string()),
+        ),
+        (
+            4,
+            3,
+            EnforcementEventType::SubagentSpawned,
+            Some("sub-abc".to_string()),
+        ),
     ] {
         let mut e = EnforcementEvent {
             seq_no: seq,
             schema_version: version,
+            event_type: ty,
             prev_hash: prev.clone(),
             agent_session: agent.as_ref().map(|_| "sess-1".to_string()),
             agent_id: agent,
@@ -1100,10 +1113,47 @@ fn mixed_v1_v2_v3_chain_verifies_valid() {
 
     let v = verify_chain(&events);
     assert!(v.is_valid(), "mixed-era chain must verify clean: {v:?}");
-    assert_eq!(v.checked, 3);
+    assert_eq!(v.checked, 4);
     assert_eq!(v.tampered_events, 0);
     assert_eq!(v.linkage_breaks, 0);
     assert_eq!(v.unknown_schema, 0);
+}
+
+#[test]
+fn subagent_spawned_event_hashes_and_labels() {
+    let e = EnforcementEvent {
+        schema_version: SCHEMA_VERSION,
+        event_type: EnforcementEventType::SubagentSpawned,
+        subject_kind: SubjectKind::System,
+        subject_key: "sub-1".to_string(),
+        agent_session: Some("sess-1".to_string()),
+        agent_id: Some("sub-1".to_string()),
+        ..frozen_test_event()
+    };
+    // Deterministic and covered by the v3+ canonical form.
+    assert_eq!(e.compute_hash(), e.compute_hash());
+    assert_eq!(
+        crate::store::enforcement::event_type_label(&e.event_type),
+        "subagent_spawned"
+    );
+}
+
+#[test]
+fn future_schema_event_reads_as_unknown_not_tampering() {
+    // The same guarantee that protects an OLD binary from a v4 event: an event
+    // at a version this binary does not know verifies as UnknownSchema, never
+    // Tampered. Proven here with SCHEMA_VERSION + 1.
+    let mut e = EnforcementEvent {
+        schema_version: SCHEMA_VERSION + 1,
+        event_hash: String::new(),
+        ..frozen_test_event()
+    };
+    e.event_hash = e.compute_hash();
+
+    let v = verify_chain(&[e]);
+    assert_eq!(v.unknown_schema, 1);
+    assert_eq!(v.tampered_events, 0);
+    assert_eq!(v.checked, 0);
 }
 
 /// Write an event straight into the store at a given seq/timestamp,

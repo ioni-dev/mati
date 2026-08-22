@@ -196,6 +196,9 @@ enum Commands {
     /// Harvest a finished subagent's summary from the SubagentStop payload on stdin.
     #[command(hide = true, name = "subagent-harvest")]
     SubagentHarvest,
+    /// Record a subagent's presence from the SubagentStart payload on stdin.
+    #[command(hide = true, name = "subagent-record")]
+    SubagentRecord,
     /// Emit SubagentStart hook JSON — inject mati awareness into a freshly-spawned subagent.
     #[command(hide = true, name = "subagent-context")]
     SubagentContext,
@@ -457,6 +460,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },
         Commands::SubagentHarvest => match cli::hooks::run_subagent_harvest().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
+        Commands::SubagentRecord => match cli::hooks::run_subagent_record().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },

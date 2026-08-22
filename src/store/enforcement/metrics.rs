@@ -101,6 +101,7 @@ pub fn aggregate_event_counts(events: &[EnforcementEvent]) -> EnforcementEventCo
             EnforcementEventType::RecordingGap { .. } => counts.gaps += 1,
             EnforcementEventType::RetentionPruned { .. } => counts.retention_prunes += 1,
             EnforcementEventType::CleanShutdown { .. } => counts.clean_shutdowns += 1,
+            EnforcementEventType::SubagentSpawned => counts.subagent_spawns += 1,
         }
     }
     counts
@@ -136,6 +137,9 @@ pub struct EnforcementEventCounts {
     /// Graceful daemon exits. One per run that ended cleanly, so the count
     /// falls short of the number of runs by exactly the crashes.
     pub clean_shutdowns: u64,
+    /// `SubagentSpawned` events — subagents that spawned, whether or not they
+    /// went on to consult. Lets the audit attribute spawned-then-idle subagents.
+    pub subagent_spawns: u64,
 }
 
 /// Derived enforcement metrics (PMF/friction signals) computed from the
@@ -269,5 +273,6 @@ pub fn event_type_label(event_type: &EnforcementEventType) -> &'static str {
         EnforcementEventType::RecordingGap { .. } => "gap",
         EnforcementEventType::RetentionPruned { .. } => "retention_pruned",
         EnforcementEventType::CleanShutdown { .. } => "clean_shutdown",
+        EnforcementEventType::SubagentSpawned => "subagent_spawned",
     }
 }
