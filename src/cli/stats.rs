@@ -140,6 +140,97 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
+/// Render the Enforcement (30d) section from a scanned event window. Shared by
+/// the live and cached `mati stats` paths so both show the same figures.
+/// Enforcement events are never in the write-seq-keyed snapshot cache, so the
+/// caller re-runs the bounded scan on a cache hit rather than freezing a count.
+/// Prints nothing when the window is empty.
+#[allow(clippy::too_many_arguments)]
+fn print_enforcement_section(
+    counts: &mati_core::store::enforcement::EnforcementEventCounts,
+    derived: &mati_core::store::enforcement::DerivedEnforcementMetrics,
+    bold: &str,
+    blue: &str,
+    white: &str,
+    red: &str,
+    green: &str,
+    yellow: &str,
+    gray: &str,
+    reset: &str,
+) {
+    if counts.total == 0 {
+        return;
+    }
+    println!("  {bold}{blue}Enforcement (30d){reset}");
+    println!("    Total events           {white}{}{reset}", counts.total);
+    let deny_color = if counts.denials > 0 { red } else { green };
+    println!(
+        "    Denials (blocked)      {deny_color}{}{reset}",
+        counts.denials
+    );
+    println!(
+        "    Allowed after receipt  {green}{}{reset}",
+        counts.allowed_after_receipt
+    );
+    // `receipts_minted` is the raw event count; a single consultation is
+    // reported by up to three emitters, so show the de-duplicated figure and
+    // keep the raw one visible when they differ.
+    if counts.receipts_minted > counts.consultations {
+        println!(
+            "    Consultations          {white}{}{reset}  {gray}({} receipt events){reset}",
+            counts.consultations, counts.receipts_minted
+        );
+    } else {
+        println!(
+            "    Consultations          {white}{}{reset}",
+            counts.consultations
+        );
+    }
+    let bp_c = if counts.bypasses > 0 { red } else { green };
+    println!(
+        "    Bypasses               {bp_c}{}{reset}",
+        counts.bypasses
+    );
+    let gap_c = if counts.gaps > 0 { yellow } else { green };
+    println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
+
+    if counts.subagent_spawns > 0 {
+        println!(
+            "    Subagent spawns        {white}{}{reset}",
+            counts.subagent_spawns
+        );
+    }
+
+    // Derived friction metrics.
+    match derived.blocks_per_session {
+        Some(bps) => println!(
+            "    Blocks / session       {white}{bps:.1}{reset}  {gray}({} sessions){reset}",
+            derived.blocked_sessions
+        ),
+        None => println!("    Blocks / session       {gray}\u{2014}{reset}"),
+    }
+    match derived.median_time_to_consult_ms {
+        Some(ms) => println!(
+            "    Median time-to-consult {white}{}{reset}  {gray}(n={}){reset}",
+            format_duration_ms(ms),
+            derived.consult_pairs
+        ),
+        None => println!("    Median time-to-consult {gray}\u{2014}{reset}"),
+    }
+
+    // Gotcha lifecycle from ControlChanged events.
+    if counts.controls_changed > 0 {
+        println!(
+            "    Gotcha lifecycle       {gray}created{reset} {white}{}{reset} {gray}· confirmed{reset} {white}{}{reset} {gray}· updated{reset} {white}{}{reset} {gray}· removed{reset} {white}{}{reset}",
+            counts.controls_created,
+            counts.controls_confirmed,
+            counts.controls_updated,
+            counts.controls_removed
+        );
+    }
+    println!();
+}
+
 /// Scan the last-30d enforcement events once and compute both the typed
 /// counts and the derived friction metrics. `None` when no direct store is
 /// available or the scan fails — best-effort, like the rest of `mati stats`.
@@ -250,7 +341,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         if let Some(snapshot) = cached.payload_as::<HealthSnapshot>() {
             let age = now.saturating_sub(snapshot.computed_at);
             if snapshot.write_seq == current_seq && age < SNAPSHOT_MAX_AGE_SECS {
-                display_cached_stats(&snapshot, age, &cwd);
+                display_cached_stats(&snapshot, age, &cwd, &store, now).await;
                 store.close().await?;
                 return Ok(());
             }
@@ -549,76 +640,9 @@ pub async fn run(args: StatsArgs) -> Result<()> {
     // ════════════════════════════════════════════════════════════════════════════
 
     if let Some((counts, derived)) = enforcement_metrics_30d(&store, now * 1_000).await {
-        if counts.total > 0 {
-            println!("  {bold}{blue}Enforcement (30d){reset}");
-            println!("    Total events           {white}{}{reset}", counts.total);
-            let deny_color = if counts.denials > 0 { red } else { green };
-            println!(
-                "    Denials (blocked)      {deny_color}{}{reset}",
-                counts.denials
-            );
-            println!(
-                "    Allowed after receipt  {green}{}{reset}",
-                counts.allowed_after_receipt
-            );
-            // `receipts_minted` is the raw event count; a single consultation
-            // is reported by up to three emitters, so show the de-duplicated
-            // figure and keep the raw one visible when they differ.
-            if counts.receipts_minted > counts.consultations {
-                println!(
-                    "    Consultations          {white}{}{reset}  {gray}({} receipt events){reset}",
-                    counts.consultations, counts.receipts_minted
-                );
-            } else {
-                println!(
-                    "    Consultations          {white}{}{reset}",
-                    counts.consultations
-                );
-            }
-            let bp_c = if counts.bypasses > 0 { red } else { green };
-            println!(
-                "    Bypasses               {bp_c}{}{reset}",
-                counts.bypasses
-            );
-            let gap_c = if counts.gaps > 0 { yellow } else { green };
-            println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
-
-            if counts.subagent_spawns > 0 {
-                println!(
-                    "    Subagent spawns        {white}{}{reset}",
-                    counts.subagent_spawns
-                );
-            }
-
-            // Derived friction metrics.
-            match derived.blocks_per_session {
-                Some(bps) => println!(
-                    "    Blocks / session       {white}{bps:.1}{reset}  {gray}({} sessions){reset}",
-                    derived.blocked_sessions
-                ),
-                None => println!("    Blocks / session       {gray}\u{2014}{reset}"),
-            }
-            match derived.median_time_to_consult_ms {
-                Some(ms) => println!(
-                    "    Median time-to-consult {white}{}{reset}  {gray}(n={}){reset}",
-                    format_duration_ms(ms),
-                    derived.consult_pairs
-                ),
-                None => println!("    Median time-to-consult {gray}\u{2014}{reset}"),
-            }
-
-            // Gotcha lifecycle from ControlChanged events.
-            if counts.controls_changed > 0 {
-                println!(
-                    "    Gotcha lifecycle       {gray}created{reset} {white}{}{reset} {gray}· confirmed{reset} {white}{}{reset} {gray}· updated{reset} {white}{}{reset} {gray}· removed{reset} {white}{}{reset}",
-                    counts.controls_created,
-                    counts.controls_confirmed,
-                    counts.controls_updated,
-                    counts.controls_removed
-                );
-            }
-            println!();
-        }
+        print_enforcement_section(
+            &counts, &derived, bold, blue, white, red, green, yellow, gray, reset,
+        );
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -891,7 +915,13 @@ async fn write_snapshot_record_direct(
 ///
 /// Output is identical to the live computation path except for a small
 /// "(cached Ns ago)" annotation after the header.
-fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
+async fn display_cached_stats(
+    s: &HealthSnapshot,
+    age: u64,
+    cwd: &std::path::Path,
+    store: &StoreProxy,
+    now: u64,
+) {
     let use_color = io::stdout().is_terminal();
 
     let (red, blue, green, yellow, gray, white, bold, reset) = if use_color {
@@ -1075,13 +1105,18 @@ fn display_cached_stats(s: &HealthSnapshot, age: u64, cwd: &std::path::Path) {
     }
 
     // Fail-open events from fail_open.log (always live, not cached)
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     print_fail_open(&scan_fail_open_log(now), red, gray, reset);
 
     println!();
+
+    // Enforcement events are not part of the write-seq-keyed snapshot, so scan
+    // them live even on a cache hit — otherwise a cached render would omit the
+    // section entirely (and never show subagent spawns).
+    if let Some((counts, derived)) = enforcement_metrics_30d(store, now * 1_000).await {
+        print_enforcement_section(
+            &counts, &derived, bold, blue, white, red, green, yellow, gray, reset,
+        );
+    }
 }
 
 // ── Compliance scanning helpers ──────────────────────────────────────────────
