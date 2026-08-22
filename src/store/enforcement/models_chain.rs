@@ -10,7 +10,12 @@ use super::*;
 /// canonical form and is hashed only for events at that version or newer, so v1
 /// events keep their original 14-field layout and hashes, and v2 events keep their
 /// 15-field layout (see `compute_hash`). Increment only when fields are added or
-/// serialization changes. Verifiers must reject events with unknown schema versions.
+/// serialization changes. A NEW EVENT TYPE does not bump this: `event_type` is one
+/// opaque hashed field, so a new `EnforcementEventType` variant changes no layout
+/// (section 24). An older binary cannot deserialize the new tag and reports the
+/// event as `UnknownSchema` — bumping instead would make it reject EVERY newer
+/// event, so the no-bump path preserves the most downgrade-compatibility.
+/// Verifiers must reject events with unknown schema versions.
 pub const SCHEMA_VERSION: u8 = 3;
 
 /// Hash algorithm used for event_hash and prev_hash.
@@ -177,6 +182,15 @@ pub enum EnforcementEventType {
     CleanShutdown {
         reason: String,
     },
+    /// A subagent was spawned (Claude Code `SubagentStart`). Records the
+    /// subagent's PRESENCE independent of any consult, so the audit can attribute
+    /// and score a subagent that spawned and then did nothing. `agent_session` is
+    /// the spawning session and `agent_id` the subagent, giving the same one-level
+    /// lineage pair as a consult. `subject_key` is the agent_id; `subject_kind` is
+    /// `System`. A new event type, not a new field — no SCHEMA_VERSION bump; it
+    /// rides the existing v3 canonical form. Recorded best-effort from the
+    /// SubagentStart hook.
+    SubagentSpawned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +328,8 @@ impl EnforcementEvent {
         // never reach here — `verify_chain` short-circuits `schema_version >
         // SCHEMA_VERSION` to UnknownSchema, and the writer only stamps
         // SCHEMA_VERSION — so the `>= 3` arm serializes exactly the v3 layout.
+        // A new event TYPE (e.g. SubagentSpawned) rides the same v3 arm: it is
+        // just another `event_type` value, no field or layout change.
         let json = if self.schema_version >= 3 {
             let canonical = CanonicalEventV3 {
                 event_id: &self.event_id,

@@ -289,6 +289,39 @@ pub async fn run_subagent_harvest() -> Result<HookRunOutcome> {
     .await
 }
 
+pub async fn run_subagent_record() -> Result<HookRunOutcome> {
+    use mati_core::mcp::protocol as p;
+    // SubagentStart hook. Best-effort presence recording; bound the round-trip.
+    const SUBAGENT_START_DEADLINE_MS: u64 = 3000;
+
+    let mut buf = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).is_err() {
+        return Ok(HookRunOutcome::Terminate(0));
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&buf) else {
+        return Ok(HookRunOutcome::Terminate(0));
+    };
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    // No agent_id → nothing to attribute; skip without a daemon round-trip.
+    let agent_id = field("agent_id").unwrap_or_default();
+    if agent_id.trim().is_empty() {
+        return Ok(HookRunOutcome::Terminate(0));
+    }
+
+    run_with_deadline(
+        "subagent-start",
+        "<subagent-record>",
+        SUBAGENT_START_DEADLINE_MS,
+        "subagent presence record exceeded internal deadline",
+        hook_fire_v2(p::Command::SubagentSpawned(p::SubagentSpawnedInput {
+            agent_id: field("agent_id"),
+            session_id: field("session_id"),
+            agent_type: field("agent_type"),
+        })),
+    )
+    .await
+}
+
 pub async fn run_session_clear_consults() -> Result<HookRunOutcome> {
     // Clearing receipts is a best-effort scan/delete after compaction. It is
     // not on the enforcement ceiling, but 3000ms bounds a large receipt set

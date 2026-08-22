@@ -297,6 +297,11 @@ pub enum Command {
     #[serde(rename = "subagent_harvest")]
     SubagentHarvest(SubagentHarvestInput),
 
+    /// Record a subagent's presence (from the SubagentStart hook) as a
+    /// hash-chained `SubagentSpawned` enforcement event.
+    #[serde(rename = "subagent_spawned")]
+    SubagentSpawned(SubagentSpawnedInput),
+
     /// Bulk-import a batch of pre-built `Record`s into the knowledge tree.
     /// Bypasses the semantic upsert handlers — records are written verbatim
     /// so an `export → import` round-trip preserves every field

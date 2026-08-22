@@ -472,6 +472,25 @@ fn subagent_harvest_decodes_with_defaults() {
 }
 
 #[test]
+fn subagent_spawned_decodes_with_defaults() {
+    let json = serde_json::json!({
+        "v": 2,
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "session": "660e8400-e29b-41d4-a716-446655440000",
+        "cmd": { "type": "subagent_spawned", "agent_id": "sub-1", "session_id": "sess-1" }
+    });
+    let req: Request = serde_json::from_value(json).unwrap();
+    match req.cmd {
+        Command::SubagentSpawned(input) => {
+            assert_eq!(input.agent_id.as_deref(), Some("sub-1"));
+            assert_eq!(input.session_id.as_deref(), Some("sess-1"));
+            assert!(input.agent_type.is_none());
+        }
+        other => panic!("expected SubagentSpawned, got {other:?}"),
+    }
+}
+
+#[test]
 fn session_clear_consults_decodes() {
     let json = serde_json::json!({
         "v": 2,
