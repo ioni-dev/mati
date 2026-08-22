@@ -198,6 +198,7 @@ async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
             "receipt_events": counts.receipts_minted,
             "bypasses": counts.bypasses,
             "gaps": counts.gaps,
+            "subagent_spawns": counts.subagent_spawns,
             "controls": {
                 "changed": counts.controls_changed,
                 "created": counts.controls_created,
@@ -581,6 +582,13 @@ pub async fn run(args: StatsArgs) -> Result<()> {
             );
             let gap_c = if counts.gaps > 0 { yellow } else { green };
             println!("    Gaps                   {gap_c}{}{reset}", counts.gaps);
+
+            if counts.subagent_spawns > 0 {
+                println!(
+                    "    Subagent spawns        {white}{}{reset}",
+                    counts.subagent_spawns
+                );
+            }
 
             // Derived friction metrics.
             match derived.blocks_per_session {
