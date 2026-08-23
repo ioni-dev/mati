@@ -136,7 +136,7 @@ mati/
 │   │   ├── clusters.rs      # co-change clustering
 │   │   ├── propagation.rs   # staleness propagation through import graph
 │   │   ├── reparse.rs       # single-file Layer 0 re-parse
-│   │   ├── auto_memory.rs   # auto-memory extraction
+│   │   ├── auto_memory.rs   # Claude auto-memory import → dev notes
 │   │   ├── claude_md.rs     # CLAUDE.md parsing/import
 │   │   └── onboarding.rs    # onboarding-signal mining
 │   ├── health/              # knowledge health system
