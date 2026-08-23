@@ -827,23 +827,27 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
     }
 }
 
-/// Confirmed gotchas that name no file — injected at bootstrap, unable to gate.
+/// Active confirmed gotchas, split by the two ways one can fail to gate a read.
 ///
-/// A confirmed `gotcha:*` with empty `affected_files` is globally injected by
-/// `mem_bootstrap` (context_packet scans all confirmed gotchas) but the read
-/// gate can never fire it: the gate looks up `file:<path>.gotcha_keys`, which
-/// derive from `affected_files`. That is a legitimate state for a project-wide
-/// rule, so this is `Info`, never `Warn`/`Fail` — it surfaces the "confirmed
-/// but cannot gate" set so a developer can spot one that was meant to gate a
-/// file and is silently only advisory. Auto-derived stubs
-/// (`gotcha:cochange/revert/ownership:*`) are `confirmed=false` by design and
-/// never counted here.
-/// Count active confirmed gotchas and how many of them name no file.
-/// Auto-derived stubs are `confirmed=false`, so they fall out via `confirmed`.
-fn gating_counts(records: &[mati_core::store::Record]) -> (usize, usize) {
+/// Returns `(confirmed, ungated, inert)` — both residuals are `Info`, never
+/// `Warn`/`Fail`, since each is a legitimate state, not a defect:
+/// - `inert`: `quality < 0.4`. Confirm forces confidence to 0.80, so quality is
+///   the only reachable blocker. Below 0.4 the record is excluded from bootstrap
+///   injection (`is_injectable_gotcha`) AND cannot deny a read (`decide`
+///   requires `quality >= 0.4`) — it does nothing, whether or not it names files.
+/// - `ungated`: `quality >= 0.4` but empty `affected_files`. Injected by
+///   `mem_bootstrap` as a project-wide advisory, yet the read gate can never
+///   fire it — the gate keys on `file:<path>.gotcha_keys`, derived from
+///   `affected_files`. Quality is checked first, so this bucket is genuinely
+///   injected; the two are disjoint.
+///
+/// Auto-derived stubs (`gotcha:cochange/revert/ownership:*`) are
+/// `confirmed=false` by design, so they fall out via `confirmed`.
+fn gating_counts(records: &[mati_core::store::Record]) -> (usize, usize, usize) {
     use mati_core::store::{GotchaRecord, RecordLifecycle};
     let mut confirmed = 0usize;
     let mut ungated = 0usize;
+    let mut inert = 0usize;
     for record in records {
         if !matches!(record.lifecycle, RecordLifecycle::Active) {
             continue;
@@ -855,11 +859,13 @@ fn gating_counts(records: &[mati_core::store::Record]) -> (usize, usize) {
             continue;
         }
         confirmed += 1;
-        if g.affected_files.is_empty() {
+        if record.quality.value < 0.4 {
+            inert += 1;
+        } else if g.affected_files.is_empty() {
             ungated += 1;
         }
     }
-    (confirmed, ungated)
+    (confirmed, ungated, inert)
 }
 
 async fn collect_gating_check(cwd: &Path) -> CheckResult {
@@ -890,7 +896,7 @@ async fn collect_gating_check(cwd: &Path) -> CheckResult {
     };
     let _ = proxy.close().await;
 
-    let (confirmed, ungated) = gating_counts(&records);
+    let (confirmed, ungated, inert) = gating_counts(&records);
 
     if confirmed == 0 {
         return CheckResult {
@@ -901,24 +907,45 @@ async fn collect_gating_check(cwd: &Path) -> CheckResult {
             fix: None,
         };
     }
-    if ungated == 0 {
+    if ungated == 0 && inert == 0 {
         return CheckResult {
             section: "knowledge",
             name: "gating",
             status: Status::Pass,
-            detail: format!("{confirmed} confirmed gotcha(s), all name affected files"),
+            detail: format!("{confirmed} confirmed gotcha(s), all gate a file read"),
             fix: None,
         };
     }
+
+    let mut parts: Vec<String> = Vec::new();
+    if ungated > 0 {
+        parts.push(format!(
+            "{ungated} name no affected_files (injected as advisory, cannot gate a read)"
+        ));
+    }
+    if inert > 0 {
+        parts.push(format!(
+            "{inert} name files but quality < 0.4 (not injected — inert)"
+        ));
+    }
+    let fix = match (ungated > 0, inert > 0) {
+        (true, true) => "mem_set affected_files, and raise quality >= 0.4 on the low-quality ones",
+        (true, false) => "mem_set the gotcha with affected_files, or record it as a dev note",
+        (false, true) => {
+            "raise the gotcha's quality >= 0.4 (add causality, a specific identifier, more detail)"
+        }
+        (false, false) => unreachable!("guarded by the ungated == 0 && inert == 0 return above"),
+    };
     CheckResult {
         section: "knowledge",
         name: "gating",
         status: Status::Info,
         detail: format!(
-            "{ungated} of {confirmed} confirmed gotcha(s) have no affected_files — \
-             injected at bootstrap but cannot gate a file read"
+            "{} of {confirmed} confirmed gotcha(s) cannot gate a file read: {}",
+            ungated + inert,
+            parts.join("; ")
         ),
-        fix: Some("mem_set the gotcha with affected_files, or record it as a dev note"),
+        fix: Some(fix),
     }
 }
 
@@ -1290,6 +1317,7 @@ mod tests {
         key: &str,
         confirmed: bool,
         affected_files: Vec<String>,
+        quality: f32,
         lifecycle: mati_core::store::RecordLifecycle,
     ) -> mati_core::store::Record {
         use mati_core::store::{
@@ -1322,7 +1350,12 @@ mod tests {
                 logical_clock: 1,
                 wall_clock: 0,
             },
-            quality: QualityScore::layer0_default(),
+            quality: QualityScore {
+                value: quality,
+                tier: QualityScore::tier_from_value(quality),
+                signals: vec![],
+                computed_at: 0,
+            },
             access_count: 0,
             last_accessed: 0,
             source: RecordSource::DeveloperManual,
@@ -1340,23 +1373,44 @@ mod tests {
             at: 0,
         };
         let records = vec![
-            // confirmed + has file → counted, not ungated
-            gotcha_rec("gotcha:a", true, vec!["src/a.rs".into()], Active),
+            // confirmed + has file + quality >= 0.4 → counted, gates
+            gotcha_rec("gotcha:a", true, vec!["src/a.rs".into()], 0.6, Active),
             // confirmed + no file → counted AND ungated (the residual)
-            gotcha_rec("gotcha:b", true, vec![], Active),
+            gotcha_rec("gotcha:b", true, vec![], 0.6, Active),
             // unconfirmed stub + no file → not counted at all
-            gotcha_rec("gotcha:cochange:x|y", false, vec![], Active),
+            gotcha_rec("gotcha:cochange:x|y", false, vec![], 0.6, Active),
             // tombstoned confirmed + no file → excluded by lifecycle
-            gotcha_rec("gotcha:c", true, vec![], tombstoned),
+            gotcha_rec("gotcha:c", true, vec![], 0.6, tombstoned),
         ];
-        let (confirmed, ungated) = gating_counts(&records);
+        let (confirmed, ungated, inert) = gating_counts(&records);
         assert_eq!(confirmed, 2, "only active confirmed gotchas count");
         assert_eq!(ungated, 1, "only the confirmed file-less one is ungated");
+        assert_eq!(inert, 0, "no low-quality file-naming gotcha here");
+    }
+
+    #[test]
+    fn gating_counts_flags_low_quality_file_naming_gotchas_as_inert() {
+        use mati_core::store::RecordLifecycle::Active;
+        let records = vec![
+            // confirmed + files + quality < 0.4 → inert (not injected, cannot gate)
+            gotcha_rec("gotcha:a", true, vec!["src/a.rs".into()], 0.30, Active),
+            // confirmed + files + quality >= 0.4 → gates, not a residual
+            gotcha_rec("gotcha:b", true, vec!["src/b.rs".into()], 0.60, Active),
+            // confirmed + no files + quality >= 0.4 → ungated, not inert
+            gotcha_rec("gotcha:c", true, vec![], 0.60, Active),
+            // confirmed + no files + quality < 0.4 → inert (quality checked
+            // first: not injected, so not an "advisory" ungated record)
+            gotcha_rec("gotcha:d", true, vec![], 0.30, Active),
+        ];
+        let (confirmed, ungated, inert) = gating_counts(&records);
+        assert_eq!(confirmed, 4);
+        assert_eq!(ungated, 1, "only the q>=0.4 file-less one is ungated");
+        assert_eq!(inert, 2, "both q<0.4 records are inert, files or not");
     }
 
     #[test]
     fn gating_counts_empty_store_is_zero() {
-        assert_eq!(gating_counts(&[]), (0, 0));
+        assert_eq!(gating_counts(&[]), (0, 0, 0));
     }
 
     #[test]
