@@ -1844,7 +1844,7 @@ async fn strict_mode_enforcement_config_records_change_event() {
 // ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn record_event_with_session_attributes_event_v2() {
+async fn record_event_with_session_attributes_event_v3() {
     use mati_core::store::enforcement::record_event_with_session;
     let (_dir, store) = temp_store().await;
 
@@ -1872,13 +1872,13 @@ async fn record_event_with_session_attributes_event_v2() {
         Some("sess-xyz"),
         "the agent session must be recorded on the event"
     );
-    assert_eq!(ev.schema_version, 2, "new events are schema_version 2");
-    // The session is part of the v2 canonical form, so a recorded event
+    assert_eq!(ev.schema_version, 3, "new events are schema_version 3");
+    // The session is part of the v3 canonical form, so a recorded event
     // self-verifies (event_hash == compute_hash) — tamper-evident attribution.
     assert_eq!(
         ev.event_hash,
         ev.compute_hash(),
-        "v2 event must self-verify"
+        "v3 event must self-verify"
     );
 }
 
