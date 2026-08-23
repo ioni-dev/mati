@@ -825,43 +825,6 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
     }
 
-    // ── 9b. Seed stats + stale cache (first run only) ────────────────────────
-    // On incremental re-init, in-memory record slices are incomplete
-    // (only changed files). Skip seeding — mati stats/stale will recompute
-    // from the full store on their next call.
-    if skipped_count == 0 {
-        let gotcha_recs: Vec<Record> = claude_import
-            .records
-            .iter()
-            .filter(|r| r.key.starts_with("gotcha:"))
-            .cloned()
-            .chain(cochange_record_structs.iter().cloned())
-            .chain(revert_record_structs.iter().cloned())
-            .chain(ownership_record_structs.iter().cloned())
-            .collect();
-        let decision_recs: Vec<Record> = claude_import
-            .records
-            .iter()
-            .filter(|r| r.key.starts_with("decision:"))
-            .cloned()
-            .collect();
-        if let Err(e) = super::stats::seed_snapshot(
-            &store,
-            &file_record_structs,
-            &gotcha_recs,
-            &decision_recs,
-            &dep_record_structs,
-            now,
-        )
-        .await
-        {
-            tracing::warn!("stats snapshot seed failed (non-fatal): {e}");
-        }
-        if let Err(e) = super::stale::seed_stale_cache(&store, &root, &all_records).await {
-            tracing::warn!("stale cache seed failed (non-fatal): {e}");
-        }
-    }
-
     // ── 9c. HasGotcha edges from all auto-generated gotchas ────────────────────
     // build_edges creates CoChanges + Imports edges but not HasGotcha. Generate
     // HasGotcha edges from affected_files in every gotcha record so the graph
@@ -1077,6 +1040,49 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 prop_count,
                 t.elapsed().as_millis()
             );
+        }
+    }
+
+    // ── 10d. Seed stats + stale cache (first run only) ───────────────────────
+    // Must run after 10a/10c: those passes rewrite every file: record, bumping
+    // write_seq. Seeding earlier stamps the caches with a stale write_seq, so
+    // the very first `mati stats`/`mati stale` never validates the cache and
+    // recomputes (dead cache in daemon mode). The blast-radius/propagation
+    // patches don't affect what these caches store (purpose/hotspot/confidence
+    // and staleness.tier), so the in-memory slices are still correct.
+    // On incremental re-init, in-memory record slices are incomplete (only
+    // changed files). Skip seeding — mati stats/stale will recompute instead.
+    if skipped_count == 0 {
+        let store_ref = graph.store();
+        let gotcha_recs: Vec<Record> = claude_import
+            .records
+            .iter()
+            .filter(|r| r.key.starts_with("gotcha:"))
+            .cloned()
+            .chain(cochange_record_structs.iter().cloned())
+            .chain(revert_record_structs.iter().cloned())
+            .chain(ownership_record_structs.iter().cloned())
+            .collect();
+        let decision_recs: Vec<Record> = claude_import
+            .records
+            .iter()
+            .filter(|r| r.key.starts_with("decision:"))
+            .cloned()
+            .collect();
+        if let Err(e) = super::stats::seed_snapshot(
+            store_ref,
+            &file_record_structs,
+            &gotcha_recs,
+            &decision_recs,
+            &dep_record_structs,
+            now,
+        )
+        .await
+        {
+            tracing::warn!("stats snapshot seed failed (non-fatal): {e}");
+        }
+        if let Err(e) = super::stale::seed_stale_cache(store_ref, &root, &all_records).await {
+            tracing::warn!("stale cache seed failed (non-fatal): {e}");
         }
     }
 
