@@ -448,6 +448,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     // this one before `network` would have shifted it from 13 to 14.
     checks.push(collect_policy_check(cwd).await);
     checks.push(collect_binary_parity_check(cwd, root));
+    checks.push(collect_gating_check(cwd).await);
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -826,6 +827,101 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
     }
 }
 
+/// Confirmed gotchas that name no file — injected at bootstrap, unable to gate.
+///
+/// A confirmed `gotcha:*` with empty `affected_files` is globally injected by
+/// `mem_bootstrap` (context_packet scans all confirmed gotchas) but the read
+/// gate can never fire it: the gate looks up `file:<path>.gotcha_keys`, which
+/// derive from `affected_files`. That is a legitimate state for a project-wide
+/// rule, so this is `Info`, never `Warn`/`Fail` — it surfaces the "confirmed
+/// but cannot gate" set so a developer can spot one that was meant to gate a
+/// file and is silently only advisory. Auto-derived stubs
+/// (`gotcha:cochange/revert/ownership:*`) are `confirmed=false` by design and
+/// never counted here.
+/// Count active confirmed gotchas and how many of them name no file.
+/// Auto-derived stubs are `confirmed=false`, so they fall out via `confirmed`.
+fn gating_counts(records: &[mati_core::store::Record]) -> (usize, usize) {
+    use mati_core::store::{GotchaRecord, RecordLifecycle};
+    let mut confirmed = 0usize;
+    let mut ungated = 0usize;
+    for record in records {
+        if !matches!(record.lifecycle, RecordLifecycle::Active) {
+            continue;
+        }
+        let Some(g) = record.payload_as::<GotchaRecord>() else {
+            continue;
+        };
+        if !g.confirmed {
+            continue;
+        }
+        confirmed += 1;
+        if g.affected_files.is_empty() {
+            ungated += 1;
+        }
+    }
+    (confirmed, ungated)
+}
+
+async fn collect_gating_check(cwd: &Path) -> CheckResult {
+    let proxy = match crate::cli::proxy::StoreProxy::open(cwd).await {
+        Ok(p) => p,
+        Err(_) => {
+            return CheckResult {
+                section: "knowledge",
+                name: "gating",
+                status: Status::Info,
+                detail: "skipped — no store initialized for this directory".to_string(),
+                fix: None,
+            };
+        }
+    };
+    let records = match proxy.scan_prefix("gotcha:").await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = proxy.close().await;
+            return CheckResult {
+                section: "knowledge",
+                name: "gating",
+                status: Status::Fail,
+                detail: format!("could not read gotchas: {e}"),
+                fix: Some("mati doctor"),
+            };
+        }
+    };
+    let _ = proxy.close().await;
+
+    let (confirmed, ungated) = gating_counts(&records);
+
+    if confirmed == 0 {
+        return CheckResult {
+            section: "knowledge",
+            name: "gating",
+            status: Status::Info,
+            detail: "no confirmed gotchas yet".to_string(),
+            fix: None,
+        };
+    }
+    if ungated == 0 {
+        return CheckResult {
+            section: "knowledge",
+            name: "gating",
+            status: Status::Pass,
+            detail: format!("{confirmed} confirmed gotcha(s), all name affected files"),
+            fix: None,
+        };
+    }
+    CheckResult {
+        section: "knowledge",
+        name: "gating",
+        status: Status::Info,
+        detail: format!(
+            "{ungated} of {confirmed} confirmed gotcha(s) have no affected_files — \
+             injected at bootstrap but cannot gate a file read"
+        ),
+        fix: Some("mem_set the gotcha with affected_files, or record it as a dev note"),
+    }
+}
+
 /// Do the hooks and the daemon run the same mati build?
 ///
 /// They resolve independently. `mati init` pins `.claude/hooks/mati` (and the
@@ -1189,6 +1285,79 @@ fn relative_ts(ts: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gotcha_rec(
+        key: &str,
+        confirmed: bool,
+        affected_files: Vec<String>,
+        lifecycle: mati_core::store::RecordLifecycle,
+    ) -> mati_core::store::Record {
+        use mati_core::store::{
+            Category, ConfidenceScore, GotchaRecord, Priority, QualityScore, Record, RecordSource,
+            RecordVersion, StalenessScore,
+        };
+        let gotcha = GotchaRecord {
+            rule: "r".into(),
+            reason: "because x".into(),
+            severity: Priority::Normal,
+            affected_files,
+            ref_url: None,
+            discovered_session: 0,
+            confirmed,
+            confirmed_content: Default::default(),
+        };
+        Record {
+            key: key.into(),
+            value: "r".into(),
+            category: Category::Gotcha,
+            priority: Priority::Normal,
+            tags: vec![],
+            created_at: 0,
+            updated_at: 0,
+            ref_url: None,
+            staleness: StalenessScore::fresh(),
+            lifecycle,
+            version: RecordVersion {
+                device_id: uuid::Uuid::nil(),
+                logical_clock: 1,
+                wall_clock: 0,
+            },
+            quality: QualityScore::layer0_default(),
+            access_count: 0,
+            last_accessed: 0,
+            source: RecordSource::DeveloperManual,
+            confidence: ConfidenceScore::for_new_record(&RecordSource::DeveloperManual),
+            gap_analysis_score: 0.0,
+            payload: serde_json::to_value(&gotcha).ok(),
+        }
+    }
+
+    #[test]
+    fn gating_counts_flags_confirmed_gotchas_with_no_files() {
+        use mati_core::store::RecordLifecycle::Active;
+        let tombstoned = mati_core::store::RecordLifecycle::Tombstoned {
+            reason: mati_core::store::TombstoneReason::ManualDeletion,
+            at: 0,
+        };
+        let records = vec![
+            // confirmed + has file → counted, not ungated
+            gotcha_rec("gotcha:a", true, vec!["src/a.rs".into()], Active),
+            // confirmed + no file → counted AND ungated (the residual)
+            gotcha_rec("gotcha:b", true, vec![], Active),
+            // unconfirmed stub + no file → not counted at all
+            gotcha_rec("gotcha:cochange:x|y", false, vec![], Active),
+            // tombstoned confirmed + no file → excluded by lifecycle
+            gotcha_rec("gotcha:c", true, vec![], tombstoned),
+        ];
+        let (confirmed, ungated) = gating_counts(&records);
+        assert_eq!(confirmed, 2, "only active confirmed gotchas count");
+        assert_eq!(ungated, 1, "only the confirmed file-less one is ungated");
+    }
+
+    #[test]
+    fn gating_counts_empty_store_is_zero() {
+        assert_eq!(gating_counts(&[]), (0, 0));
+    }
 
     #[test]
     fn read_lifecycle_tail_parses_well_formed_lines() {
