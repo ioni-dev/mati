@@ -1162,3 +1162,76 @@ fn mcp_stdio_server_discover_is_cacheable() {
         "discovery result missing capabilities: {result}"
     );
 }
+
+/// `tools/list` advertises a Public, cacheable result under protocol 2026-07-28.
+///
+/// mati's tool set is a compile-time constant, so the list never changes within
+/// a running binary. rmcp's `#[tool_handler]` default marks it `Public` but with
+/// `ttlMs = 0` (revalidate every call); mati overrides `list_tools` to raise the
+/// TTL. The client must negotiate 2026-07-28 in `initialize` for the cache
+/// fields to appear — this test does the full handshake, unlike the stateless
+/// `server/discover` probe above.
+#[test]
+fn mcp_stdio_tools_list_is_cacheable() {
+    let project_dir = TempDir::new().expect("failed to create tempdir for MCP test");
+    common::isolate_mati_home();
+    let _daemon_guard = common::DaemonGuard::for_mati_home(project_dir.path(), common::mati_home());
+
+    let bin = env!("CARGO_BIN_EXE_mati");
+    let mut child = Command::new(bin)
+        .arg("serve")
+        .current_dir(project_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn `mati serve`");
+    let stdin = child.stdin.take().expect("mati serve has no stdin handle");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("mati serve has no stdout handle");
+    let _guard = ChildGuard(child);
+    let mut stdin = stdin;
+    let rx = spawn_reader(stdout);
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#,
+    );
+    let init_response = read_until_id(&rx, 1);
+    assert!(
+        init_response.get("error").is_none(),
+        "initialize should not return an error: {init_response}"
+    );
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
+    );
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    );
+    let resp = read_until_id(&rx, 2);
+
+    assert!(
+        resp.get("error").is_none(),
+        "tools/list must not return an error: {resp}"
+    );
+    let result = &resp["result"];
+    assert_eq!(
+        result["cacheScope"].as_str(),
+        Some("public"),
+        "tool list must be Public-cacheable: {result}"
+    );
+    assert!(
+        result["ttlMs"].as_u64().unwrap_or(0) > 0,
+        "tool list must advertise a nonzero cache TTL: {result}"
+    );
+    // The tools are the payload a client caches instead of re-fetching.
+    let tools = result["tools"]
+        .as_array()
+        .expect("tools/list result.tools should be an array");
+    assert_eq!(tools.len(), 4, "expected exactly four tools: {result}");
+}

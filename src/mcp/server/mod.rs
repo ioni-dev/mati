@@ -57,6 +57,11 @@ pub(crate) enum ProxyDaemonResult {
 /// One hour is conservative for that; raise it freely.
 const DISCOVER_TTL_MS: u64 = 3_600_000;
 
+/// How long a client may cache the `tools/list` response (SEP-2549). Same
+/// rationale as [`DISCOVER_TTL_MS`]: the tool set is a compile-time constant, so
+/// the list never changes within a running binary.
+const LIST_TOOLS_TTL_MS: u64 = 3_600_000;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MatiServer {
     fn get_info(&self) -> ServerInfo {
@@ -93,6 +98,31 @@ impl ServerHandler for MatiServer {
         .with_ttl_ms(DISCOVER_TTL_MS)
         .with_cache_scope(CacheScope::Public);
         std::future::ready(Ok(result))
+    }
+
+    /// `tools/list` cache hints (MCP 2026-07-28, SEP-2549). mati's tool set is a
+    /// compile-time constant — exactly four tools, static per binary — so the
+    /// list is safe to cache `Public`. rmcp's `#[tool_handler]` default already
+    /// reports `Public` scope but with `ttl_ms = 0`, which forces revalidation
+    /// on every call; this override raises the TTL so a client can actually
+    /// reuse the tool list. Cache fields are emitted only when the client
+    /// negotiated a protocol version that understands them — older peers get the
+    /// pre-cache-hint shape unchanged.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut result = rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all());
+        if supports_cache_hints {
+            result = result
+                .with_ttl_ms(LIST_TOOLS_TTL_MS)
+                .with_cache_scope(CacheScope::Public);
+        }
+        Ok(result)
     }
 }
 
