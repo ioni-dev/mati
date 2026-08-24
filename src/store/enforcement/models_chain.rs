@@ -16,6 +16,11 @@ use super::*;
 /// event as `UnknownSchema` — bumping instead would make it reject EVERY newer
 /// event, so the no-bump path preserves the most downgrade-compatibility.
 /// Verifiers must reject events with unknown schema versions.
+///
+/// The v4 canonical form (`CanonicalEventV4`, appending `parent_agent_id` for
+/// nested agent→agent lineage) is defined and tested but NOT yet stamped: this
+/// constant stays 3 until an emitter populates `parent_agent_id`, so no event is
+/// written at v4 before the data and the enterprise reader for it exist.
 pub const SCHEMA_VERSION: u8 = 3;
 
 /// Hash algorithm used for event_hash and prev_hash.
@@ -122,6 +127,17 @@ pub struct EnforcementEvent {
     /// enterprise audit asks. Added in schema_version 3; hashed only for v3+
     /// events (see `compute_hash`).
     pub agent_id: Option<String>,
+
+    /// The agent that SPAWNED the subagent in `agent_id` (Claude Code Task
+    /// `agent_id` of the parent). `None` when the parent is the root session —
+    /// i.e. one-level lineage, where `agent_session` already identifies the
+    /// spawner. Set only for nested spawns (a subagent spawning another
+    /// subagent), carried by the `Agent`-tool `PostToolUse` hook payload
+    /// (top-level `agent_id` = spawner, `tool_response.agentId` = the child in
+    /// `agent_id` here). Together with `agent_session` and `agent_id` this walks
+    /// the full spawn tree, not just the leaf. Added in schema_version 4; hashed
+    /// only for v4+ events (see `compute_hash`).
+    pub parent_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +330,31 @@ struct CanonicalEventV3<'a> {
     agent_id: Option<&'a str>,
 }
 
+/// schema_version 4 canonical form: the v3 fields followed by `parent_agent_id`,
+/// appended at the END so v3 events (serialized via `CanonicalEventV3`) keep a
+/// byte-identical canonical form and their original hashes.
+#[derive(Serialize)]
+struct CanonicalEventV4<'a> {
+    event_id: &'a str,
+    schema_version: u8,
+    seq_no: u64,
+    recorded_at_ms: u64,
+    event_type: &'a EnforcementEventType,
+    prev_hash: &'a str,
+    installation_id: &'a str,
+    actor_local: &'a Option<ActorLocal>,
+    agent_type: &'a str,
+    subject_kind: SubjectKind,
+    subject_key: &'a str,
+    canonical_subject_hash: Option<&'a str>,
+    receipt_id: Option<&'a str>,
+    decision_reason_code: &'a str,
+    decision_basis_hash: Option<&'a str>,
+    agent_session: Option<&'a str>,
+    agent_id: Option<&'a str>,
+    parent_agent_id: Option<&'a str>,
+}
+
 impl EnforcementEvent {
     /// Compute the canonical hash of this event.
     ///
@@ -322,15 +363,40 @@ impl EnforcementEvent {
     /// without incrementing SCHEMA_VERSION.
     pub fn compute_hash(&self) -> String {
         // schema_version 1 hashes the original 14-field canonical form; v2 the
-        // 15-field form with `agent_session` appended; v3+ the 16-field form with
-        // `agent_id` appended too. Each branch keeps every pre-existing event's
-        // hash byte-identical at its own version (no false tamper). Newer schemas
-        // never reach here — `verify_chain` short-circuits `schema_version >
-        // SCHEMA_VERSION` to UnknownSchema, and the writer only stamps
-        // SCHEMA_VERSION — so the `>= 3` arm serializes exactly the v3 layout.
-        // A new event TYPE (e.g. SubagentSpawned) rides the same v3 arm: it is
-        // just another `event_type` value, no field or layout change.
-        let json = if self.schema_version >= 3 {
+        // 15-field form with `agent_session` appended; v3 the 16-field form with
+        // `agent_id` appended too; v4+ the 17-field form with `parent_agent_id`
+        // appended. Each branch keeps every pre-existing event's hash
+        // byte-identical at its own version (no false tamper). The writer stamps
+        // SCHEMA_VERSION (currently 3), so in production the `== 3` arm is the top
+        // reached; the `>= 4` arm is defined and unit-tested ahead of the bump but
+        // not yet written to the store. `verify_chain` short-circuits
+        // `schema_version > SCHEMA_VERSION` to UnknownSchema, so a stray v4 event
+        // never reaches here in a verify pass either. A new event TYPE (e.g.
+        // SubagentSpawned) rides the current arm: just another `event_type` value,
+        // no field or layout change.
+        let json = if self.schema_version >= 4 {
+            let canonical = CanonicalEventV4 {
+                event_id: &self.event_id,
+                schema_version: self.schema_version,
+                seq_no: self.seq_no,
+                recorded_at_ms: self.recorded_at_ms,
+                event_type: &self.event_type,
+                prev_hash: &self.prev_hash,
+                installation_id: &self.installation_id,
+                actor_local: &self.actor_local,
+                agent_type: &self.agent_type,
+                subject_kind: self.subject_kind,
+                subject_key: &self.subject_key,
+                canonical_subject_hash: self.canonical_subject_hash.as_deref(),
+                receipt_id: self.receipt_id.as_deref(),
+                decision_reason_code: &self.decision_reason_code,
+                decision_basis_hash: self.decision_basis_hash.as_deref(),
+                agent_session: self.agent_session.as_deref(),
+                agent_id: self.agent_id.as_deref(),
+                parent_agent_id: self.parent_agent_id.as_deref(),
+            };
+            serde_json::to_string(&canonical).expect("canonical serialization must not fail")
+        } else if self.schema_version == 3 {
             let canonical = CanonicalEventV3 {
                 event_id: &self.event_id,
                 schema_version: self.schema_version,

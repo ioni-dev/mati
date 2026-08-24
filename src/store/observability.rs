@@ -322,6 +322,7 @@ mod tests {
             decision_basis_hash: None,
             agent_session: None,
             agent_id: None,
+            parent_agent_id: None,
         }
     }
 
