@@ -1,0 +1,6 @@
+# Findings in vendored third-party parser test fixtures (tests/fixtures/real_world/**),
+# not mati secrets. Both are throwaway/example data from the upstream projects.
+# jsoup localhost test cert (removed from HEAD; remains in history at c40e3ed):
+c40e3ed8edad84848e7a2c4c8f6f2b612018bdde:tests/fixtures/real_world/jsoup/src/test/resources/local-cert/server.key:private-key:1
+# Example API key in sinatra's own README:
+c40e3ed8edad84848e7a2c4c8f6f2b612018bdde:tests/fixtures/real_world/sinatra/README.md:generic-api-key:1215
