@@ -103,4 +103,4 @@ This appends a line to the commit message:
 Signed-off-by: Your Name <your@email.com>
 ```
 
-Use your real name and an email you can be reached at; the name must match the commit author. To sign off commits you already made, run `git rebase --signoff <base>` (or `git commit --amend -s` for the last one). A check on each pull request verifies every commit is signed off.
+Use your real name and an email you can be reached at; the name must match the commit author. To sign off commits you already made, run `git rebase --signoff <base>` (or `git commit --amend -s` for the last one). Please make sure every commit in your pull request is signed off.
