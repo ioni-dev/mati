@@ -86,3 +86,21 @@ cargo test --doc
 mati is licensed under the Apache License 2.0. See `LICENSE`.
 
 By submitting a contribution, you agree that it will be licensed under the same Apache 2.0 terms: inbound equals outbound.
+
+### Sign your commits (DCO)
+
+Contributions require a Developer Certificate of Origin sign-off. The DCO is a lightweight statement — not a CLA, no rights transfer — that you have the right to submit your work under the project's license. The full text is in the `DCO` file.
+
+Add a sign-off to each commit with `-s`:
+
+```bash
+git commit -s -m "your message"
+```
+
+This appends a line to the commit message:
+
+```text
+Signed-off-by: Your Name <your@email.com>
+```
+
+Use your real name and an email you can be reached at; the name must match the commit author. To sign off commits you already made, run `git rebase --signoff <base>` (or `git commit --amend -s` for the last one). A check on each pull request verifies every commit is signed off.
