@@ -146,10 +146,14 @@ jobs:
           cp "$sbom" artifacts/mati-sbom.cdx.json
           echo "SBOM: $sbom -> artifacts/mati-sbom.cdx.json ($(wc -c < artifacts/mati-sbom.cdx.json) bytes)"
 
-      - name: Generate checksums
+      # install.sh is the bootstrap the README points at
+      # (releases/latest/download/install.sh), so it must ship as a release
+      # asset. Stage it alongside the binaries and checksum it too.
+      - name: Stage install.sh and generate checksums
         run: |
+          cp install.sh artifacts/install.sh
           cd artifacts
-          sha256sum mati-*.tar.gz mati-sbom.cdx.json > checksums.txt
+          sha256sum mati-*.tar.gz mati-sbom.cdx.json install.sh > checksums.txt
           cat checksums.txt
 
       - name: Publish release
@@ -161,6 +165,7 @@ jobs:
             artifacts/mati-x86_64-apple-darwin.tar.gz
             artifacts/mati-aarch64-apple-darwin.tar.gz
             artifacts/mati-sbom.cdx.json
+            artifacts/install.sh
             artifacts/checksums.txt
           generate_release_notes: true
         env:
