@@ -1,9 +1,11 @@
 # Trademark Policy
 
-The Mati source code is licensed under the MIT License (see `LICENSE`). This
-trademark policy is **separate from, and in addition to,** that license. The MIT
-license grants broad rights to use, modify, and redistribute the _code_. It does
-**not** grant any right to use the project's _names, logo, or branding_.
+The Mati source code is licensed under the Apache License 2.0 (see `LICENSE`).
+This trademark policy is **separate from, and in addition to,** that license. The
+Apache 2.0 license grants broad rights to use, modify, and redistribute the
+_code_. It does **not** grant any right to use the project's _names, logo, or
+branding_ — indeed, Section 6 of the Apache License expressly withholds
+trademark rights.
 
 ## The marks
 
@@ -39,7 +41,7 @@ relevant jurisdiction.
 
 Choose a distinct name and logo, and state clearly that it is an unofficial fork
 not affiliated with or endorsed by Mati or Mati Systems. You keep every right the
-MIT license grants to the code; you simply may not brand it as Mati.
+Apache 2.0 license grants to the code; you simply may not brand it as Mati.
 
 ## Contact
 
@@ -51,4 +53,4 @@ unsure whether a use is allowed.
 ---
 
 _This policy may be updated. It does not grant any patent or copyright rights,
-and nothing in it limits the MIT license grant to the code itself._
+and nothing in it limits the Apache License 2.0 grant to the code itself._

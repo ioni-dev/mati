@@ -7,7 +7,7 @@ name = "mati-ai"
 version = "0.1.0"
 description = "Engineering knowledge that survives turnover"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 
 [project.urls]
 Repository = "https://github.com/ioni-dev/mati"
