@@ -1872,14 +1872,10 @@ async fn record_event_with_session_attributes_event_v3() {
         Some("sess-xyz"),
         "the agent session must be recorded on the event"
     );
-    assert_eq!(ev.schema_version, 3, "new events are schema_version 3");
-    // The session is part of the v3 canonical form, so a recorded event
-    // self-verifies (event_hash == compute_hash) — tamper-evident attribution.
-    assert_eq!(
-        ev.event_hash,
-        ev.compute_hash(),
-        "v3 event must self-verify"
-    );
+    assert_eq!(ev.schema_version, 4, "new events are schema_version 4");
+    // The session is part of every canonical form from v2 on, so a recorded
+    // event self-verifies (event_hash == compute_hash) — tamper-evident attribution.
+    assert_eq!(ev.event_hash, ev.compute_hash(), "event must self-verify");
 }
 
 #[tokio::test]

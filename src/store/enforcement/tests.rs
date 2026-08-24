@@ -985,11 +985,8 @@ fn canonical_subject_hash_is_deterministic() {
 }
 
 #[test]
-fn schema_version_is_three() {
-    // Stays 3 until an emitter populates `parent_agent_id`; the v4 canonical form
-    // is defined and tested (see `parent_agent_id_is_hashed_for_v4_only`) but not
-    // yet stamped onto written events.
-    assert_eq!(SCHEMA_VERSION, 3);
+fn schema_version_is_four() {
+    assert_eq!(SCHEMA_VERSION, 4);
     assert_eq!(HASH_ALGORITHM, "sha256");
 }
 
@@ -1130,27 +1127,35 @@ fn parent_agent_id_is_hashed_for_v4_only() {
 }
 
 #[test]
-fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
-    // One store can hold events written by three eras of the binary, plus a
+fn mixed_v1_v2_v3_v4_chain_with_subagent_spawned_verifies_valid() {
+    // One store can hold events written by four eras of the binary, plus a
     // SubagentSpawned (a new event TYPE at v3 — no schema bump, rides the v3
-    // layout). All must verify clean in one chain. (v4 is not exercised here: it
-    // exceeds SCHEMA_VERSION until the bump, so verify_chain reads it as unknown —
-    // see future_schema_event_reads_as_unknown_not_tampering.)
+    // layout) and a v4 SubagentEdge carrying nested lineage (parent_agent_id).
+    // All must verify clean in one chain.
     let mut prev = String::new();
     let mut events = Vec::new();
-    for (seq, version, ty, agent) in [
-        (1u64, 1u8, EnforcementEventType::Deny, None),
-        (2, 2, EnforcementEventType::Deny, None),
+    for (seq, version, ty, agent, parent) in [
+        (1u64, 1u8, EnforcementEventType::Deny, None, None),
+        (2, 2, EnforcementEventType::Deny, None, None),
         (
             3,
             3,
             EnforcementEventType::Deny,
             Some("sub-xyz".to_string()),
+            None,
         ),
         (
             4,
             3,
             EnforcementEventType::SubagentSpawned,
+            Some("sub-abc".to_string()),
+            None,
+        ),
+        (
+            5,
+            4,
+            EnforcementEventType::SubagentEdge,
+            Some("sub-child".to_string()),
             Some("sub-abc".to_string()),
         ),
     ] {
@@ -1161,6 +1166,7 @@ fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
             prev_hash: prev.clone(),
             agent_session: agent.as_ref().map(|_| "sess-1".to_string()),
             agent_id: agent,
+            parent_agent_id: parent,
             event_hash: String::new(),
             ..frozen_test_event()
         };
@@ -1171,7 +1177,7 @@ fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
 
     let v = verify_chain(&events);
     assert!(v.is_valid(), "mixed-era chain must verify clean: {v:?}");
-    assert_eq!(v.checked, 4);
+    assert_eq!(v.checked, 5);
     assert_eq!(v.tampered_events, 0);
     assert_eq!(v.linkage_breaks, 0);
     assert_eq!(v.unknown_schema, 0);
@@ -1198,10 +1204,10 @@ fn subagent_spawned_event_hashes_and_labels() {
 
 #[test]
 fn future_schema_event_reads_as_unknown_not_tampering() {
-    // The same guarantee that protects an OLD binary from a v4 event: an event
+    // The same guarantee that protects an OLD binary from a v5 event: an event
     // at a version this binary does not know verifies as UnknownSchema, never
-    // Tampered. Proven here with SCHEMA_VERSION + 1. This is also why the v4
-    // bump can be deferred safely: a stray v4 event reads as unknown, not tamper.
+    // Tampered. Proven here with SCHEMA_VERSION + 1. This is why a v4 store read
+    // by an older v3 binary degrades to unknown, not a false tamper.
     let mut e = EnforcementEvent {
         schema_version: SCHEMA_VERSION + 1,
         event_hash: String::new(),

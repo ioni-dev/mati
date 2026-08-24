@@ -189,9 +189,7 @@ pub async fn record_event_with_lineage(
 /// Like [`record_event_with_lineage`], plus `parent_agent_id` — the agent that
 /// spawned `agent_id`, for nested agent→agent lineage (schema_version 4). Set
 /// only by the `SubagentEdge` emitter fed by the `Agent`-tool `PostToolUse`
-/// payload. `parent_agent_id` is written onto the event now but hashed only once
-/// the store reaches v4 (see `SCHEMA_VERSION`); until then it rides along
-/// unhashed, exactly like the field's dormant state.
+/// payload; hashed by the v4 canonical form (see `SCHEMA_VERSION`).
 #[allow(clippy::too_many_arguments)]
 pub async fn record_event_with_nested_lineage(
     store: &Store,

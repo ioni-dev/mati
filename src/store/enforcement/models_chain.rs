@@ -6,22 +6,19 @@ use super::*;
 
 /// Schema version for the enforcement event envelope. v2 appends `agent_session`
 /// (the spawning session); v3 appends `agent_id` (the subagent actor, for
-/// one-level agent lineage). Each version appends its new field at the END of the
-/// canonical form and is hashed only for events at that version or newer, so v1
-/// events keep their original 14-field layout and hashes, and v2 events keep their
-/// 15-field layout (see `compute_hash`). Increment only when fields are added or
-/// serialization changes. A NEW EVENT TYPE does not bump this: `event_type` is one
-/// opaque hashed field, so a new `EnforcementEventType` variant changes no layout
-/// (section 24). An older binary cannot deserialize the new tag and reports the
-/// event as `UnknownSchema` — bumping instead would make it reject EVERY newer
-/// event, so the no-bump path preserves the most downgrade-compatibility.
-/// Verifiers must reject events with unknown schema versions.
-///
-/// The v4 canonical form (`CanonicalEventV4`, appending `parent_agent_id` for
-/// nested agent→agent lineage) is defined and tested but NOT yet stamped: this
-/// constant stays 3 until an emitter populates `parent_agent_id`, so no event is
-/// written at v4 before the data and the enterprise reader for it exist.
-pub const SCHEMA_VERSION: u8 = 3;
+/// one-level agent lineage); v4 appends `parent_agent_id` (the spawner of that
+/// subagent, for nested agent→agent lineage). Each version appends its new field
+/// at the END of the canonical form and is hashed only for events at that version
+/// or newer, so v1 events keep their original 14-field layout and hashes, v2
+/// events keep their 15-field layout, and v3 events keep their 16-field layout
+/// (see `compute_hash`). Increment only when fields are added or serialization
+/// changes. A NEW EVENT TYPE does not bump this: `event_type` is one opaque hashed
+/// field, so a new `EnforcementEventType` variant changes no layout (section 24).
+/// An older binary cannot deserialize the new tag and reports the event as
+/// `UnknownSchema` — bumping instead would make it reject EVERY newer event, so
+/// the no-bump path preserves the most downgrade-compatibility. Verifiers must
+/// reject events with unknown schema versions.
+pub const SCHEMA_VERSION: u8 = 4;
 
 /// Hash algorithm used for event_hash and prev_hash.
 /// Frozen for v1. Do not change without incrementing SCHEMA_VERSION.
@@ -215,9 +212,9 @@ pub enum EnforcementEventType {
     /// the spawner, so the pair walks the tree past the leaf. Emitted ONLY when
     /// the spawner is itself a subagent — a root-session spawn is already recorded
     /// by `SubagentSpawned` and by every child event's `agent_session`, so this
-    /// event is purely additive. A new event TYPE, not a new field — no
-    /// SCHEMA_VERSION bump; the `parent_agent_id` it carries is hashed only once
-    /// the store is at v4 (see `SCHEMA_VERSION`). Recorded best-effort.
+    /// event is purely additive. A new event TYPE, not a new field — it needed no
+    /// bump of its own; the `parent_agent_id` it carries is hashed by the v4
+    /// canonical form (see `SCHEMA_VERSION`). Recorded best-effort.
     SubagentEdge,
 }
 
@@ -378,14 +375,12 @@ impl EnforcementEvent {
         // 15-field form with `agent_session` appended; v3 the 16-field form with
         // `agent_id` appended too; v4+ the 17-field form with `parent_agent_id`
         // appended. Each branch keeps every pre-existing event's hash
-        // byte-identical at its own version (no false tamper). The writer stamps
-        // SCHEMA_VERSION (currently 3), so in production the `== 3` arm is the top
-        // reached; the `>= 4` arm is defined and unit-tested ahead of the bump but
-        // not yet written to the store. `verify_chain` short-circuits
-        // `schema_version > SCHEMA_VERSION` to UnknownSchema, so a stray v4 event
-        // never reaches here in a verify pass either. A new event TYPE (e.g.
-        // SubagentSpawned) rides the current arm: just another `event_type` value,
-        // no field or layout change.
+        // byte-identical at its own version (no false tamper). Newer schemas
+        // never reach here — `verify_chain` short-circuits `schema_version >
+        // SCHEMA_VERSION` to UnknownSchema, and the writer only stamps
+        // SCHEMA_VERSION — so the `>= 4` arm serializes exactly the v4 layout.
+        // A new event TYPE (e.g. SubagentSpawned, SubagentEdge) rides the current
+        // arm: just another `event_type` value, no field or layout change.
         let json = if self.schema_version >= 4 {
             let canonical = CanonicalEventV4 {
                 event_id: &self.event_id,

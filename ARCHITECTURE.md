@@ -1154,9 +1154,9 @@ enforcement:event:<seq_no>
 - Each event carries `prev_hash`, which is the `event_hash` of the immediately preceding event. The first event uses an empty string.
 - `seq_no` is globally unique, monotonically increasing, and persisted before the event that uses it.
 - Gaps in `seq_no` are acceptable after a crash — a seq is persisted before the event that uses it, so a crash in between leaves a hole. Nothing detects a seq hole today; `RecordingGap` is written on a time gap instead (section 18.1). Hash chain breaks indicate tampering or corruption.
-- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 3: v2 appends `agent_session`, v3 appends `agent_id`, each at the END of the layout. v1 events still hash under the original 14-field form, v2 events under the 15-field form, v3 under 16 — `compute_hash` branches on the version so every stored hash stays byte-identical. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered. A v4 form (appending `parent_agent_id`, 17 fields) is defined and unit-tested but not yet stamped: `SCHEMA_VERSION` stays 3 until an emitter populates `parent_agent_id`, so no event is written at v4 before the data and the enterprise reader for it exist.
+- The canonical form is frozen per `schema_version`. `SCHEMA_VERSION` is 4: v2 appends `agent_session`, v3 appends `agent_id`, v4 appends `parent_agent_id`, each at the END of the layout. v1 events still hash under the original 14-field form, v2 events under the 15-field form, v3 under 16, v4 under 17 — `compute_hash` branches on the version so every stored hash stays byte-identical. Do not change field order or serialization without incrementing the version — every stored hash would recompute differently and the chain would read as tampered. An older binary that predates v4 reads a v4 event as `UnknownSchema`, never tampered, so a store can be read by a lagging reader during a staggered upgrade.
 
-There are 10 event types:
+There are 11 event types:
 
 | Event                      | Trigger                                                                                                          |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -1170,6 +1170,7 @@ There are 10 event types:
 | `RetentionPruned`          | An oldest-first prefix of the event log was deleted past `enforcement.retention`. Records the count and the seq range. Written by `mati repair`'s full scan, after the deletion |
 | `CleanShutdown`            | The daemon exited gracefully. Records the shutdown reason. Written by `mati daemon start` as the last event of its run, after the drain and before the store closes (section 18.2) |
 | `SubagentSpawned`          | A Task subagent was spawned (Claude Code `SubagentStart`). Records presence — `agent_session` + `agent_id` — independent of any consult, so the audit can attribute a subagent that spawned and never consulted. `subject_kind` is `System`, `subject_key` the agent_id. A new event TYPE at schema_version 3, no bump (section 24) |
+| `SubagentEdge`             | A subagent spawned another subagent — the nested (agent→agent) spawn edge, from the `claude-post-task` hook on the `Agent`-tool `PostToolUse`. `agent_id` is the child, `parent_agent_id` the spawner; `subject_kind` is `System`, `subject_key` the child. Emitted only for NESTED spawns (root spawns are covered by `SubagentSpawned`). A new event TYPE; `parent_agent_id` is carried by the v4 canonical form |
 
 Each event also carries:
 
@@ -1194,7 +1195,7 @@ parent_agent_id
 
 `receipt_id`, `decision_basis_hash`, and `agent_session` were part of the v2 canonical layout before anything wrote them, so filling them in needs no schema bump — an event written when they were null still hashes under the layout it recorded, and every era verifies in one chain. `agent_id` is different: it did not exist in the v2 layout, so hashing it required the v3 bump. Attribution is per-write — the shared writer clears `agent_session`/`agent_id`/`parent_agent_id` after each event, so an unattributed event (e.g. a `RecordingGap`) written next never inherits the previous event's lineage.
 
-`parent_agent_id` (schema_version 4, not yet stamped) is the agent that spawned the subagent in `agent_id`, for nested agent→agent lineage. `None` when the parent is the root session — there `agent_session` already names the spawner, so one-level lineage needs no parent id. The struct field exists and the v4 canonical form hashes it, but `SCHEMA_VERSION` is still 3 and no emitter populates it: written events stay v4-free until population lands. The spawner is carried by the `Agent`-tool `PostToolUse` hook payload (top-level `agent_id` = spawner, `tool_response.agentId` = the child), which the recording path does not yet consume.
+`parent_agent_id` (schema_version 4) is the agent that spawned the subagent in `agent_id`, for nested agent→agent lineage. `None` when the parent is the root session — there `agent_session` already names the spawner, so one-level lineage needs no parent id. It is populated only by the `SubagentEdge` event, whose emitter is the `claude-post-task` hook on the `Agent`-tool `PostToolUse` payload (top-level `agent_id` = spawner, `tool_response.agentId` = the child). Only a NESTED spawn (spawner is itself a subagent) produces a `SubagentEdge`; a root-session spawn is already recorded by `SubagentSpawned`, so recording it again would double-count.
 
 The enforcement event log is local and owned by the developer. The enterprise tier reads it to generate signed audit artifacts. It does not add events to the log.
 

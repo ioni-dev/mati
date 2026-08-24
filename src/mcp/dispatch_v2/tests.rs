@@ -2159,8 +2159,7 @@ async fn subagent_edge_records_nested_lineage() {
         .expect("a SubagentEdge event must be recorded");
 
     // The child is the actor; the parent is the spawner. Both are carried so the
-    // audit can walk the tree. (parent_agent_id rides the event now; it is hashed
-    // once SCHEMA_VERSION reaches 4.)
+    // audit can walk the tree; parent_agent_id is hashed by the v4 canonical form.
     assert_eq!(edge.agent_id.as_deref(), Some("child-1"));
     assert_eq!(edge.parent_agent_id.as_deref(), Some("parent-1"));
     assert_eq!(edge.agent_session.as_deref(), Some("sess-1"));
