@@ -45,6 +45,10 @@ PENDING\ WORK/
 !ARCHITECTURE.md
 !CLAUDE.md
 !SECURITY.md
+!README.md
+!CODE_OF_CONDUCT.md
+# Community health files under .github/ (issue/PR templates)
+!.github/**/*.md
 
 docs/REAL_LIFE_TEST_REPORT_M11.md
 
