@@ -2,3 +2,6 @@
 # Collapse them in GitHub diffs and keep them out of the language stats.
 /Cargo.lock linguist-generated=true
 /fuzz/Cargo.lock linguist-generated=true
+
+# Vendored third-party corpora used only as parser test fixtures.
+tests/fixtures/real_world/** linguist-vendored=true
