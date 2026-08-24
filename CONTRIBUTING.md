@@ -83,6 +83,6 @@ cargo test --doc
 
 ## Licensing of contributions
 
-mati is MIT licensed. See `LICENSE`.
+mati is licensed under the Apache License 2.0. See `LICENSE`.
 
-By submitting a contribution, you agree that it will be licensed under the same MIT terms: inbound equals outbound.
+By submitting a contribution, you agree that it will be licensed under the same Apache 2.0 terms: inbound equals outbound.

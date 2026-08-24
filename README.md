@@ -244,4 +244,4 @@ Vanilla `cargo test` works but is constrained to single-threaded execution. See 
 
 ## License
 
-mati is released under the [MIT License](LICENSE). The "mati" name and logo are trademarks of the project. See [TRADEMARK.md](TRADEMARK.md).
+mati is released under the [Apache License 2.0](LICENSE). The "mati" name and logo are trademarks of the project. See [TRADEMARK.md](TRADEMARK.md).
