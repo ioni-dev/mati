@@ -1633,12 +1633,13 @@ mod tests {
                 ("attestation", "network"),
                 ("enforcement", "policy"),
                 ("enforcement", "binary parity"),
+                ("knowledge", "gating"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
              ping → dirty_marker → drift → chain → freshness → network → policy \
-             → binary parity (new checks append at the end so an index a \
+             → binary parity → gating (new checks append at the end so an index a \
              consumer already relies on never moves)"
         );
         assert_eq!(report.version, 2);

@@ -95,9 +95,11 @@ pub(crate) fn platform_events(
         HookVariant::CodexPostBash
         | HookVariant::ClaudePostMemGet
         | HookVariant::ClaudePostBash
+        | HookVariant::ClaudePostTask
         | HookVariant::ClaudeInstructionsLoaded
         | HookVariant::ClaudeFileChanged => {
-            // Post-bash and post-memget use their own flows — should not reach here.
+            // Post-bash, post-memget, and post-task use their own flows — should
+            // not reach here.
             events
         }
         HookVariant::ClaudePreEdit => events
@@ -334,6 +336,7 @@ pub(crate) fn allow_output(variant: HookVariant) -> Option<&'static str> {
         | HookVariant::ClaudePreEdit
         | HookVariant::ClaudePostMemGet
         | HookVariant::ClaudePostBash
+        | HookVariant::ClaudePostTask
         | HookVariant::ClaudeInstructionsLoaded
         | HookVariant::ClaudeFileChanged => None,
     }
@@ -711,6 +714,7 @@ pub(crate) fn format_decision(
         HookVariant::CodexPostBash
         | HookVariant::ClaudePostMemGet
         | HookVariant::ClaudePostBash
+        | HookVariant::ClaudePostTask
         | HookVariant::ClaudeInstructionsLoaded
         | HookVariant::ClaudeFileChanged => (String::new(), String::new(), 0),
     }

@@ -84,6 +84,7 @@ fn frozen_test_event() -> EnforcementEvent {
         decision_basis_hash: Some("def456".to_string()),
         agent_session: None,
         agent_id: None,
+        parent_agent_id: None,
     }
 }
 
@@ -984,8 +985,8 @@ fn canonical_subject_hash_is_deterministic() {
 }
 
 #[test]
-fn schema_version_is_three() {
-    assert_eq!(SCHEMA_VERSION, 3);
+fn schema_version_is_four() {
+    assert_eq!(SCHEMA_VERSION, 4);
     assert_eq!(HASH_ALGORITHM, "sha256");
 }
 
@@ -1074,25 +1075,87 @@ fn agent_id_is_hashed_for_v3_only() {
 }
 
 #[test]
-fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
-    // One store can hold events written by three eras of the binary, plus a
+fn parent_agent_id_is_hashed_for_v4_only() {
+    // A v3 event's canonical form stops at agent_id, so parent_agent_id must not
+    // affect its hash — a v3 event written before v4 existed stays byte-identical.
+    let v3_none = EnforcementEvent {
+        schema_version: 3,
+        parent_agent_id: None,
+        ..frozen_test_event()
+    };
+    let v3_with_parent = EnforcementEvent {
+        schema_version: 3,
+        parent_agent_id: Some("parent-1".to_string()),
+        ..frozen_test_event()
+    };
+    assert_eq!(
+        v3_none.compute_hash(),
+        v3_with_parent.compute_hash(),
+        "the v3 canonical form must ignore parent_agent_id"
+    );
+
+    // A v4 event hashes parent_agent_id, so changing it changes the hash —
+    // tamper-evident nested lineage, the same guarantee agent_id gained in v3.
+    let v4_none = EnforcementEvent {
+        schema_version: 4,
+        parent_agent_id: None,
+        ..frozen_test_event()
+    };
+    let v4_with_parent = EnforcementEvent {
+        schema_version: 4,
+        parent_agent_id: Some("parent-1".to_string()),
+        ..frozen_test_event()
+    };
+    assert_ne!(
+        v4_none.compute_hash(),
+        v4_with_parent.compute_hash(),
+        "the v4 canonical form must cover parent_agent_id"
+    );
+    assert_eq!(
+        v4_with_parent.compute_hash(),
+        v4_with_parent.compute_hash(),
+        "v4 hashing is deterministic"
+    );
+
+    // The v4 form (even with parent_agent_id=None) differs from the v3 form of
+    // the same event — 17 vs 16 fields — proving compute_hash branches into v4.
+    assert_ne!(
+        v3_none.compute_hash(),
+        v4_none.compute_hash(),
+        "v3 and v4 canonical forms must differ (16 vs 17 fields)"
+    );
+}
+
+#[test]
+fn mixed_v1_v2_v3_v4_chain_with_subagent_spawned_verifies_valid() {
+    // One store can hold events written by four eras of the binary, plus a
     // SubagentSpawned (a new event TYPE at v3 — no schema bump, rides the v3
-    // layout). All must verify clean in one chain.
+    // layout) and a v4 SubagentEdge carrying nested lineage (parent_agent_id).
+    // All must verify clean in one chain.
     let mut prev = String::new();
     let mut events = Vec::new();
-    for (seq, version, ty, agent) in [
-        (1u64, 1u8, EnforcementEventType::Deny, None),
-        (2, 2, EnforcementEventType::Deny, None),
+    for (seq, version, ty, agent, parent) in [
+        (1u64, 1u8, EnforcementEventType::Deny, None, None),
+        (2, 2, EnforcementEventType::Deny, None, None),
         (
             3,
             3,
             EnforcementEventType::Deny,
             Some("sub-xyz".to_string()),
+            None,
         ),
         (
             4,
             3,
             EnforcementEventType::SubagentSpawned,
+            Some("sub-abc".to_string()),
+            None,
+        ),
+        (
+            5,
+            4,
+            EnforcementEventType::SubagentEdge,
+            Some("sub-child".to_string()),
             Some("sub-abc".to_string()),
         ),
     ] {
@@ -1103,6 +1166,7 @@ fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
             prev_hash: prev.clone(),
             agent_session: agent.as_ref().map(|_| "sess-1".to_string()),
             agent_id: agent,
+            parent_agent_id: parent,
             event_hash: String::new(),
             ..frozen_test_event()
         };
@@ -1113,7 +1177,7 @@ fn mixed_v1_v2_v3_chain_with_subagent_spawned_verifies_valid() {
 
     let v = verify_chain(&events);
     assert!(v.is_valid(), "mixed-era chain must verify clean: {v:?}");
-    assert_eq!(v.checked, 4);
+    assert_eq!(v.checked, 5);
     assert_eq!(v.tampered_events, 0);
     assert_eq!(v.linkage_breaks, 0);
     assert_eq!(v.unknown_schema, 0);
@@ -1140,9 +1204,10 @@ fn subagent_spawned_event_hashes_and_labels() {
 
 #[test]
 fn future_schema_event_reads_as_unknown_not_tampering() {
-    // The same guarantee that protects an OLD binary from a v4 event: an event
+    // The same guarantee that protects an OLD binary from a v5 event: an event
     // at a version this binary does not know verifies as UnknownSchema, never
-    // Tampered. Proven here with SCHEMA_VERSION + 1.
+    // Tampered. Proven here with SCHEMA_VERSION + 1. This is why a v4 store read
+    // by an older v3 binary degrades to unknown, not a false tamper.
     let mut e = EnforcementEvent {
         schema_version: SCHEMA_VERSION + 1,
         event_hash: String::new(),

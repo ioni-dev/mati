@@ -218,6 +218,10 @@ pub struct EnforcementEventWriter {
     /// Subagent actor (Claude Code Task `agent_id`) that drove the write, for
     /// one-level agent lineage (schema_version 3). `None` unless set before `write`.
     pub(super) agent_id: Option<String>,
+    /// Agent that spawned `agent_id`, for nested agent→agent lineage
+    /// (schema_version 4). `None` unless set before `write` (and `None` when the
+    /// spawner is the root session). See `EnforcementEvent::parent_agent_id`.
+    pub(super) parent_agent_id: Option<String>,
 }
 
 impl EnforcementEventWriter {
@@ -236,6 +240,7 @@ impl EnforcementEventWriter {
             prev_hash,
             agent_session: None,
             agent_id: None,
+            parent_agent_id: None,
         })
     }
 
@@ -321,6 +326,7 @@ impl EnforcementEventWriter {
             decision_basis_hash,
             agent_session: self.agent_session.clone(),
             agent_id: self.agent_id.clone(),
+            parent_agent_id: self.parent_agent_id.clone(),
         };
 
         // Compute and set the event hash
@@ -340,6 +346,7 @@ impl EnforcementEventWriter {
         // Every attributed path sets these immediately before calling `write`.
         self.agent_session = None;
         self.agent_id = None;
+        self.parent_agent_id = None;
 
         Ok(event)
     }

@@ -226,6 +226,7 @@ fn is_session_side(cmd: &Command) -> bool {
             | Command::SessionClearConsults
             | Command::SubagentHarvest(_)
             | Command::SubagentSpawned(_)
+            | Command::SubagentEdge(_)
     )
 }
 

@@ -36,6 +36,11 @@ pub enum HookVariant {
     /// successful allowlisted database introspection.
     #[value(name = "claude-post-bash")]
     ClaudePostBash,
+    /// Claude PostToolUse(Task): record a nested subagent→subagent spawn edge.
+    /// The payload's top-level `agent_id` is the spawner and
+    /// `tool_response.agentId` the child; only nested spawns are recorded.
+    #[value(name = "claude-post-task")]
+    ClaudePostTask,
     /// Claude Code `InstructionsLoaded`: record the exact ambient instruction
     /// payload without emitting a hook decision.
     #[value(name = "claude-instructions-loaded")]
@@ -150,6 +155,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     if args.variant == HookVariant::ClaudePostBash {
         return run_post_bash_introspection(&input).await;
+    }
+
+    if args.variant == HookVariant::ClaudePostTask {
+        return run_post_task(&input).await;
     }
 
     if args.variant == HookVariant::ClaudeConfigChange {

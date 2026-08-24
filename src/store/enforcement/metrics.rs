@@ -102,6 +102,7 @@ pub fn aggregate_event_counts(events: &[EnforcementEvent]) -> EnforcementEventCo
             EnforcementEventType::RetentionPruned { .. } => counts.retention_prunes += 1,
             EnforcementEventType::CleanShutdown { .. } => counts.clean_shutdowns += 1,
             EnforcementEventType::SubagentSpawned => counts.subagent_spawns += 1,
+            EnforcementEventType::SubagentEdge => counts.subagent_edges += 1,
         }
     }
     counts
@@ -140,6 +141,10 @@ pub struct EnforcementEventCounts {
     /// `SubagentSpawned` events — subagents that spawned, whether or not they
     /// went on to consult. Lets the audit attribute spawned-then-idle subagents.
     pub subagent_spawns: u64,
+    /// `SubagentEdge` events — nested subagent→subagent spawns. Each is one
+    /// parent→child edge past the leaf, recorded only when the spawner is itself
+    /// a subagent (root spawns are counted by `subagent_spawns`).
+    pub subagent_edges: u64,
 }
 
 /// Derived enforcement metrics (PMF/friction signals) computed from the
@@ -274,5 +279,6 @@ pub fn event_type_label(event_type: &EnforcementEventType) -> &'static str {
         EnforcementEventType::RetentionPruned { .. } => "retention_pruned",
         EnforcementEventType::CleanShutdown { .. } => "clean_shutdown",
         EnforcementEventType::SubagentSpawned => "subagent_spawned",
+        EnforcementEventType::SubagentEdge => "subagent_edge",
     }
 }

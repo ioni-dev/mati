@@ -6,17 +6,19 @@ use super::*;
 
 /// Schema version for the enforcement event envelope. v2 appends `agent_session`
 /// (the spawning session); v3 appends `agent_id` (the subagent actor, for
-/// one-level agent lineage). Each version appends its new field at the END of the
-/// canonical form and is hashed only for events at that version or newer, so v1
-/// events keep their original 14-field layout and hashes, and v2 events keep their
-/// 15-field layout (see `compute_hash`). Increment only when fields are added or
-/// serialization changes. A NEW EVENT TYPE does not bump this: `event_type` is one
-/// opaque hashed field, so a new `EnforcementEventType` variant changes no layout
-/// (section 24). An older binary cannot deserialize the new tag and reports the
-/// event as `UnknownSchema` — bumping instead would make it reject EVERY newer
-/// event, so the no-bump path preserves the most downgrade-compatibility.
-/// Verifiers must reject events with unknown schema versions.
-pub const SCHEMA_VERSION: u8 = 3;
+/// one-level agent lineage); v4 appends `parent_agent_id` (the spawner of that
+/// subagent, for nested agent→agent lineage). Each version appends its new field
+/// at the END of the canonical form and is hashed only for events at that version
+/// or newer, so v1 events keep their original 14-field layout and hashes, v2
+/// events keep their 15-field layout, and v3 events keep their 16-field layout
+/// (see `compute_hash`). Increment only when fields are added or serialization
+/// changes. A NEW EVENT TYPE does not bump this: `event_type` is one opaque hashed
+/// field, so a new `EnforcementEventType` variant changes no layout (section 24).
+/// An older binary cannot deserialize the new tag and reports the event as
+/// `UnknownSchema` — bumping instead would make it reject EVERY newer event, so
+/// the no-bump path preserves the most downgrade-compatibility. Verifiers must
+/// reject events with unknown schema versions.
+pub const SCHEMA_VERSION: u8 = 4;
 
 /// Hash algorithm used for event_hash and prev_hash.
 /// Frozen for v1. Do not change without incrementing SCHEMA_VERSION.
@@ -122,6 +124,17 @@ pub struct EnforcementEvent {
     /// enterprise audit asks. Added in schema_version 3; hashed only for v3+
     /// events (see `compute_hash`).
     pub agent_id: Option<String>,
+
+    /// The agent that SPAWNED the subagent in `agent_id` (Claude Code Task
+    /// `agent_id` of the parent). `None` when the parent is the root session —
+    /// i.e. one-level lineage, where `agent_session` already identifies the
+    /// spawner. Set only for nested spawns (a subagent spawning another
+    /// subagent), carried by the `Agent`-tool `PostToolUse` hook payload
+    /// (top-level `agent_id` = spawner, `tool_response.agentId` = the child in
+    /// `agent_id` here). Together with `agent_session` and `agent_id` this walks
+    /// the full spawn tree, not just the leaf. Added in schema_version 4; hashed
+    /// only for v4+ events (see `compute_hash`).
+    pub parent_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +204,18 @@ pub enum EnforcementEventType {
     /// rides the existing v3 canonical form. Recorded best-effort from the
     /// SubagentStart hook.
     SubagentSpawned,
+    /// A subagent spawned another subagent — the nested (agent→agent) spawn edge.
+    /// Captured at the child's completion from the Claude Code `Agent`-tool
+    /// `PostToolUse` payload, whose top-level `agent_id` is the spawner and whose
+    /// `tool_response.agentId` is the child. `subject_key` is the child agent_id,
+    /// `subject_kind` is `System`; `agent_id` is the child and `parent_agent_id`
+    /// the spawner, so the pair walks the tree past the leaf. Emitted ONLY when
+    /// the spawner is itself a subagent — a root-session spawn is already recorded
+    /// by `SubagentSpawned` and by every child event's `agent_session`, so this
+    /// event is purely additive. A new event TYPE, not a new field — it needed no
+    /// bump of its own; the `parent_agent_id` it carries is hashed by the v4
+    /// canonical form (see `SCHEMA_VERSION`). Recorded best-effort.
+    SubagentEdge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +339,31 @@ struct CanonicalEventV3<'a> {
     agent_id: Option<&'a str>,
 }
 
+/// schema_version 4 canonical form: the v3 fields followed by `parent_agent_id`,
+/// appended at the END so v3 events (serialized via `CanonicalEventV3`) keep a
+/// byte-identical canonical form and their original hashes.
+#[derive(Serialize)]
+struct CanonicalEventV4<'a> {
+    event_id: &'a str,
+    schema_version: u8,
+    seq_no: u64,
+    recorded_at_ms: u64,
+    event_type: &'a EnforcementEventType,
+    prev_hash: &'a str,
+    installation_id: &'a str,
+    actor_local: &'a Option<ActorLocal>,
+    agent_type: &'a str,
+    subject_kind: SubjectKind,
+    subject_key: &'a str,
+    canonical_subject_hash: Option<&'a str>,
+    receipt_id: Option<&'a str>,
+    decision_reason_code: &'a str,
+    decision_basis_hash: Option<&'a str>,
+    agent_session: Option<&'a str>,
+    agent_id: Option<&'a str>,
+    parent_agent_id: Option<&'a str>,
+}
+
 impl EnforcementEvent {
     /// Compute the canonical hash of this event.
     ///
@@ -322,15 +372,38 @@ impl EnforcementEvent {
     /// without incrementing SCHEMA_VERSION.
     pub fn compute_hash(&self) -> String {
         // schema_version 1 hashes the original 14-field canonical form; v2 the
-        // 15-field form with `agent_session` appended; v3+ the 16-field form with
-        // `agent_id` appended too. Each branch keeps every pre-existing event's
-        // hash byte-identical at its own version (no false tamper). Newer schemas
+        // 15-field form with `agent_session` appended; v3 the 16-field form with
+        // `agent_id` appended too; v4+ the 17-field form with `parent_agent_id`
+        // appended. Each branch keeps every pre-existing event's hash
+        // byte-identical at its own version (no false tamper). Newer schemas
         // never reach here — `verify_chain` short-circuits `schema_version >
         // SCHEMA_VERSION` to UnknownSchema, and the writer only stamps
-        // SCHEMA_VERSION — so the `>= 3` arm serializes exactly the v3 layout.
-        // A new event TYPE (e.g. SubagentSpawned) rides the same v3 arm: it is
-        // just another `event_type` value, no field or layout change.
-        let json = if self.schema_version >= 3 {
+        // SCHEMA_VERSION — so the `>= 4` arm serializes exactly the v4 layout.
+        // A new event TYPE (e.g. SubagentSpawned, SubagentEdge) rides the current
+        // arm: just another `event_type` value, no field or layout change.
+        let json = if self.schema_version >= 4 {
+            let canonical = CanonicalEventV4 {
+                event_id: &self.event_id,
+                schema_version: self.schema_version,
+                seq_no: self.seq_no,
+                recorded_at_ms: self.recorded_at_ms,
+                event_type: &self.event_type,
+                prev_hash: &self.prev_hash,
+                installation_id: &self.installation_id,
+                actor_local: &self.actor_local,
+                agent_type: &self.agent_type,
+                subject_kind: self.subject_kind,
+                subject_key: &self.subject_key,
+                canonical_subject_hash: self.canonical_subject_hash.as_deref(),
+                receipt_id: self.receipt_id.as_deref(),
+                decision_reason_code: &self.decision_reason_code,
+                decision_basis_hash: self.decision_basis_hash.as_deref(),
+                agent_session: self.agent_session.as_deref(),
+                agent_id: self.agent_id.as_deref(),
+                parent_agent_id: self.parent_agent_id.as_deref(),
+            };
+            serde_json::to_string(&canonical).expect("canonical serialization must not fail")
+        } else if self.schema_version == 3 {
             let canonical = CanonicalEventV3 {
                 event_id: &self.event_id,
                 schema_version: self.schema_version,
