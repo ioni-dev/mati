@@ -15,7 +15,9 @@ use mati_core::graph::edges::EdgeKind;
 use mati_core::graph::Graph;
 use mati_core::scaffold::codex::CodexInstallResult;
 use mati_core::scaffold::settings::InstallResult;
-use mati_core::scaffold::{install_codex, write_claude_md_stub, write_mati_enrich_command};
+use mati_core::scaffold::{
+    install_codex, write_capture_skills, write_claude_md_stub, write_mati_enrich_command,
+};
 use mati_core::store::{
     derive_slug, slug_root, Category, ConfidenceScore, FileRecord, GotchaRecord, Priority,
     QualityScore, Record, RecordLifecycle, RecordSource, RecordVersion, StalenessScore,

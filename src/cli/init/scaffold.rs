@@ -73,6 +73,21 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
         }
 
         let t = Instant::now();
+        match write_capture_skills(root) {
+            Ok(_) => println!(
+                "  Writing .claude/skills/ (capture)...                {:>3}ms",
+                t.elapsed().as_millis()
+            ),
+            Err(e) => {
+                tracing::warn!("capture skills write failed: {e}");
+                println!(
+                    "  Writing .claude/skills/ (capture)...    skipped — {:#}",
+                    e
+                );
+            }
+        }
+
+        let t = Instant::now();
         match install_hooks_with_options(root, args.claude_mcp_tool) {
             Ok(InstallResult::Installed { missing_deps, .. }) => {
                 claude_installed = true;
@@ -103,7 +118,10 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                         claude_hooks.len(),
                         claude_hooks.join(", ")
                     );
-                    println!("    {g}.claude/CLAUDE.md              knowledge capture + enrichment instructions{r}");
+                    println!(
+                        "    {g}.claude/CLAUDE.md              read-gate + enrichment pointer{r}"
+                    );
+                    println!("    {g}.claude/skills/                capture skills (gotcha, policy) — load on demand{r}");
                     if args.claude_mcp_tool {
                         println!(
                             "    {g}experimental mcp_tool              additive prototype; shell pre-read remains the startup-independent path{r}"

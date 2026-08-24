@@ -5,6 +5,13 @@
 //! Vector C — framing it as an environmental fact rather than a polite request
 //! makes models treat it as a constraint, not a guideline.
 //!
+//! Only always-relevant instructions live here (mem_get-before-read, gotcha
+//! and policy capture). `.claude/CLAUDE.md` loads into every session, so its
+//! cost is paid every turn. The `/mati-enrich` extraction pipeline is NOT in
+//! this stub — it lives in the command body (see [`super::commands`]), which
+//! loads only when the command runs. That split keeps the always-on footprint
+//! ~700 tokens instead of ~2.9K (design principle P2: pull on demand).
+//!
 //! The stub is **appended** if a `.claude/CLAUDE.md` already exists, and
 //! **created** if it does not. The marker comment prevents duplicate writes
 //! on re-init.
@@ -30,233 +37,11 @@ High-confidence records (confidence >= 0.6, confirmed=true) replace file reads.
 The PreToolUse hook enforces this at the environment level.
 Run `mati status` to see current knowledge health.
 
-## mati Knowledge Capture
-
-When the developer says any of these:
-- \"add that as a gotcha\" / \"that's a gotcha\" / \"remember this\"
-- \"note that down\" / \"mati note: ...\" / \"we decided to...\"
-
-Call mem_set immediately. Do not ask for confirmation.
-Single gotcha from developer request: mem_set to write, then mem_set with action=\"confirm\" — mati prompts the developer to approve before enforcement activates.
-Batch /mati-enrich directory: leave unconfirmed, remind to run `mati review`.
-
-## mati Policy Capture
-
-CAPTURE TRIGGERS. Author a policy when the developer either:
-- asks explicitly: \"mati policy: ...\", \"make this a policy\", \"create a policy around this\", \"enforce this\", or \"add a guardrail for this\"; or
-- states a standing directive implicitly: \"from now on\", \"before you ever\", \"always X before Y\", \"never run X without Y\", or \"make it a rule that\".
-In both cases author it without asking for confirmation, matching the existing
-gotcha capture convention. Author policies at `off` and suggest that the
-developer run `mati policy stage <slug> shadow` to review what they would
-catch; promoting one to `enforce` is theirs to do.
-
-NOT EVERY DIRECTIVE IS A POLICY. A policy can only match a governable action
-category: `db_client`, `file_read`, or `path`. If the directive does not map to
-one of those (for example \"always write better commit messages\"), do not author
-a policy whose trigger can never match. Say plainly that it is not enforceable
-as a policy and offer to capture it as a gotcha or dev note instead.
-
-LIFECYCLE. To create, or refine a policy, use `mem_set` with a `policy:<slug>`
-key. Author it at `off` and suggest that the developer run
-`mati policy stage <slug> shadow` to begin review. When the developer asks to
-stage, update, disable, or delete, run the matching
-`mati policy stage|edit|enable|disable|delete <slug>` command via Bash. The
-developer sees a permission prompt and approves it. Promoting a policy to
-`enforce` is the developer's decision. Never claim a policy is live unless its
-stage is `enforce`. Always dry-run a new or changed predicate with
-`mati policy test --trigger`, against both a command that should match and one
-that should not, before writing. Never claim a policy is active unless it was
-actually enabled.
-
 ## /mati-enrich
 
-Run /mati-enrich [path] to enrich a file or directory.
-
-Before enriching each file, call mem_get(\"file:<path>\"). If the record has
-source \"claude_enrich\" or \"developer_manual\" and confidence >= 0.60, skip it —
-already enriched. Only re-enrich if the user explicitly passes the file path.
-
-Per-file flow: mem_get → Read file → extract purpose + gotchas → mem_set file → mem_set each gotcha.
-Single file: mem_set to write, then mem_set action=\"confirm\" for each gotcha — mati prompts the developer to approve each one.
-Directory/batch: mem_set only (confirmed=false).
-
-When enrichment is complete, print a summary:
-  Enriched: X files (Y skipped — already enriched)
-  Gotcha candidates extracted: Z
-  Run `mati review` to confirm candidates and activate hook enforcement.
-  Run `mati stats` to see updated coverage and onboarding score.
-
-## /mati-enrich — extraction pipeline (v0.2)
-
-The four-stage pipeline below is the operational instruction set for
-extracting gotcha candidates. It SUPERSEDES the brief overview above
-for the actual extraction steps; the intro stays as the high-level
-intent. Apply all four stages per file.
-
-### Stage 1 — Setup (before reading)
-
-1. `mem_query mode=\"dir_gotchas\" query=\"<dirname-of-file>\" limit 5`
-   → top 5 confirmed gotchas for that directory as POSITIVE
-     EXEMPLARS. If the array is empty (cold start), continue with
-     schema-only guidance. Do not use `mode=\"text\"` here: the search
-     index carries no `affected_files`, so a directory query returns
-     file records instead of gotchas.
-2. `mem_get(\"file:<path>\")` — mints the consultation receipt, returns
-   existing gotcha_keys, AND returns the `enrichment_depth_hint` field
-   (D2-α: one of \"fast\", \"standard\", \"deep\"). Use it to pick the
-   tier branch below. If absent (older daemon), default to \"deep\".
-3. **Deep tier only**: call via Bash
-   `mati ls tombstoned --dir <dirname-of-file> --recent 30d --json`
-   to retrieve NEGATIVE EXEMPLARS — rules that were proposed for
-   this directory and then tombstoned. Use them in Stage 2 to
-   calibrate AGAINST proposing similar rules. If `count` is 0,
-   skip the negative block. Record whether the block was actually
-   used — controls the `with-neg-exemplars` tag in Stage 4.
-4. **AST seeding**: call `mati extract-signals --file <path>` via Bash
-   for deterministic, AST-aware signal extraction across all 12
-   supported languages. Returns JSON
-   `{ file, language, signal_count, signals: [{ file_line, tier,
-      kind, evidence }, ...] }`. Treat each `file_line` as a SEED that
-   Stage 2 must examine. Seeds never replace the file scan — read the
-   file in Stage 2 at every tier, whatever `signal_count` says.
-   For `panic`, `assert`, and `unwrap_like` signals, `evidence` is a
-   bare identifier (`bail`, `expect`), not source text. A candidate
-   drafted from that alone passes Stage 3 by construction — the quote
-   is the token the extractor matched — and carries an invented
-   reason. Take `evidence_quote` from the file, not from `evidence`.
-   The extractor also misses signals inside macro bodies, which
-   tree-sitter parses as token trees.
-
-### Tier branches (D2)
-
-| Tier      | Positive exemplars | Negative exemplars | Stage 2 file scan |
-| --------- | ------------------ | ------------------ | ----------------- |
-| fast      | no (schema only)   | no                 | yes               |
-| standard  | yes                | no                 | yes               |
-| deep      | yes                | yes                | yes               |
-
-`fast` for trivial files (LoC < 100, isolated blast, no cluster).
-`standard` is the default. `deep` adds negative exemplars for
-hotspot / signal-rich files. Tier gates exemplars only — it never
-gates the file scan.
-
-Stage 3 runs at every tier. It is one CLI call per candidate, not a
-reasoning pass, so tier does not gate it.
-
-### Stage 2 — Enumeration (maximize recall)
-
-Read the file. Output a JSON array of candidates, using the POSITIVE
-EXEMPLARS as calibration for this project's specific bar.
-
-Signal ranking (extract from highest first):
-  HIGH:    WARNING / FIXME / HACK / SAFETY / IMPORTANT comments;
-           panic!/assert!/expect(\"…\") with non-trivial messages;
-           comments explaining \"why this looks weird\" or \"do not\".
-  MEDIUM:  Defensive guards (early returns, custom error paths);
-           non-obvious literal arguments (e.g. with_versioning(true, 0));
-           error handling that diverges from the rest of the file.
-  LOW:     Raw API usage with no comment context.
-
-Schema (strict JSON, one element per candidate):
-[
-  { \"candidate_id\": \"C1\",
-    \"signal_tier\": \"high\" | \"medium\" | \"low\",
-    \"file_line\": \"L42\",
-    \"evidence_quote\": \"exact text from file at that line\",
-    \"draft_rule\": \"imperative verb + specific target\",
-    \"draft_reason\": \"what breaks and why\",
-    \"draft_severity\": \"critical\" | \"high\" | \"normal\" | \"low\" } ]
-
-Write each candidate to be Specific (names a concrete API, value, or
-pattern — never \"be careful\" or \"review carefully\"), Enforceable (a
-hook could deny a real mistake on it), Non-obvious (not derivable
-from type signatures alone), and Causal (the reason says WHAT breaks,
-with \"because\"/\"since\"). These shape how you draft a candidate. They
-are not a filter — do not drop a candidate for failing them here.
-
-Goal: maximize recall. Weak candidates are OK — filtered next.
-
-### Stage 3 — Evidence verification (deterministic, D-α)
-
-One pass, no rounds. For each candidate, call `mati verify-evidence`
-via Bash:
-  mati verify-evidence \\
-    --file <path> \\
-    --line <candidate.file_line> \\
-    --quote \"<candidate.evidence_quote>\" \\
-    --pattern \"<api/literal named in candidate.draft_rule>\"
-The CLI returns JSON. Parse it:
-  { \"verified\": true, ... }  → keep, add \"verified\": true
-  { \"verified\": false, ... } → DISCARD (hallucinated citation, or
-                                  rule generalizes beyond visible scope)
-The CLI is the source of truth. Do not second-guess a verdict, and do
-not re-run a candidate that already returned one — the check is
-deterministic, so a repeat call returns the same answer.
-
-Known limit: the check reads a ±5-line window. It proves the citation
-is real, not that the rule follows from it. Keep `draft_rule` anchored
-to what is visible at `file_line` — a rule whose claim spans more of
-the file than that window passes unverified.
-
-### Stage 4 — Refinement and write
-
-For each verified candidate:
-
-1. Tighten rule: imperative verb first; concrete names not pronouns;
-   ≤ 80 chars where possible. If a candidate is still vague after
-   tightening — no concrete API, value, or pattern to enforce on —
-   drop it here.
-2. Verify reason uses \"because\"/\"since\"/\"as\" — add if missing.
-3. Assign severity (D-β). One judgment, one deterministic floor:
-
-   3a. SEMANTIC pass — the severity. Judge rule + reason against:
-       critical — data loss, corruption, security, unbounded growth
-       high     — wrong result, silent failure, race, broken invariant
-       normal   — performance, workflow blocker, non-obvious cleanup
-       low      — informational, stylistic, minor inconvenience
-
-   3b. KEYWORD FLOOR — deterministic, raises only, never lowers.
-       Scan rule + reason case-insensitively for these stems:
-         \"data loss\" / \"corrupt\" / \"security\" / \"unbounded\"  → critical
-         \"silent\" / \"race\" / \"wrong result\" / \"lost\"         → high
-       No stem present → no floor.
-
-   3c. severity = the higher of 3a and the floor.
-       Tag \"severity-disputed\" ONLY when the floor RAISED 3a — the
-       text names a failure the judgment underrated. No stem matched,
-       or 3a already at or above the floor → no tag. The tag flags a
-       real conflict for the reviewer; it is not a routine annotation.
-
-4. Call `mem_set`:
-     key: `gotcha:<slug>`
-     rule, reason, severity (from step 3)
-     affected_files: [<path>]
-     tags:  [\"enriched\", \"depth:<tier>\"]
-          + [\"signal-source:ast\"] (if this candidate's file_line was
-            an extract-signals seed) else [\"signal-source:llm\"]
-          + [\"with-neg-exemplars\"] (if Stage 1 step 3 used negatives)
-          + ([\"severity-disputed\"] if step 3c flagged)
-     confirmed: false
-
-     `signal-source:*` is per candidate, not per file — it records
-     which channel first surfaced the line. The `depth:<tier>` tag
-     (D3) drives per-tier accuracy in `mati doctor`.
-
-     This is attribution, not an experiment: Stage 2 sees the seeds
-     while scanning, so `signal-source:llm` candidates are not an
-     uncontaminated control.
-
-### Notes
-
-- Per-file token budget: ~8K tokens for Stage 2. Stage 3 is CLI
-  calls, near-zero tokens. If you exceed the budget, truncate Stage 2
-  candidates to top 10 by signal_tier.
-- The Rust-side quality gate still applies at write time. The
-  pipeline maximizes what gets through; the gate enforces the floor.
-- Do not add verification passes of your own, and do not spawn a
-  subagent to double-check candidates. Stage 3 and the write-time
-  quality gate are the only filters. Extra self-review costs tokens
-  and suppresses recall without improving precision.
+Run `/mati-enrich [path]` to enrich files into the store. The full
+four-stage extraction pipeline lives in the `/mati-enrich` command
+and loads only when you run it — never injected into every session.
 ";
 
 fn vector_c_stub() -> String {
@@ -364,14 +149,15 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join(".claude/CLAUDE.md")).unwrap();
         assert!(content.contains(MARKER));
         assert!(content.contains(END_MARKER));
+        // Read-gate stays always-on.
         assert!(content.contains("mem_get(\"file:<path>\")"));
         assert!(content.contains("PreToolUse hook enforces this"));
-        assert!(content.contains("## mati Policy Capture"));
-        assert!(content.contains("mati policy: ..."));
-        assert!(content.contains("it is not enforceable"));
-        assert!(content.contains("mati policy test --trigger"));
-        assert!(content.contains("mati policy stage|edit|enable|disable|delete <slug>"));
-        assert!(content.contains("mati policy stage <slug> shadow"));
+        // Capture guidance moved to lazy skills (scaffold::skills); the enrich
+        // pipeline moved to the command. Neither belongs in the always-on stub.
+        assert!(!content.contains("## mati Policy Capture"));
+        assert!(!content.contains("## mati Knowledge Capture"));
+        assert!(!content.contains("### Stage 1 — Setup"));
+        assert!(content.contains("loads only when you run it"));
     }
 
     #[test]

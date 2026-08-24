@@ -38,6 +38,15 @@ mati does not push records into Claude’s context at session start. `mem_bootst
 
 There is one deliberate exception: the passive “Suggested Actions” nudge appended to MCP tool results in `mcp/tools.rs`. It surfaces possible next steps, but it does not inject record content.
 
+P2 also governs the scaffold’s own instructions. `mati init` writes `.claude/CLAUDE.md`, which Claude Code loads into every session — so its content is a per-turn token cost. Only proactive, every-turn guidance stays in the stub: the read-gate (mem_get-before-read) and a one-line `/mati-enrich` pointer, ~130 tokens. Everything episodic loads on demand:
+
+- The ~2.3K-token `/mati-enrich` extraction pipeline lives in the `.claude/commands/mati-enrich.md` command body (`scaffold/commands.rs`), `disable-model-invocation: true` so it never auto-loads speculatively.
+- Knowledge capture ("remember this") and policy capture ("from now on…") live in lazy skills under `.claude/skills/` (`scaffold/skills.rs`). A skill's description (~40 tokens) stays in context; its body loads only when the trigger fires.
+
+The split is measured, not assumed. Moving guidance off the always-on stub is safe only for utterance-triggered behavior: policy authoring drops to 0% when its guidance leaves context entirely and returns to 100% as a lazy skill; gotcha capture is robust either way. The read-gate is the exception — a lazy skill cannot fire ahead of a file read, and relocating it to the MCP server `instructions` field measured ~40% proactive compliance versus ~100% in the stub. So the read-gate stays always-on; do not move it, and do not move the capture guidance or the pipeline back into the stub.
+
+Codex gets the lazy behavior for free — its `.codex/skills/mati/SKILL.md` is already lazy-loaded.
+
 **P3: Four MCP tools, no more.**
 
 The exposed tools are `mem_get`, `mem_query`, `mem_bootstrap`, and `mem_set`.

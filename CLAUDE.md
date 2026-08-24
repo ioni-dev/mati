@@ -237,6 +237,16 @@ never block Claude on a mati outage — hooks fail open (P9).
   `file:*.gotcha_keys` and `graph:edge:*:has_gotcha:*` are rebuilt from canonical
   `gotcha:*` records. If they disagree with the gotcha's `affected_files`, the
   gotcha record wins.
+- **The always-on `.claude/CLAUDE.md` stub carries only the read-gate.** It
+  loads every session, so only proactive every-turn guidance belongs there
+  (mem_get-before-read + a `/mati-enrich` pointer, ~130 tokens). Episodic
+  guidance loads on demand: the four-stage pipeline in `scaffold/commands.rs`
+  (`disable-model-invocation: true`), and gotcha/policy capture in lazy skills
+  in `scaffold/skills.rs`. Do NOT move capture or the pipeline back into the
+  stub. The read-gate is the one thing that must stay (a lazy skill can't fire
+  before a read; MCP-instructions relocation measured ~40% vs ~100% proactive).
+  Measured: policy capture is 0% authored without its skill, 100% with it;
+  gotcha capture is robust. See ARCHITECTURE.md §2 P2.
 
 CLI color palette is defined in `src/cli/colors.rs` (GitHub-style hex semantics).
 

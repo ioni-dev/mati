@@ -910,8 +910,35 @@ pub enum ReceiptSource {
 pub const CODEX_PRODUCIBLE_SOURCES: &[ReceiptSource] =
     &[ReceiptSource::MemGet, ReceiptSource::HookContext];
 
+/// Default consultation freshness. Mirrors the `mati policy add --requires`
+/// clap default (`src/cli/policy.rs`); a `policy_requires_default_matches_cli`
+/// test locks the two together so the CLI and `mem_set` authoring paths agree.
+const DEFAULT_POLICY_TTL_SECS: u64 = 900;
+
+fn default_policy_ttl_secs() -> u64 {
+    DEFAULT_POLICY_TTL_SECS
+}
+
+fn default_policy_freshness() -> PolicyFreshness {
+    PolicyFreshness {
+        ttl_secs: DEFAULT_POLICY_TTL_SECS,
+        fingerprint: false,
+    }
+}
+
+/// The default `requires` for a policy authored without one. Empty key/via means
+/// "no consultation gate" — the same inert default `mati policy add` writes.
+fn default_policy_requires() -> PolicyRequires {
+    PolicyRequires {
+        key: String::new(),
+        via: Vec::new(),
+        freshness: default_policy_freshness(),
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFreshness {
+    #[serde(default = "default_policy_ttl_secs")]
     pub ttl_secs: u64,
     #[serde(default)]
     pub fingerprint: bool,
@@ -919,8 +946,11 @@ pub struct PolicyFreshness {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRequires {
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub via: Vec<ReceiptSource>,
+    #[serde(default = "default_policy_freshness")]
     pub freshness: PolicyFreshness,
 }
 
@@ -933,6 +963,7 @@ pub struct PolicyRecord {
     pub scope: String,
     pub mode: PolicyMode,
     pub trigger: PolicyTrigger,
+    #[serde(default = "default_policy_requires")]
     pub requires: PolicyRequires,
     pub stage: PolicyStage,
     pub severity: Priority,
@@ -1316,6 +1347,45 @@ mod tests {
         let restored: Record = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(restored.category, Category::Policy);
         assert_eq!(restored.payload_as::<PolicyRecord>().unwrap(), policy);
+    }
+
+    #[test]
+    fn policy_requires_defaults_when_payload_omits_it() {
+        // A policy payload authored via `mem_set` may omit `requires`; it must
+        // deserialize to the inert default instead of erroring. Regression for
+        // the observed mem_set "missing field `requires`" retry.
+        let full = PolicyRecord {
+            name: "n".into(),
+            rule: "r".into(),
+            reason: "why".into(),
+            scope: "repo".into(),
+            mode: PolicyMode::Steer,
+            trigger: PolicyTrigger {
+                tool: Some("path".into()),
+                host_glob: None,
+                target_path_glob: Some("src/secrets/**".into()),
+                command_glob: None,
+            },
+            requires: default_policy_requires(),
+            stage: PolicyStage::Off,
+            severity: Priority::High,
+            created_by: "developer".into(),
+        };
+        let mut value = serde_json::to_value(&full).unwrap();
+        value.as_object_mut().unwrap().remove("requires");
+        let parsed: PolicyRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.requires, default_policy_requires());
+        assert_eq!(parsed.requires.freshness.ttl_secs, DEFAULT_POLICY_TTL_SECS);
+        assert!(parsed.requires.key.is_empty());
+    }
+
+    #[test]
+    fn policy_requires_default_matches_cli_literal() {
+        // Lock the serde default to the `mati policy add --requires` clap default
+        // so the CLI and mem_set authoring paths cannot drift apart.
+        let cli = r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#;
+        let from_cli: PolicyRequires = serde_json::from_str(cli).unwrap();
+        assert_eq!(from_cli, default_policy_requires());
     }
 
     #[test]
