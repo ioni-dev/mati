@@ -101,6 +101,12 @@ const SETTINGS_JSON: &str = r#"{
         "hooks": [
           { "type": "command", "command": ".claude/hooks/post-bash.sh", "async": true }
         ]
+      },
+      {
+        "matcher": "Task|Agent",
+        "hooks": [
+          { "type": "command", "command": ".claude/hooks/post-task.sh", "async": true }
+        ]
       }
     ],
     "PreCompact": [
@@ -252,6 +258,7 @@ pub const HOOK_SCRIPTS: &[(&str, &str)] = &[
     ("stop.sh", crate::hooks::claude_stop::SCRIPT),
     ("post-memget.sh", crate::hooks::post_memget::SCRIPT),
     ("post-bash.sh", crate::hooks::post_bash::SCRIPT),
+    ("post-task.sh", crate::hooks::post_task::SCRIPT),
 ];
 
 /// Return the exact project settings template whose hook registrations are
@@ -598,7 +605,7 @@ mod tests {
 
         let result = install_hooks(dir.path()).unwrap();
         match result {
-            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 17),
+            InstallResult::Installed { scripts, .. } => assert_eq!(scripts, 18),
             other => panic!("expected Installed, got {other:?}"),
         }
 

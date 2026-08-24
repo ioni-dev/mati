@@ -80,6 +80,9 @@ pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> O
         // it uses tool_input.key directly, not a file path.
         HookVariant::ClaudePostMemGet => None,
         HookVariant::ClaudePostBash => None,
+        // post-task is handled by `run_post_task` before extract_path; it uses
+        // the payload's agent ids, not a file path.
+        HookVariant::ClaudePostTask => None,
         HookVariant::ClaudeInstructionsLoaded => None,
         // Handled by `run_file_changed` before the single-path pipeline; its
         // `file_path` is absolute and needs repo-relative resolution.

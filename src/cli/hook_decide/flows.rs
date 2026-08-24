@@ -132,6 +132,96 @@ pub(crate) async fn run_post_memget(input: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+// ── claude-post-task flow ───────────────────────────────────────────────────
+
+/// A nested subagent spawn parsed from an `Agent`-tool PostToolUse payload:
+/// (child_agent_id, parent_agent_id, session_id, agent_type).
+type NestedSpawn = (String, String, Option<String>, Option<String>);
+
+/// Extract a NESTED spawn edge from an `Agent`/`Task` PostToolUse payload.
+///
+/// Returns `None` for anything that is not a completed nested spawn: a failed or
+/// in-progress tool call, a missing child id, or a root-session spawn (top-level
+/// `agent_id` absent). A root spawn is already recorded by the SubagentStart
+/// hook's `SubagentSpawned`, so recording it here too would double-count — hence
+/// the parent (spawner) is required.
+fn parse_nested_spawn(input: &serde_json::Value) -> Option<NestedSpawn> {
+    // Only record a spawn that actually returned a subagent. A failed Task call
+    // surfaces `tool_response.isError` or a non-"completed" status.
+    if input
+        .pointer("/tool_response/isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if input
+        .pointer("/tool_response/status")
+        .and_then(|v| v.as_str())
+        != Some("completed")
+    {
+        return None;
+    }
+
+    let child = input
+        .pointer("/tool_response/agentId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    // The spawner. Absent ⇒ the root session spawned this child ⇒ not a nested
+    // edge; SubagentSpawned already covers it.
+    let parent = input
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    let session_id = input
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let agent_type = input
+        .pointer("/tool_response/agentType")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Some((child, parent, session_id, agent_type))
+}
+
+/// Record a nested subagent→subagent spawn edge after an `Agent` tool call.
+///
+/// Fail-open at every step: a non-nested spawn, a missing daemon, or a bad
+/// payload all exit 0 with no output (PostToolUse hooks are fire-and-forget).
+pub(crate) async fn run_post_task(input: &serde_json::Value) -> Result<()> {
+    let Some((child, parent, session_id, agent_type)) = parse_nested_spawn(input) else {
+        return Ok(());
+    };
+
+    let cwd = std::env::current_dir()?;
+    let repo_root = discover_repo_root(&cwd);
+    let root_for_slug = repo_root.as_deref().unwrap_or(&cwd);
+    let mati_root = match mati_root_for(root_for_slug) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    if !ensure_daemon(&mati_root).await {
+        return Ok(());
+    }
+
+    let cmd = mati_core::mcp::protocol::Command::SubagentEdge(
+        mati_core::mcp::protocol::SubagentEdgeInput {
+            child_agent_id: Some(child),
+            parent_agent_id: Some(parent),
+            session_id,
+            agent_type,
+        },
+    );
+    let _ = super::daemon::daemon_v2(&mati_root, cmd).await;
+    Ok(())
+}
+
 /// Best-effort PostToolUse adapter for schema introspection. The policy
 /// evaluation and receipt minting are deliberately fire-and-forget: a
 /// PostToolUse hook must never disrupt the agent session.
@@ -594,4 +684,95 @@ pub(crate) async fn run_apply_patch(input: &serde_json::Value) -> Result<()> {
     )
     .await;
     std::process::exit(2);
+}
+
+#[cfg(test)]
+mod post_task_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Shaped like a real CC 2.1.241 `Agent` PostToolUse payload: top-level
+    // `agent_id` is the spawner, `tool_response.agentId` the child.
+    fn nested_payload() -> serde_json::Value {
+        json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Agent",
+            "agent_id": "a55cfb5149181a437",
+            "session_id": "2e97c8b3-d0a5-4bdf-9570-095ef9631b74",
+            "tool_response": {
+                "status": "completed",
+                "agentId": "a81912b553cdfcfac",
+                "agentType": "general-purpose",
+                "content": [{"type": "text", "text": "done"}]
+            }
+        })
+    }
+
+    #[test]
+    fn nested_spawn_parses_both_ends() {
+        let (child, parent, session, agent_type) = parse_nested_spawn(&nested_payload()).unwrap();
+        assert_eq!(child, "a81912b553cdfcfac");
+        assert_eq!(parent, "a55cfb5149181a437");
+        assert_eq!(
+            session.as_deref(),
+            Some("2e97c8b3-d0a5-4bdf-9570-095ef9631b74")
+        );
+        assert_eq!(agent_type.as_deref(), Some("general-purpose"));
+    }
+
+    #[test]
+    fn root_spawn_is_not_an_edge() {
+        // Root session spawns a subagent: no top-level agent_id. SubagentSpawned
+        // already records this, so parse_nested_spawn must skip it.
+        let mut p = nested_payload();
+        p.as_object_mut().unwrap().remove("agent_id");
+        assert!(parse_nested_spawn(&p).is_none());
+    }
+
+    #[test]
+    fn empty_spawner_is_not_an_edge() {
+        // An interpolated-empty agent_id (main thread) is treated as absent.
+        let mut p = nested_payload();
+        p["agent_id"] = json!("");
+        assert!(parse_nested_spawn(&p).is_none());
+    }
+
+    #[test]
+    fn incomplete_spawn_is_skipped() {
+        let mut p = nested_payload();
+        p["tool_response"]["status"] = json!("in_progress");
+        assert!(parse_nested_spawn(&p).is_none());
+    }
+
+    #[test]
+    fn errored_spawn_is_skipped() {
+        let mut p = nested_payload();
+        p["tool_response"]["isError"] = json!(true);
+        assert!(parse_nested_spawn(&p).is_none());
+    }
+
+    #[test]
+    fn missing_child_id_is_skipped() {
+        let mut p = nested_payload();
+        p["tool_response"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agentId");
+        assert!(parse_nested_spawn(&p).is_none());
+    }
+
+    #[test]
+    fn absent_session_and_type_are_none_not_error() {
+        let mut p = nested_payload();
+        p.as_object_mut().unwrap().remove("session_id");
+        p["tool_response"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agentType");
+        let (child, parent, session, agent_type) = parse_nested_spawn(&p).unwrap();
+        assert_eq!(child, "a81912b553cdfcfac");
+        assert_eq!(parent, "a55cfb5149181a437");
+        assert!(session.is_none());
+        assert!(agent_type.is_none());
+    }
 }

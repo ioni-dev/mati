@@ -545,6 +545,30 @@ pub struct SubagentSpawnedInput {
     pub agent_type: Option<String>,
 }
 
+/// Input for `Command::SubagentEdge`. Written by the `Agent`-tool `PostToolUse`
+/// hook when one subagent spawns another: records the parent→child spawn edge as
+/// a hash-chained enforcement event so the audit can walk the tree past the leaf.
+/// `child_agent_id` (the spawned subagent) and `parent_agent_id` (its spawner)
+/// are both required in practice; the recorder no-ops when either is absent —
+/// a root-session spawn (no parent) is already covered by `SubagentSpawned`. All
+/// fields default for hook/daemon version skew.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentEdgeInput {
+    /// The spawned child subagent's own agent_id (`tool_response.agentId`).
+    #[serde(default)]
+    pub child_agent_id: Option<String>,
+    /// The spawning parent subagent's agent_id (top-level `agent_id`).
+    #[serde(default)]
+    pub parent_agent_id: Option<String>,
+    /// The shared session_id.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Child subagent type (e.g. "general-purpose"), preserved for audit scoring.
+    #[serde(default)]
+    pub agent_type: Option<String>,
+}
+
 /// Input for `Command::RecordImport`. Records are written verbatim into the
 /// knowledge tree, preserving every field. The daemon validates each record's
 /// key prefix against the knowledge-namespace allowlist before writing.

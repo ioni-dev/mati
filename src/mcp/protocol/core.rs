@@ -302,6 +302,11 @@ pub enum Command {
     #[serde(rename = "subagent_spawned")]
     SubagentSpawned(SubagentSpawnedInput),
 
+    /// Record a nested subagent→subagent spawn edge (from the `Agent`-tool
+    /// `PostToolUse` hook) as a hash-chained `SubagentEdge` enforcement event.
+    #[serde(rename = "subagent_edge")]
+    SubagentEdge(SubagentEdgeInput),
+
     /// Bulk-import a batch of pre-built `Record`s into the knowledge tree.
     /// Bypasses the semantic upsert handlers — records are written verbatim
     /// so an `export → import` round-trip preserves every field

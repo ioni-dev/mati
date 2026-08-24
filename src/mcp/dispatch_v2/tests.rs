@@ -2124,3 +2124,79 @@ async fn config_unknown_key_rejected() {
         Response::Ok { .. } => panic!("expected ValidationFailed for unknown set key"),
     }
 }
+
+#[tokio::test]
+async fn subagent_edge_records_nested_lineage() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let req = make_request(Command::SubagentEdge(SubagentEdgeInput {
+        child_agent_id: Some("child-1".into()),
+        parent_agent_id: Some("parent-1".into()),
+        session_id: Some("sess-1".into()),
+        agent_type: Some("general-purpose".into()),
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, req).await,
+        Response::Ok { .. }
+    ));
+
+    let g = graph.read().await;
+    let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+        .await
+        .unwrap();
+    let edge = events
+        .iter()
+        .find(|e| {
+            matches!(
+                e.event_type,
+                crate::store::enforcement::EnforcementEventType::SubagentEdge
+            )
+        })
+        .expect("a SubagentEdge event must be recorded");
+
+    // The child is the actor; the parent is the spawner. Both are carried so the
+    // audit can walk the tree. (parent_agent_id rides the event now; it is hashed
+    // once SCHEMA_VERSION reaches 4.)
+    assert_eq!(edge.agent_id.as_deref(), Some("child-1"));
+    assert_eq!(edge.parent_agent_id.as_deref(), Some("parent-1"));
+    assert_eq!(edge.agent_session.as_deref(), Some("sess-1"));
+    assert_eq!(edge.subject_key, "child-1");
+}
+
+#[tokio::test]
+async fn subagent_edge_without_parent_is_noop() {
+    // A root-session spawn (no parent) is already recorded by SubagentSpawned;
+    // the edge handler must not double-record it.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let req = make_request(Command::SubagentEdge(SubagentEdgeInput {
+        child_agent_id: Some("child-1".into()),
+        parent_agent_id: None,
+        session_id: Some("sess-1".into()),
+        agent_type: Some("general-purpose".into()),
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, req).await,
+        Response::Ok { .. }
+    ));
+
+    let g = graph.read().await;
+    let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+        .await
+        .unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.event_type,
+            crate::store::enforcement::EnforcementEventType::SubagentEdge
+        )),
+        "no SubagentEdge event should be recorded without a parent"
+    );
+}

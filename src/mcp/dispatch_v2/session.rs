@@ -588,6 +588,38 @@ pub(super) async fn dispatch_session_side(
             Response::ok(request_id, serde_json::Value::Null)
         }
 
+        Command::SubagentEdge(input) => {
+            // A nested edge needs BOTH ends. The child is the actor; the parent
+            // is the spawner. Either absent means this is not a nested spawn (a
+            // root spawn has no parent and is already recorded by SubagentSpawned)
+            // — no-op, matching the SubagentSpawned identity guard.
+            let (Some(child), Some(parent)) = (
+                input.child_agent_id.clone().filter(|a| !a.is_empty()),
+                input.parent_agent_id.clone().filter(|a| !a.is_empty()),
+            ) else {
+                return Response::ok(request_id, serde_json::Value::Null);
+            };
+            let reason = match input.agent_type.as_deref().filter(|t| !t.is_empty()) {
+                Some(t) => format!("subagent_edge:{t}"),
+                None => "subagent_edge".to_string(),
+            };
+            let _ = crate::store::enforcement::record_event_with_nested_lineage(
+                store,
+                crate::store::enforcement::EnforcementEventType::SubagentEdge,
+                crate::store::enforcement::SubjectKind::System,
+                child.clone(),
+                "claude".to_string(),
+                None,
+                reason,
+                None,
+                input.session_id.clone(),
+                Some(child),
+                Some(parent),
+            )
+            .await;
+            Response::ok(request_id, serde_json::Value::Null)
+        }
+
         _ => unreachable!("is_session_side guard ensures only session commands reach here"),
     }
 }

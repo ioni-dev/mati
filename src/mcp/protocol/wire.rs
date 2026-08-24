@@ -46,6 +46,7 @@ impl Command {
             Self::SessionClearConsults => "session_clear_consults",
             Self::SubagentHarvest(_) => "subagent_harvest",
             Self::SubagentSpawned(_) => "subagent_spawned",
+            Self::SubagentEdge(_) => "subagent_edge",
             Self::RecordImport(_) => "record_import",
         }
     }
@@ -93,6 +94,7 @@ impl Command {
             | Self::SessionClearConsults
             | Self::SubagentHarvest(_)
             | Self::SubagentSpawned(_)
+            | Self::SubagentEdge(_)
             | Self::RecordImport(_) => "",
         }
     }
@@ -131,6 +133,7 @@ impl Command {
             | Self::SessionClearConsults
             | Self::SubagentHarvest(_)
             | Self::SubagentSpawned(_)
+            | Self::SubagentEdge(_)
             | Self::RecordImport(_)
         )
     }

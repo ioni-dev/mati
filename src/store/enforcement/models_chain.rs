@@ -207,6 +207,18 @@ pub enum EnforcementEventType {
     /// rides the existing v3 canonical form. Recorded best-effort from the
     /// SubagentStart hook.
     SubagentSpawned,
+    /// A subagent spawned another subagent — the nested (agent→agent) spawn edge.
+    /// Captured at the child's completion from the Claude Code `Agent`-tool
+    /// `PostToolUse` payload, whose top-level `agent_id` is the spawner and whose
+    /// `tool_response.agentId` is the child. `subject_key` is the child agent_id,
+    /// `subject_kind` is `System`; `agent_id` is the child and `parent_agent_id`
+    /// the spawner, so the pair walks the tree past the leaf. Emitted ONLY when
+    /// the spawner is itself a subagent — a root-session spawn is already recorded
+    /// by `SubagentSpawned` and by every child event's `agent_session`, so this
+    /// event is purely additive. A new event TYPE, not a new field — no
+    /// SCHEMA_VERSION bump; the `parent_agent_id` it carries is hashed only once
+    /// the store is at v4 (see `SCHEMA_VERSION`). Recorded best-effort.
+    SubagentEdge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

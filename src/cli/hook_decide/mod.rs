@@ -37,6 +37,7 @@ pub(super) use events_output::{
 };
 pub(super) use flows::{
     ensure_daemon, run_apply_patch, run_post_bash, run_post_bash_introspection, run_post_memget,
+    run_post_task,
 };
 pub(super) use path::{
     canonical_rel_path, discover_repo_root, discover_repo_root_for, extract_path,
