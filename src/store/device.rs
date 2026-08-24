@@ -2,12 +2,17 @@
 //!
 //! `Record.version.device_id` identifies the AUTHORING DEVICE — it is the
 //! tiebreaker axis for the planned v0.2 `MergeEngine` (see `record.rs`,
-//! `DeviceId`). The original design ("UUID v7 generated once, persisted")
-//! was deferred at M-05 and every write path used a fresh `Uuid::new_v4()`
-//! placeholder instead, which made the field meaningless: two records from
-//! the same machine looked like two devices. This module implements the
-//! documented design — one v7 UUID per user+machine, created on first use
-//! at `~/.mati/device_id` and memoized for the process lifetime.
+//! `DeviceId`). Persisting one id was deferred at M-05, so every write path
+//! minted a fresh id per record. That is what made the field meaningless —
+//! two records from one machine looked like two devices — because the id was
+//! never persisted, not because of which UUID version produced it. This
+//! module implements the documented design: one id per user+machine, created
+//! on first use at `~/.mati/device_id` and memoized for the process lifetime.
+//!
+//! The id is a UUID v7 (RFC 9562). Its leading 48-bit millisecond timestamp
+//! makes device ids creation-ordered, which lets the MergeEngine tiebreak by
+//! first-seen time with no extra state. A persisted v4 would give the same
+//! stability; v7 is chosen for that ordering, not for correctness.
 //!
 //! Fail-open: if the home directory is missing or unwritable, a
 //! process-lifetime random id is used — a degraded device id must never
