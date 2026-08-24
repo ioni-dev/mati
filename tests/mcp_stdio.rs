@@ -1103,3 +1103,62 @@ fn mcp_stdio_is_error_flag() {
     );
     assert_eq!(extract_text(&resp), "null");
 }
+
+// ── server/discover (F7 — MCP 2026-07-28 cacheable discovery) ─────────────────
+
+/// `server/discover` returns a Public, cacheable capability probe.
+///
+/// rmcp answers the request from `get_info`; mati overrides `discover` to mark
+/// the result cacheable (`ttlMs > 0`, `cacheScope = public`) since the tool set
+/// is a compile-time constant. The request carries the 2026-07-28 required
+/// `_meta` (protocol version + client capabilities); no `initialize` first.
+#[test]
+fn mcp_stdio_server_discover_is_cacheable() {
+    let project_dir = TempDir::new().expect("failed to create tempdir for MCP test");
+    common::isolate_mati_home();
+    let _daemon_guard = common::DaemonGuard::for_mati_home(project_dir.path(), common::mati_home());
+
+    let bin = env!("CARGO_BIN_EXE_mati");
+    let mut child = Command::new(bin)
+        .arg("serve")
+        .current_dir(project_dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn `mati serve`");
+    let stdin = child.stdin.take().expect("mati serve has no stdin handle");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("mati serve has no stdout handle");
+    let _guard = ChildGuard(child);
+    let mut stdin = stdin;
+    let rx = spawn_reader(stdout);
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#,
+    );
+    let resp = read_until_id(&rx, 1);
+
+    assert!(
+        resp.get("error").is_none(),
+        "server/discover must not return an error: {resp}"
+    );
+    let result = &resp["result"];
+    assert_eq!(
+        result["cacheScope"].as_str(),
+        Some("public"),
+        "discovery result must be Public-cacheable: {result}"
+    );
+    assert!(
+        result["ttlMs"].as_u64().unwrap_or(0) > 0,
+        "discovery result must advertise a nonzero cache TTL: {result}"
+    );
+    // The tool capabilities are the payload a client caches instead of re-fetching.
+    assert!(
+        result.get("capabilities").is_some(),
+        "discovery result missing capabilities: {result}"
+    );
+}

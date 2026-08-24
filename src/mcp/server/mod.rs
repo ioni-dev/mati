@@ -28,7 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{CacheScope, DiscoverResult, ServerCapabilities, ServerInfo};
+use rmcp::service::{MaybeSendFuture, RequestContext, RoleServer};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -49,6 +50,13 @@ pub(crate) enum ProxyDaemonResult {
     Unresponsive,
 }
 
+/// How long a client may cache the `server/discover` response (SEP-2549).
+/// mati's tool set is a compile-time constant (exactly four tools) and
+/// `get_info` is fully static, so the discovery result never changes within a
+/// running binary — an upgrade replaces the binary and restarts the session.
+/// One hour is conservative for that; raise it freely.
+const DISCOVER_TTL_MS: u64 = 3_600_000;
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MatiServer {
     fn get_info(&self) -> ServerInfo {
@@ -64,6 +72,27 @@ impl ServerHandler for MatiServer {
                  search and graph traversal, mem_bootstrap for session context, \
                  and mem_set for writing knowledge records.",
         )
+    }
+
+    /// `server/discover` (MCP 2026-07-28): a stateless capability probe a client
+    /// can issue without a full `initialize` handshake. rmcp's default derives
+    /// the result from `get_info` but marks it non-cacheable (`ttl_ms = 0`,
+    /// `Private`). The response is identical for every caller and static per
+    /// binary, so mati returns it as `Public` and cacheable — this is the F7
+    /// win: a client may cache the tool list instead of paying its token cost on
+    /// every call. Answered locally in `serve`; no daemon or store access.
+    fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<DiscoverResult, rmcp::ErrorData>> + MaybeSendFuture + '_
+    {
+        let result = DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(DISCOVER_TTL_MS)
+        .with_cache_scope(CacheScope::Public);
+        std::future::ready(Ok(result))
     }
 }
 
