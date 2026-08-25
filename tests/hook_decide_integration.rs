@@ -630,6 +630,319 @@ fn hook_decide_denies_gotcha_through_symlink() {
     eprintln!("[wi20] all symlink-bypass assertions passed");
 }
 
+/// Live E2E for the `deny_if` content-deny axis through the real hook path.
+///
+/// Authors a `deny_if` policy via the library (there is no CLI flag yet), starts
+/// a real daemon, and drives the real `mati hook-decide` binary:
+///   1. `psql ... drop table` DENIES (codex exit 2; claude JSON deny);
+///   2. `psql ... select 1` ALLOWS (no false positive);
+///   3. the hash-chained log records a `policy_content_denied` Deny event.
+#[test]
+#[ignore]
+fn hook_decide_content_deny_denies_and_records() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    // Pin this process's MATI_HOME to the test dir so the final in-process event
+    // read (after the daemon stops) cannot inherit a leaked ambient MATI_HOME.
+    std::env::set_var("MATI_HOME", home);
+
+    // ── 1. init the store ───────────────────────────────────────────────────
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+    let r = run(&bin, repo, home, &["ping"]);
+    assert_eq!(r.code, 0, "ping after init failed");
+
+    // ── 2. author + enable a content-deny policy via the real CLI ───────────
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "no-drop-table",
+            "--name",
+            "No destructive prod SQL",
+            "--rule",
+            "Deny DROP TABLE via db clients.",
+            "--reason",
+            "Dropping a table is irreversible data loss.",
+            "--mode",
+            "block",
+            "--trigger",
+            r#"{"tool":"db_client"}"#,
+            "--deny-if-command-glob",
+            "*drop table*",
+            "--enable",
+        ],
+    );
+    assert_eq!(
+        r.code, 0,
+        "mati policy add failed:\n{}\n{}",
+        r.stdout, r.stderr
+    );
+    let r = run(&bin, repo, home, &["ping"]);
+    assert_eq!(r.code, 0, "ping after policy add failed");
+
+    // ── 3. start a real daemon (loads the policy into its matcher at boot) ───
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable",
+    );
+
+    // Sanity: the daemon actually knows the policy we just authored.
+    let show = run(
+        &bin,
+        repo,
+        home,
+        &["policy", "show", "policy:no-drop-table"],
+    );
+    assert_eq!(
+        show.code, 0,
+        "daemon does not know policy:no-drop-table:\n{}\n{}",
+        show.stdout, show.stderr,
+    );
+
+    // ── 4. matching DROP → codex-pre-bash DENIES (exit 2) ───────────────────
+    let deny = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "codex-pre-bash"],
+        r#"{"tool_input":{"command":"psql -h prod -c \"drop table orders\""}}"#,
+    );
+    assert_eq!(
+        deny.code, 2,
+        "content-deny must DENY (exit 2).\nstdout: {}\nstderr: {}",
+        deny.stdout, deny.stderr,
+    );
+    assert!(
+        deny.stderr.to_lowercase().contains("deny")
+            || deny.stderr.contains("content")
+            || deny.stderr.contains("no-drop-table"),
+        "deny stderr should carry the content-deny reason.\nstderr: {}",
+        deny.stderr,
+    );
+    eprintln!("[content-deny] codex drop: exit 2 (deny) -- correct");
+
+    // ── 5. non-matching SELECT → ALLOWS (exit 0), no false positive ─────────
+    let allow = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "codex-pre-bash"],
+        r#"{"tool_input":{"command":"psql -h prod -c \"select 1\""}}"#,
+    );
+    assert_eq!(
+        allow.code, 0,
+        "a read must ALLOW (exit 0).\nstdout: {}\nstderr: {}",
+        allow.stdout, allow.stderr,
+    );
+    eprintln!("[content-deny] codex select: exit 0 (allow) -- no false positive");
+
+    // ── 6. claude-pre-bash → JSON permissionDecision deny ───────────────────
+    let claude = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-bash"],
+        r#"{"tool_input":{"command":"psql -h prod -c \"drop table orders\""}}"#,
+    );
+    assert_eq!(claude.code, 0, "claude hooks always exit 0");
+    let json: serde_json::Value = serde_json::from_str(claude.stdout.trim())
+        .unwrap_or_else(|e| panic!("claude-pre-bash stdout not JSON: {e}\n{}", claude.stdout));
+    assert_eq!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str()),
+        Some("deny"),
+        "claude-pre-bash must deny the drop.\nJSON: {}",
+        claude.stdout,
+    );
+    eprintln!("[content-deny] claude drop: permissionDecision=deny -- correct");
+
+    // ── 7. confirm the daemon recorded the content-deny as a Deny event ─────
+    //
+    // The live daemon is the oracle: its hash-chained enforcement log surfaces
+    // through `stats --json`. The only denies this test can produce come from
+    // the content-deny policy, so a non-zero `denials` is attributable to it.
+    // (The distinct `policy_content_denied` reason code is unit-tested in
+    // `src/mcp/dispatch_v2/session.rs` and `events_output.rs`.)
+    let stats = run(&bin, repo, home, &["stats", "--json"]);
+    assert_eq!(
+        stats.code, 0,
+        "mati stats failed:\n{}\n{}",
+        stats.stdout, stats.stderr
+    );
+    let json: serde_json::Value = serde_json::from_str(stats.stdout.trim())
+        .unwrap_or_else(|e| panic!("stats --json not JSON: {e}\n{}", stats.stdout));
+    let denials = json
+        .pointer("/enforcement_30d/denials")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        denials >= 1,
+        "the content-deny must be recorded as a Deny enforcement event; stats: {}",
+        stats.stdout,
+    );
+    eprintln!("[content-deny] daemon recorded {denials} deny enforcement event(s) -- correct");
+}
+
+/// Live E2E for the path channel of the `deny_if` axis (`--deny-if-path-glob`).
+///
+/// The command E2E above proves the argv channel. This proves the path channel:
+/// an EDIT carries no argv, only `target_path ∪ files`, so a `PathGlob` predicate
+/// is the only thing that can gate it. Authors a `path` policy via the new CLI
+/// flag, starts a real daemon, and drives `mati hook-decide claude-pre-edit`:
+///   1. editing a file under `**/secrets/**` DENIES (permissionDecision=deny);
+///   2. editing a file outside it ALLOWS (no false positive);
+///   3. the daemon records the deny.
+#[test]
+#[ignore]
+fn hook_decide_path_content_deny_denies_edit() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    std::env::set_var("MATI_HOME", home);
+
+    // A secret file to edit, under a nested `secrets/` segment so `**/secrets/**`
+    // matches whether the hook keys on the relative or canonical-relative path.
+    std::fs::create_dir_all(repo.join("config/secrets")).expect("mkdir secrets");
+    std::fs::write(repo.join("config/secrets/prod.env"), "TOKEN=abc\n").expect("write secret");
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+
+    // Author + enable a path content-deny policy via the real CLI.
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "no-edit-secrets",
+            "--name",
+            "No editing secrets",
+            "--rule",
+            "Deny edits to files under secrets/.",
+            "--reason",
+            "Secret material must not be edited through the agent.",
+            "--mode",
+            "block",
+            "--trigger",
+            r#"{"tool":"path"}"#,
+            "--deny-if-path-glob",
+            "**/secrets/**",
+            "--enable",
+        ],
+    );
+    assert_eq!(
+        r.code, 0,
+        "mati policy add failed:\n{}\n{}",
+        r.stdout, r.stderr
+    );
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable",
+    );
+
+    // 1. editing the secret → claude-pre-edit denies via JSON.
+    let deny = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-edit"],
+        r#"{"tool_input":{"file_path":"config/secrets/prod.env"}}"#,
+    );
+    assert_eq!(deny.code, 0, "claude hooks always exit 0");
+    let json: serde_json::Value = serde_json::from_str(deny.stdout.trim())
+        .unwrap_or_else(|e| panic!("claude-pre-edit stdout not JSON: {e}\n{}", deny.stdout));
+    assert_eq!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str()),
+        Some("deny"),
+        "editing a secret must deny on the path predicate.\nJSON: {}",
+        deny.stdout,
+    );
+    eprintln!("[path-content-deny] edit secret: permissionDecision=deny -- correct");
+
+    // 2. editing a non-secret existing file → no false positive.
+    let allow = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-edit"],
+        r#"{"tool_input":{"file_path":"src/test.rs"}}"#,
+    );
+    assert_eq!(allow.code, 0, "claude hooks always exit 0");
+    // A non-denied edit defers with empty stdout: the ClaudePreEdit adapter never
+    // force-allows a permission-required edit. Empty (or any non-deny) stdout is
+    // the correct no-false-positive outcome.
+    let not_denied = allow.stdout.trim().is_empty()
+        || serde_json::from_str::<serde_json::Value>(allow.stdout.trim())
+            .ok()
+            .and_then(|json| {
+                json.pointer("/hookSpecificOutput/permissionDecision")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            != Some("deny".to_string());
+    assert!(
+        not_denied,
+        "a non-secret edit must not deny.\nstdout: {}",
+        allow.stdout,
+    );
+    eprintln!("[path-content-deny] edit non-secret: not denied -- no false positive");
+
+    // 3. the daemon recorded the path content-deny.
+    let stats = run(&bin, repo, home, &["stats", "--json"]);
+    assert_eq!(
+        stats.code, 0,
+        "mati stats failed:\n{}\n{}",
+        stats.stdout, stats.stderr
+    );
+    let json: serde_json::Value = serde_json::from_str(stats.stdout.trim())
+        .unwrap_or_else(|e| panic!("stats --json not JSON: {e}\n{}", stats.stdout));
+    let denials = json
+        .pointer("/enforcement_30d/denials")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        denials >= 1,
+        "the path content-deny must record a Deny event; stats: {}",
+        stats.stdout,
+    );
+    eprintln!("[path-content-deny] daemon recorded {denials} deny event(s) -- correct");
+}
+
 /// The internal deadline must end the process, not merely decide.
 ///
 /// `run_inner` reads stdin through Tokio's blocking reader. When

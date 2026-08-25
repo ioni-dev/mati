@@ -379,6 +379,7 @@ mod tests {
 
     fn sample() -> PolicyRecord {
         PolicyRecord {
+            deny_if: None,
             name: "Query safety".into(),
             rule: "Consult the schema first.".into(),
             reason: "Schemas drift because production changes independently.".into(),

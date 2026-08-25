@@ -127,6 +127,17 @@ struct AddArgs {
     severity: String,
     #[arg(long, default_value = "developer")]
     created_by: String,
+    /// Content-deny predicate: deny when the command's argv matches this glob,
+    /// independent of any consult gate. Lexical tripwire (quoting, `-f file`,
+    /// heredocs, and aliases bypass it), never a guarantee.
+    #[arg(long)]
+    deny_if_command_glob: Option<String>,
+    /// Content-deny predicate on the path: deny when any of `target_path ∪
+    /// files` matches this glob (edits, path-verb bash, db `-f` file args),
+    /// independent of any consult gate. Lexical path match; sees the requested
+    /// path, not file contents.
+    #[arg(long, conflicts_with = "deny_if_command_glob")]
+    deny_if_path_glob: Option<String>,
     /// Enable immediately (otherwise the new policy is inert).
     #[arg(long)]
     enable: bool,
@@ -260,6 +271,13 @@ async fn add(args: AddArgs) -> Result<()> {
         scope: args.scope,
         mode: parse_mode(&args.mode)?,
         trigger: parse_trigger(&args.trigger)?,
+        deny_if: args
+            .deny_if_command_glob
+            .map(mati_core::store::ActionPredicate::CommandGlob)
+            .or_else(|| {
+                args.deny_if_path_glob
+                    .map(mati_core::store::ActionPredicate::PathGlob)
+            }),
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
         stage: if args.enable {
@@ -761,6 +779,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
             scope: "repo".into(),
             mode: PolicyMode::Steer,
             trigger,
+            deny_if: None,
             requires: serde_json::from_str(r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#)?,
             stage: PolicyStage::Enforce,
             severity: Priority::Normal,
@@ -984,6 +1003,7 @@ mod tests {
     #[test]
     fn policy_test_output_reports_human_match_and_mode() {
         let policy = PolicyRecord {
+            deny_if: None,
             name: "Production query safety".into(),
             rule: "Consult the schema first.".into(),
             reason: "Production schemas drift because deployments change.".into(),
@@ -1009,6 +1029,7 @@ mod tests {
             .matches(&action)
             .into_iter()
             .map(|matched| mati_core::mcp::protocol::PolicyVerdict {
+                content: mati_core::store::ContentOutcome::None,
                 key: matched.key.to_string(),
                 stage: matched.policy.stage,
                 mode: matched.policy.mode,
@@ -1038,6 +1059,7 @@ mod tests {
     fn policy_test_output_surfaces_unbacked_memget_requirement() {
         let action = normalize_action(Some("psql -h db.prod.internal -c select"), None);
         let matched = mati_core::mcp::protocol::PolicyVerdict {
+            content: mati_core::store::ContentOutcome::None,
             key: "policy:prod".into(),
             stage: PolicyStage::Enforce,
             mode: PolicyMode::Block,

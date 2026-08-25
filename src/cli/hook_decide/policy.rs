@@ -194,6 +194,12 @@ pub(crate) fn policy_core_verdicts(
                     && (!introspection_exemption || verdict.satisfied),
                 satisfied: verdict.satisfied,
                 stage: verdict.stage,
+                // H1: the content outcome is carried verbatim and is deliberately
+                // NOT gated by `introspection_exemption` — the exemption is the
+                // remedy for a consult gate, meaningless for a content
+                // restriction. Block vs steer was already folded in by the
+                // daemon (Deny vs Warn).
+                content: verdict.content,
             })
         })
         .collect()

@@ -870,11 +870,84 @@ pub struct PolicyTrigger {
     pub command_glob: Option<String>,
 }
 
+/// A content predicate evaluated on the action itself, independent of any
+/// consult gate — the engine's first unconditional deny.
+///
+/// Lexical tripwire in this phase, on either channel:
+/// - `CommandGlob` matches `action.argv` joined by single spaces, so quoting,
+///   `-f file.sql`, heredocs, env, and aliases all bypass it.
+/// - `PathGlob` matches any member of `target_path ∪ files` — the same path set
+///   the consult-axis `target_path_glob` trigger uses. It sees only the
+///   requested path, never file contents or a diff.
+///
+/// A deny on either is a tripwire, never a guarantee.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionPredicate {
+    /// Deny when `action.argv.join(" ")` matches this glob.
+    CommandGlob(String),
+    /// Deny when any of `target_path ∪ files` matches this glob.
+    PathGlob(String),
+}
+
+impl ActionPredicate {
+    /// Whether this predicate denies the action. Pure; a glob that fails to
+    /// compile is treated as no-match so the enforcement path fails open (P9).
+    /// `CommandGlob` reads `argv`; `PathGlob` reads `paths` (`target_path ∪
+    /// files`). Each variant ignores the channel it does not govern.
+    pub fn denies(&self, argv: &[String], paths: &[String]) -> bool {
+        match self {
+            ActionPredicate::CommandGlob(pattern) => globset::Glob::new(pattern)
+                .ok()
+                .map(|glob| glob.compile_matcher())
+                .is_some_and(|matcher| matcher.is_match(argv.join(" "))),
+            ActionPredicate::PathGlob(pattern) => globset::Glob::new(pattern)
+                .ok()
+                .map(|glob| glob.compile_matcher())
+                .is_some_and(|matcher| paths.iter().any(|path| matcher.is_match(path))),
+        }
+    }
+}
+
+/// Outcome of a policy's `deny_if` content predicate against one action,
+/// precomputed by the daemon so the hook side carries it verbatim. Kept off the
+/// consult (`satisfied`) axis and never lowered by the schema-introspection
+/// exemption.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentOutcome {
+    /// No `deny_if` predicate on this policy.
+    #[default]
+    None,
+    /// `deny_if` present, but the action content did not match it. Suppresses
+    /// the policy's generic trigger-steer — a content policy speaks only through
+    /// its predicate.
+    Inert,
+    /// `deny_if` matched and the author set `steer` — warn only.
+    Warn,
+    /// `deny_if` matched and the author set `block` — deny.
+    Deny,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {
     Steer,
     Block,
+}
+
+impl ActionPredicate {
+    /// Classify an action against this predicate for the given mode.
+    pub fn outcome(&self, argv: &[String], paths: &[String], mode: PolicyMode) -> ContentOutcome {
+        if self.denies(argv, paths) {
+            match mode {
+                PolicyMode::Block => ContentOutcome::Deny,
+                PolicyMode::Steer => ContentOutcome::Warn,
+            }
+        } else {
+            ContentOutcome::Inert
+        }
+    }
 }
 
 /// Rollout stage for a local policy.
@@ -963,6 +1036,10 @@ pub struct PolicyRecord {
     pub scope: String,
     pub mode: PolicyMode,
     pub trigger: PolicyTrigger,
+    /// Content restriction on the matched action, orthogonal to `requires`
+    /// (consult). `None` for every policy authored before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_if: Option<ActionPredicate>,
     #[serde(default = "default_policy_requires")]
     pub requires: PolicyRequires,
     pub stage: PolicyStage,
@@ -1295,6 +1372,7 @@ mod tests {
     #[test]
     fn policy_record_roundtrips_through_record_messagepack() {
         let policy = PolicyRecord {
+            deny_if: None,
             name: "Production query safety".into(),
             rule: "Consult the production schema before querying it.".into(),
             reason: "Queries can target incompatible production tables because schemas drift."
@@ -1355,6 +1433,7 @@ mod tests {
         // deserialize to the inert default instead of erroring. Regression for
         // the observed mem_set "missing field `requires`" retry.
         let full = PolicyRecord {
+            deny_if: None,
             name: "n".into(),
             rule: "r".into(),
             reason: "why".into(),

@@ -238,6 +238,19 @@ pub(super) async fn dispatch_policy_evaluate(
                     matched.policy.requires.via.clone(),
                     matched.policy.requires.freshness.fingerprint,
                     matched.policy.requires.freshness.ttl_secs,
+                    matched.policy.deny_if.as_ref().map_or(
+                        crate::store::ContentOutcome::None,
+                        |predicate| {
+                            let paths: Vec<String> = input
+                                .action
+                                .target_path
+                                .iter()
+                                .chain(input.action.files.iter())
+                                .cloned()
+                                .collect();
+                            predicate.outcome(&input.action.argv, &paths, matched.policy.mode)
+                        },
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -256,8 +269,19 @@ pub(super) async fn dispatch_policy_evaluate(
         crate::store::enforcement::EnforcementMode::Strict
     );
     let mut verdicts = Vec::with_capacity(matched.len());
-    for (key, stage, mode, rule, reason, severity, requires_key, via, fingerprint, ttl_secs) in
-        matched
+    for (
+        key,
+        stage,
+        mode,
+        rule,
+        reason,
+        severity,
+        requires_key,
+        via,
+        fingerprint,
+        ttl_secs,
+        content,
+    ) in matched
     {
         let satisfied = match mode {
             crate::store::PolicyMode::Steer => true,
@@ -300,6 +324,7 @@ pub(super) async fn dispatch_policy_evaluate(
             via,
             satisfied,
             strict,
+            content,
         });
     }
 

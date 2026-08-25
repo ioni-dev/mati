@@ -89,6 +89,7 @@ pub async fn run(args: ProtectArgs) -> Result<()> {
             target_path_glob: Some(target_glob.clone()),
             command_glob: None,
         },
+        deny_if: None,
         requires: PolicyRequires {
             key: decision_key.clone(),
             via: vec![ReceiptSource::MemGet],

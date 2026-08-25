@@ -27,10 +27,10 @@ pub use device::stable_device_id;
 pub use durability::{Durability, Encoding};
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use record::{
-    AgentKind, Category, ConfidenceScore, ContextPacket, DeviceId, FileRecord, GapType,
-    GotchaRecord, KnowledgeGap, OnboardingScore, PolicyFreshness, PolicyMode, PolicyRecord,
-    PolicyRequires, PolicyStage, PolicyTrigger, Priority, QualityScore, QualitySignal, QualityTier,
-    ReceiptSource, Record, RecordLifecycle, RecordSource, RecordVersion, StaleReviewEntry,
-    StaleReviewPayload, StalenessScore, StalenessSignal, StalenessTier, TodoComment, TodoKind,
-    TombstoneReason, CODEX_PRODUCIBLE_SOURCES,
+    ActionPredicate, AgentKind, Category, ConfidenceScore, ContentOutcome, ContextPacket, DeviceId,
+    FileRecord, GapType, GotchaRecord, KnowledgeGap, OnboardingScore, PolicyFreshness, PolicyMode,
+    PolicyRecord, PolicyRequires, PolicyStage, PolicyTrigger, Priority, QualityScore,
+    QualitySignal, QualityTier, ReceiptSource, Record, RecordLifecycle, RecordSource,
+    RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, StalenessSignal,
+    StalenessTier, TodoComment, TodoKind, TombstoneReason, CODEX_PRODUCIBLE_SOURCES,
 };

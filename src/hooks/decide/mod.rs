@@ -130,6 +130,9 @@ pub enum DenyOrigin {
     /// Local policy. `file_key` is the POLICY key, which is not consultable —
     /// the consultable key lives in `reason`.
     Policy,
+    /// Local policy `deny_if` matched the action's content. Unconditional — no
+    /// consult unlocks it. `file_key` is the policy key.
+    PolicyContentDenied,
 }
 
 impl DenyOrigin {
@@ -144,6 +147,7 @@ impl DenyOrigin {
             DenyOrigin::Gotcha => HookEvent::BlockedUnconsultedRead { key },
             DenyOrigin::ConsultMandate => HookEvent::FloorConsultBlocked { key },
             DenyOrigin::Policy => HookEvent::PolicyConsultBlocked { key },
+            DenyOrigin::PolicyContentDenied => HookEvent::PolicyContentBlocked { key },
         }
     }
 }
@@ -176,6 +180,9 @@ pub enum HookEvent {
     FloorConsultBlocked { key: String },
     /// Local policy denied an unconsulted governed action.
     PolicyConsultBlocked { key: String },
+    /// Local policy `deny_if` denied a governed action on its content — daemon
+    /// records a `Deny` with reason `policy_content_denied`.
+    PolicyContentBlocked { key: String },
     /// Local policy allowed a governed action after its receipt was present.
     PolicyConsulted { key: String },
     /// A steer policy injected guidance without changing the action decision.
@@ -204,6 +211,10 @@ pub struct PolicyVerdict {
     pub block: bool,
     pub satisfied: bool,
     pub stage: crate::store::PolicyStage,
+    /// Outcome of the policy's `deny_if` predicate. Independent of
+    /// `satisfied`/`requires`, and never lowered by the schema-introspection
+    /// exemption (that gate lives upstream and is not applied to this field).
+    pub content: crate::store::ContentOutcome,
 }
 
 /// Apply local policy verdicts with escalate-only semantics.
@@ -218,6 +229,7 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
     struct PolicyDeny {
         key: String,
         reason: String,
+        origin: DenyOrigin,
     }
 
     let mut context = Vec::new();
@@ -231,20 +243,57 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             continue;
         }
         if matches!(verdict.stage, crate::store::PolicyStage::Shadow) {
-            if !verdict.block {
+            let would = match verdict.content {
+                crate::store::ContentOutcome::Deny => Some(ShadowOutcome::Block),
+                crate::store::ContentOutcome::Warn => Some(ShadowOutcome::Steer),
+                // A content predicate that did not match observes nothing.
+                crate::store::ContentOutcome::Inert => None,
+                crate::store::ContentOutcome::None => {
+                    if !verdict.block {
+                        Some(ShadowOutcome::Steer)
+                    } else if !verdict.satisfied {
+                        Some(ShadowOutcome::Block)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(would) = would {
                 events.push(HookEvent::PolicyShadowObserved {
                     key: verdict.key.clone(),
-                    would: ShadowOutcome::Steer,
-                    action: None,
-                });
-            } else if !verdict.satisfied {
-                events.push(HookEvent::PolicyShadowObserved {
-                    key: verdict.key.clone(),
-                    would: ShadowOutcome::Block,
+                    would,
                     action: None,
                 });
             }
             continue;
+        }
+        // The content predicate governs first — independent of
+        // `satisfied`/`requires`, never lowered by the schema-introspection
+        // exemption (upstream). A content policy speaks ONLY through its
+        // predicate: on a non-match (`Inert`) it neither denies nor steers.
+        match verdict.content {
+            crate::store::ContentOutcome::Deny if strict => {
+                denied.get_or_insert_with(|| PolicyDeny {
+                    key: verdict.key.clone(),
+                    reason: format!(
+                        "mati: policy {} denied this action: its content matches a deny rule.",
+                        verdict.key
+                    ),
+                    origin: DenyOrigin::PolicyContentDenied,
+                });
+                continue;
+            }
+            // Steer warns; a Deny under the global kill-switch (`!strict`)
+            // degrades to the same warning.
+            crate::store::ContentOutcome::Deny | crate::store::ContentOutcome::Warn => {
+                context.push(verdict.rule.clone());
+                events.push(HookEvent::PolicySteered {
+                    key: verdict.key.clone(),
+                });
+                continue;
+            }
+            crate::store::ContentOutcome::Inert => continue,
+            crate::store::ContentOutcome::None => {}
         }
         if verdict.block && !verdict.satisfied && strict {
             denied.get_or_insert_with(|| PolicyDeny {
@@ -253,6 +302,7 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
                     "mati: policy {} blocked this action. Consult first: mem_get(\"{}\")",
                     verdict.key, verdict.requires_key
                 ),
+                origin: DenyOrigin::Policy,
             });
         } else if verdict.block && verdict.satisfied {
             events.push(HookEvent::PolicyConsulted {
@@ -280,12 +330,12 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             .into_iter()
             .filter(|event| matches!(event, HookEvent::PolicyShadowObserved { .. }))
             .collect();
-        events.push(DenyOrigin::Policy.deny_event(deny.key.clone()));
+        events.push(deny.origin.deny_event(deny.key.clone()));
         return EnforcementResult {
             decision: Decision::Deny {
                 file_key: deny.key,
                 reason: deny.reason,
-                origin: DenyOrigin::Policy,
+                origin: deny.origin,
             },
             events,
         };

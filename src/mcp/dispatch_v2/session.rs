@@ -62,6 +62,7 @@ pub(super) async fn dispatch_session_side(
                 // event's decision_reason_code (floor_consult_required).
                 protocol::SessionEvent::FloorConsultMiss => "compliance:miss_",
                 protocol::SessionEvent::PolicyConsultMiss => "compliance:miss_",
+                protocol::SessionEvent::PolicyContentMiss => "compliance:miss_",
                 protocol::SessionEvent::PolicyConsultHit => "compliance:allow_after_receipt_",
                 protocol::SessionEvent::PolicySteered => "analytics:policy_steer_",
                 protocol::SessionEvent::WrappedDbClientMiss => "compliance:wrapped_db_client_miss_",
@@ -244,6 +245,20 @@ pub(super) async fn dispatch_session_side(
                         "claude".to_string(),
                         None,
                         "policy_consult_required".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::PolicyContentMiss => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::Control,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "policy_content_denied".to_string(),
                         input.decision_basis_hash.clone(),
                         input.session_id.clone(),
                     )
