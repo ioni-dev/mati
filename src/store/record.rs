@@ -870,11 +870,105 @@ pub struct PolicyTrigger {
     pub command_glob: Option<String>,
 }
 
+/// A content predicate evaluated on the action itself, independent of any
+/// consult gate — the engine's first unconditional deny.
+///
+/// Lexical tripwire in this phase, on either channel:
+/// - `CommandGlob` matches `action.argv` joined by single spaces, so quoting,
+///   `-f file.sql`, heredocs, env, and aliases all bypass it.
+/// - `PathGlob` matches any member of `target_path ∪ files` — the same path set
+///   the consult-axis `target_path_glob` trigger uses. It sees only the
+///   requested path, never file contents or a diff.
+///
+/// A deny on either is a tripwire, never a guarantee.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionPredicate {
+    /// Deny when `action.argv.join(" ")` matches this glob.
+    CommandGlob(String),
+    /// Deny when any of `target_path ∪ files` matches this glob.
+    PathGlob(String),
+}
+
+impl ActionPredicate {
+    /// Whether this predicate denies the action. Pure; a glob that fails to
+    /// compile is treated as no-match so the enforcement path fails open (P9).
+    /// `CommandGlob` reads `argv`; `PathGlob` reads `paths` (`target_path ∪
+    /// files`). Each variant ignores the channel it does not govern.
+    pub fn denies(&self, argv: &[String], paths: &[String]) -> bool {
+        match self {
+            ActionPredicate::CommandGlob(pattern) => globset::Glob::new(pattern)
+                .ok()
+                .map(|glob| glob.compile_matcher())
+                .is_some_and(|matcher| matcher.is_match(argv.join(" "))),
+            ActionPredicate::PathGlob(pattern) => globset::Glob::new(pattern)
+                .ok()
+                .map(|glob| glob.compile_matcher())
+                .is_some_and(|matcher| paths.iter().any(|path| matcher.is_match(path))),
+        }
+    }
+}
+
+/// Outcome of a policy's `deny_if` content predicate against one action,
+/// precomputed by the daemon so the hook side carries it verbatim. Kept off the
+/// consult (`satisfied`) axis and never lowered by the schema-introspection
+/// exemption.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentOutcome {
+    /// No `deny_if` predicate on this policy.
+    #[default]
+    None,
+    /// `deny_if` present, but the action content did not match it. Suppresses
+    /// the policy's generic trigger-steer — a content policy speaks only through
+    /// its predicate.
+    Inert,
+    /// `deny_if` matched and the author set `steer` — warn only.
+    Warn,
+    /// `deny_if` matched and the author set `block` — deny.
+    Deny,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyMode {
     Steer,
     Block,
+}
+
+impl ActionPredicate {
+    /// Classify an action against this predicate for the given mode, as a
+    /// `deny_if` (denylist) rule: match → deny/warn, no match → inert.
+    pub fn outcome(&self, argv: &[String], paths: &[String], mode: PolicyMode) -> ContentOutcome {
+        if self.denies(argv, paths) {
+            match mode {
+                PolicyMode::Block => ContentOutcome::Deny,
+                PolicyMode::Steer => ContentOutcome::Warn,
+            }
+        } else {
+            ContentOutcome::Inert
+        }
+    }
+
+    /// Classify an action against this predicate as a `require` (allowlist)
+    /// rule — the polarity mirror of `outcome`: the requirement is MET when the
+    /// predicate matches (inert), and MISSED when it does not (deny/warn). A
+    /// `require: PathGlob("src/**")` therefore denies any action outside `src/`.
+    pub fn require_outcome(
+        &self,
+        argv: &[String],
+        paths: &[String],
+        mode: PolicyMode,
+    ) -> ContentOutcome {
+        if self.denies(argv, paths) {
+            ContentOutcome::Inert
+        } else {
+            match mode {
+                PolicyMode::Block => ContentOutcome::Deny,
+                PolicyMode::Steer => ContentOutcome::Warn,
+            }
+        }
+    }
 }
 
 /// Rollout stage for a local policy.
@@ -892,6 +986,17 @@ pub enum ReceiptSource {
     DbIntrospection,
     HookContext,
     MemGet,
+    /// A watched command was observed running (Bash PreToolUse). Attests the
+    /// command was ATTEMPTED, not that it succeeded — the mint fires before the
+    /// exit status is known. Portable across Claude and Codex for that reason.
+    CommandObserved,
+    /// A source string this binary does not recognize — a receipt or policy
+    /// written by a newer mati. Never accepted by any `via` check and never in
+    /// `CODEX_PRODUCIBLE_SOURCES`, so an unknown source reads as "no receipt":
+    /// the consult gate denies, which fails safe for a block policy. Never
+    /// constructed locally, so it is never serialized back out.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Receipt sources a Codex session can actually produce.
@@ -906,9 +1011,14 @@ pub enum ReceiptSource {
 /// Both the hook-time degrade and the authoring-time warning read this, so the
 /// two can never disagree about what Codex can attest to. Keep it in step with
 /// the mint sites: `HookContext` belongs here because `fire_events` runs on the
-/// Codex pre-bash and apply-patch paths.
-pub const CODEX_PRODUCIBLE_SOURCES: &[ReceiptSource] =
-    &[ReceiptSource::MemGet, ReceiptSource::HookContext];
+/// Codex pre-bash and apply-patch paths, and `CommandObserved` belongs here
+/// because its mint fires on the same Codex pre-bash path, BEFORE the exit
+/// status Codex omits — "attempted" needs no exit status.
+pub const CODEX_PRODUCIBLE_SOURCES: &[ReceiptSource] = &[
+    ReceiptSource::MemGet,
+    ReceiptSource::HookContext,
+    ReceiptSource::CommandObserved,
+];
 
 /// Default consultation freshness. Mirrors the `mati policy add --requires`
 /// clap default (`src/cli/policy.rs`); a `policy_requires_default_matches_cli`
@@ -954,6 +1064,22 @@ pub struct PolicyRequires {
     pub freshness: PolicyFreshness,
 }
 
+/// Binds an observed command to a receipt it mints. When a Bash PreToolUse
+/// action's joined argv matches `on_command_glob`, mati writes
+/// `session:consulted:<key>` with source [`ReceiptSource::CommandObserved`], so
+/// a separate policy whose `requires.key` is that key is satisfied. The bridge
+/// for workflow ordering ("run tests before you commit").
+///
+/// Attests ATTEMPTED, not passed: the mint fires before the command's exit
+/// status is known. Author `on_command_glob` for a FULL-suite run
+/// (`cargo nextest run`, not `cargo test one::case`) — a subset-run glob mints
+/// on a single-test invocation and is the dominant false-satisfy source.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEmitter {
+    pub on_command_glob: String,
+    pub key: String,
+}
+
 /// A developer-authored local policy stored under `policy:<slug>`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRecord {
@@ -963,8 +1089,24 @@ pub struct PolicyRecord {
     pub scope: String,
     pub mode: PolicyMode,
     pub trigger: PolicyTrigger,
+    /// Content restriction on the matched action, orthogonal to `requires`
+    /// (consult). `None` for every policy authored before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_if: Option<ActionPredicate>,
+    /// Polarity mirror of `deny_if`: deny UNLESS the predicate matches
+    /// (allowlist / required content). `None` for every policy that does not
+    /// use it. Evaluated after `deny_if` — a `deny_if` match wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require: Option<ActionPredicate>,
     #[serde(default = "default_policy_requires")]
     pub requires: PolicyRequires,
+    /// When set, an observed command matching `on_command_glob` mints the named
+    /// [`ReceiptSource::CommandObserved`] receipt. `None` for every policy that
+    /// does not emit one. Orthogonal to this policy's own `requires`/`trigger`:
+    /// a policy typically EITHER mints (the test-runner) OR requires (the
+    /// commit gate), rarely both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mints: Option<ReceiptEmitter>,
     pub stage: PolicyStage,
     pub severity: Priority,
     pub created_by: String,
@@ -1295,6 +1437,8 @@ mod tests {
     #[test]
     fn policy_record_roundtrips_through_record_messagepack() {
         let policy = PolicyRecord {
+            deny_if: None,
+            require: None,
             name: "Production query safety".into(),
             rule: "Consult the production schema before querying it.".into(),
             reason: "Queries can target incompatible production tables because schemas drift."
@@ -1315,6 +1459,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
+            mints: None,
             stage: PolicyStage::Enforce,
             severity: Priority::Critical,
             created_by: "developer".into(),
@@ -1355,6 +1500,8 @@ mod tests {
         // deserialize to the inert default instead of erroring. Regression for
         // the observed mem_set "missing field `requires`" retry.
         let full = PolicyRecord {
+            deny_if: None,
+            require: None,
             name: "n".into(),
             rule: "r".into(),
             reason: "why".into(),
@@ -1367,6 +1514,7 @@ mod tests {
                 command_glob: None,
             },
             requires: default_policy_requires(),
+            mints: None,
             stage: PolicyStage::Off,
             severity: Priority::High,
             created_by: "developer".into(),
@@ -1377,6 +1525,31 @@ mod tests {
         assert_eq!(parsed.requires, default_policy_requires());
         assert_eq!(parsed.requires.freshness.ttl_secs, DEFAULT_POLICY_TTL_SECS);
         assert!(parsed.requires.key.is_empty());
+    }
+
+    #[test]
+    fn unknown_receipt_source_deserializes_to_unknown() {
+        // Forward-compat: a source string from a newer mati degrades to Unknown
+        // instead of failing the whole record, and Unknown is never accepted.
+        assert_eq!(
+            serde_json::from_str::<ReceiptSource>("\"future_source\"").unwrap(),
+            ReceiptSource::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<ReceiptSource>("\"command_observed\"").unwrap(),
+            ReceiptSource::CommandObserved
+        );
+        assert!(!CODEX_PRODUCIBLE_SOURCES.contains(&ReceiptSource::Unknown));
+        assert!(CODEX_PRODUCIBLE_SOURCES.contains(&ReceiptSource::CommandObserved));
+    }
+
+    #[test]
+    fn policy_mints_roundtrips_and_defaults_none() {
+        let json = r#"{"on_command_glob":"cargo nextest run*","key":"tests-ran"}"#;
+        let emitter: ReceiptEmitter = serde_json::from_str(json).unwrap();
+        assert_eq!(emitter.key, "tests-ran");
+        assert_eq!(emitter.on_command_glob, "cargo nextest run*");
+        assert_serde_roundtrip(&emitter);
     }
 
     #[test]

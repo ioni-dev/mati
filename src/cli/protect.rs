@@ -89,6 +89,8 @@ pub async fn run(args: ProtectArgs) -> Result<()> {
             target_path_glob: Some(target_glob.clone()),
             command_glob: None,
         },
+        deny_if: None,
+        require: None,
         requires: PolicyRequires {
             key: decision_key.clone(),
             via: vec![ReceiptSource::MemGet],
@@ -97,6 +99,7 @@ pub async fn run(args: ProtectArgs) -> Result<()> {
                 fingerprint: false,
             },
         },
+        mints: None,
         stage,
         severity: Priority::High,
         created_by: "developer".into(),

@@ -12,6 +12,8 @@ fn schema_introspection_exempts_matching_strict_block() {
     let result = decide::evaluate_policy_verdicts(
         &[decide::PolicyVerdict {
             key: "policy:prod-query".into(),
+            content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             rule: "Inspect production schema first.".into(),
             requires_key: "schema:orders".into(),
             block: false,
@@ -33,6 +35,8 @@ fn schema_introspection_exemption_produces_no_shadow_observation() {
     let verdicts = policy_core_verdicts(
         &[mati_core::mcp::protocol::PolicyVerdict {
             key: "policy:prod-query".into(),
+            content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             stage: mati_core::store::PolicyStage::Shadow,
             mode: mati_core::store::PolicyMode::Block,
             rule: "Inspect production schema first.".into(),
@@ -63,6 +67,8 @@ fn codex_policy_without_a_producible_source_degrades_to_steering() {
     let verdicts = policy_core_verdicts(
         &[mati_core::mcp::protocol::PolicyVerdict {
             key: "policy:db-schema".into(),
+            content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             stage: mati_core::store::PolicyStage::Enforce,
             mode: mati_core::store::PolicyMode::Block,
             rule: "Inspect the schema first.".into(),
@@ -86,6 +92,57 @@ fn codex_policy_without_a_producible_source_degrades_to_steering() {
         .any(|event| matches!(event, HookEvent::PolicyConsultBlocked { .. })));
 }
 
+/// H1: a content-deny must NOT be lowered by the schema-introspection
+/// exemption. The exemption is the remedy for a *consult* gate, meaningless for
+/// a content restriction — so a `deny_if` policy denies even when the same call
+/// path grants the introspection exemption that clears a consult block.
+#[test]
+fn content_deny_ignores_the_introspection_exemption() {
+    let verdict =
+        |content: mati_core::store::ContentOutcome| mati_core::mcp::protocol::PolicyVerdict {
+            key: "policy:no-write".into(),
+            content,
+            require_content: mati_core::store::ContentOutcome::None,
+            stage: mati_core::store::PolicyStage::Enforce,
+            mode: mati_core::store::PolicyMode::Block,
+            rule: "Deny writes.".into(),
+            reason: "Read-only.".into(),
+            severity: mati_core::store::Priority::High,
+            requires_key: "schema:orders".into(),
+            satisfied: false,
+            via: vec![mati_core::store::ReceiptSource::DbIntrospection],
+            strict: true,
+        };
+
+    // introspection_exemption = true. A plain consult block is lowered by it...
+    let consult = policy_core_verdicts(
+        &[verdict(mati_core::store::ContentOutcome::None)],
+        true,
+        false,
+    );
+    assert!(
+        !matches!(
+            decide::evaluate_policy_verdicts(&consult, true).decision,
+            Decision::Deny { .. }
+        ),
+        "consult block should be lowered under the introspection exemption"
+    );
+
+    // ...but a content-deny is not — it still denies, with its own origin.
+    let content = policy_core_verdicts(
+        &[verdict(mati_core::store::ContentOutcome::Deny)],
+        true,
+        false,
+    );
+    assert!(matches!(
+        decide::evaluate_policy_verdicts(&content, true).decision,
+        Decision::Deny {
+            origin: decide::DenyOrigin::PolicyContentDenied,
+            ..
+        }
+    ));
+}
+
 /// A Codex policy that names a source Codex CAN mint must keep blocking.
 ///
 /// `HookContext` is produced on the Codex pre-bash and apply-patch paths
@@ -105,6 +162,8 @@ fn codex_policy_naming_a_producible_source_still_blocks() {
         let verdicts = policy_core_verdicts(
             &[mati_core::mcp::protocol::PolicyVerdict {
                 key: "policy:db-schema".into(),
+                content: mati_core::store::ContentOutcome::None,
+                require_content: mati_core::store::ContentOutcome::None,
                 stage: mati_core::store::PolicyStage::Enforce,
                 mode: mati_core::store::PolicyMode::Block,
                 rule: "Inspect the schema first.".into(),
@@ -134,6 +193,8 @@ fn schema_introspection_exemption_preserves_satisfied_block() {
     let result = decide::evaluate_policy_verdicts(
         &[decide::PolicyVerdict {
             key: "policy:prod-query".into(),
+            content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             rule: "Inspect production schema first.".into(),
             requires_key: "schema:orders".into(),
             block: true,
@@ -1040,6 +1101,8 @@ fn policy_bash_output_denies_or_injects_without_force_allow() {
 fn codex_db_client_policy_gates_cover_fileless_file_bearing_and_introspection() {
     let deny_verdict = decide::PolicyVerdict {
         key: "policy:prod-query".into(),
+        content: mati_core::store::ContentOutcome::None,
+        require_content: mati_core::store::ContentOutcome::None,
         rule: "Consult the schema first.".into(),
         requires_key: "schema:orders".into(),
         block: true,

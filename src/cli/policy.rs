@@ -127,6 +127,36 @@ struct AddArgs {
     severity: String,
     #[arg(long, default_value = "developer")]
     created_by: String,
+    /// Content-deny predicate: deny when the command's argv matches this glob,
+    /// independent of any consult gate. Lexical tripwire (quoting, `-f file`,
+    /// heredocs, and aliases bypass it), never a guarantee.
+    #[arg(long)]
+    deny_if_command_glob: Option<String>,
+    /// Content-deny predicate on the path: deny when any of `target_path ∪
+    /// files` matches this glob (edits, path-verb bash, db `-f` file args),
+    /// independent of any consult gate. Lexical path match; sees the requested
+    /// path, not file contents.
+    #[arg(long, conflicts_with = "deny_if_command_glob")]
+    deny_if_path_glob: Option<String>,
+    /// Require predicate: deny UNLESS the command's argv matches this glob (the
+    /// polarity mirror of `--deny-if-command-glob`). Lexical tripwire.
+    #[arg(long)]
+    require_command_glob: Option<String>,
+    /// Require predicate on the path: deny UNLESS any of `target_path ∪ files`
+    /// matches this glob — an allowlist (e.g. `src/**` denies edits outside
+    /// `src/`). Lexical path match; sees the requested path, not file contents.
+    #[arg(long, conflicts_with = "require_command_glob")]
+    require_path_glob: Option<String>,
+    /// Mint a CommandObserved receipt named `--mints-key` when an observed
+    /// command's argv matches this glob (workflow ordering, e.g. a test runner
+    /// minting `tests-ran`). Attests ATTEMPTED, not passed — prefer a full-suite
+    /// glob. Requires `--mints-key`.
+    #[arg(long, requires = "mints_key")]
+    mints_command_glob: Option<String>,
+    /// Receipt key the `--mints-command-glob` emitter writes. A separate policy
+    /// sets `requires.key` to this to gate on it.
+    #[arg(long)]
+    mints_key: Option<String>,
     /// Enable immediately (otherwise the new policy is inert).
     #[arg(long)]
     enable: bool,
@@ -260,6 +290,28 @@ async fn add(args: AddArgs) -> Result<()> {
         scope: args.scope,
         mode: parse_mode(&args.mode)?,
         trigger: parse_trigger(&args.trigger)?,
+        deny_if: args
+            .deny_if_command_glob
+            .map(mati_core::store::ActionPredicate::CommandGlob)
+            .or_else(|| {
+                args.deny_if_path_glob
+                    .map(mati_core::store::ActionPredicate::PathGlob)
+            }),
+        require: args
+            .require_command_glob
+            .map(mati_core::store::ActionPredicate::CommandGlob)
+            .or_else(|| {
+                args.require_path_glob
+                    .map(mati_core::store::ActionPredicate::PathGlob)
+            }),
+        mints: match (args.mints_command_glob, args.mints_key) {
+            (Some(on_command_glob), Some(key)) => Some(mati_core::store::ReceiptEmitter {
+                on_command_glob,
+                key,
+            }),
+            (None, None) => None,
+            _ => anyhow::bail!("--mints-command-glob and --mints-key must be given together"),
+        },
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
         stage: if args.enable {
@@ -755,12 +807,15 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     if let Some(trigger_json) = args.trigger {
         let trigger = parse_trigger(&trigger_json)?;
         let policy = PolicyRecord {
+            mints: None,
             name: "ad-hoc".into(),
             rule: "ad-hoc trigger".into(),
             reason: "ad-hoc trigger evaluation".into(),
             scope: "repo".into(),
             mode: PolicyMode::Steer,
             trigger,
+            deny_if: None,
+            require: None,
             requires: serde_json::from_str(r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#)?,
             stage: PolicyStage::Enforce,
             severity: Priority::Normal,
@@ -984,6 +1039,9 @@ mod tests {
     #[test]
     fn policy_test_output_reports_human_match_and_mode() {
         let policy = PolicyRecord {
+            deny_if: None,
+            require: None,
+            mints: None,
             name: "Production query safety".into(),
             rule: "Consult the schema first.".into(),
             reason: "Production schemas drift because deployments change.".into(),
@@ -1009,6 +1067,8 @@ mod tests {
             .matches(&action)
             .into_iter()
             .map(|matched| mati_core::mcp::protocol::PolicyVerdict {
+                content: mati_core::store::ContentOutcome::None,
+                require_content: mati_core::store::ContentOutcome::None,
                 key: matched.key.to_string(),
                 stage: matched.policy.stage,
                 mode: matched.policy.mode,
@@ -1038,6 +1098,8 @@ mod tests {
     fn policy_test_output_surfaces_unbacked_memget_requirement() {
         let action = normalize_action(Some("psql -h db.prod.internal -c select"), None);
         let matched = mati_core::mcp::protocol::PolicyVerdict {
+            content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             key: "policy:prod".into(),
             stage: PolicyStage::Enforce,
             mode: PolicyMode::Block,

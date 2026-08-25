@@ -16,6 +16,9 @@ struct CompiledPolicy {
     host_glob: Option<GlobMatcher>,
     target_path_glob: Option<GlobMatcher>,
     command_glob: Option<GlobMatcher>,
+    /// Compiled `mints.on_command_glob` — the pattern that, when matched by an
+    /// observed command, mints this policy's [`ReceiptEmitter`] receipt.
+    mints_glob: Option<GlobMatcher>,
 }
 
 /// A set of staged, active policies with their glob predicates compiled.
@@ -131,12 +134,22 @@ impl PolicyMatcherSet {
                         .map(|glob| glob.compile_matcher())
                 })
                 .transpose()?;
+            let mints_glob = policy
+                .mints
+                .as_ref()
+                .map(|emitter| {
+                    Glob::new(&emitter.on_command_glob)
+                        .with_context(|| format!("invalid mints.on_command_glob for policy {key}"))
+                        .map(|glob| glob.compile_matcher())
+                })
+                .transpose()?;
             compiled.push(CompiledPolicy {
                 key,
                 policy,
                 host_glob,
                 target_path_glob,
                 command_glob,
+                mints_glob,
             });
         }
         Ok(Self { policies: compiled })
@@ -176,6 +189,24 @@ impl PolicyMatcherSet {
             .map(|compiled| MatchedPolicy {
                 key: &compiled.key,
                 policy: &compiled.policy,
+            })
+            .collect()
+    }
+
+    /// Receipt keys to mint for this action: every `Enforce`-stage policy whose
+    /// `mints` emitter glob matches the action's joined argv. Only `Enforce`
+    /// mints — a `shadow` emitter observes without writing state, so it can
+    /// never satisfy a real gate. Independent of the trigger: an emitter watches
+    /// its own command pattern, not the policy's gated action.
+    pub fn mints_for(&self, action: &Action) -> Vec<&str> {
+        self.policies
+            .iter()
+            .filter(|compiled| matches!(compiled.policy.stage, PolicyStage::Enforce))
+            .filter_map(|compiled| {
+                let emitter = compiled.policy.mints.as_ref()?;
+                let glob = compiled.mints_glob.as_ref()?;
+                (!action.argv.is_empty() && glob.is_match(action.argv.join(" ")))
+                    .then_some(emitter.key.as_str())
             })
             .collect()
     }
@@ -239,6 +270,8 @@ mod tests {
 
     fn policy(name: &str, trigger: PolicyTrigger) -> PolicyRecord {
         PolicyRecord {
+            deny_if: None,
+            require: None,
             name: name.into(),
             rule: "Consult the required knowledge first.".into(),
             reason: "The action needs current context because production state changes.".into(),
@@ -253,6 +286,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
+            mints: None,
             stage: PolicyStage::Enforce,
             severity: Priority::High,
             created_by: "test".into(),
@@ -267,6 +301,59 @@ mod tests {
             argv: vec!["psql".into()],
             files: files.iter().map(|path| (*path).into()).collect(),
         }
+    }
+
+    fn bash_action(cmd: &str) -> Action {
+        Action {
+            tool: "shell".into(),
+            target_path: None,
+            host: None,
+            argv: cmd.split_whitespace().map(str::to_string).collect(),
+            files: vec![],
+        }
+    }
+
+    fn emitter_policy(glob: &str, key: &str, stage: PolicyStage) -> PolicyRecord {
+        let mut p = policy(
+            "emitter",
+            PolicyTrigger {
+                command_glob: Some(glob.into()),
+                ..Default::default()
+            },
+        );
+        p.mode = PolicyMode::Steer;
+        p.stage = stage;
+        p.mints = Some(crate::store::ReceiptEmitter {
+            on_command_glob: glob.into(),
+            key: key.into(),
+        });
+        p
+    }
+
+    #[test]
+    fn enforce_emitter_mints_on_matching_command() {
+        let set = PolicyMatcherSet::from_policies([(
+            "policy:emit".into(),
+            emitter_policy("cargo nextest run*", "tests-ran", PolicyStage::Enforce),
+        )])
+        .unwrap();
+        assert_eq!(
+            set.mints_for(&bash_action("cargo nextest run --lib")),
+            vec!["tests-ran"]
+        );
+        assert!(set.mints_for(&bash_action("cargo build")).is_empty());
+    }
+
+    #[test]
+    fn shadow_emitter_never_mints() {
+        // A shadow emitter observes without writing state; it must not satisfy
+        // a real gate.
+        let set = PolicyMatcherSet::from_policies([(
+            "policy:emit".into(),
+            emitter_policy("cargo nextest run*", "tests-ran", PolicyStage::Shadow),
+        )])
+        .unwrap();
+        assert!(set.mints_for(&bash_action("cargo nextest run")).is_empty());
     }
 
     #[test]

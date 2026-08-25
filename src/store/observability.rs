@@ -278,6 +278,9 @@ mod tests {
 
     fn policy_record(key: &str, tool: Option<&str>, stage: PolicyStage) -> Record {
         let policy = PolicyRecord {
+            deny_if: None,
+            require: None,
+            mints: None,
             name: "n".into(),
             rule: "r".into(),
             reason: "why".into(),

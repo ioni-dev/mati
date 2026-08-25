@@ -70,6 +70,9 @@ async fn policy_write_dispatches_against_daemon_store() {
     let graph = Arc::new(tokio::sync::RwLock::new(graph));
     let ctx = test_ctx(dir.path());
     let policy = PolicyRecord {
+        deny_if: None,
+        require: None,
+        mints: None,
         name: "Daemon policy".into(),
         rule: "Consult first.".into(),
         reason: "The schema changes because production is live.".into(),
@@ -134,6 +137,9 @@ async fn policy_evaluate_uses_live_matcher_and_receipt_state() {
     let graph = Arc::new(tokio::sync::RwLock::new(graph));
     let ctx = test_ctx(dir.path());
     let policy = PolicyRecord {
+        deny_if: None,
+        require: None,
+        mints: None,
         name: "Production query safety".into(),
         rule: "Consult the schema first.".into(),
         reason: "Production schemas drift because deployments change.".into(),
@@ -297,6 +303,9 @@ async fn policies_sharing_requires_key_respect_different_via_sources() {
         None,
     );
     let make_policy = |via| PolicyRecord {
+        deny_if: None,
+        require: None,
+        mints: None,
         name: "Shared schema requirement".into(),
         rule: "Consult the schema first.".into(),
         reason: "Production schemas drift because deployments change.".into(),
@@ -385,6 +394,9 @@ async fn unclassified_policy_literal_bypass_records_and_verifies_chain() {
     let ctx = test_ctx(dir.path());
     let policy_key = "policy:prod-db";
     let policy = PolicyRecord {
+        deny_if: None,
+        require: None,
+        mints: None,
         name: "Production database safety".into(),
         rule: "Consult the production schema first.".into(),
         reason: "Production data changes because deployments are live.".into(),

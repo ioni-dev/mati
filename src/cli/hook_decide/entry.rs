@@ -466,12 +466,15 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         }
     }
 
-    // A file-bearing governed DB command gets the policy decision after the
-    // existing file gate. A file-gate Deny is already final, so skip the
-    // policy round-trip and its possible second event on that path.
+    // A file-bearing governed action (DB command, edit, or read) gets the
+    // policy decision after the existing file gate. A file-gate Deny is already
+    // final, so skip the policy round-trip and its possible second event.
     if matches!(
         args.variant,
-        HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreEdit
+        HookVariant::ClaudePreBash
+            | HookVariant::CodexPreBash
+            | HookVariant::ClaudePreEdit
+            | HookVariant::ClaudePreRead
     ) && !matches!(adapter.decision, Decision::Deny { .. })
     {
         // A bash file argument has the same second identity as an edit target:
@@ -509,6 +512,19 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 .chain(canon_rel.as_deref())
                 .map(|path| decide::normalize_action(None, Some(path)))
                 .collect(),
+            // A read carries no argv; only its path can gate it. Build one
+            // file_read action so a `deny_if` path predicate fires. Both the
+            // lexical and symlink-resolved paths go in `files` — the same
+            // canonical fallback the file gate applies above.
+            HookVariant::ClaudePreRead => vec![decide::Action {
+                tool: "file_read".to_string(),
+                target_path: Some(rel_path.clone()),
+                host: None,
+                argv: Vec::new(),
+                files: std::iter::once(rel_path.clone())
+                    .chain(canon_rel.clone())
+                    .collect(),
+            }],
             _ => Vec::new(),
         };
         for action in &policy_actions {
@@ -520,12 +536,13 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                 break;
             }
             // Govern each action by its own category: edits and path-mutating
-            // bash commands (rm/mv/rmdir/shred → tool=path) gate on `path`, DB
-            // clients on `db_client`. Reads stay on the file gate.
-            let governed_tool = if action.tool == "path" {
-                "path"
-            } else {
-                "db_client"
+            // bash commands (rm/mv/rmdir/shred → tool=path) gate on `path`,
+            // reads (Read tool, cat/grep) on `file_read`, DB clients on
+            // `db_client`.
+            let governed_tool = match action.tool.as_str() {
+                "path" => "path",
+                "file_read" => "file_read",
+                _ => "db_client",
             };
             if let Some((policy_decision, policy_events)) = evaluate_governed_policy(
                 Some(&mati_root),

@@ -50,6 +50,16 @@ pub struct PolicyVerdict {
     /// Snapshot of the global enforcement mode used for block degradation.
     #[serde(default)]
     pub strict: bool,
+    /// Outcome of the policy's `deny_if` predicate against this action,
+    /// independent of `satisfied`/`requires` and never lowered by the
+    /// schema-introspection exemption. Defaults to `None` for older daemons.
+    #[serde(default)]
+    pub content: crate::store::ContentOutcome,
+    /// Outcome of the policy's `require` predicate (allowlist mirror of
+    /// `content`): `Deny`/`Warn` means the requirement was missed. Defaults to
+    /// `None` for older daemons.
+    #[serde(default)]
+    pub require_content: crate::store::ContentOutcome,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -442,6 +452,17 @@ pub enum SessionEvent {
     FloorConsultMiss,
     /// Local policy denied an unconsulted governed action.
     PolicyConsultMiss,
+    /// Local policy `deny_if` denied a governed action on its content. Records a
+    /// `Deny` with reason `policy_content_denied`, distinct from the consult
+    /// deny so the audit chain can tell a content restriction from a missed
+    /// consult.
+    PolicyContentMiss,
+    /// Local policy `require` denied a governed action that fell outside its
+    /// allowlist / missed a required-content predicate. Records a `Deny` with
+    /// reason `policy_requirement_unmet`, distinct from a `deny_if` content
+    /// deny so the audit chain can tell "did a forbidden thing" from "failed to
+    /// do a required thing."
+    PolicyRequirementMiss,
     /// Local policy allowed an action after its receipt was present.
     PolicyConsultHit,
     /// Local policy injected steering context without changing the decision.

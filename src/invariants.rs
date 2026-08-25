@@ -614,6 +614,14 @@ mod gotcha_write_sites {
              record; gotchas are the primary consultation target",
         ),
         (
+            "src/mcp/dispatch_v2/knowledge.rs",
+            "dispatch_policy_evaluate",
+            Class::NonGotcha,
+            "mints CommandObserved receipts: writes only staged.key from \
+             consultation_receipt_staged_with_fingerprint, always a \
+             session:consulted:* key, never a gotcha",
+        ),
+        (
             "src/mcp/handlers/gotcha.rs",
             "upsert_commit_once",
             Class::Bypass,

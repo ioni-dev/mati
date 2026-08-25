@@ -221,7 +221,7 @@ pub(super) async fn dispatch_policy_evaluate(
         unreachable!("dispatch_policy_evaluate only accepts PolicyEvaluate")
     };
 
-    let (matched, bypass_key) = {
+    let (matched, bypass_key, mints_keys) = {
         let matcher = ctx.policy_matcher.read().await;
         let matched = matcher
             .matches(&input.action)
@@ -238,6 +238,36 @@ pub(super) async fn dispatch_policy_evaluate(
                     matched.policy.requires.via.clone(),
                     matched.policy.requires.freshness.fingerprint,
                     matched.policy.requires.freshness.ttl_secs,
+                    matched.policy.deny_if.as_ref().map_or(
+                        crate::store::ContentOutcome::None,
+                        |predicate| {
+                            let paths: Vec<String> = input
+                                .action
+                                .target_path
+                                .iter()
+                                .chain(input.action.files.iter())
+                                .cloned()
+                                .collect();
+                            predicate.outcome(&input.action.argv, &paths, matched.policy.mode)
+                        },
+                    ),
+                    matched.policy.require.as_ref().map_or(
+                        crate::store::ContentOutcome::None,
+                        |predicate| {
+                            let paths: Vec<String> = input
+                                .action
+                                .target_path
+                                .iter()
+                                .chain(input.action.files.iter())
+                                .cloned()
+                                .collect();
+                            predicate.require_outcome(
+                                &input.action.argv,
+                                &paths,
+                                matched.policy.mode,
+                            )
+                        },
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -246,18 +276,51 @@ pub(super) async fn dispatch_policy_evaluate(
                 .detect_unclassified_literal_bypass(&input.action, raw)
                 .map(str::to_string)
         });
-        (matched, bypass_key)
+        let mints_keys: Vec<String> = matcher
+            .mints_for(&input.action)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        (matched, bypass_key, mints_keys)
     };
 
     let g = graph.read().await;
     let store = g.store();
+
+    // Mint CommandObserved receipts for every matched emitter — attests the
+    // watched command was ATTEMPTED (this fires before its exit status is
+    // known). Best-effort: a mint failure must not fail the evaluation.
+    for receipt_key in &mints_keys {
+        if let Ok(staged) = sess::consultation_receipt_staged_with_fingerprint(
+            receipt_key,
+            input.actor.as_deref(),
+            None,
+            Some(crate::store::ReceiptSource::CommandObserved),
+        ) {
+            if let Ok(record) = rmp_serde::from_slice::<crate::store::Record>(&staged.bytes) {
+                let _ = store.put(&staged.key, &record).await;
+            }
+        }
+    }
     let strict = matches!(
         crate::store::enforcement::get_policy_mode(store).await,
         crate::store::enforcement::EnforcementMode::Strict
     );
     let mut verdicts = Vec::with_capacity(matched.len());
-    for (key, stage, mode, rule, reason, severity, requires_key, via, fingerprint, ttl_secs) in
-        matched
+    for (
+        key,
+        stage,
+        mode,
+        rule,
+        reason,
+        severity,
+        requires_key,
+        via,
+        fingerprint,
+        ttl_secs,
+        content,
+        require_content,
+    ) in matched
     {
         let satisfied = match mode {
             crate::store::PolicyMode::Steer => true,
@@ -300,6 +363,8 @@ pub(super) async fn dispatch_policy_evaluate(
             via,
             satisfied,
             strict,
+            content,
+            require_content,
         });
     }
 
