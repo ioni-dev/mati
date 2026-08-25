@@ -943,6 +943,138 @@ fn hook_decide_path_content_deny_denies_edit() {
     eprintln!("[path-content-deny] daemon recorded {denials} deny event(s) -- correct");
 }
 
+/// Live E2E for the `file_read` category through the Read tool.
+///
+/// The Read tool carries no argv and, before this, never entered policy
+/// evaluation at all — reads were governed only by the file gate. This proves
+/// the read-path routing: a `file_read` policy with a `deny_if` path predicate
+/// gates the Read tool.
+///   1. reading a file under `**/secrets/**` DENIES (permissionDecision=deny);
+///   2. reading a file outside it ALLOWS (permissionDecision=allow);
+///   3. the daemon records the deny.
+#[test]
+#[ignore]
+fn hook_decide_file_read_content_deny_denies_read() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    std::env::set_var("MATI_HOME", home);
+
+    std::fs::create_dir_all(repo.join("config/secrets")).expect("mkdir secrets");
+    std::fs::write(repo.join("config/secrets/prod.env"), "TOKEN=abc\n").expect("write secret");
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+
+    // Author + enable a file_read content-deny policy via the real CLI.
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "no-read-secrets",
+            "--name",
+            "No reading secrets",
+            "--rule",
+            "Deny reads of files under secrets/.",
+            "--reason",
+            "Secret material must not be read through the agent.",
+            "--mode",
+            "block",
+            "--trigger",
+            r#"{"tool":"file_read"}"#,
+            "--deny-if-path-glob",
+            "**/secrets/**",
+            "--enable",
+        ],
+    );
+    assert_eq!(
+        r.code, 0,
+        "mati policy add failed:\n{}\n{}",
+        r.stdout, r.stderr
+    );
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable",
+    );
+
+    // 1. reading the secret → claude-pre-read denies via JSON.
+    let deny = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-read"],
+        r#"{"tool_input":{"file_path":"config/secrets/prod.env"}}"#,
+    );
+    assert_eq!(deny.code, 0, "claude hooks always exit 0");
+    let json: serde_json::Value = serde_json::from_str(deny.stdout.trim())
+        .unwrap_or_else(|e| panic!("claude-pre-read stdout not JSON: {e}\n{}", deny.stdout));
+    assert_eq!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str()),
+        Some("deny"),
+        "reading a secret must deny on the file_read path predicate.\nJSON: {}",
+        deny.stdout,
+    );
+    eprintln!("[file-read-content-deny] read secret: permissionDecision=deny -- correct");
+
+    // 2. reading a non-secret existing file → allow (reads always emit JSON).
+    let allow = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-read"],
+        r#"{"tool_input":{"file_path":"src/test.rs"}}"#,
+    );
+    assert_eq!(allow.code, 0, "claude hooks always exit 0");
+    let json: serde_json::Value = serde_json::from_str(allow.stdout.trim())
+        .unwrap_or_else(|e| panic!("claude-pre-read stdout not JSON: {e}\n{}", allow.stdout));
+    assert_eq!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str()),
+        Some("allow"),
+        "a non-secret read must allow.\nJSON: {}",
+        allow.stdout,
+    );
+    eprintln!("[file-read-content-deny] read non-secret: allow -- no false positive");
+
+    // 3. the daemon recorded the read content-deny.
+    let stats = run(&bin, repo, home, &["stats", "--json"]);
+    assert_eq!(
+        stats.code, 0,
+        "mati stats failed:\n{}\n{}",
+        stats.stdout, stats.stderr
+    );
+    let json: serde_json::Value = serde_json::from_str(stats.stdout.trim())
+        .unwrap_or_else(|e| panic!("stats --json not JSON: {e}\n{}", stats.stdout));
+    let denials = json
+        .pointer("/enforcement_30d/denials")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        denials >= 1,
+        "the file_read content-deny must record a Deny event; stats: {}",
+        stats.stdout,
+    );
+    eprintln!("[file-read-content-deny] daemon recorded {denials} deny event(s) -- correct");
+}
+
 /// The internal deadline must end the process, not merely decide.
 ///
 /// `run_inner` reads stdin through Tokio's blocking reader. When

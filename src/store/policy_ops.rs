@@ -94,7 +94,7 @@ pub fn validate_trigger(trigger: &super::record::PolicyTrigger) -> Result<()> {
 pub const WRITABLE_KEY_PREFIXES: &[&str] = &["gotcha:", "decision:", "dev_note:", "policy:"];
 
 /// Trigger tools that at least one installed policy adapter evaluates.
-pub const ADAPTER_POLICY_TOOLS: &[&str] = &["db_client", "path"];
+pub const ADAPTER_POLICY_TOOLS: &[&str] = &["db_client", "path", "file_read"];
 
 /// Can a record ever exist at this key?
 pub fn key_is_writable(key: &str) -> bool {
@@ -125,7 +125,7 @@ pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<S
     }
     if policy.trigger.tool.as_deref() == Some("file_read") {
         warnings.push(
-            "warning: policy trigger tool 'file_read' has no enforcing adapter; Bash file reads are governed by gotchas, so this policy will never be evaluated. Use a gotcha for reads or a db_client/path policy for an adapter-backed action.".into(),
+            "note: policy trigger tool 'file_read' is enforced for the Claude Read tool and cat/grep reads. Codex's native file-read tool fires no hook, so reads through it are ungoverned.".into(),
         );
     }
     if let Some(tool) = policy
