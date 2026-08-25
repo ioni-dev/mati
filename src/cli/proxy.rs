@@ -889,18 +889,24 @@ impl StoreProxy {
                             }
                         }
                     };
-                    let content = policy.deny_if.as_ref().map_or(
-                        mati_core::store::ContentOutcome::None,
-                        |predicate| {
-                            let paths: Vec<String> = action
-                                .target_path
-                                .iter()
-                                .chain(action.files.iter())
-                                .cloned()
-                                .collect();
+                    let paths: Vec<String> = action
+                        .target_path
+                        .iter()
+                        .chain(action.files.iter())
+                        .cloned()
+                        .collect();
+                    let content = policy
+                        .deny_if
+                        .as_ref()
+                        .map_or(mati_core::store::ContentOutcome::None, |predicate| {
                             predicate.outcome(&action.argv, &paths, policy.mode)
-                        },
-                    );
+                        });
+                    let require_content = policy
+                        .require
+                        .as_ref()
+                        .map_or(mati_core::store::ContentOutcome::None, |predicate| {
+                            predicate.require_outcome(&action.argv, &paths, policy.mode)
+                        });
                     verdicts.push(p::PolicyVerdict {
                         key: matched.key.to_string(),
                         stage: policy.stage,
@@ -913,6 +919,7 @@ impl StoreProxy {
                         satisfied,
                         strict,
                         content,
+                        require_content,
                     });
                 }
                 Ok(verdicts)
@@ -1510,6 +1517,7 @@ mod tests {
         let store = Store::open(dir.path()).await.unwrap();
         let policy = mati_core::store::PolicyRecord {
             deny_if: None,
+            require: None,
             name: "Production query".into(),
             rule: "Consult first.".into(),
             reason: "Production changes because deployments happen.".into(),
@@ -1585,6 +1593,7 @@ mod tests {
         store.put(&staged.key, &receipt).await.unwrap();
         let policy = mati_core::store::PolicyRecord {
             deny_if: None,
+            require: None,
             name: "Fingerprint query".into(),
             rule: "Consult current schema.".into(),
             reason: "Schemas drift because deployments change.".into(),

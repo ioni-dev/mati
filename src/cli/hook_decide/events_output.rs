@@ -121,6 +121,9 @@ pub(crate) fn platform_events(
                 HookEvent::PolicyContentBlocked { key } => {
                     Some(HookEvent::PolicyContentBlocked { key })
                 }
+                HookEvent::PolicyRequirementBlocked { key } => {
+                    Some(HookEvent::PolicyRequirementBlocked { key })
+                }
                 HookEvent::PolicyConsulted { key } => Some(HookEvent::PolicyConsulted { key }),
                 HookEvent::PolicySteered { key } => Some(HookEvent::PolicySteered { key }),
                 HookEvent::PolicyShadowObserved { key, would, action } => {
@@ -275,6 +278,13 @@ pub(crate) fn session_command(
         }),
         HookEvent::PolicyContentBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::PolicyContentMiss,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            decision_basis_hash: None,
+        }),
+        HookEvent::PolicyRequirementBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::PolicyRequirementMiss,
             key: key.clone(),
             session_id: sid(),
             actor: scope(),
@@ -712,9 +722,9 @@ pub(crate) fn format_decision(
                 // requires.key. Matched exhaustively so a new origin has to
                 // choose a shape rather than inherit one.
                 let stderr = match origin {
-                    decide::DenyOrigin::Policy | decide::DenyOrigin::PolicyContentDenied => {
-                        reason.clone()
-                    }
+                    decide::DenyOrigin::Policy
+                    | decide::DenyOrigin::PolicyContentDenied
+                    | decide::DenyOrigin::PolicyRequirementUnmet => reason.clone(),
                     decide::DenyOrigin::Gotcha | decide::DenyOrigin::ConsultMandate => {
                         format!("mati: call mem_get(\"{file_key}\") first")
                     }

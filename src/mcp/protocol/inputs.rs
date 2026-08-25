@@ -55,6 +55,11 @@ pub struct PolicyVerdict {
     /// schema-introspection exemption. Defaults to `None` for older daemons.
     #[serde(default)]
     pub content: crate::store::ContentOutcome,
+    /// Outcome of the policy's `require` predicate (allowlist mirror of
+    /// `content`): `Deny`/`Warn` means the requirement was missed. Defaults to
+    /// `None` for older daemons.
+    #[serde(default)]
+    pub require_content: crate::store::ContentOutcome,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -452,6 +457,12 @@ pub enum SessionEvent {
     /// deny so the audit chain can tell a content restriction from a missed
     /// consult.
     PolicyContentMiss,
+    /// Local policy `require` denied a governed action that fell outside its
+    /// allowlist / missed a required-content predicate. Records a `Deny` with
+    /// reason `policy_requirement_unmet`, distinct from a `deny_if` content
+    /// deny so the audit chain can tell "did a forbidden thing" from "failed to
+    /// do a required thing."
+    PolicyRequirementMiss,
     /// Local policy allowed an action after its receipt was present.
     PolicyConsultHit,
     /// Local policy injected steering context without changing the decision.

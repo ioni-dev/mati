@@ -1118,6 +1118,7 @@ fn path_mutating_multi_arg_matches_target_path_glob() {
     let action = normalize_action(Some("rm -rf safe.txt src/migrations/x"), None);
     let policy = PolicyRecord {
         deny_if: None,
+        require: None,
         name: "protect migrations".into(),
         rule: "Consult before deleting migrations.".into(),
         reason: "Migrations are irreversible because they alter production schema.".into(),
@@ -1536,6 +1537,7 @@ fn policy(block: bool, satisfied: bool, rule: &str) -> PolicyVerdict {
     PolicyVerdict {
         key: "policy:prod-query".into(),
         content: crate::store::ContentOutcome::None,
+        require_content: crate::store::ContentOutcome::None,
         rule: rule.into(),
         requires_key: "schema:orders".into(),
         block,
@@ -1752,6 +1754,7 @@ fn multi_policy_deny_only_records_the_blocking_policy() {
         PolicyVerdict {
             key: "policy:A".into(),
             content: crate::store::ContentOutcome::None,
+            require_content: crate::store::ContentOutcome::None,
             rule: "A was consulted.".into(),
             requires_key: "schema:a".into(),
             block: true,
@@ -1761,6 +1764,7 @@ fn multi_policy_deny_only_records_the_blocking_policy() {
         PolicyVerdict {
             key: "policy:S".into(),
             content: crate::store::ContentOutcome::None,
+            require_content: crate::store::ContentOutcome::None,
             rule: "Steer this action.".into(),
             requires_key: "schema:s".into(),
             block: false,
@@ -1770,6 +1774,7 @@ fn multi_policy_deny_only_records_the_blocking_policy() {
         PolicyVerdict {
             key: "policy:B".into(),
             content: crate::store::ContentOutcome::None,
+            require_content: crate::store::ContentOutcome::None,
             rule: "B must be consulted.".into(),
             requires_key: "schema:b".into(),
             block: true,

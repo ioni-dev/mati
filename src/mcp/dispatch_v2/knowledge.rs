@@ -251,6 +251,23 @@ pub(super) async fn dispatch_policy_evaluate(
                             predicate.outcome(&input.action.argv, &paths, matched.policy.mode)
                         },
                     ),
+                    matched.policy.require.as_ref().map_or(
+                        crate::store::ContentOutcome::None,
+                        |predicate| {
+                            let paths: Vec<String> = input
+                                .action
+                                .target_path
+                                .iter()
+                                .chain(input.action.files.iter())
+                                .cloned()
+                                .collect();
+                            predicate.require_outcome(
+                                &input.action.argv,
+                                &paths,
+                                matched.policy.mode,
+                            )
+                        },
+                    ),
                 )
             })
             .collect::<Vec<_>>();
@@ -281,6 +298,7 @@ pub(super) async fn dispatch_policy_evaluate(
         fingerprint,
         ttl_secs,
         content,
+        require_content,
     ) in matched
     {
         let satisfied = match mode {
@@ -325,6 +343,7 @@ pub(super) async fn dispatch_policy_evaluate(
             satisfied,
             strict,
             content,
+            require_content,
         });
     }
 

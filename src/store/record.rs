@@ -937,7 +937,8 @@ pub enum PolicyMode {
 }
 
 impl ActionPredicate {
-    /// Classify an action against this predicate for the given mode.
+    /// Classify an action against this predicate for the given mode, as a
+    /// `deny_if` (denylist) rule: match → deny/warn, no match → inert.
     pub fn outcome(&self, argv: &[String], paths: &[String], mode: PolicyMode) -> ContentOutcome {
         if self.denies(argv, paths) {
             match mode {
@@ -946,6 +947,26 @@ impl ActionPredicate {
             }
         } else {
             ContentOutcome::Inert
+        }
+    }
+
+    /// Classify an action against this predicate as a `require` (allowlist)
+    /// rule — the polarity mirror of `outcome`: the requirement is MET when the
+    /// predicate matches (inert), and MISSED when it does not (deny/warn). A
+    /// `require: PathGlob("src/**")` therefore denies any action outside `src/`.
+    pub fn require_outcome(
+        &self,
+        argv: &[String],
+        paths: &[String],
+        mode: PolicyMode,
+    ) -> ContentOutcome {
+        if self.denies(argv, paths) {
+            ContentOutcome::Inert
+        } else {
+            match mode {
+                PolicyMode::Block => ContentOutcome::Deny,
+                PolicyMode::Steer => ContentOutcome::Warn,
+            }
         }
     }
 }
@@ -1040,6 +1061,11 @@ pub struct PolicyRecord {
     /// (consult). `None` for every policy authored before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deny_if: Option<ActionPredicate>,
+    /// Polarity mirror of `deny_if`: deny UNLESS the predicate matches
+    /// (allowlist / required content). `None` for every policy that does not
+    /// use it. Evaluated after `deny_if` — a `deny_if` match wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require: Option<ActionPredicate>,
     #[serde(default = "default_policy_requires")]
     pub requires: PolicyRequires,
     pub stage: PolicyStage,
@@ -1373,6 +1399,7 @@ mod tests {
     fn policy_record_roundtrips_through_record_messagepack() {
         let policy = PolicyRecord {
             deny_if: None,
+            require: None,
             name: "Production query safety".into(),
             rule: "Consult the production schema before querying it.".into(),
             reason: "Queries can target incompatible production tables because schemas drift."
@@ -1434,6 +1461,7 @@ mod tests {
         // the observed mem_set "missing field `requires`" retry.
         let full = PolicyRecord {
             deny_if: None,
+            require: None,
             name: "n".into(),
             rule: "r".into(),
             reason: "why".into(),

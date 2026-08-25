@@ -240,6 +240,7 @@ mod tests {
     fn policy(name: &str, trigger: PolicyTrigger) -> PolicyRecord {
         PolicyRecord {
             deny_if: None,
+            require: None,
             name: name.into(),
             rule: "Consult the required knowledge first.".into(),
             reason: "The action needs current context because production state changes.".into(),

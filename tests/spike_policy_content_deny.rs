@@ -23,6 +23,21 @@ fn verdict(content: ContentOutcome, block: bool, satisfied: bool) -> PolicyVerdi
         satisfied,
         stage: PolicyStage::Enforce,
         content,
+        require_content: ContentOutcome::None,
+    }
+}
+
+/// A verdict carrying only a `require` (allowlist) outcome — `content` absent.
+fn require_verdict(require_content: ContentOutcome) -> PolicyVerdict {
+    PolicyVerdict {
+        key: "policy:require".into(),
+        rule: "require rule".into(),
+        requires_key: String::new(),
+        block: false,
+        satisfied: false,
+        stage: PolicyStage::Enforce,
+        content: ContentOutcome::None,
+        require_content,
     }
 }
 
@@ -173,6 +188,101 @@ fn path_glob_roundtrips_through_serde() {
     assert_eq!(json, r#"{"path_glob":"**/prod/**"}"#);
     let back: ActionPredicate = serde_json::from_str(&json).unwrap();
     assert_eq!(back, predicate);
+}
+
+#[test]
+fn require_outcome_is_the_allowlist_mirror_of_outcome() {
+    use mati_core::store::PolicyMode;
+    // "only edit under src/": require_outcome INVERTS outcome — a match is the
+    // requirement MET (Inert), a non-match is the requirement MISSED (Deny/Warn).
+    let allow = ActionPredicate::PathGlob("src/**".into());
+    assert_eq!(
+        allow.require_outcome(&[], &args(&["src/main.rs"]), PolicyMode::Block),
+        ContentOutcome::Inert
+    );
+    assert_eq!(
+        allow.require_outcome(&[], &args(&["scripts/seo.js"]), PolicyMode::Block),
+        ContentOutcome::Deny
+    );
+    assert_eq!(
+        allow.require_outcome(&[], &args(&["scripts/seo.js"]), PolicyMode::Steer),
+        ContentOutcome::Warn
+    );
+}
+
+#[test]
+fn require_miss_denies_with_distinct_origin() {
+    let result = decide::evaluate_policy_verdicts(&[require_verdict(ContentOutcome::Deny)], true);
+    match result.decision {
+        Decision::Deny { origin, .. } => assert_eq!(origin, DenyOrigin::PolicyRequirementUnmet),
+        other => panic!("expected Deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn require_met_is_inert() {
+    // Requirement satisfied (predicate matched) → silent allow, no deny, no steer.
+    let result = decide::evaluate_policy_verdicts(&[require_verdict(ContentOutcome::Inert)], true);
+    assert!(matches!(result.decision, Decision::Allow));
+}
+
+#[test]
+fn require_steer_warns_without_denying() {
+    // A steer-author requirement miss (Warn) advises, never denies.
+    let result = decide::evaluate_policy_verdicts(&[require_verdict(ContentOutcome::Warn)], true);
+    assert!(matches!(result.decision, Decision::Advisory { .. }));
+}
+
+#[test]
+fn deny_if_takes_precedence_over_require() {
+    // When both axes would deny, deny_if wins — the audit records the content
+    // deny, not the requirement miss.
+    let both = PolicyVerdict {
+        key: "policy:both".into(),
+        rule: "both".into(),
+        requires_key: String::new(),
+        block: true,
+        satisfied: false,
+        stage: PolicyStage::Enforce,
+        content: ContentOutcome::Deny,
+        require_content: ContentOutcome::Deny,
+    };
+    match decide::evaluate_policy_verdicts(&[both], true).decision {
+        Decision::Deny { origin, .. } => assert_eq!(origin, DenyOrigin::PolicyContentDenied),
+        other => panic!("expected Deny, got {other:?}"),
+    }
+}
+
+#[test]
+fn require_field_roundtrips_and_defaults_to_none() {
+    // Old payload without the field → None (back-compat).
+    let old = r#"{
+        "name":"src-only","rule":"r","reason":"why","scope":"repo",
+        "mode":"block",
+        "trigger":{},
+        "requires":{"key":"","via":[],"freshness":{"ttl_secs":900,"fingerprint":false}},
+        "stage":"enforce","severity":"normal","created_by":"dev"
+    }"#;
+    let legacy: PolicyRecord = serde_json::from_str(old).expect("old payload must deserialize");
+    assert!(legacy.require.is_none());
+
+    // New payload with a require predicate round-trips.
+    let new = r#"{
+        "name":"src-only","rule":"r","reason":"why","scope":"repo",
+        "mode":"block",
+        "trigger":{},
+        "require":{"path_glob":"src/**"},
+        "requires":{"key":"","via":[],"freshness":{"ttl_secs":900,"fingerprint":false}},
+        "stage":"enforce","severity":"normal","created_by":"dev"
+    }"#;
+    let policy: PolicyRecord = serde_json::from_str(new).expect("new payload must deserialize");
+    assert_eq!(
+        policy.require,
+        Some(ActionPredicate::PathGlob("src/**".into()))
+    );
+    let back: PolicyRecord =
+        serde_json::from_str(&serde_json::to_string(&policy).unwrap()).unwrap();
+    assert_eq!(back.require, policy.require);
 }
 
 fn args(tokens: &[&str]) -> Vec<String> {

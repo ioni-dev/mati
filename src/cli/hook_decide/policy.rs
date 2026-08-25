@@ -200,6 +200,9 @@ pub(crate) fn policy_core_verdicts(
                 // restriction. Block vs steer was already folded in by the
                 // daemon (Deny vs Warn).
                 content: verdict.content,
+                // Allowlist mirror, same H1 reasoning — carried verbatim, not
+                // gated by the introspection exemption.
+                require_content: verdict.require_content,
             })
         })
         .collect()

@@ -1466,3 +1466,139 @@ fn blocking_lifecycle_hooks_terminate_and_log_against_stalled_daemon() {
         eprintln!("[{hook} deadline] exited at {elapsed:?} with daemon response withheld");
     }
 }
+
+/// Live E2E for the `require` (allowlist) axis — the polarity mirror of
+/// `deny_if`. A `require: PathGlob("src/**")` policy denies an edit UNLESS its
+/// path is under `src/`. Inverse of the path content-deny test:
+///   1. editing a file OUTSIDE `src/**` DENIES (requirement missed);
+///   2. editing a file under `src/**` ALLOWS (requirement met, no false positive);
+///   3. the daemon records the deny.
+#[test]
+#[ignore]
+fn hook_decide_require_allowlist_denies_edit_outside_src() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    std::env::set_var("MATI_HOME", home);
+
+    std::fs::create_dir_all(repo.join("scripts")).expect("mkdir scripts");
+    std::fs::write(repo.join("scripts/seo.js"), "// generated\n").expect("write script");
+    std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
+    std::fs::write(repo.join("src/app.rs"), "fn main() {}\n").expect("write src");
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+
+    // Author + enable an allowlist policy: edits must stay under src/.
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "edits-under-src-only",
+            "--name",
+            "Edits under src only",
+            "--rule",
+            "Only edit files under src/.",
+            "--reason",
+            "Generated and config files must not be edited through the agent.",
+            "--mode",
+            "block",
+            "--trigger",
+            r#"{"tool":"path"}"#,
+            "--require-path-glob",
+            "src/**",
+            "--enable",
+        ],
+    );
+    assert_eq!(
+        r.code, 0,
+        "mati policy add failed:\n{}\n{}",
+        r.stdout, r.stderr
+    );
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable",
+    );
+
+    // 1. editing outside src/ → requirement missed → deny.
+    let deny = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-edit"],
+        r#"{"tool_input":{"file_path":"scripts/seo.js"}}"#,
+    );
+    assert_eq!(deny.code, 0, "claude hooks always exit 0");
+    let json: serde_json::Value = serde_json::from_str(deny.stdout.trim())
+        .unwrap_or_else(|e| panic!("claude-pre-edit stdout not JSON: {e}\n{}", deny.stdout));
+    assert_eq!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str()),
+        Some("deny"),
+        "editing outside src/ must deny on the require predicate.\nJSON: {}",
+        deny.stdout,
+    );
+    eprintln!("[require-allowlist] edit outside src: permissionDecision=deny -- correct");
+
+    // 2. editing under src/ → requirement met → not denied.
+    let allow = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-pre-edit"],
+        r#"{"tool_input":{"file_path":"src/app.rs"}}"#,
+    );
+    assert_eq!(allow.code, 0, "claude hooks always exit 0");
+    let not_denied = allow.stdout.trim().is_empty()
+        || serde_json::from_str::<serde_json::Value>(allow.stdout.trim())
+            .ok()
+            .and_then(|json| {
+                json.pointer("/hookSpecificOutput/permissionDecision")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            != Some("deny".to_string());
+    assert!(
+        not_denied,
+        "an edit under src/ must satisfy the requirement and not deny.\nstdout: {}",
+        allow.stdout,
+    );
+    eprintln!("[require-allowlist] edit under src: not denied -- requirement met");
+
+    // 3. the daemon recorded the requirement deny.
+    let stats = run(&bin, repo, home, &["stats", "--json"]);
+    assert_eq!(
+        stats.code, 0,
+        "mati stats failed:\n{}\n{}",
+        stats.stdout, stats.stderr
+    );
+    let json: serde_json::Value = serde_json::from_str(stats.stdout.trim())
+        .unwrap_or_else(|e| panic!("stats --json not JSON: {e}\n{}", stats.stdout));
+    let denials = json
+        .pointer("/enforcement_30d/denials")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        denials >= 1,
+        "the require deny must record a Deny event; stats: {}",
+        stats.stdout,
+    );
+    eprintln!("[require-allowlist] daemon recorded {denials} deny event(s) -- correct");
+}

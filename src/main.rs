@@ -40,6 +40,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// The `Policy` variant carries the largest arg struct; a clap command enum is
+// parsed once at startup and never held hot, so the variant-size spread is moot.
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     // ── Core workflow ────────────────────────────────────────────────────
     /// Build project memory — scan files, mine git history, detect patterns

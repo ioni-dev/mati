@@ -13,6 +13,7 @@ fn schema_introspection_exempts_matching_strict_block() {
         &[decide::PolicyVerdict {
             key: "policy:prod-query".into(),
             content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             rule: "Inspect production schema first.".into(),
             requires_key: "schema:orders".into(),
             block: false,
@@ -35,6 +36,7 @@ fn schema_introspection_exemption_produces_no_shadow_observation() {
         &[mati_core::mcp::protocol::PolicyVerdict {
             key: "policy:prod-query".into(),
             content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             stage: mati_core::store::PolicyStage::Shadow,
             mode: mati_core::store::PolicyMode::Block,
             rule: "Inspect production schema first.".into(),
@@ -66,6 +68,7 @@ fn codex_policy_without_a_producible_source_degrades_to_steering() {
         &[mati_core::mcp::protocol::PolicyVerdict {
             key: "policy:db-schema".into(),
             content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             stage: mati_core::store::PolicyStage::Enforce,
             mode: mati_core::store::PolicyMode::Block,
             rule: "Inspect the schema first.".into(),
@@ -99,6 +102,7 @@ fn content_deny_ignores_the_introspection_exemption() {
         |content: mati_core::store::ContentOutcome| mati_core::mcp::protocol::PolicyVerdict {
             key: "policy:no-write".into(),
             content,
+            require_content: mati_core::store::ContentOutcome::None,
             stage: mati_core::store::PolicyStage::Enforce,
             mode: mati_core::store::PolicyMode::Block,
             rule: "Deny writes.".into(),
@@ -159,6 +163,7 @@ fn codex_policy_naming_a_producible_source_still_blocks() {
             &[mati_core::mcp::protocol::PolicyVerdict {
                 key: "policy:db-schema".into(),
                 content: mati_core::store::ContentOutcome::None,
+                require_content: mati_core::store::ContentOutcome::None,
                 stage: mati_core::store::PolicyStage::Enforce,
                 mode: mati_core::store::PolicyMode::Block,
                 rule: "Inspect the schema first.".into(),
@@ -189,6 +194,7 @@ fn schema_introspection_exemption_preserves_satisfied_block() {
         &[decide::PolicyVerdict {
             key: "policy:prod-query".into(),
             content: mati_core::store::ContentOutcome::None,
+            require_content: mati_core::store::ContentOutcome::None,
             rule: "Inspect production schema first.".into(),
             requires_key: "schema:orders".into(),
             block: true,
@@ -1096,6 +1102,7 @@ fn codex_db_client_policy_gates_cover_fileless_file_bearing_and_introspection() 
     let deny_verdict = decide::PolicyVerdict {
         key: "policy:prod-query".into(),
         content: mati_core::store::ContentOutcome::None,
+        require_content: mati_core::store::ContentOutcome::None,
         rule: "Consult the schema first.".into(),
         requires_key: "schema:orders".into(),
         block: true,

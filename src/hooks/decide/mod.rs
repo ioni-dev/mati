@@ -133,6 +133,10 @@ pub enum DenyOrigin {
     /// Local policy `deny_if` matched the action's content. Unconditional — no
     /// consult unlocks it. `file_key` is the policy key.
     PolicyContentDenied,
+    /// Local policy `require` was NOT satisfied — the action fell outside an
+    /// allowlist or missed a required-content predicate. Unconditional, the
+    /// polarity mirror of `PolicyContentDenied`. `file_key` is the policy key.
+    PolicyRequirementUnmet,
 }
 
 impl DenyOrigin {
@@ -148,6 +152,7 @@ impl DenyOrigin {
             DenyOrigin::ConsultMandate => HookEvent::FloorConsultBlocked { key },
             DenyOrigin::Policy => HookEvent::PolicyConsultBlocked { key },
             DenyOrigin::PolicyContentDenied => HookEvent::PolicyContentBlocked { key },
+            DenyOrigin::PolicyRequirementUnmet => HookEvent::PolicyRequirementBlocked { key },
         }
     }
 }
@@ -183,6 +188,10 @@ pub enum HookEvent {
     /// Local policy `deny_if` denied a governed action on its content — daemon
     /// records a `Deny` with reason `policy_content_denied`.
     PolicyContentBlocked { key: String },
+    /// Local policy `require` denied a governed action that fell outside its
+    /// allowlist / missed a required-content predicate — daemon records a
+    /// `Deny` with reason `policy_requirement_unmet`.
+    PolicyRequirementBlocked { key: String },
     /// Local policy allowed a governed action after its receipt was present.
     PolicyConsulted { key: String },
     /// A steer policy injected guidance without changing the action decision.
@@ -215,6 +224,10 @@ pub struct PolicyVerdict {
     /// `satisfied`/`requires`, and never lowered by the schema-introspection
     /// exemption (that gate lives upstream and is not applied to this field).
     pub content: crate::store::ContentOutcome,
+    /// Outcome of the policy's `require` predicate — the allowlist mirror of
+    /// `content`. `Deny`/`Warn` means the requirement was MISSED. Evaluated
+    /// after `content`, so a `deny_if` match takes precedence.
+    pub require_content: crate::store::ContentOutcome,
 }
 
 /// Apply local policy verdicts with escalate-only semantics.
@@ -243,18 +256,32 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             continue;
         }
         if matches!(verdict.stage, crate::store::PolicyStage::Shadow) {
+            // `deny_if` (content) is observed first; if it did not fire, the
+            // `require` mirror is; only when neither predicate is present does
+            // the consult gate decide the shadow outcome.
             let would = match verdict.content {
                 crate::store::ContentOutcome::Deny => Some(ShadowOutcome::Block),
                 crate::store::ContentOutcome::Warn => Some(ShadowOutcome::Steer),
-                // A content predicate that did not match observes nothing.
-                crate::store::ContentOutcome::Inert => None,
-                crate::store::ContentOutcome::None => {
-                    if !verdict.block {
-                        Some(ShadowOutcome::Steer)
-                    } else if !verdict.satisfied {
-                        Some(ShadowOutcome::Block)
-                    } else {
-                        None
+                crate::store::ContentOutcome::Inert | crate::store::ContentOutcome::None => {
+                    match verdict.require_content {
+                        crate::store::ContentOutcome::Deny => Some(ShadowOutcome::Block),
+                        crate::store::ContentOutcome::Warn => Some(ShadowOutcome::Steer),
+                        // A require predicate that matched observes nothing.
+                        crate::store::ContentOutcome::Inert => None,
+                        crate::store::ContentOutcome::None => {
+                            // A deny_if that was present but inert observes
+                            // nothing; only a policy with neither content
+                            // predicate falls to the consult gate.
+                            if !matches!(verdict.content, crate::store::ContentOutcome::None) {
+                                None
+                            } else if !verdict.block {
+                                Some(ShadowOutcome::Steer)
+                            } else if !verdict.satisfied {
+                                Some(ShadowOutcome::Block)
+                            } else {
+                                None
+                            }
+                        }
                     }
                 }
             };
@@ -267,10 +294,12 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
             }
             continue;
         }
-        // The content predicate governs first — independent of
-        // `satisfied`/`requires`, never lowered by the schema-introspection
-        // exemption (upstream). A content policy speaks ONLY through its
-        // predicate: on a non-match (`Inert`) it neither denies nor steers.
+        // The content axis governs first — independent of `satisfied`/`requires`,
+        // never lowered by the schema-introspection exemption (upstream). A
+        // content policy speaks ONLY through its predicate: on a non-match
+        // (`Inert`) it neither denies nor steers. `deny_if` (content) is checked
+        // before `require` (require_content); a `deny_if` match takes precedence.
+        let deny_if_present = !matches!(verdict.content, crate::store::ContentOutcome::None);
         match verdict.content {
             crate::store::ContentOutcome::Deny if strict => {
                 denied.get_or_insert_with(|| PolicyDeny {
@@ -292,8 +321,41 @@ pub fn evaluate_policy_verdicts(verdicts: &[PolicyVerdict], strict: bool) -> Enf
                 });
                 continue;
             }
+            // deny_if absent or inert — fall through to the require mirror.
+            crate::store::ContentOutcome::Inert | crate::store::ContentOutcome::None => {}
+        }
+        // `require` denies UNLESS its predicate matched (allowlist mirror): a
+        // `Deny`/`Warn` here means the requirement was MISSED.
+        match verdict.require_content {
+            crate::store::ContentOutcome::Deny if strict => {
+                denied.get_or_insert_with(|| PolicyDeny {
+                    key: verdict.key.clone(),
+                    reason: format!(
+                        "mati: policy {} denied this action: it does not satisfy a required rule.",
+                        verdict.key
+                    ),
+                    origin: DenyOrigin::PolicyRequirementUnmet,
+                });
+                continue;
+            }
+            crate::store::ContentOutcome::Deny | crate::store::ContentOutcome::Warn => {
+                context.push(verdict.rule.clone());
+                events.push(HookEvent::PolicySteered {
+                    key: verdict.key.clone(),
+                });
+                continue;
+            }
+            // Requirement satisfied — the policy spoke and is content with it.
             crate::store::ContentOutcome::Inert => continue,
-            crate::store::ContentOutcome::None => {}
+            crate::store::ContentOutcome::None => {
+                // No require predicate. If deny_if was present but inert, the
+                // content axis already spoke (nothing) — do not fall to the
+                // consult gate. Only a policy with NEITHER content predicate
+                // reaches consult.
+                if deny_if_present {
+                    continue;
+                }
+            }
         }
         if verdict.block && !verdict.satisfied && strict {
             denied.get_or_insert_with(|| PolicyDeny {

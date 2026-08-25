@@ -129,6 +129,11 @@ pub enum ErrorCode {
 /// There is no public `put` or `delete` command. All mutations are semantic.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
+// `PolicyWrite` carries a full `PolicyRecord`, the largest payload; every other
+// variant is far smaller. A `Command` is constructed, serialized, and sent over
+// the Unix socket one at a time — never held hot on the stack or in an array —
+// so the variant-size spread does not matter here.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     // ── A. Pure reads ───────────────────────────────────────────────────
     /// Health check. No arguments.
