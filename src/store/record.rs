@@ -986,6 +986,17 @@ pub enum ReceiptSource {
     DbIntrospection,
     HookContext,
     MemGet,
+    /// A watched command was observed running (Bash PreToolUse). Attests the
+    /// command was ATTEMPTED, not that it succeeded — the mint fires before the
+    /// exit status is known. Portable across Claude and Codex for that reason.
+    CommandObserved,
+    /// A source string this binary does not recognize — a receipt or policy
+    /// written by a newer mati. Never accepted by any `via` check and never in
+    /// `CODEX_PRODUCIBLE_SOURCES`, so an unknown source reads as "no receipt":
+    /// the consult gate denies, which fails safe for a block policy. Never
+    /// constructed locally, so it is never serialized back out.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Receipt sources a Codex session can actually produce.
@@ -1000,9 +1011,14 @@ pub enum ReceiptSource {
 /// Both the hook-time degrade and the authoring-time warning read this, so the
 /// two can never disagree about what Codex can attest to. Keep it in step with
 /// the mint sites: `HookContext` belongs here because `fire_events` runs on the
-/// Codex pre-bash and apply-patch paths.
-pub const CODEX_PRODUCIBLE_SOURCES: &[ReceiptSource] =
-    &[ReceiptSource::MemGet, ReceiptSource::HookContext];
+/// Codex pre-bash and apply-patch paths, and `CommandObserved` belongs here
+/// because its mint fires on the same Codex pre-bash path, BEFORE the exit
+/// status Codex omits — "attempted" needs no exit status.
+pub const CODEX_PRODUCIBLE_SOURCES: &[ReceiptSource] = &[
+    ReceiptSource::MemGet,
+    ReceiptSource::HookContext,
+    ReceiptSource::CommandObserved,
+];
 
 /// Default consultation freshness. Mirrors the `mati policy add --requires`
 /// clap default (`src/cli/policy.rs`); a `policy_requires_default_matches_cli`
@@ -1048,6 +1064,22 @@ pub struct PolicyRequires {
     pub freshness: PolicyFreshness,
 }
 
+/// Binds an observed command to a receipt it mints. When a Bash PreToolUse
+/// action's joined argv matches `on_command_glob`, mati writes
+/// `session:consulted:<key>` with source [`ReceiptSource::CommandObserved`], so
+/// a separate policy whose `requires.key` is that key is satisfied. The bridge
+/// for workflow ordering ("run tests before you commit").
+///
+/// Attests ATTEMPTED, not passed: the mint fires before the command's exit
+/// status is known. Author `on_command_glob` for a FULL-suite run
+/// (`cargo nextest run`, not `cargo test one::case`) — a subset-run glob mints
+/// on a single-test invocation and is the dominant false-satisfy source.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptEmitter {
+    pub on_command_glob: String,
+    pub key: String,
+}
+
 /// A developer-authored local policy stored under `policy:<slug>`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PolicyRecord {
@@ -1068,6 +1100,13 @@ pub struct PolicyRecord {
     pub require: Option<ActionPredicate>,
     #[serde(default = "default_policy_requires")]
     pub requires: PolicyRequires,
+    /// When set, an observed command matching `on_command_glob` mints the named
+    /// [`ReceiptSource::CommandObserved`] receipt. `None` for every policy that
+    /// does not emit one. Orthogonal to this policy's own `requires`/`trigger`:
+    /// a policy typically EITHER mints (the test-runner) OR requires (the
+    /// commit gate), rarely both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mints: Option<ReceiptEmitter>,
     pub stage: PolicyStage,
     pub severity: Priority,
     pub created_by: String,
@@ -1420,6 +1459,7 @@ mod tests {
                     fingerprint: false,
                 },
             },
+            mints: None,
             stage: PolicyStage::Enforce,
             severity: Priority::Critical,
             created_by: "developer".into(),
@@ -1474,6 +1514,7 @@ mod tests {
                 command_glob: None,
             },
             requires: default_policy_requires(),
+            mints: None,
             stage: PolicyStage::Off,
             severity: Priority::High,
             created_by: "developer".into(),
@@ -1484,6 +1525,31 @@ mod tests {
         assert_eq!(parsed.requires, default_policy_requires());
         assert_eq!(parsed.requires.freshness.ttl_secs, DEFAULT_POLICY_TTL_SECS);
         assert!(parsed.requires.key.is_empty());
+    }
+
+    #[test]
+    fn unknown_receipt_source_deserializes_to_unknown() {
+        // Forward-compat: a source string from a newer mati degrades to Unknown
+        // instead of failing the whole record, and Unknown is never accepted.
+        assert_eq!(
+            serde_json::from_str::<ReceiptSource>("\"future_source\"").unwrap(),
+            ReceiptSource::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<ReceiptSource>("\"command_observed\"").unwrap(),
+            ReceiptSource::CommandObserved
+        );
+        assert!(!CODEX_PRODUCIBLE_SOURCES.contains(&ReceiptSource::Unknown));
+        assert!(CODEX_PRODUCIBLE_SOURCES.contains(&ReceiptSource::CommandObserved));
+    }
+
+    #[test]
+    fn policy_mints_roundtrips_and_defaults_none() {
+        let json = r#"{"on_command_glob":"cargo nextest run*","key":"tests-ran"}"#;
+        let emitter: ReceiptEmitter = serde_json::from_str(json).unwrap();
+        assert_eq!(emitter.key, "tests-ran");
+        assert_eq!(emitter.on_command_glob, "cargo nextest run*");
+        assert_serde_roundtrip(&emitter);
     }
 
     #[test]

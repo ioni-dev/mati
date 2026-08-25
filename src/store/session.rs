@@ -1242,6 +1242,7 @@ mod tests {
             ReceiptSource::MemGet,
             ReceiptSource::DbIntrospection,
             ReceiptSource::HookContext,
+            ReceiptSource::CommandObserved,
         ] {
             let staged =
                 consultation_receipt_staged_with_fingerprint(key, None, None, Some(source))
@@ -1260,7 +1261,9 @@ mod tests {
             let other = match source {
                 ReceiptSource::MemGet => ReceiptSource::DbIntrospection,
                 ReceiptSource::DbIntrospection => ReceiptSource::HookContext,
-                ReceiptSource::HookContext => ReceiptSource::MemGet,
+                ReceiptSource::HookContext => ReceiptSource::CommandObserved,
+                ReceiptSource::CommandObserved => ReceiptSource::MemGet,
+                ReceiptSource::Unknown => ReceiptSource::MemGet,
             };
             assert!(
                 !check_consulted_recent_with_sources(&store, key, 900, None, &[other])

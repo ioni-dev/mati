@@ -1602,3 +1602,348 @@ fn hook_decide_require_allowlist_denies_edit_outside_src() {
     );
     eprintln!("[require-allowlist] daemon recorded {denials} deny event(s) -- correct");
 }
+
+/// Live E2E for Axis B — action-as-receipt (`ReceiptSource::CommandObserved`).
+///
+/// Proves the workflow-ordering bridge end to end against a real daemon: an
+/// observed test command mints a receipt that satisfies a separate commit gate.
+///   1. `git commit` with no prior test run DENIES (gate unsatisfied);
+///   2. `cargo nextest run` ALLOWS and MINTS the `tests-ran` receipt (the
+///      emitter policy is `steer`, so it never denies the test command itself);
+///   3. `git commit` now ALLOWS — the minted CommandObserved receipt satisfies
+///      the gate.
+#[test]
+#[ignore]
+fn hook_decide_command_observed_receipt_satisfies_commit_gate() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    std::env::set_var("MATI_HOME", home);
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+
+    // ── commit gate: block `git commit` until a `tests-ran` receipt exists,
+    //    accepting only a CommandObserved source ─────────────────────────────
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "tests-before-commit",
+            "--name",
+            "Run tests before commit",
+            "--rule",
+            "Run the suite before committing.",
+            "--reason",
+            "A commit on red wastes a CI cycle.",
+            "--mode",
+            "block",
+            "--trigger",
+            r#"{"command_glob":"git commit*"}"#,
+            "--requires",
+            r#"{"key":"tests-ran","via":["command_observed"],"freshness":{"ttl_secs":900}}"#,
+            "--enable",
+        ],
+    );
+    assert_eq!(
+        r.code, 0,
+        "commit-gate add failed:\n{}\n{}",
+        r.stdout, r.stderr
+    );
+
+    // ── test-runner emitter: mint `tests-ran` when `cargo nextest run` is
+    //    observed. `steer` so it never denies the test command itself ────────
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "tests-ran-emitter",
+            "--name",
+            "Test run mints tests-ran",
+            "--rule",
+            "Observing a full-suite run attests tests were attempted.",
+            "--reason",
+            "Bridges the test run to the commit gate.",
+            "--mode",
+            "steer",
+            "--trigger",
+            r#"{"command_glob":"cargo nextest run*"}"#,
+            "--mints-command-glob",
+            "cargo nextest run*",
+            "--mints-key",
+            "tests-ran",
+            "--enable",
+        ],
+    );
+    assert_eq!(r.code, 0, "emitter add failed:\n{}\n{}", r.stdout, r.stderr);
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable",
+    );
+
+    // Empty stdout is an ALLOW: claude-pre-bash defers a satisfied action with
+    // no output; only a deny emits a `permissionDecision` JSON object.
+    let decision = |stdin: &str| -> Option<String> {
+        let r = run_with_stdin(&bin, repo, home, &["hook-decide", "claude-pre-bash"], stdin);
+        assert_eq!(
+            r.code, 0,
+            "claude hooks always exit 0; stderr: {}",
+            r.stderr
+        );
+        let out = r.stdout.trim();
+        if out.is_empty() {
+            return None;
+        }
+        let json: serde_json::Value = serde_json::from_str(out)
+            .unwrap_or_else(|e| panic!("stdout not JSON: {e}\n{}", r.stdout));
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+
+    // 1. commit BEFORE any test run → denied (gate unsatisfied).
+    assert_eq!(
+        decision(r#"{"tool_input":{"command":"git commit -m wip"}}"#).as_deref(),
+        Some("deny"),
+        "commit before a test run must be denied",
+    );
+    eprintln!("[command-observed] commit before test: deny -- correct");
+
+    // 2. the test run mints the receipt and is itself allowed (emitter is steer).
+    assert_ne!(
+        decision(r#"{"tool_input":{"command":"cargo nextest run --lib"}}"#).as_deref(),
+        Some("deny"),
+        "the test run must not be denied by the steer emitter",
+    );
+    eprintln!("[command-observed] test run: not denied, receipt minted -- correct");
+
+    // 3. commit AFTER the test run → allowed (CommandObserved receipt satisfies).
+    assert_ne!(
+        decision(r#"{"tool_input":{"command":"git commit -m wip"}}"#).as_deref(),
+        Some("deny"),
+        "commit after a test run must be allowed by the minted receipt",
+    );
+    eprintln!("[command-observed] commit after test: allowed by receipt -- correct");
+}
+
+/// Author the Axis B policy pair (an `Enforce` commit gate on `tests-ran` + an
+/// emitter) and start a daemon. `emitter_stage` is `--enable` or `--shadow`.
+fn setup_axis_b_daemon(
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    emitter_glob: &str,
+    emitter_stage: &str,
+) -> ChildGuard {
+    let r = run(bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "init failed:\n{}\n{}", r.stdout, r.stderr);
+    let r = run(
+        bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "tests-before-commit",
+            "--name",
+            "Run tests before commit",
+            "--rule",
+            "Run the suite before committing.",
+            "--reason",
+            "A commit on red wastes a CI cycle.",
+            "--mode",
+            "block",
+            "--trigger",
+            r#"{"command_glob":"git commit*"}"#,
+            "--requires",
+            r#"{"key":"tests-ran","via":["command_observed"],"freshness":{"ttl_secs":900}}"#,
+            "--enable",
+        ],
+    );
+    assert_eq!(r.code, 0, "gate add failed:\n{}\n{}", r.stdout, r.stderr);
+    let trigger = format!(r#"{{"command_glob":"{emitter_glob}"}}"#);
+    let r = run(
+        bin,
+        repo,
+        home,
+        &[
+            "policy",
+            "add",
+            "tests-ran-emitter",
+            "--name",
+            "Test run mints tests-ran",
+            "--rule",
+            "Observing a full-suite run attests tests were attempted.",
+            "--reason",
+            "Bridges the test run to the commit gate.",
+            "--mode",
+            "steer",
+            "--trigger",
+            &trigger,
+            "--mints-command-glob",
+            emitter_glob,
+            "--mints-key",
+            "tests-ran",
+            emitter_stage,
+        ],
+    );
+    assert_eq!(r.code, 0, "emitter add failed:\n{}\n{}", r.stdout, r.stderr);
+    let daemon = Command::new(bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable",
+    );
+    guard
+}
+
+/// `claude-pre-bash` decision for a bash command: `Some("deny")` on a deny,
+/// `None` on an allow (a satisfied action defers with empty stdout).
+fn claude_decision(bin: &Path, repo: &Path, home: &Path, cmd: &str) -> Option<String> {
+    let stdin = format!(r#"{{"tool_input":{{"command":"{cmd}"}}}}"#);
+    let r = run_with_stdin(bin, repo, home, &["hook-decide", "claude-pre-bash"], &stdin);
+    assert_eq!(
+        r.code, 0,
+        "claude hooks always exit 0; stderr: {}",
+        r.stderr
+    );
+    let out = r.stdout.trim();
+    if out.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(out)
+        .ok()
+        .and_then(|j| {
+            j.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// Axis B is portable to Codex: the mint fires on `codex-pre-bash`, BEFORE the
+/// exit status Codex omits, so `CommandObserved` satisfies a commit gate there
+/// exactly as on Claude. codex-pre-bash: deny = exit 2, allow = exit 0.
+#[test]
+#[ignore]
+fn hook_decide_command_observed_portable_on_codex() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+    std::env::set_var("MATI_HOME", home);
+    let _guard = setup_axis_b_daemon(&bin, repo, home, "cargo nextest run*", "--enable");
+
+    let codex = |cmd: &str| -> i32 {
+        let stdin = format!(r#"{{"tool_input":{{"command":"{cmd}"}}}}"#);
+        run_with_stdin(&bin, repo, home, &["hook-decide", "codex-pre-bash"], &stdin).code
+    };
+    assert_eq!(
+        codex("git commit -m wip"),
+        2,
+        "commit before test must DENY on codex"
+    );
+    assert_eq!(
+        codex("cargo nextest run --lib"),
+        0,
+        "test run allowed + mints on codex"
+    );
+    assert_eq!(
+        codex("git commit -m wip"),
+        0,
+        "commit after test allowed on codex"
+    );
+    eprintln!("[command-observed] codex portability -- correct");
+}
+
+/// A `shadow` emitter observes without writing state, so it must NEVER satisfy
+/// an `Enforce` gate. Running the test command mints nothing; the commit stays
+/// denied. Guards against shadow leaking into enforcement.
+#[test]
+#[ignore]
+fn hook_decide_shadow_emitter_does_not_satisfy_gate() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+    std::env::set_var("MATI_HOME", home);
+    let _guard = setup_axis_b_daemon(&bin, repo, home, "cargo nextest run*", "--shadow");
+
+    assert_ne!(
+        claude_decision(&bin, repo, home, "cargo nextest run --lib").as_deref(),
+        Some("deny"),
+        "the steer emitter never denies the test command",
+    );
+    assert_eq!(
+        claude_decision(&bin, repo, home, "git commit -m wip").as_deref(),
+        Some("deny"),
+        "a shadow emitter must not mint, so the commit stays denied",
+    );
+    eprintln!("[command-observed] shadow emitter does not satisfy gate -- correct");
+}
+
+/// The mint is bounded by `on_command_glob`: a different test runner that does
+/// not match the glob mints nothing, so the commit stays denied — while the
+/// matching runner still mints. Proves the glob boundary, not just presence.
+#[test]
+#[ignore]
+fn hook_decide_command_observed_glob_boundary() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+    std::env::set_var("MATI_HOME", home);
+    let _guard = setup_axis_b_daemon(&bin, repo, home, "cargo nextest run*", "--enable");
+
+    // A non-matching runner is itself ungated (no trigger matches) but mints nothing.
+    assert_ne!(
+        claude_decision(&bin, repo, home, "cargo test --lib").as_deref(),
+        Some("deny"),
+        "cargo test is not gated",
+    );
+    assert_eq!(
+        claude_decision(&bin, repo, home, "git commit -m wip").as_deref(),
+        Some("deny"),
+        "cargo test must not mint the nextest-glob receipt; commit stays denied",
+    );
+    // The matching runner mints; the commit then passes.
+    assert_ne!(
+        claude_decision(&bin, repo, home, "cargo nextest run --lib").as_deref(),
+        Some("deny"),
+        "the matching runner is not denied",
+    );
+    assert_ne!(
+        claude_decision(&bin, repo, home, "git commit -m wip").as_deref(),
+        Some("deny"),
+        "commit allowed once the matching runner minted",
+    );
+    eprintln!("[command-observed] glob boundary -- correct");
+}

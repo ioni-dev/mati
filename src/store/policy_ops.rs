@@ -174,6 +174,12 @@ pub fn author_warnings(policy: &PolicyRecord, has_backing_record: bool) -> Vec<S
             "warning: block policy has an empty requires.key; nothing could ever unlock it.".into(),
         );
     }
+    if let Some(emitter) = &policy.mints {
+        warnings.push(format!(
+            "note: mints receipt '{}' when a command matches '{}'. It attests the command was ATTEMPTED, not that it passed — the mint fires before the exit status is known. Author the glob for a FULL-suite run; a subset-run glob mints on a single-test invocation.",
+            emitter.key, emitter.on_command_glob
+        ));
+    }
     warnings
 }
 
@@ -381,6 +387,7 @@ mod tests {
         PolicyRecord {
             deny_if: None,
             require: None,
+            mints: None,
             name: "Query safety".into(),
             rule: "Consult the schema first.".into(),
             reason: "Schemas drift because production changes independently.".into(),

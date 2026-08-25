@@ -147,6 +147,16 @@ struct AddArgs {
     /// `src/`). Lexical path match; sees the requested path, not file contents.
     #[arg(long, conflicts_with = "require_command_glob")]
     require_path_glob: Option<String>,
+    /// Mint a CommandObserved receipt named `--mints-key` when an observed
+    /// command's argv matches this glob (workflow ordering, e.g. a test runner
+    /// minting `tests-ran`). Attests ATTEMPTED, not passed — prefer a full-suite
+    /// glob. Requires `--mints-key`.
+    #[arg(long, requires = "mints_key")]
+    mints_command_glob: Option<String>,
+    /// Receipt key the `--mints-command-glob` emitter writes. A separate policy
+    /// sets `requires.key` to this to gate on it.
+    #[arg(long)]
+    mints_key: Option<String>,
     /// Enable immediately (otherwise the new policy is inert).
     #[arg(long)]
     enable: bool,
@@ -294,6 +304,14 @@ async fn add(args: AddArgs) -> Result<()> {
                 args.require_path_glob
                     .map(mati_core::store::ActionPredicate::PathGlob)
             }),
+        mints: match (args.mints_command_glob, args.mints_key) {
+            (Some(on_command_glob), Some(key)) => Some(mati_core::store::ReceiptEmitter {
+                on_command_glob,
+                key,
+            }),
+            (None, None) => None,
+            _ => anyhow::bail!("--mints-command-glob and --mints-key must be given together"),
+        },
         requires: serde_json::from_str::<PolicyRequires>(&args.requires)
             .context("parsing --requires JSON")?,
         stage: if args.enable {
@@ -789,6 +807,7 @@ async fn test_policies(args: TestArgs) -> Result<()> {
     if let Some(trigger_json) = args.trigger {
         let trigger = parse_trigger(&trigger_json)?;
         let policy = PolicyRecord {
+            mints: None,
             name: "ad-hoc".into(),
             rule: "ad-hoc trigger".into(),
             reason: "ad-hoc trigger evaluation".into(),
@@ -1022,6 +1041,7 @@ mod tests {
         let policy = PolicyRecord {
             deny_if: None,
             require: None,
+            mints: None,
             name: "Production query safety".into(),
             rule: "Consult the schema first.".into(),
             reason: "Production schemas drift because deployments change.".into(),

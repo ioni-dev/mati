@@ -280,6 +280,7 @@ mod tests {
         let policy = PolicyRecord {
             deny_if: None,
             require: None,
+            mints: None,
             name: "n".into(),
             rule: "r".into(),
             reason: "why".into(),

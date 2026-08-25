@@ -4,6 +4,7 @@ fn sample_policy() -> crate::store::PolicyRecord {
     crate::store::PolicyRecord {
         deny_if: None,
         require: None,
+        mints: None,
         name: "Mode collision test".into(),
         rule: "Consult the schema first.".into(),
         reason: "Schemas drift because production changes independently.".into(),

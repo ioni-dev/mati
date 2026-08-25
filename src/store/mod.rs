@@ -30,7 +30,8 @@ pub use record::{
     ActionPredicate, AgentKind, Category, ConfidenceScore, ContentOutcome, ContextPacket, DeviceId,
     FileRecord, GapType, GotchaRecord, KnowledgeGap, OnboardingScore, PolicyFreshness, PolicyMode,
     PolicyRecord, PolicyRequires, PolicyStage, PolicyTrigger, Priority, QualityScore,
-    QualitySignal, QualityTier, ReceiptSource, Record, RecordLifecycle, RecordSource,
-    RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore, StalenessSignal,
-    StalenessTier, TodoComment, TodoKind, TombstoneReason, CODEX_PRODUCIBLE_SOURCES,
+    QualitySignal, QualityTier, ReceiptEmitter, ReceiptSource, Record, RecordLifecycle,
+    RecordSource, RecordVersion, StaleReviewEntry, StaleReviewPayload, StalenessScore,
+    StalenessSignal, StalenessTier, TodoComment, TodoKind, TombstoneReason,
+    CODEX_PRODUCIBLE_SOURCES,
 };

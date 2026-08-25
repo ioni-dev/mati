@@ -94,6 +94,7 @@ pub async fn run(args: GuardArgs) -> Result<()> {
                 fingerprint: false,
             },
         },
+        mints: None,
         stage,
         severity: Priority::High,
         created_by: "developer".into(),

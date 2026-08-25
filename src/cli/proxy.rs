@@ -1518,6 +1518,7 @@ mod tests {
         let policy = mati_core::store::PolicyRecord {
             deny_if: None,
             require: None,
+            mints: None,
             name: "Production query".into(),
             rule: "Consult first.".into(),
             reason: "Production changes because deployments happen.".into(),
@@ -1594,6 +1595,7 @@ mod tests {
         let policy = mati_core::store::PolicyRecord {
             deny_if: None,
             require: None,
+            mints: None,
             name: "Fingerprint query".into(),
             rule: "Consult current schema.".into(),
             reason: "Schemas drift because deployments change.".into(),

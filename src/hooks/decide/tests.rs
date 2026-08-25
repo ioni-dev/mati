@@ -1119,6 +1119,7 @@ fn path_mutating_multi_arg_matches_target_path_glob() {
     let policy = PolicyRecord {
         deny_if: None,
         require: None,
+        mints: None,
         name: "protect migrations".into(),
         rule: "Consult before deleting migrations.".into(),
         reason: "Migrations are irreversible because they alter production schema.".into(),
