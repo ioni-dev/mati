@@ -1919,3 +1919,59 @@ fn watched_rel_path_falls_back_for_a_missing_leaf() {
         Some("src/gone.rs")
     );
 }
+
+// ── Tier 1 session lockdown ─────────────────────────────────────────────────
+
+#[test]
+fn a_lockdown_deny_is_recorded_as_its_own_event() {
+    use mati_core::mcp::protocol as p;
+    let cmd = session_command(
+        &HookEvent::LockdownBlocked {
+            key: "file:keys.py".into(),
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("a lockdown deny must be recorded");
+    match cmd {
+        p::Command::SessionLog(input) => {
+            assert_eq!(input.event, p::SessionEvent::LockdownBlocked);
+            assert_eq!(input.key, "file:keys.py");
+        }
+        other => panic!("expected SessionLog, got {other:?}"),
+    }
+}
+
+#[test]
+fn codex_records_a_lockdown_deny_as_a_codex_block() {
+    // Attribution outranks reason-code granularity: SessionEvent is the only
+    // thing that tells the audit chain which platform blocked, and a deny
+    // attributed to the wrong agent is a falsified chain.
+    let events = vec![HookEvent::LockdownBlocked {
+        key: "file:keys.py".into(),
+    }];
+    let decision = decide::lockdown_result("file:keys.py").decision;
+    let result = platform_events(HookVariant::CodexPreBash, &decision, events);
+    assert!(matches!(
+        &result[..],
+        [HookEvent::CodexShellBlocked { key }] if key == "file:keys.py"
+    ));
+}
+
+#[test]
+fn the_bash_gate_denies_under_lockdown_and_says_how_to_lift_it() {
+    let decision = decide::lockdown_result("file:keys.py").decision;
+    let (stdout, _stderr, exit_code) =
+        format_decision(HookVariant::ClaudePreBash, &decision, "file:keys.py");
+    assert_eq!(exit_code, 0);
+    assert!(stdout.contains(r#""permissionDecision":"deny""#));
+    assert!(stdout.contains(r#"mem_get(\"file:keys.py\")"#));
+
+    // Codex denies on the exit code, and needs the same instruction on stderr.
+    let (_stdout, stderr, exit_code) =
+        format_decision(HookVariant::CodexPreBash, &decision, "file:keys.py");
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("mem_get(\"file:keys.py\")"));
+}

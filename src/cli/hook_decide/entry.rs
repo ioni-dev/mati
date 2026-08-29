@@ -195,6 +195,17 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,
         None => {
+            // Tier 1: a command naming no governed path is exactly the shape a
+            // computed filename takes (`open('ke' + 'ys.py')`). Nothing here
+            // is classified — the gate asks whether the session owes a
+            // receipt, which no construction can hide.
+            if matches!(
+                args.variant,
+                HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+            ) && run_bash_lockdown(&input, args.variant, agent_id).await
+            {
+                return Ok(());
+            }
             if let Some(action) = bash_action
                 .as_ref()
                 .filter(|action| action.tool == "db_client" || action.tool == "unknown")
@@ -563,6 +574,31 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             {
                 merge_policy_result(&mut adapter, args.variant, policy_decision, policy_events);
             }
+        }
+    }
+
+    // Tier 1 session lockdown, after every file-and-policy gate had its say:
+    // an outstanding receipt denies the rest of the session's shell, including
+    // commands whose own target is ungoverned. Escalate-only, and skipped when
+    // something already denied.
+    if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) && !matches!(adapter.decision, Decision::Deny { .. })
+    {
+        if let Some(owed) = lockdown_owed_key(&mati_root, actor_scope.as_deref()).await {
+            let result = decide::lockdown_result(&owed);
+            let events = platform_events(args.variant, &result.decision, result.events);
+            let (stdout, stderr, exit_code) =
+                format_decision(args.variant, &result.decision, &owed);
+            adapter = AdapterResult {
+                stdout,
+                stderr,
+                exit_code,
+                events,
+                basis_hash: None,
+                decision: result.decision,
+            };
         }
     }
 

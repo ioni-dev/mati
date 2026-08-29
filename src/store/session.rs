@@ -730,6 +730,86 @@ pub async fn session_flush(store: &Store) -> Result<()> {
     Ok(())
 }
 
+// ── Tier 1 session lockdown ───────────────────────────────────────────────────
+
+/// Prefix for the markers naming a file an actor was denied and has not
+/// consulted since.
+pub const OWED_PREFIX: &str = "session:owed:";
+
+/// How long an unconsulted deny keeps locking the session down. The same
+/// window as the shell gate's receipt TTL, so a debt lasts exactly as long as
+/// the receipt that would have settled it.
+pub const OWED_RECEIPT_TTL_SECS: u64 = CONSULTED_RECENT_TTL_SECS;
+
+/// `session:owed:<actor>|<key>`. `|` separates scope from key because an actor
+/// scope is a worktree tag optionally `:`-joined to an agent id: a `:`
+/// separator would make the main thread's prefix scan match its subagents'
+/// markers too.
+fn owed_key(key: &str, actor: Option<&str>) -> String {
+    format!("{}{key}", owed_scan_prefix(actor))
+}
+
+fn owed_scan_prefix(actor: Option<&str>) -> String {
+    format!("{OWED_PREFIX}{}|", actor.unwrap_or("-"))
+}
+
+/// Record that `actor` was denied `key` and owes its consultation receipt.
+///
+/// Expired and already-settled markers for the same actor are dropped in the
+/// same pass. That is what bounds the scan [`outstanding_owed`] runs on every
+/// Bash command.
+pub async fn record_owed_receipt(store: &Store, key: &str, actor: Option<&str>) -> Result<()> {
+    let prefix = owed_scan_prefix(actor);
+    let now = now_secs();
+    for record in store.scan_prefix(&prefix).await? {
+        let Some(owed) = record.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if owed == key {
+            continue;
+        }
+        if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS
+            || check_consulted(store, owed, actor).await?
+        {
+            store.delete(&record.key).await?;
+        }
+    }
+    let marker_key = owed_key(key, actor);
+    // Create-once: the debt window runs from the first deny. Refreshing it on
+    // every repeat deny would let an agent that keeps retrying hold its own
+    // lockdown open indefinitely.
+    if store.get(&marker_key).await?.is_some() {
+        return Ok(());
+    }
+    let record = session_record(&marker_key, String::new());
+    store.put(&marker_key, &record).await
+}
+
+/// The most recently denied key this actor still has not consulted.
+///
+/// `None` when nothing is owed: no marker, all expired, or every one settled by
+/// a receipt. This is the decidable question the lockdown asks instead of "does
+/// this command touch file X" — a computed filename is invisible to a
+/// classifier and irrelevant here.
+pub async fn outstanding_owed(store: &Store, actor: Option<&str>) -> Result<Option<String>> {
+    let prefix = owed_scan_prefix(actor);
+    let now = now_secs();
+    let mut markers = store.scan_prefix(&prefix).await?;
+    markers.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+    for record in markers {
+        if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS {
+            continue;
+        }
+        let Some(owed) = record.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !check_consulted(store, owed, actor).await? {
+            return Ok(Some(owed.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Delete all consult receipts (`session:consulted:*`) from the store.
 ///
 /// Shared by `session_clear_consults` (PostCompact) and the end-of-session
@@ -738,6 +818,12 @@ pub async fn session_flush(store: &Store) -> Result<()> {
 async fn delete_all_receipts(store: &Store) -> Result<()> {
     let consulted_keys = store.scan_keys("session:consulted:").await?;
     for k in &consulted_keys {
+        store.delete(k).await?;
+    }
+    // Lockdown markers go with them: clearing receipts re-arms every gate, so
+    // markers left behind would lock the next window down before it touched
+    // anything.
+    for k in &store.scan_keys(OWED_PREFIX).await? {
         store.delete(k).await?;
     }
     Ok(())

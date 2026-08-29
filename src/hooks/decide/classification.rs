@@ -19,6 +19,29 @@ const DB_CLIENT_LIKE: &[&str] = &[
 ];
 const PATH_MUTATING: &[&str] = &["rm", "mv", "rmdir", "shred"];
 
+/// Git subcommands that put file content in front of the agent. `status`,
+/// bare `log`, and `add` disclose none and stay unclassified. Measured
+/// 2026-08-28: `git show` was 41% of all off-gate content reads.
+const VCS_CONTENT_SUBCOMMANDS: &[&str] = &["show", "cat-file", "diff", "blame", "grep"];
+
+/// Git global flags that consume the following token, so it is not the
+/// subcommand: `git -C dir show …`, `git -c k=v show …`.
+pub(super) const GIT_VALUE_FLAGS: &[&str] =
+    &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+
+/// Commands whose SOURCE arguments are reads. Measured 2026-08-29 (E1): an
+/// agent copied a gated file to /tmp and read the copy, describing it as "to
+/// bypass path-based hook matching". `cp` was already named in the design as a
+/// WRITE onto a governed path; the source side is the half that leaked.
+const COPY_LIKE: &[&str] = &["cp", "install", "ln", "rsync", "dd"];
+
+/// Interpreters that read a file named by a string literal in their source
+/// rather than by an argument. Measured 2026-08-28: 47% of off-gate content
+/// accesses went through `python3`.
+const INTERPRETER_WORDS: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "php",
+];
+
 pub(super) const ACTION_TOOL_DB_CLIENT: &str = "db_client";
 pub(super) const ACTION_TOOL_FILE_READ: &str = "file_read";
 pub(super) const ACTION_TOOL_PATH: &str = "path";
@@ -205,8 +228,44 @@ pub fn effective_command_for_fuzzing(cmd: &str) -> String {
     effective_command(cmd)
 }
 
+/// Does this `git` invocation run a content-disclosing subcommand? Walks the
+/// global flags to find the subcommand word. `log` counts only with a patch
+/// flag, since bare `git log` shows messages, not content.
+fn is_content_disclosing_git(eff: &str) -> bool {
+    let tokens = shell_tokens(eff);
+    let mut i = 1;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if GIT_VALUE_FLAGS.contains(&tok) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if tok == "log" {
+            return tokens[i + 1..]
+                .iter()
+                .any(|t| t == "-p" || t == "-u" || t == "--patch" || t.starts_with("-U"));
+        }
+        return VCS_CONTENT_SUBCOMMANDS.contains(&tok);
+    }
+    false
+}
+
 /// Classify a bash command string. Returns `None` for non-file-read commands.
+///
+/// Every shell segment is classified, and the first governed one wins: a gated
+/// read hidden behind `echo hi &&` is caught (measured 2026-08-29). Escalate-
+/// only — a command with several governed segments reports the first class,
+/// and [`extract_file_paths`] then gathers paths from every segment of it.
 pub fn classify_command(cmd: &str) -> Option<CommandClass> {
+    shell_segments(cmd).into_iter().find_map(classify_segment)
+}
+
+/// Classify ONE shell segment.
+fn classify_segment(cmd: &str) -> Option<CommandClass> {
     let eff = effective_command(cmd);
     let trimmed = eff.as_str();
     for &word in CAT_LIKE {
@@ -227,6 +286,19 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
     for &word in PATH_MUTATING {
         if matches_command_word(trimmed, word) {
             return Some(CommandClass::PathMutating);
+        }
+    }
+    if matches_command_word(trimmed, "git") && is_content_disclosing_git(trimmed) {
+        return Some(CommandClass::VcsRead);
+    }
+    for &word in INTERPRETER_WORDS {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::InterpreterSource);
+        }
+    }
+    for &word in COPY_LIKE {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::CopyLike);
         }
     }
     None

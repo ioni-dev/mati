@@ -159,6 +159,9 @@ fn parse_class(s: &str) -> Option<CommandClass> {
         "grep_like" => Some(CommandClass::GrepLike),
         "db_client_like" => Some(CommandClass::DbClientLike),
         "path_mutating" => Some(CommandClass::PathMutating),
+        "vcs_read" => Some(CommandClass::VcsRead),
+        "interpreter_source" => Some(CommandClass::InterpreterSource),
+        "copy_like" => Some(CommandClass::CopyLike),
         "none" => None,
         other => panic!("corpus: bad expect_class {other:?}"),
     }

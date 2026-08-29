@@ -68,6 +68,9 @@ pub(super) async fn dispatch_session_side(
                 protocol::SessionEvent::PolicySteered => "analytics:policy_steer_",
                 protocol::SessionEvent::WrappedDbClientMiss => "compliance:wrapped_db_client_miss_",
                 protocol::SessionEvent::TombstoneBypassedDeny => "compliance:tombstone_bypass_",
+                // A lockdown deny IS a deny; the distinction lives in the
+                // event's decision_reason_code (session_lockdown).
+                protocol::SessionEvent::LockdownBlocked => "compliance:miss_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -335,6 +338,20 @@ pub(super) async fn dispatch_session_side(
                     )
                     .await;
                 }
+                protocol::SessionEvent::LockdownBlocked => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "session_lockdown".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
                 // Record-only signal; reuse BypassDetected so the frozen hash
                 // contract needs no new EnforcementEventType or schema bump.
                 protocol::SessionEvent::UnclassifiedPolicyLiteralBypass => {
@@ -352,6 +369,20 @@ pub(super) async fn dispatch_session_side(
                     .await;
                 }
                 _ => {}
+            }
+
+            // Tier 1: arm the session lockdown. Every event here is a deny a
+            // consultation clears, so the marker names a key `mem_get` can
+            // settle. Best-effort, like the enforcement event above — a
+            // missing marker costs the lockdown, never the deny itself.
+            if matches!(
+                input.event,
+                protocol::SessionEvent::ComplianceMiss
+                    | protocol::SessionEvent::CodexShellBlocked
+                    | protocol::SessionEvent::EditBlocked
+                    | protocol::SessionEvent::FloorConsultMiss
+            ) {
+                let _ = sess::record_owed_receipt(store, &input.key, input.actor.as_deref()).await;
             }
 
             Response::ok(request_id, serde_json::Value::Null)

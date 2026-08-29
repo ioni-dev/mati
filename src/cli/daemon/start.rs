@@ -127,7 +127,17 @@ pub async fn run_daemon_start() -> Result<()> {
         ),
     );
 
-    // Clear stale session:consulted:* markers from previous sessions.
+    // Clear stale session:consulted:* markers from previous sessions. Lockdown
+    // markers go with them — a debt from a dead session must not lock this one
+    // down before it has run anything.
+    if let Ok(keys) = store
+        .scan_keys(mati_core::store::session::OWED_PREFIX)
+        .await
+    {
+        for k in &keys {
+            let _ = store.delete(k).await;
+        }
+    }
     if let Ok(keys) = store.scan_keys("session:consulted:").await {
         for k in &keys {
             let _ = store.delete(k).await;

@@ -14,6 +14,106 @@ pub(crate) async fn ensure_daemon(mati_root: &Path) -> bool {
     mati_core::mcp::daemon_lifecycle::ensure_daemon(mati_root).await
 }
 
+// ── Tier 1 session lockdown ─────────────────────────────────────────────────
+
+/// Is the Tier 1 session lockdown switched on for this invocation?
+///
+/// Read per hook process, not per daemon, so flipping it needs no restart.
+/// Default off: the lockdown denies unrelated commands by design, so it is the
+/// operator's call, not mati's.
+fn lockdown_enabled() -> bool {
+    matches!(
+        std::env::var("MATI_LOCKDOWN").as_deref(),
+        Ok("1" | "on" | "true")
+    )
+}
+
+/// The file this session was denied and still owes a receipt for.
+///
+/// `None` when the lockdown is off or the daemon says nothing is owed, and on
+/// every daemon fault — an unreachable daemon must not deny (P9). No command is
+/// exempt, `mati` included: the receipt that lifts the lockdown is minted by
+/// `mem_get`, which is not a shell command, so exempting one would only open a
+/// route without opening the exit.
+pub(crate) async fn lockdown_owed_key(mati_root: &Path, actor: Option<&str>) -> Option<String> {
+    if !lockdown_enabled() {
+        return None;
+    }
+    let response = match super::daemon::daemon_v2(
+        mati_root,
+        mati_core::mcp::protocol::Command::SessionOwedReceipt(
+            mati_core::mcp::protocol::SessionOwedReceiptInput {
+                actor: actor.map(str::to_string),
+            },
+        ),
+    )
+    .await
+    {
+        DaemonResult::Ok(response) => response,
+        _ => return None,
+    };
+    daemon_data(&response)?
+        .get("owed")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Emit the lockdown deny for a Bash command that reached no file gate.
+///
+/// Self-contained like [`run_fileless_policy`]: it resolves its own repo
+/// identity because the path-less branch returns before `run_inner` has done
+/// so. Returns whether it denied.
+pub(crate) async fn run_bash_lockdown(
+    input: &serde_json::Value,
+    variant: HookVariant,
+    agent_id: Option<&str>,
+) -> bool {
+    if !lockdown_enabled() {
+        return false;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let repo_ident = mati_core::store::RepoIdent::discover(&cwd);
+    let Ok(mati_root) = mati_root_for_ident(&repo_ident, &cwd) else {
+        return false;
+    };
+    if !ensure_daemon(&mati_root).await {
+        return false;
+    }
+    let worktree = mati_core::store::session::worktree_scope_tag_for(&repo_ident);
+    let actor_scope =
+        mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id);
+    let Some(owed) = lockdown_owed_key(&mati_root, actor_scope.as_deref()).await else {
+        return false;
+    };
+
+    let result = decide::lockdown_result(&owed);
+    let events = platform_events(variant, &result.decision, result.events);
+    let (stdout, stderr, exit_code) = format_decision(variant, &result.decision, &owed);
+    if !stdout.is_empty() {
+        println!("{stdout}");
+    }
+    if !stderr.is_empty() {
+        eprintln!("{stderr}");
+    }
+    let session_id = input.get("session_id").and_then(|value| value.as_str());
+    fire_events(
+        &mati_root,
+        &events,
+        session_id,
+        agent_id,
+        actor_scope.as_deref(),
+        None,
+    )
+    .await;
+    if exit_code != 0 {
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
+    true
+}
+
 // ── codex-post-bash flow ────────────────────────────────────────────────────
 
 /// Compliance logging only — no `evaluate()`, no gotcha fetching.

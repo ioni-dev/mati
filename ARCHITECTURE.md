@@ -542,6 +542,41 @@ Decisions are evaluated in this order:
 
 `confidence < 0.3` or `quality < 0.4` always allows without injection, no matter what the `confirmed` state says.
 
+### 10.1a Session lockdown (Tier 1)
+
+Off by default. Set `MATI_LOCKDOWN=1` in the hook process to switch it on.
+
+Every gate in 10.1 asks which file a command touches. For a `PreToolUse` hook
+that question is undecidable: it receives a command string and must answer
+before execution, so `open('ke' + 'ys.py')` defeats any classifier over the
+string. Measured 2026-08-29: four of ten red-team runs reached a gated file
+that way, each after being denied four times first.
+
+The lockdown asks a decidable question instead — does this session owe a
+receipt?
+
+- A consult-clearable deny (`ComplianceMiss`, `CodexShellBlocked`,
+  `EditBlocked`, `FloorConsultMiss`) writes a marker at
+  `session:owed:<actor>|<file_key>`. A policy deny does not: a policy key is
+  not consultable, so arming on it would produce a lockdown no `mem_get` could
+  lift.
+- While any marker is unsettled, every Bash command denies, whatever it names.
+  Nothing is parsed, so a computed filename has nothing to defeat.
+- The marker settles when the receipt for its key exists at the same actor
+  scope. `mem_get` is the only route — it is not a shell command, so no command
+  is exempt from the deny, `mati` included.
+- Markers are created once, not refreshed, so a retrying agent cannot hold its
+  own lockdown open. They expire after `OWED_RECEIPT_TTL_SECS` (900s, the shell
+  gate's receipt TTL), and are cleared wholesale on PostCompact and at daemon
+  start along with the receipts.
+- The query is one pure daemon read (`session_owed_receipt`), and every fault
+  path allows (P9).
+
+Known holes: an agent that never triggers a deny is never locked down (the
+first command can still be a computed path); the deny only covers Bash, so the
+`Read` tool on an unrelated file stays governed by 10.1 alone; and 15 minutes
+of not consulting lifts the lockdown without one.
+
 ### 10.2 Command Classification (pre-bash)
 
 The pre-bash hook classifies shell commands before they run.

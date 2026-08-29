@@ -18,6 +18,7 @@ impl Command {
             Self::HistorySince(_) => "history_since",
             Self::SessionCheckConsulted(_) => "session_check_consulted",
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
+            Self::SessionOwedReceipt(_) => "session_owed_receipt",
             Self::MemQuery(_) => "mem_query",
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
             Self::ScanEnforcementEventsWithSkips(_) => "scan_enforcement_events_with_skips",
@@ -85,6 +86,7 @@ impl Command {
             Self::SandboxAudit(i) => &i.setting,
             Self::Ping
             | Self::Metrics
+            | Self::SessionOwedReceipt(_)
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
             | Self::ScanEnforcementEventsWithSkips(_)

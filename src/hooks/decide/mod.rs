@@ -34,11 +34,14 @@ pub use path_normalize::normalize_path;
 // evaluate() below calls json_helpers.rs's payload readers directly.
 use classification::{
     effective_command, ACTION_TOOL_DB_CLIENT, ACTION_TOOL_FILE_READ, ACTION_TOOL_PATH,
+    GIT_VALUE_FLAGS,
 };
 #[cfg(test)]
 use json_helpers::json_has_signal;
 use json_helpers::{any_qualifying_gotcha, json_bool, json_f32, json_str, json_string_array};
-use path_extraction::{shell_tokens, split_at_shell_operator};
+#[cfg(test)]
+use path_extraction::MAX_INTERPRETER_PATHS;
+use path_extraction::{shell_segments, shell_tokens, split_at_shell_operator};
 
 use std::collections::HashMap;
 
@@ -59,6 +62,20 @@ pub enum CommandClass {
     /// `tool=path`, so a `target_path_glob` policy gates deletes and moves the
     /// same way it gates edits.
     PathMutating,
+    /// `git show HEAD:f`, `git cat-file -p rev:f`, `git diff -- f`,
+    /// `git log -p -- f`, `git blame f`, `git grep pat -- f` — content reaches
+    /// the agent from the object store, so the working-tree path never appears
+    /// as a bare argument. Normalizes to `file_read`.
+    VcsRead,
+    /// `cp f /tmp/x`, `install`, `ln`, `rsync`, `dd if=f` — every argument but
+    /// the destination is a read. Normalizes to `file_read`.
+    CopyLike,
+    /// `python3 -c "open('f').read()"`, `perl -e`, `node -e`, and heredoc
+    /// bodies fed to an interpreter. The path is a string literal inside
+    /// source, not an argument. Normalizes to `file_read`; a write through the
+    /// same route is gated as a read, since consultation is what the gate
+    /// requires either way.
+    InterpreterSource,
 }
 
 /// Normalized shape of an agent tool invocation for policy matching.
@@ -137,6 +154,11 @@ pub enum DenyOrigin {
     /// allowlist or missed a required-content predicate. Unconditional, the
     /// polarity mirror of `PolicyContentDenied`. `file_key` is the policy key.
     PolicyRequirementUnmet,
+    /// Tier 1 session lockdown: this actor was denied a file earlier in the
+    /// session and still owes its receipt, so every Bash command is denied
+    /// until that receipt exists. `file_key` is the owed — and consultable —
+    /// file key, not anything read from the command being denied.
+    SessionLockdown,
 }
 
 impl DenyOrigin {
@@ -153,6 +175,7 @@ impl DenyOrigin {
             DenyOrigin::Policy => HookEvent::PolicyConsultBlocked { key },
             DenyOrigin::PolicyContentDenied => HookEvent::PolicyContentBlocked { key },
             DenyOrigin::PolicyRequirementUnmet => HookEvent::PolicyRequirementBlocked { key },
+            DenyOrigin::SessionLockdown => HookEvent::LockdownBlocked { key },
         }
     }
 }
@@ -202,6 +225,9 @@ pub enum HookEvent {
         would: ShadowOutcome,
         action: Option<Action>,
     },
+    /// Tier 1 session lockdown denied a Bash command that named no governed
+    /// path, because the session still owes a receipt on `key`.
+    LockdownBlocked { key: String },
     /// The `FileDeleted` bypass fired on a caller-confirmed deletion
     /// (`file_exists: Some(false)`) that also suppressed a deny a qualifying
     /// confirmed gotcha would otherwise have produced. Unlike the plain
@@ -441,6 +467,32 @@ pub struct EnforcementInput {
 pub struct EnforcementResult {
     pub decision: Decision,
     pub events: Vec<HookEvent>,
+}
+
+// ── Tier 1 session lockdown ─────────────────────────────────────────────────
+
+/// The deny every Bash command gets while the session owes `owed_key`.
+///
+/// Tier 1 answers a decidable question — does this session owe a receipt? —
+/// instead of the undecidable one a classifier asks, which is what file a
+/// command string will open. Measured 2026-08-29: every red-team run that
+/// eventually reached a gated file was denied four times first, then built the
+/// filename from pieces (`"ke" + "ys.py"`). Nothing here is parsed, so that
+/// construction has nothing to defeat.
+pub fn lockdown_result(owed_key: &str) -> EnforcementResult {
+    let path = owed_key.strip_prefix("file:").unwrap_or(owed_key);
+    EnforcementResult {
+        decision: Decision::Deny {
+            file_key: owed_key.to_string(),
+            reason: format!(
+                "[mati] Session locked: {path} was denied earlier and has not been \
+                 consulted. Every Bash command is denied until you call \
+                 mem_get(\"{owed_key}\")."
+            ),
+            origin: DenyOrigin::SessionLockdown,
+        },
+        events: vec![DenyOrigin::SessionLockdown.deny_event(owed_key.to_string())],
+    }
 }
 
 // ── Core Decision Engine ────────────────────────────────────────────────────

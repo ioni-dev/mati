@@ -28,6 +28,8 @@ pub struct LsArgs {
     /// (tombstoned only) Emit JSON instead of human-readable table.
     /// Designed for programmatic consumption by `/mati-enrich`'s Stage 2
     /// negative-exemplar retrieval.
+    /// Rejected on the other categories rather than ignored — use
+    /// `mati export --format json` for those.
     #[arg(long)]
     pub json: bool,
 }

@@ -171,6 +171,8 @@ pub(crate) async fn dispatch_v2(
             dispatch_mem_query(graph, &req).await
         } else if matches!(&req.cmd, Command::PolicyEvaluate(_)) {
             dispatch_policy_evaluate(graph, ctx, &req).await
+        } else if matches!(&req.cmd, Command::SessionOwedReceipt(_)) {
+            dispatch_owed_receipt(graph, &req).await
         } else if is_session_side(&req.cmd) {
             // Session-side mutations: native handler with audit in sessions tree.
             dispatch_session_side(graph, ctx, &req).await
@@ -504,5 +506,7 @@ use compound::dispatch_file_edit_hook;
 use knowledge::{dispatch_knowledge_mutation, dispatch_policy_evaluate, dispatch_policy_write};
 #[cfg(test)]
 use reads::command_to_v1;
-use reads::{dispatch_mem_query, dispatch_side_effecting_read, dispatch_via_v1};
+use reads::{
+    dispatch_mem_query, dispatch_owed_receipt, dispatch_side_effecting_read, dispatch_via_v1,
+};
 use session::dispatch_session_side;

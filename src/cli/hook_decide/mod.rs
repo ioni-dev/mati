@@ -33,11 +33,11 @@ pub(super) use config::run_config_change;
 pub(super) use events_output::{
     apply_consult_mandate, check_eval_data, consult_globset, consulted_flag, daemon_data,
     emit_allow, escape_json_string, fire_events, format_decision, log_fail_open,
-    log_fail_open_named, process_eval_response, AdapterResult, EvalDataCheck,
+    log_fail_open_named, platform_events, process_eval_response, AdapterResult, EvalDataCheck,
 };
 pub(super) use flows::{
-    ensure_daemon, run_apply_patch, run_post_bash, run_post_bash_introspection, run_post_memget,
-    run_post_task,
+    ensure_daemon, lockdown_owed_key, run_apply_patch, run_bash_lockdown, run_post_bash,
+    run_post_bash_introspection, run_post_memget, run_post_task,
 };
 pub(super) use path::{
     canonical_rel_path, discover_repo_root, discover_repo_root_for, extract_path,
@@ -50,8 +50,7 @@ pub(super) use policy::{
 
 #[cfg(test)]
 pub(super) use events_output::{
-    allow_output, consult_globset_from, decision_basis_hash, log_fail_open_at, platform_events,
-    session_command,
+    allow_output, consult_globset_from, decision_basis_hash, log_fail_open_at, session_command,
 };
 #[cfg(test)]
 pub(super) use flows::{accepts_db_introspection, post_bash_succeeded, receipt_actor};

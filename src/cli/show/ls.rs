@@ -64,6 +64,21 @@ fn ls_cache_record(key: &str, value: String) -> Record {
 // ── run_ls (M-08-C/D/E) ─────────────────────────────────────────────────────
 
 pub async fn run_ls(args: LsArgs) -> Result<()> {
+    // `--json` is implemented for `tombstoned` only. Accepting it silently on
+    // the other categories left callers parsing the human table — which is how
+    // a `Last author:` bullet from the Stability block ends up counted as a
+    // gotcha. Fail loudly and name the command that does work.
+    if !matches!(
+        args.category.as_deref(),
+        Some("tombstoned") | Some("tombstones")
+    ) && args.json
+    {
+        anyhow::bail!(
+            "--json is only supported for the `tombstoned` category.\n\
+             For machine-readable records use `mati export --format json`."
+        );
+    }
+
     let cwd = std::env::current_dir()?;
     let store = StoreProxy::open(&cwd).await?;
     let use_color = std::io::stdout().is_terminal();

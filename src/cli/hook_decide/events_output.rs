@@ -72,6 +72,11 @@ pub(crate) fn platform_events(
                 HookEvent::BlockedUnconsultedRead { key } => {
                     Some(HookEvent::CodexShellBlocked { key })
                 }
+                // Same translation, for the same reason: the audit chain
+                // attributes the deny to `codex`, and only SessionEvent tells
+                // it which platform blocked. The lockdown's own reason code is
+                // the cost; mis-attributing the agent would be the worse one.
+                HookEvent::LockdownBlocked { key } => Some(HookEvent::CodexShellBlocked { key }),
                 HookEvent::Hit { .. } => {
                     // Suppress Hit for outcomes where Codex receives no context.
                     // Minting a consultation receipt without delivering context
@@ -222,6 +227,14 @@ pub(crate) fn session_command(
             session_id: sid(),
             actor: scope(),
             decision_basis_hash: basis(),
+        }),
+        HookEvent::LockdownBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::LockdownBlocked,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            // The lockdown decides on session state, not on the file's gotchas.
+            decision_basis_hash: None,
         }),
         HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::CodexShellBlocked,
@@ -722,9 +735,13 @@ pub(crate) fn format_decision(
                 // requires.key. Matched exhaustively so a new origin has to
                 // choose a shape rather than inherit one.
                 let stderr = match origin {
+                    // The lockdown reason names both the owed file and the
+                    // `mem_get` that lifts it; the bare form would lose why a
+                    // command that touched nothing governed was denied.
                     decide::DenyOrigin::Policy
                     | decide::DenyOrigin::PolicyContentDenied
-                    | decide::DenyOrigin::PolicyRequirementUnmet => reason.clone(),
+                    | decide::DenyOrigin::PolicyRequirementUnmet
+                    | decide::DenyOrigin::SessionLockdown => reason.clone(),
                     decide::DenyOrigin::Gotcha | decide::DenyOrigin::ConsultMandate => {
                         format!("mati: call mem_get(\"{file_key}\") first")
                     }

@@ -1,5 +1,19 @@
 use super::*;
 
+/// The root repo-relative record paths resolve against.
+///
+/// `Commands::Serve` canonicalizes its `--path` but never discovers, so the
+/// launch cwd can sit below the repo root while `derive_slug` discovers upward
+/// and opens the store keyed to the root. Joining a root-relative `file:` key
+/// onto the subdirectory would stat a path that does not exist and read as
+/// "still deleted", so the `FileDeleted` bypass would stay open on exactly the
+/// restore this check exists to catch. `slug_root` is the repo's own answer —
+/// "callers that must resolve repo-relative record paths against the same root
+/// the store was named for" — and is what `StoreProxy::open` already uses.
+fn stat_root(repo_root: &Path) -> PathBuf {
+    crate::store::RepoIdent::discover(repo_root).slug_root(repo_root)
+}
+
 /// Start the MCP stdio proxy for the project rooted at `repo_root`.
 ///
 /// After γ-C4, `mati serve` is a thin MCP-stdio ↔ UDS forwarder: every
@@ -72,17 +86,18 @@ pub async fn serve(repo_root: &Path) -> Result<()> {
     // single git2 lookup at startup is enough for the life of the session.
     let worktree_tag = crate::store::session::worktree_scope_tag(repo_root);
     let transport = rmcp::transport::io::stdio();
-    let service = MatiServer::with_socket_root(mati_root.clone(), worktree_tag)
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP proxy initialization failed: {e}"))
-        .inspect_err(|e| {
-            super::metadata::record_lifecycle_event(
-                &mati_root,
-                "serve_failed",
-                &format!("proxy init: {e:#}"),
-            )
-        })?;
+    let service =
+        MatiServer::with_socket_root(mati_root.clone(), stat_root(repo_root), worktree_tag)
+            .serve(transport)
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP proxy initialization failed: {e}"))
+            .inspect_err(|e| {
+                super::metadata::record_lifecycle_event(
+                    &mati_root,
+                    "serve_failed",
+                    &format!("proxy init: {e:#}"),
+                )
+            })?;
 
     let shutdown_reason: &'static str = match service.waiting().await {
         Ok(_) => "client_disconnect",
@@ -364,3 +379,40 @@ async fn proxy_daemon_send_v2(root: &Path, v2_cmd: serde_json::Value) -> Attempt
 
 // cleanup_stale_pid and local is_pid_alive removed — callers now use
 // metadata::check_and_cleanup_stale which centralizes PID liveness checks.
+
+#[cfg(test)]
+mod tests {
+    use super::stat_root;
+    use tempfile::TempDir;
+
+    /// `mati serve --path <repo>/sub` canonicalizes but never discovers, while
+    /// `derive_slug` discovers upward and opens the store keyed to the root.
+    /// The stat root must follow the store, or a root-relative `file:` key
+    /// joins onto the subdirectory, stats a path that does not exist, and the
+    /// `FileDeleted` bypass stays open on the restore it exists to catch.
+    #[test]
+    fn stat_root_resolves_a_subdirectory_launch_to_the_repo_root() {
+        let dir = TempDir::new().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let sub = dir.path().join("crates").join("inner");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            stat_root(&sub),
+            root,
+            "a subdir launch must stat from the root"
+        );
+        assert_eq!(stat_root(dir.path()), root, "a root launch is unchanged");
+    }
+
+    /// Outside a repo there is nothing to discover, so the launch path stands.
+    #[test]
+    fn stat_root_falls_back_to_the_launch_path_outside_a_repo() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            stat_root(dir.path()),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+}

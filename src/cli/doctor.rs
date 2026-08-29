@@ -793,8 +793,20 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
             };
         }
     };
-    let summary = crate::cli::stale::cached_stale_summary(&proxy).await;
+    let summary = crate::cli::stale::stale_summary(&proxy).await;
     let _ = proxy.close().await;
+    freshness_result(summary)
+}
+
+/// The `knowledge/freshness` verdict, split out so every branch is testable
+/// without a store.
+///
+/// Drift gets its own arm. Folding it into the general Warn arm rendered
+/// "0 stale record(s) (0 stale, 0 liability, 0 tombstone); 1 confirmed
+/// gotcha(s) describe changed code" — a count of zero followed by a real
+/// problem — and offered `mati reparse`, which cannot clear drift. Only
+/// re-confirming can.
+fn freshness_result(summary: Option<crate::cli::stale::StaleSummary>) -> CheckResult {
     match summary {
         None => CheckResult {
             section: "knowledge",
@@ -809,6 +821,16 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
             status: Status::Pass,
             detail: "no stale records".to_string(),
             fix: None,
+        },
+        Some(s) if s.total == 0 => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Warn,
+            detail: format!(
+                "no records stale by age; {} confirmed gotcha(s) describe changed code",
+                s.drift
+            ),
+            fix: Some("mati gotcha confirm <key>  (after re-reading the file)"),
         },
         Some(s) => CheckResult {
             section: "knowledge",
@@ -1645,6 +1667,48 @@ mod tests {
         assert_eq!(report.version, 2);
     }
 
+    fn summary(total: usize, drift: usize) -> crate::cli::stale::StaleSummary {
+        crate::cli::stale::StaleSummary {
+            total,
+            stale: total,
+            liability: 0,
+            tombstone: 0,
+            drift,
+        }
+    }
+
+    /// Drift alone must not render as a zero count. The general Warn arm used
+    /// to print "0 stale record(s) (0 stale, 0 liability, 0 tombstone)" above
+    /// a real drift finding, and pointed at `mati reparse`, which cannot clear
+    /// drift.
+    #[test]
+    fn freshness_reports_drift_without_claiming_a_zero_stale_count() {
+        let r = freshness_result(Some(summary(0, 1)));
+        assert!(matches!(r.status, Status::Warn));
+        assert!(
+            !r.detail.contains("0 stale record(s)"),
+            "detail was: {}",
+            r.detail
+        );
+        assert!(r
+            .detail
+            .contains("1 confirmed gotcha(s) describe changed code"));
+        assert!(r.fix.unwrap().contains("gotcha confirm"));
+    }
+
+    /// The clean and the stale-records paths are unchanged by the new arm.
+    #[test]
+    fn freshness_keeps_its_other_verdicts() {
+        let clean = freshness_result(Some(summary(0, 0)));
+        assert!(matches!(clean.status, Status::Pass));
+        assert_eq!(clean.detail, "no stale records");
+
+        let stale = freshness_result(Some(summary(3, 0)));
+        assert!(matches!(stale.status, Status::Warn));
+        assert!(stale.detail.contains("3 stale record(s)"));
+
+        assert!(matches!(freshness_result(None).status, Status::Info));
+    }
     /// Content drift rides on the existing `knowledge/freshness` detail rather
     /// than adding a check, so the `--json` array stays index-stable and does
     /// not collide with `integrity/drift`, which means derived-index drift.

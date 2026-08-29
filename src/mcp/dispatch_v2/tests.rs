@@ -2211,3 +2211,182 @@ async fn subagent_edge_without_parent_is_noop() {
         "no SubagentEdge event should be recorded without a parent"
     );
 }
+
+// ── Tier 1 session lockdown ─────────────────────────────────────────────────
+
+/// Ask the daemon what `actor` still owes.
+async fn owed_for(
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
+    ctx: &RequestContext,
+    actor: Option<&str>,
+) -> serde_json::Value {
+    let req = make_request(Command::SessionOwedReceipt(SessionOwedReceiptInput {
+        actor: actor.map(str::to_string),
+    }));
+    match dispatch_v2(graph, ctx, req).await {
+        Response::Ok { data, .. } => data["owed"].clone(),
+        Response::Err { message, .. } => panic!("owed query failed: {message}"),
+    }
+}
+
+async fn log_event(
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
+    ctx: &RequestContext,
+    event: SessionEvent,
+    key: &str,
+    actor: Option<&str>,
+) {
+    let req = make_request(Command::SessionLog(SessionLogInput {
+        event,
+        key: key.into(),
+        session_id: None,
+        actor: actor.map(str::to_string),
+        decision_basis_hash: None,
+    }));
+    assert!(matches!(
+        dispatch_v2(graph, ctx, req).await,
+        Response::Ok { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_deny_arms_the_lockdown_and_the_receipt_lifts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+    assert_eq!(owed_for(&graph, &ctx, Some("wt")).await, "file:keys.py");
+
+    // The consultation the deny asked for is the whole exit.
+    let hit = make_request(Command::ConsultationHit(ConsultationHitInput {
+        key: "file:keys.py".into(),
+        capture_fingerprint: false,
+        actor: Some("wt".into()),
+        session_id: None,
+        agent_id: None,
+        decision_basis_hash: None,
+        source: Some(ReceiptSource::MemGet),
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, hit).await,
+        Response::Ok { .. }
+    ));
+    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+}
+
+#[tokio::test]
+async fn a_lockdown_marker_does_not_leak_across_actor_scopes() {
+    // The scope string is a worktree tag optionally `:`-joined to an agent id,
+    // so a `:`-separated marker key would make the main thread's prefix scan
+    // match its own subagents' debts.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt:sub"),
+    )
+    .await;
+
+    assert_eq!(owed_for(&graph, &ctx, Some("wt:sub")).await, "file:keys.py");
+    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+    assert!(owed_for(&graph, &ctx, None).await.is_null());
+}
+
+#[tokio::test]
+async fn a_policy_deny_does_not_arm_the_lockdown() {
+    // A policy key is not consultable — its receipt lives under `requires.key`.
+    // Arming on it would produce a lockdown no mem_get could lift.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::PolicyConsultMiss,
+        "policy:no-prod",
+        Some("wt"),
+    )
+    .await;
+    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+}
+
+#[tokio::test]
+async fn clearing_consults_clears_the_lockdown() {
+    // PostCompact clears receipts to re-arm every gate. A debt left behind
+    // would lock the next window down before it had run anything.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+    assert_eq!(owed_for(&graph, &ctx, Some("wt")).await, "file:keys.py");
+
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, make_request(Command::SessionClearConsults)).await,
+        Response::Ok { .. }
+    ));
+    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+}
+
+#[tokio::test]
+async fn a_lockdown_deny_records_its_own_reason_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::LockdownBlocked,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+
+    let g = graph.read().await;
+    let events = crate::store::enforcement::scan_events_since(g.store(), 0)
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.decision_reason_code == "session_lockdown"),
+        "the audit chain must tell a lockdown deny from the gotcha deny that armed it"
+    );
+    // The deny it records is not itself a new debt: re-arming on every retry
+    // would let the agent hold its own lockdown open past the TTL.
+    let markers = g
+        .store()
+        .scan_keys(crate::store::session::OWED_PREFIX)
+        .await
+        .unwrap();
+    assert!(markers.is_empty());
+}

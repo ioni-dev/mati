@@ -169,10 +169,12 @@ confidence < 0.3 OR quality < 0.4                            → allow, no injec
 
 Staleness tier gates injection, not the gotcha deny above — a qualifying
 gotcha denies at any tier, including `liability` and `tombstone`. The only
-enforcement bypass is a literal `FileDeleted` staleness signal: allow
-unconditionally, no injection. Absent that signal, `liability` degrades
-injection to a warning and `tombstone` excludes it, but the gotcha check
-still runs first.
+enforcement bypass is a literal `FileDeleted` staleness signal AND a caller
+that did not observe the path back on disk: allow, no injection. A caller
+that stats the path and finds it present falls through to the ordinary gotcha
+check instead of bypassing. Absent that signal, `liability` degrades injection
+to a warning and `tombstone` excludes it, but the gotcha check still runs
+first.
 
 Design principles (full set in ARCHITECTURE.md section 2): hook enforcement is primary
 (P1); inject nothing by default, pull on demand (P2); four MCP tools max (P3);

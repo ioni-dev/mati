@@ -822,6 +822,13 @@ mod gotcha_write_sites {
             "scans gotcha:*, sets confirmed = true and increments \
              confirmation_count",
         ),
+        (
+            "src/store/session.rs",
+            "record_owed_receipt",
+            Class::NonGotcha,
+            "owed_key() prepends session:owed:<actor>| to the caller's key, so \
+             the written key is never in the gotcha namespace",
+        ),
     ];
 
     /// True when `expr` provably names a key outside the gotcha namespace.

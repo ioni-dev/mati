@@ -143,6 +143,16 @@ pub struct SessionCheckConsultedRecentInput {
     pub ttl_secs: u64,
 }
 
+/// Ask whether an actor still owes a consultation receipt for a file it was
+/// denied — the Tier 1 session lockdown's only input.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOwedReceiptInput {
+    /// Receipt scope of the caller, exactly as the gate evaluates it.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
 fn default_ttl_secs() -> u64 {
     900
 }
@@ -393,7 +403,7 @@ pub struct DevNoteUpsertInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLogInput {
-    /// The event type (closed enum, 14 variants).
+    /// The event type (closed enum, 15 variants).
     pub event: SessionEvent,
     /// The record key this event pertains to.
     pub key: String,
@@ -476,6 +486,10 @@ pub enum SessionEvent {
     /// An unclassified command mentioned a meaningful literal from an active
     /// policy trigger; records a bypass signal without changing the decision.
     UnclassifiedPolicyLiteralBypass,
+    /// Tier 1 session lockdown DENIED a Bash command because the session still
+    /// owes a receipt on the keyed file. Records `Deny` with reason
+    /// `session_lockdown`, distinct from the gotcha deny that armed it.
+    LockdownBlocked,
     Bootstrap,
     PromptNudge,
     /// Post-bash observed a command that passed `is_schema_introspection` but
