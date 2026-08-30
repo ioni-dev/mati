@@ -183,6 +183,13 @@ enum Commands {
     #[command(hide = true)]
     LogPromptNudge { key: String },
     #[command(hide = true)]
+    PostReadCompliance {
+        key: String,
+        /// Subagent id from the hook payload, when the caller is a subagent.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+    #[command(hide = true)]
     SessionCheckConsulted {
         key: String,
         /// Subagent id from the hook payload, when the caller is a subagent.
@@ -452,6 +459,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::LogCodexShellMiss { key } => cli::hooks::run_log_codex_shell_miss(&key).await,
         Commands::LogBootstrap { key } => cli::hooks::run_log_bootstrap(&key).await,
         Commands::LogPromptNudge { key } => cli::hooks::run_log_prompt_nudge(&key).await,
+        Commands::PostReadCompliance { key, agent_id } => {
+            cli::hooks::run_post_read_compliance(&key, agent_id.as_deref()).await
+        }
         Commands::SessionCheckConsulted { key, agent_id } => {
             cli::hooks::run_session_check_consulted(&key, agent_id.as_deref()).await
         }

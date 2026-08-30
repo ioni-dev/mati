@@ -33,7 +33,10 @@ fi
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || echo "")
 [ -z "$FILE_PATH" ] && exit 0
 
-# Convert absolute path to repo-relative (same as pre-read.sh)
+# Convert absolute path to repo-relative (same as pre-read.sh). The strip is
+# lexical and fails when the two sides disagree about symlinks (macOS
+# /private/tmp vs /tmp); `mati` canonicalizes an absolute key it is handed, so
+# do not re-fix this here — see repo_relative_key in src/cli/hooks.rs.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 if [ -n "$REPO_ROOT" ]; then
   REL_PATH="${FILE_PATH#$REPO_ROOT/}"
@@ -61,17 +64,19 @@ if ! mati ping --daemon-only &>/dev/null; then
   exit 0
 fi
 
-# Check if this file was consulted via mati before being read. The worktree
-# half of the receipt scope is resolved by mati itself; only the subagent id
-# lives in the payload, so forward it. Without the scope this check asks about
-# a receipt key the gate never writes and answers "false" for every read.
+# Was this file consulted before the read? One command decides and records:
+# it logs a plain Miss, never the gate's ComplianceMiss (that one records an
+# EnforcementEventType::Deny and arms the Tier 1 lockdown — a block that did
+# not occur here, since PostToolUse only fires for a read that was allowed),
+# and it stays silent for a file with no record at all, which the pre-read gate
+# already counted. The worktree half of the receipt scope is resolved by mati
+# itself; only the subagent id lives in the payload, so forward it. Without the
+# scope the check asks about a receipt key the gate never writes and answers
+# "false" for every read.
 AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // ""' 2>/dev/null || echo "")
 if [ -n "$AGENT_ID" ]; then
-  CONSULTED=$(mati session-check-consulted "file:$REL_PATH" --agent-id "$AGENT_ID" 2>/dev/null || echo "false")
+  mati post-read-compliance "file:$REL_PATH" --agent-id "$AGENT_ID" &>/dev/null || true
 else
-  CONSULTED=$(mati session-check-consulted "file:$REL_PATH" 2>/dev/null || echo "false")
-fi
-if [ "$CONSULTED" = "false" ]; then
-  mati log-compliance-miss "file:$REL_PATH" &>/dev/null &
+  mati post-read-compliance "file:$REL_PATH" &>/dev/null || true
 fi
 "#;

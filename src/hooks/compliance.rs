@@ -305,7 +305,7 @@ case "$1" in
     doc-capture)
         cat >/dev/null
         echo "$@" >> "{log_file}" ;;
-    log-miss|log-hit|log-compliance-miss|log-compliance-hit|log-codex-shell-miss|log-bootstrap|log-prompt-nudge|edit-hook|session-flush|session-harvest)
+    log-miss|log-hit|log-compliance-miss|log-compliance-hit|log-codex-shell-miss|log-bootstrap|log-prompt-nudge|edit-hook|session-flush|session-harvest|post-read-compliance)
         echo "$@" >> "{log_file}" ;;
     reparse)
         exit 0 ;;
@@ -847,7 +847,7 @@ fn post_compliance_logs_extensionless_root_file_miss() {
     let output = harness.run(&input);
     assert_eq!(output.exit_code, 0);
     assert!(
-        harness.wait_for_log_contains("log-compliance-miss file:Dockerfile"),
+        harness.wait_for_log_contains("post-read-compliance file:Dockerfile"),
         "extensionless file should still be tracked as a compliance miss, log: {}",
         harness.read_log()
     );
@@ -954,7 +954,7 @@ fn post_compliance_records_fail_open_when_jq_is_missing() {
         "the record must follow $MATI_HOME, not $HOME/.mati"
     );
     assert!(
-        !harness.read_log().contains("log-compliance-miss"),
+        !harness.read_log().contains("post-read-compliance"),
         "no jq means no compliance check — that is the skip being recorded"
     );
 }
