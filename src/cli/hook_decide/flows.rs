@@ -117,16 +117,25 @@ pub(crate) async fn run_bash_lockdown(
 // ── codex-post-bash flow ────────────────────────────────────────────────────
 
 /// Compliance logging only — no `evaluate()`, no gotcha fetching.
-pub(crate) async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()> {
+pub(crate) async fn run_post_bash(
+    mati_root: &Path,
+    rel_path: &str,
+    actor: Option<&str>,
+) -> Result<()> {
     let file_key = format!("file:{rel_path}");
 
-    // Reuse existing session_check_consulted_recent command.
+    // Reuse existing session_check_consulted_recent command. `actor` is the
+    // same scope the gate evaluated at: querying without it asks about a
+    // global receipt the gate never mints, and every consulted read then
+    // records CodexShellMiss — a `bypass` event claiming the agent reached the
+    // file off-gate when it had consulted first (measured 2026-08-29).
     let consulted = match daemon_result(
         mati_root,
         "session_check_consulted_recent",
         serde_json::json!({
             "key": &file_key,
             "ttl_secs": mati_core::store::session::CONSULTED_RECENT_TTL_SECS,
+            "actor": actor,
         }),
     )
     .await
@@ -152,7 +161,9 @@ pub(crate) async fn run_post_bash(mati_root: &Path, rel_path: &str) -> Result<()
             event,
             key: file_key.clone(),
             session_id: None,
-            actor: None,
+            // Same scope the check ran at, so the daemon can find the receipt
+            // that authorized the allow it is recording.
+            actor: actor.map(str::to_string),
             decision_basis_hash: None,
         });
     let _ = super::daemon::daemon_v2(mati_root, cmd).await;

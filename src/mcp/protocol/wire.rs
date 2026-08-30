@@ -213,11 +213,14 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "since_ts": args.get("since_ts").and_then(|v| v.as_u64()).unwrap_or(0),
             "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50),
         }),
-        "session_check_consulted" => json!({"type": "session_check_consulted", "key": args["key"]}),
+        "session_check_consulted" => {
+            json!({"type": "session_check_consulted", "key": args["key"], "actor": args["actor"]})
+        }
         "session_check_consulted_recent" => json!({
             "type": "session_check_consulted_recent",
             "key": args["key"],
             "ttl_secs": args.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(900),
+            "actor": args["actor"],
         }),
         "mem_query" => json!({
             "type": "mem_query",

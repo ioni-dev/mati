@@ -183,12 +183,20 @@ enum Commands {
     #[command(hide = true)]
     LogPromptNudge { key: String },
     #[command(hide = true)]
-    SessionCheckConsulted { key: String },
+    SessionCheckConsulted {
+        key: String,
+        /// Subagent id from the hook payload, when the caller is a subagent.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
     #[command(hide = true)]
     SessionCheckConsultedRecent {
         key: String,
         #[arg(long, default_value_t = mati_core::store::session::CONSULTED_RECENT_TTL_SECS)]
         ttl_secs: u64,
+        /// Subagent id from the hook payload, when the caller is a subagent.
+        #[arg(long)]
+        agent_id: Option<String>,
     },
     #[command(hide = true)]
     SessionFlush,
@@ -444,11 +452,16 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::LogCodexShellMiss { key } => cli::hooks::run_log_codex_shell_miss(&key).await,
         Commands::LogBootstrap { key } => cli::hooks::run_log_bootstrap(&key).await,
         Commands::LogPromptNudge { key } => cli::hooks::run_log_prompt_nudge(&key).await,
-        Commands::SessionCheckConsulted { key } => {
-            cli::hooks::run_session_check_consulted(&key).await
+        Commands::SessionCheckConsulted { key, agent_id } => {
+            cli::hooks::run_session_check_consulted(&key, agent_id.as_deref()).await
         }
-        Commands::SessionCheckConsultedRecent { key, ttl_secs } => {
-            cli::hooks::run_session_check_consulted_recent(&key, ttl_secs).await
+        Commands::SessionCheckConsultedRecent {
+            key,
+            ttl_secs,
+            agent_id,
+        } => {
+            cli::hooks::run_session_check_consulted_recent(&key, ttl_secs, agent_id.as_deref())
+                .await
         }
         Commands::SessionFlush => match cli::hooks::run_session_flush().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),

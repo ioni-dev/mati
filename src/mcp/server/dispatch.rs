@@ -430,8 +430,9 @@ pub(crate) async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
+            let actor = req.args.get("actor").and_then(|v| v.as_str());
             let g = graph.read().await;
-            match sess::check_consulted(g.store(), key, None).await {
+            match sess::check_consulted(g.store(), key, actor).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -447,8 +448,9 @@ pub(crate) async fn socket_dispatch(
                 .get("ttl_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(900);
+            let actor = req.args.get("actor").and_then(|v| v.as_str());
             let g = graph.read().await;
-            match sess::check_consulted_recent(g.store(), key, ttl_secs, None).await {
+            match sess::check_consulted_recent(g.store(), key, ttl_secs, actor).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }

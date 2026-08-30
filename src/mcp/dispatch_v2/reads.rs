@@ -172,12 +172,13 @@ pub(super) fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             "history_since".into(),
             json!({ "key": i.key, "since_ts": i.since_ts, "limit": i.limit }),
         ),
-        Command::SessionCheckConsulted(i) => {
-            ("session_check_consulted".into(), json!({ "key": i.key }))
-        }
+        Command::SessionCheckConsulted(i) => (
+            "session_check_consulted".into(),
+            json!({ "key": i.key, "actor": i.actor }),
+        ),
         Command::SessionCheckConsultedRecent(i) => (
             "session_check_consulted_recent".into(),
-            json!({ "key": i.key, "ttl_secs": i.ttl_secs }),
+            json!({ "key": i.key, "ttl_secs": i.ttl_secs, "actor": i.actor }),
         ),
         Command::SessionOwedReceipt(_) => {
             unreachable!("SessionOwedReceipt is handled natively, not via v1 bridge")

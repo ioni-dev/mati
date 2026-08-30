@@ -810,10 +810,14 @@ async fn v1_bridge_only_handles_pure_reads() {
             since_ts: 0,
             limit: 10,
         }),
-        Command::SessionCheckConsulted(SessionCheckConsultedInput { key: "k".into() }),
+        Command::SessionCheckConsulted(SessionCheckConsultedInput {
+            key: "k".into(),
+            actor: None,
+        }),
         Command::SessionCheckConsultedRecent(SessionCheckConsultedRecentInput {
             key: "k".into(),
             ttl_secs: 900,
+            actor: None,
         }),
     ];
 
@@ -2389,4 +2393,58 @@ async fn a_lockdown_deny_records_its_own_reason_code() {
         .await
         .unwrap();
     assert!(markers.is_empty());
+}
+
+/// The consult check must answer at the scope receipts are minted at.
+///
+/// It did not: `mati session-check-consulted` sent no actor, so the daemon
+/// checked the global key the gate never writes inside a repo and answered
+/// "false" for every read. `post-read-compliance.sh` then recorded a
+/// compliance miss — a `deny` event on the hash chain — for reads that had
+/// been consulted and were allowed. Measured 2026-08-29: 29 of 32 lab runs.
+#[tokio::test]
+async fn a_consult_check_sees_an_actor_scoped_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    let hit = make_request(Command::ConsultationHit(ConsultationHitInput {
+        key: "file:keys.py".into(),
+        capture_fingerprint: false,
+        actor: Some("wt".into()),
+        session_id: None,
+        agent_id: None,
+        decision_basis_hash: None,
+        source: Some(ReceiptSource::MemGet),
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, hit).await,
+        Response::Ok { .. }
+    ));
+
+    let check = |actor: Option<&str>| {
+        make_request(Command::SessionCheckConsulted(SessionCheckConsultedInput {
+            key: "file:keys.py".into(),
+            actor: actor.map(str::to_string),
+        }))
+    };
+    let scoped = dispatch_v2(&graph, &ctx, check(Some("wt"))).await;
+    let Response::Ok { data, .. } = scoped else {
+        panic!("scoped check should succeed")
+    };
+    assert_eq!(
+        data,
+        serde_json::json!(true),
+        "the receipt exists at this scope"
+    );
+
+    // Receipts have no actor-to-global fallback, so the unscoped question is a
+    // different one and still answers false. That is why the CALLER has to
+    // resolve the scope.
+    let global = dispatch_v2(&graph, &ctx, check(None)).await;
+    let Response::Ok { data, .. } = global else {
+        panic!("global check should succeed")
+    };
+    assert_eq!(data, serde_json::json!(false));
 }

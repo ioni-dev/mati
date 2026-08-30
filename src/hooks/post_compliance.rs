@@ -61,8 +61,16 @@ if ! mati ping --daemon-only &>/dev/null; then
   exit 0
 fi
 
-# Check if this file was consulted via mati before being read
-CONSULTED=$(mati session-check-consulted "file:$REL_PATH" 2>/dev/null || echo "false")
+# Check if this file was consulted via mati before being read. The worktree
+# half of the receipt scope is resolved by mati itself; only the subagent id
+# lives in the payload, so forward it. Without the scope this check asks about
+# a receipt key the gate never writes and answers "false" for every read.
+AGENT_ID=$(echo "$INPUT" | jq -r '.agent_id // ""' 2>/dev/null || echo "")
+if [ -n "$AGENT_ID" ]; then
+  CONSULTED=$(mati session-check-consulted "file:$REL_PATH" --agent-id "$AGENT_ID" 2>/dev/null || echo "false")
+else
+  CONSULTED=$(mati session-check-consulted "file:$REL_PATH" 2>/dev/null || echo "false")
+fi
 if [ "$CONSULTED" = "false" ]; then
   mati log-compliance-miss "file:$REL_PATH" &>/dev/null &
 fi

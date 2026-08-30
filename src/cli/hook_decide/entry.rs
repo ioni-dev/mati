@@ -262,7 +262,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     // 6. codex-post-bash: separate flow — no evaluate(), just compliance logging.
     if args.variant == HookVariant::CodexPostBash {
-        return run_post_bash(&mati_root, &rel_path).await;
+        return run_post_bash(&mati_root, &rel_path, actor_scope.as_deref()).await;
     }
 
     // 7. Single hook_evaluate round-trip.

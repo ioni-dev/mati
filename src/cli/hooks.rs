@@ -371,14 +371,37 @@ pub async fn run_doc_capture(path: &str) -> Result<()> {
 
 // ── Boolean query hook commands ──────────────────────────────────────────────
 
-pub async fn run_session_check_consulted(key: &str) -> Result<()> {
-    hook_query_bool("session_check_consulted", serde_json::json!({ "key": key })).await
+/// The scope the gate mints receipts at, resolved the same way `hook-decide`
+/// resolves it: the worktree tag, combined with a subagent id when the caller
+/// has one.
+///
+/// A shell hook cannot compute the worktree tag (a hash of the canonical
+/// workdir), so it is computed here. Without it these checks ask about the
+/// global key `session:consulted:<key>`, which the gate never writes inside a
+/// git repo — so the answer was always "not consulted", and every post-hook
+/// built on it recorded a compliance miss for reads that had been consulted.
+fn cli_actor_scope(agent_id: Option<&str>) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id)
 }
 
-pub async fn run_session_check_consulted_recent(key: &str, ttl_secs: u64) -> Result<()> {
+pub async fn run_session_check_consulted(key: &str, agent_id: Option<&str>) -> Result<()> {
+    hook_query_bool(
+        "session_check_consulted",
+        serde_json::json!({ "key": key, "actor": cli_actor_scope(agent_id) }),
+    )
+    .await
+}
+
+pub async fn run_session_check_consulted_recent(
+    key: &str,
+    ttl_secs: u64,
+    agent_id: Option<&str>,
+) -> Result<()> {
     hook_query_bool(
         "session_check_consulted_recent",
-        serde_json::json!({ "key": key, "ttl_secs": ttl_secs }),
+        serde_json::json!({ "key": key, "ttl_secs": ttl_secs, "actor": cli_actor_scope(agent_id) }),
     )
     .await
 }

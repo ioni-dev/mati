@@ -133,6 +133,11 @@ fn default_history_limit() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct SessionCheckConsultedInput {
     pub key: String,
+    /// Receipt scope to check at. Receipts are minted actor-scoped and have no
+    /// actor-to-global fallback, so a check that omits this asks about a key
+    /// the gate never writes and always answers "not consulted".
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,6 +146,9 @@ pub struct SessionCheckConsultedRecentInput {
     pub key: String,
     #[serde(default = "default_ttl_secs")]
     pub ttl_secs: u64,
+    /// Receipt scope to check at — see [`SessionCheckConsultedInput::actor`].
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 /// Ask whether an actor still owes a consultation receipt for a file it was

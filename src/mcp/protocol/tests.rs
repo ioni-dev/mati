@@ -589,13 +589,17 @@ fn command_kind_covers_all_variants() {
         ),
         (
             "session_check_consulted",
-            Command::SessionCheckConsulted(SessionCheckConsultedInput { key: "k".into() }),
+            Command::SessionCheckConsulted(SessionCheckConsultedInput {
+                key: "k".into(),
+                actor: None,
+            }),
         ),
         (
             "session_check_consulted_recent",
             Command::SessionCheckConsultedRecent(SessionCheckConsultedRecentInput {
                 key: "k".into(),
                 ttl_secs: 900,
+                actor: None,
             }),
         ),
         (
