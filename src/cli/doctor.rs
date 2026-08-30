@@ -486,9 +486,12 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
 /// never phones home"): an auditor running `mati doctor` sees the posture
 /// directly instead of having to read the CI workflow. It is a *compile-time*
 /// attestation, deliberately NOT a runtime probe — a probe would itself be a
-/// network call, contradicting the very property being attested. The hard proof
-/// lives in CI (the build-time dep-ban + the runtime syscall audit); this row
-/// reports which build you are running.
+/// network call, contradicting the very property being attested. The proof is
+/// the `zero_network` module in `src/invariants.rs`, which scans the source for
+/// IP-socket and HTTP APIs, asserts the daemon transport is a Unix socket, and
+/// checks the default build's resolved dependency graph. That is static
+/// analysis; a syscall-level audit would be the runtime proof and does not
+/// exist. This row reports which build you are running.
 ///
 /// Accurate via `cfg!(feature = "semantic")`: the default (enforcement) build
 /// links no network/HTTP-client crate; the opt-in `semantic` feature is the one
@@ -513,9 +516,10 @@ fn collect_network_attestation() -> CheckResult {
             name: "network",
             status: Status::Pass,
             detail: "no network/HTTP-client dependency linked in this build; the \
-                     enforcement path makes no outbound connection (verified in \
-                     CI: build-time dep-ban + runtime syscall audit). mati never \
-                     phones home."
+                     enforcement path makes no outbound connection (checked by the \
+                     zero_network tests: source scan, Unix-socket transport, and \
+                     the default build's dependency graph — static analysis, not a \
+                     runtime probe). mati never phones home."
                 .into(),
             fix: None,
         }
