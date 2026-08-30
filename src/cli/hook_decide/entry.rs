@@ -195,14 +195,15 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,
         None => {
-            // Tier 1: a command naming no governed path is exactly the shape a
-            // computed filename takes (`open('ke' + 'ys.py')`). Nothing here
-            // is classified — the gate asks whether the session owes a
-            // receipt, which no construction can hide.
+            // Tier 1: an access naming no governed path is exactly the shape a
+            // computed filename takes (`open('ke' + 'ys.py')`), and the shape
+            // `Grep`/`Glob` take with no `path`. Nothing here is classified —
+            // the gate asks whether the session owes a receipt, which no
+            // construction can hide.
             if matches!(
                 args.variant,
-                HookVariant::ClaudePreBash | HookVariant::CodexPreBash
-            ) && run_bash_lockdown(&input, args.variant, agent_id).await
+                HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreRead
+            ) && run_pathless_lockdown(&input, args.variant, agent_id).await
             {
                 return Ok(());
             }
@@ -578,15 +579,19 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     }
 
     // Tier 1 session lockdown, after every file-and-policy gate had its say:
-    // an outstanding receipt denies the rest of the session's shell, including
-    // commands whose own target is ungoverned. Escalate-only, and skipped when
+    // an outstanding receipt denies the rest of the session's reads and shell,
+    // including accesses whose own target is ungoverned. A `Grep` scoped to a
+    // directory arrives here rather than at the path-less branch, because
+    // `extract_path` takes `tool_input.path`. Escalate-only, and skipped when
     // something already denied.
     if matches!(
         args.variant,
-        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreRead
     ) && !matches!(adapter.decision, Decision::Deny { .. })
     {
-        if let Some(owed) = lockdown_owed_key(&mati_root, actor_scope.as_deref()).await {
+        if let Some(owed) =
+            lockdown_owed_key(&mati_root, worktree.as_deref(), actor_scope.as_deref()).await
+        {
             let result = decide::lockdown_result(&owed);
             let events = platform_events(args.variant, &result.decision, result.events);
             let (stdout, stderr, exit_code) =

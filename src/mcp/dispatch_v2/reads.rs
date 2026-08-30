@@ -36,7 +36,8 @@ pub(super) async fn dispatch_owed_receipt(
         unreachable!("dispatch_owed_receipt only accepts SessionOwedReceipt")
     };
     let g = graph.read().await;
-    match sess::outstanding_owed(g.store(), input.actor.as_deref()).await {
+    match sess::outstanding_owed(g.store(), input.worktree.as_deref(), input.actor.as_deref()).await
+    {
         Ok(owed) => Response::ok(request_id, serde_json::json!({ "owed": owed })),
         // Fail open: an unreadable marker set must not lock the session down.
         Err(error) => Response::err(request_id, ErrorCode::StoreError, error.to_string()),

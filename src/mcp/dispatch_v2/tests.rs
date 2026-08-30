@@ -2114,6 +2114,57 @@ async fn config_set_rejects_invalid_enforcement_mode() {
     }
 }
 
+/// `enforcement.lockdown` round-trips through the same dispatcher as the other
+/// config keys, defaults to `off`, and rejects anything but `on`/`off`.
+#[tokio::test]
+async fn config_lockdown_round_trip_and_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let get = || {
+        make_request(Command::ConfigGet(ConfigGetInput {
+            key: "enforcement.lockdown".into(),
+        }))
+    };
+    match dispatch_v2(&graph, &ctx, get()).await {
+        Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("off")),
+        Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+    }
+
+    let set_req = make_request(Command::ConfigSet(ConfigSetInput {
+        key: "enforcement.lockdown".into(),
+        value: "on".into(),
+    }));
+    match dispatch_v2(&graph, &ctx, set_req).await {
+        Response::Ok { data, .. } => assert_eq!(data, serde_json::json!({ "old": "off" })),
+        Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+    }
+    match dispatch_v2(&graph, &ctx, get()).await {
+        Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("on")),
+        Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+    }
+
+    let bad = make_request(Command::ConfigSet(ConfigSetInput {
+        key: "enforcement.lockdown".into(),
+        value: "1".into(),
+    }));
+    match dispatch_v2(&graph, &ctx, bad).await {
+        Response::Err { code, .. } => assert_eq!(code, ErrorCode::ValidationFailed),
+        Response::Ok { .. } => panic!("expected ValidationFailed for a non on/off value"),
+    }
+    match dispatch_v2(&graph, &ctx, get()).await {
+        Response::Ok { data, .. } => assert_eq!(
+            data,
+            serde_json::json!("on"),
+            "rejected write must not land"
+        ),
+        Response::Err { message, .. } => panic!("expected Ok, got Err: {message}"),
+    }
+}
+
 /// Unknown config key surfaces ValidationFailed on both get and set.
 #[tokio::test]
 async fn config_unknown_key_rejected() {
@@ -2218,19 +2269,43 @@ async fn subagent_edge_without_parent_is_noop() {
 
 // ── Tier 1 session lockdown ─────────────────────────────────────────────────
 
-/// Ask the daemon what `actor` still owes.
+/// Ask the daemon what `actor` still owes for debts incurred in `worktree`.
 async fn owed_for(
     graph: &Arc<tokio::sync::RwLock<Graph>>,
     ctx: &RequestContext,
+    worktree: Option<&str>,
     actor: Option<&str>,
 ) -> serde_json::Value {
     let req = make_request(Command::SessionOwedReceipt(SessionOwedReceiptInput {
         actor: actor.map(str::to_string),
+        worktree: worktree.map(str::to_string),
     }));
     match dispatch_v2(graph, ctx, req).await {
         Response::Ok { data, .. } => data["owed"].clone(),
         Response::Err { message, .. } => panic!("owed query failed: {message}"),
     }
+}
+
+/// Mint the consultation receipt `actor` would get from its own `mem_get`.
+async fn mint_receipt(
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
+    ctx: &RequestContext,
+    key: &str,
+    actor: Option<&str>,
+) {
+    let hit = make_request(Command::ConsultationHit(ConsultationHitInput {
+        key: key.into(),
+        capture_fingerprint: false,
+        actor: actor.map(str::to_string),
+        session_id: None,
+        agent_id: None,
+        decision_basis_hash: None,
+        source: Some(ReceiptSource::MemGet),
+    }));
+    assert!(matches!(
+        dispatch_v2(graph, ctx, hit).await,
+        Response::Ok { .. }
+    ));
 }
 
 async fn log_event(
@@ -2260,7 +2335,9 @@ async fn a_deny_arms_the_lockdown_and_the_receipt_lifts_it() {
     let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
     let ctx = test_ctx(dir.path());
 
-    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt"))
+        .await
+        .is_null());
 
     log_event(
         &graph,
@@ -2270,7 +2347,10 @@ async fn a_deny_arms_the_lockdown_and_the_receipt_lifts_it() {
         Some("wt"),
     )
     .await;
-    assert_eq!(owed_for(&graph, &ctx, Some("wt")).await, "file:keys.py");
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt")).await,
+        "file:keys.py"
+    );
 
     // The consultation the deny asked for is the whole exit.
     let hit = make_request(Command::ConsultationHit(ConsultationHitInput {
@@ -2286,14 +2366,49 @@ async fn a_deny_arms_the_lockdown_and_the_receipt_lifts_it() {
         dispatch_v2(&graph, &ctx, hit).await,
         Response::Ok { .. }
     ));
-    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt"))
+        .await
+        .is_null());
 }
 
 #[tokio::test]
-async fn a_lockdown_marker_does_not_leak_across_actor_scopes() {
-    // The scope string is a worktree tag optionally `:`-joined to an agent id,
-    // so a `:`-separated marker key would make the main thread's prefix scan
-    // match its own subagents' debts.
+async fn a_parent_deny_locks_its_subagents_until_they_consult() {
+    // Measured 2026-08-30: spawning a subagent used to clear the lockdown
+    // outright. The debt was written at the parent's scope and the child
+    // scanned its own, so it found nothing and read on.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt:sub")).await,
+        "file:keys.py"
+    );
+    mint_receipt(&graph, &ctx, "file:keys.py", Some("wt:sub")).await;
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt:sub"))
+        .await
+        .is_null());
+    // The child read the record into its own context, not its parent's.
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt")).await,
+        "file:keys.py"
+    );
+}
+
+#[tokio::test]
+async fn a_subagent_deny_locks_the_whole_worktree() {
+    // Symmetric on purpose. Binding children only would leave the same escape
+    // one spawn deeper: a denied child dies, a fresh sibling starts clean.
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
     let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
@@ -2308,9 +2423,212 @@ async fn a_lockdown_marker_does_not_leak_across_actor_scopes() {
     )
     .await;
 
-    assert_eq!(owed_for(&graph, &ctx, Some("wt:sub")).await, "file:keys.py");
-    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
-    assert!(owed_for(&graph, &ctx, None).await.is_null());
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt")).await,
+        "file:keys.py"
+    );
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt:other")).await,
+        "file:keys.py"
+    );
+}
+
+#[tokio::test]
+async fn a_receipt_settles_the_debt_only_for_its_own_actor() {
+    // One marker, two actors. A receipt is proof the record entered one context
+    // window, so it must not answer for a window that never saw it.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+    mint_receipt(&graph, &ctx, "file:keys.py", Some("wt:a")).await;
+
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt:a"))
+        .await
+        .is_null());
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt:b")).await,
+        "file:keys.py"
+    );
+}
+
+/// The single owed marker: its key and the clock the TTL is measured against.
+async fn only_marker(graph: &Arc<tokio::sync::RwLock<Graph>>) -> (String, u64) {
+    let g = graph.read().await;
+    let keys = g
+        .store()
+        .scan_keys(crate::store::session::OWED_PREFIX)
+        .await
+        .unwrap();
+    assert_eq!(keys.len(), 1, "expected exactly one owed marker");
+    let record = g
+        .store()
+        .get(&keys[0])
+        .await
+        .unwrap()
+        .expect("marker record");
+    (keys[0].clone(), record.updated_at)
+}
+
+/// Move a marker's clock back, since a test cannot wait out the window.
+async fn backdate_marker(graph: &Arc<tokio::sync::RwLock<Graph>>, key: &str, secs: u64) {
+    let g = graph.read().await;
+    let mut record = g.store().get(key).await.unwrap().expect("marker record");
+    record.updated_at = record.updated_at.saturating_sub(secs);
+    g.store().put(key, &record).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_deny_after_the_window_re_arms_the_lockdown() {
+    // Create-once used to mean once per session. An expired marker was
+    // invisible to `outstanding_owed`, which skips it as stale, and present to
+    // `record_owed_receipt`, which returned early on finding it — so once a
+    // window lapsed, that file could never lock the session down again.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt")).await,
+        "file:keys.py"
+    );
+
+    let (marker, _) = only_marker(&graph).await;
+    backdate_marker(
+        &graph,
+        &marker,
+        crate::store::session::OWED_RECEIPT_TTL_SECS + 1,
+    )
+    .await;
+    assert!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt"))
+            .await
+            .is_null(),
+        "the window must lift the lockdown on its own"
+    );
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt")).await,
+        "file:keys.py",
+        "a deny after the window is a new deny, not a retry"
+    );
+}
+
+#[tokio::test]
+async fn a_repeat_deny_inside_the_window_does_not_refresh_the_marker() {
+    // The other half of create-once, and the reason the fix above is scoped to
+    // expired markers: an agent that keeps tripping the same deny must not be
+    // able to push its own TTL out indefinitely.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+
+    // Aged, but not past the window: still live, so the retry must not touch it.
+    let (marker, _) = only_marker(&graph).await;
+    backdate_marker(&graph, &marker, 60).await;
+    let (_, aged) = only_marker(&graph).await;
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+
+    let (_, after) = only_marker(&graph).await;
+    assert_eq!(
+        after, aged,
+        "a repeat deny inside the window must leave the debt clock alone"
+    );
+}
+
+#[tokio::test]
+async fn a_debt_in_another_worktree_does_not_lock_this_one() {
+    // Worktrees share history but not working-tree content, so the same path
+    // can hold different bytes. A debt stops at the tree that incurred it.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("other"),
+    )
+    .await;
+
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt"))
+        .await
+        .is_null());
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt:sub"))
+        .await
+        .is_null());
+}
+
+#[tokio::test]
+async fn an_owed_query_without_a_worktree_scans_at_the_actor_scope() {
+    // An older hook binary sends no worktree. It must keep the behaviour it
+    // shipped with rather than scan every scope in the store.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(Graph::load(store).await.unwrap()));
+    let ctx = test_ctx(dir.path());
+
+    log_event(
+        &graph,
+        &ctx,
+        SessionEvent::ComplianceMiss,
+        "file:keys.py",
+        Some("wt"),
+    )
+    .await;
+
+    assert_eq!(
+        owed_for(&graph, &ctx, None, Some("wt")).await,
+        "file:keys.py"
+    );
+    assert!(owed_for(&graph, &ctx, None, Some("wt:sub")).await.is_null());
 }
 
 #[tokio::test]
@@ -2330,7 +2648,9 @@ async fn a_policy_deny_does_not_arm_the_lockdown() {
         Some("wt"),
     )
     .await;
-    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt"))
+        .await
+        .is_null());
 }
 
 #[tokio::test]
@@ -2350,13 +2670,18 @@ async fn clearing_consults_clears_the_lockdown() {
         Some("wt"),
     )
     .await;
-    assert_eq!(owed_for(&graph, &ctx, Some("wt")).await, "file:keys.py");
+    assert_eq!(
+        owed_for(&graph, &ctx, Some("wt"), Some("wt")).await,
+        "file:keys.py"
+    );
 
     assert!(matches!(
         dispatch_v2(&graph, &ctx, make_request(Command::SessionClearConsults)).await,
         Response::Ok { .. }
     ));
-    assert!(owed_for(&graph, &ctx, Some("wt")).await.is_null());
+    assert!(owed_for(&graph, &ctx, Some("wt"), Some("wt"))
+        .await
+        .is_null());
 }
 
 #[tokio::test]

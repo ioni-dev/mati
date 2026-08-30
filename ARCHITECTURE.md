@@ -544,7 +544,9 @@ Decisions are evaluated in this order:
 
 ### 10.1a Session lockdown (Tier 1)
 
-Off by default. Set `MATI_LOCKDOWN=1` in the hook process to switch it on.
+Off by default. Turn it on with `mati config set enforcement.lockdown on`.
+`MATI_LOCKDOWN=1` (or `0`) in the hook process overrides the stored value
+for that invocation, in either direction.
 
 Every gate in 10.1 asks which file a command touches. For a `PreToolUse` hook
 that question is undecidable: it receives a command string and must answer
@@ -560,22 +562,45 @@ receipt?
   `session:owed:<actor>|<file_key>`. A policy deny does not: a policy key is
   not consultable, so arming on it would produce a lockdown no `mem_get` could
   lift.
-- While any marker is unsettled, every Bash command denies, whatever it names.
-  Nothing is parsed, so a computed filename has nothing to defeat.
-- The marker settles when the receipt for its key exists at the same actor
-  scope. `mem_get` is the only route — it is not a shell command, so no command
-  is exempt from the deny, `mati` included.
-- Markers are created once, not refreshed, so a retrying agent cannot hold its
-  own lockdown open. They expire after `OWED_RECEIPT_TTL_SECS` (900s, the shell
-  gate's receipt TTL), and are cleared wholesale on PostCompact and at daemon
+- While any marker is unsettled, every Bash command and every `Read`, `Grep`
+  and `Glob` denies, whatever it names. Nothing is parsed, so a computed
+  filename has nothing to defeat. Two branches carry it: a `Grep`/`Glob` with
+  no `path` reaches the path-less branch, while a directory-scoped `Grep` and a
+  plain `Read` reach the file gate, because `extract_path` takes
+  `tool_input.path`. Both deny; the gotcha deny wins where it also fires.
+- The debt is scoped to the worktree, not to the actor that incurred it: the
+  scan stops at the worktree tag, so it covers the main thread's markers
+  (`session:owed:<wt>|…`) and its subagents' (`session:owed:<wt>:<agent>|…`)
+  alike. A parent's deny binds its subagents and a subagent's binds its
+  parent. Measured 2026-08-30, before this: a lockdown armed in either scope
+  allowed every read from the other, on both branches — spawning a subagent
+  cleared it outright.
+- Settling stays per actor. The marker lifts for an actor once the receipt for
+  its key exists at that actor's scope, because a receipt is proof the record
+  entered *that* context window and a subagent's `mem_get` puts nothing in its
+  parent's. So one marker can be settled for the child and still owed by the
+  parent. `mem_get` is the only route — it is not a shell command, so no
+  command is exempt from the deny, `mati` included.
+- Markers are created once per window, not refreshed, so a retrying agent
+  cannot hold its own lockdown open. They expire after `OWED_RECEIPT_TTL_SECS`
+  (900s, the shell gate's receipt TTL); a deny after that window re-arms,
+  because the arming sweep drops the lapsed marker before the create-once
+  check reads it. Markers are cleared wholesale on PostCompact and at daemon
   start along with the receipts.
-- The query is one pure daemon read (`session_owed_receipt`), and every fault
-  path allows (P9).
+- The query is two pure daemon reads — `config_get` for the switch, then
+  `session_owed_receipt` when it is on. `MATI_LOCKDOWN` skips the first.
+  Every fault path allows (P9).
 
 Known holes: an agent that never triggers a deny is never locked down (the
-first command can still be a computed path); the deny only covers Bash, so the
-`Read` tool on an unrelated file stays governed by 10.1 alone; and 15 minutes
-of not consulting lifts the lockdown without one.
+first command can still be a computed path); edits are not covered, so `Edit`
+and `Write` stay governed by 10.1 alone; a subagent spawned into its own git
+worktree carries a different tag and so escapes the debt, which is the price
+of worktree scoping — the same path can hold different bytes there; 15 minutes
+of not consulting lifts the lockdown without one; and the switch is a stored
+value, so `mati config set enforcement.lockdown off` disarms it — only before
+the first deny, since every command denies once a marker is unsettled. That is
+the same class of hole as `mati daemon stop`, which fail-open (P9) makes
+structural.
 
 ### 10.2 Command Classification (pre-bash)
 

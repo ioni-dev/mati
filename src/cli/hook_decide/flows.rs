@@ -18,25 +18,51 @@ pub(crate) async fn ensure_daemon(mati_root: &Path) -> bool {
 
 /// Is the Tier 1 session lockdown switched on for this invocation?
 ///
-/// Read per hook process, not per daemon, so flipping it needs no restart.
-/// Default off: the lockdown denies unrelated commands by design, so it is the
-/// operator's call, not mati's.
-fn lockdown_enabled() -> bool {
-    matches!(
-        std::env::var("MATI_LOCKDOWN").as_deref(),
-        Ok("1" | "on" | "true")
+/// `MATI_LOCKDOWN` decides on its own when set, in either direction — it is
+/// the per-process override the lab uses and the way out when the daemon holds
+/// a value you cannot reach. Unset, the stored `enforcement.lockdown` key
+/// decides, read per hook process so flipping it needs no restart. Default off
+/// on every fault path: the lockdown denies unrelated reads and commands by
+/// design, so it is the operator's call, not mati's.
+///
+/// Callers must have ensured the daemon first; the config read is a plain
+/// daemon round trip.
+async fn lockdown_enabled(mati_root: &Path) -> bool {
+    match std::env::var("MATI_LOCKDOWN").as_deref() {
+        Ok("1" | "on" | "true") => return true,
+        Ok("0" | "off" | "false") => return false,
+        _ => {}
+    }
+    let response = match super::daemon::daemon_v2(
+        mati_root,
+        mati_core::mcp::protocol::Command::ConfigGet(mati_core::mcp::protocol::ConfigGetInput {
+            key: "enforcement.lockdown".to_string(),
+        }),
     )
+    .await
+    {
+        DaemonResult::Ok(response) => response,
+        _ => return false,
+    };
+    daemon_data(&response).is_some_and(|value| value.as_str() == Some("on"))
 }
 
-/// The file this session was denied and still owes a receipt for.
+/// The file this worktree was denied that `actor` still owes a receipt for.
+///
+/// `worktree` scopes the debt and `actor` settles it, so a subagent inherits
+/// its parent's lockdown and lifts it only with its own `mem_get`.
 ///
 /// `None` when the lockdown is off or the daemon says nothing is owed, and on
-/// every daemon fault — an unreachable daemon must not deny (P9). No command is
-/// exempt, `mati` included: the receipt that lifts the lockdown is minted by
-/// `mem_get`, which is not a shell command, so exempting one would only open a
-/// route without opening the exit.
-pub(crate) async fn lockdown_owed_key(mati_root: &Path, actor: Option<&str>) -> Option<String> {
-    if !lockdown_enabled() {
+/// every daemon fault — an unreachable daemon must not deny (P9). No command or
+/// read is exempt, `mati` included: the receipt that lifts the lockdown is
+/// minted by `mem_get`, which is neither a shell command nor a read tool, so
+/// exempting one would only open a route without opening the exit.
+pub(crate) async fn lockdown_owed_key(
+    mati_root: &Path,
+    worktree: Option<&str>,
+    actor: Option<&str>,
+) -> Option<String> {
+    if !lockdown_enabled(mati_root).await {
         return None;
     }
     let response = match super::daemon::daemon_v2(
@@ -44,6 +70,7 @@ pub(crate) async fn lockdown_owed_key(mati_root: &Path, actor: Option<&str>) -> 
         mati_core::mcp::protocol::Command::SessionOwedReceipt(
             mati_core::mcp::protocol::SessionOwedReceiptInput {
                 actor: actor.map(str::to_string),
+                worktree: worktree.map(str::to_string),
             },
         ),
     )
@@ -58,19 +85,17 @@ pub(crate) async fn lockdown_owed_key(mati_root: &Path, actor: Option<&str>) -> 
         .map(str::to_string)
 }
 
-/// Emit the lockdown deny for a Bash command that reached no file gate.
+/// Emit the lockdown deny for an access that reached no file gate — a Bash
+/// command naming no path, or a `Grep`/`Glob` with no `path`.
 ///
 /// Self-contained like [`run_fileless_policy`]: it resolves its own repo
 /// identity because the path-less branch returns before `run_inner` has done
 /// so. Returns whether it denied.
-pub(crate) async fn run_bash_lockdown(
+pub(crate) async fn run_pathless_lockdown(
     input: &serde_json::Value,
     variant: HookVariant,
     agent_id: Option<&str>,
 ) -> bool {
-    if !lockdown_enabled() {
-        return false;
-    }
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
@@ -84,7 +109,9 @@ pub(crate) async fn run_bash_lockdown(
     let worktree = mati_core::store::session::worktree_scope_tag_for(&repo_ident);
     let actor_scope =
         mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id);
-    let Some(owed) = lockdown_owed_key(&mati_root, actor_scope.as_deref()).await else {
+    let Some(owed) =
+        lockdown_owed_key(&mati_root, worktree.as_deref(), actor_scope.as_deref()).await
+    else {
         return false;
     };
 

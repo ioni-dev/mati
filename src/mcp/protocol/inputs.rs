@@ -156,9 +156,16 @@ pub struct SessionCheckConsultedRecentInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionOwedReceiptInput {
-    /// Receipt scope of the caller, exactly as the gate evaluates it.
+    /// Receipt scope of the caller, exactly as the gate evaluates it. This is
+    /// what settles the debt: a receipt is per context window, so only this
+    /// actor's own consultation lifts the lockdown for it.
     #[serde(default)]
     pub actor: Option<String>,
+    /// Worktree tag the debt is scoped to, so a deny by any actor in this
+    /// worktree binds the others. Absent from an older hook binary, which
+    /// leaves the scan at the actor scope it used to run at.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 fn default_ttl_secs() -> u64 {

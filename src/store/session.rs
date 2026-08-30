@@ -741,10 +741,10 @@ pub const OWED_PREFIX: &str = "session:owed:";
 /// the receipt that would have settled it.
 pub const OWED_RECEIPT_TTL_SECS: u64 = CONSULTED_RECENT_TTL_SECS;
 
-/// `session:owed:<actor>|<key>`. `|` separates scope from key because an actor
-/// scope is a worktree tag optionally `:`-joined to an agent id: a `:`
-/// separator would make the main thread's prefix scan match its subagents'
-/// markers too.
+/// `session:owed:<actor>|<key>`. `|` separates scope from key so that a scan
+/// stops at the scope boundary: an actor scope is a worktree tag optionally
+/// `:`-joined to an agent id, and without the terminator a scan for one scope
+/// would cross-match a key that merely starts the same way.
 fn owed_key(key: &str, actor: Option<&str>) -> String {
     format!("{}{key}", owed_scan_prefix(actor))
 }
@@ -753,31 +753,42 @@ fn owed_scan_prefix(actor: Option<&str>) -> String {
     format!("{OWED_PREFIX}{}|", actor.unwrap_or("-"))
 }
 
+/// The prefix covering every debt in one worktree: the main thread's markers
+/// (`session:owed:<wt>|…`) and its subagents' (`session:owed:<wt>:<agent>|…`)
+/// alike. Stopping before the `|` is what widens the scan, and the worktree tag
+/// is a fixed-width hex digest, so a prefix match on it is tag equality — no
+/// other worktree can be caught by it.
+///
+/// Outside a git repo there is no tag, and a bare `session:owed:` prefix would
+/// scan every scope in the store, so that case falls back to the actor scope.
+fn owed_debt_scan_prefix(worktree: Option<&str>, actor: Option<&str>) -> String {
+    match worktree {
+        Some(worktree) => format!("{OWED_PREFIX}{worktree}"),
+        None => owed_scan_prefix(actor),
+    }
+}
+
 /// Record that `actor` was denied `key` and owes its consultation receipt.
 ///
-/// Expired and already-settled markers for the same actor are dropped in the
-/// same pass. That is what bounds the scan [`outstanding_owed`] runs on every
-/// Bash command.
+/// Expired markers for the same actor are dropped in the same pass, which is
+/// what bounds the scan [`outstanding_owed`] runs on every Bash command.
+/// Already-settled ones are not: settlement is per actor, so a marker this
+/// actor has consulted may be the only thing still holding another actor's
+/// lockdown.
 pub async fn record_owed_receipt(store: &Store, key: &str, actor: Option<&str>) -> Result<()> {
     let prefix = owed_scan_prefix(actor);
     let now = now_secs();
     for record in store.scan_prefix(&prefix).await? {
-        let Some(owed) = record.key.strip_prefix(&prefix) else {
-            continue;
-        };
-        if owed == key {
-            continue;
-        }
-        if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS
-            || check_consulted(store, owed, actor).await?
-        {
+        if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS {
             store.delete(&record.key).await?;
         }
     }
     let marker_key = owed_key(key, actor);
-    // Create-once: the debt window runs from the first deny. Refreshing it on
-    // every repeat deny would let an agent that keeps retrying hold its own
-    // lockdown open indefinitely.
+    // Create-once per window, not per session: the debt runs from the first
+    // deny, so an agent that keeps retrying cannot refresh its way into an
+    // endless lockdown. The sweep above already dropped this key's marker if
+    // the window had passed, so a deny after it re-arms rather than finding a
+    // marker `outstanding_owed` will skip as stale and never lock down again.
     if store.get(&marker_key).await?.is_some() {
         return Ok(());
     }
@@ -785,14 +796,25 @@ pub async fn record_owed_receipt(store: &Store, key: &str, actor: Option<&str>) 
     store.put(&marker_key, &record).await
 }
 
-/// The most recently denied key this actor still has not consulted.
+/// The most recently denied key in `worktree` that `actor` has not consulted.
+///
+/// The two scopes differ on purpose. The debt is worktree-wide: it records that
+/// this worktree was denied, and spawning a fresh context window does not
+/// un-happen that, so a parent's deny binds its subagents and a subagent's
+/// binds its parent. Settlement stays per actor, because a receipt proves the
+/// record entered *that* context window and a subagent's `mem_get` puts nothing
+/// in its parent's.
 ///
 /// `None` when nothing is owed: no marker, all expired, or every one settled by
-/// a receipt. This is the decidable question the lockdown asks instead of "does
-/// this command touch file X" — a computed filename is invisible to a
-/// classifier and irrelevant here.
-pub async fn outstanding_owed(store: &Store, actor: Option<&str>) -> Result<Option<String>> {
-    let prefix = owed_scan_prefix(actor);
+/// a receipt this actor holds. This is the decidable question the lockdown asks
+/// instead of "does this command touch file X" — a computed filename is
+/// invisible to a classifier and irrelevant here.
+pub async fn outstanding_owed(
+    store: &Store,
+    worktree: Option<&str>,
+    actor: Option<&str>,
+) -> Result<Option<String>> {
+    let prefix = owed_debt_scan_prefix(worktree, actor);
     let now = now_secs();
     let mut markers = store.scan_prefix(&prefix).await?;
     markers.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
@@ -800,7 +822,11 @@ pub async fn outstanding_owed(store: &Store, actor: Option<&str>) -> Result<Opti
         if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS {
             continue;
         }
-        let Some(owed) = record.key.strip_prefix(&prefix) else {
+        // Split on the FIRST `|`, not the caller's prefix: the scan spans
+        // several actor scopes and each has its own prefix length. The scope
+        // is the leading field, so this is exact as long as no agent id
+        // contains a `|` — a record key may, since a path can.
+        let Some((_, owed)) = record.key.split_once('|') else {
             continue;
         };
         if !check_consulted(store, owed, actor).await? {
@@ -2079,6 +2105,17 @@ fn main() {}",
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "-q", "-m", "init"]);
         dir
+    }
+
+    /// The debt scan matches a worktree tag with no terminator after it, so
+    /// the tag must be fixed width or one tree's prefix could catch another's
+    /// markers. `hex::encode` of four bytes is always eight characters.
+    #[test]
+    fn a_worktree_scope_tag_is_always_eight_hex_characters() {
+        let main = temp_repo_for_worktrees();
+        let tag = worktree_scope_tag(main.path()).expect("main tag");
+        assert_eq!(tag.len(), 8, "tag width is what makes the debt scan exact");
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// The common layout: `git worktree add ../feature`. The worktree's own

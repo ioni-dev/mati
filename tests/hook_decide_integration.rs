@@ -1947,3 +1947,381 @@ fn hook_decide_command_observed_glob_boundary() {
     );
     eprintln!("[command-observed] glob boundary -- correct");
 }
+
+// ── Tier 1 session lockdown on the read gate ────────────────────────────────
+
+/// `hook-decide claude-pre-read` with the lockdown armed. Returns stdout.
+fn locked_read(bin: &Path, repo: &Path, home: &Path, tool_input: &str) -> String {
+    pre_read(bin, repo, home, tool_input, Some("1"))
+}
+
+/// `locked_read` from a subagent: the payload carries a top-level `agent_id`,
+/// which is the only thing distinguishing a subagent's hook call from the main
+/// thread's.
+fn locked_read_as(bin: &Path, repo: &Path, home: &Path, tool_input: &str, agent: &str) -> String {
+    pre_read_as(bin, repo, home, tool_input, Some("1"), Some(agent))
+}
+
+/// `hook-decide claude-pre-read`, with `MATI_LOCKDOWN` set only when given.
+/// `None` leaves the hook to read `enforcement.lockdown` from the store.
+fn pre_read(
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    tool_input: &str,
+    lockdown_env: Option<&str>,
+) -> String {
+    pre_read_as(bin, repo, home, tool_input, lockdown_env, None)
+}
+
+fn pre_read_as(
+    bin: &Path,
+    repo: &Path,
+    home: &Path,
+    tool_input: &str,
+    lockdown_env: Option<&str>,
+    agent_id: Option<&str>,
+) -> String {
+    let agent = agent_id
+        .map(|id| format!(r#""agent_id":"{id}","#))
+        .unwrap_or_default();
+    let payload = format!(r#"{{"session_id":"lockdown",{agent}"tool_input":{tool_input}}}"#);
+    let mut cmd = Command::new(bin);
+    if let Some(value) = lockdown_env {
+        cmd.env("MATI_LOCKDOWN", value);
+    }
+    let mut child = cmd
+        .args(["hook-decide", "claude-pre-read"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn mati");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(payload.as_bytes()).expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("wait for mati");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The lockdown must cover the read tools, not only Bash.
+///
+/// Two branches reach it, and each one used to allow: `Grep`/`Glob` with no
+/// `path` take the path-less branch, while `Grep {path: <dir>}` and a plain
+/// `Read` take the file gate — `extract_path` reads `tool_input.path`, so a
+/// directory-scoped search never reaches the path-less branch. Both routes
+/// disclose a denied file's content; neither names it.
+#[test]
+#[ignore]
+fn lockdown_denies_every_read_until_the_receipt_is_minted() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+    assert_eq!(run(&bin, repo, home, &["ping"]).code, 0, "ping after init");
+
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "gotcha",
+            "add",
+            "src/test.rs",
+            "-r",
+            "Never bypass auth token validation",
+            "-m",
+            "Skipping validation allows unauthorized access to protected endpoints",
+        ],
+    );
+    assert_eq!(r.code, 0, "gotcha add failed:\n{}\n{}", r.stdout, r.stderr);
+    assert_eq!(
+        run(&bin, repo, home, &["ping"]).code,
+        0,
+        "ping after gotcha"
+    );
+
+    // Ungoverned, and written after `init` so it carries no file record at all.
+    std::fs::write(repo.join("src/other.rs"), "fn other() {}\n").expect("write other.rs");
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable within 5 seconds",
+    );
+
+    // Arm: the gotcha deny writes the owed marker.
+    let armed = locked_read(&bin, repo, home, r#"{"file_path":"src/test.rs"}"#);
+    assert!(
+        armed.contains(r#""permissionDecision":"deny""#),
+        "the gotcha read deny must arm the lockdown, got: {armed}"
+    );
+
+    let repo_str = repo.to_str().expect("repo path is UTF-8");
+    for (label, tool_input) in [
+        ("Grep with no path", r#"{"pattern":"token"}"#.to_string()),
+        ("Glob with no path", r#"{"pattern":"**/*.rs"}"#.to_string()),
+        (
+            "Grep scoped to the repo",
+            format!(r#"{{"pattern":"token","path":"{repo_str}"}}"#),
+        ),
+        (
+            "Read of an ungoverned file",
+            r#"{"file_path":"src/other.rs"}"#.to_string(),
+        ),
+    ] {
+        let out = locked_read(&bin, repo, home, &tool_input);
+        assert!(
+            out.contains(r#""permissionDecision":"deny""#) && out.contains("Session locked"),
+            "{label} must be denied while the session owes a receipt, got: {out}"
+        );
+    }
+
+    // The receipt lifts it. `mem_get` is the only route that settles the owed
+    // marker — `mati explain` mints the file-gate receipt but not this one.
+    let minted = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-post-memget"],
+        r#"{"session_id":"lockdown","tool_input":{"key":"file:src/test.rs"}}"#,
+    );
+    assert_eq!(minted.code, 0, "post-memget failed:\n{}", minted.stderr);
+
+    let out = locked_read(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#);
+    assert!(
+        !out.contains("Session locked"),
+        "the receipt must lift the lockdown, got: {out}"
+    );
+    eprintln!("[lockdown] read gate denies all four routes, receipt lifts -- correct");
+}
+
+/// Spawning a subagent must not clear the lockdown.
+///
+/// Measured 2026-08-30, before the fix: a parent-armed lockdown allowed every
+/// read carrying an `agent_id`, on both branches and in both directions. The
+/// debt was keyed at the acting scope, so a fresh context window scanned a
+/// prefix nothing had ever been written under. The debt is worktree-wide now;
+/// settling it stays per actor, because a receipt is proof the record entered
+/// one context window and the child's `mem_get` puts nothing in its parent's.
+#[test]
+#[ignore]
+fn lockdown_survives_a_subagent_spawn() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "gotcha",
+            "add",
+            "src/test.rs",
+            "-r",
+            "Never bypass auth token validation",
+            "-m",
+            "Skipping validation allows unauthorized access to protected endpoints",
+        ],
+    );
+    assert_eq!(r.code, 0, "gotcha add failed:\n{}\n{}", r.stdout, r.stderr);
+
+    // Ungoverned, so only the lockdown can deny a read of it.
+    std::fs::write(repo.join("src/other.rs"), "fn other() {}\n").expect("write other.rs");
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable within 5 seconds",
+    );
+
+    let armed = locked_read(&bin, repo, home, r#"{"file_path":"src/test.rs"}"#);
+    assert!(
+        armed.contains(r#""permissionDecision":"deny""#),
+        "the gotcha read deny must arm the lockdown, got: {armed}"
+    );
+
+    // Both branches, from a subagent that never saw the deny.
+    for (label, tool_input) in [
+        (
+            "Read of an ungoverned file",
+            r#"{"file_path":"src/other.rs"}"#,
+        ),
+        ("Grep with no path", r#"{"pattern":"token"}"#),
+    ] {
+        let out = locked_read_as(&bin, repo, home, tool_input, "sub-1");
+        assert!(
+            out.contains(r#""permissionDecision":"deny""#) && out.contains("Session locked"),
+            "{label} from a subagent must inherit the parent's lockdown, got: {out}"
+        );
+    }
+
+    // The subagent's own consultation lifts it for the subagent.
+    let minted = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-post-memget"],
+        r#"{"session_id":"lockdown","agent_id":"sub-1","tool_input":{"key":"file:src/test.rs"}}"#,
+    );
+    assert_eq!(minted.code, 0, "post-memget failed:\n{}", minted.stderr);
+    let out = locked_read_as(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#, "sub-1");
+    assert!(
+        !out.contains("Session locked"),
+        "the subagent's own receipt must lift its lockdown, got: {out}"
+    );
+
+    // ...and for nobody else. A sibling spawned after it is the same escape one
+    // level deeper, and the parent still has not read the record.
+    let out = locked_read_as(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#, "sub-2");
+    assert!(
+        out.contains("Session locked"),
+        "a sibling subagent must still owe the receipt, got: {out}"
+    );
+    let out = locked_read(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#);
+    assert!(
+        out.contains("Session locked"),
+        "the parent must still owe the receipt its child settled, got: {out}"
+    );
+
+    let minted = run_with_stdin(
+        &bin,
+        repo,
+        home,
+        &["hook-decide", "claude-post-memget"],
+        r#"{"session_id":"lockdown","tool_input":{"key":"file:src/test.rs"}}"#,
+    );
+    assert_eq!(minted.code, 0, "post-memget failed:\n{}", minted.stderr);
+    let out = locked_read(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#);
+    assert!(
+        !out.contains("Session locked"),
+        "the parent's own receipt must lift its lockdown, got: {out}"
+    );
+    eprintln!("[lockdown] a subagent inherits the debt and settles only its own -- correct");
+}
+
+/// The lockdown is a stored setting, not an environment variable.
+///
+/// `mati config set enforcement.lockdown on` must arm it for a hook process
+/// that has no `MATI_LOCKDOWN` at all, and `MATI_LOCKDOWN=0` must still switch
+/// it off for one invocation — the override has to work in both directions or
+/// a stored `on` with an unreachable operator has no way out.
+#[test]
+#[ignore]
+fn lockdown_arms_from_the_config_key_and_the_env_var_overrides_it() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir) = setup_repo();
+    let repo = repo_dir.path();
+    let home = home_dir.path();
+
+    let r = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert_eq!(r.code, 0, "mati init failed:\n{}\n{}", r.stdout, r.stderr);
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &[
+            "gotcha",
+            "add",
+            "src/test.rs",
+            "-r",
+            "Never bypass auth token validation",
+            "-m",
+            "Skipping validation allows unauthorized access to protected endpoints",
+        ],
+    );
+    assert_eq!(r.code, 0, "gotcha add failed:\n{}\n{}", r.stdout, r.stderr);
+    std::fs::write(repo.join("src/other.rs"), "fn other() {}\n").expect("write other.rs");
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn daemon");
+    let _guard = ChildGuard(daemon);
+    assert!(
+        wait_for_daemon(&bin, repo, home, Duration::from_secs(5)),
+        "daemon did not become reachable within 5 seconds",
+    );
+
+    let r = run(&bin, repo, home, &["config", "get", "enforcement.lockdown"]);
+    assert_eq!(r.code, 0, "config get failed:\n{}", r.stderr);
+    assert_eq!(r.stdout.trim(), "off", "the lockdown must default to off");
+
+    // The gotcha deny writes the owed marker whether or not the lockdown is on.
+    let armed = pre_read(&bin, repo, home, r#"{"file_path":"src/test.rs"}"#, None);
+    assert!(
+        armed.contains(r#""permissionDecision":"deny""#),
+        "the gotcha read deny must arm the lockdown, got: {armed}"
+    );
+
+    let off = pre_read(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#, None);
+    assert!(
+        !off.contains("Session locked"),
+        "with the config off and no env var, an ungoverned read must allow, got: {off}"
+    );
+
+    let r = run(
+        &bin,
+        repo,
+        home,
+        &["config", "set", "enforcement.lockdown", "on"],
+    );
+    assert_eq!(r.code, 0, "config set failed:\n{}", r.stderr);
+
+    let on = pre_read(&bin, repo, home, r#"{"file_path":"src/other.rs"}"#, None);
+    assert!(
+        on.contains(r#""permissionDecision":"deny""#) && on.contains("Session locked"),
+        "the config key alone must arm the lockdown, got: {on}"
+    );
+
+    let overridden = pre_read(
+        &bin,
+        repo,
+        home,
+        r#"{"file_path":"src/other.rs"}"#,
+        Some("0"),
+    );
+    assert!(
+        !overridden.contains("Session locked"),
+        "MATI_LOCKDOWN=0 must switch a stored `on` off for the invocation, got: {overridden}"
+    );
+    eprintln!("[lockdown] config key arms it, env var overrides both ways -- correct");
+}

@@ -36,7 +36,7 @@ pub(super) use events_output::{
     log_fail_open_named, platform_events, process_eval_response, AdapterResult, EvalDataCheck,
 };
 pub(super) use flows::{
-    ensure_daemon, lockdown_owed_key, run_apply_patch, run_bash_lockdown, run_post_bash,
+    ensure_daemon, lockdown_owed_key, run_apply_patch, run_pathless_lockdown, run_post_bash,
     run_post_bash_introspection, run_post_memget, run_post_task,
 };
 pub(super) use path::{

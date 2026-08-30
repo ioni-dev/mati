@@ -108,6 +108,45 @@ pub async fn set_policy_mode(store: &Store, mode: EnforcementMode) -> Result<Enf
     Ok(old)
 }
 
+/// Store key for the Tier 1 session lockdown switch.
+const LOCKDOWN_KEY: &str = "enforcement:lockdown";
+
+/// Read the Tier 1 session lockdown switch. Off unless explicitly turned on:
+/// the lockdown denies unrelated reads and commands by design, so it is the
+/// operator's call, not mati's.
+pub async fn get_lockdown(store: &Store) -> bool {
+    matches!(
+        store.get_raw_bytes(LOCKDOWN_KEY).await,
+        Ok(Some(bytes)) if bytes.as_slice() == b"on"
+    )
+}
+
+/// Persist the lockdown switch and return the previous value.
+pub async fn set_lockdown(store: &Store, on: bool) -> Result<bool> {
+    let old = get_lockdown(store).await;
+    let value = if on { "on" } else { "off" };
+    store.put_raw(LOCKDOWN_KEY, value.as_bytes()).await?;
+    if old != on {
+        let label = |on: bool| if on { "on" } else { "off" };
+        let _ = record_event(
+            store,
+            EnforcementEventType::EnforcementConfigChanged {
+                setting: "enforcement.lockdown".to_string(),
+                old_value: label(old).to_string(),
+                new_value: label(on).to_string(),
+            },
+            SubjectKind::Config,
+            LOCKDOWN_KEY.to_string(),
+            "developer".to_string(),
+            None,
+            "config_changed".to_string(),
+            None,
+        )
+        .await;
+    }
+    Ok(old)
+}
+
 /// Read the configured retention period in days.
 pub async fn get_retention_days(store: &Store) -> u64 {
     match store.get_raw_bytes(RETENTION_DAYS_KEY).await {

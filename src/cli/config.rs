@@ -7,6 +7,8 @@
 //! mati config set enforcement.retention 365
 //! mati config get policy.mode
 //! mati config set policy.mode advisory
+//! mati config get enforcement.lockdown
+//! mati config set enforcement.lockdown on
 //! ```
 
 use anyhow::Result;
@@ -25,18 +27,19 @@ const CONFIG_KEYS: &[&str] = &[
     "audit.write_durability",
     "enforcement.retention",
     "policy.mode",
+    "enforcement.lockdown",
 ];
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
     /// Get a configuration value
     Get {
-        /// Configuration key (e.g., audit.write_durability, enforcement.retention, policy.mode)
+        /// Configuration key (e.g., audit.write_durability, enforcement.retention, enforcement.lockdown, policy.mode)
         key: String,
     },
     /// Set a configuration value
     Set {
-        /// Configuration key (e.g., audit.write_durability, enforcement.retention, policy.mode)
+        /// Configuration key (e.g., audit.write_durability, enforcement.retention, enforcement.lockdown, policy.mode)
         key: String,
         /// Value to set
         value: String,
@@ -94,6 +97,13 @@ async fn run_set(proxy: &StoreProxy, key: &str, value: &str) -> Result<()> {
         "policy.mode" => {
             println!("policy.mode: {value}");
         }
+        "enforcement.lockdown" => {
+            if old == value {
+                println!("enforcement.lockdown is already {value}");
+            } else {
+                println!("enforcement.lockdown: {old} → {value}");
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -106,5 +116,10 @@ mod tests {
     #[test]
     fn config_dump_includes_policy_mode() {
         assert!(CONFIG_KEYS.contains(&"policy.mode"));
+    }
+
+    #[test]
+    fn config_dump_includes_lockdown() {
+        assert!(CONFIG_KEYS.contains(&"enforcement.lockdown"));
     }
 }

@@ -62,6 +62,28 @@ async fn policy_mode_unrecognized_value_is_strict() {
     assert_eq!(get_policy_mode(&store).await, EnforcementMode::Strict);
 }
 
+/// The lockdown is off unless the key literally says `on`. Anything else —
+/// absent, empty, a stale `true` — must not arm a control that denies every
+/// read and command in the session.
+#[tokio::test]
+async fn lockdown_is_off_unless_the_key_says_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    assert!(!get_lockdown(&store).await, "absent key must be off");
+
+    assert!(!set_lockdown(&store, true).await.unwrap(), "old value");
+    assert!(get_lockdown(&store).await);
+
+    assert!(set_lockdown(&store, false).await.unwrap(), "old value");
+    assert!(!get_lockdown(&store).await);
+
+    store
+        .put_raw("enforcement:lockdown", b"true")
+        .await
+        .unwrap();
+    assert!(!get_lockdown(&store).await, "only `on` arms the lockdown");
+}
+
 /// Construct a deterministic event for hash testing.
 fn frozen_test_event() -> EnforcementEvent {
     EnforcementEvent {

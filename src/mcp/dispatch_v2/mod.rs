@@ -276,8 +276,8 @@ fn is_config_command(cmd: &Command) -> bool {
 /// audit trail for config mutations.
 async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
     use crate::store::enforcement::{
-        get_enforcement_mode, get_policy_mode, get_retention_days, set_enforcement_mode,
-        set_policy_mode, set_retention_days, EnforcementMode,
+        get_enforcement_mode, get_lockdown, get_policy_mode, get_retention_days,
+        set_enforcement_mode, set_lockdown, set_policy_mode, set_retention_days, EnforcementMode,
     };
 
     let request_id = req.id;
@@ -299,12 +299,17 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                     EnforcementMode::Advisory => "advisory".to_string(),
                     EnforcementMode::Strict => "strict".to_string(),
                 },
+                "enforcement.lockdown" => if get_lockdown(store).await {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                },
                 other => {
                     return Response::err(
                         request_id,
                         ErrorCode::ValidationFailed,
                         format!(
-                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode"
+                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode, enforcement.lockdown"
                         ),
                     );
                 }
@@ -388,11 +393,33 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                     Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
                 }
             }
+            "enforcement.lockdown" => {
+                let on = match input.value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        return Response::err(
+                            request_id,
+                            ErrorCode::ValidationFailed,
+                            format!(
+                                "invalid enforcement.lockdown: {other}; valid values: on, off"
+                            ),
+                        );
+                    }
+                };
+                match set_lockdown(store, on).await {
+                    Ok(old) => {
+                        let old_label = if old { "on" } else { "off" };
+                        Response::ok(request_id, serde_json::json!({ "old": old_label }))
+                    }
+                    Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
+                }
+            }
             other => Response::err(
                 request_id,
                 ErrorCode::ValidationFailed,
                 format!(
-                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode"
+                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode, enforcement.lockdown"
                 ),
             ),
         },

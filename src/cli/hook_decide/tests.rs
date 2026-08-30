@@ -1975,3 +1975,22 @@ fn the_bash_gate_denies_under_lockdown_and_says_how_to_lift_it() {
     assert_eq!(exit_code, 2);
     assert!(stderr.contains("mem_get(\"file:keys.py\")"));
 }
+
+#[test]
+fn the_read_gate_denies_under_lockdown_and_keeps_the_event() {
+    // `Grep`/`Glob` disclose a denied file's content without naming it, so the
+    // lockdown covers the read gate too — deny on stdout, event kept for the chain.
+    let result = decide::lockdown_result("file:keys.py");
+    let (stdout, stderr, exit_code) =
+        format_decision(HookVariant::ClaudePreRead, &result.decision, "file:keys.py");
+    assert_eq!(exit_code, 0);
+    assert!(stderr.is_empty());
+    assert!(stdout.contains(r#""permissionDecision":"deny""#));
+    assert!(stdout.contains(r#"mem_get(\"file:keys.py\")"#));
+
+    let events = platform_events(HookVariant::ClaudePreRead, &result.decision, result.events);
+    assert!(matches!(
+        &events[..],
+        [HookEvent::LockdownBlocked { key }] if key == "file:keys.py"
+    ));
+}

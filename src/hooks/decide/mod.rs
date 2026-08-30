@@ -155,7 +155,7 @@ pub enum DenyOrigin {
     /// polarity mirror of `PolicyContentDenied`. `file_key` is the policy key.
     PolicyRequirementUnmet,
     /// Tier 1 session lockdown: this actor was denied a file earlier in the
-    /// session and still owes its receipt, so every Bash command is denied
+    /// session and still owes its receipt, so every command and read is denied
     /// until that receipt exists. `file_key` is the owed — and consultable —
     /// file key, not anything read from the command being denied.
     SessionLockdown,
@@ -471,7 +471,7 @@ pub struct EnforcementResult {
 
 // ── Tier 1 session lockdown ─────────────────────────────────────────────────
 
-/// The deny every Bash command gets while the session owes `owed_key`.
+/// The deny every command and read gets while the session owes `owed_key`.
 ///
 /// Tier 1 answers a decidable question — does this session owe a receipt? —
 /// instead of the undecidable one a classifier asks, which is what file a
@@ -486,7 +486,7 @@ pub fn lockdown_result(owed_key: &str) -> EnforcementResult {
             file_key: owed_key.to_string(),
             reason: format!(
                 "[mati] Session locked: {path} was denied earlier and has not been \
-                 consulted. Every Bash command is denied until you call \
+                 consulted. Every read and command is denied until you call \
                  mem_get(\"{owed_key}\")."
             ),
             origin: DenyOrigin::SessionLockdown,
