@@ -2559,3 +2559,66 @@ fn lockdown_names_the_receipt_that_lifts_it() {
         matches!(&result.events[..], [HookEvent::LockdownBlocked { key }] if key == "file:keys.py")
     );
 }
+
+// ── read_needs_receipt (mati's own content-emitting commands) ────────
+
+/// A `hook_evaluate` bundle as the daemon returns it.
+fn eval_bundle(consulted: bool, gotcha: Option<serde_json::Value>) -> serde_json::Value {
+    let keys: Vec<&str> = if gotcha.is_some() {
+        vec!["gotcha:g1"]
+    } else {
+        vec![]
+    };
+    let mut records = json!({});
+    if let Some(g) = gotcha {
+        records["gotcha:g1"] = g;
+    }
+    json!({
+        "file_record": make_file_record(0.9, 0.9, 0.0, "fresh", &keys),
+        "gotcha_records": records,
+        "consulted": consulted,
+    })
+}
+
+#[test]
+fn read_needs_receipt_on_an_unconsulted_qualifying_gotcha() {
+    let data = eval_bundle(false, Some(make_gotcha(true, 0.8, 0.6)));
+    assert!(read_needs_receipt(&data));
+}
+
+#[test]
+fn read_needs_no_receipt_once_consulted() {
+    let data = eval_bundle(true, Some(make_gotcha(true, 0.8, 0.6)));
+    assert!(!read_needs_receipt(&data));
+}
+
+/// The thresholds are `any_qualifying_gotcha`'s, not a fourth copy of them.
+#[test]
+fn read_needs_no_receipt_below_the_deny_thresholds() {
+    for gotcha in [
+        make_gotcha(false, 0.8, 0.6), // unconfirmed Layer 0 stub
+        make_gotcha(true, 0.5, 0.6),  // confidence under 0.6
+        make_gotcha(true, 0.8, 0.3),  // quality under 0.4
+    ] {
+        assert!(!read_needs_receipt(&eval_bundle(false, Some(gotcha))));
+    }
+}
+
+#[test]
+fn read_needs_no_receipt_with_no_record_or_no_gotcha() {
+    assert!(!read_needs_receipt(&eval_bundle(false, None)));
+    assert!(!read_needs_receipt(
+        &json!({ "file_record": serde_json::Value::Null, "consulted": false })
+    ));
+    assert!(!read_needs_receipt(&json!({})));
+}
+
+/// A `FileDeleted` signal must not open this gate. The hook path lets that
+/// signal bypass enforcement only for a caller that did NOT see the path on
+/// disk; a command about to open the file has seen it.
+#[test]
+fn read_needs_receipt_despite_a_file_deleted_signal() {
+    let mut data = eval_bundle(false, Some(make_gotcha(true, 0.8, 0.6)));
+    data["file_record"]["staleness"]["signals"] = json!(["file_deleted"]);
+    assert!(read_needs_receipt(&data));
+}

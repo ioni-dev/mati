@@ -2,6 +2,7 @@ pub mod check;
 pub mod clusters;
 pub mod colors;
 pub mod config;
+pub mod consult_gate;
 pub mod daemon;
 pub mod diff;
 pub mod doctor;

@@ -718,3 +718,33 @@ pub fn evaluate(input: &EnforcementInput) -> EnforcementResult {
         events: vec![],
     }
 }
+
+/// True when printing this file's contents must be refused for want of a
+/// consultation receipt, given a `hook_evaluate` bundle.
+///
+/// For mati's own content-emitting commands. They are not shell commands, so
+/// [`classify_command`] never sees them and the read gate never fires; without
+/// this an agent reaches a gated file's bytes through mati itself.
+///
+/// Narrower than [`evaluate`] on purpose. No `FileDeleted` bypass: a caller
+/// about to open the file has observed the path present, which is the case
+/// that falls through to the ordinary gotcha check anyway. No advisory,
+/// staleness or policy handling: the only question is whether to print bytes,
+/// and everything below a deny prints them.
+pub fn read_needs_receipt(eval_data: &serde_json::Value) -> bool {
+    if json_bool(eval_data, "/consulted") {
+        return false;
+    }
+    let Some(file_record) = eval_data.get("file_record").filter(|v| v.is_object()) else {
+        return false;
+    };
+    let gotcha_records: HashMap<String, serde_json::Value> = eval_data
+        .get("gotcha_records")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    any_qualifying_gotcha(
+        &json_string_array(file_record, "/payload/gotcha_keys"),
+        &gotcha_records,
+    )
+}
