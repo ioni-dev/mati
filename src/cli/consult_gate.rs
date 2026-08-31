@@ -121,3 +121,140 @@ fn unknown(rel: &str, why: &str) -> String {
          Retry, or run `mati daemon start`."
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    /// A file inside `dir` with a parent that exists, so `abs.parent()` is a
+    /// real anchor rather than the cwd fallback.
+    fn source_file(dir: &TempDir) -> std::path::PathBuf {
+        let file = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        file
+    }
+
+    /// Put a store where the gate will look for `file`'s, so it gets past the
+    /// "no store, nothing to gate" branch. An empty file is enough — that
+    /// branch only calls `exists`.
+    fn seed_store_for(file: &Path) {
+        let anchor = file.parent().unwrap();
+        let ident = mati_core::store::RepoIdent::discover(anchor);
+        let root = mati_root_for_ident(&ident, anchor).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("knowledge.db"), b"").unwrap();
+    }
+
+    /// `ensure_daemon` skips its spawn phase on `cfg!(test)` OR this variable.
+    /// A bin test links the lib without `--test`, so `cfg!(test)` is false
+    /// there and the variable is what keeps these tests from spawning a real
+    /// daemon. Unset on drop, so a failing assert does not leak it.
+    struct NoDaemonSpawn;
+
+    impl NoDaemonSpawn {
+        fn on() -> Self {
+            std::env::set_var("MATI_DISABLE_AUTO_SPAWN", "1");
+            Self
+        }
+    }
+
+    impl Drop for NoDaemonSpawn {
+        fn drop(&mut self) {
+            std::env::remove_var("MATI_DISABLE_AUTO_SPAWN");
+        }
+    }
+
+    /// A file outside any mati store has no gotchas, so gating it would refuse
+    /// reads nothing can ever authorize. Checked before `ensure_daemon`, so
+    /// this must not scaffold a store either.
+    #[tokio::test]
+    async fn a_file_with_no_store_is_not_gated() {
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let file = source_file(&dir);
+
+        require_consultation(&file)
+            .await
+            .expect("no store, no gate");
+
+        let anchor = file.parent().unwrap();
+        let ident = mati_core::store::RepoIdent::discover(anchor);
+        let root = mati_root_for_ident(&ident, anchor).unwrap();
+        assert!(
+            !root.join("knowledge.db").exists(),
+            "the gate must not create a store it only meant to look for"
+        );
+    }
+
+    /// The bypass this exists to close: stop the daemon, then read. Failing
+    /// open here would hand it out in one line, so an unreachable daemon is an
+    /// error, not an allow — the opposite of the hook path's P9.
+    #[tokio::test]
+    async fn an_unreachable_daemon_refuses_rather_than_printing() {
+        crate::cli::ensure_test_home();
+        let dir = TempDir::new().unwrap();
+        let file = source_file(&dir);
+        seed_store_for(&file);
+
+        let _no_spawn = NoDaemonSpawn::on();
+        let err = require_consultation(&file)
+            .await
+            .expect_err("an unreachable daemon must not allow the read");
+
+        let msg = err.to_string();
+        assert!(msg.contains("lib.rs"), "must name the file: {msg}");
+        assert!(msg.contains("the mati daemon did not answer"), "{msg}");
+        assert!(msg.contains("refuses rather than guess"), "{msg}");
+    }
+
+    /// The store is discovered from the target file, never the process cwd:
+    /// `cd /tmp && mati extract-signals --file /abs/path/in/repo.rs` otherwise
+    /// resolves to no store and prints the file. The cwd here is the mati repo,
+    /// whose per-process test home holds no store, so reaching the refusal at
+    /// all proves the anchor came from the file.
+    #[tokio::test]
+    async fn the_store_is_found_from_the_file_not_the_cwd() {
+        crate::cli::ensure_test_home();
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_ident = mati_core::store::RepoIdent::discover(&cwd);
+        let cwd_root = mati_root_for_ident(&cwd_ident, &cwd).unwrap();
+        assert!(
+            !cwd_root.join("knowledge.db").exists(),
+            "the control is void if the cwd already has a store"
+        );
+
+        let dir = TempDir::new().unwrap();
+        let file = source_file(&dir);
+        seed_store_for(&file);
+
+        let _no_spawn = NoDaemonSpawn::on();
+        let err = require_consultation(&file)
+            .await
+            .expect_err("the file's own store must be the one consulted");
+        assert!(err.to_string().contains("cannot tell whether"), "{err}");
+    }
+
+    /// A symlink from outside the repo is gated as its target. Without the
+    /// canonicalize the anchor would be the link's parent, which has no store,
+    /// and the gate would wave the read through.
+    #[tokio::test]
+    async fn a_symlink_is_gated_as_its_target() {
+        crate::cli::ensure_test_home();
+        let target_dir = TempDir::new().unwrap();
+        let target = source_file(&target_dir);
+        seed_store_for(&target);
+
+        let link_dir = TempDir::new().unwrap();
+        let link = link_dir.path().join("shortcut.rs");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let _no_spawn = NoDaemonSpawn::on();
+        let err = require_consultation(&link)
+            .await
+            .expect_err("a symlink must resolve to its target's store");
+        assert!(err.to_string().contains("cannot tell whether"), "{err}");
+    }
+}
