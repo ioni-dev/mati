@@ -2599,6 +2599,51 @@ fn tree_preserving_git_verbs_are_not_floor_restoring() {
     }
 }
 
+/// Measured 2026-08-31 against a file held at mode `000`: each of these
+/// restored or destroyed the floor, because each unlinks or renames over the
+/// path instead of opening it. `cp` without `-f` is listed too — it does not
+/// restore on its own, but the verb is denied whole rather than parsed for a
+/// flag that hides in `-rf`, `--force` and `$FLAGS`.
+#[test]
+fn copy_and_move_verbs_that_defeat_mode_000_are_floor_restoring() {
+    for cmd in [
+        "cp -f /tmp/x.py src/gated.rs",
+        "cp /tmp/x.py src/gated.rs",
+        "install /tmp/x.py src/gated.rs",
+        "install -m 600 /tmp/x.py src/gated.rs",
+        "mv /tmp/x.py src/gated.rs",
+        "ln -f /tmp/x.py src/gated.rs",
+        "ln -sf /tmp/x.py src/gated.rs",
+        "rsync /tmp/x.py src/gated.rs",
+        "rsync --inplace /tmp/x.py src/gated.rs",
+        "rm -f src/gated.rs",
+        "sudo cp -f /tmp/x.py src/gated.rs",
+        "echo hi && mv /tmp/x.py src/gated.rs",
+        "sh -c 'rm -f src/gated.rs'",
+    ] {
+        assert!(restores_read_floor(cmd), "must be caught: {cmd}");
+    }
+}
+
+/// Verbs that OPEN the path instead of replacing it. Measured 2026-08-31:
+/// each failed with `EACCES` against mode `000` and left the file intact, so
+/// denying them would be cost with no hazard behind it. `dd` stays classified
+/// `CopyLike` for its source args; it is only the floor question it answers no
+/// to.
+#[test]
+fn verbs_that_cannot_defeat_mode_000_are_not_floor_restoring() {
+    for cmd in [
+        "dd if=/tmp/x.py of=src/gated.rs",
+        "dd if=/tmp/x.py of=src/gated.rs conv=notrunc",
+        "echo x | tee src/gated.rs",
+        "echo x | tee -a src/gated.rs",
+        "sed -i '' s/a/b/ src/gated.rs",
+        "echo x > src/gated.rs",
+    ] {
+        assert!(!restores_read_floor(cmd), "must not be caught: {cmd}");
+    }
+}
+
 #[test]
 fn the_floor_deny_names_the_receipt_that_lifts_it() {
     let result = seal_floor_result("file:src/gated.rs");

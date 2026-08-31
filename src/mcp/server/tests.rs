@@ -520,6 +520,7 @@ async fn mcp_call_after_daemon_restart_does_not_kill_transport() {
         session: session_before,
         owner: super::super::metadata::DaemonOwner::Daemon,
         version: String::new(),
+        build: String::new(),
     };
     super::super::metadata::publish_metadata(&root, &meta_before).unwrap();
 
@@ -558,6 +559,7 @@ async fn mcp_call_after_daemon_restart_does_not_kill_transport() {
             session: session_after,
             owner: super::super::metadata::DaemonOwner::Daemon,
             version: String::new(),
+            build: String::new(),
         };
         super::super::metadata::publish_metadata(&root_for_rotate, &meta_after).unwrap();
     });
@@ -620,6 +622,7 @@ async fn mcp_call_session_mismatch_no_retry_target_returns_envelope() {
         session,
         owner: super::super::metadata::DaemonOwner::Daemon,
         version: String::new(),
+        build: String::new(),
     };
     super::super::metadata::publish_metadata(&root, &meta).unwrap();
 

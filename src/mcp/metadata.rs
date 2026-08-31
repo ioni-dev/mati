@@ -78,6 +78,29 @@ pub struct DaemonMetadata {
     /// version, and must still parse.
     #[serde(default)]
     pub version: String,
+    /// SHA-256 of the executable this daemon is running, taken at startup.
+    ///
+    /// `version` alone cannot see a same-version skew: `cargo install` twice
+    /// off one working tree leaves two different binaries both calling
+    /// themselves `0.1.4`, and a daemon started from the first keeps serving
+    /// the old code against freshly-built hooks. Hashing at startup — not on
+    /// demand — is what makes it detectable, because the file at that path has
+    /// already been replaced by the time anyone asks.
+    ///
+    /// `#[serde(default)]`: metadata written by an older binary has no build.
+    #[serde(default)]
+    pub build: String,
+}
+
+/// SHA-256 of a binary on disk, as lowercase hex. `None` if it cannot be read.
+pub fn build_id_of(bin: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    Some(format!("{:x}", Sha256::digest(std::fs::read(bin).ok()?)))
+}
+
+/// SHA-256 of the running executable. ~100ms on a 36 MB binary, paid once.
+fn current_build_id() -> Option<String> {
+    build_id_of(&std::env::current_exe().ok()?)
 }
 
 impl DaemonMetadata {
@@ -88,6 +111,7 @@ impl DaemonMetadata {
             session: Uuid::new_v4(),
             owner,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            build: current_build_id().unwrap_or_default(),
         }
     }
 }
@@ -203,6 +227,7 @@ pub fn read_metadata(root: &Path) -> Option<DaemonMetadata> {
             session: Uuid::nil(),
             owner: DaemonOwner::Daemon,
             version: String::new(),
+            build: String::new(),
         });
     }
 
@@ -225,6 +250,7 @@ pub fn read_metadata(root: &Path) -> Option<DaemonMetadata> {
             session: Uuid::nil(),
             owner,
             version: String::new(),
+            build: String::new(),
         });
     }
 
@@ -1240,6 +1266,7 @@ mod tests {
             session: Uuid::new_v4(),
             owner: DaemonOwner::Mcp,
             version: String::new(),
+            build: String::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: DaemonMetadata = serde_json::from_str(&json).unwrap();
@@ -1255,6 +1282,7 @@ mod tests {
             session,
             owner: DaemonOwner::Daemon,
             version: String::new(),
+            build: String::new(),
         };
         publish_metadata(dir.path(), &meta).unwrap();
 
@@ -1329,6 +1357,7 @@ mod tests {
             session: Uuid::new_v4(),
             owner: DaemonOwner::Daemon,
             version: String::new(),
+            build: String::new(),
         };
         publish_metadata(dir.path(), &meta1).unwrap();
 
@@ -1338,6 +1367,7 @@ mod tests {
             session: Uuid::new_v4(),
             owner: DaemonOwner::Mcp,
             version: String::new(),
+            build: String::new(),
         };
         publish_metadata(dir.path(), &meta2).unwrap();
 
@@ -1391,6 +1421,7 @@ mod tests {
             session: Uuid::new_v4(),
             owner: DaemonOwner::Daemon,
             version: String::new(),
+            build: String::new(),
         };
         publish_metadata(dir.path(), &meta).unwrap();
         std::fs::write(dir.path().join("mati.sock"), "").unwrap();
@@ -1409,6 +1440,7 @@ mod tests {
             session: Uuid::new_v4(),
             owner: DaemonOwner::Daemon,
             version: String::new(),
+            build: String::new(),
         };
         publish_metadata(dir.path(), &meta).unwrap();
 

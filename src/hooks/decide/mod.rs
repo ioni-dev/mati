@@ -521,9 +521,10 @@ pub fn seal_floor_result(sealed_key: &str) -> EnforcementResult {
             file_key: sealed_key.to_string(),
             reason: format!(
                 "[mati] {path} is sealed and has not been consulted. Commands that \
-                 would restore it — chmod, git checkout, git restore, git reset \
-                 --hard, git worktree add, git clone — are denied until you call \
-                 mem_get(\"{sealed_key}\"), which unseals it."
+                 would restore it — chmod, cp, mv, ln, rm, install, rsync, git \
+                 checkout, git restore, git reset --hard, git worktree add, git \
+                 clone — are denied until you call mem_get(\"{sealed_key}\"), \
+                 which unseals it."
             ),
             origin: DenyOrigin::SealFloor,
         },

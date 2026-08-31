@@ -35,6 +35,20 @@ pub(super) const GIT_VALUE_FLAGS: &[&str] =
 /// WRITE onto a governed path; the source side is the half that leaked.
 const COPY_LIKE: &[&str] = &["cp", "install", "ln", "rsync", "dd"];
 
+/// Copy- and move-like verbs that return a sealed file to a readable state.
+///
+/// Measured 2026-08-31 against a file held at mode `000`: `cp -f`, `install`,
+/// `mv`, `ln -f`, `ln -sf`, `rsync` (plain, `-I` and `--inplace`) and `rm`
+/// each restored or destroyed the floor, because each one unlinks or renames
+/// over the path rather than opening it. Plain `cp`, `cp -p`, `cp -a`, `dd`
+/// (including `conv=notrunc`), `tee`, `tee -a`, `sed -i`, a `>` redirect and
+/// `open(p, "w")` all failed with `EACCES` and are deliberately absent.
+///
+/// `cp` restores only with `-f`, but the verb is denied whole rather than
+/// parsed for a flag: `-f` hides in `-rf`, `--force` and `$FLAGS`, and the
+/// cost of the false positive is one `mem_get`.
+const FLOOR_RESTORING_COPY: &[&str] = &["cp", "install", "ln", "mv", "rsync", "rm"];
+
 /// Interpreters that read a file named by a string literal in their source
 /// rather than by an argument. Measured 2026-08-28: 47% of off-gate content
 /// accesses went through `python3`.
@@ -337,6 +351,12 @@ pub fn restores_read_floor(cmd: &str) -> bool {
 fn segment_restores(cmd: &str) -> bool {
     let eff = effective_command(cmd);
     if matches_command_word(&eff, "chmod") {
+        return true;
+    }
+    if FLOOR_RESTORING_COPY
+        .iter()
+        .any(|w| matches_command_word(&eff, w))
+    {
         return true;
     }
     if !matches_command_word(&eff, "git") {

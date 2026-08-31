@@ -1121,6 +1121,14 @@ fn collect_binary_parity_check(cwd: &Path, root: &Path) -> CheckResult {
     };
 
     if hook_version == server_version {
+        if let Some(detail) = build_skew(&wrapper, root) {
+            return check(
+                "binary parity",
+                Status::Warn,
+                detail,
+                Some("mati daemon stop  (the next call restarts it from the current binary)"),
+            );
+        }
         check(
             "binary parity",
             Status::Pass,
@@ -1139,6 +1147,40 @@ fn collect_binary_parity_check(cwd: &Path, root: &Path) -> CheckResult {
             Some("mati init  (re-pins the hook wrapper to this binary)"),
         )
     }
+}
+
+/// Same version string, two different binaries — the skew `version` cannot
+/// see. `cargo install` twice off one tree leaves a daemon serving the old
+/// code while hooks exec the new, and both answer `--version` identically.
+/// `None` when there is nothing to compare: no running daemon, metadata from a
+/// binary that recorded no build, or an unreadable wrapper target.
+fn build_skew(wrapper: &Path, root: &Path) -> Option<String> {
+    let daemon_build = mati_core::mcp::metadata::read_metadata(root)
+        .map(|m| m.build)
+        .filter(|b| !b.is_empty())?;
+    let target = wrapper_exec_target(wrapper)?;
+    let hook_build = mati_core::mcp::metadata::build_id_of(&target)?;
+    if hook_build == daemon_build {
+        return None;
+    }
+    Some(format!(
+        "hooks and the daemon both report {}, but are different builds \
+         (hooks {}, daemon {}) — the daemon is still serving the code it \
+         started with, so a rebuilt gate is not the one being enforced",
+        env!("CARGO_PKG_VERSION"),
+        &hook_build[..12],
+        &daemon_build[..12],
+    ))
+}
+
+/// The absolute binary a hook wrapper execs. The wrapper is a fixed four-line
+/// bash script written by `scaffold::write_mati_wrapper`, so the target is the
+/// quoted word on the `exec` line.
+fn wrapper_exec_target(wrapper: &Path) -> Option<PathBuf> {
+    let body = std::fs::read_to_string(wrapper).ok()?;
+    let rest = body.lines().find_map(|l| l.strip_prefix("exec \""))?;
+    let (bin, _) = rest.split_once('"')?;
+    Some(PathBuf::from(bin))
 }
 
 /// The binary wrapper a host's hooks exec, if one is installed.
@@ -1640,6 +1682,67 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    /// A wrapper in the real `exec "<bin>" "$@"` shape, pointing at `target`.
+    fn fake_wrapper_execing(cwd: &Path, target: &Path) {
+        let dir = cwd.join(".claude/hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mati");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\nexec \"{}\" \"$@\"\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Two builds of one version compare equal on the version string, so the
+    /// daemon keeps serving the old code while hooks exec the new one. The
+    /// recorded build hash is what separates them.
+    #[test]
+    fn binary_parity_names_a_same_version_build_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mati-bin");
+        std::fs::write(&target, "#!/bin/sh\necho 'mati 0.1.4'\n").unwrap();
+        fake_wrapper_execing(dir.path(), &target);
+        fake_daemon(dir.path(), "0.1.4");
+        // The daemon started from a different build of the same version.
+        let mut meta = mati_core::mcp::metadata::read_metadata(dir.path()).unwrap();
+        meta.build = "0".repeat(64);
+        mati_core::mcp::metadata::publish_metadata(dir.path(), &meta).unwrap();
+
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Warn), "{}", result.detail);
+        assert!(
+            result.detail.contains("different builds"),
+            "must name the skew, got: {}",
+            result.detail
+        );
+    }
+
+    /// Same version AND same build is the only clean state.
+    #[test]
+    fn binary_parity_passes_when_the_build_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mati-bin");
+        std::fs::write(&target, "#!/bin/sh\necho 'mati 0.1.4'\n").unwrap();
+        fake_wrapper_execing(dir.path(), &target);
+        fake_daemon(dir.path(), "0.1.4");
+        let mut meta = mati_core::mcp::metadata::read_metadata(dir.path()).unwrap();
+        meta.build = mati_core::mcp::metadata::build_id_of(&target).unwrap();
+        mati_core::mcp::metadata::publish_metadata(dir.path(), &meta).unwrap();
+
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Pass), "{}", result.detail);
     }
 
     fn fake_daemon(root: &Path, version: &str) {

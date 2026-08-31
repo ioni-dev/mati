@@ -649,10 +649,17 @@ unconsulted completion.
   tag. `mati seal clear` empties the manifest and cannot drop the tag, so a
   tag-keyed re-arm would undo the break-glass at the next daemon start.
 - **Restore verbs deny.** While any manifest row is unsettled, pre-Bash denies
-  `chmod` and git `checkout`, `checkout-index`, `restore`, `clone`, `reset
-  --hard` and `worktree add`, through `sudo`, `sh -c` and `git -C` alike. The
-  question is the verb, never the path: `chmod -R u+rwX .` names no sealed file
-  and restores every one. Each deny arms the lockdown.
+  `chmod`; `cp`, `install`, `ln`, `mv`, `rm` and `rsync`; and git `checkout`,
+  `checkout-index`, `restore`, `clone`, `reset --hard` and `worktree add`,
+  through `sudo`, `sh -c` and `git -C` alike. The question is the verb, never
+  the path: `chmod -R u+rwX .` names no sealed file and restores every one.
+  Each deny arms the lockdown. The copy-like half was measured 2026-08-31
+  against a file at mode `000`: `cp -f`, `install`, `mv`, `ln -f`, `ln -sf`,
+  `rsync` and `rm` each replaced or destroyed it, because each unlinks or
+  renames over the path instead of opening it. `dd`, `tee`, `sed -i`, a `>`
+  redirect and `open(p, "w")` all returned `EACCES` and are deliberately not
+  denied. Plain `cp` is denied anyway: it restores only with `-f`, and `-f`
+  hides in `-rf`, `--force` and `$FLAGS`.
 - **Post-Bash sweep.** One `stat` per row on an async hook. A row whose mode is
   down is classified by date — a receipt at or after `rearmed_at` explains the
   lift, anything older cannot have caused it. A row still at `000` whose size,
@@ -678,15 +685,18 @@ directory from a missing one.
 
 Known holes:
 
-- **`unlink` then create.** Mode bits guard the inode, not the path.
-  `os.remove(p)` needs write permission on the *directory*, and the
-  replacement is created at the umask. Found unprompted by an agent on
-  2026-08-30. The sweep catches it — the row stats as a lowered floor, no
-  receipt explains it, it is recorded and re-armed — so the seal alone
-  detects where it cannot prevent. The pre-Bash gate cannot close it:
+- **`unlink` then create, from an interpreter.** Mode bits guard the inode,
+  not the path. `os.remove(p)` needs write permission on the *directory*, and
+  the replacement is created at the umask. Found unprompted by an agent on
+  2026-08-30. The named-command forms of this — `cp -f`, `install`, `mv`,
+  `ln`, `rm`, `rsync` — are denied by the restore-verb gate above. What is
+  left is the interpreter route, which the pre-Bash gate cannot close:
   `os.remove` inside a python heredoc is not a verb, and extending the deny to
-  interpreter words was measured and rejected. `mati sandbox protect` does
-  close it, at the OS layer — see the composition note below.
+  interpreter words was measured and rejected. There the sweep catches it
+  after the fact — the row stats as a lowered floor, no receipt explains it,
+  it is recorded and re-armed — so the seal alone detects where it cannot
+  prevent. `mati sandbox protect` does close it, at the OS layer — see the
+  composition note below.
 - **History.** See the scope paragraph above. In a repo where the sealed file
   is committed, its bytes are one `git cat-file` away.
 - **macOS only.** Every filesystem and native-tool probe above is macOS, uid
