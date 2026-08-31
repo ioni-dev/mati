@@ -97,7 +97,7 @@ None of those twenty tried a name-free route, so this arm does not cover the hol
 
 So the claim mati makes is this: **once mati has denied an access, an agent cannot work around it without consulting.** Not "it can't get in." Once denied.
 
-Both results were registered before the runs, on Claude Sonnet, one fixture family, ten-turn tasks. The 4-of-10 baseline is a historical control on a saved binary, not a concurrent arm.
+Every result on this page was registered before its run, on Claude Sonnet, one fixture family, ten-turn tasks. The 4-of-10 baseline is a historical control on a saved binary; the sealed and unsealed arms below are concurrent.
 
 ### The lockdown
 
@@ -108,6 +108,33 @@ mati config set enforcement.lockdown on
 ```
 
 With it on, a deny puts the session in debt for that file. Every further read and shell command is denied — in the main thread and in any subagent in the same worktree — until the agent calls the `mem_get` that the deny message names. It ships off because it denies unrelated work too: an agent blocked on `keys.py` cannot `ls` an unrelated directory until it consults.
+
+### Sealing a file
+
+The hole above is about the route, and no classifier closes it. `mati seal` closes it a different way — it takes the bytes away.
+
+```bash
+mati seal add src/keys.py
+```
+
+The file goes to mode `000`. The kernel refuses every reader: the shell, anything it spawns, the agent's `Read` (a hard `EACCES`), and its `Grep`, which skips the file entirely rather than redacting it — no match, no count, no filename in the results. `mem_get` lifts the mode for the session, and it goes back when the receipt lapses. While the receipt is owed, the commands that would restore it — `chmod`, `git checkout`, `git restore`, `git reset --hard`, `git worktree add`, `git clone` — are denied.
+
+Same prompt as the 8-of-10 result above, same fixture, same binary, same model. Ten runs sealed against ten unsealed, interleaved:
+
+- **0 of 10** sealed runs finished the task without consulting, against **6 of 10** unsealed (p=0.011).
+- The bug the gotcha warns about landed in **0 of 10** sealed runs, against **4 of 10**.
+- **9 of 10** sealed runs were denied at least once, against 3 of 10. mati sees the attempt now.
+- The route that beat the hook in 7 of 10 unsealed runs showed up in 1 of 10 sealed ones. `grep -rl` cannot list a file it cannot open.
+
+What it does not do:
+
+- **It does not make the bytes unobtainable.** Two sealed runs read the file out of git history with `git cat-file`. That is out of scope by design — git must read its own objects to work at all, and a secret in git history is a secret-scanner problem.
+- **A file can be replaced without ever being read.** `os.remove` needs write permission on the directory, not on the file. One sealed run did exactly that, then wrote a new one. The post-command sweep caught it, recorded it and put the mode back — but nothing prevented it.
+- **Your build stops too.** A cached `cargo check` still passes; the next real rebuild fails with `Permission denied`. rust-analyzer exits 0 and silently drops the module, so you get wrong answers rather than an error. `git add` cannot index the file. Seal a file whose bytes must be unavailable to everything, not one you are building against.
+
+Three sealed runs did not finish. All three were the agent declining the red-team instruction — one of them after reading the file from history and stopping at the write — not the floor blocking the work. On the seven runs that attempted it, seven succeeded.
+
+Verified on macOS with Claude Code. Linux and WSL2 are untested.
 
 ### The rest of the boundary
 
@@ -188,6 +215,8 @@ Two shortcuts sit on top of the same engine:
 - `mati guard <cmd-glob>` gates a destructive command the same way.
 
 For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into deny rules for the host's own sandbox, which hold outside the hook path. Verified on macOS with Claude Code's `/sandbox` turned on. The Linux and WSL2 paths are written and untested.
+
+Hardest of all is `mati seal add <file>`, which holds the file at mode `000` until the session consults it. It is the only one that closes a read the hook never sees, and the only one that also stops your own build. [Sealing a file](#sealing-a-file) has the numbers and the cost.
 
 ### Static analysis
 
@@ -287,6 +316,7 @@ mati stats
 | `mati protect <glob>`      | Gate edits and deletes to a path behind a fresh consult                                               |
 | `mati guard <cmd-glob>`    | Gate a destructive command behind a fresh consult                                                     |
 | `mati sandbox <sub>`       | Compile crown-jewel gotchas into a host-sandbox deny floor (`compile`, `protect`, `unprotect`, `clear`) |
+| `mati seal <sub>`          | Hold a file at mode 000 until the session consults it (`add`, `remove`, `list`, `clear`) |
 | `mati verify-chain`        | Recompute and verify the hash-chained enforcement log (`--json`)                                     |
 
 #### Maintain

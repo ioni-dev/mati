@@ -625,6 +625,15 @@ floor. `Grep` skips a sealed file silently — absent from `files_with_matches`
 and from the count, not redacted — so there is no match oracle either. Only
 the filename survives, which `ls` already discloses.
 
+Measured 2026-08-30 against the same prompt, fixture, binary and model, ten
+runs sealed and ten unsealed, interleaved: 0 of 10 sealed runs finished without
+consulting against 6 of 10 unsealed (p=0.011); the trap bug landed in 0 of 10
+against 4 of 10; 9 of 10 sealed runs were denied at least once against 3 of 10.
+The route that beat Tier 1 in 7 of 10 unsealed runs appeared in 1 of 10 sealed
+ones. The floor does not stop the *read* — two sealed runs took the bytes out
+of git history and one replaced the file — it stops the read becoming an
+unconsulted completion.
+
 - **Manifest before chmod.** The `chmod` destroys the original mode, so
   `~/.mati/<slug>/sealed.json` records it first, written temp-file → fsync →
   rename. `mati seal clear` restores from that manifest without opening the
