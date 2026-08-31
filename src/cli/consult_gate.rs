@@ -91,18 +91,26 @@ pub async fn require_consultation(file: &Path) -> Result<()> {
         bail!(unknown(&rel, "the mati daemon did not answer"));
     };
 
+    decide_from_response(&rel, &resp)
+}
+
+/// Turn a `hook_evaluate` response into a decision.
+///
+/// Split out so every branch here is reachable without a daemon. Reaching the
+/// daemon is the one part that is not, and the caller above owns it.
+fn decide_from_response(rel: &str, resp: &serde_json::Value) -> Result<()> {
     if resp.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        bail!(unknown(&rel, "the mati daemon returned an error"));
+        bail!(unknown(rel, "the mati daemon returned an error"));
     }
     let Some(data) = resp.get("data").filter(|v| v.is_object()) else {
-        bail!(unknown(&rel, "the mati daemon returned no evaluation"));
+        bail!(unknown(rel, "the mati daemon returned no evaluation"));
     };
 
     // A store or gotcha fault leaves consultation state unknown. The hook path
     // fails open here; this one cannot, for the reason in the module doc.
     let flag = |name: &str| data.get(name).and_then(|v| v.as_bool()).unwrap_or(false);
     if flag("gotcha_error") || (flag("store_error") && data.get("file_record").is_none()) {
-        bail!(unknown(&rel, "mati could not read its own store"));
+        bail!(unknown(rel, "mati could not read its own store"));
     }
 
     if mati_core::hooks::decide::read_needs_receipt(data) {
@@ -256,5 +264,146 @@ mod tests {
             .await
             .expect_err("a symlink must resolve to its target's store");
         assert!(err.to_string().contains("cannot tell whether"), "{err}");
+    }
+
+    // ── decide_from_response ────────────────────────────────────────────
+
+    fn ok_response(data: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "ok": true, "data": data })
+    }
+
+    /// A `hook_evaluate` bundle shaped the way `read_needs_receipt` reads it:
+    /// `file_record.payload.gotcha_keys` names entries in `gotcha_records`.
+    /// The qualifying thresholds live in `any_qualifying_gotcha` and are tested
+    /// there; this only has to sit on the qualifying side of them.
+    fn eval_data(consulted: bool, gotcha: Option<serde_json::Value>) -> serde_json::Value {
+        let keys: Vec<&str> = if gotcha.is_some() {
+            vec!["gotcha:g1"]
+        } else {
+            vec![]
+        };
+        let mut records = serde_json::json!({});
+        if let Some(g) = gotcha {
+            records["gotcha:g1"] = g;
+        }
+        serde_json::json!({
+            "file_record": { "payload": { "gotcha_keys": keys } },
+            "gotcha_records": records,
+            "consulted": consulted,
+        })
+    }
+
+    fn qualifying_gotcha() -> serde_json::Value {
+        serde_json::json!({
+            "confidence": { "value": 0.8 },
+            "quality": { "value": 0.6 },
+            "payload": { "confirmed": true },
+        })
+    }
+
+    /// `ok` absent, false, or not a bool all mean the same thing: no answer to
+    /// act on. A truthy-looking string must not pass for consent.
+    #[test]
+    fn a_response_that_is_not_ok_refuses() {
+        for resp in [
+            serde_json::json!({ "ok": false }),
+            serde_json::json!({}),
+            serde_json::json!({ "ok": "true" }),
+            serde_json::json!({ "ok": 1 }),
+        ] {
+            let err = decide_from_response("src/lib.rs", &resp)
+                .expect_err("a non-ok response must not allow the read");
+            let msg = err.to_string();
+            assert!(msg.contains("the mati daemon returned an error"), "{msg}");
+            assert!(msg.contains("refuses rather than guess"), "{msg}");
+        }
+    }
+
+    /// `ok` alone is not enough — the evaluation has to be there and be an
+    /// object, or there is nothing to decide from.
+    #[test]
+    fn an_ok_response_with_no_evaluation_refuses() {
+        for data in [
+            serde_json::Value::Null,
+            serde_json::json!("nope"),
+            serde_json::json!([]),
+        ] {
+            let err = decide_from_response("src/lib.rs", &ok_response(data))
+                .expect_err("an empty evaluation must not allow the read");
+            assert!(
+                err.to_string()
+                    .contains("the mati daemon returned no evaluation"),
+                "{err}"
+            );
+        }
+        let err = decide_from_response("src/lib.rs", &serde_json::json!({ "ok": true }))
+            .expect_err("a missing evaluation must not allow the read");
+        assert!(
+            err.to_string()
+                .contains("the mati daemon returned no evaluation"),
+            "{err}"
+        );
+    }
+
+    /// A fault leaves consultation state unknown, and unknown is a refusal
+    /// here. The hook path fails open on the same signal; this one cannot, or
+    /// corrupting the store would become the bypass.
+    #[test]
+    fn a_store_or_gotcha_fault_refuses() {
+        for data in [
+            serde_json::json!({ "gotcha_error": true, "consulted": false }),
+            serde_json::json!({ "store_error": true, "consulted": false }),
+        ] {
+            let err = decide_from_response("src/lib.rs", &ok_response(data))
+                .expect_err("a fault must not allow the read");
+            assert!(
+                err.to_string()
+                    .contains("mati could not read its own store"),
+                "{err}"
+            );
+        }
+    }
+
+    /// `store_error` with a file record is NOT a fault: the record answered, so
+    /// consultation state is known and the gotcha check can run. Only a
+    /// `store_error` that left no record is fatal. `gotcha_error` is fatal
+    /// either way.
+    #[test]
+    fn a_store_error_that_still_returned_a_record_is_not_a_fault() {
+        let mut data = eval_data(true, Some(qualifying_gotcha()));
+        data["store_error"] = serde_json::json!(true);
+        decide_from_response("src/lib.rs", &ok_response(data))
+            .expect("a record that came back is enough to decide on");
+
+        let mut fatal = eval_data(true, Some(qualifying_gotcha()));
+        fatal["gotcha_error"] = serde_json::json!(true);
+        decide_from_response("src/lib.rs", &ok_response(fatal))
+            .expect_err("a gotcha fault is fatal even with a file record");
+    }
+
+    /// A deny the agent cannot clear is a deadlock, so the refusal has to name
+    /// the exact call that lifts it.
+    #[test]
+    fn an_unconsulted_gotcha_names_the_call_that_lifts_it() {
+        let data = eval_data(false, Some(qualifying_gotcha()));
+        let err = decide_from_response("src/lib.rs", &ok_response(data))
+            .expect_err("an unconsulted confirmed gotcha must not print source");
+        let msg = err.to_string();
+        assert!(msg.contains("src/lib.rs has a confirmed gotcha"), "{msg}");
+        assert!(msg.contains(r#"mem_get("file:src/lib.rs")"#), "{msg}");
+    }
+
+    /// The two ways through: the receipt exists, or there is no qualifying
+    /// gotcha to need one for.
+    #[test]
+    fn a_consulted_or_ungoverned_file_passes() {
+        decide_from_response(
+            "src/lib.rs",
+            &ok_response(eval_data(true, Some(qualifying_gotcha()))),
+        )
+        .expect("a consulted file is allowed");
+
+        decide_from_response("src/lib.rs", &ok_response(eval_data(false, None)))
+            .expect("a file with no qualifying gotcha is allowed");
     }
 }
