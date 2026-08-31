@@ -76,6 +76,11 @@ struct HealthSnapshot {
     /// cached snapshots predate this field.
     #[serde(default)]
     denials_7d: u64,
+    /// Accesses allowed without any file gate seeing them — a Bash command
+    /// naming no path, or a `Grep`/`Glob` with none. The unobserved surface,
+    /// not a failure. Older cached snapshots predate this field.
+    #[serde(default)]
+    pathless_allows_7d: u64,
 
     computed_at: u64,
 
@@ -662,7 +667,8 @@ pub async fn run(args: StatsArgs) -> Result<()> {
 
     println!("  {bold}{blue}Compliance (7d){reset}");
 
-    let (hits_7d, misses_7d, denials_7d, bypasses_7d) = scan_compliance_7d(&store, now).await;
+    let (hits_7d, misses_7d, denials_7d, bypasses_7d, pathless_allows_7d) =
+        scan_compliance_7d(&store, now).await;
 
     let total_lookups = hits_7d + misses_7d;
     let hit_rate = if total_lookups > 0 {
@@ -682,6 +688,12 @@ pub async fn run(args: StatsArgs) -> Result<()> {
 
     if denials_7d > 0 {
         println!("    Denials (blocked)      {red}{denials_7d}{reset}");
+    }
+
+    if pathless_allows_7d > 0 {
+        println!(
+            "    Unobserved (no path)   {yellow}{pathless_allows_7d}{reset}  (no file gate saw these)"
+        );
     }
 
     let bp_color = if bypasses_7d == 0 { green } else { yellow };
@@ -746,6 +758,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         },
         bypasses_7d,
         denials_7d,
+        pathless_allows_7d,
 
         computed_at: now,
         write_seq: current_seq,
@@ -932,6 +945,7 @@ pub async fn seed_snapshot(
         hit_rate_7d: 0.0,
         bypasses_7d: 0,
         denials_7d: 0,
+        pathless_allows_7d: 0,
         computed_at: now,
         write_seq,
     };
@@ -1157,6 +1171,13 @@ async fn display_cached_stats(
         println!("    Denials (blocked)      {red}{}{reset}", s.denials_7d);
     }
 
+    if s.pathless_allows_7d > 0 {
+        println!(
+            "    Unobserved (no path)   {yellow}{}{reset}  (no file gate saw these)",
+            s.pathless_allows_7d
+        );
+    }
+
     let bp_color = if s.bypasses_7d == 0 { green } else { yellow };
     if s.bypasses_7d > 0 || total_lookups > 0 {
         println!(
@@ -1199,6 +1220,11 @@ async fn display_cached_stats(
 /// `dispatch_v2.rs`). The gate worked — nothing was bypassed — so it rolls
 /// into `denials_7d`, not `bypasses_7d`.
 ///
+/// `analytics:pathless_allow_*` counts accesses that reached no file gate at
+/// all. It joins none of the four totals: nothing was consulted, denied or
+/// bypassed, so folding it in would move a rate whose denominator is accesses
+/// a gate actually saw. It is reported on its own row.
+///
 /// `bypasses_7d` sums the five aggregates that mirror
 /// `EnforcementEventType::BypassDetected` in the hash-chained log:
 /// `compliance:codex_shell_miss_*`, `compliance:wrapped_db_client_miss_*`,
@@ -1210,11 +1236,12 @@ async fn display_cached_stats(
 /// lookups denominator and `Hit rate` reflects real consultation behavior).
 /// The other four bypass aggregates are not consultation lookups, so they are
 /// not added to `misses_7d`.
-async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64) {
+async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
     let mut denials: u64 = 0;
     let mut bypasses: u64 = 0;
+    let mut pathless_allows: u64 = 0;
 
     // Generate date keys for the last 7 days
     for day_offset in 0..7 {
@@ -1231,6 +1258,7 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         let unclassified_literal_bypass_key =
             format!("compliance:unclassified_policy_literal_bypass_{date}");
         let seal_bypass_key = format!("compliance:seal_bypass_{date}");
+        let pathless_allow_key = format!("analytics:pathless_allow_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
@@ -1247,6 +1275,15 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         if let Ok(Some(record)) = store.get(&deny_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 denials += agg.count;
+            }
+        }
+
+        // Deliberately joins none of the four totals above: nothing was
+        // consulted, denied or bypassed, so folding it into any of them would
+        // move a rate whose denominator is accesses a gate actually saw.
+        if let Ok(Some(record)) = store.get(&pathless_allow_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                pathless_allows += agg.count;
             }
         }
 
@@ -1294,7 +1331,7 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         }
     }
 
-    (hits, misses, denials, bypasses)
+    (hits, misses, denials, bypasses, pathless_allows)
 }
 
 /// Format a Unix timestamp as `YYYY-MM-DD` for snapshot keys.
@@ -1565,6 +1602,7 @@ mod tests {
             hit_rate_7d: 0.84,
             bypasses_7d: 1,
             denials_7d: 5,
+            pathless_allows_7d: 3,
             computed_at: 1_710_520_800,
             write_seq: 42,
         }
@@ -1582,6 +1620,7 @@ mod tests {
         assert_eq!(parsed["hits_7d"], 42);
         assert_eq!(parsed["bypasses_7d"], 1);
         assert_eq!(parsed["denials_7d"], 5);
+        assert_eq!(parsed["pathless_allows_7d"], 3);
         assert_eq!(parsed["critical_uncovered"], 4);
         assert_eq!(parsed["orphaned_decisions"], 1);
         assert_eq!(parsed["low_confidence"], 3);
@@ -1612,6 +1651,7 @@ mod tests {
         assert_eq!(deserialized.misses_7d, snapshot.misses_7d);
         assert_eq!(deserialized.bypasses_7d, snapshot.bypasses_7d);
         assert_eq!(deserialized.denials_7d, snapshot.denials_7d);
+        assert_eq!(deserialized.pathless_allows_7d, snapshot.pathless_allows_7d);
         assert_eq!(deserialized.computed_at, snapshot.computed_at);
         assert!((deserialized.avg_confidence - snapshot.avg_confidence).abs() < 0.001);
         assert!((deserialized.estimated_minutes - snapshot.estimated_minutes).abs() < 0.01);
@@ -1647,6 +1687,9 @@ mod tests {
         assert_eq!(snapshot.orphaned_decisions, 0);
         assert_eq!(snapshot.low_confidence, 0);
         assert_eq!(snapshot.denials_7d, 0);
+        // Caches written before this field existed must still load. Without
+        // `#[serde(default)]` an upgrade would fail every cached snapshot.
+        assert_eq!(snapshot.pathless_allows_7d, 0);
         // Existing fields parse correctly
         assert_eq!(snapshot.files_with_purpose, 5);
         assert_eq!(snapshot.total_files, 10);

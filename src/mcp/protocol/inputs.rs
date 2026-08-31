@@ -515,6 +515,11 @@ pub enum SessionEvent {
     /// with reason `seal_bypass`. Unlike the deny events, this one is written
     /// AFTER the fact — the sweep detects and repairs, it does not prevent.
     SealBypassDetected,
+    /// An access that reached no file gate at all was ALLOWED — a Bash command
+    /// naming no path, or a `Grep`/`Glob` with none. Not an enforcement
+    /// outcome: it measures the surface enforcement never saw, so a repo can
+    /// report its own unobserved rate instead of quoting a constant.
+    PathlessAllow,
     Bootstrap,
     PromptNudge,
     /// Post-bash observed a command that passed `is_schema_introspection` but

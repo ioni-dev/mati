@@ -246,6 +246,14 @@ pub(crate) fn session_command(
             // file's gotchas, so there is no decision basis to hash.
             decision_basis_hash: None,
         }),
+        HookEvent::PathlessAllow { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::PathlessAllow,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            // No file record was read, so there is no gotcha state to digest.
+            decision_basis_hash: None,
+        }),
         HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
             event: p::SessionEvent::CodexShellBlocked,
             key: key.clone(),

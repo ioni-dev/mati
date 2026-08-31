@@ -244,6 +244,9 @@ pub enum HookEvent {
     /// enforcement log as `BypassDetected` — enforcement was suppressed, not
     /// merely a cache miss.
     TombstoneBypassedDeny { key: String },
+    /// An access no file gate ever saw was allowed. `key` names the surface it
+    /// came in on, not a file — there is no path, which is the point.
+    PathlessAllow { key: String },
 }
 
 /// The I/O-free subset of a daemon policy verdict needed by the hook adapter.

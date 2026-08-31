@@ -74,6 +74,10 @@ pub(super) async fn dispatch_session_side(
                 // Same for the Tier 2 floor deny (seal_floor_restore).
                 protocol::SessionEvent::SealFloorBlocked => "compliance:miss_",
                 protocol::SessionEvent::SealBypassDetected => "compliance:seal_bypass_",
+                // Not a compliance outcome — nothing was denied and nothing
+                // was consulted. `analytics:` keeps it out of the hit/miss
+                // rate, whose denominator is accesses a gate actually saw.
+                protocol::SessionEvent::PathlessAllow => "analytics:pathless_allow_",
             };
             let agg_key = sess::today_key(agg_prefix);
 

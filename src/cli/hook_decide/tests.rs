@@ -1994,3 +1994,48 @@ fn the_read_gate_denies_under_lockdown_and_keeps_the_event() {
         [HookEvent::LockdownBlocked { key }] if key == "file:keys.py"
     ));
 }
+
+// ── PathlessAllow ───────────────────────────────────────────────────────────
+
+/// The event exists to measure the surface enforcement never saw, so it must
+/// reach the daemon as its own `SessionEvent` rather than folding into `Miss`
+/// (which counts lookups a gate did make).
+#[test]
+fn a_pathless_allow_records_its_own_session_event() {
+    let cmd = session_command(
+        &decide::HookEvent::PathlessAllow {
+            key: "pathless:claude-bash".into(),
+        },
+        Some("sess-1"),
+        None,
+        Some("wt-abc"),
+        Some("basis-hash"),
+    );
+    let Some(mati_core::mcp::protocol::Command::SessionLog(input)) = cmd else {
+        panic!("a path-less allow must record a SessionLog, got {cmd:?}");
+    };
+    assert_eq!(
+        input.event,
+        mati_core::mcp::protocol::SessionEvent::PathlessAllow
+    );
+    assert_eq!(input.key, "pathless:claude-bash");
+    assert_eq!(input.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(input.actor.as_deref(), Some("wt-abc"));
+    // No file record was read, so there is no gotcha state to digest. A hash
+    // here would claim a decision basis the gate never had.
+    assert_eq!(input.decision_basis_hash, None);
+}
+
+/// The key names the surface, not the command. Low cardinality is the point:
+/// the daily aggregate caps its key list, and the question is which tool
+/// escapes the file gate.
+#[test]
+fn the_pathless_key_names_the_surface_not_the_command() {
+    for (variant, want) in [
+        (HookVariant::ClaudePreBash, "pathless:claude-bash"),
+        (HookVariant::CodexPreBash, "pathless:codex-bash"),
+        (HookVariant::ClaudePreRead, "pathless:claude-read"),
+    ] {
+        assert_eq!(flows::pathless_surface_key(variant), want, "{variant:?}");
+    }
+}

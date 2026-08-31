@@ -112,6 +112,12 @@ pub(crate) async fn run_pathless_lockdown(
     let Some(owed) =
         lockdown_owed_key(&mati_root, worktree.as_deref(), actor_scope.as_deref()).await
     else {
+        // Nothing owed, so the access proceeds and no file gate ever saw it.
+        // Record that. It is the one quantity a coverage claim cannot take
+        // from the enforcement log, because by definition nothing was
+        // enforced, and without it the unobserved rate stays a constant
+        // quoted from ARCHITECTURE section 24 rather than a per-repo measurement.
+        record_pathless_allow(&mati_root, input, variant, agent_id, actor_scope.as_deref()).await;
         return false;
     };
 
@@ -139,6 +145,55 @@ pub(crate) async fn run_pathless_lockdown(
         std::process::exit(exit_code);
     }
     true
+}
+
+/// Record that a path-less access was allowed without any file gate seeing it.
+///
+/// Reachable only with the daemon up — [`run_pathless_lockdown`] returns before
+/// this when `ensure_daemon` fails — so the count is a lower bound on the
+/// unobserved surface, never an upper one.
+///
+/// A command gate may still have run after this: `run_fileless_policy` handles
+/// `db_client` and `unknown` tools further down. That does not double-count.
+/// The claim is that no FILE gate saw the access, which stays true either way.
+async fn record_pathless_allow(
+    mati_root: &Path,
+    input: &serde_json::Value,
+    variant: HookVariant,
+    agent_id: Option<&str>,
+    actor_scope: Option<&str>,
+) {
+    let session_id = input.get("session_id").and_then(|value| value.as_str());
+    fire_events(
+        mati_root,
+        &[decide::HookEvent::PathlessAllow {
+            key: pathless_surface_key(variant),
+        }],
+        session_id,
+        agent_id,
+        actor_scope,
+        None,
+    )
+    .await;
+}
+
+/// Which surface a path-less access arrived on.
+///
+/// Deliberately low-cardinality, and deliberately not a file key — there is no
+/// path, which is the whole point. The daily aggregate caps its key list at
+/// 100, and the useful question is which tool escapes the file gate, not which
+/// command did it once.
+pub(crate) fn pathless_surface_key(variant: HookVariant) -> String {
+    let surface = match variant {
+        HookVariant::ClaudePreBash => "claude-bash",
+        HookVariant::CodexPreBash => "codex-bash",
+        HookVariant::ClaudePreRead => "claude-read",
+        // Unreachable: `entry.rs` calls the path-less gate for the three above
+        // only. Named rather than panicking, so widening that list degrades to
+        // a coarse count instead of killing the hook.
+        _ => "other",
+    };
+    format!("pathless:{surface}")
 }
 
 // ── Tier 2 read floor ───────────────────────────────────────────────────────

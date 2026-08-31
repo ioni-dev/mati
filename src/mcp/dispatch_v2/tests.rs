@@ -542,6 +542,49 @@ async fn v2_get_returns_null_for_missing_key() {
 }
 
 #[tokio::test]
+async fn v2_session_log_pathless_allow_lands_in_the_analytics_aggregate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let req = make_request(Command::SessionLog(SessionLogInput {
+        event: SessionEvent::PathlessAllow,
+        key: "pathless:claude-bash".into(),
+        session_id: None,
+        actor: None,
+        decision_basis_hash: None,
+    }));
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, req).await,
+        Response::Ok { .. }
+    ));
+
+    let g = graph.read().await;
+    // `analytics:` is what routes this to Eventual durability, which the
+    // design asks for; `store::durability` owns that mapping and tests it.
+    let analytics = g
+        .store()
+        .scan_keys("analytics:pathless_allow_")
+        .await
+        .unwrap();
+    assert_eq!(
+        analytics.len(),
+        1,
+        "a path-less allow must land in its own daily aggregate"
+    );
+    // The unobserved surface is not a compliance outcome. Landing anywhere
+    // under `compliance:` would move a rate whose denominator is accesses a
+    // gate actually saw.
+    let compliance = g.store().scan_keys("compliance:").await.unwrap();
+    assert!(
+        compliance.is_empty(),
+        "a path-less allow must not touch any compliance aggregate: {compliance:?}"
+    );
+}
+
+#[tokio::test]
 async fn v2_session_log_writes_audit_to_sessions_tree() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).await.unwrap();
