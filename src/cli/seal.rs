@@ -138,11 +138,11 @@ async fn run_seal(args: FileArgs, add: bool) -> Result<()> {
         println!("Sealed `{rel}` at mode 000 ({n} gotcha(s) tagged {TAG_CONSULT_TO_READ}).");
         println!("  Your editor, language server and build cannot read it either.");
         println!("  Undo: mati seal remove {rel}   |   all: mati seal clear");
-        // The mode bit is a floor the sweep repairs after the fact. A Seatbelt
-        // `file-write-mode` deny prevents the chmod outright — measured
-        // 2026-08-30, including from inside `python3`, which is the computed
-        // path the pre-Bash gate cannot classify. It needs `sandbox.enabled`,
-        // which mati never writes, so this is a pointer and not a default.
+        // The mode bit is a floor the sweep repairs after the fact. Claude
+        // Code compiles `denyWrite` to `(deny file-write* …)`, so the same path
+        // under `mati sandbox protect` cannot be chmod'd or unlinked at all —
+        // verified 2026-08-31 with a control. It needs `sandbox.enabled`, which
+        // mati never writes, so this is a pointer and not a default.
         println!("  With Claude Code's sandbox on, `mati sandbox protect {rel}` also");
         println!("  prevents the chmod instead of repairing it afterwards.");
     } else {

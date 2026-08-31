@@ -682,15 +682,31 @@ Known holes:
   `os.remove(p)` needs write permission on the *directory*, and the
   replacement is created at the umask. Found unprompted by an agent on
   2026-08-30. The sweep catches it — the row stats as a lowered floor, no
-  receipt explains it, it is recorded and re-armed — so detection holds where
-  prevention does not. The pre-Bash gate cannot close it: `os.remove` inside a
-  python heredoc is not a verb, and extending the deny to interpreter words was
-  measured and rejected.
+  receipt explains it, it is recorded and re-armed — so the seal alone
+  detects where it cannot prevent. The pre-Bash gate cannot close it:
+  `os.remove` inside a python heredoc is not a verb, and extending the deny to
+  interpreter words was measured and rejected. `mati sandbox protect` does
+  close it, at the OS layer — see the composition note below.
 - **History.** See the scope paragraph above. In a repo where the sealed file
   is committed, its bytes are one `git cat-file` away.
 - **macOS only.** Every filesystem and native-tool probe above is macOS, uid
   501, non-root, Claude Code. Linux and WSL2 are untested, and Codex fires no
   hook for its native read tool at all.
+
+**With the host sandbox on, the shell route is prevented, not just recorded.**
+Claude Code compiles each `sandbox.filesystem.denyWrite` entry to `(deny
+file-write* (subpath <path>))` — the wildcard, not `file-write-data` alone —
+plus a second `(deny file-write-unlink file-write-create)` over the path and
+every ancestor directory. `file-write*` covers `file-write-mode`,
+`file-write-unlink` and `file-write-flags`, so a path `mati sandbox protect`
+has compiled cannot be chmod'd, unlinked, replaced or `chflags`-ed from the
+agent's shell or anything it spawns. Verified 2026-08-31 end to end against a
+concurrent control: with the entry present `chmod 644` returns `Operation not
+permitted` and the mode stays `000`, and `os.remove` raises `PermissionError`
+with the bytes intact; with the sandbox on and the entry absent both succeed.
+The daemon runs outside the sandbox, so `mem_get` still lifts the mode. It
+needs `sandbox.enabled`, which mati never writes, so the composition is the
+developer's opt-in and not a default.
 
 Cost, measured 2026-08-30 on this repo with `src/store/record.rs` sealed:
 

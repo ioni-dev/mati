@@ -129,7 +129,7 @@ Same prompt as the 8-of-10 result above, same fixture, same binary, same model. 
 What it does not do:
 
 - **It does not make the bytes unobtainable.** Two sealed runs read the file out of git history with `git cat-file`. That is out of scope by design — git must read its own objects to work at all, and a secret in git history is a secret-scanner problem.
-- **A file can be replaced without ever being read.** `os.remove` needs write permission on the directory, not on the file. One sealed run did exactly that, then wrote a new one. The post-command sweep caught it, recorded it and put the mode back — but nothing prevented it.
+- **A file can be replaced without ever being read.** `os.remove` needs write permission on the directory, not on the file. One sealed run did exactly that, then wrote a new one. The post-command sweep caught it, recorded it and put the mode back — but the seal on its own does not stop it. Turning on Claude Code's sandbox and adding `mati sandbox protect <file>` does: the deny it compiles blocks `chmod` and `unlink` in the kernel, measured against a control.
 - **Your build stops too.** A cached `cargo check` still passes; the next real rebuild fails with `Permission denied`. rust-analyzer exits 0 and silently drops the module, so you get wrong answers rather than an error. `git add` cannot index the file. Seal a file whose bytes must be unavailable to everything, not one you are building against.
 
 Three sealed runs did not finish. All three were the agent declining the red-team instruction — one of them after reading the file from history and stopping at the write — not the floor blocking the work. On the seven runs that attempted it, seven succeeded.
