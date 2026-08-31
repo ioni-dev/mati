@@ -119,11 +119,15 @@ mod sealed_digest_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A repo whose sealed file's digest lives in a manifest under a fake
-    /// `MATI_HOME`. Returns the repo dir, kept alive by the caller.
-    fn sealed_repo(with_digest: bool) -> (tempfile::TempDir, tempfile::TempDir, String) {
-        let home = tempfile::tempdir().unwrap();
-        std::env::set_var("MATI_HOME", home.path());
+    /// A repo whose sealed file's digest lives in a manifest under the
+    /// per-process test home. Returns the repo dir, kept alive by the caller.
+    ///
+    /// Deliberately does not set `MATI_HOME`: `mati_home_opt` drops an
+    /// inherited value at its first resolution, which would land after a
+    /// `set_var` here and wipe it. The manifest is written and read through the
+    /// same `manifest_path`, and the slug comes from this tempdir repo, so the
+    /// per-process home isolates it just as well.
+    fn sealed_repo(with_digest: bool) -> (tempfile::TempDir, String) {
         let repo = tempfile::tempdir().unwrap();
         let rel = "src/gated.rs";
         let abs = repo.path().join(rel);
@@ -145,14 +149,14 @@ mod sealed_digest_tests {
         });
         crate::seal::write_manifest(&mpath, &manifest).unwrap();
         std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(0o000)).unwrap();
-        (repo, home, digest)
+        (repo, digest)
     }
 
     /// Without the fallback a sealed file reads as "unknown", which is silence
     /// on exactly the file whose rule matters most.
     #[test]
     fn a_sealed_file_hashes_to_its_lock_time_digest() {
-        let (repo, _home, digest) = sealed_repo(true);
+        let (repo, digest) = sealed_repo(true);
         let root = std::fs::canonicalize(repo.path()).unwrap();
         assert!(std::fs::read(root.join("src/gated.rs")).is_err(), "sealed");
         assert_eq!(disk_content_hash(&root, "src/gated.rs"), Some(digest));
@@ -162,7 +166,7 @@ mod sealed_digest_tests {
     /// right answer there — inventing one would report false drift.
     #[test]
     fn a_sealed_file_with_no_recorded_digest_stays_unknown() {
-        let (repo, _home, _) = sealed_repo(false);
+        let (repo, _) = sealed_repo(false);
         let root = std::fs::canonicalize(repo.path()).unwrap();
         assert_eq!(disk_content_hash(&root, "src/gated.rs"), None);
     }
@@ -171,7 +175,7 @@ mod sealed_digest_tests {
     /// reach the manifest read.
     #[test]
     fn a_missing_path_stays_unknown_and_never_consults_the_manifest() {
-        let (repo, _home, _) = sealed_repo(true);
+        let (repo, _) = sealed_repo(true);
         let root = std::fs::canonicalize(repo.path()).unwrap();
         assert_eq!(disk_content_hash(&root, "src/payments/**"), None);
         assert_eq!(disk_content_hash(&root, "src/gone.rs"), None);

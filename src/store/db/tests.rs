@@ -28,6 +28,26 @@ fn unit_tests_never_touch_real_mati_home() {
     );
 }
 
+/// Narrower than the guard above, and what let the real bug through:
+/// `mati_home_opt` used to return an inherited `MATI_HOME` before reaching the
+/// per-process redirect. An exported one then pointed every unit test at a
+/// single shared store — not the real `~/.mati`, so the check above stayed
+/// green while the suite quietly lost its isolation.
+#[test]
+fn the_unit_test_home_is_process_unique() {
+    let resolved = mati_home().expect("mati_home resolves under test");
+    let pid = std::process::id().to_string();
+    let leaf = resolved
+        .file_name()
+        .map(|leaf| leaf.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert!(
+        leaf.contains(&pid),
+        "MATI_HOME must end in a per-process leaf containing pid {pid}, got {}",
+        resolved.display()
+    );
+}
+
 // Helper: open a store backed by a temp directory (no real git repo needed)
 fn temp_store() -> (Store, TempDir) {
     let dir = TempDir::new().unwrap();

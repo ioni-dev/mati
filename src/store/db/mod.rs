@@ -127,6 +127,9 @@ pub fn mati_home() -> Result<PathBuf> {
 /// Non-failing [`mati_home`] for the call sites that already tolerate a missing
 /// home (logging, best-effort cleanup) with their own fallback.
 pub fn mati_home_opt() -> Option<PathBuf> {
+    #[cfg(test)]
+    drop_inherited_home();
+
     if let Some(dir) = std::env::var_os("MATI_HOME").filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(dir));
     }
@@ -156,15 +159,52 @@ pub fn mati_home_opt() -> Option<PathBuf> {
     }
 }
 
+/// Drop a `MATI_HOME` inherited from the environment, once per process.
+///
+/// A developer who exports `MATI_HOME` would otherwise put every unit test in
+/// one shared store, and the suite would stay green while they did. Only a
+/// value the process sets for itself may select a home; those are written after
+/// the first resolution, so they survive this. `MATI_TEST_HOME` is the lever
+/// for choosing where test homes live.
+#[cfg(test)]
+fn drop_inherited_home() {
+    use std::sync::OnceLock;
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| std::env::remove_var("MATI_HOME"));
+}
+
+/// Parent of the per-process test home.
+///
+/// `MATI_TEST_HOME` overrides it because macOS caps Unix socket paths at 104
+/// bytes and `$TMPDIR` is long. It sets the parent only — the per-process leaf
+/// is always appended, so a shared root cannot collapse two processes into one
+/// store the way a shared `MATI_HOME` did.
+#[cfg(test)]
+fn test_home_root() -> PathBuf {
+    std::env::var_os("MATI_TEST_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Per-process temp `MATI_HOME` for unit tests. Computed once and exported to
 /// the environment so any child `mati` process a test spawns inherits the same
 /// root instead of computing a divergent one.
+///
+/// The bin crate (`cli::ensure_test_home`) and the integration crates
+/// (`tests/common::mati_home`) carry the same shape, because both compile
+/// against this library without `--test` and cannot see a `cfg(test)` item
+/// here. Each of the three pins the per-process invariant with its own test.
 #[cfg(test)]
 fn test_home() -> PathBuf {
     use std::sync::OnceLock;
     static HOME: OnceLock<PathBuf> = OnceLock::new();
     HOME.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("mati-unit-test-{}", std::process::id()));
+        let dir = test_home_root().join(format!("mati-unit-test-{}", std::process::id()));
+        // Pids are recycled and these dirs outlive the run that made them, so
+        // wipe before use: a fresh process must never inherit an older one's
+        // store. Only the leaf is removed, never the root.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("MATI_HOME", &dir);
         dir
