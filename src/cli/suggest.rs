@@ -15,7 +15,7 @@ use clap::Args;
 
 use mati_core::analysis::onboarding;
 use mati_core::analysis::walker::Walker;
-use mati_core::store::record::Record;
+use mati_core::store::record::{GotchaRecord, Record, RecordLifecycle};
 
 use crate::cli::proxy::StoreProxy;
 
@@ -58,9 +58,20 @@ pub async fn run(args: SuggestArgs) -> Result<()> {
         .as_secs();
     let device_id = mati_core::store::stable_device_id();
 
+    let proxy = StoreProxy::open(&root).await?;
+    let governed = governed_files(&proxy).await.unwrap_or_default();
+
     let codeowners = read_codeowners(&root);
-    let files = read_text_files(&root);
+    let files: Vec<(String, String)> = read_text_files(&root)
+        .into_iter()
+        .filter(|(rel, _)| !governed.contains(rel))
+        .collect();
     let candidates = onboarding::build_candidates(codeowners.as_deref(), &files, device_id, 1, now);
+    let governed_note = if governed.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} governed file(s) skipped)", governed.len())
+    };
 
     if candidates.is_empty() {
         println!(
@@ -70,26 +81,33 @@ pub async fn run(args: SuggestArgs) -> Result<()> {
     }
 
     if args.dry_run {
-        println!("Would propose {} candidate(s):", candidates.len());
+        println!(
+            "Would propose {} candidate(s):{governed_note}",
+            candidates.len()
+        );
         for c in &candidates {
             println!("  {}\n      {}", c.key, c.value);
         }
+        proxy.close().await?;
         return Ok(());
     }
 
-    let proxy = StoreProxy::open(&root).await?;
     let outcome = write_candidates(&proxy, &candidates).await;
     let (written, skipped) = proxy.close_with_result(outcome).await?;
 
     if written == 0 {
-        println!("All {skipped} candidate(s) already present — nothing new to propose.");
+        println!(
+            "All {skipped} candidate(s) already present — nothing new to propose.{governed_note}"
+        );
     } else {
         let tail = if skipped > 0 {
             format!(" ({skipped} already present)")
         } else {
             String::new()
         };
-        println!("Proposed {written} new candidate(s){tail} — run `mati review` to approve.");
+        println!(
+            "Proposed {written} new candidate(s){tail}{governed_note} — run `mati review` to approve."
+        );
     }
     Ok(())
 }
@@ -108,6 +126,27 @@ async fn write_candidates(proxy: &StoreProxy, candidates: &[Record]) -> Result<(
         written += 1;
     }
     Ok((written, skipped))
+}
+
+/// Repo-relative paths already covered by a confirmed gotcha.
+///
+/// `suggest` proposes onboarding candidates for files mati does not yet know
+/// about, so a file that already carries a confirmed gotcha has nothing left
+/// to onboard. Skipping it also keeps `suggest` from minting a record that
+/// quotes a marker line out of a file the read gate is currently denying:
+/// `mati show` prints record content without minting a receipt, so an
+/// on-demand mint from ungated bytes would be a disclosure channel around the
+/// gate. Reproduced 2026-08-31 before this filter existed.
+async fn governed_files(proxy: &StoreProxy) -> Result<std::collections::HashSet<String>> {
+    Ok(proxy
+        .scan_prefix("gotcha:")
+        .await?
+        .into_iter()
+        .filter(|r| matches!(r.lifecycle, RecordLifecycle::Active))
+        .filter_map(|r| r.payload_as::<GotchaRecord>())
+        .filter(|g| g.confirmed)
+        .flat_map(|g| g.affected_files)
+        .collect())
 }
 
 /// Read the first existing CODEOWNERS file under the repo root.

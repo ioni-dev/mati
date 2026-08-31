@@ -10,8 +10,21 @@
 //!
 //! The line this draws: a command that emits source text without producing a
 //! record is a raw read channel and is gated here. Records that quote source —
-//! a gotcha's `reason`, a file record's `purpose` — are the product, and
-//! reading one is the consultation itself, so nothing about them is gated.
+//! a gotcha's `reason`, a file record's `purpose` — are the product and are
+//! not gated.
+//!
+//! That is disclosure the design accepts, not consultation. `mati show` prints
+//! record content and mints NO receipt: verified 2026-08-31, a `cat` on the
+//! same file denies identically before and after. So a file record's
+//! `purpose` — the module doc comment `mati init` extracted — is readable for
+//! a file the gate is denying. Accepted, because the hook already injects that
+//! same field as `additionalContext` without a receipt, and because it is
+//! developer-written prose rather than the implementation.
+//!
+//! What is NOT accepted is minting such a record from ungated bytes on demand.
+//! `mati suggest` would quote a `SECURITY:` line out of a denied file into a
+//! new record that `mati show` then prints (reproduced 2026-08-31), so it
+//! skips files that already carry a confirmed gotcha.
 //!
 //! **Fails closed**, unlike the hook path. `FAILURE_MODES.md` section 1 puts
 //! fail-open where correctness depends on a live daemon *and* blocking would
