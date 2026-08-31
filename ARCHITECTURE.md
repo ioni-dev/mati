@@ -602,6 +602,103 @@ the first deny, since every command denies once a marker is unsettled. That is
 the same class of hole as `mati daemon stop`, which fail-open (P9) makes
 structural.
 
+### 10.1b Read floor (Tier 2)
+
+Opt-in, per file. `mati seal add <file>` arms it; `mati seal remove <file>` and
+`mati seal clear` disarm it. The file must already carry a confirmed gotcha —
+the floor is a read gate whose receipt has to prove a specific record was read,
+so the selector sits on the record that carries the reason. `mati seal add`
+tags it `consult-to-read`.
+
+Tier 1 asks a decidable question, but it still needs mati to deny once before
+it can ask. Measured 2026-08-29: told only to keep a file's literal name out of
+every command, agents reached its contents in 10 of 10 runs and were denied in
+none. Seven took the same route — `F=$(grep -rl "<a line from the file>" .);
+cat "$F"` — which names a pattern, not a file. Nothing that reads a command
+string can gate that.
+
+So the floor removes the bytes instead of classifying the command. A sealed
+file sits at mode `000` and the kernel refuses every reader: the shell, any
+interpreter it spawns, the agent's native `Read` (a hard `EACCES`), and its
+native `Grep`, which is not a subprocess and so never meets the `mati sandbox`
+floor. `Grep` skips a sealed file silently — absent from `files_with_matches`
+and from the count, not redacted — so there is no match oracle either. Only
+the filename survives, which `ls` already discloses.
+
+- **Manifest before chmod.** The `chmod` destroys the original mode, so
+  `~/.mati/<slug>/sealed.json` records it first, written temp-file → fsync →
+  rename. `mati seal clear` restores from that manifest without opening the
+  store, so a wedged daemon cannot strand a locked tree. If mati will not run
+  at all, `chmod -R u+rwX <worktree>` is the last rung.
+- **Lift on receipt.** `mem_get` mints the receipt and lifts the mode in the
+  same call, after the sessions write. The floor is worktree-scoped, not
+  per-actor — one inode cannot answer differently for a parent and its
+  subagent — so 10.1a stays the per-actor gate on top of it.
+- **Re-arm on lapse.** Three sites put the mode back: daemon start after the
+  receipt wipe, the `SessionClearConsults` handler before it, and `mati
+  watch-paths`. All key on the manifest row, never on the `consult-to-read`
+  tag. `mati seal clear` empties the manifest and cannot drop the tag, so a
+  tag-keyed re-arm would undo the break-glass at the next daemon start.
+- **Restore verbs deny.** While any manifest row is unsettled, pre-Bash denies
+  `chmod` and git `checkout`, `checkout-index`, `restore`, `clone`, `reset
+  --hard` and `worktree add`, through `sudo`, `sh -c` and `git -C` alike. The
+  question is the verb, never the path: `chmod -R u+rwX .` names no sealed file
+  and restores every one. Each deny arms the lockdown.
+- **Post-Bash sweep.** One `stat` per row on an async hook. A row whose mode is
+  down is classified by date — a receipt at or after `rearmed_at` explains the
+  lift, anything older cannot have caused it. A row still at `000` whose size,
+  mtime or ctime moved is hashed through the floor. ctime is in the stamp
+  because `utimensat` restores mtime to the nanosecond, which defeats a
+  size-and-mtime check outright. What no receipt explains is recorded and the
+  floor re-armed.
+- **No twelfth event type.** `DenyOrigin::SealFloor` and the two session events
+  record through the existing `Deny` and `BypassDetected` with reason codes
+  `seal_floor_restore` and `seal_bypass`, so the hash-chain contract in 12 is
+  unchanged. `mati doctor`'s `enforcement/seal` row and the `Sealed files` line
+  in `mati stats` report the manifest; both only `stat`, so neither reporting
+  surface can lift a mode.
+
+**Scope is the working tree, not the repository.** Git must read its own
+objects to function, so `git log -p`, `git show <ref>` and `git cat-file -p
+<blob>` reach a sealed file's committed bytes, and the object files stay
+readable to any interpreter. Confidentiality was never the claim: a secret in
+git history is a secret-scanner problem. Making the object store unreadable is
+not an option — with `.git/objects` at mode `000` every git command fails
+`fatal: not a git repository`, because git cannot tell an unreadable object
+directory from a missing one.
+
+Known holes:
+
+- **`unlink` then create.** Mode bits guard the inode, not the path.
+  `os.remove(p)` needs write permission on the *directory*, and the
+  replacement is created at the umask. Found unprompted by an agent on
+  2026-08-30. The sweep catches it — the row stats as a lowered floor, no
+  receipt explains it, it is recorded and re-armed — so detection holds where
+  prevention does not. The pre-Bash gate cannot close it: `os.remove` inside a
+  python heredoc is not a verb, and extending the deny to interpreter words was
+  measured and rejected.
+- **History.** See the scope paragraph above. In a repo where the sealed file
+  is committed, its bytes are one `git cat-file` away.
+- **macOS only.** Every filesystem and native-tool probe above is macOS, uid
+  501, non-root, Claude Code. Linux and WSL2 are untested, and Codex fires no
+  hook for its native read tool at all.
+
+Cost, measured 2026-08-30 on this repo with `src/store/record.rs` sealed:
+
+| Surface | Sealed |
+|---|---|
+| `cargo check` — nothing to rebuild | passes. The fingerprint reads mtime, which the `chmod` does not move |
+| `cargo check` — anything to rebuild | `error: couldn't read <file>: Permission denied`, exit 101 |
+| rust-analyzer | exit 0, no diagnostic, and the module silently absent from the analysis. Verified against an unsealed control: symbols defined in the file appear four times each unsealed and zero times sealed |
+| `git status` | reports the file as modified. Git cannot hash it, so it cannot call it unchanged |
+| `git diff` / `git add -A` | `fatal: cannot hash`, `unable to index file`. Other paths still stage; the sealed one cannot be committed until it is unsealed |
+| `mati status`, `stale`, `repair --check`, `doctor` | unchanged, same output and same exit code as unsealed |
+
+The mode is what reaches the developer's own tools; the `mati sandbox` floor
+constrains only the agent's sandboxed shell. Where a static shell deny is
+enough, prefer the floor. Seal a file only when the bytes must be unavailable
+to everything, and expect the build to stop until it is consulted or cleared.
+
 ### 10.2 Command Classification (pre-bash)
 
 The pre-bash hook classifies shell commands before they run.
