@@ -1150,9 +1150,20 @@ async fn display_cached_stats(
 
     println!("  {bold}{blue}Compliance (7d){reset}");
 
-    let total_lookups = s.hits_7d + s.misses_7d;
+    // Re-scanned on a cache hit rather than read from the snapshot, for the
+    // same reason the Enforcement section is: these count hook activity, which
+    // moves without a knowledge write. The snapshot is keyed on the KNOWLEDGE
+    // write-seq, so a hook-only day never invalidates it, and `mati init`
+    // seeds every one of these at zero — a fresh repo reported no hook
+    // activity until something unrelated wrote knowledge. The snapshot still
+    // carries the fields; they are the values as of its computation, not what
+    // is rendered.
+    let (hits_7d, misses_7d, denials_7d, bypasses_7d, pathless_allows_7d) =
+        scan_compliance_7d(store, now).await;
+
+    let total_lookups = hits_7d + misses_7d;
     let hit_rate = if total_lookups > 0 {
-        s.hits_7d as f32 / total_lookups as f32 * 100.0
+        hits_7d as f32 / total_lookups as f32 * 100.0
     } else {
         0.0
     };
@@ -1160,30 +1171,25 @@ async fn display_cached_stats(
     if total_lookups > 0 {
         let hr_color = if hit_rate >= 80.0 { green } else { yellow };
         println!(
-            "    Hit rate               {hr_color}{hit_rate:.0}%{reset}  ({white}{}{reset} hits / {white}{total_lookups}{reset} lookups)",
-            s.hits_7d
+            "    Hit rate               {hr_color}{hit_rate:.0}%{reset}  ({white}{hits_7d}{reset} hits / {white}{total_lookups}{reset} lookups)"
         );
     } else {
         println!("    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)");
     }
 
-    if s.denials_7d > 0 {
-        println!("    Denials (blocked)      {red}{}{reset}", s.denials_7d);
+    if denials_7d > 0 {
+        println!("    Denials (blocked)      {red}{denials_7d}{reset}");
     }
 
-    if s.pathless_allows_7d > 0 {
+    if pathless_allows_7d > 0 {
         println!(
-            "    Unobserved (no path)   {yellow}{}{reset}  (no file gate saw these)",
-            s.pathless_allows_7d
+            "    Unobserved (no path)   {yellow}{pathless_allows_7d}{reset}  (no file gate saw these)"
         );
     }
 
-    let bp_color = if s.bypasses_7d == 0 { green } else { yellow };
-    if s.bypasses_7d > 0 || total_lookups > 0 {
-        println!(
-            "    Bypasses               {bp_color}{}{reset}",
-            s.bypasses_7d
-        );
+    let bp_color = if bypasses_7d == 0 { green } else { yellow };
+    if bypasses_7d > 0 || total_lookups > 0 {
+        println!("    Bypasses               {bp_color}{bypasses_7d}{reset}");
     } else {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }

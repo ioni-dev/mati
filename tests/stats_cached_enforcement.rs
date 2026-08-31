@@ -128,23 +128,25 @@ fn cached_stats_renders_enforcement_and_subagent_spawns() {
     );
 }
 
-/// The path-less allow is recorded, and the write survives the daemon coming
-/// down. That seam is otherwise untested: deleting the `record_pathless_allow`
-/// call in `run_pathless_lockdown` leaves every unit test green and the feature
-/// silently dead.
+/// The path-less allow end to end: recorded through a live daemon, durable
+/// across `mati daemon stop`, and rendered as its own `mati stats` row.
 ///
-/// It also settles an open question about `analytics:*` aggregates. They are
-/// Eventual durability — an OS buffer, not an fsync — and a lost write here
+/// Three seams no unit test reaches. Deleting the `record_pathless_allow` call
+/// in `run_pathless_lockdown`, or the read in `scan_compliance_7d`, leaves
+/// every unit test green and the feature silently dead.
+///
+/// The `stats` assertion is also the regression for the snapshot cache. `mati
+/// init` seeds compliance counters at zero and the cache is keyed on the
+/// KNOWLEDGE write-seq, which a sessions-tree aggregate never bumps — so
+/// before the fix this row (and the hit rate, denials and bypasses beside it)
+/// stayed at zero until an unrelated knowledge write.
+///
+/// It also settles an open question about `analytics:*` aggregates: they are
+/// Eventual durability, an OS buffer rather than an fsync, and a lost write
 /// would make the count unreportable. Measured: it survives.
-///
-/// Deliberately does NOT assert the `mati stats` row. `mati init` seeds the
-/// health snapshot with compliance counters hardcoded to zero, and the cache is
-/// keyed on the KNOWLEDGE write-seq, which a sessions-tree aggregate never
-/// bumps. So the row stays hidden until an unrelated knowledge write, exactly
-/// as `hits_7d`, `misses_7d`, `denials_7d` and `bypasses_7d` already do.
 #[test]
 #[ignore]
-fn a_pathless_command_is_recorded_and_survives_daemon_stop() {
+fn a_pathless_command_is_recorded_durable_and_rendered() {
     let s = Scratch::new("pathless");
     assert!(s.mati(&["init"], true).status.success(), "init failed");
 
@@ -187,5 +189,12 @@ fn a_pathless_command_is_recorded_and_survives_daemon_stop() {
         shown.status.success(),
         "a path-less allow must persist as {key} after the daemon stops.\nstderr: {}",
         String::from_utf8_lossy(&shown.stderr)
+    );
+
+    let stats = s.mati(&["stats"], true);
+    let text = String::from_utf8_lossy(&stats.stdout);
+    assert!(
+        text.contains("Unobserved (no path)"),
+        "stats must render the unobserved-surface row on a seeded cache.\n{text}"
     );
 }
