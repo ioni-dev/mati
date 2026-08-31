@@ -150,6 +150,15 @@ pub async fn run_daemon_start() -> Result<()> {
         }
     }
 
+    // Tier 2: the wipe above lapsed every consultation in this worktree, so
+    // every file the manifest lists goes back to mode 000. Store-free, and it
+    // reads `store.root` rather than recomputing the slug so it can never name
+    // a different manifest than the receipt lift does.
+    let rearmed = mati_core::seal::rearm_all(&store.root);
+    if !rearmed.is_empty() {
+        tracing::info!("daemon: re-armed {} sealed file(s)", rearmed.len());
+    }
+
     // Every window with no daemon is a window with no enforcement. Best-effort:
     // a daemon that refuses to start because it could not write an audit event
     // is worse than the missing event (P9).

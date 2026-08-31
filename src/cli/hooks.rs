@@ -46,11 +46,21 @@ where
 }
 
 /// Fire-and-forget with a typed v2 Command. Preferred for mutation/side-effecting calls.
-async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
-    let kind = cmd.kind();
+pub(super) async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
-    match super::daemon::daemon_v2(&root, cmd).await {
+    hook_fire_v2_at(&root, cmd).await
+}
+
+/// [`hook_fire_v2`] for a caller that already resolved the mati root from repo
+/// identity. Re-deriving it from the process cwd would name a different slug
+/// from a subdirectory — the same trap `derive-mati-root-from-repo-root` pins.
+pub(super) async fn hook_fire_v2_at(
+    root: &std::path::Path,
+    cmd: mati_core::mcp::protocol::Command,
+) -> Result<()> {
+    let kind = cmd.kind();
+    match super::daemon::daemon_v2(root, cmd).await {
         DaemonResult::Ok(_) => {}
         _ => tracing::debug!("mati {kind}: daemon unreachable — dropping event"),
     }

@@ -2536,6 +2536,100 @@ fn copy_onto_a_governed_path_is_not_gated() {
     );
 }
 
+// ── Tier 2 read floor ────────────────────────────────────────────────
+
+/// Every verb measured 2026-08-30 to restore a mode-000 tracked file.
+#[test]
+fn every_measured_floor_restoring_verb_is_recognised() {
+    for cmd in [
+        "chmod 644 src/gated.rs",
+        "chmod -R u+rwX .",
+        "git checkout -- src/gated.rs",
+        "git checkout .",
+        "git checkout HEAD -- src/gated.rs",
+        "git checkout -- src/",
+        "git restore src/gated.rs",
+        "git restore .",
+        "git reset --hard",
+        "git reset --hard HEAD",
+        "git worktree add ../wt",
+        "git clone . ../copy",
+        "git checkout-index -f -a",
+    ] {
+        assert!(restores_read_floor(cmd), "must be caught: {cmd}");
+    }
+}
+
+/// The wrapper and shell-unwrap classes `effective_command` already closes for
+/// the read gate close here too, because this reuses it.
+#[test]
+fn wrapped_and_segmented_floor_restores_are_recognised() {
+    for cmd in [
+        "sudo chmod 644 src/gated.rs",
+        "/bin/chmod 644 src/gated.rs",
+        "env FOO=1 chmod 644 src/gated.rs",
+        "sh -c 'chmod 644 src/gated.rs'",
+        "echo hi && chmod 644 src/gated.rs",
+        "git -C /repo checkout -- src/gated.rs",
+        "git -c core.pager=cat restore src/gated.rs",
+    ] {
+        assert!(restores_read_floor(cmd), "must be caught: {cmd}");
+    }
+}
+
+/// Verbs that leave the working tree alone. Denying these would be cost with
+/// no hazard behind it.
+#[test]
+fn tree_preserving_git_verbs_are_not_floor_restoring() {
+    for cmd in [
+        "git status",
+        "git log",
+        "git add .",
+        "git commit -m x",
+        "git reset",
+        "git reset --soft HEAD~1",
+        "git reset HEAD src/gated.rs",
+        "git worktree list",
+        "git worktree prune",
+        "git diff",
+        "chmodx --help",
+        "cat src/gated.rs",
+    ] {
+        assert!(!restores_read_floor(cmd), "must not be caught: {cmd}");
+    }
+}
+
+#[test]
+fn the_floor_deny_names_the_receipt_that_lifts_it() {
+    let result = seal_floor_result("file:src/gated.rs");
+    let Decision::Deny {
+        file_key,
+        reason,
+        origin,
+    } = &result.decision
+    else {
+        panic!("the floor must deny")
+    };
+    assert_eq!(file_key, "file:src/gated.rs");
+    assert_eq!(*origin, DenyOrigin::SealFloor);
+    assert!(
+        reason.contains("mem_get(\"file:src/gated.rs\")"),
+        "a deny the agent cannot clear is a deadlock: {reason}"
+    );
+}
+
+/// The floor deny must not be filed under the lockdown's reason code — the
+/// audit has to tell a blanket session deny from one aimed at a mode bit.
+#[test]
+fn the_floor_deny_carries_its_own_event() {
+    assert_eq!(
+        seal_floor_result("file:a.rs").events,
+        vec![HookEvent::SealFloorBlocked {
+            key: "file:a.rs".to_string()
+        }]
+    );
+}
+
 // ── Tier 1 session lockdown ──────────────────────────────────────────
 
 #[test]

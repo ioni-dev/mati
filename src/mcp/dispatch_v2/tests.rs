@@ -711,6 +711,48 @@ async fn v2_session_clear_consults_deletes_receipts_silently() {
     );
 }
 
+/// The receipt clear is also the session-boundary re-arm: a file a receipt had
+/// lifted goes back to mode 000, and the floor and the gate move together.
+#[tokio::test]
+async fn v2_session_clear_consults_rearms_a_lifted_sealed_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let store_root = store.root.clone();
+
+    // A file already lifted: mode 644, manifest row retained.
+    let abs = dir.path().join("gated.rs");
+    std::fs::write(&abs, b"secret").unwrap();
+    let mut manifest = crate::seal::Manifest::default();
+    manifest.files.push(crate::seal::SealedFile {
+        path: std::fs::canonicalize(&abs)
+            .unwrap()
+            .to_string_lossy()
+            .into(),
+        mode: "644".to_string(),
+        ..Default::default()
+    });
+    crate::seal::write_manifest(&crate::seal::manifest_in(&store_root), &manifest).unwrap();
+    assert!(std::fs::read(&abs).is_ok(), "file starts lifted");
+
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let req = make_request(Command::SessionClearConsults);
+    assert!(matches!(
+        dispatch_v2(&graph, &ctx, req).await,
+        Response::Ok { .. }
+    ));
+
+    assert_eq!(
+        std::fs::metadata(&abs).unwrap().permissions().mode() & 0o7777,
+        crate::seal::SEALED_MODE,
+        "the clear must re-arm the floor the lapsed receipt had lifted"
+    );
+}
+
 #[tokio::test]
 async fn v2_pure_read_does_not_write_audit() {
     let dir = tempfile::tempdir().unwrap();

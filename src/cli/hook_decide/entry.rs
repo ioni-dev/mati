@@ -191,6 +191,28 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         .pointer("/tool_input/command")
         .and_then(|value| value.as_str());
 
+    // Tier 2: a command that would return a sealed file to a readable state is
+    // denied before path extraction, because the verbs that do it reach files
+    // they never name — `chmod -R u+rwX .` and `git clone` restore the whole
+    // tree — so there is no governed path for the file gate below to find.
+    if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) && run_seal_guard(&input, args.variant, agent_id).await
+    {
+        return Ok(());
+    }
+
+    // Codex's post-Bash sweep. Claude's runs inside `run_post_bash_introspection`,
+    // which `run_inner` dispatches before any of this; Codex's `run_post_bash`
+    // is reached only at step 6, AFTER path extraction, so a command naming no
+    // path — every `chmod`, and every computed path inside an interpreter —
+    // would never reach it. The sweep asks the filesystem, not the command, so
+    // it belongs here rather than there.
+    if args.variant == HookVariant::CodexPostBash {
+        run_seal_sweep(&input, agent_id).await;
+    }
+
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,

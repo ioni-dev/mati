@@ -505,6 +505,16 @@ pub enum SessionEvent {
     /// owes a receipt on the keyed file. Records `Deny` with reason
     /// `session_lockdown`, distinct from the gotcha deny that armed it.
     LockdownBlocked,
+    /// Tier 2 DENIED a command that would have returned the keyed sealed file
+    /// to a readable state. Records `Deny` with reason `seal_floor_restore`,
+    /// distinct from the lockdown so the audit can tell a blanket session deny
+    /// from a deny aimed at one file's mode bit.
+    SealFloorBlocked,
+    /// The post-Bash sweep found the keyed sealed file's floor down, or its
+    /// bytes moved, with no receipt to explain it. Records `BypassDetected`
+    /// with reason `seal_bypass`. Unlike the deny events, this one is written
+    /// AFTER the fact — the sweep detects and repairs, it does not prevent.
+    SealBypassDetected,
     Bootstrap,
     PromptNudge,
     /// Post-bash observed a command that passed `is_schema_introspection` but

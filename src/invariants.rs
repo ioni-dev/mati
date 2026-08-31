@@ -579,6 +579,16 @@ mod gotcha_write_sites {
              tags",
         ),
         (
+            "src/cli/seal.rs",
+            "tag_gotchas",
+            Class::Bypass,
+            "re-puts scan_prefix(\"gotcha:\") matches with the consult-to-read \
+             tag. Same shape as sandbox.rs run_protect, and gotcha_ops offers \
+             no tag-only entry point: apply_gotcha_write de-confirms the \
+             record, which would destroy the confirmed gotcha `mati seal` \
+             requires as its selector",
+        ),
+        (
             "src/cli/suggest.rs",
             "write_candidates",
             Class::Bypass,

@@ -77,6 +77,7 @@ pub(crate) fn platform_events(
                 // it which platform blocked. The lockdown's own reason code is
                 // the cost; mis-attributing the agent would be the worse one.
                 HookEvent::LockdownBlocked { key } => Some(HookEvent::CodexShellBlocked { key }),
+                HookEvent::SealFloorBlocked { key } => Some(HookEvent::SealFloorBlocked { key }),
                 HookEvent::Hit { .. } => {
                     // Suppress Hit for outcomes where Codex receives no context.
                     // Minting a consultation receipt without delivering context
@@ -234,6 +235,15 @@ pub(crate) fn session_command(
             session_id: sid(),
             actor: scope(),
             // The lockdown decides on session state, not on the file's gotchas.
+            decision_basis_hash: None,
+        }),
+        HookEvent::SealFloorBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
+            event: p::SessionEvent::SealFloorBlocked,
+            key: key.clone(),
+            session_id: sid(),
+            actor: scope(),
+            // The floor decides on the manifest and the receipt, not on the
+            // file's gotchas, so there is no decision basis to hash.
             decision_basis_hash: None,
         }),
         HookEvent::CodexShellBlocked { key } => p::Command::SessionLog(p::SessionLogInput {
@@ -741,7 +751,8 @@ pub(crate) fn format_decision(
                     decide::DenyOrigin::Policy
                     | decide::DenyOrigin::PolicyContentDenied
                     | decide::DenyOrigin::PolicyRequirementUnmet
-                    | decide::DenyOrigin::SessionLockdown => reason.clone(),
+                    | decide::DenyOrigin::SessionLockdown
+                    | decide::DenyOrigin::SealFloor => reason.clone(),
                     decide::DenyOrigin::Gotcha | decide::DenyOrigin::ConsultMandate => {
                         format!("mati: call mem_get(\"{file_key}\") first")
                     }

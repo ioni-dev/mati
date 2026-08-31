@@ -179,6 +179,23 @@ pub(crate) async fn handle_mem_get(
     )
     .await;
 
+    // 3c. Tier 2: lift the read floor on the file this receipt was just minted
+    // for. After the sessions write, never before — a crash between the two
+    // must leave the file sealed, not open with no receipt behind it. The
+    // staging-failure path above returns before reaching here for the same
+    // reason; a failed sessions transaction does not, matching the fail-open
+    // stance that path already takes.
+    if let Some(rel) = input.key.strip_prefix("file:") {
+        if let Some(mode) = crate::seal::lift_on_receipt(&ctx.repo_root, &store.root, rel) {
+            tracing::info!(
+                request_id = %request_id,
+                key = %input.key,
+                mode = format!("{mode:o}"),
+                "mem_get: Tier 2 floor lifted on receipt"
+            );
+        }
+    }
+
     // 4. Deferred best-effort: access_count bump + daily agg.
     if let Some(mut r) = record {
         r.access_count += 1;

@@ -19,7 +19,8 @@ mod tests;
 #[cfg(fuzzing)]
 pub use classification::effective_command_for_fuzzing;
 pub use classification::{
-    classify_command, is_known_action_tool, is_schema_introspection, KNOWN_ACTION_TOOLS,
+    classify_command, is_known_action_tool, is_schema_introspection, restores_read_floor,
+    KNOWN_ACTION_TOOLS,
 };
 pub use config_change::{local_violations, project_violations, ConfigViolation, ExpectedFloor};
 pub use envelope::{extract_apply_patch_files, MAX_APPLY_PATCH_FILES};
@@ -159,6 +160,10 @@ pub enum DenyOrigin {
     /// until that receipt exists. `file_key` is the owed — and consultable —
     /// file key, not anything read from the command being denied.
     SessionLockdown,
+    /// Tier 2 read floor: a command that would return a sealed file to a
+    /// readable state, run while that file's receipt is outstanding.
+    /// `file_key` is the sealed — and consultable — file key.
+    SealFloor,
 }
 
 impl DenyOrigin {
@@ -176,6 +181,7 @@ impl DenyOrigin {
             DenyOrigin::PolicyContentDenied => HookEvent::PolicyContentBlocked { key },
             DenyOrigin::PolicyRequirementUnmet => HookEvent::PolicyRequirementBlocked { key },
             DenyOrigin::SessionLockdown => HookEvent::LockdownBlocked { key },
+            DenyOrigin::SealFloor => HookEvent::SealFloorBlocked { key },
         }
     }
 }
@@ -228,6 +234,9 @@ pub enum HookEvent {
     /// Tier 1 session lockdown denied a Bash command that named no governed
     /// path, because the session still owes a receipt on `key`.
     LockdownBlocked { key: String },
+    /// Tier 2 denied a command that would have lifted the read floor on the
+    /// sealed file `key`, whose receipt is still outstanding.
+    SealFloorBlocked { key: String },
     /// The `FileDeleted` bypass fired on a caller-confirmed deletion
     /// (`file_exists: Some(false)`) that also suppressed a deny a qualifying
     /// confirmed gotcha would otherwise have produced. Unlike the plain
@@ -492,6 +501,33 @@ pub fn lockdown_result(owed_key: &str) -> EnforcementResult {
             origin: DenyOrigin::SessionLockdown,
         },
         events: vec![DenyOrigin::SessionLockdown.deny_event(owed_key.to_string())],
+    }
+}
+
+// ── Tier 2 read floor ───────────────────────────────────────────────────────
+
+/// The deny a floor-restoring command gets while `sealed_key` is still owed.
+///
+/// Measured 2026-08-30: `chmod`, `git checkout`/`restore` with a pathspec,
+/// `git reset --hard`, `git worktree add` and `git clone` each returned a
+/// mode-`000` file to a readable state, and the last two did it by making a
+/// second tree rather than by naming the file at all. So the gate asks the
+/// decidable question — is anything sealed whose receipt is outstanding —
+/// rather than which path the command will touch.
+pub fn seal_floor_result(sealed_key: &str) -> EnforcementResult {
+    let path = sealed_key.strip_prefix("file:").unwrap_or(sealed_key);
+    EnforcementResult {
+        decision: Decision::Deny {
+            file_key: sealed_key.to_string(),
+            reason: format!(
+                "[mati] {path} is sealed and has not been consulted. Commands that \
+                 would restore it — chmod, git checkout, git restore, git reset \
+                 --hard, git worktree add, git clone — are denied until you call \
+                 mem_get(\"{sealed_key}\"), which unseals it."
+            ),
+            origin: DenyOrigin::SealFloor,
+        },
+        events: vec![DenyOrigin::SealFloor.deny_event(sealed_key.to_string())],
     }
 }
 

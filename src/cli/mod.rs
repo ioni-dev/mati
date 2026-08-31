@@ -23,6 +23,7 @@ pub mod repair;
 pub mod reparse;
 pub mod review;
 pub mod sandbox;
+pub mod seal;
 pub mod search;
 pub mod show;
 pub mod stale;

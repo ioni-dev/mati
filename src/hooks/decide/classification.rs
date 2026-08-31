@@ -304,6 +304,69 @@ fn classify_segment(cmd: &str) -> Option<CommandClass> {
     None
 }
 
+/// Git subcommands that return a sealed file to a readable state, or
+/// materialise a second readable copy of the worktree.
+///
+/// Measured 2026-08-30 against a tracked file held at mode `000`: each of
+/// these restored access. `git checkout -- <path>`, `git checkout .`,
+/// `git checkout HEAD -- <path>`, `git checkout -- <dir>`, `git restore
+/// <path>`, `git restore .` and `git reset --hard` all rewrote the file at
+/// its committed mode; `git worktree add` and `git clone` produced a second
+/// tree whose copy was readable. `git checkout-index -f -a` was found by
+/// probing the list itself and restored too — it is a separate command word,
+/// so `checkout` alone did not cover it.
+///
+/// Two forms that do NOT restore are denied anyway, because both already fail
+/// on their own and the deny only substitutes a clear message for a confusing
+/// one: a bare `git checkout <branch>` aborts with "local changes to the
+/// following files would be overwritten", whether or not the branches differ
+/// on the file, and `git stash` fails with `open(...): Permission denied`.
+const FLOOR_RESTORING_GIT: &[&str] = &["checkout", "checkout-index", "restore", "clone"];
+
+/// Does this command return a sealed file to a readable state?
+///
+/// Asks about the verb only, never about which path the verb will touch. The
+/// path question is undecidable in the direction that matters — `chmod -R
+/// u+rwX .` names no sealed file and restores every one of them — so the gate
+/// that consumes this asks the decidable question instead: is anything sealed
+/// whose receipt is outstanding. Same reasoning as [`super::lockdown_result`].
+pub fn restores_read_floor(cmd: &str) -> bool {
+    shell_segments(cmd).iter().any(|s| segment_restores(s))
+}
+
+fn segment_restores(cmd: &str) -> bool {
+    let eff = effective_command(cmd);
+    if matches_command_word(&eff, "chmod") {
+        return true;
+    }
+    if !matches_command_word(&eff, "git") {
+        return false;
+    }
+    let tokens = shell_tokens(&eff);
+    let mut i = 1;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if GIT_VALUE_FLAGS.contains(&tok) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return match tok {
+            // `--soft` and `--mixed` leave the working tree alone; only a
+            // tree-updating reset restores. `--merge` and `--keep` also update
+            // it and were not probed, so they are left out rather than guessed.
+            "reset" => tokens[i + 1..].iter().any(|t| t == "--hard"),
+            // Only `add` materialises a tree; `list`, `prune`, `remove` do not.
+            "worktree" => tokens.get(i + 1).is_some_and(|t| t == "add"),
+            other => FLOOR_RESTORING_GIT.contains(&other),
+        };
+    }
+    false
+}
+
 /// Return whether a command performs an allowlisted database schema
 /// introspection. This is deliberately lexical: it recognizes only bounded
 /// SQL/meta-command forms and never infers intent from natural language.

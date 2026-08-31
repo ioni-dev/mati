@@ -138,6 +138,8 @@ enum Commands {
     Hooks(cli::init::HooksArgs),
     /// Compile Claude denies or prepare Codex entries (Codex does not currently enforce them)
     Sandbox(cli::sandbox::SandboxArgs),
+    /// Seal a file at mode 000 — unreadable to every process until consulted
+    Seal(cli::seal::SealArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Generate user-level service unit (launchd/systemd) to keep the daemon alive
@@ -382,6 +384,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::VerifyChain(args) => cli::verify_chain::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Sandbox(args) => cli::sandbox::run(args).await,
+        Commands::Seal(args) => cli::seal::run(args).await,
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
             cli::daemon::DaemonCommand::Stop(args) => cli::daemon::run_daemon_stop(args).await,

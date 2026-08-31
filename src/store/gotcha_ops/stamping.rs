@@ -16,11 +16,31 @@ use super::*;
 /// `~/.mati/<slug>`) and never the process cwd.
 ///
 /// `None` for anything that is not a readable file: a glob entry such as
-/// `src/payments/**`, a deleted path, an unreadable one. Every caller treats
-/// that as "unknown", never as drift.
+/// `src/payments/**`, a deleted path. Every caller treats that as "unknown",
+/// never as drift.
+///
+/// The one exception is a Tier 2 file, which is unreadable *by design* and is
+/// by construction the file whose rule matters most — reporting it as unknown
+/// is exactly the silence `mati seal` must not buy. Its digest was taken at
+/// lock time and the post-Bash sweep re-baselines it on any change, so the
+/// stamp is the answer and no privileged read is needed here.
 pub fn disk_content_hash(repo_root: &Path, path: &str) -> Option<String> {
-    let bytes = std::fs::read(repo_root.join(path)).ok()?;
-    Some(format!("{:x}", Sha256::digest(&bytes)))
+    match std::fs::read(repo_root.join(path)) {
+        Ok(bytes) => Some(format!("{:x}", Sha256::digest(&bytes))),
+        // Keyed on the error kind, not on a manifest lookup: a glob entry and
+        // a deleted path are `NotFound` and must not pay for a manifest read.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            sealed_digest(repo_root, path)
+        }
+        Err(_) => None,
+    }
+}
+
+/// The lock-time digest `mati seal` recorded for `path`, if it is sealed.
+fn sealed_digest(repo_root: &Path, path: &str) -> Option<String> {
+    let abs = std::fs::canonicalize(repo_root.join(path)).ok()?;
+    let manifest = crate::seal::read_manifest(&crate::seal::manifest_path(repo_root).ok()?);
+    manifest.find(&abs.to_string_lossy())?.sha256.clone()
 }
 
 /// Collect the confirm-time content stamp for `affected_files`.
@@ -90,4 +110,70 @@ pub fn set_confirm_stamp(record: &mut Record, stamp: &BTreeMap<String, String>) 
         "confirmed_content".into(),
         serde_json::Value::Object(stamped),
     );
+}
+
+// ── Tier 2 fallback ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod sealed_digest_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A repo whose sealed file's digest lives in a manifest under a fake
+    /// `MATI_HOME`. Returns the repo dir, kept alive by the caller.
+    fn sealed_repo(with_digest: bool) -> (tempfile::TempDir, tempfile::TempDir, String) {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("MATI_HOME", home.path());
+        let repo = tempfile::tempdir().unwrap();
+        let rel = "src/gated.rs";
+        let abs = repo.path().join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, b"secret").unwrap();
+
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        let digest = disk_content_hash(&root, rel).unwrap();
+        let mpath = crate::seal::manifest_path(&root).unwrap();
+        let mut manifest = crate::seal::Manifest::default();
+        manifest.files.push(crate::seal::SealedFile {
+            path: std::fs::canonicalize(&abs)
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+            mode: "644".to_string(),
+            sha256: with_digest.then(|| digest.clone()),
+            ..Default::default()
+        });
+        crate::seal::write_manifest(&mpath, &manifest).unwrap();
+        std::fs::set_permissions(&abs, std::fs::Permissions::from_mode(0o000)).unwrap();
+        (repo, home, digest)
+    }
+
+    /// Without the fallback a sealed file reads as "unknown", which is silence
+    /// on exactly the file whose rule matters most.
+    #[test]
+    fn a_sealed_file_hashes_to_its_lock_time_digest() {
+        let (repo, _home, digest) = sealed_repo(true);
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(std::fs::read(root.join("src/gated.rs")).is_err(), "sealed");
+        assert_eq!(disk_content_hash(&root, "src/gated.rs"), Some(digest));
+    }
+
+    /// A row written before the stamp existed has no digest. Unknown is the
+    /// right answer there — inventing one would report false drift.
+    #[test]
+    fn a_sealed_file_with_no_recorded_digest_stays_unknown() {
+        let (repo, _home, _) = sealed_repo(false);
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(disk_content_hash(&root, "src/gated.rs"), None);
+    }
+
+    /// A glob entry and a deleted path are `NotFound`, so they must never
+    /// reach the manifest read.
+    #[test]
+    fn a_missing_path_stays_unknown_and_never_consults_the_manifest() {
+        let (repo, _home, _) = sealed_repo(true);
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(disk_content_hash(&root, "src/payments/**"), None);
+        assert_eq!(disk_content_hash(&root, "src/gone.rs"), None);
+    }
 }

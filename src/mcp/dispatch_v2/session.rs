@@ -71,6 +71,9 @@ pub(super) async fn dispatch_session_side(
                 // A lockdown deny IS a deny; the distinction lives in the
                 // event's decision_reason_code (session_lockdown).
                 protocol::SessionEvent::LockdownBlocked => "compliance:miss_",
+                // Same for the Tier 2 floor deny (seal_floor_restore).
+                protocol::SessionEvent::SealFloorBlocked => "compliance:miss_",
+                protocol::SessionEvent::SealBypassDetected => "compliance:seal_bypass_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -352,6 +355,34 @@ pub(super) async fn dispatch_session_side(
                     )
                     .await;
                 }
+                protocol::SessionEvent::SealFloorBlocked => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "seal_floor_restore".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::SealBypassDetected => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::BypassDetected,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "seal_bypass".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
                 // Record-only signal; reuse BypassDetected so the frozen hash
                 // contract needs no new EnforcementEventType or schema bump.
                 protocol::SessionEvent::UnclassifiedPolicyLiteralBypass => {
@@ -381,6 +412,11 @@ pub(super) async fn dispatch_session_side(
                     | protocol::SessionEvent::CodexShellBlocked
                     | protocol::SessionEvent::EditBlocked
                     | protocol::SessionEvent::FloorConsultMiss
+                    | protocol::SessionEvent::SealFloorBlocked
+                    // A detected bypass is stronger evidence than a deny: the
+                    // floor was actually crossed. The key it names is a file
+                    // key, so `mem_get` still clears the lockdown it arms.
+                    | protocol::SessionEvent::SealBypassDetected
             ) {
                 let _ = sess::record_owed_receipt(store, &input.key, input.actor.as_deref()).await;
             }
@@ -585,6 +621,15 @@ pub(super) async fn dispatch_session_side(
             // Silent scan+delete — no audit entry by design. Compaction wipes the
             // agent's memory, so clearing receipts is a maintenance action, not a
             // semantic mutation worth auditing. Fail-open on error (log, not crash).
+            //
+            // Tier 2 re-arms first, never after: a crash between the two must
+            // leave the file sealed with a live receipt, not open with none.
+            // This is also the session-boundary re-arm — `mati watch-paths`
+            // fires this command when the manifest is non-empty.
+            let rearmed = crate::seal::rearm_all(&store.root);
+            if !rearmed.is_empty() {
+                tracing::info!("re-armed {} sealed file(s) on receipt clear", rearmed.len());
+            }
             match sess::session_clear_consults(store).await {
                 Ok(()) => Response::ok(request_id, serde_json::Value::Null),
                 Err(e) => {

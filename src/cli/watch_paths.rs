@@ -3,10 +3,12 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use mati_core::mcp::protocol::Command;
+use mati_core::seal::{manifest_path, read_manifest};
 use mati_core::store::{GotchaRecord, RecordLifecycle};
 
 use super::hook_decide::{discover_repo_root, HookRunOutcome};
-use super::hooks::run_with_deadline;
+use super::hooks::{hook_fire_v2, run_with_deadline};
 use super::proxy::StoreProxy;
 
 /// Watching a file costs a descriptor, and every event costs a `mati`
@@ -44,6 +46,8 @@ async fn run_watch_paths_inner() -> Result<()> {
     };
     let repo_root = discover_repo_root(&cwd).unwrap_or_else(|| cwd.clone());
 
+    rearm_sealed_files(&repo_root).await;
+
     let store = match StoreProxy::open(&cwd).await {
         Ok(s) => s,
         Err(_) => return Ok(()),
@@ -66,6 +70,25 @@ async fn run_watch_paths_inner() -> Result<()> {
     });
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
+}
+
+/// Tier 2: a new session must not inherit the previous one's lifted files.
+///
+/// Fires the existing receipt clear, which re-arms the manifest daemon-side,
+/// so the floor and the gate move together. Re-arming alone would leave a
+/// sealed file behind a receipt that is still live in this worktree — the gate
+/// would allow the read, the kernel would refuse it, and nothing would tell
+/// the agent to consult.
+///
+/// Gated on a non-empty manifest, read store-free: a repo that seals nothing
+/// keeps its receipts across a session boundary exactly as before.
+async fn rearm_sealed_files(repo_root: &Path) {
+    let sealed = manifest_path(repo_root)
+        .map(|p| !read_manifest(&p).files.is_empty())
+        .unwrap_or(false);
+    if sealed {
+        let _ = hook_fire_v2(Command::SessionClearConsults).await;
+    }
 }
 
 /// The watch set: every existing file named by an Active gotcha.

@@ -125,7 +125,18 @@ async fn call_mem_get(
     graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
     key: &str,
 ) -> String {
-    let ctx = handler_test_ctx();
+    call_mem_get_rooted(graph_arc, key, std::path::Path::new("")).await
+}
+
+/// `call_mem_get` against a daemon whose repo root is `repo_root` — the only
+/// thing that resolves a `file:` key to a path on disk.
+async fn call_mem_get_rooted(
+    graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    key: &str,
+    repo_root: &std::path::Path,
+) -> String {
+    let mut ctx = handler_test_ctx();
+    ctx.repo_root = repo_root.to_path_buf();
     let input = crate::mcp::protocol::MemGetInput {
         key: key.to_string(),
         actor: None,
@@ -197,6 +208,57 @@ async fn mem_get_returns_null_for_nonexistent_key() {
 
     let result = call_mem_get(&graph_arc, "file:nonexistent.rs").await;
     assert_eq!(result, "null");
+}
+
+/// Task 8: the receipt `mem_get` mints is what lifts the Tier 2 floor, so a
+/// sealed file becomes readable by consulting it and not by any other route.
+#[tokio::test]
+async fn mem_get_lifts_the_tier_2_floor_on_the_file_it_mints_a_receipt_for() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let store_root = store.root.clone();
+
+    let rel = "src/gated.rs";
+    let abs = dir.path().join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, b"secret").unwrap();
+    let key = format!("file:{rel}");
+    let record = make_record(&key, "gated file", Category::File, 0.8);
+    store.put(&key, &record).await.unwrap();
+
+    // Seal it the way `mati seal add` does: manifest row first, then chmod.
+    let mut manifest = crate::seal::Manifest::default();
+    manifest.files.push(crate::seal::SealedFile {
+        path: std::fs::canonicalize(&abs)
+            .unwrap()
+            .to_string_lossy()
+            .into(),
+        mode: "644".to_string(),
+        ..Default::default()
+    });
+    crate::seal::write_manifest(&crate::seal::manifest_in(&store_root), &manifest).unwrap();
+    std::fs::set_permissions(
+        &abs,
+        std::fs::Permissions::from_mode(crate::seal::SEALED_MODE),
+    )
+    .unwrap();
+    assert!(
+        std::fs::read(&abs).is_err(),
+        "sealed file must be unreadable"
+    );
+
+    let graph = Graph::load(store).await.unwrap();
+    let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+    // A receipt for another file leaves the floor standing.
+    call_mem_get_rooted(&graph_arc, "file:src/other.rs", dir.path()).await;
+    assert!(std::fs::read(&abs).is_err());
+
+    let result = call_mem_get_rooted(&graph_arc, &key, dir.path()).await;
+    assert!(result.contains(&key));
+    assert_eq!(std::fs::read(&abs).unwrap(), b"secret");
 }
 
 #[tokio::test]
