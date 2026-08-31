@@ -1671,7 +1671,7 @@ Peer credentials are checked through `SO_PEERCRED` on Linux and `LOCAL_PEERCRED`
 
 **C9: bash `cat` bypass, around 2-5% miss rate.**
 
-`pre-bash.sh` catches `cat <file>`, but not every variant. Variable expansion (`cat "$FILE"`), process substitution, piped input, and unusual quoting are not caught. This is known and accepted. The compliance monitor tracks and reports it. Do not chase 100% coverage here; the false positives are not worth the marginal gain.
+`pre-bash.sh` catches `cat <file>`, but not every variant. Variable expansion (`cat "$FILE"`), process substitution, piped input, and unusual quoting are not caught. This is known and accepted. `mati stats` now reports an `Unobserved (no path)` row, backed by `analytics:pathless_allow_*` — hook accesses that reached no file gate. That count is an upper bound on this bypass, not a measurement of it: it also includes harmless pathless commands (`ls`, `git status`). It is recorded only with the daemon up, so it under-counts in exactly the case where the hooks are already failing open. Do not chase 100% coverage here; the false positives are not worth the marginal gain.
 
 **In-repo symlink access resolves to the real target for enforcement (WI-20).**
 

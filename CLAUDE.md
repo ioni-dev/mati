@@ -205,7 +205,9 @@ never block Claude on a mati outage — hooks fail open (P9).
   field is in seconds and defaults to 600 for command hooks.
 - **The bash `cat` bypass is a known, accepted miss (~2–5%).** `pre-bash.sh`
   catches `cat <file>` but not variable expansion, process substitution, or
-  unusual quoting (C9 in ARCHITECTURE.md section 24). Do not chase 100%.
+  unusual quoting (C9 in ARCHITECTURE.md section 24). The `Unobserved (no
+  path)` row in `mati stats` is an upper bound on it, not a measurement. Do
+  not chase 100%.
 - **Codex `apply_patch` edits are gated** by the `codex-pre-apply-patch` hook
   (ARCHITECTURE.md section 10.3): editing a file with an unconsulted confirmed gotcha
   is denied (exit 2) until `mem_get`. It parses the patch envelope for exact
