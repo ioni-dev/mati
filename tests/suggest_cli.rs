@@ -29,6 +29,55 @@ fn run_in(dir: &Path, args: &[&str]) -> std::process::Output {
         .expect("run mati")
 }
 
+/// Run against a private `MATI_HOME` with daemon auto-spawn disabled, forcing
+/// `StoreProxy` down its direct-open branch.
+///
+/// The home must be private, not `common::mati_home()`: that helper honors an
+/// inherited `MATI_HOME`, and `StoreProxy::open` pings for a live daemon BEFORE
+/// consulting the spawn gate, so a daemon already running for a shared home
+/// puts the run back on the socket path. `MATI_DISABLE_AUTO_SPAWN` suppresses
+/// spawning, not reuse.
+fn run_direct_in(dir: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(dir)
+        .env("MATI_HOME", home)
+        .env("MATI_DISABLE_AUTO_SPAWN", "1")
+        .output()
+        .expect("run mati")
+}
+
+fn ok_direct_in(dir: &Path, home: &Path, args: &[&str]) -> String {
+    let out = run_direct_in(dir, home, args);
+    assert!(
+        out.status.success(),
+        "`mati {}` failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Socket paths anywhere under `home`, i.e. a daemon was involved.
+fn sockets(home: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.file_name().is_some_and(|n| n == "mati.sock") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(home, &mut found);
+    found
+}
+
 fn ok_in(dir: &Path, args: &[&str]) -> String {
     let out = run_in(dir, args);
     assert!(
@@ -222,5 +271,81 @@ fn governed_note_counts_actual_skips_not_the_governed_set() {
     assert!(
         !s.contains("governed file(s) skipped"),
         "no file was skipped, so no skip should be reported; got:\n{s}"
+    );
+}
+
+/// The same governed skip and write, on the direct-open store path.
+///
+/// Every other test here reaches the store through a daemon socket, so the
+/// `StoreProxy::Direct` branch of `scan_prefix`/`get`/`put` is otherwise
+/// unexercised. This one runs against a private `MATI_HOME` with auto-spawn
+/// disabled, so no daemon exists for it and every command opens the store
+/// directly.
+///
+/// It does NOT prove the proxy is closed. `gotcha:*` is `Immediate` durability,
+/// so each write is fsynced on its own and survives a skipped close — verified
+/// by mutation: dropping the proxy unclosed leaves this passing.
+#[test]
+fn suggest_skips_governed_files_on_the_direct_store_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let root = root.as_path();
+    let home = home.as_path();
+    write(root, "README.md", "x\n");
+    ok_direct_in(root, home, &["init"]);
+    write(
+        root,
+        "src/gated.rs",
+        "fn a() {\n    // SECURITY: validate the token before use\n}\n",
+    );
+    write(
+        root,
+        "src/other.rs",
+        "fn b() {\n    // DO NOT REMOVE: load-bearing init order\n}\n",
+    );
+    ok_direct_in(
+        root,
+        home,
+        &[
+            "gotcha",
+            "add",
+            "src/gated.rs",
+            "-r",
+            "Validate the token before use",
+            "-m",
+            "Because an unvalidated token authenticates anyone",
+        ],
+    );
+
+    let out = ok_direct_in(root, home, &["suggest"]);
+    assert!(
+        out.contains("Proposed 1 new candidate(s)"),
+        "expected exactly the ungoverned file's candidate; got:\n{out}"
+    );
+    assert!(
+        out.contains("(1 governed file(s) skipped)"),
+        "the skip must be reported on the direct path too; got:\n{out}"
+    );
+
+    // A separate process, so this reads what actually reached disk.
+    let listed = ok_direct_in(root, home, &["ls", "gotchas"]);
+    assert!(
+        listed.contains("marker:src/other.rs:2"),
+        "the candidate should persist across processes; got:\n{listed}"
+    );
+    assert!(
+        !listed.contains("marker:src/gated.rs"),
+        "a confirmed gotcha's file must not be re-mined for markers; got:\n{listed}"
+    );
+
+    // Without this the test silently degrades into a duplicate of the
+    // socket-mode one the moment anything puts a daemon back in the path.
+    let sockets = sockets(home);
+    assert!(
+        sockets.is_empty(),
+        "a daemon socket exists, so this ran on the socket path: {sockets:?}"
     );
 }
