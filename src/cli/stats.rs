@@ -156,6 +156,47 @@ fn format_duration_ms(ms: u64) -> String {
 /// Enforcement events are never in the write-seq-keyed snapshot cache, so the
 /// caller re-runs the bounded scan on a cache hit rather than freezing a count.
 /// Prints nothing when the window is empty.
+/// Current state of the Tier 2 read floor: how many files `mati seal` holds
+/// at mode `000` right now.
+///
+/// Live on every render, never cached — the floor lifts and re-arms within a
+/// session, so a snapshot value would be stale the moment it was written.
+/// Silent when nothing is sealed, which is the ordinary repo.
+fn print_sealed_line(
+    inv: &mati_core::seal::Inventory,
+    white: &str,
+    yellow: &str,
+    gray: &str,
+    reset: &str,
+) {
+    if inv.total() == 0 {
+        return;
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if inv.lifted > 0 {
+        notes.push(format!("{} lifted", inv.lifted));
+    }
+    if inv.missing > 0 {
+        notes.push(format!("{} missing", inv.missing));
+    }
+    let color = if inv.missing > 0 { yellow } else { white };
+    let suffix = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("  {gray}({}){reset}", notes.join(" \u{b7} "))
+    };
+    println!(
+        "    Sealed files           {color}{}{reset}{suffix}",
+        inv.total()
+    );
+}
+
+fn seal_inventory(store: &StoreProxy) -> mati_core::seal::Inventory {
+    mati_core::seal::manifest_path(store.repo_root())
+        .map(|p| mati_core::seal::inventory(&p))
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_enforcement_section(
     counts: &mati_core::store::enforcement::EnforcementEventCounts,
@@ -319,10 +360,19 @@ async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
         None => serde_json::json!({ "available": false }),
     };
 
+    let inv = seal_inventory(store);
     let out = serde_json::json!({
         "project": project,
         "computed_at": now,
         "window_days": 30,
+        // Current state, not a windowed count: the floor lifts and re-arms
+        // inside a session.
+        "sealed": {
+            "total": inv.total(),
+            "at_floor": inv.at_floor,
+            "lifted": inv.lifted,
+            "missing": inv.missing,
+        },
         "gotchas": {
             "active": health.active,
             "confirmed": health.confirmed,
@@ -640,6 +690,8 @@ pub async fn run(args: StatsArgs) -> Result<()> {
     } else {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
+
+    print_sealed_line(&seal_inventory(&store), white, yellow, gray, reset);
 
     // Fail-open events from fail_open.log
     print_fail_open(&scan_fail_open_log(now), red, gray, reset);
@@ -1115,6 +1167,8 @@ async fn display_cached_stats(
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
 
+    print_sealed_line(&seal_inventory(store), white, yellow, gray, reset);
+
     // Fail-open events from fail_open.log (always live, not cached)
     print_fail_open(&scan_fail_open_log(now), red, gray, reset);
 
@@ -1145,15 +1199,16 @@ async fn display_cached_stats(
 /// `dispatch_v2.rs`). The gate worked — nothing was bypassed — so it rolls
 /// into `denials_7d`, not `bypasses_7d`.
 ///
-/// `bypasses_7d` sums the four aggregates that mirror
+/// `bypasses_7d` sums the five aggregates that mirror
 /// `EnforcementEventType::BypassDetected` in the hash-chained log:
 /// `compliance:codex_shell_miss_*`, `compliance:wrapped_db_client_miss_*`,
-/// `compliance:tombstone_bypass_*`, and
-/// `compliance:unclassified_policy_literal_bypass_*`. `compliance:codex_shell_miss_*` is
+/// `compliance:tombstone_bypass_*`,
+/// `compliance:unclassified_policy_literal_bypass_*`, and
+/// `compliance:seal_bypass_*`. `compliance:codex_shell_miss_*` is
 /// fired by `codex-post-bash` after a file was used without a valid receipt;
 /// it also rolls into `misses_7d` (so the hook activity registers in the
 /// lookups denominator and `Hit rate` reflects real consultation behavior).
-/// The other three bypass aggregates are not consultation lookups, so they are
+/// The other four bypass aggregates are not consultation lookups, so they are
 /// not added to `misses_7d`.
 async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64) {
     let mut hits: u64 = 0;
@@ -1175,6 +1230,7 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         let tombstone_bypass_key = format!("compliance:tombstone_bypass_{date}");
         let unclassified_literal_bypass_key =
             format!("compliance:unclassified_policy_literal_bypass_{date}");
+        let seal_bypass_key = format!("compliance:seal_bypass_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
@@ -1224,6 +1280,14 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         }
 
         if let Ok(Some(record)) = store.get(&unclassified_literal_bypass_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
+
+        // Tier 2: the post-Bash sweep found a sealed file's floor down or its
+        // bytes moved with no receipt to explain it.
+        if let Ok(Some(record)) = store.get(&seal_bypass_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 bypasses += agg.count;
             }

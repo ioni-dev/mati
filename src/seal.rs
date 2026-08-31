@@ -374,6 +374,42 @@ pub fn reseal(store_root: &Path, repo_root: &Path, rel: &str) -> bool {
     write_manifest(&mpath, &manifest).is_ok()
 }
 
+// ── Read-only inventory ─────────────────────────────────────────────────────
+
+/// What the manifest holds, against what the filesystem says about each row.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Inventory {
+    /// Rows still at mode `000`.
+    pub at_floor: usize,
+    /// Rows readable right now, because a live receipt lifted them.
+    pub lifted: usize,
+    /// Rows whose file is gone. `mati seal remove` drops the row.
+    pub missing: usize,
+}
+
+impl Inventory {
+    pub fn total(&self) -> usize {
+        self.at_floor + self.lifted + self.missing
+    }
+}
+
+/// Stat every manifest row for `mati doctor` and `mati stats`.
+///
+/// One `stat` per row and nothing else. Unlike [`scan`] it never hashes, so it
+/// never lifts the mode — a reporting surface must not be a lever for opening
+/// a sealed file.
+pub fn inventory(manifest: &Path) -> Inventory {
+    let mut inv = Inventory::default();
+    for f in read_manifest(manifest).files {
+        match std::fs::metadata(&f.path) {
+            Err(_) => inv.missing += 1,
+            Ok(m) if m.permissions().mode() & 0o7777 == SEALED_MODE => inv.at_floor += 1,
+            Ok(_) => inv.lifted += 1,
+        }
+    }
+    inv
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -754,6 +790,63 @@ mod tests {
         let (repo, store, rel) = seal_fixture(SEALED_MODE);
         let other = tempfile::tempdir().unwrap();
         assert_eq!(lift_on_receipt(other.path(), store.path(), rel), None);
+        assert_eq!(mode_of(&repo.path().join(rel)), SEALED_MODE);
+    }
+
+    #[test]
+    fn inventory_counts_a_row_still_at_the_floor() {
+        let (_repo, store, _rel) = seal_fixture(SEALED_MODE);
+        let inv = inventory(&manifest_in(store.path()));
+        assert_eq!(
+            inv,
+            Inventory {
+                at_floor: 1,
+                lifted: 0,
+                missing: 0
+            }
+        );
+        assert_eq!(inv.total(), 1);
+    }
+
+    #[test]
+    fn inventory_counts_a_lifted_row_separately() {
+        let (_repo, store, _rel) = seal_fixture(0o644);
+        assert_eq!(
+            inventory(&manifest_in(store.path())),
+            Inventory {
+                at_floor: 0,
+                lifted: 1,
+                missing: 0
+            }
+        );
+    }
+
+    #[test]
+    fn inventory_counts_a_row_whose_file_is_gone() {
+        let (repo, store, rel) = seal_fixture(SEALED_MODE);
+        std::fs::remove_file(repo.path().join(rel)).unwrap();
+        assert_eq!(
+            inventory(&manifest_in(store.path())),
+            Inventory {
+                at_floor: 0,
+                lifted: 0,
+                missing: 1
+            }
+        );
+    }
+
+    #[test]
+    fn inventory_of_a_missing_manifest_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(inventory(&manifest_in(dir.path())), Inventory::default());
+    }
+
+    /// The reporting surface must not become a lever: a sealed row is still at
+    /// mode `000` after an inventory, whatever the stamp says about its bytes.
+    #[test]
+    fn inventory_never_lifts_the_mode() {
+        let (repo, store, rel) = seal_fixture(SEALED_MODE);
+        inventory(&manifest_in(store.path()));
         assert_eq!(mode_of(&repo.path().join(rel)), SEALED_MODE);
     }
 }

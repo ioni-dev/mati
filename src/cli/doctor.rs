@@ -449,6 +449,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     checks.push(collect_policy_check(cwd).await);
     checks.push(collect_binary_parity_check(cwd, root));
     checks.push(collect_gating_check(cwd).await);
+    checks.push(collect_seal_check(cwd, root).await);
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -973,6 +974,88 @@ async fn collect_gating_check(cwd: &Path) -> CheckResult {
         ),
         fix: Some(fix),
     }
+}
+
+/// Tier 2 read floor: what `mati seal` is holding at mode `000` right now.
+///
+/// Inventory only. `seal::inventory` stats each manifest row and never hashes,
+/// so running `mati doctor` cannot open a sealed file — the one privileged read
+/// Tier 2 grants belongs to the post-Bash sweep, which has already seen the
+/// bytes move before it takes it.
+///
+/// A lifted row is reported, never accused. Deciding whether a lowered floor
+/// was a live receipt or a bypass needs a receipt question against the daemon,
+/// and that is the sweep's job. Doctor reports the bypasses the sweep already
+/// recorded instead of re-deriving them.
+async fn collect_seal_check(cwd: &Path, root: &Path) -> CheckResult {
+    let row = |status, detail: String, fix| CheckResult {
+        section: "enforcement",
+        name: "seal",
+        status,
+        detail,
+        fix,
+    };
+
+    let inv = mati_core::seal::inventory(&mati_core::seal::manifest_in(root));
+    if inv.total() == 0 {
+        return row(Status::Info, "no files sealed".to_string(), None);
+    }
+
+    let bypasses = seal_bypasses_recorded(cwd).await;
+    let mut notes: Vec<String> = Vec::new();
+    if inv.lifted > 0 {
+        notes.push(format!("{} currently readable", inv.lifted));
+    }
+    if inv.missing > 0 {
+        notes.push(format!("{} gone from disk", inv.missing));
+    }
+    let detail = format!(
+        "{} file(s) sealed, {} at mode 000{}",
+        inv.total(),
+        inv.at_floor,
+        if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
+        }
+    );
+
+    if bypasses > 0 {
+        return row(
+            Status::Warn,
+            format!("{detail}; {bypasses} bypass(es) recorded on sealed files"),
+            Some("mati seal list, and mati verify-chain for the recorded events"),
+        );
+    }
+    if inv.missing > 0 {
+        return row(
+            Status::Warn,
+            detail,
+            Some("mati seal remove <path>  (drops the row for a file that is gone)"),
+        );
+    }
+    row(Status::Pass, detail, None)
+}
+
+/// Sum every retained `compliance:seal_bypass_*` daily aggregate.
+///
+/// A prefix scan rather than seven dated `get`s: the window that matters is
+/// "has the floor ever been bypassed in this repo", and retention already
+/// bounds how far back the rows go.
+async fn seal_bypasses_recorded(cwd: &Path) -> u64 {
+    let Ok(proxy) = crate::cli::proxy::StoreProxy::open(cwd).await else {
+        return 0;
+    };
+    let total = match proxy.scan_prefix("compliance:seal_bypass_").await {
+        Ok(records) => records
+            .iter()
+            .filter_map(|r| r.payload_as::<mati_core::store::session::DailyAgg>())
+            .map(|a| a.count)
+            .sum(),
+        Err(_) => 0,
+    };
+    let _ = proxy.close().await;
+    total
 }
 
 /// Do the hooks and the daemon run the same mati build?
@@ -1623,7 +1706,7 @@ mod tests {
     /// `version: 2` schema must keep both stable.
     ///
     /// `attestation/network` holds index 13, `enforcement/policy` index 14, and
-    /// `enforcement/binary parity` index 15.
+    /// `enforcement/binary parity` index 15. `enforcement/seal` appends at 17.
     /// Policy was added later (75bec3a) and originally landed before `network`,
     /// which pushed a published index. New checks append at the end so an
     /// index a consumer already relies on never moves.
@@ -1660,15 +1743,50 @@ mod tests {
                 ("enforcement", "policy"),
                 ("enforcement", "binary parity"),
                 ("knowledge", "gating"),
+                ("enforcement", "seal"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
              ping → dirty_marker → drift → chain → freshness → network → policy \
-             → binary parity → gating (new checks append at the end so an index a \
-             consumer already relies on never moves)"
+             → binary parity → gating → seal (new checks append at the end so an \
+             index a consumer already relies on never moves)"
         );
         assert_eq!(report.version, 2);
+    }
+
+    /// A manifest row whose file is gone strands the seal: the mode is lost
+    /// with the inode, so the row can only be dropped, never restored.
+    #[tokio::test]
+    async fn seal_row_warns_when_a_sealed_file_is_gone() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // Written as JSON, not through `write_manifest`, so the test reads the
+        // manifest the same way doctor does — off disk, in its on-disk form.
+        std::fs::write(
+            mati_core::seal::manifest_in(root.path()),
+            serde_json::json!({
+                "files": [{
+                    "path": repo.path().join("gone.rs").to_string_lossy(),
+                    "mode": "644",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let r = collect_seal_check(repo.path(), root.path()).await;
+        assert!(matches!(r.status, Status::Warn), "detail: {}", r.detail);
+        assert!(r.detail.contains("gone from disk"), "detail: {}", r.detail);
+        assert!(r.fix.unwrap().contains("mati seal remove"));
+    }
+
+    #[tokio::test]
+    async fn seal_row_is_info_when_nothing_is_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = collect_seal_check(dir.path(), dir.path()).await;
+        assert!(matches!(r.status, Status::Info));
+        assert_eq!(r.detail, "no files sealed");
     }
 
     fn summary(total: usize, drift: usize) -> crate::cli::stale::StaleSummary {
