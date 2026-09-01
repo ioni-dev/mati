@@ -585,8 +585,11 @@ receipt?
   cannot hold its own lockdown open. They expire after `OWED_RECEIPT_TTL_SECS`
   (900s, the shell gate's receipt TTL); a deny after that window re-arms,
   because the arming sweep drops the lapsed marker before the create-once
-  check reads it. Markers are cleared wholesale on PostCompact and at daemon
-  start along with the receipts.
+  check reads it. Markers are cleared wholesale along with the receipts: on
+  PostCompact, at daemon start, and on SessionEnd (`session_harvest` calls
+  `delete_all_receipts`). The SessionEnd wipe is store-wide, so a session that
+  ends in any worktree clears every worktree's debt — see the measurement
+  below.
 - Keeping markers across a receipt wipe is not a one-line change, and it was
   considered. `outstanding_owed` never deletes a settled marker — it re-derives
   settlement on every call from the live receipt, so a marker holds no record
@@ -603,14 +606,53 @@ receipt?
 
 Known holes: an agent that never triggers a deny is never locked down (the
 first command can still be a computed path); edits are not covered, so `Edit`
-and `Write` stay governed by 10.1 alone; a subagent spawned into its own git
-worktree carries a different tag and so escapes the debt, which is the price
-of worktree scoping — the same path can hold different bytes there; 15 minutes
-of not consulting lifts the lockdown without one; and the switch is a stored
-value, so `mati config set enforcement.lockdown off` disarms it — only before
-the first deny, since every command denies once a marker is unsettled. That is
-the same class of hole as `mati daemon stop`, which fail-open (P9) makes
-structural.
+and `Write` stay governed by 10.1 alone; a session whose working directory is
+another git worktree of the same repo carries a different tag and does not see
+the debt (measured, below); 15 minutes of not consulting lifts the lockdown
+without one; and the switch is a stored value, so `mati config set
+enforcement.lockdown off` disarms it — only before the first deny, since every
+command denies once a marker is unsettled. That is the same class of hole as
+`mati daemon stop`, which fail-open (P9) makes structural.
+
+**The worktree escape, measured 2026-08-31.** Previously inferred from the
+code; now exercised. Isolated fixture: one scratch repo with a remote (so a
+linked worktree hashes to the same slug and shares one store), one confirmed
+gotcha, release binary, short `MATI_HOME`.
+
+Hook layer, synthetic payloads, five per cell, debt armed in the main
+worktree. Denied there 5/5 on an ungoverned `Read` by a fresh agent id, 5/5
+from a plain subdirectory of it, 5/5 on a path-less Bash command; every one
+reported `Session locked`. From a linked worktree of the same repo the same
+probes allowed 5/5 — ungoverned `Read` and path-less Bash alike. Fisher
+one-sided p = 0.004 against the same-worktree cell. Control with the lockdown
+off: 5/5 allow in both worktrees, so an allow is not the harness failing to
+reach the gate. The keys carry it exactly:
+`session:owed:cded33e0|file:src/secret.rs` for the main checkout,
+`session:owed:64eefd1b:<agent>|…` for the worktree, and `owed_debt_scan_prefix`
+stops at the tag. Arm a debt inside the worktree and it denies there 5/5, so
+the lockdown is not broken in a worktree — only blind to the other one's debt.
+
+End to end with `claude -p`, re-arming before each run: main worktree denied
+4/4, linked worktree read the file 4/4, lockdown-off control read it 6/6
+(p = 0.014).
+
+The tag follows the worktree root, not the process directory. A subdirectory
+is denied 5/5, and an absolute path *into* another worktree from the locked
+one is denied 5/5. Only moving the session's own working directory escapes,
+and an agent already in debt cannot make that move — Bash is denied, so `git
+worktree add` denies 5/5. The escape therefore needs a worktree that exists
+before the first deny plus a host feature that pins a session or subagent to
+it (Claude Code's worktree-isolated subagents and its worktree-switch tool are
+both such features, and neither is a hook-gated tool).
+
+Two neighbouring facts fell out of the same fixture. Reading the *governed*
+file by absolute path from another worktree of the same repo is allowed 5/5
+with the lockdown off: `file:*` keys are relative to the discovered worktree
+root, so a sibling checkout of identical bytes is a different key, and 10.1's
+own gate misses it. And a `claude -p` session confined to a linked worktree
+cleared the main worktree's debt 3 of 3 on exit, after which the main worktree
+allowed — `session_harvest` deletes every `session:owed:*` in the store, not
+just its own worktree's.
 
 ### 10.1b Read floor (Tier 2)
 
