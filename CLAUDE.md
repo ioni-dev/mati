@@ -246,6 +246,13 @@ never block Claude on a mati outage — hooks fail open (P9).
   `file:*.gotcha_keys` and `graph:edge:*:has_gotcha:*` are rebuilt from canonical
   `gotcha:*` records. If they disagree with the gotcha's `affected_files`, the
   gotcha record wins.
+- **`file:*` keys are worktree-relative, keyed off the discovering worktree.**
+  The file gate strips the cwd worktree's root off the accessed path. An
+  absolute read into a *sibling* linked worktree of the same clone is re-keyed
+  by `cross_worktree_rel_key` (`cli::hook_decide::path`): it canonicalizes and
+  strips the accessed worktree's root, then looks the repo-relative key up in
+  the unchanged (shared-slug) store. A symlink into a sibling worktree still
+  misses. See ARCHITECTURE.md 10.1a.
 - **The always-on `.claude/CLAUDE.md` stub carries only the read-gate.** It
   loads every session, so only proactive every-turn guidance belongs there
   (mem_get-before-read + a `/mati-enrich` pointer, ~130 tokens). Episodic

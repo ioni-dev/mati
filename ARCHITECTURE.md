@@ -645,14 +645,21 @@ before the first deny plus a host feature that pins a session or subagent to
 it (Claude Code's worktree-isolated subagents and its worktree-switch tool are
 both such features, and neither is a hook-gated tool).
 
-Two neighbouring facts fell out of the same fixture. Reading the *governed*
-file by absolute path from another worktree of the same repo is allowed 5/5
-with the lockdown off: `file:*` keys are relative to the discovered worktree
-root, so a sibling checkout of identical bytes is a different key, and 10.1's
-own gate misses it. And a `claude -p` session confined to a linked worktree
-cleared the main worktree's debt 3 of 3 on exit, after which the main worktree
-allowed — `session_harvest` deletes every `session:owed:*` in the store, not
-just its own worktree's.
+Two neighbouring facts fell out of the same fixture. The first is fixed.
+Reading the *governed* file by absolute path from another worktree of the same
+repo used to allow 5/5 with the lockdown off: `file:*` keys are relative to the
+discovered worktree root, so a sibling checkout of identical bytes was a
+different key and 10.1's own gate missed it. `cross_worktree_rel_key`
+(`cli::hook_decide::path`) now re-keys it: when the accessed path sits in a
+worktree that shares the cwd repo's `commondir` (canonicalized, so `/var` vs
+`/private/var` cannot split them), it strips that worktree's root and looks the
+repo-relative key up in the unchanged, shared-slug store. Test:
+`file_gate_denies_a_governed_read_from_a_sibling_worktree`. The residual miss is
+a symlink in the cwd worktree pointing into a sibling — it strips to a relative
+key and `canonical_rel_path` fails containment against the cwd root. Still open:
+a `claude -p` session confined to a linked worktree cleared the main worktree's
+debt 3 of 3 on exit, after which the main worktree allowed — `session_harvest`
+deletes every `session:owed:*` in the store, not just its own worktree's.
 
 ### 10.1b Read floor (Tier 2)
 

@@ -272,7 +272,17 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // `rel_path` is the LEXICAL key — the primary gate. When it finds no
     // gotcha, the canonical-key fallback below (WI-20) re-evaluates the
     // symlink's real target so the gate still fires.
-    let rel_path = decide::normalize_path(&raw_path, repo_root_str);
+    let mut rel_path = decide::normalize_path(&raw_path, repo_root_str);
+
+    // Cross-worktree read (ARCH 10.1a): an absolute path into a sibling worktree
+    // of the same repo stays absolute against cwd's root and matches no key, so
+    // the gate misses a governed file the sibling shares. Re-root it against the
+    // accessed worktree; the shared-slug store the lookup uses is unchanged.
+    if rel_path.starts_with('/') {
+        if let Some(key) = cross_worktree_rel_key(&raw_path, &repo_ident) {
+            rel_path = key;
+        }
+    }
 
     // 4. Resolve mati root (for daemon socket), from the same repo_ident.
     let mati_root = match mati_root_for_ident(&repo_ident, &cwd) {

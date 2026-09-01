@@ -41,8 +41,8 @@ pub(super) use flows::{
     run_seal_guard, run_seal_sweep,
 };
 pub(super) use path::{
-    canonical_rel_path, discover_repo_root, discover_repo_root_for, extract_path,
-    file_exists_for_deleted_signal, resolve_access_path,
+    canonical_rel_path, cross_worktree_rel_key, discover_repo_root, discover_repo_root_for,
+    extract_path, file_exists_for_deleted_signal, resolve_access_path,
 };
 pub(super) use policy::{
     evaluate_governed_policy, merge_policy_result, policy_block_exempt, policy_verdicts_for_action,
