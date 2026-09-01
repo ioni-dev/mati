@@ -32,8 +32,10 @@ fi
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // ""')
 [ -z "$FILE_PATH" ] && exit 0
 
-# Convert absolute path to repo-relative path.
-# Claude Code always passes absolute paths; mati store keys use relative paths.
+# Convert absolute path to repo-relative path. The strip is lexical and fails
+# when the two sides disagree about symlinks (macOS /private/tmp vs /tmp);
+# `mati` canonicalizes an absolute path it is handed, so do not re-fix this
+# here — see repo_relative_path in src/cli/hooks.rs.
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 if [ -n "$REPO_ROOT" ]; then
   FILE_PATH="${FILE_PATH#$REPO_ROOT/}"

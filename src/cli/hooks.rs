@@ -203,15 +203,51 @@ pub async fn run_post_read_compliance(key: &str, agent_id: Option<&str>) -> Resu
     .await
 }
 
+/// Strip the repo root from an absolute path, canonicalizing both sides.
+///
+/// `None` whenever the path cannot be improved — relative, no repo root, an
+/// unresolvable path, or a target outside the repo — so every caller keeps
+/// what it was handed. See [`repo_relative_key`] for why the strip has to be
+/// canonical rather than lexical.
+fn repo_relative_path(raw: &str, repo_root: Option<&std::path::Path>) -> Option<String> {
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+    let canon_root = crate::cli::sandbox::canonicalize_lenient(repo_root?)?;
+    let canon_path = crate::cli::sandbox::canonicalize_lenient(path)?;
+    let rel = canon_path.strip_prefix(&canon_root).ok()?;
+    Some(mati_core::hooks::decide::normalize_path(
+        rel.to_str()?,
+        None,
+    ))
+}
+
+/// [`repo_relative_path`] against the repo the hook process is running in.
+fn repo_relative_path_here(path: &str) -> String {
+    let unchanged = || path.to_string();
+    if !std::path::Path::new(path).is_absolute() {
+        return unchanged();
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return unchanged();
+    };
+    repo_relative_path(
+        path,
+        crate::cli::hook_decide::discover_repo_root(&cwd).as_deref(),
+    )
+    .unwrap_or_else(unchanged)
+}
+
 /// Rewrite an absolute `file:` key to the repo-relative key the store uses.
 ///
-/// `post-read-compliance.sh` strips the repo root lexically, which fails
-/// whenever the tool input and `git rev-parse --show-toplevel` disagree about
-/// symlinks — on macOS the toplevel is `/private/tmp/...` while Claude Code
-/// passes `/tmp/...`. The key then names a path no record carries, so a
-/// consulted read answers `false` and records a compliance miss that did not
-/// happen. Canonicalizing both sides here fixes it for every caller of the
-/// hook commands, in the one language that already has `canonicalize_lenient`.
+/// `post-edit.sh` strips the repo root lexically, which fails whenever the
+/// tool input and `git rev-parse --show-toplevel` disagree about symlinks —
+/// on macOS the toplevel is `/private/tmp/...` while Claude Code passes
+/// `/tmp/...`. The key then names a path no record carries, so a consulted
+/// read answers `false` and records a compliance miss that did not happen.
+/// Canonicalizing both sides here fixes it for every caller of the hook
+/// commands, in the one language that already has `canonicalize_lenient`.
 ///
 /// Returns the key unchanged for a relative path, a non-`file:` key, or a
 /// target outside the repo — none of those can be improved by canonicalizing.
@@ -219,29 +255,9 @@ fn repo_relative_key(key: &str, repo_root: Option<&std::path::Path>) -> String {
     let Some(raw) = key.strip_prefix("file:") else {
         return key.to_string();
     };
-    let path = std::path::Path::new(raw);
-    if !path.is_absolute() {
-        return key.to_string();
-    }
-    let unchanged = || key.to_string();
-    let Some(root) = repo_root else {
-        return unchanged();
-    };
-    let (Some(canon_root), Some(canon_path)) = (
-        crate::cli::sandbox::canonicalize_lenient(root),
-        crate::cli::sandbox::canonicalize_lenient(path),
-    ) else {
-        return unchanged();
-    };
-    let Ok(rel) = canon_path.strip_prefix(&canon_root) else {
-        return unchanged();
-    };
-    match rel.to_str() {
-        Some(rel) => format!(
-            "file:{}",
-            mati_core::hooks::decide::normalize_path(rel, None)
-        ),
-        None => unchanged(),
+    match repo_relative_path(raw, repo_root) {
+        Some(rel) => format!("file:{rel}"),
+        None => key.to_string(),
     }
 }
 
@@ -454,13 +470,10 @@ pub async fn run_session_clear_consults() -> Result<HookRunOutcome> {
 /// Combined log-hit + reparse in a single daemon round-trip.
 /// Called by post-edit.sh hook to avoid two separate process spawns.
 pub async fn run_edit_hook(path: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let rel = std::path::Path::new(path)
-        .strip_prefix(&cwd)
-        .map(|r| r.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string());
     hook_fire_v2(mati_core::mcp::protocol::Command::FileEditHook(
-        mati_core::mcp::protocol::FileEditHookInput { path: rel },
+        mati_core::mcp::protocol::FileEditHookInput {
+            path: repo_relative_path_here(path),
+        },
     ))
     .await
 }
@@ -474,7 +487,7 @@ pub async fn run_doc_capture(path: &str) -> Result<()> {
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
     hook_fire_v2(mati_core::mcp::protocol::Command::DocCapture(
         mati_core::mcp::protocol::DocCaptureInput {
-            path: path.to_string(),
+            path: repo_relative_path_here(path),
         },
     ))
     .await
@@ -743,6 +756,60 @@ mod tests {
             super::repo_relative_key(&via_real, Some(&link)),
             "file:src/test.rs",
             "a symlinked root must strip a real access path"
+        );
+    }
+
+    /// The same symlink trap on the write path: `post-edit.sh` strips the repo
+    /// root lexically, and `run_edit_hook`/`run_doc_capture` forwarded whatever
+    /// survived it. An absolute path reached the daemon, which builds
+    /// `file:<path>` verbatim — a key no record carries, so the edit-activity
+    /// bump and the doc-comment capture both landed on nothing.
+    #[test]
+    fn an_absolute_path_through_a_symlink_becomes_the_repo_relative_path() {
+        let real = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(real.path().join("src")).expect("src dir");
+        std::fs::write(real.path().join("src/test.rs"), "fn t() {}\n").expect("file");
+
+        let link_parent = tempfile::tempdir().expect("link parent");
+        let link = link_parent.path().join("repo");
+        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+
+        let via_link = link.join("src/test.rs");
+        assert_eq!(
+            super::repo_relative_path(&via_link.to_string_lossy(), Some(real.path())),
+            Some("src/test.rs".to_string()),
+            "a symlinked access path must strip against the real root"
+        );
+
+        let via_real = real.path().join("src/test.rs");
+        assert_eq!(
+            super::repo_relative_path(&via_real.to_string_lossy(), Some(&link)),
+            Some("src/test.rs".to_string()),
+            "a symlinked root must strip a real access path"
+        );
+    }
+
+    /// Mirrors [`repo_relative_key`]'s contract at the path level: anything it
+    /// cannot improve yields `None`, and the caller keeps the path it had.
+    #[test]
+    fn repo_relative_path_declines_what_it_cannot_improve() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::repo_relative_path("src/test.rs", Some(repo.path())),
+            None,
+            "a relative path is already correct"
+        );
+        let outside = tempfile::tempdir().expect("outside");
+        let elsewhere = outside.path().join("elsewhere.rs");
+        assert_eq!(
+            super::repo_relative_path(&elsewhere.to_string_lossy(), Some(repo.path())),
+            None,
+            "a target outside the repo cannot become a repo-relative path"
+        );
+        assert_eq!(
+            super::repo_relative_path(&elsewhere.to_string_lossy(), None),
+            None,
+            "no repo root means no prefix to strip"
         );
     }
 
