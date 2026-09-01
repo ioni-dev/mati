@@ -567,6 +567,21 @@ fn default_capture_fingerprint() -> bool {
     true
 }
 
+/// Input for `Command::SessionHarvest`. Written by the `SessionEnd` hook.
+/// `worktree` is the ending session's worktree tag (`worktree_scope_tag` of the
+/// hook's cwd), used to scope the receipt/lockdown cleanup to the worktree that
+/// is ending — the daemon serves every sibling worktree of a shared-slug clone,
+/// so a store-wide wipe would lift a sibling's lockdown. Defaults to `None` so
+/// an older hook binary talking to a newer daemon still decodes (it then wipes
+/// store-wide, the prior behavior).
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHarvestInput {
+    /// The ending session's worktree tag, or `None` outside a git repo.
+    #[serde(default)]
+    pub worktree: Option<String>,
+}
+
 /// Input for `Command::SubagentHarvest`. Written by the `SubagentStop` hook
 /// when a Task subagent finishes: its `last_assistant_message` is the subagent's
 /// own prose summary, captured into `session:summary:latest` so `mem_bootstrap`

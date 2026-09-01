@@ -846,9 +846,10 @@ pub async fn outstanding_owed(
 
 /// Delete all consult receipts (`session:consulted:*`) from the store.
 ///
-/// Shared by `session_clear_consults` (PostCompact) and the end-of-session
-/// `session_harvest` cleanup. Propagates store errors; the daemon-startup
-/// stale-marker sweep keeps its own fail-soft loop.
+/// Used by `session_clear_consults` (PostCompact), which resets the whole
+/// store's consultation state. `session_harvest` scopes its cleanup to the
+/// ending worktree instead (see [`delete_scope_receipts`]). Propagates store
+/// errors; the daemon-startup stale-marker sweep keeps its own fail-soft loop.
 async fn delete_all_receipts(store: &Store) -> Result<()> {
     let consulted_keys = store.scan_keys("session:consulted:").await?;
     for k in &consulted_keys {
@@ -858,6 +859,33 @@ async fn delete_all_receipts(store: &Store) -> Result<()> {
     // markers left behind would lock the next window down before it touched
     // anything.
     for k in &store.scan_keys(OWED_PREFIX).await? {
+        store.delete(k).await?;
+    }
+    Ok(())
+}
+
+/// Delete only the ending worktree's consult receipts and lockdown markers.
+///
+/// Harvest runs on the daemon, which serves every sibling worktree of a
+/// shared-slug clone (a checkout with a remote). A store-wide wipe would clear
+/// a sibling worktree's outstanding debt and lift its lockdown for free, so
+/// both deletes are scoped to the ending worktree: `session:consulted:<wt>…`
+/// and `session:owed:<wt>…`, the same worktree tag `record_owed_receipt` and
+/// the receipt writer key on. Clearing receipts re-arms this worktree's gates,
+/// so its markers go with them; the sibling's stay untouched. Outside a git
+/// repo (`worktree` None) there is no sibling and the wipe stays store-wide.
+async fn delete_scope_receipts(store: &Store, worktree: Option<&str>) -> Result<()> {
+    let (consulted_prefix, owed_prefix) = match worktree {
+        Some(wt) => (
+            format!("session:consulted:{wt}"),
+            format!("{OWED_PREFIX}{wt}"),
+        ),
+        None => ("session:consulted:".to_string(), OWED_PREFIX.to_string()),
+    };
+    for k in &store.scan_keys(&consulted_prefix).await? {
+        store.delete(k).await?;
+    }
+    for k in &store.scan_keys(&owed_prefix).await? {
         store.delete(k).await?;
     }
     Ok(())
@@ -877,13 +905,21 @@ pub async fn session_clear_consults(store: &Store) -> Result<()> {
 /// Archive session, run staleness analysis, auto-promote gotchas.
 ///
 /// `repo_root` is the project root; the git root is discovered upward from it.
-/// Called from both daemon socket handlers — `mcp::server::socket_dispatch` and
-/// `mcp::dispatch_v2::session::dispatch_session_side` — on SessionEnd.
+/// `worktree` is the ending session's worktree tag, computed client-side from
+/// the SessionEnd hook's cwd — the daemon's own `repo_root` names whichever
+/// worktree started it, not the one ending, so the receipt cleanup cannot be
+/// scoped from `repo_root`. Called from both daemon socket handlers —
+/// `mcp::server::socket_dispatch` and `mcp::dispatch_v2::session::dispatch_session_side`
+/// — on SessionEnd.
 ///
 /// Every step is fail-open: staleness runs on the SessionEnd path, and a git
 /// fault must not cost the session its archive, its promotions, or its receipt
 /// cleanup.
-pub async fn session_harvest(store: &Store, repo_root: &Path) -> Result<()> {
+pub async fn session_harvest(
+    store: &Store,
+    repo_root: &Path,
+    worktree: Option<&str>,
+) -> Result<()> {
     let now = now_secs();
 
     // M-12-D: promote gotcha candidates before archiving
@@ -937,8 +973,8 @@ pub async fn session_harvest(store: &Store, repo_root: &Path) -> Result<()> {
     perm.payload = session_rec.payload;
     store.put(&session_key, &perm).await?;
 
-    // Clean up session:consulted:* markers
-    delete_all_receipts(store).await?;
+    // Clean up this worktree's consulted markers and lockdown debt only.
+    delete_scope_receipts(store, worktree).await?;
 
     // Update stage:current with last session timestamp
     if let Some(mut stage) = store.get("stage:current").await? {
@@ -1498,7 +1534,7 @@ mod tests {
         assert!(record.staleness.last_record_sha.is_empty());
         store.put(&record.key, &record).await.expect("put");
 
-        session_harvest(&store, repo_dir.path())
+        session_harvest(&store, repo_dir.path(), None)
             .await
             .expect("harvest");
 
@@ -1528,7 +1564,7 @@ mod tests {
 
         // No git repo anywhere above a tempdir — the analyzer can do nothing.
         let nowhere = TempDir::new().expect("tempdir");
-        session_harvest(&store, nowhere.path())
+        session_harvest(&store, nowhere.path(), None)
             .await
             .expect("harvest must not fail when staleness cannot run");
 
@@ -1625,6 +1661,63 @@ mod tests {
         store.close().await.expect("close");
     }
 
+    /// Two sibling worktrees share one store (a clone with a remote resolves to
+    /// one slug). A session ending in one worktree must settle only its own
+    /// lockdown debt: its owed markers and consult receipts clear, the sibling's
+    /// survive untouched. A store-wide wipe would lift the sibling's lockdown.
+    #[tokio::test]
+    async fn harvest_settles_only_the_ending_worktree_debt() {
+        let (_dir, store) = temp_store().await;
+
+        let ending = "aaaaaaaa";
+        let sibling = "bbbbbbbb";
+
+        // Each worktree owes an unconsulted deny and holds one consult receipt.
+        record_owed_receipt(&store, "file:a.rs", Some(ending))
+            .await
+            .expect("owe ending");
+        record_owed_receipt(&store, "file:b.rs", Some(sibling))
+            .await
+            .expect("owe sibling");
+        for (actor, key) in [(ending, "file:a.rs"), (sibling, "file:b.rs")] {
+            let rec = session_record(&receipt_key(key, Some(actor)), String::new());
+            store.put(&rec.key, &rec).await.expect("put receipt");
+        }
+
+        // Harvest returns early without a session:current — mint one.
+        session_flush(&store).await.expect("flush");
+
+        let nowhere = TempDir::new().expect("tempdir");
+        session_harvest(&store, nowhere.path(), Some(ending))
+            .await
+            .expect("harvest");
+
+        let owed = store.scan_keys(OWED_PREFIX).await.expect("scan owed");
+        assert!(
+            owed.iter().all(|k| !k.contains(ending)),
+            "ending worktree debt must clear: {owed:?}"
+        );
+        assert!(
+            owed.iter().any(|k| k.contains(sibling)),
+            "sibling worktree debt must survive: {owed:?}"
+        );
+
+        let consulted = store
+            .scan_keys("session:consulted:")
+            .await
+            .expect("scan consulted");
+        assert!(
+            consulted.iter().all(|k| !k.contains(ending)),
+            "ending worktree receipt must clear: {consulted:?}"
+        );
+        assert!(
+            consulted.iter().any(|k| k.contains(sibling)),
+            "sibling worktree receipt must survive: {consulted:?}"
+        );
+
+        store.close().await.expect("close");
+    }
+
     #[tokio::test]
     async fn session_harvest_clears_subagent_summary() {
         let (_dir, store) = temp_store().await;
@@ -1640,7 +1733,7 @@ mod tests {
 
         // Harvest with no git repo — still runs the archive + cleanup path.
         let nowhere = TempDir::new().expect("tempdir");
-        session_harvest(&store, nowhere.path())
+        session_harvest(&store, nowhere.path(), None)
             .await
             .expect("harvest");
 
@@ -1678,7 +1771,7 @@ mod tests {
             .await
             .expect("put cursor");
 
-        session_harvest(&store, repo_dir.path())
+        session_harvest(&store, repo_dir.path(), None)
             .await
             .expect("harvest must survive a cursor it cannot place");
 

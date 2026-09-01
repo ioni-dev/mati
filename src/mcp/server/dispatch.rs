@@ -467,8 +467,11 @@ pub(crate) async fn socket_dispatch(
         }
 
         "session_harvest" => {
+            // Legacy in-process v1 bridge (tests). The public wire uses v2,
+            // which carries the ending worktree; this path has none, so the
+            // cleanup stays store-wide.
             let g = graph.read().await;
-            if let Err(e) = sess::session_harvest(g.store(), repo_root).await {
+            if let Err(e) = sess::session_harvest(g.store(), repo_root, None).await {
                 tracing::warn!("daemon socket session_harvest: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)

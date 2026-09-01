@@ -296,7 +296,7 @@ pub enum Command {
 
     /// Archive session, run promotions, collect stale reviews.
     #[serde(rename = "session_harvest")]
-    SessionHarvest,
+    SessionHarvest(SessionHarvestInput),
 
     /// Clear all consult receipts (PostCompact: force re-block after compaction).
     #[serde(rename = "session_clear_consults")]

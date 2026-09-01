@@ -593,11 +593,14 @@ pub(super) async fn dispatch_session_side(
             Response::ok(request_id, serde_json::Value::Null)
         }
 
-        Command::SessionHarvest => {
+        Command::SessionHarvest(input) => {
             // SessionHarvest is inherently cross-tree (promotes gotchas in
             // knowledge, archives sessions). Delegate to existing logic which
             // commits its own per-step transactions, then write session-side audit.
-            let result = sess::session_harvest(store, &ctx.repo_root).await;
+            // `input.worktree` scopes the receipt cleanup to the ending worktree;
+            // `ctx.repo_root` is the daemon's, which may name a sibling worktree.
+            let result =
+                sess::session_harvest(store, &ctx.repo_root, input.worktree.as_deref()).await;
             let (accepted, error_code) = match &result {
                 Ok(()) => (true, None),
                 Err(_) => (false, Some(ErrorCode::StoreError)),

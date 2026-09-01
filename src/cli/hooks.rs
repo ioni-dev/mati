@@ -369,12 +369,21 @@ pub async fn run_session_harvest() -> Result<HookRunOutcome> {
     // it can: the staleness scan gates on record *start*, not completion.
     const SESSION_END_DEADLINE_MS: u64 = 2500;
 
+    // Tag the ending session's worktree so the daemon scopes its receipt/lockdown
+    // cleanup to it. The daemon serves every sibling worktree of a shared-slug
+    // clone and cannot tell which one is ending from its own repo_root.
+    let worktree = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| mati_core::store::session::worktree_scope_tag(&cwd));
+
     run_with_deadline(
         "session-end",
         "<session-harvest>",
         SESSION_END_DEADLINE_MS,
         "session harvest exceeded internal deadline",
-        hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest),
+        hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest(
+            mati_core::mcp::protocol::SessionHarvestInput { worktree },
+        )),
     )
     .await
 }

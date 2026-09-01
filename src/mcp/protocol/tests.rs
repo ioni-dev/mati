@@ -448,7 +448,26 @@ fn session_harvest_decodes() {
         "cmd": { "type": "session_harvest" }
     });
     let req: Request = serde_json::from_value(json).unwrap();
-    assert!(matches!(req.cmd, Command::SessionHarvest));
+    // An older hook sends no `worktree`; it decodes to `None` (backward compat).
+    assert!(matches!(
+        req.cmd,
+        Command::SessionHarvest(SessionHarvestInput { worktree: None })
+    ));
+}
+
+#[test]
+fn session_harvest_decodes_with_worktree() {
+    let json = serde_json::json!({
+        "v": 2,
+        "id": "550e8400-e29b-41d4-a716-446655440000",
+        "session": "660e8400-e29b-41d4-a716-446655440000",
+        "cmd": { "type": "session_harvest", "worktree": "deadbeef" }
+    });
+    let req: Request = serde_json::from_value(json).unwrap();
+    match req.cmd {
+        Command::SessionHarvest(input) => assert_eq!(input.worktree.as_deref(), Some("deadbeef")),
+        other => panic!("expected SessionHarvest, got {other:?}"),
+    }
 }
 
 #[test]
@@ -719,7 +738,10 @@ fn command_kind_covers_all_variants() {
             }),
         ),
         ("session_flush", Command::SessionFlush),
-        ("session_harvest", Command::SessionHarvest),
+        (
+            "session_harvest",
+            Command::SessionHarvest(SessionHarvestInput::default()),
+        ),
         ("session_clear_consults", Command::SessionClearConsults),
     ];
 
@@ -775,7 +797,7 @@ fn command_is_mutation_classification() {
     })
     .is_mutation());
     assert!(Command::SessionFlush.is_mutation());
-    assert!(Command::SessionHarvest.is_mutation());
+    assert!(Command::SessionHarvest(SessionHarvestInput::default()).is_mutation());
     assert!(Command::SessionClearConsults.is_mutation());
 }
 

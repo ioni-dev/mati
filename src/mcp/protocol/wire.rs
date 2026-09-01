@@ -43,7 +43,7 @@ impl Command {
             Self::ConsultationHit(_) => "consultation_hit",
             Self::PolicyShadowObserve(_) => "policy_shadow_observe",
             Self::SessionFlush => "session_flush",
-            Self::SessionHarvest => "session_harvest",
+            Self::SessionHarvest(_) => "session_harvest",
             Self::SessionClearConsults => "session_clear_consults",
             Self::SubagentHarvest(_) => "subagent_harvest",
             Self::SubagentSpawned(_) => "subagent_spawned",
@@ -92,7 +92,7 @@ impl Command {
             | Self::ScanEnforcementEventsWithSkips(_)
             | Self::ScanEnforcementEventsSinceMs(_)
             | Self::SessionFlush
-            | Self::SessionHarvest
+            | Self::SessionHarvest(_)
             | Self::SessionClearConsults
             | Self::SubagentHarvest(_)
             | Self::SubagentSpawned(_)
@@ -131,7 +131,7 @@ impl Command {
             | Self::ConfigSet(_)
             | Self::SandboxAudit(_)
             | Self::SessionFlush
-            | Self::SessionHarvest
+            | Self::SessionHarvest(_)
             | Self::SessionClearConsults
             | Self::SubagentHarvest(_)
             | Self::SubagentSpawned(_)

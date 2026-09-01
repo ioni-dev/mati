@@ -1018,7 +1018,7 @@ fn no_mutation_or_side_effecting_read_reaches_v1_bridge() {
             source: None,
         }),
         Command::SessionFlush,
-        Command::SessionHarvest,
+        Command::SessionHarvest(SessionHarvestInput::default()),
         Command::SessionClearConsults,
         // Side-effecting reads.
         Command::MemGet(MemGetInput {

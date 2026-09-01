@@ -228,7 +228,7 @@ pub(super) fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         | Command::ConsultationHit(_)
         | Command::PolicyShadowObserve(_)
         | Command::SessionFlush
-        | Command::SessionHarvest
+        | Command::SessionHarvest(_)
         | Command::SessionClearConsults
         | Command::SubagentHarvest(_)
         | Command::SubagentSpawned(_)
