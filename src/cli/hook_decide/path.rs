@@ -87,6 +87,8 @@ pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> O
         // Handled by `run_file_changed` before the single-path pipeline; its
         // `file_path` is absolute and needs repo-relative resolution.
         HookVariant::ClaudeFileChanged => None,
+        // Handled by `run_post_read_compliance` before the single-path pipeline.
+        HookVariant::ClaudePostReadCompliance => None,
     }
 }
 
@@ -179,7 +181,7 @@ pub(crate) fn canonical_rel_path(
 /// hook process resolves a bare relative shell argument. Same rule
 /// `canonical_rel_path` uses for `abs_access`, without the symlink
 /// resolution — an existence check doesn't need it.
-pub(super) fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
+pub(crate) fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
     let raw = Path::new(accessed_path);
     if raw.is_absolute() {
         raw.to_path_buf()

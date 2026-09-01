@@ -1873,11 +1873,10 @@ mod tests {
     }
 
     /// The other writer of `fail_open.log` is a bash hook, not Rust. When jq
-    /// is missing, `post-read-compliance.sh` skips the whole compliance check
-    /// and its only trace is the line it appends here — so that line must land
-    /// under `$MATI_HOME` (what this reader resolves) and parse. If it does
-    /// not, a machine with no jq reports 0 fail-open events while enforcing
-    /// nothing.
+    /// is missing, `post-edit.sh` skips edit tracking and doc capture, and its
+    /// only trace is the line it appends here — so that line must land under
+    /// `$MATI_HOME` (what this reader resolves) and parse. If it does not, a
+    /// machine with no jq reports 0 fail-open events while enforcing nothing.
     #[test]
     fn shell_hook_fail_open_round_trips_into_the_scanner() {
         use std::io::Write as _;
@@ -1902,8 +1901,8 @@ mod tests {
             }
         }
 
-        let script = dir.path().join("post-read-compliance.sh");
-        std::fs::write(&script, mati_core::hooks::post_compliance::SCRIPT).unwrap();
+        let script = dir.path().join("post-edit.sh");
+        std::fs::write(&script, mati_core::hooks::post_edit::SCRIPT).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let now_before = SystemTime::now()

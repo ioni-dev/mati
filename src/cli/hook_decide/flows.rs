@@ -659,6 +659,60 @@ pub(crate) async fn run_post_task(input: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+// ── claude-post-read-compliance flow ────────────────────────────────────────
+
+/// Bash's `case "$REL_PATH" in *.*|*/*` guard: a name with a dot or a
+/// separator is taken as a path, anything else only if it is really on disk.
+/// Keeps `Dockerfile`, drops the tool-input junk that never named a file.
+pub(super) fn names_a_file(path: &str, cwd: &Path, repo_root: Option<&Path>) -> bool {
+    if path.contains('.') || path.contains('/') {
+        return true;
+    }
+    resolve_access_path(path, cwd).exists()
+        || repo_root.is_some_and(|root| root.join(path).exists())
+}
+
+/// Record a read that went unconsulted, exactly once.
+///
+/// PostToolUse: no stdout, always exit 0. The decision itself lives in
+/// [`crate::cli::hooks::run_post_read_compliance`], which also canonicalizes
+/// the key; this flow only extracts the path and guards the daemon.
+pub(crate) async fn run_post_read_compliance(input: &serde_json::Value) -> Result<()> {
+    let Some(path) = input
+        .pointer("/tool_input/file_path")
+        .or_else(|| input.pointer("/tool_input/path"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return Ok(());
+    };
+    let repo_ident = mati_core::store::RepoIdent::discover(&cwd);
+    let repo_root = discover_repo_root_for(&repo_ident);
+    if !names_a_file(path, &cwd, repo_root.as_deref()) {
+        return Ok(());
+    }
+    let mati_root = match mati_root_for_ident(&repo_ident, &cwd) {
+        Ok(root) => root,
+        Err(_) => {
+            log_fail_open_named("post-read-compliance", path, "cannot determine mati root");
+            return Ok(());
+        }
+    };
+    if !ensure_daemon(&mati_root).await {
+        log_fail_open_named("post-read-compliance", path, "daemon not running");
+        return Ok(());
+    }
+
+    let agent_id = input
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    crate::cli::hooks::run_post_read_compliance(&format!("file:{path}"), agent_id).await
+}
+
 /// Best-effort PostToolUse adapter for schema introspection. The policy
 /// evaluation and receipt minting are deliberately fire-and-forget: a
 /// PostToolUse hook must never disrupt the agent session.

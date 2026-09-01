@@ -2039,3 +2039,31 @@ fn the_pathless_key_names_the_surface_not_the_command() {
         assert_eq!(flows::pathless_surface_key(variant), want, "{variant:?}");
     }
 }
+
+/// The extensionless guard the bash `case` block carried: `Dockerfile` is a
+/// real file and must still be checked, while a bare word that is not on disk
+/// was never a path and must not reach the daemon.
+#[test]
+fn an_extensionless_name_counts_only_when_it_is_really_on_disk() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    std::fs::write(repo.path().join("Dockerfile"), "FROM rust:1.80").expect("write");
+
+    assert!(flows::names_a_file(
+        "Dockerfile",
+        repo.path(),
+        Some(repo.path())
+    ));
+    assert!(!flows::names_a_file(
+        "notafile",
+        repo.path(),
+        Some(repo.path())
+    ));
+    assert!(
+        flows::names_a_file("src/main.rs", repo.path(), Some(repo.path())),
+        "a separator alone makes it a path"
+    );
+    assert!(
+        flows::names_a_file("Cargo.toml", repo.path(), Some(repo.path())),
+        "an extension alone makes it a path"
+    );
+}

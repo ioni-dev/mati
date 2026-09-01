@@ -49,6 +49,10 @@ pub enum HookVariant {
     /// staleness follow the edit. No decision, no stdout.
     #[value(name = "claude-file-changed")]
     ClaudeFileChanged,
+    /// Claude PostToolUse(Read|Glob|Grep): record a read that went unconsulted.
+    /// No decision, no stdout.
+    #[value(name = "claude-post-read-compliance")]
+    ClaudePostReadCompliance,
 }
 
 #[derive(Args, Debug)]
@@ -159,6 +163,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     if args.variant == HookVariant::ClaudePostTask {
         return run_post_task(&input).await;
+    }
+
+    if args.variant == HookVariant::ClaudePostReadCompliance {
+        return run_post_read_compliance(&input).await;
     }
 
     if args.variant == HookVariant::ClaudeConfigChange {
