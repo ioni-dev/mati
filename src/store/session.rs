@@ -805,6 +805,9 @@ pub async fn record_owed_receipt(store: &Store, key: &str, actor: Option<&str>) 
 /// record entered *that* context window and a subagent's `mem_get` puts nothing
 /// in its parent's.
 ///
+/// Settlement is re-derived here on every call, never recorded: a marker holds
+/// no memory of having been paid, so clearing receipts re-owes every marker.
+///
 /// `None` when nothing is owed: no marker, all expired, or every one settled by
 /// a receipt this actor holds. This is the decidable question the lockdown asks
 /// instead of "does this command touch file X" — a computed filename is

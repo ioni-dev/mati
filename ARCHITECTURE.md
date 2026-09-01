@@ -587,6 +587,16 @@ receipt?
   because the arming sweep drops the lapsed marker before the create-once
   check reads it. Markers are cleared wholesale on PostCompact and at daemon
   start along with the receipts.
+- Keeping markers across a receipt wipe is not a one-line change, and it was
+  considered. `outstanding_owed` never deletes a settled marker — it re-derives
+  settlement on every call from the live receipt, so a marker holds no record
+  of having been paid. Clear the receipts and every marker in the window reads
+  as owed again, settled ones included, and the next window starts locked
+  before it has run anything. Making the debt outlive compaction means
+  recording settlement as its own fact, not merely declining to delete markers.
+  Decided against for now: the lockdown is off by default, both halves of the
+  question are design preference rather than measurement, and the measured gap
+  is the turn-1 hole below, which no compaction rule touches.
 - The query is two pure daemon reads — `config_get` for the switch, then
   `session_owed_receipt` when it is on. `MATI_LOCKDOWN` skips the first.
   Every fault path allows (P9).
