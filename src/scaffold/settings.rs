@@ -896,6 +896,42 @@ mod tests {
         }
     }
 
+    /// `async` is what keeps these off the critical path, and nothing else
+    /// does. post-read-compliance fires on every Read/Glob/Grep and calls
+    /// `ensure_daemon`, which measures ~13.8ms against a live daemon but
+    /// ~430ms when it has to spawn one. Fire-and-forget, that costs the tool
+    /// call nothing. Drop the flag and every one of those becomes blocking.
+    ///
+    /// A `timeout` beside `async` is the same mistake in reverse: the host
+    /// does not apply one to a hook it never waits for, so writing it here
+    /// only implies a ceiling that is not enforced. `HOOK_DEADLINE_MS` is the
+    /// real bound — measured at 2521ms against a wedged daemon.
+    ///
+    /// post-memget is deliberately absent from this list: it mints the
+    /// consultation receipt, so it must finish before the next tool call.
+    #[test]
+    fn fire_and_forget_post_hooks_stay_async_and_untimed() {
+        let settings = settings_template_with_mcp(false);
+        let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        for command in [
+            ".claude/hooks/post-read-compliance.sh",
+            ".claude/hooks/post-edit.sh",
+            ".claude/hooks/post-bash.sh",
+            ".claude/hooks/post-task.sh",
+        ] {
+            let hook = post
+                .iter()
+                .flat_map(|entry| entry["hooks"].as_array().unwrap())
+                .find(|hook| hook["command"] == command)
+                .unwrap_or_else(|| panic!("{command} must stay registered on PostToolUse"));
+            assert_eq!(hook["async"], true, "{command} must stay fire-and-forget");
+            assert!(
+                hook.get("timeout").is_none(),
+                "{command} is async, so a timeout implies a ceiling the host never applies"
+            );
+        }
+    }
+
     #[test]
     fn settings_template_with_mcp_tool_adds_registration_beside_shell_hook() {
         let settings = settings_template_with_mcp(true);
