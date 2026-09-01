@@ -213,9 +213,14 @@ never block Claude on a mati outage — hooks fail open (P9).
   is denied (exit 2) until `mem_get`. It parses the patch envelope for exact
   paths, so unlike the `cat` path it is immune to the wrapper/quoting bypass
   above. This rests on a documented Codex contract: `PreToolUse` intercepts
-  `apply_patch` and reports `tool_name: "apply_patch"`. Codex now has near-full
-  hook parity with Claude Code and supports `updatedInput`, which mati does not
-  use. It still fires no hook for its native file-read tool.
+  `apply_patch` and reports `tool_name: "apply_patch"`. Codex documents 11 hook
+  events and supports `updatedInput`, which mati does not use. This is NOT hook
+  parity with Claude Code: `PreToolUse` fires for four tools only — `shell`,
+  `unified_exec`, `apply_patch`, `mcp`. The docs table claims "other local
+  function tools" are covered; `openai/codex#20204` (open, checked 2026-08-31)
+  says they are not. Cite the tracker, not the table. Codex reads are gated
+  only through the shell path, for a sharper reason than "no hook on its read
+  tool" — ARCHITECTURE.md section 10.3 carries the measured account.
   Claude edits are covered PRIMARILY by the read gate (transitively): Claude
   Code's own read-before-edit rule forces a prior read, which the read gate gates,
   so a *naive* blind edit is stopped by Claude Code's "File must be read first"
