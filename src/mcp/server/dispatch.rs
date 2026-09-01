@@ -321,7 +321,9 @@ pub(crate) async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.key"),
             };
             let g = graph.read().await;
-            if let Err(e) = sess::log_hit(g.store(), key).await {
+            // v1 in-process arm, unscoped (matches pre-scoping behavior); the
+            // live worktree-scoped path is the v2 ConsultationHit command.
+            if let Err(e) = sess::log_hit(g.store(), key, None).await {
                 tracing::warn!("daemon socket log_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -493,7 +495,7 @@ pub(crate) async fn socket_dispatch(
             let file_key = format!("file:{path}");
             let g = graph.read().await;
             let store = g.store();
-            if let Err(e) = sess::log_hit(store, &file_key).await {
+            if let Err(e) = sess::log_hit(store, &file_key, None).await {
                 tracing::warn!("daemon socket edit_hook: log_hit failed: {e}");
             }
             if let Err(e) = crate::analysis::reparse::reparse_impl(store, repo_root, path).await {

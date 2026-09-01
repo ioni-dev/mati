@@ -523,14 +523,22 @@ impl StoreProxy {
 
     /// Record a consultation receipt for a key.
     pub async fn log_hit(&self, key: &str) -> Result<()> {
+        // Scope the receipt to the caller's worktree so it satisfies the
+        // worktree-scoped file gate, which derives the same tag from its cwd.
+        // No agent_id at the CLI layer — this is a main-thread consultation.
+        let scope = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| mati_core::store::session::worktree_scope_tag(&cwd));
         match &self.inner {
-            ProxyInner::Direct(store) => mati_core::store::session::log_hit(store, key).await,
+            ProxyInner::Direct(store) => {
+                mati_core::store::session::log_hit(store, key, scope.as_deref()).await
+            }
             ProxyInner::Socket { root } => {
                 let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
                     mati_core::mcp::protocol::ConsultationHitInput {
                         key: key.to_string(),
                         capture_fingerprint: true,
-                        actor: None,
+                        actor: scope,
                         session_id: None,
                         agent_id: None,
                         decision_basis_hash: None,

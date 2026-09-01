@@ -489,7 +489,12 @@ pub async fn session_flush_staged(store: &Store) -> Result<Option<(String, Vec<u
 // ── log_hit ───────────────────────────────────────────────────────────────────
 
 /// Record a cache hit: write consulted marker, bump access_count, update daily agg.
-pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
+///
+/// `actor` scopes the receipt (worktree, or worktree+agent). It MUST match the
+/// scope the file gate checks — an unscoped receipt never satisfies a
+/// worktree-scoped gate. Callers derive it from their cwd via
+/// [`worktree_scope_tag`]; see `cli::proxy::StoreProxy::log_hit`.
+pub async fn log_hit(store: &Store, key: &str, actor: Option<&str>) -> Result<()> {
     let now = now_secs();
 
     // 1. Daily hit aggregation
@@ -499,7 +504,7 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     // 2. Mark as consulted for session tracking. No source: this is the direct
     // store path behind `StoreProxy::log_hit`, reached from CLI commands whose
     // consultation is neither a `mem_get` nor an introspection.
-    let staged = consultation_receipt_staged_for_store(store, key, None, true, None).await?;
+    let staged = consultation_receipt_staged_for_store(store, key, actor, true, None).await?;
     let receipt: Record = rmp_serde::from_slice(&staged.bytes)
         .context("failed to deserialize staged consultation receipt")?;
     store.put(&staged.key, &receipt).await?;
@@ -1761,7 +1766,9 @@ mod tests {
             .await
             .expect("no receipt yet"));
 
-        log_hit(&store, key).await.expect("log consultation hit");
+        log_hit(&store, key, None)
+            .await
+            .expect("log consultation hit");
 
         assert!(check_consulted_recent(&store, key, 900, None)
             .await
@@ -1776,7 +1783,7 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        log_hit(&store, key).await.unwrap();
+        log_hit(&store, key, None).await.unwrap();
 
         let receipt = store.get(&receipt_key(key, None)).await.unwrap().unwrap();
         assert!(receipt
@@ -1837,7 +1844,7 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        log_hit(&store, key).await.unwrap();
+        log_hit(&store, key, None).await.unwrap();
         let receipt_key_value = receipt_key(key, None);
         let mut receipt = store.get(&receipt_key_value).await.unwrap().unwrap();
         receipt.updated_at = 0;
@@ -1857,7 +1864,7 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        log_hit(&store, key).await.unwrap();
+        log_hit(&store, key, None).await.unwrap();
         store.delete(key).await.unwrap();
 
         assert!(
@@ -1951,8 +1958,8 @@ mod tests {
         let key1 = "file:src/main.rs";
         let key2 = "file:src/lib.rs";
 
-        log_hit(&store, key1).await.expect("log first hit");
-        log_hit(&store, key2).await.expect("log second hit");
+        log_hit(&store, key1, None).await.expect("log first hit");
+        log_hit(&store, key2, None).await.expect("log second hit");
 
         // Verify receipts exist before clearing.
         let before = store
