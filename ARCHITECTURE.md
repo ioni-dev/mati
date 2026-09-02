@@ -585,11 +585,14 @@ receipt?
   cannot hold its own lockdown open. They expire after `OWED_RECEIPT_TTL_SECS`
   (900s, the shell gate's receipt TTL); a deny after that window re-arms,
   because the arming sweep drops the lapsed marker before the create-once
-  check reads it. Markers are cleared wholesale along with the receipts: on
-  PostCompact, at daemon start, and on SessionEnd (`session_harvest` calls
-  `delete_all_receipts`). The SessionEnd wipe is store-wide, so a session that
-  ends in any worktree clears every worktree's debt — see the measurement
-  below.
+  check reads it. Markers are cleared wholesale along with the receipts on
+  PostCompact (`session_clear_consults` → `delete_all_receipts`, store-wide),
+  which is correct because compaction resets the whole session's memory. On
+  SessionEnd the clear is scoped instead: `session_harvest` →
+  `delete_scope_receipts` deletes only the ending worktree's tag (since
+  `4e99553`), store-wide only outside a git repo. SessionEnd previously used the
+  same wholesale wipe, which let a session ending in one worktree clear a
+  sibling's debt — see the measurement below.
 - Keeping markers across a receipt wipe is not a one-line change, and it was
   considered. `outstanding_owed` never deletes a settled marker — it re-derives
   settlement on every call from the live receipt, so a marker holds no record
@@ -656,10 +659,12 @@ worktree that shares the cwd repo's `commondir` (canonicalized, so `/var` vs
 repo-relative key up in the unchanged, shared-slug store. Test:
 `file_gate_denies_a_governed_read_from_a_sibling_worktree`. The residual miss is
 a symlink in the cwd worktree pointing into a sibling — it strips to a relative
-key and `canonical_rel_path` fails containment against the cwd root. Still open:
-a `claude -p` session confined to a linked worktree cleared the main worktree's
-debt 3 of 3 on exit, after which the main worktree allowed — `session_harvest`
-deletes every `session:owed:*` in the store, not just its own worktree's.
+key and `canonical_rel_path` fails containment against the cwd root. Fixed
+(`4e99553`): a `claude -p` session confined to a linked worktree used to clear
+the main worktree's debt 3 of 3 on exit — `session_harvest` deleted every
+`session:owed:*` in the store. It now scopes the delete to the ending worktree's
+tag (`delete_scope_receipts`), so ending a session in one worktree leaves a
+sibling's debt intact; the clear stays store-wide only outside a git repo.
 
 ### 10.1b Read floor (Tier 2)
 
@@ -1735,6 +1740,12 @@ Peer credentials are checked through `SO_PEERCRED` on Linux and `LOCAL_PEERCRED`
 **In-repo symlink access resolves to the real target for enforcement (WI-20).**
 
 A gotcha is keyed by the lexical repo-relative path, so an agent could route around the gate by reading or editing a gotcha'd file through a symlink whose key differs. The read/edit decision path — including Codex `apply_patch` patch targets — adds an escalate-only canonical-key fallback: when the lexical gate does not deny, it resolves the accessed path through symlinks (shared with the L3 sandbox's `canonicalize_lenient`), strips the canonicalized repo root, and evaluates the real target's key too — adopting that result only when it denies. It is fully fail-open (no repo root, a `canonicalize` failure, an out-of-repo target, or an identical key all leave the lexical decision intact) and costs one extra `realpath` plus one daemon round-trip, only on the non-deny path. This closes the in-repo symlink bypass at the hook level (L1). It does not change the lexical store key. Hardlink aliases (which `canonicalize` does not resolve) and out-of-tree targets remain out of scope for the hook tier; the L3 OS floor (`mati sandbox`) is what denies crown-jewel files across the shell and its subprocesses.
+
+**Tier 1 lockdown: sibling-worktree escape. Accepted; not fixed.**
+
+Session lockdown (section 10.1a) keys its debt to a per-worktree tag, `sha256(worktree_root)[..4]`. Every linked git worktree of a shared-slug clone carries a different tag, so a session whose working directory is a sibling worktree does not see the debt armed in another, and its commands are not denied. Measured 2026-08-31: 5/5 escapes at the hook layer (Fisher one-sided p = 0.004) and 4/4 end to end via `claude -p` (p = 0.014); full account in section 10.1a. The escape needs a worktree that exists before the first deny plus a host feature that pins a session to it — an in-debt agent cannot create one, because Bash is denied and `git worktree add` denies 5/5.
+
+Accepted, not fixed, by decision 2026-09-01. The worktree tag is the only identity signal and cannot separate an evasion vehicle from genuine parallel work across two checkouts, so any fix that makes one worktree's debt visible in another false-denies an honest developer running two worktrees at once — a wider blast radius than the escape it closes. The feature is off by default, and this mechanism is enforcement parity, not the product's differentiator, so the response is to measure and publish the bypass rate, not to patch it. The zero-tension half shipped separately: SessionEnd receipt cleanup is now scoped to the ending worktree (`4e99553`), so ending a session in one worktree no longer clears a sibling's debt. Reopen only on a real report that a host worktree-switch feature is used as a live evasion; gate that on a transcript count of concurrent independent-worktree sessions (the unmeasured quantity) before building the session-id-continuity fix.
 
 **petgraph is in-memory only.**
 
