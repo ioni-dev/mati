@@ -232,11 +232,43 @@ pub async fn daemon_result(root: &Path, cmd: &str, args: serde_json::Value) -> D
     send_v2_raw(root, v2_cmd, timeout).await
 }
 
-/// Low-level: connect to daemon socket, send a pre-built v2 Command JSON,
-/// read and parse the v2 Response.
+/// Connect, send a v2 Command, and read the Response, retrying once on
+/// `session_mismatch`.
+///
+/// The daemon rejects a request whose cached session UUID predates a daemon
+/// restart (dispatch_v2's session fence). The contract is that the client
+/// re-reads metadata and retries — `send_v2_once` reads the session fresh per
+/// attempt, so the retry picks up the rotated UUID. Mirrors the MCP proxy's
+/// `proxy_daemon_send_v2` (`src/mcp/server/proxy.rs`). Without this, a restart
+/// racing a CLI read surfaced as a spurious "record not found" (the error
+/// envelope carries no `data`, which the read arms read as a null record).
 async fn send_v2_raw(
     root: &Path,
     v2_cmd: serde_json::Value,
+    response_timeout: Duration,
+) -> DaemonResult {
+    let first = send_v2_once(root, &v2_cmd, response_timeout).await;
+    if !is_session_mismatch(&first) {
+        return first;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    send_v2_once(root, &v2_cmd, response_timeout).await
+}
+
+/// True when a daemon result is the `session_mismatch` error envelope.
+fn is_session_mismatch(result: &DaemonResult) -> bool {
+    matches!(
+        result,
+        DaemonResult::Ok(v)
+            if v.get("code").and_then(|c| c.as_str()) == Some("session_mismatch")
+    )
+}
+
+/// Low-level single attempt: connect to daemon socket, send a pre-built v2
+/// Command JSON, read and parse the v2 Response.
+async fn send_v2_once(
+    root: &Path,
+    v2_cmd: &serde_json::Value,
     response_timeout: Duration,
 ) -> DaemonResult {
     let sock_path = root.join("mati.sock");
@@ -295,7 +327,7 @@ async fn send_v2_raw(
         "v": mati_core::mcp::protocol::PROTOCOL_VERSION,
         "id": uuid::Uuid::new_v4(),
         "session": daemon_session,
-        "cmd": v2_cmd,
+        "cmd": v2_cmd.clone(),
     });
 
     let (reader, mut writer) = stream.into_split();
