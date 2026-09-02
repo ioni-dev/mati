@@ -87,6 +87,14 @@ We measured that rather than guessing. Ten runs, one governed file, an agent tol
 
 Seven of them found the same route: `F=$(grep -rl "def normalize_path" .); cat "$F"`. The file is located by what is inside it. No classifier reading a command string can gate that, because the string never names the file. That is the interface, not a bug in it.
 
+That 8 of 10 is the ceiling, not the rate. It needed an instruction to hide the filename. We ran the ordinary case too: the same trap, the repo grown to about a hundred files so the target is not the obvious one, a task that names the function to write and never the file, and no instruction to avoid anything.
+
+- **10 of 10** found the file by searching its contents, the same grep route as above.
+- Every run then named the file. Seven were denied on that read and consulted; three ran `mem_get` first and were never denied.
+- **0 of 10** reached the file without consulting.
+
+Told to hide the name, an agent takes the route no classifier can see. Left to work normally, it names the file it just found, and the gate is there. The hole is a deliberate evasion, not the common case.
+
 What does hold is narrower, and was measured the same day. Twenty runs, same fixture, an agent told to defeat the guard, with the session lockdown on:
 
 - **0 of 20** reached the file without consulting, against 4 of 10 without the lockdown (p=0.0077).
