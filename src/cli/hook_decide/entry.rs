@@ -49,6 +49,10 @@ pub enum HookVariant {
     /// staleness follow the edit. No decision, no stdout.
     #[value(name = "claude-file-changed")]
     ClaudeFileChanged,
+    /// Claude PostToolUse(Read|Glob|Grep): record a read that went unconsulted.
+    /// No decision, no stdout.
+    #[value(name = "claude-post-read-compliance")]
+    ClaudePostReadCompliance,
 }
 
 #[derive(Args, Debug)]
@@ -161,6 +165,10 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         return run_post_task(&input).await;
     }
 
+    if args.variant == HookVariant::ClaudePostReadCompliance {
+        return run_post_read_compliance(&input).await;
+    }
+
     if args.variant == HookVariant::ClaudeConfigChange {
         return run_config_change(&input).await;
     }
@@ -191,10 +199,44 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
         .pointer("/tool_input/command")
         .and_then(|value| value.as_str());
 
+    // Tier 2: a command that would return a sealed file to a readable state is
+    // denied before path extraction, because the verbs that do it reach files
+    // they never name — `chmod -R u+rwX .` and `git clone` restore the whole
+    // tree — so there is no governed path for the file gate below to find.
+    if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash
+    ) && run_seal_guard(&input, args.variant, agent_id).await
+    {
+        return Ok(());
+    }
+
+    // Codex's post-Bash sweep. Claude's runs inside `run_post_bash_introspection`,
+    // which `run_inner` dispatches before any of this; Codex's `run_post_bash`
+    // is reached only at step 6, AFTER path extraction, so a command naming no
+    // path — every `chmod`, and every computed path inside an interpreter —
+    // would never reach it. The sweep asks the filesystem, not the command, so
+    // it belongs here rather than there.
+    if args.variant == HookVariant::CodexPostBash {
+        run_seal_sweep(&input, agent_id).await;
+    }
+
     // 2. Extract file path (variant-specific).
     let raw_path = match extract_path(&input, args.variant) {
         Some(p) => p,
         None => {
+            // Tier 1: an access naming no governed path is exactly the shape a
+            // computed filename takes (`open('ke' + 'ys.py')`), and the shape
+            // `Grep`/`Glob` take with no `path`. Nothing here is classified —
+            // the gate asks whether the session owes a receipt, which no
+            // construction can hide.
+            if matches!(
+                args.variant,
+                HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreRead
+            ) && run_pathless_lockdown(&input, args.variant, agent_id).await
+            {
+                return Ok(());
+            }
             if let Some(action) = bash_action
                 .as_ref()
                 .filter(|action| action.tool == "db_client" || action.tool == "unknown")
@@ -230,7 +272,17 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
     // `rel_path` is the LEXICAL key — the primary gate. When it finds no
     // gotcha, the canonical-key fallback below (WI-20) re-evaluates the
     // symlink's real target so the gate still fires.
-    let rel_path = decide::normalize_path(&raw_path, repo_root_str);
+    let mut rel_path = decide::normalize_path(&raw_path, repo_root_str);
+
+    // Cross-worktree read (ARCH 10.1a): an absolute path into a sibling worktree
+    // of the same repo stays absolute against cwd's root and matches no key, so
+    // the gate misses a governed file the sibling shares. Re-root it against the
+    // accessed worktree; the shared-slug store the lookup uses is unchanged.
+    if rel_path.starts_with('/') {
+        if let Some(key) = cross_worktree_rel_key(&raw_path, &repo_ident) {
+            rel_path = key;
+        }
+    }
 
     // 4. Resolve mati root (for daemon socket), from the same repo_ident.
     let mati_root = match mati_root_for_ident(&repo_ident, &cwd) {
@@ -251,7 +303,7 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
 
     // 6. codex-post-bash: separate flow — no evaluate(), just compliance logging.
     if args.variant == HookVariant::CodexPostBash {
-        return run_post_bash(&mati_root, &rel_path).await;
+        return run_post_bash(&mati_root, &rel_path, actor_scope.as_deref()).await;
     }
 
     // 7. Single hook_evaluate round-trip.
@@ -563,6 +615,35 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
             {
                 merge_policy_result(&mut adapter, args.variant, policy_decision, policy_events);
             }
+        }
+    }
+
+    // Tier 1 session lockdown, after every file-and-policy gate had its say:
+    // an outstanding receipt denies the rest of the session's reads and shell,
+    // including accesses whose own target is ungoverned. A `Grep` scoped to a
+    // directory arrives here rather than at the path-less branch, because
+    // `extract_path` takes `tool_input.path`. Escalate-only, and skipped when
+    // something already denied.
+    if matches!(
+        args.variant,
+        HookVariant::ClaudePreBash | HookVariant::CodexPreBash | HookVariant::ClaudePreRead
+    ) && !matches!(adapter.decision, Decision::Deny { .. })
+    {
+        if let Some(owed) =
+            lockdown_owed_key(&mati_root, worktree.as_deref(), actor_scope.as_deref()).await
+        {
+            let result = decide::lockdown_result(&owed);
+            let events = platform_events(args.variant, &result.decision, result.events);
+            let (stdout, stderr, exit_code) =
+                format_decision(args.variant, &result.decision, &owed);
+            adapter = AdapterResult {
+                stdout,
+                stderr,
+                exit_code,
+                events,
+                basis_hash: None,
+                decision: result.decision,
+            };
         }
     }
 

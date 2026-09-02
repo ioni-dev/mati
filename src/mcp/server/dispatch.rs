@@ -321,7 +321,9 @@ pub(crate) async fn socket_dispatch(
                 None => return SocketResponse::err("missing args.key"),
             };
             let g = graph.read().await;
-            if let Err(e) = sess::log_hit(g.store(), key).await {
+            // v1 in-process arm, unscoped (matches pre-scoping behavior); the
+            // live worktree-scoped path is the v2 ConsultationHit command.
+            if let Err(e) = sess::log_hit(g.store(), key, None).await {
                 tracing::warn!("daemon socket log_hit: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -430,8 +432,9 @@ pub(crate) async fn socket_dispatch(
                 Some(k) => k,
                 None => return SocketResponse::err("missing args.key"),
             };
+            let actor = req.args.get("actor").and_then(|v| v.as_str());
             let g = graph.read().await;
-            match sess::check_consulted(g.store(), key, None).await {
+            match sess::check_consulted(g.store(), key, actor).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -447,8 +450,9 @@ pub(crate) async fn socket_dispatch(
                 .get("ttl_secs")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(900);
+            let actor = req.args.get("actor").and_then(|v| v.as_str());
             let g = graph.read().await;
-            match sess::check_consulted_recent(g.store(), key, ttl_secs, None).await {
+            match sess::check_consulted_recent(g.store(), key, ttl_secs, actor).await {
                 Ok(found) => SocketResponse::ok(serde_json::Value::Bool(found)),
                 Err(e) => SocketResponse::err(format!("store: {e}")),
             }
@@ -463,8 +467,11 @@ pub(crate) async fn socket_dispatch(
         }
 
         "session_harvest" => {
+            // Legacy in-process v1 bridge (tests). The public wire uses v2,
+            // which carries the ending worktree; this path has none, so the
+            // cleanup stays store-wide.
             let g = graph.read().await;
-            if let Err(e) = sess::session_harvest(g.store(), repo_root).await {
+            if let Err(e) = sess::session_harvest(g.store(), repo_root, None).await {
                 tracing::warn!("daemon socket session_harvest: {e}");
             }
             SocketResponse::ok(serde_json::Value::Null)
@@ -491,7 +498,7 @@ pub(crate) async fn socket_dispatch(
             let file_key = format!("file:{path}");
             let g = graph.read().await;
             let store = g.store();
-            if let Err(e) = sess::log_hit(store, &file_key).await {
+            if let Err(e) = sess::log_hit(store, &file_key, None).await {
                 tracing::warn!("daemon socket edit_hook: log_hit failed: {e}");
             }
             if let Err(e) = crate::analysis::reparse::reparse_impl(store, repo_root, path).await {

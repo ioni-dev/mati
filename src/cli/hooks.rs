@@ -16,7 +16,7 @@
 use anyhow::Result;
 use std::{future::Future, time::Duration};
 
-use crate::cli::daemon::{daemon_result, mati_root_for, DaemonResult};
+use crate::cli::daemon::{daemon_result, daemon_v2, mati_root_for, DaemonResult};
 use crate::cli::hook_decide::{log_fail_open_named, HookRunOutcome};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -46,11 +46,21 @@ where
 }
 
 /// Fire-and-forget with a typed v2 Command. Preferred for mutation/side-effecting calls.
-async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
-    let kind = cmd.kind();
+pub(super) async fn hook_fire_v2(cmd: mati_core::mcp::protocol::Command) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let root = mati_root_for(&cwd)?;
-    match super::daemon::daemon_v2(&root, cmd).await {
+    hook_fire_v2_at(&root, cmd).await
+}
+
+/// [`hook_fire_v2`] for a caller that already resolved the mati root from repo
+/// identity. Re-deriving it from the process cwd would name a different slug
+/// from a subdirectory — the same trap `derive-mati-root-from-repo-root` pins.
+pub(super) async fn hook_fire_v2_at(
+    root: &std::path::Path,
+    cmd: mati_core::mcp::protocol::Command,
+) -> Result<()> {
+    let kind = cmd.kind();
+    match super::daemon::daemon_v2(root, cmd).await {
         DaemonResult::Ok(_) => {}
         _ => tracing::debug!("mati {kind}: daemon unreachable — dropping event"),
     }
@@ -124,7 +134,7 @@ pub async fn run_log_miss(key: &str) -> Result<()> {
     use mati_core::mcp::protocol as p;
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::Miss,
-        key: key.to_string(),
+        key: repo_relative_key_here(key),
         session_id: None,
         actor: None,
         decision_basis_hash: None,
@@ -148,11 +158,128 @@ pub async fn run_log_hit(key: &str) -> Result<()> {
     .await
 }
 
+/// Post-read compliance: record a read that went unconsulted, exactly once.
+///
+/// Replaces the script's `session-check-consulted` + `log-miss` pair with one
+/// process, and adds the condition that pair was missing. `evaluate()` already
+/// emits `Miss` for a file with NO record, so logging one here counted the same
+/// read twice. What the gate never emits — and what this exists for — is the
+/// read of a file whose record sits below the injection thresholds (confidence
+/// 0.3 / quality 0.4), which is every file straight after `mati init`.
+///
+/// Silent on every fault: an unknown consultation state must not fabricate a
+/// miss, and neither must an unreachable daemon (P9).
+pub async fn run_post_read_compliance(key: &str, agent_id: Option<&str>) -> Result<()> {
+    use mati_core::mcp::protocol as p;
+    let key = repo_relative_key_here(key);
+    let cwd = std::env::current_dir()?;
+    let root = mati_root_for(&cwd)?;
+
+    let consulted = daemon_result(
+        &root,
+        "session_check_consulted",
+        serde_json::json!({ "key": key, "actor": cli_actor_scope(agent_id) }),
+    )
+    .await;
+    match consulted {
+        DaemonResult::Ok(resp)
+            if resp.get("ok").and_then(|v| v.as_bool()) == Some(true)
+                && resp.get("data").and_then(|v| v.as_bool()) == Some(false) => {}
+        _ => return Ok(()),
+    }
+
+    match daemon_v2(&root, p::Command::Get(p::GetInput { key: key.clone() })).await {
+        DaemonResult::Ok(resp) if resp.get("data").is_some_and(|v| v.is_object()) => {}
+        _ => return Ok(()),
+    }
+
+    hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
+        event: p::SessionEvent::Miss,
+        key,
+        session_id: None,
+        actor: None,
+        decision_basis_hash: None,
+    }))
+    .await
+}
+
+/// Strip the repo root from an absolute path, canonicalizing both sides.
+///
+/// `None` whenever the path cannot be improved — relative, no repo root, an
+/// unresolvable path, or a target outside the repo — so every caller keeps
+/// what it was handed. See [`repo_relative_key`] for why the strip has to be
+/// canonical rather than lexical.
+fn repo_relative_path(raw: &str, repo_root: Option<&std::path::Path>) -> Option<String> {
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return None;
+    }
+    let canon_root = crate::cli::sandbox::canonicalize_lenient(repo_root?)?;
+    let canon_path = crate::cli::sandbox::canonicalize_lenient(path)?;
+    let rel = canon_path.strip_prefix(&canon_root).ok()?;
+    Some(mati_core::hooks::decide::normalize_path(
+        rel.to_str()?,
+        None,
+    ))
+}
+
+/// [`repo_relative_path`] against the repo the hook process is running in.
+fn repo_relative_path_here(path: &str) -> String {
+    let unchanged = || path.to_string();
+    if !std::path::Path::new(path).is_absolute() {
+        return unchanged();
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return unchanged();
+    };
+    repo_relative_path(
+        path,
+        crate::cli::hook_decide::discover_repo_root(&cwd).as_deref(),
+    )
+    .unwrap_or_else(unchanged)
+}
+
+/// Rewrite an absolute `file:` key to the repo-relative key the store uses.
+///
+/// `post-edit.sh` strips the repo root lexically, which fails whenever the
+/// tool input and `git rev-parse --show-toplevel` disagree about symlinks —
+/// on macOS the toplevel is `/private/tmp/...` while Claude Code passes
+/// `/tmp/...`. The key then names a path no record carries, so a consulted
+/// read answers `false` and records a compliance miss that did not happen.
+/// Canonicalizing both sides here fixes it for every caller of the hook
+/// commands, in the one language that already has `canonicalize_lenient`.
+///
+/// Returns the key unchanged for a relative path, a non-`file:` key, or a
+/// target outside the repo — none of those can be improved by canonicalizing.
+fn repo_relative_key(key: &str, repo_root: Option<&std::path::Path>) -> String {
+    let Some(raw) = key.strip_prefix("file:") else {
+        return key.to_string();
+    };
+    match repo_relative_path(raw, repo_root) {
+        Some(rel) => format!("file:{rel}"),
+        None => key.to_string(),
+    }
+}
+
+/// [`repo_relative_key`] against the repo the hook process is running in.
+fn repo_relative_key_here(key: &str) -> String {
+    if !key.starts_with("file:/") {
+        return key.to_string();
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return key.to_string();
+    };
+    repo_relative_key(
+        key,
+        crate::cli::hook_decide::discover_repo_root(&cwd).as_deref(),
+    )
+}
+
 pub async fn run_log_compliance_miss(key: &str) -> Result<()> {
     use mati_core::mcp::protocol as p;
     hook_fire_v2(p::Command::SessionLog(p::SessionLogInput {
         event: p::SessionEvent::ComplianceMiss,
-        key: key.to_string(),
+        key: repo_relative_key_here(key),
         session_id: None,
         actor: None,
         decision_basis_hash: None,
@@ -242,12 +369,21 @@ pub async fn run_session_harvest() -> Result<HookRunOutcome> {
     // it can: the staleness scan gates on record *start*, not completion.
     const SESSION_END_DEADLINE_MS: u64 = 2500;
 
+    // Tag the ending session's worktree so the daemon scopes its receipt/lockdown
+    // cleanup to it. The daemon serves every sibling worktree of a shared-slug
+    // clone and cannot tell which one is ending from its own repo_root.
+    let worktree = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| mati_core::store::session::worktree_scope_tag(&cwd));
+
     run_with_deadline(
         "session-end",
         "<session-harvest>",
         SESSION_END_DEADLINE_MS,
         "session harvest exceeded internal deadline",
-        hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest),
+        hook_fire_v2(mati_core::mcp::protocol::Command::SessionHarvest(
+            mati_core::mcp::protocol::SessionHarvestInput { worktree },
+        )),
     )
     .await
 }
@@ -343,13 +479,10 @@ pub async fn run_session_clear_consults() -> Result<HookRunOutcome> {
 /// Combined log-hit + reparse in a single daemon round-trip.
 /// Called by post-edit.sh hook to avoid two separate process spawns.
 pub async fn run_edit_hook(path: &str) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let rel = std::path::Path::new(path)
-        .strip_prefix(&cwd)
-        .map(|r| r.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string());
     hook_fire_v2(mati_core::mcp::protocol::Command::FileEditHook(
-        mati_core::mcp::protocol::FileEditHookInput { path: rel },
+        mati_core::mcp::protocol::FileEditHookInput {
+            path: repo_relative_path_here(path),
+        },
     ))
     .await
 }
@@ -363,7 +496,7 @@ pub async fn run_doc_capture(path: &str) -> Result<()> {
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
     hook_fire_v2(mati_core::mcp::protocol::Command::DocCapture(
         mati_core::mcp::protocol::DocCaptureInput {
-            path: path.to_string(),
+            path: repo_relative_path_here(path),
         },
     ))
     .await
@@ -371,14 +504,37 @@ pub async fn run_doc_capture(path: &str) -> Result<()> {
 
 // ── Boolean query hook commands ──────────────────────────────────────────────
 
-pub async fn run_session_check_consulted(key: &str) -> Result<()> {
-    hook_query_bool("session_check_consulted", serde_json::json!({ "key": key })).await
+/// The scope the gate mints receipts at, resolved the same way `hook-decide`
+/// resolves it: the worktree tag, combined with a subagent id when the caller
+/// has one.
+///
+/// A shell hook cannot compute the worktree tag (a hash of the canonical
+/// workdir), so it is computed here. Without it these checks ask about the
+/// global key `session:consulted:<key>`, which the gate never writes inside a
+/// git repo — so the answer was always "not consulted", and every post-hook
+/// built on it recorded a compliance miss for reads that had been consulted.
+fn cli_actor_scope(agent_id: Option<&str>) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let worktree = mati_core::store::session::worktree_scope_tag(&cwd);
+    mati_core::store::session::combined_actor_scope(worktree.as_deref(), agent_id)
 }
 
-pub async fn run_session_check_consulted_recent(key: &str, ttl_secs: u64) -> Result<()> {
+pub async fn run_session_check_consulted(key: &str, agent_id: Option<&str>) -> Result<()> {
+    hook_query_bool(
+        "session_check_consulted",
+        serde_json::json!({ "key": repo_relative_key_here(key), "actor": cli_actor_scope(agent_id) }),
+    )
+    .await
+}
+
+pub async fn run_session_check_consulted_recent(
+    key: &str,
+    ttl_secs: u64,
+    agent_id: Option<&str>,
+) -> Result<()> {
     hook_query_bool(
         "session_check_consulted_recent",
-        serde_json::json!({ "key": key, "ttl_secs": ttl_secs }),
+        serde_json::json!({ "key": key, "ttl_secs": ttl_secs, "actor": cli_actor_scope(agent_id) }),
     )
     .await
 }
@@ -580,5 +736,118 @@ mod tests {
         let entries = collect_stale_entries(&store, &keys).await.unwrap();
         assert!(entries.len() <= MAX_STALE_REVIEW_ENTRIES);
         store.close().await.unwrap();
+    }
+
+    /// The false-compliance-miss bug: on macOS `git rev-parse --show-toplevel`
+    /// answers `/private/tmp/...` while the tool input says `/tmp/...`, so the
+    /// script's lexical strip leaves the key absolute and a consulted read is
+    /// recorded as a miss. Canonicalizing both sides must produce the same
+    /// repo-relative key whichever side carries the symlink.
+    #[test]
+    fn an_absolute_key_through_a_symlink_becomes_the_repo_relative_key() {
+        let real = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(real.path().join("src")).expect("src dir");
+        std::fs::write(real.path().join("src/test.rs"), "fn t() {}\n").expect("file");
+
+        let link_parent = tempfile::tempdir().expect("link parent");
+        let link = link_parent.path().join("repo");
+        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+
+        let via_link = format!("file:{}", link.join("src/test.rs").display());
+        assert_eq!(
+            super::repo_relative_key(&via_link, Some(real.path())),
+            "file:src/test.rs",
+            "a symlinked access path must strip against the real root"
+        );
+
+        let via_real = format!("file:{}", real.path().join("src/test.rs").display());
+        assert_eq!(
+            super::repo_relative_key(&via_real, Some(&link)),
+            "file:src/test.rs",
+            "a symlinked root must strip a real access path"
+        );
+    }
+
+    /// The same symlink trap on the write path: `post-edit.sh` strips the repo
+    /// root lexically, and `run_edit_hook`/`run_doc_capture` forwarded whatever
+    /// survived it. An absolute path reached the daemon, which builds
+    /// `file:<path>` verbatim — a key no record carries, so the edit-activity
+    /// bump and the doc-comment capture both landed on nothing.
+    #[test]
+    fn an_absolute_path_through_a_symlink_becomes_the_repo_relative_path() {
+        let real = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(real.path().join("src")).expect("src dir");
+        std::fs::write(real.path().join("src/test.rs"), "fn t() {}\n").expect("file");
+
+        let link_parent = tempfile::tempdir().expect("link parent");
+        let link = link_parent.path().join("repo");
+        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+
+        let via_link = link.join("src/test.rs");
+        assert_eq!(
+            super::repo_relative_path(&via_link.to_string_lossy(), Some(real.path())),
+            Some("src/test.rs".to_string()),
+            "a symlinked access path must strip against the real root"
+        );
+
+        let via_real = real.path().join("src/test.rs");
+        assert_eq!(
+            super::repo_relative_path(&via_real.to_string_lossy(), Some(&link)),
+            Some("src/test.rs".to_string()),
+            "a symlinked root must strip a real access path"
+        );
+    }
+
+    /// Mirrors [`repo_relative_key`]'s contract at the path level: anything it
+    /// cannot improve yields `None`, and the caller keeps the path it had.
+    #[test]
+    fn repo_relative_path_declines_what_it_cannot_improve() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::repo_relative_path("src/test.rs", Some(repo.path())),
+            None,
+            "a relative path is already correct"
+        );
+        let outside = tempfile::tempdir().expect("outside");
+        let elsewhere = outside.path().join("elsewhere.rs");
+        assert_eq!(
+            super::repo_relative_path(&elsewhere.to_string_lossy(), Some(repo.path())),
+            None,
+            "a target outside the repo cannot become a repo-relative path"
+        );
+        assert_eq!(
+            super::repo_relative_path(&elsewhere.to_string_lossy(), None),
+            None,
+            "no repo root means no prefix to strip"
+        );
+    }
+
+    /// Everything the helper cannot improve is returned untouched: the store
+    /// key shape it is given is already the one the gate wrote.
+    #[test]
+    fn repo_relative_key_leaves_keys_it_cannot_improve_alone() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::repo_relative_key("file:src/test.rs", Some(repo.path())),
+            "file:src/test.rs",
+            "a relative key is already correct"
+        );
+        assert_eq!(
+            super::repo_relative_key("gotcha:some-slug", Some(repo.path())),
+            "gotcha:some-slug",
+            "a non-file key is not a path"
+        );
+        let outside = tempfile::tempdir().expect("outside");
+        let key = format!("file:{}", outside.path().join("elsewhere.rs").display());
+        assert_eq!(
+            super::repo_relative_key(&key, Some(repo.path())),
+            key,
+            "a target outside the repo cannot become a repo-relative key"
+        );
+        assert_eq!(
+            super::repo_relative_key(&key, None),
+            key,
+            "no repo root means no prefix to strip"
+        );
     }
 }

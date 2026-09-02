@@ -136,9 +136,17 @@ pub(crate) async fn dispatch_v2(
 
         // 1b. Session fence — reject requests from stale clients whose cached
         // daemon metadata predates a daemon restart. The client should re-read
-        // DaemonMetadata and retry once. Nil session on the request is tolerated
-        // only when the daemon itself has a nil session (test / legacy fallback).
-        if req.session != ctx.daemon_session {
+        // DaemonMetadata and retry once.
+        //
+        // A nil request session is not a stale client. It means the client
+        // connected in the window after the socket was bound but before the
+        // daemon published its session (cold start binds first, publishes
+        // metadata next), so `read_metadata` found nothing and the client sent
+        // `Uuid::nil`. Serve it: it holds no opinion about which instance it
+        // reached, and rejecting it both forces a client retry and records a
+        // phantom error in the metrics ring. A genuinely stale client after a
+        // restart sends its OLD non-nil session, which still mismatches here.
+        if !req.session.is_nil() && req.session != ctx.daemon_session {
             let resp = Response::err(
                 req.id,
                 ErrorCode::SessionMismatch,
@@ -171,6 +179,8 @@ pub(crate) async fn dispatch_v2(
             dispatch_mem_query(graph, &req).await
         } else if matches!(&req.cmd, Command::PolicyEvaluate(_)) {
             dispatch_policy_evaluate(graph, ctx, &req).await
+        } else if matches!(&req.cmd, Command::SessionOwedReceipt(_)) {
+            dispatch_owed_receipt(graph, &req).await
         } else if is_session_side(&req.cmd) {
             // Session-side mutations: native handler with audit in sessions tree.
             dispatch_session_side(graph, ctx, &req).await
@@ -222,7 +232,7 @@ fn is_session_side(cmd: &Command) -> bool {
             | Command::ConsultationHit(_)
             | Command::PolicyShadowObserve(_)
             | Command::SessionFlush
-            | Command::SessionHarvest
+            | Command::SessionHarvest(_)
             | Command::SessionClearConsults
             | Command::SubagentHarvest(_)
             | Command::SubagentSpawned(_)
@@ -274,8 +284,8 @@ fn is_config_command(cmd: &Command) -> bool {
 /// audit trail for config mutations.
 async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request) -> Response {
     use crate::store::enforcement::{
-        get_enforcement_mode, get_policy_mode, get_retention_days, set_enforcement_mode,
-        set_policy_mode, set_retention_days, EnforcementMode,
+        get_enforcement_mode, get_lockdown, get_policy_mode, get_retention_days,
+        set_enforcement_mode, set_lockdown, set_policy_mode, set_retention_days, EnforcementMode,
     };
 
     let request_id = req.id;
@@ -297,12 +307,17 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                     EnforcementMode::Advisory => "advisory".to_string(),
                     EnforcementMode::Strict => "strict".to_string(),
                 },
+                "enforcement.lockdown" => if get_lockdown(store).await {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                },
                 other => {
                     return Response::err(
                         request_id,
                         ErrorCode::ValidationFailed,
                         format!(
-                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode"
+                            "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode, enforcement.lockdown"
                         ),
                     );
                 }
@@ -386,11 +401,33 @@ async fn dispatch_config(graph: &Arc<tokio::sync::RwLock<Graph>>, req: &Request)
                     Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
                 }
             }
+            "enforcement.lockdown" => {
+                let on = match input.value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        return Response::err(
+                            request_id,
+                            ErrorCode::ValidationFailed,
+                            format!(
+                                "invalid enforcement.lockdown: {other}; valid values: on, off"
+                            ),
+                        );
+                    }
+                };
+                match set_lockdown(store, on).await {
+                    Ok(old) => {
+                        let old_label = if old { "on" } else { "off" };
+                        Response::ok(request_id, serde_json::json!({ "old": old_label }))
+                    }
+                    Err(e) => Response::err(request_id, ErrorCode::StoreError, e.to_string()),
+                }
+            }
             other => Response::err(
                 request_id,
                 ErrorCode::ValidationFailed,
                 format!(
-                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode"
+                    "unknown config key: {other}; valid keys: audit.write_durability, enforcement.retention, policy.mode, enforcement.lockdown"
                 ),
             ),
         },
@@ -504,5 +541,7 @@ use compound::dispatch_file_edit_hook;
 use knowledge::{dispatch_knowledge_mutation, dispatch_policy_evaluate, dispatch_policy_write};
 #[cfg(test)]
 use reads::command_to_v1;
-use reads::{dispatch_mem_query, dispatch_side_effecting_read, dispatch_via_v1};
+use reads::{
+    dispatch_mem_query, dispatch_owed_receipt, dispatch_side_effecting_read, dispatch_via_v1,
+};
 use session::dispatch_session_side;

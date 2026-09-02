@@ -71,6 +71,8 @@ struct VerifyResult<'a> {
 }
 
 pub async fn run(args: VerifyEvidenceArgs) -> Result<()> {
+    crate::cli::consult_gate::require_consultation(Path::new(&args.file)).await?;
+
     let line_num = parse_line_arg(&args.line)
         .with_context(|| format!("invalid --line value: {}", args.line))?;
 

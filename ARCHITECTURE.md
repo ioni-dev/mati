@@ -542,6 +542,262 @@ Decisions are evaluated in this order:
 
 `confidence < 0.3` or `quality < 0.4` always allows without injection, no matter what the `confirmed` state says.
 
+### 10.1a Session lockdown (Tier 1)
+
+Off by default. Turn it on with `mati config set enforcement.lockdown on`.
+`MATI_LOCKDOWN=1` (or `0`) in the hook process overrides the stored value
+for that invocation, in either direction.
+
+Every gate in 10.1 asks which file a command touches. For a `PreToolUse` hook
+that question is undecidable: it receives a command string and must answer
+before execution, so `open('ke' + 'ys.py')` defeats any classifier over the
+string. Measured 2026-08-29: four of ten red-team runs reached a gated file
+that way, each after being denied four times first.
+
+The lockdown asks a decidable question instead — does this session owe a
+receipt?
+
+- A consult-clearable deny (`ComplianceMiss`, `CodexShellBlocked`,
+  `EditBlocked`, `FloorConsultMiss`) writes a marker at
+  `session:owed:<actor>|<file_key>`. A policy deny does not: a policy key is
+  not consultable, so arming on it would produce a lockdown no `mem_get` could
+  lift.
+- While any marker is unsettled, every Bash command and every `Read`, `Grep`
+  and `Glob` denies, whatever it names. Nothing is parsed, so a computed
+  filename has nothing to defeat. Two branches carry it: a `Grep`/`Glob` with
+  no `path` reaches the path-less branch, while a directory-scoped `Grep` and a
+  plain `Read` reach the file gate, because `extract_path` takes
+  `tool_input.path`. Both deny; the gotcha deny wins where it also fires.
+- The debt is scoped to the worktree, not to the actor that incurred it: the
+  scan stops at the worktree tag, so it covers the main thread's markers
+  (`session:owed:<wt>|…`) and its subagents' (`session:owed:<wt>:<agent>|…`)
+  alike. A parent's deny binds its subagents and a subagent's binds its
+  parent. Measured 2026-08-30, before this: a lockdown armed in either scope
+  allowed every read from the other, on both branches — spawning a subagent
+  cleared it outright.
+- Settling stays per actor. The marker lifts for an actor once the receipt for
+  its key exists at that actor's scope, because a receipt is proof the record
+  entered *that* context window and a subagent's `mem_get` puts nothing in its
+  parent's. So one marker can be settled for the child and still owed by the
+  parent. `mem_get` is the only route — it is not a shell command, so no
+  command is exempt from the deny, `mati` included.
+- Markers are created once per window, not refreshed, so a retrying agent
+  cannot hold its own lockdown open. They expire after `OWED_RECEIPT_TTL_SECS`
+  (900s, the shell gate's receipt TTL); a deny after that window re-arms,
+  because the arming sweep drops the lapsed marker before the create-once
+  check reads it. Markers are cleared wholesale along with the receipts on
+  PostCompact (`session_clear_consults` → `delete_all_receipts`, store-wide),
+  which is correct because compaction resets the whole session's memory. On
+  SessionEnd the clear is scoped instead: `session_harvest` →
+  `delete_scope_receipts` deletes only the ending worktree's tag (since
+  `4e99553`), store-wide only outside a git repo. SessionEnd previously used the
+  same wholesale wipe, which let a session ending in one worktree clear a
+  sibling's debt — see the measurement below.
+- Keeping markers across a receipt wipe is not a one-line change, and it was
+  considered. `outstanding_owed` never deletes a settled marker — it re-derives
+  settlement on every call from the live receipt, so a marker holds no record
+  of having been paid. Clear the receipts and every marker in the window reads
+  as owed again, settled ones included, and the next window starts locked
+  before it has run anything. Making the debt outlive compaction means
+  recording settlement as its own fact, not merely declining to delete markers.
+  Decided against for now: the lockdown is off by default, both halves of the
+  question are design preference rather than measurement, and the measured gap
+  is the turn-1 hole below, which no compaction rule touches.
+- The query is two pure daemon reads — `config_get` for the switch, then
+  `session_owed_receipt` when it is on. `MATI_LOCKDOWN` skips the first.
+  Every fault path allows (P9).
+
+Known holes: an agent that never triggers a deny is never locked down (the
+first command can still be a computed path); edits are not covered, so `Edit`
+and `Write` stay governed by 10.1 alone; a session whose working directory is
+another git worktree of the same repo carries a different tag and does not see
+the debt (measured, below); 15 minutes of not consulting lifts the lockdown
+without one; and the switch is a stored value, so `mati config set
+enforcement.lockdown off` disarms it — only before the first deny, since every
+command denies once a marker is unsettled. That is the same class of hole as
+`mati daemon stop`, which fail-open (P9) makes structural.
+
+**The worktree escape, measured 2026-08-31.** Previously inferred from the
+code; now exercised. Isolated fixture: one scratch repo with a remote (so a
+linked worktree hashes to the same slug and shares one store), one confirmed
+gotcha, release binary, short `MATI_HOME`.
+
+Hook layer, synthetic payloads, five per cell, debt armed in the main
+worktree. Denied there 5/5 on an ungoverned `Read` by a fresh agent id, 5/5
+from a plain subdirectory of it, 5/5 on a path-less Bash command; every one
+reported `Session locked`. From a linked worktree of the same repo the same
+probes allowed 5/5 — ungoverned `Read` and path-less Bash alike. Fisher
+one-sided p = 0.004 against the same-worktree cell. Control with the lockdown
+off: 5/5 allow in both worktrees, so an allow is not the harness failing to
+reach the gate. The keys carry it exactly:
+`session:owed:cded33e0|file:src/secret.rs` for the main checkout,
+`session:owed:64eefd1b:<agent>|…` for the worktree, and `owed_debt_scan_prefix`
+stops at the tag. Arm a debt inside the worktree and it denies there 5/5, so
+the lockdown is not broken in a worktree — only blind to the other one's debt.
+
+End to end with `claude -p`, re-arming before each run: main worktree denied
+4/4, linked worktree read the file 4/4, lockdown-off control read it 6/6
+(p = 0.014).
+
+The tag follows the worktree root, not the process directory. A subdirectory
+is denied 5/5, and an absolute path *into* another worktree from the locked
+one is denied 5/5. Only moving the session's own working directory escapes,
+and an agent already in debt cannot make that move — Bash is denied, so `git
+worktree add` denies 5/5. The escape therefore needs a worktree that exists
+before the first deny plus a host feature that pins a session or subagent to
+it (Claude Code's worktree-isolated subagents and its worktree-switch tool are
+both such features, and neither is a hook-gated tool).
+
+Two neighbouring facts fell out of the same fixture. The first is fixed.
+Reading the *governed* file by absolute path from another worktree of the same
+repo used to allow 5/5 with the lockdown off: `file:*` keys are relative to the
+discovered worktree root, so a sibling checkout of identical bytes was a
+different key and 10.1's own gate missed it. `cross_worktree_rel_key`
+(`cli::hook_decide::path`) now re-keys it: when the accessed path sits in a
+worktree that shares the cwd repo's `commondir` (canonicalized, so `/var` vs
+`/private/var` cannot split them), it strips that worktree's root and looks the
+repo-relative key up in the unchanged, shared-slug store. Test:
+`file_gate_denies_a_governed_read_from_a_sibling_worktree`. The residual miss is
+a symlink in the cwd worktree pointing into a sibling — it strips to a relative
+key and `canonical_rel_path` fails containment against the cwd root. Fixed
+(`4e99553`): a `claude -p` session confined to a linked worktree used to clear
+the main worktree's debt 3 of 3 on exit — `session_harvest` deleted every
+`session:owed:*` in the store. It now scopes the delete to the ending worktree's
+tag (`delete_scope_receipts`), so ending a session in one worktree leaves a
+sibling's debt intact; the clear stays store-wide only outside a git repo.
+
+### 10.1b Read floor (Tier 2)
+
+Opt-in, per file. `mati seal add <file>` arms it; `mati seal remove <file>` and
+`mati seal clear` disarm it. The file must already carry a confirmed gotcha —
+the floor is a read gate whose receipt has to prove a specific record was read,
+so the selector sits on the record that carries the reason. `mati seal add`
+tags it `consult-to-read`.
+
+Tier 1 asks a decidable question, but it still needs mati to deny once before
+it can ask. Measured 2026-08-29: told only to keep a file's literal name out of
+every command, agents reached its contents in 10 of 10 runs and were denied in
+none. Seven took the same route — `F=$(grep -rl "<a line from the file>" .);
+cat "$F"` — which names a pattern, not a file. Nothing that reads a command
+string can gate that.
+
+So the floor removes the bytes instead of classifying the command. A sealed
+file sits at mode `000` and the kernel refuses every reader: the shell, any
+interpreter it spawns, the agent's native `Read` (a hard `EACCES`), and its
+native `Grep`, which is not a subprocess and so never meets the `mati sandbox`
+floor. `Grep` skips a sealed file silently — absent from `files_with_matches`
+and from the count, not redacted — so there is no match oracle either. Only
+the filename survives, which `ls` already discloses.
+
+Measured 2026-08-30 against the same prompt, fixture, binary and model, ten
+runs sealed and ten unsealed, interleaved: 0 of 10 sealed runs finished without
+consulting against 6 of 10 unsealed (p=0.011); the trap bug landed in 0 of 10
+against 4 of 10; 9 of 10 sealed runs were denied at least once against 3 of 10.
+The route that beat Tier 1 in 7 of 10 unsealed runs appeared in 1 of 10 sealed
+ones. The floor does not stop the *read* — two sealed runs took the bytes out
+of git history and one replaced the file — it stops the read becoming an
+unconsulted completion.
+
+- **Manifest before chmod.** The `chmod` destroys the original mode, so
+  `~/.mati/<slug>/sealed.json` records it first, written temp-file → fsync →
+  rename. `mati seal clear` restores from that manifest without opening the
+  store, so a wedged daemon cannot strand a locked tree. If mati will not run
+  at all, `chmod -R u+rwX <worktree>` is the last rung.
+- **Lift on receipt.** `mem_get` mints the receipt and lifts the mode in the
+  same call, after the sessions write. The floor is worktree-scoped, not
+  per-actor — one inode cannot answer differently for a parent and its
+  subagent — so 10.1a stays the per-actor gate on top of it.
+- **Re-arm on lapse.** Three sites put the mode back: daemon start after the
+  receipt wipe, the `SessionClearConsults` handler before it, and `mati
+  watch-paths`. All key on the manifest row, never on the `consult-to-read`
+  tag. `mati seal clear` empties the manifest and cannot drop the tag, so a
+  tag-keyed re-arm would undo the break-glass at the next daemon start.
+- **Restore verbs deny.** While any manifest row is unsettled, pre-Bash denies
+  `chmod`; `cp`, `install`, `ln`, `mv`, `rm` and `rsync`; and git `checkout`,
+  `checkout-index`, `restore`, `clone`, `reset --hard` and `worktree add`,
+  through `sudo`, `sh -c` and `git -C` alike. The question is the verb, never
+  the path: `chmod -R u+rwX .` names no sealed file and restores every one.
+  Each deny arms the lockdown. The copy-like half was measured 2026-08-31
+  against a file at mode `000`: `cp -f`, `install`, `mv`, `ln -f`, `ln -sf`,
+  `rsync` and `rm` each replaced or destroyed it, because each unlinks or
+  renames over the path instead of opening it. `dd`, `tee`, `sed -i`, a `>`
+  redirect and `open(p, "w")` all returned `EACCES` and are deliberately not
+  denied. Plain `cp` is denied anyway: it restores only with `-f`, and `-f`
+  hides in `-rf`, `--force` and `$FLAGS`.
+- **Post-Bash sweep.** One `stat` per row on an async hook. A row whose mode is
+  down is classified by date — a receipt at or after `rearmed_at` explains the
+  lift, anything older cannot have caused it. A row still at `000` whose size,
+  mtime or ctime moved is hashed through the floor. ctime is in the stamp
+  because `utimensat` restores mtime to the nanosecond, which defeats a
+  size-and-mtime check outright. What no receipt explains is recorded and the
+  floor re-armed.
+- **No twelfth event type.** `DenyOrigin::SealFloor` and the two session events
+  record through the existing `Deny` and `BypassDetected` with reason codes
+  `seal_floor_restore` and `seal_bypass`, so the hash-chain contract in 12 is
+  unchanged. `mati doctor`'s `enforcement/seal` row and the `Sealed files` line
+  in `mati stats` report the manifest; both only `stat`, so neither reporting
+  surface can lift a mode.
+
+**Scope is the working tree, not the repository.** Git must read its own
+objects to function, so `git log -p`, `git show <ref>` and `git cat-file -p
+<blob>` reach a sealed file's committed bytes, and the object files stay
+readable to any interpreter. Confidentiality was never the claim: a secret in
+git history is a secret-scanner problem. Making the object store unreadable is
+not an option — with `.git/objects` at mode `000` every git command fails
+`fatal: not a git repository`, because git cannot tell an unreadable object
+directory from a missing one.
+
+Known holes:
+
+- **`unlink` then create, from an interpreter.** Mode bits guard the inode,
+  not the path. `os.remove(p)` needs write permission on the *directory*, and
+  the replacement is created at the umask. Found unprompted by an agent on
+  2026-08-30. The named-command forms of this — `cp -f`, `install`, `mv`,
+  `ln`, `rm`, `rsync` — are denied by the restore-verb gate above. What is
+  left is the interpreter route, which the pre-Bash gate cannot close:
+  `os.remove` inside a python heredoc is not a verb, and extending the deny to
+  interpreter words was measured and rejected. There the sweep catches it
+  after the fact — the row stats as a lowered floor, no receipt explains it,
+  it is recorded and re-armed — so the seal alone detects where it cannot
+  prevent. `mati sandbox protect` does close it, at the OS layer — see the
+  composition note below.
+- **History.** See the scope paragraph above. In a repo where the sealed file
+  is committed, its bytes are one `git cat-file` away.
+- **macOS only.** Every filesystem and native-tool probe above is macOS, uid
+  501, non-root, Claude Code. Linux and WSL2 are untested, and Codex fires no
+  hook for its native read tool at all.
+
+**With the host sandbox on, the shell route is prevented, not just recorded.**
+Claude Code compiles each `sandbox.filesystem.denyWrite` entry to `(deny
+file-write* (subpath <path>))` — the wildcard, not `file-write-data` alone —
+plus a second `(deny file-write-unlink file-write-create)` over the path and
+every ancestor directory. `file-write*` covers `file-write-mode`,
+`file-write-unlink` and `file-write-flags`, so a path `mati sandbox protect`
+has compiled cannot be chmod'd, unlinked, replaced or `chflags`-ed from the
+agent's shell or anything it spawns. Verified 2026-08-31 end to end against a
+concurrent control: with the entry present `chmod 644` returns `Operation not
+permitted` and the mode stays `000`, and `os.remove` raises `PermissionError`
+with the bytes intact; with the sandbox on and the entry absent both succeed.
+The daemon runs outside the sandbox, so `mem_get` still lifts the mode. It
+needs `sandbox.enabled`, which mati never writes, so the composition is the
+developer's opt-in and not a default.
+
+Cost, measured 2026-08-30 on this repo with `src/store/record.rs` sealed:
+
+| Surface | Sealed |
+|---|---|
+| `cargo check` — nothing to rebuild | passes. The fingerprint reads mtime, which the `chmod` does not move |
+| `cargo check` — anything to rebuild | `error: couldn't read <file>: Permission denied`, exit 101 |
+| rust-analyzer | exit 0, no diagnostic, and the module silently absent from the analysis. Verified against an unsealed control: symbols defined in the file appear four times each unsealed and zero times sealed |
+| `git status` | reports the file as modified. Git cannot hash it, so it cannot call it unchanged |
+| `git diff` / `git add -A` | `fatal: cannot hash`, `unable to index file`. Other paths still stage; the sealed one cannot be committed until it is unsealed |
+| `mati status`, `stale`, `repair --check`, `doctor` | unchanged, same output and same exit code as unsealed |
+
+The mode is what reaches the developer's own tools; the `mati sandbox` floor
+constrains only the agent's sandboxed shell. Where a static shell deny is
+enough, prefer the floor. Seal a file only when the bytes must be unavailable
+to everything, and expect the build to stop until it is consulted or cleared.
+
 ### 10.2 Command Classification (pre-bash)
 
 The pre-bash hook classifies shell commands before they run.
@@ -583,7 +839,7 @@ Because the envelope gives mati the exact target path, edit gating is not affect
 
 It fails open on every uncertainty: unparseable patch, unreachable daemon, per-file lookup error, more than `MAX_APPLY_PATCH_FILES = 50` touched files, or an older binary that does not recognize the variant. Blocking all edits by mistake would be worse than missing one gotcha. The wrapper script in `codex_pre_apply_patch.rs` enforces that bias by treating only `exit 2` with a `mati:` message as a real deny.
 
-Coverage depends on platform support. `apply_patch` gating rests on a documented Codex contract, not on an implementation quirk: Codex's `PreToolUse` "can intercept Bash, file edits performed through `apply_patch`, MCP tool calls, and other local function tools," and reports `tool_name: "apply_patch"` for patch operations (matchers also accept `Edit` and `Write` as aliases). Codex now carries near-full hook parity with Claude Code — `SessionStart`, `SessionEnd`, `SubagentStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`, `UserPromptSubmit`, `SubagentStop`, `Stop` — and supports `updatedInput` for rewriting a Bash or `apply_patch` call without blocking it. mati does not use `updatedInput`: silently rewriting a call the agent believes it issued is a correctness hazard, and the gates here are meant to deny or defer, never to substitute. Codex reads are gated only through the shell path, but the reason is sharper than "no hook on its read tool" and was measured on codex-cli 0.147.0 (2026-08-12). Codex appears to have no built-in text-file read tool at all — asked for one in a live session it answered "no built-in text-file reading tool is available," and a single session that both read a file and ran a shell command produced `PreToolUse` payloads for only `list_mcp_resources` and `Bash`. Yet in an earlier run the file's contents reached the model with ZERO `PreToolUse` payloads, against a fixture proven live by a Bash control. So some path — most likely automatic context gathering rather than a tool call — delivers file content outside the tool surface entirely. This is not C9: no amount of shell-command parsing closes it, because no shell command is involved. Only the host can close it. Claude Code edits are covered primarily by the read gate, transitively: Claude Code's own read-before-edit rule forces a prior read, which the read gate gates — and a *naive* blind edit is stopped by Claude Code's "File must be read first" guard *before any PreToolUse hook runs* (confirmed by live test 2026-06-18: a blind Edit yielded Claude Code's built-in guard, not a mati deny; enforcement came from the read gate). The `claude-pre-edit` hook (the `ClaudePreEdit` adapter, PreToolUse on `Edit`/`Write`/`NotebookEdit`) is therefore a BACKSTOP, not the primary blocker: keyed on `consulted_recent` (TTL, like the Codex `apply_patch` edit gate), it denies via `permissionDecision: deny` only an edit whose consultation has gone stale, or one that satisfied read-before-edit via a shell read the best-effort pre-bash path missed (e.g. `cat "$VAR"`; `egrep`/`fgrep` are now detected). Non-deny outcomes defer to the normal permission flow (edits are permission-required, unlike reads, so emitting `allow` would suppress the user's edit prompt). The `consulted_recent` keying is load-bearing: with the read gate's persistent `consulted`, the edit gate would never fire, since the forced read always consults first.
+Coverage depends on platform support. `apply_patch` gating rests on a documented Codex contract, not on an implementation quirk: Codex's `PreToolUse` "can intercept Bash, file edits performed through `apply_patch`, MCP tool calls, and other local function tools," and reports `tool_name: "apply_patch"` for patch operations (matchers also accept `Edit` and `Write` as aliases). Codex documents 11 hook events — `SessionStart`, `SessionEnd`, `SubagentStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`, `UserPromptSubmit`, `SubagentStop`, `Stop` — and supports `updatedInput` for rewriting a Bash or `apply_patch` call without blocking it. The event surface is near-complete; the `PreToolUse` tool surface is not, so this is not hook parity with Claude Code. `PreToolUse` fires for four tools only — `shell`, `unified_exec`, `apply_patch`, `mcp`. `list_dir`, `view_image`, `mcp_resource`, `plan`, `goal`, `agent_jobs`, `tool_search`, `tool_suggest` and `web_search` emit nothing (`openai/codex#20204`, open since 2026-04-29, updated 2026-08-29, labelled bug+hooks). The "other local function tools" clause quoted above is from the docs table, which contradicts that tracker; cite the issue, not the table. This tightens the read gap below rather than widening it: `list_dir` and `view_image` are two more non-shell tools that fire no hook. mati does not use `updatedInput`: silently rewriting a call the agent believes it issued is a correctness hazard, and the gates here are meant to deny or defer, never to substitute. Codex reads are gated only through the shell path, but the reason is sharper than "no hook on its read tool" and was measured on codex-cli 0.147.0 (2026-08-12). Codex appears to have no built-in text-file read tool at all — asked for one in a live session it answered "no built-in text-file reading tool is available," and a single session that both read a file and ran a shell command produced `PreToolUse` payloads for only `list_mcp_resources` and `Bash`. Yet in an earlier run the file's contents reached the model with ZERO `PreToolUse` payloads, against a fixture proven live by a Bash control. So some path — most likely automatic context gathering rather than a tool call — delivers file content outside the tool surface entirely. This is not C9: no amount of shell-command parsing closes it, because no shell command is involved. Only the host can close it. Claude Code edits are covered primarily by the read gate, transitively: Claude Code's own read-before-edit rule forces a prior read, which the read gate gates — and a *naive* blind edit is stopped by Claude Code's "File must be read first" guard *before any PreToolUse hook runs* (confirmed by live test 2026-06-18: a blind Edit yielded Claude Code's built-in guard, not a mati deny; enforcement came from the read gate). The `claude-pre-edit` hook (the `ClaudePreEdit` adapter, PreToolUse on `Edit`/`Write`/`NotebookEdit`) is therefore a BACKSTOP, not the primary blocker: keyed on `consulted_recent` (TTL, like the Codex `apply_patch` edit gate), it denies via `permissionDecision: deny` only an edit whose consultation has gone stale, or one that satisfied read-before-edit via a shell read the best-effort pre-bash path missed (e.g. `cat "$VAR"`; `egrep`/`fgrep` are now detected). Non-deny outcomes defer to the normal permission flow (edits are permission-required, unlike reads, so emitting `allow` would suppress the user's edit prompt). The `consulted_recent` keying is load-bearing: with the read gate's persistent `consulted`, the edit gate would never fire, since the forced read always consults first.
 
 ### 10.4 ConfigChange enforcement self-integrity (F1)
 
@@ -1479,11 +1735,17 @@ Peer credentials are checked through `SO_PEERCRED` on Linux and `LOCAL_PEERCRED`
 
 **C9: bash `cat` bypass, around 2-5% miss rate.**
 
-`pre-bash.sh` catches `cat <file>`, but not every variant. Variable expansion (`cat "$FILE"`), process substitution, piped input, and unusual quoting are not caught. This is known and accepted. The compliance monitor tracks and reports it. Do not chase 100% coverage here; the false positives are not worth the marginal gain.
+`pre-bash.sh` catches `cat <file>`, but not every variant. Variable expansion (`cat "$FILE"`), process substitution, piped input, and unusual quoting are not caught. This is known and accepted. `mati stats` now reports an `Unobserved (no path)` row, backed by `analytics:pathless_allow_*` — hook accesses that reached no file gate. That count is an upper bound on this bypass, not a measurement of it: it also includes harmless pathless commands (`ls`, `git status`). It is recorded only with the daemon up, so it under-counts in exactly the case where the hooks are already failing open. Do not chase 100% coverage here; the false positives are not worth the marginal gain.
 
 **In-repo symlink access resolves to the real target for enforcement (WI-20).**
 
 A gotcha is keyed by the lexical repo-relative path, so an agent could route around the gate by reading or editing a gotcha'd file through a symlink whose key differs. The read/edit decision path — including Codex `apply_patch` patch targets — adds an escalate-only canonical-key fallback: when the lexical gate does not deny, it resolves the accessed path through symlinks (shared with the L3 sandbox's `canonicalize_lenient`), strips the canonicalized repo root, and evaluates the real target's key too — adopting that result only when it denies. It is fully fail-open (no repo root, a `canonicalize` failure, an out-of-repo target, or an identical key all leave the lexical decision intact) and costs one extra `realpath` plus one daemon round-trip, only on the non-deny path. This closes the in-repo symlink bypass at the hook level (L1). It does not change the lexical store key. Hardlink aliases (which `canonicalize` does not resolve) and out-of-tree targets remain out of scope for the hook tier; the L3 OS floor (`mati sandbox`) is what denies crown-jewel files across the shell and its subprocesses.
+
+**Tier 1 lockdown: sibling-worktree escape. Accepted; not fixed.**
+
+Session lockdown (section 10.1a) keys its debt to a per-worktree tag, `sha256(worktree_root)[..4]`. Every linked git worktree of a shared-slug clone carries a different tag, so a session whose working directory is a sibling worktree does not see the debt armed in another, and its commands are not denied. Measured 2026-08-31: 5/5 escapes at the hook layer (Fisher one-sided p = 0.004) and 4/4 end to end via `claude -p` (p = 0.014); full account in section 10.1a. The escape needs a worktree that exists before the first deny plus a host feature that pins a session to it — an in-debt agent cannot create one, because Bash is denied and `git worktree add` denies 5/5.
+
+Accepted, not fixed, by decision 2026-09-01. The worktree tag is the only identity signal and cannot separate an evasion vehicle from genuine parallel work across two checkouts, so any fix that makes one worktree's debt visible in another false-denies an honest developer running two worktrees at once — a wider blast radius than the escape it closes. The feature is off by default, and this mechanism is enforcement parity, not the product's differentiator, so the response is to measure and publish the bypass rate, not to patch it. The zero-tension half shipped separately: SessionEnd receipt cleanup is now scoped to the ending worktree (`4e99553`), so ending a session in one worktree no longer clears a sibling's debt. Reopen only on a real report that a host worktree-switch feature is used as a live evasion; gate that on a transcript count of concurrent independent-worktree sessions (the unmeasured quantity) before building the session-id-continuity fix.
 
 **petgraph is in-memory only.**
 

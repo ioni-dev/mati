@@ -25,6 +25,25 @@ pub(super) async fn dispatch_mem_query(
     }
 }
 
+/// Pure-read native dispatch for `Command::SessionOwedReceipt` — the Tier 1
+/// session lockdown's one query. Returns `{"owed": "file:x" | null}`.
+pub(super) async fn dispatch_owed_receipt(
+    graph: &Arc<tokio::sync::RwLock<Graph>>,
+    req: &Request,
+) -> Response {
+    let request_id = req.id;
+    let Command::SessionOwedReceipt(input) = &req.cmd else {
+        unreachable!("dispatch_owed_receipt only accepts SessionOwedReceipt")
+    };
+    let g = graph.read().await;
+    match sess::outstanding_owed(g.store(), input.worktree.as_deref(), input.actor.as_deref()).await
+    {
+        Ok(owed) => Response::ok(request_id, serde_json::json!({ "owed": owed })),
+        // Fail open: an unreadable marker set must not lock the session down.
+        Err(error) => Response::err(request_id, ErrorCode::StoreError, error.to_string()),
+    }
+}
+
 pub(super) async fn dispatch_side_effecting_read(
     graph: &Arc<tokio::sync::RwLock<Graph>>,
     ctx: &RequestContext,
@@ -154,13 +173,17 @@ pub(super) fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
             "history_since".into(),
             json!({ "key": i.key, "since_ts": i.since_ts, "limit": i.limit }),
         ),
-        Command::SessionCheckConsulted(i) => {
-            ("session_check_consulted".into(), json!({ "key": i.key }))
-        }
+        Command::SessionCheckConsulted(i) => (
+            "session_check_consulted".into(),
+            json!({ "key": i.key, "actor": i.actor }),
+        ),
         Command::SessionCheckConsultedRecent(i) => (
             "session_check_consulted_recent".into(),
-            json!({ "key": i.key, "ttl_secs": i.ttl_secs }),
+            json!({ "key": i.key, "ttl_secs": i.ttl_secs, "actor": i.actor }),
         ),
+        Command::SessionOwedReceipt(_) => {
+            unreachable!("SessionOwedReceipt is handled natively, not via v1 bridge")
+        }
         // MemQuery is now handled natively via `dispatch_mem_query`
         // (γ-C1.5). It must not reach this bridge.
         Command::MemQuery(_) => {
@@ -205,7 +228,7 @@ pub(super) fn command_to_v1(cmd: &Command) -> (String, serde_json::Value) {
         | Command::ConsultationHit(_)
         | Command::PolicyShadowObserve(_)
         | Command::SessionFlush
-        | Command::SessionHarvest
+        | Command::SessionHarvest(_)
         | Command::SessionClearConsults
         | Command::SubagentHarvest(_)
         | Command::SubagentSpawned(_)

@@ -76,6 +76,11 @@ struct HealthSnapshot {
     /// cached snapshots predate this field.
     #[serde(default)]
     denials_7d: u64,
+    /// Accesses allowed without any file gate seeing them — a Bash command
+    /// naming no path, or a `Grep`/`Glob` with none. The unobserved surface,
+    /// not a failure. Older cached snapshots predate this field.
+    #[serde(default)]
+    pathless_allows_7d: u64,
 
     computed_at: u64,
 
@@ -156,6 +161,47 @@ fn format_duration_ms(ms: u64) -> String {
 /// Enforcement events are never in the write-seq-keyed snapshot cache, so the
 /// caller re-runs the bounded scan on a cache hit rather than freezing a count.
 /// Prints nothing when the window is empty.
+/// Current state of the Tier 2 read floor: how many files `mati seal` holds
+/// at mode `000` right now.
+///
+/// Live on every render, never cached — the floor lifts and re-arms within a
+/// session, so a snapshot value would be stale the moment it was written.
+/// Silent when nothing is sealed, which is the ordinary repo.
+fn print_sealed_line(
+    inv: &mati_core::seal::Inventory,
+    white: &str,
+    yellow: &str,
+    gray: &str,
+    reset: &str,
+) {
+    if inv.total() == 0 {
+        return;
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if inv.lifted > 0 {
+        notes.push(format!("{} lifted", inv.lifted));
+    }
+    if inv.missing > 0 {
+        notes.push(format!("{} missing", inv.missing));
+    }
+    let color = if inv.missing > 0 { yellow } else { white };
+    let suffix = if notes.is_empty() {
+        String::new()
+    } else {
+        format!("  {gray}({}){reset}", notes.join(" \u{b7} "))
+    };
+    println!(
+        "    Sealed files           {color}{}{reset}{suffix}",
+        inv.total()
+    );
+}
+
+fn seal_inventory(store: &StoreProxy) -> mati_core::seal::Inventory {
+    mati_core::seal::manifest_path(store.repo_root())
+        .map(|p| mati_core::seal::inventory(&p))
+        .unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn print_enforcement_section(
     counts: &mati_core::store::enforcement::EnforcementEventCounts,
@@ -319,10 +365,19 @@ async fn run_json(store: &StoreProxy, cwd: &std::path::Path) -> Result<()> {
         None => serde_json::json!({ "available": false }),
     };
 
+    let inv = seal_inventory(store);
     let out = serde_json::json!({
         "project": project,
         "computed_at": now,
         "window_days": 30,
+        // Current state, not a windowed count: the floor lifts and re-arms
+        // inside a session.
+        "sealed": {
+            "total": inv.total(),
+            "at_floor": inv.at_floor,
+            "lifted": inv.lifted,
+            "missing": inv.missing,
+        },
         "gotchas": {
             "active": health.active,
             "confirmed": health.confirmed,
@@ -612,7 +667,8 @@ pub async fn run(args: StatsArgs) -> Result<()> {
 
     println!("  {bold}{blue}Compliance (7d){reset}");
 
-    let (hits_7d, misses_7d, denials_7d, bypasses_7d) = scan_compliance_7d(&store, now).await;
+    let (hits_7d, misses_7d, denials_7d, bypasses_7d, pathless_allows_7d) =
+        scan_compliance_7d(&store, now).await;
 
     let total_lookups = hits_7d + misses_7d;
     let hit_rate = if total_lookups > 0 {
@@ -634,12 +690,20 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         println!("    Denials (blocked)      {red}{denials_7d}{reset}");
     }
 
+    if pathless_allows_7d > 0 {
+        println!(
+            "    Unobserved (no path)   {yellow}{pathless_allows_7d}{reset}  (no file gate saw these)"
+        );
+    }
+
     let bp_color = if bypasses_7d == 0 { green } else { yellow };
     if bypasses_7d > 0 || total_lookups > 0 {
         println!("    Bypasses               {bp_color}{bypasses_7d}{reset}");
     } else {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
+
+    print_sealed_line(&seal_inventory(&store), white, yellow, gray, reset);
 
     // Fail-open events from fail_open.log
     print_fail_open(&scan_fail_open_log(now), red, gray, reset);
@@ -694,6 +758,7 @@ pub async fn run(args: StatsArgs) -> Result<()> {
         },
         bypasses_7d,
         denials_7d,
+        pathless_allows_7d,
 
         computed_at: now,
         write_seq: current_seq,
@@ -880,6 +945,7 @@ pub async fn seed_snapshot(
         hit_rate_7d: 0.0,
         bypasses_7d: 0,
         denials_7d: 0,
+        pathless_allows_7d: 0,
         computed_at: now,
         write_seq,
     };
@@ -1084,9 +1150,20 @@ async fn display_cached_stats(
 
     println!("  {bold}{blue}Compliance (7d){reset}");
 
-    let total_lookups = s.hits_7d + s.misses_7d;
+    // Re-scanned on a cache hit rather than read from the snapshot, for the
+    // same reason the Enforcement section is: these count hook activity, which
+    // moves without a knowledge write. The snapshot is keyed on the KNOWLEDGE
+    // write-seq, so a hook-only day never invalidates it, and `mati init`
+    // seeds every one of these at zero — a fresh repo reported no hook
+    // activity until something unrelated wrote knowledge. The snapshot still
+    // carries the fields; they are the values as of its computation, not what
+    // is rendered.
+    let (hits_7d, misses_7d, denials_7d, bypasses_7d, pathless_allows_7d) =
+        scan_compliance_7d(store, now).await;
+
+    let total_lookups = hits_7d + misses_7d;
     let hit_rate = if total_lookups > 0 {
-        s.hits_7d as f32 / total_lookups as f32 * 100.0
+        hits_7d as f32 / total_lookups as f32 * 100.0
     } else {
         0.0
     };
@@ -1094,26 +1171,30 @@ async fn display_cached_stats(
     if total_lookups > 0 {
         let hr_color = if hit_rate >= 80.0 { green } else { yellow };
         println!(
-            "    Hit rate               {hr_color}{hit_rate:.0}%{reset}  ({white}{}{reset} hits / {white}{total_lookups}{reset} lookups)",
-            s.hits_7d
+            "    Hit rate               {hr_color}{hit_rate:.0}%{reset}  ({white}{hits_7d}{reset} hits / {white}{total_lookups}{reset} lookups)"
         );
     } else {
         println!("    Hit rate               {gray}\u{2014}{reset}  (no hook data yet)");
     }
 
-    if s.denials_7d > 0 {
-        println!("    Denials (blocked)      {red}{}{reset}", s.denials_7d);
+    if denials_7d > 0 {
+        println!("    Denials (blocked)      {red}{denials_7d}{reset}");
     }
 
-    let bp_color = if s.bypasses_7d == 0 { green } else { yellow };
-    if s.bypasses_7d > 0 || total_lookups > 0 {
+    if pathless_allows_7d > 0 {
         println!(
-            "    Bypasses               {bp_color}{}{reset}",
-            s.bypasses_7d
+            "    Unobserved (no path)   {yellow}{pathless_allows_7d}{reset}  (no file gate saw these)"
         );
+    }
+
+    let bp_color = if bypasses_7d == 0 { green } else { yellow };
+    if bypasses_7d > 0 || total_lookups > 0 {
+        println!("    Bypasses               {bp_color}{bypasses_7d}{reset}");
     } else {
         println!("    Bypasses               {gray}\u{2014}{reset}");
     }
+
+    print_sealed_line(&seal_inventory(store), white, yellow, gray, reset);
 
     // Fail-open events from fail_open.log (always live, not cached)
     print_fail_open(&scan_fail_open_log(now), red, gray, reset);
@@ -1145,21 +1226,28 @@ async fn display_cached_stats(
 /// `dispatch_v2.rs`). The gate worked — nothing was bypassed — so it rolls
 /// into `denials_7d`, not `bypasses_7d`.
 ///
-/// `bypasses_7d` sums the four aggregates that mirror
+/// `analytics:pathless_allow_*` counts accesses that reached no file gate at
+/// all. It joins none of the four totals: nothing was consulted, denied or
+/// bypassed, so folding it in would move a rate whose denominator is accesses
+/// a gate actually saw. It is reported on its own row.
+///
+/// `bypasses_7d` sums the five aggregates that mirror
 /// `EnforcementEventType::BypassDetected` in the hash-chained log:
 /// `compliance:codex_shell_miss_*`, `compliance:wrapped_db_client_miss_*`,
-/// `compliance:tombstone_bypass_*`, and
-/// `compliance:unclassified_policy_literal_bypass_*`. `compliance:codex_shell_miss_*` is
+/// `compliance:tombstone_bypass_*`,
+/// `compliance:unclassified_policy_literal_bypass_*`, and
+/// `compliance:seal_bypass_*`. `compliance:codex_shell_miss_*` is
 /// fired by `codex-post-bash` after a file was used without a valid receipt;
 /// it also rolls into `misses_7d` (so the hook activity registers in the
 /// lookups denominator and `Hit rate` reflects real consultation behavior).
-/// The other three bypass aggregates are not consultation lookups, so they are
+/// The other four bypass aggregates are not consultation lookups, so they are
 /// not added to `misses_7d`.
-async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64) {
+async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64, u64) {
     let mut hits: u64 = 0;
     let mut misses: u64 = 0;
     let mut denials: u64 = 0;
     let mut bypasses: u64 = 0;
+    let mut pathless_allows: u64 = 0;
 
     // Generate date keys for the last 7 days
     for day_offset in 0..7 {
@@ -1175,6 +1263,8 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         let tombstone_bypass_key = format!("compliance:tombstone_bypass_{date}");
         let unclassified_literal_bypass_key =
             format!("compliance:unclassified_policy_literal_bypass_{date}");
+        let seal_bypass_key = format!("compliance:seal_bypass_{date}");
+        let pathless_allow_key = format!("analytics:pathless_allow_{date}");
 
         if let Ok(Some(record)) = store.get(&hit_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
@@ -1191,6 +1281,15 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
         if let Ok(Some(record)) = store.get(&deny_key).await {
             if let Some(agg) = record.payload_as::<DailyAgg>() {
                 denials += agg.count;
+            }
+        }
+
+        // Deliberately joins none of the four totals above: nothing was
+        // consulted, denied or bypassed, so folding it into any of them would
+        // move a rate whose denominator is accesses a gate actually saw.
+        if let Ok(Some(record)) = store.get(&pathless_allow_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                pathless_allows += agg.count;
             }
         }
 
@@ -1228,9 +1327,17 @@ async fn scan_compliance_7d(store: &StoreProxy, now: u64) -> (u64, u64, u64, u64
                 bypasses += agg.count;
             }
         }
+
+        // Tier 2: the post-Bash sweep found a sealed file's floor down or its
+        // bytes moved with no receipt to explain it.
+        if let Ok(Some(record)) = store.get(&seal_bypass_key).await {
+            if let Some(agg) = record.payload_as::<DailyAgg>() {
+                bypasses += agg.count;
+            }
+        }
     }
 
-    (hits, misses, denials, bypasses)
+    (hits, misses, denials, bypasses, pathless_allows)
 }
 
 /// Format a Unix timestamp as `YYYY-MM-DD` for snapshot keys.
@@ -1501,6 +1608,7 @@ mod tests {
             hit_rate_7d: 0.84,
             bypasses_7d: 1,
             denials_7d: 5,
+            pathless_allows_7d: 3,
             computed_at: 1_710_520_800,
             write_seq: 42,
         }
@@ -1518,6 +1626,7 @@ mod tests {
         assert_eq!(parsed["hits_7d"], 42);
         assert_eq!(parsed["bypasses_7d"], 1);
         assert_eq!(parsed["denials_7d"], 5);
+        assert_eq!(parsed["pathless_allows_7d"], 3);
         assert_eq!(parsed["critical_uncovered"], 4);
         assert_eq!(parsed["orphaned_decisions"], 1);
         assert_eq!(parsed["low_confidence"], 3);
@@ -1548,6 +1657,7 @@ mod tests {
         assert_eq!(deserialized.misses_7d, snapshot.misses_7d);
         assert_eq!(deserialized.bypasses_7d, snapshot.bypasses_7d);
         assert_eq!(deserialized.denials_7d, snapshot.denials_7d);
+        assert_eq!(deserialized.pathless_allows_7d, snapshot.pathless_allows_7d);
         assert_eq!(deserialized.computed_at, snapshot.computed_at);
         assert!((deserialized.avg_confidence - snapshot.avg_confidence).abs() < 0.001);
         assert!((deserialized.estimated_minutes - snapshot.estimated_minutes).abs() < 0.01);
@@ -1583,6 +1693,9 @@ mod tests {
         assert_eq!(snapshot.orphaned_decisions, 0);
         assert_eq!(snapshot.low_confidence, 0);
         assert_eq!(snapshot.denials_7d, 0);
+        // Caches written before this field existed must still load. Without
+        // `#[serde(default)]` an upgrade would fail every cached snapshot.
+        assert_eq!(snapshot.pathless_allows_7d, 0);
         // Existing fields parse correctly
         assert_eq!(snapshot.files_with_purpose, 5);
         assert_eq!(snapshot.total_files, 10);
@@ -1760,11 +1873,10 @@ mod tests {
     }
 
     /// The other writer of `fail_open.log` is a bash hook, not Rust. When jq
-    /// is missing, `post-read-compliance.sh` skips the whole compliance check
-    /// and its only trace is the line it appends here — so that line must land
-    /// under `$MATI_HOME` (what this reader resolves) and parse. If it does
-    /// not, a machine with no jq reports 0 fail-open events while enforcing
-    /// nothing.
+    /// is missing, `post-edit.sh` skips edit tracking and doc capture, and its
+    /// only trace is the line it appends here — so that line must land under
+    /// `$MATI_HOME` (what this reader resolves) and parse. If it does not, a
+    /// machine with no jq reports 0 fail-open events while enforcing nothing.
     #[test]
     fn shell_hook_fail_open_round_trips_into_the_scanner() {
         use std::io::Write as _;
@@ -1789,8 +1901,8 @@ mod tests {
             }
         }
 
-        let script = dir.path().join("post-read-compliance.sh");
-        std::fs::write(&script, mati_core::hooks::post_compliance::SCRIPT).unwrap();
+        let script = dir.path().join("post-edit.sh");
+        std::fs::write(&script, mati_core::hooks::post_edit::SCRIPT).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let now_before = SystemTime::now()

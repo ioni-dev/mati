@@ -127,3 +127,74 @@ fn cached_stats_renders_enforcement_and_subagent_spawns() {
         "cached render must include the subagent spawns line, got:\n{cached}"
     );
 }
+
+/// The path-less allow end to end: recorded through a live daemon, durable
+/// across `mati daemon stop`, and rendered as its own `mati stats` row.
+///
+/// Three seams no unit test reaches. Deleting the `record_pathless_allow` call
+/// in `run_pathless_lockdown`, or the read in `scan_compliance_7d`, leaves
+/// every unit test green and the feature silently dead.
+///
+/// The `stats` assertion is also the regression for the snapshot cache. `mati
+/// init` seeds compliance counters at zero and the cache is keyed on the
+/// KNOWLEDGE write-seq, which a sessions-tree aggregate never bumps — so
+/// before the fix this row (and the hit rate, denials and bypasses beside it)
+/// stayed at zero until an unrelated knowledge write.
+///
+/// It also settles an open question about `analytics:*` aggregates: they are
+/// Eventual durability, an OS buffer rather than an fsync, and a lost write
+/// would make the count unreportable. Measured: it survives.
+#[test]
+#[ignore]
+fn a_pathless_command_is_recorded_durable_and_rendered() {
+    let s = Scratch::new("pathless");
+    assert!(s.mati(&["init"], true).status.success(), "init failed");
+
+    // The hook records only through a reachable daemon; `ensure_daemon` inside
+    // the hook starts one, so no warm-up command is needed.
+    let hook = Command::new(bin())
+        .args(["hook-decide", "claude-pre-bash"])
+        .current_dir(&s.repo)
+        .env("MATI_HOME", &s.home)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id":"s1","tool_input":{"command":"echo hello"}}"#)?;
+            child.wait()
+        })
+        .expect("hook-decide claude-pre-bash");
+    assert!(hook.success(), "claude hooks always exit 0");
+
+    assert!(s.mati(&["daemon", "stop"], false).status.success());
+
+    let date = String::from_utf8_lossy(
+        &Command::new("date")
+            .args(["-u", "+%Y-%m-%d"])
+            .output()
+            .expect("date")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let key = format!("analytics:pathless_allow_{date}");
+    let shown = s.mati(&["show", &key], true);
+    assert!(
+        shown.status.success(),
+        "a path-less allow must persist as {key} after the daemon stops.\nstderr: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+
+    let stats = s.mati(&["stats"], true);
+    let text = String::from_utf8_lossy(&stats.stdout);
+    assert!(
+        text.contains("Unobserved (no path)"),
+        "stats must render the unobserved-surface row on a seeded cache.\n{text}"
+    );
+}

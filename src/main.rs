@@ -138,6 +138,8 @@ enum Commands {
     Hooks(cli::init::HooksArgs),
     /// Compile Claude denies or prepare Codex entries (Codex does not currently enforce them)
     Sandbox(cli::sandbox::SandboxArgs),
+    /// Seal a file at mode 000 — unreadable to every process until consulted
+    Seal(cli::seal::SealArgs),
     /// Manage the background daemon (reduces hook latency from ~150ms to <1ms)
     Daemon(cli::daemon::DaemonArgs),
     /// Generate user-level service unit (launchd/systemd) to keep the daemon alive
@@ -183,12 +185,27 @@ enum Commands {
     #[command(hide = true)]
     LogPromptNudge { key: String },
     #[command(hide = true)]
-    SessionCheckConsulted { key: String },
+    PostReadCompliance {
+        key: String,
+        /// Subagent id from the hook payload, when the caller is a subagent.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+    #[command(hide = true)]
+    SessionCheckConsulted {
+        key: String,
+        /// Subagent id from the hook payload, when the caller is a subagent.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
     #[command(hide = true)]
     SessionCheckConsultedRecent {
         key: String,
         #[arg(long, default_value_t = mati_core::store::session::CONSULTED_RECENT_TTL_SECS)]
         ttl_secs: u64,
+        /// Subagent id from the hook payload, when the caller is a subagent.
+        #[arg(long)]
+        agent_id: Option<String>,
     },
     #[command(hide = true)]
     SessionFlush,
@@ -367,6 +384,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::VerifyChain(args) => cli::verify_chain::run(args).await,
         Commands::Hooks(args) => cli::init::run_hooks(args),
         Commands::Sandbox(args) => cli::sandbox::run(args).await,
+        Commands::Seal(args) => cli::seal::run(args).await,
         Commands::Daemon(args) => match args.command {
             cli::daemon::DaemonCommand::Start => cli::daemon::run_daemon_start().await,
             cli::daemon::DaemonCommand::Stop(args) => cli::daemon::run_daemon_stop(args).await,
@@ -444,11 +462,19 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::LogCodexShellMiss { key } => cli::hooks::run_log_codex_shell_miss(&key).await,
         Commands::LogBootstrap { key } => cli::hooks::run_log_bootstrap(&key).await,
         Commands::LogPromptNudge { key } => cli::hooks::run_log_prompt_nudge(&key).await,
-        Commands::SessionCheckConsulted { key } => {
-            cli::hooks::run_session_check_consulted(&key).await
+        Commands::PostReadCompliance { key, agent_id } => {
+            cli::hooks::run_post_read_compliance(&key, agent_id.as_deref()).await
         }
-        Commands::SessionCheckConsultedRecent { key, ttl_secs } => {
-            cli::hooks::run_session_check_consulted_recent(&key, ttl_secs).await
+        Commands::SessionCheckConsulted { key, agent_id } => {
+            cli::hooks::run_session_check_consulted(&key, agent_id.as_deref()).await
+        }
+        Commands::SessionCheckConsultedRecent {
+            key,
+            ttl_secs,
+            agent_id,
+        } => {
+            cli::hooks::run_session_check_consulted_recent(&key, ttl_secs, agent_id.as_deref())
+                .await
         }
         Commands::SessionFlush => match cli::hooks::run_session_flush().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),

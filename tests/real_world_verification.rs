@@ -85,9 +85,25 @@ fn verification_repo(name: &str, url: &str) -> PathBuf {
         .join("tests/fixtures/real_world")
         .join(name);
     if fixture.is_dir() {
+        ensure_git_boundary(&fixture);
         return fixture;
     }
     clone_or_reuse(name, url)
+}
+
+/// Vendored fixtures ship without `.git`. Without a repo boundary `mati init`
+/// discovers the enclosing mati monorepo and scans it, rewriting the monorepo's
+/// `.mcp.json`. Give each fixture its own empty repo so init roots at the fixture.
+fn ensure_git_boundary(dir: &std::path::Path) {
+    if dir.join(".git").exists() {
+        return;
+    }
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .expect("git init failed — is git installed?");
+    assert!(status.success(), "git init failed for fixture {dir:?}");
 }
 
 /// Run `mati init` and return (init_stdout, slug).

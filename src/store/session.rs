@@ -489,7 +489,12 @@ pub async fn session_flush_staged(store: &Store) -> Result<Option<(String, Vec<u
 // ── log_hit ───────────────────────────────────────────────────────────────────
 
 /// Record a cache hit: write consulted marker, bump access_count, update daily agg.
-pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
+///
+/// `actor` scopes the receipt (worktree, or worktree+agent). It MUST match the
+/// scope the file gate checks — an unscoped receipt never satisfies a
+/// worktree-scoped gate. Callers derive it from their cwd via
+/// [`worktree_scope_tag`]; see `cli::proxy::StoreProxy::log_hit`.
+pub async fn log_hit(store: &Store, key: &str, actor: Option<&str>) -> Result<()> {
     let now = now_secs();
 
     // 1. Daily hit aggregation
@@ -499,7 +504,7 @@ pub async fn log_hit(store: &Store, key: &str) -> Result<()> {
     // 2. Mark as consulted for session tracking. No source: this is the direct
     // store path behind `StoreProxy::log_hit`, reached from CLI commands whose
     // consultation is neither a `mem_get` nor an introspection.
-    let staged = consultation_receipt_staged_for_store(store, key, None, true, None).await?;
+    let staged = consultation_receipt_staged_for_store(store, key, actor, true, None).await?;
     let receipt: Record = rmp_serde::from_slice(&staged.bytes)
         .context("failed to deserialize staged consultation receipt")?;
     store.put(&staged.key, &receipt).await?;
@@ -730,14 +735,157 @@ pub async fn session_flush(store: &Store) -> Result<()> {
     Ok(())
 }
 
+// ── Tier 1 session lockdown ───────────────────────────────────────────────────
+
+/// Prefix for the markers naming a file an actor was denied and has not
+/// consulted since.
+pub const OWED_PREFIX: &str = "session:owed:";
+
+/// How long an unconsulted deny keeps locking the session down. The same
+/// window as the shell gate's receipt TTL, so a debt lasts exactly as long as
+/// the receipt that would have settled it.
+pub const OWED_RECEIPT_TTL_SECS: u64 = CONSULTED_RECENT_TTL_SECS;
+
+/// `session:owed:<actor>|<key>`. `|` separates scope from key so that a scan
+/// stops at the scope boundary: an actor scope is a worktree tag optionally
+/// `:`-joined to an agent id, and without the terminator a scan for one scope
+/// would cross-match a key that merely starts the same way.
+fn owed_key(key: &str, actor: Option<&str>) -> String {
+    format!("{}{key}", owed_scan_prefix(actor))
+}
+
+fn owed_scan_prefix(actor: Option<&str>) -> String {
+    format!("{OWED_PREFIX}{}|", actor.unwrap_or("-"))
+}
+
+/// The prefix covering every debt in one worktree: the main thread's markers
+/// (`session:owed:<wt>|…`) and its subagents' (`session:owed:<wt>:<agent>|…`)
+/// alike. Stopping before the `|` is what widens the scan, and the worktree tag
+/// is a fixed-width hex digest, so a prefix match on it is tag equality — no
+/// other worktree can be caught by it.
+///
+/// Outside a git repo there is no tag, and a bare `session:owed:` prefix would
+/// scan every scope in the store, so that case falls back to the actor scope.
+fn owed_debt_scan_prefix(worktree: Option<&str>, actor: Option<&str>) -> String {
+    match worktree {
+        Some(worktree) => format!("{OWED_PREFIX}{worktree}"),
+        None => owed_scan_prefix(actor),
+    }
+}
+
+/// Record that `actor` was denied `key` and owes its consultation receipt.
+///
+/// Expired markers for the same actor are dropped in the same pass, which is
+/// what bounds the scan [`outstanding_owed`] runs on every Bash command.
+/// Already-settled ones are not: settlement is per actor, so a marker this
+/// actor has consulted may be the only thing still holding another actor's
+/// lockdown.
+pub async fn record_owed_receipt(store: &Store, key: &str, actor: Option<&str>) -> Result<()> {
+    let prefix = owed_scan_prefix(actor);
+    let now = now_secs();
+    for record in store.scan_prefix(&prefix).await? {
+        if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS {
+            store.delete(&record.key).await?;
+        }
+    }
+    let marker_key = owed_key(key, actor);
+    // Create-once per window, not per session: the debt runs from the first
+    // deny, so an agent that keeps retrying cannot refresh its way into an
+    // endless lockdown. The sweep above already dropped this key's marker if
+    // the window had passed, so a deny after it re-arms rather than finding a
+    // marker `outstanding_owed` will skip as stale and never lock down again.
+    if store.get(&marker_key).await?.is_some() {
+        return Ok(());
+    }
+    let record = session_record(&marker_key, String::new());
+    store.put(&marker_key, &record).await
+}
+
+/// The most recently denied key in `worktree` that `actor` has not consulted.
+///
+/// The two scopes differ on purpose. The debt is worktree-wide: it records that
+/// this worktree was denied, and spawning a fresh context window does not
+/// un-happen that, so a parent's deny binds its subagents and a subagent's
+/// binds its parent. Settlement stays per actor, because a receipt proves the
+/// record entered *that* context window and a subagent's `mem_get` puts nothing
+/// in its parent's.
+///
+/// Settlement is re-derived here on every call, never recorded: a marker holds
+/// no memory of having been paid, so clearing receipts re-owes every marker.
+///
+/// `None` when nothing is owed: no marker, all expired, or every one settled by
+/// a receipt this actor holds. This is the decidable question the lockdown asks
+/// instead of "does this command touch file X" — a computed filename is
+/// invisible to a classifier and irrelevant here.
+pub async fn outstanding_owed(
+    store: &Store,
+    worktree: Option<&str>,
+    actor: Option<&str>,
+) -> Result<Option<String>> {
+    let prefix = owed_debt_scan_prefix(worktree, actor);
+    let now = now_secs();
+    let mut markers = store.scan_prefix(&prefix).await?;
+    markers.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+    for record in markers {
+        if now.saturating_sub(record.updated_at) > OWED_RECEIPT_TTL_SECS {
+            continue;
+        }
+        // Split on the FIRST `|`, not the caller's prefix: the scan spans
+        // several actor scopes and each has its own prefix length. The scope
+        // is the leading field, so this is exact as long as no agent id
+        // contains a `|` — a record key may, since a path can.
+        let Some((_, owed)) = record.key.split_once('|') else {
+            continue;
+        };
+        if !check_consulted(store, owed, actor).await? {
+            return Ok(Some(owed.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// Delete all consult receipts (`session:consulted:*`) from the store.
 ///
-/// Shared by `session_clear_consults` (PostCompact) and the end-of-session
-/// `session_harvest` cleanup. Propagates store errors; the daemon-startup
-/// stale-marker sweep keeps its own fail-soft loop.
+/// Used by `session_clear_consults` (PostCompact), which resets the whole
+/// store's consultation state. `session_harvest` scopes its cleanup to the
+/// ending worktree instead (see [`delete_scope_receipts`]). Propagates store
+/// errors; the daemon-startup stale-marker sweep keeps its own fail-soft loop.
 async fn delete_all_receipts(store: &Store) -> Result<()> {
     let consulted_keys = store.scan_keys("session:consulted:").await?;
     for k in &consulted_keys {
+        store.delete(k).await?;
+    }
+    // Lockdown markers go with them: clearing receipts re-arms every gate, so
+    // markers left behind would lock the next window down before it touched
+    // anything.
+    for k in &store.scan_keys(OWED_PREFIX).await? {
+        store.delete(k).await?;
+    }
+    Ok(())
+}
+
+/// Delete only the ending worktree's consult receipts and lockdown markers.
+///
+/// Harvest runs on the daemon, which serves every sibling worktree of a
+/// shared-slug clone (a checkout with a remote). A store-wide wipe would clear
+/// a sibling worktree's outstanding debt and lift its lockdown for free, so
+/// both deletes are scoped to the ending worktree: `session:consulted:<wt>…`
+/// and `session:owed:<wt>…`, the same worktree tag `record_owed_receipt` and
+/// the receipt writer key on. Clearing receipts re-arms this worktree's gates,
+/// so its markers go with them; the sibling's stay untouched. Outside a git
+/// repo (`worktree` None) there is no sibling and the wipe stays store-wide.
+async fn delete_scope_receipts(store: &Store, worktree: Option<&str>) -> Result<()> {
+    let (consulted_prefix, owed_prefix) = match worktree {
+        Some(wt) => (
+            format!("session:consulted:{wt}"),
+            format!("{OWED_PREFIX}{wt}"),
+        ),
+        None => ("session:consulted:".to_string(), OWED_PREFIX.to_string()),
+    };
+    for k in &store.scan_keys(&consulted_prefix).await? {
+        store.delete(k).await?;
+    }
+    for k in &store.scan_keys(&owed_prefix).await? {
         store.delete(k).await?;
     }
     Ok(())
@@ -757,13 +905,21 @@ pub async fn session_clear_consults(store: &Store) -> Result<()> {
 /// Archive session, run staleness analysis, auto-promote gotchas.
 ///
 /// `repo_root` is the project root; the git root is discovered upward from it.
-/// Called from both daemon socket handlers — `mcp::server::socket_dispatch` and
-/// `mcp::dispatch_v2::session::dispatch_session_side` — on SessionEnd.
+/// `worktree` is the ending session's worktree tag, computed client-side from
+/// the SessionEnd hook's cwd — the daemon's own `repo_root` names whichever
+/// worktree started it, not the one ending, so the receipt cleanup cannot be
+/// scoped from `repo_root`. Called from both daemon socket handlers —
+/// `mcp::server::socket_dispatch` and `mcp::dispatch_v2::session::dispatch_session_side`
+/// — on SessionEnd.
 ///
 /// Every step is fail-open: staleness runs on the SessionEnd path, and a git
 /// fault must not cost the session its archive, its promotions, or its receipt
 /// cleanup.
-pub async fn session_harvest(store: &Store, repo_root: &Path) -> Result<()> {
+pub async fn session_harvest(
+    store: &Store,
+    repo_root: &Path,
+    worktree: Option<&str>,
+) -> Result<()> {
     let now = now_secs();
 
     // M-12-D: promote gotcha candidates before archiving
@@ -817,8 +973,8 @@ pub async fn session_harvest(store: &Store, repo_root: &Path) -> Result<()> {
     perm.payload = session_rec.payload;
     store.put(&session_key, &perm).await?;
 
-    // Clean up session:consulted:* markers
-    delete_all_receipts(store).await?;
+    // Clean up this worktree's consulted markers and lockdown debt only.
+    delete_scope_receipts(store, worktree).await?;
 
     // Update stage:current with last session timestamp
     if let Some(mut stage) = store.get("stage:current").await? {
@@ -1378,7 +1534,7 @@ mod tests {
         assert!(record.staleness.last_record_sha.is_empty());
         store.put(&record.key, &record).await.expect("put");
 
-        session_harvest(&store, repo_dir.path())
+        session_harvest(&store, repo_dir.path(), None)
             .await
             .expect("harvest");
 
@@ -1408,7 +1564,7 @@ mod tests {
 
         // No git repo anywhere above a tempdir — the analyzer can do nothing.
         let nowhere = TempDir::new().expect("tempdir");
-        session_harvest(&store, nowhere.path())
+        session_harvest(&store, nowhere.path(), None)
             .await
             .expect("harvest must not fail when staleness cannot run");
 
@@ -1505,6 +1661,63 @@ mod tests {
         store.close().await.expect("close");
     }
 
+    /// Two sibling worktrees share one store (a clone with a remote resolves to
+    /// one slug). A session ending in one worktree must settle only its own
+    /// lockdown debt: its owed markers and consult receipts clear, the sibling's
+    /// survive untouched. A store-wide wipe would lift the sibling's lockdown.
+    #[tokio::test]
+    async fn harvest_settles_only_the_ending_worktree_debt() {
+        let (_dir, store) = temp_store().await;
+
+        let ending = "aaaaaaaa";
+        let sibling = "bbbbbbbb";
+
+        // Each worktree owes an unconsulted deny and holds one consult receipt.
+        record_owed_receipt(&store, "file:a.rs", Some(ending))
+            .await
+            .expect("owe ending");
+        record_owed_receipt(&store, "file:b.rs", Some(sibling))
+            .await
+            .expect("owe sibling");
+        for (actor, key) in [(ending, "file:a.rs"), (sibling, "file:b.rs")] {
+            let rec = session_record(&receipt_key(key, Some(actor)), String::new());
+            store.put(&rec.key, &rec).await.expect("put receipt");
+        }
+
+        // Harvest returns early without a session:current — mint one.
+        session_flush(&store).await.expect("flush");
+
+        let nowhere = TempDir::new().expect("tempdir");
+        session_harvest(&store, nowhere.path(), Some(ending))
+            .await
+            .expect("harvest");
+
+        let owed = store.scan_keys(OWED_PREFIX).await.expect("scan owed");
+        assert!(
+            owed.iter().all(|k| !k.contains(ending)),
+            "ending worktree debt must clear: {owed:?}"
+        );
+        assert!(
+            owed.iter().any(|k| k.contains(sibling)),
+            "sibling worktree debt must survive: {owed:?}"
+        );
+
+        let consulted = store
+            .scan_keys("session:consulted:")
+            .await
+            .expect("scan consulted");
+        assert!(
+            consulted.iter().all(|k| !k.contains(ending)),
+            "ending worktree receipt must clear: {consulted:?}"
+        );
+        assert!(
+            consulted.iter().any(|k| k.contains(sibling)),
+            "sibling worktree receipt must survive: {consulted:?}"
+        );
+
+        store.close().await.expect("close");
+    }
+
     #[tokio::test]
     async fn session_harvest_clears_subagent_summary() {
         let (_dir, store) = temp_store().await;
@@ -1520,7 +1733,7 @@ mod tests {
 
         // Harvest with no git repo — still runs the archive + cleanup path.
         let nowhere = TempDir::new().expect("tempdir");
-        session_harvest(&store, nowhere.path())
+        session_harvest(&store, nowhere.path(), None)
             .await
             .expect("harvest");
 
@@ -1558,7 +1771,7 @@ mod tests {
             .await
             .expect("put cursor");
 
-        session_harvest(&store, repo_dir.path())
+        session_harvest(&store, repo_dir.path(), None)
             .await
             .expect("harvest must survive a cursor it cannot place");
 
@@ -1646,7 +1859,9 @@ mod tests {
             .await
             .expect("no receipt yet"));
 
-        log_hit(&store, key).await.expect("log consultation hit");
+        log_hit(&store, key, None)
+            .await
+            .expect("log consultation hit");
 
         assert!(check_consulted_recent(&store, key, 900, None)
             .await
@@ -1661,7 +1876,7 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        log_hit(&store, key).await.unwrap();
+        log_hit(&store, key, None).await.unwrap();
 
         let receipt = store.get(&receipt_key(key, None)).await.unwrap().unwrap();
         assert!(receipt
@@ -1722,7 +1937,7 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        log_hit(&store, key).await.unwrap();
+        log_hit(&store, key, None).await.unwrap();
         let receipt_key_value = receipt_key(key, None);
         let mut receipt = store.get(&receipt_key_value).await.unwrap().unwrap();
         receipt.updated_at = 0;
@@ -1742,7 +1957,7 @@ mod tests {
             .put(key, &session_record(key, "orders v1".into()))
             .await
             .unwrap();
-        log_hit(&store, key).await.unwrap();
+        log_hit(&store, key, None).await.unwrap();
         store.delete(key).await.unwrap();
 
         assert!(
@@ -1836,8 +2051,8 @@ mod tests {
         let key1 = "file:src/main.rs";
         let key2 = "file:src/lib.rs";
 
-        log_hit(&store, key1).await.expect("log first hit");
-        log_hit(&store, key2).await.expect("log second hit");
+        log_hit(&store, key1, None).await.expect("log first hit");
+        log_hit(&store, key2, None).await.expect("log second hit");
 
         // Verify receipts exist before clearing.
         let before = store
@@ -1993,6 +2208,17 @@ fn main() {}",
         run_git(dir.path(), &["add", "-A"]);
         run_git(dir.path(), &["commit", "-q", "-m", "init"]);
         dir
+    }
+
+    /// The debt scan matches a worktree tag with no terminator after it, so
+    /// the tag must be fixed width or one tree's prefix could catch another's
+    /// markers. `hex::encode` of four bytes is always eight characters.
+    #[test]
+    fn a_worktree_scope_tag_is_always_eight_hex_characters() {
+        let main = temp_repo_for_worktrees();
+        let tag = worktree_scope_tag(main.path()).expect("main tag");
+        assert_eq!(tag.len(), 8, "tag width is what makes the debt scan exact");
+        assert!(tag.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// The common layout: `git worktree add ../feature`. The worktree's own

@@ -444,9 +444,140 @@ fn git_factor_zero_when_no_repo() {
         head_commit: None,
     };
     assert_eq!(
-        analyzer.git_factor_for("file:src/main.rs", "deadbeef", far_deadline()),
+        analyzer.git_factor_for(&["src/main.rs".to_string()], "deadbeef", far_deadline()),
         (0.0, None)
     );
+}
+
+/// A gotcha's git factor keys on the files its rule describes, not on its own
+/// key. `gotcha:<slug>` is in no tree, so deriving the path from the key alone
+/// zeroed the 0.35-weighted factor for every gotcha however hard its file
+/// churned. Measured live before the fix on an 8-commit repo: `file:a.py`
+/// scored 0.35, the gotcha naming `a.py` scored 0.00.
+#[test]
+fn git_factor_for_a_gotcha_keys_on_its_affected_files() {
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let root_sha = commit_file(&repo, "a.txt", "v0\n");
+    for v in 1..=6 {
+        commit_file(&repo, "a.txt", &format!("v{v}\n"));
+    }
+    let analyzer = StalenessAnalyzer::new(dir.path());
+    let gotcha = make_stub("gotcha:handle", &["a.txt"]);
+
+    let (factor, _) = analyzer.git_factor_for(
+        &StalenessAnalyzer::git_paths_for(&gotcha),
+        &root_sha,
+        far_deadline(),
+    );
+    assert!(
+        factor > 0.0,
+        "a gotcha whose affected file churned must carry a git signal"
+    );
+}
+
+/// The worst affected file sets the factor — averaging would let one quiet
+/// file mask a rewritten one.
+#[test]
+fn a_gotcha_takes_the_worst_of_its_affected_files() {
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    commit_file(&repo, "quiet.txt", "unchanged\n");
+    let root_sha = commit_file(&repo, "loud.txt", "v0\n");
+    for v in 1..=6 {
+        commit_file(&repo, "loud.txt", &format!("v{v}\n"));
+    }
+    let analyzer = StalenessAnalyzer::new(dir.path());
+
+    let quiet_only = make_stub("gotcha:quiet", &["quiet.txt"]);
+    let both = make_stub("gotcha:both", &["quiet.txt", "loud.txt"]);
+
+    let (quiet_f, _) = analyzer.git_factor_for(
+        &StalenessAnalyzer::git_paths_for(&quiet_only),
+        &root_sha,
+        far_deadline(),
+    );
+    let (both_f, _) = analyzer.git_factor_for(
+        &StalenessAnalyzer::git_paths_for(&both),
+        &root_sha,
+        far_deadline(),
+    );
+    assert!(both_f > quiet_f, "the churned file must set the factor");
+}
+
+#[test]
+fn git_paths_come_from_the_key_for_files_and_the_payload_for_gotchas() {
+    let file = make_file_record_with_staleness(0.0);
+    assert_eq!(
+        StalenessAnalyzer::git_paths_for(&file),
+        vec!["src/main.rs".to_string()]
+    );
+
+    let gotcha = make_stub("gotcha:handle", &["a.txt", "b.txt"]);
+    assert_eq!(
+        StalenessAnalyzer::git_paths_for(&gotcha),
+        vec!["a.txt".to_string(), "b.txt".to_string()]
+    );
+
+    // A record that is neither a file key nor a gotcha payload names no path,
+    // so it has nothing to measure and gets no git signal.
+    let mut pathless = make_file_record_with_staleness(0.0);
+    pathless.key = "dep:npm:left-pad".to_string();
+    assert!(StalenessAnalyzer::git_paths_for(&pathless).is_empty());
+}
+
+/// The baseline may only advance on a pass that examined every path. Advancing
+/// after a deadline cut the loop short would move `last_record_sha` to HEAD
+/// with one file's churn never looked at, erasing it permanently.
+#[test]
+fn an_incomplete_pass_does_not_advance_the_baseline() {
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    commit_file(&repo, "quiet.txt", "unchanged\n");
+    let root_sha = commit_file(&repo, "loud.txt", "v0\n");
+    for v in 1..=6 {
+        commit_file(&repo, "loud.txt", &format!("v{v}\n"));
+    }
+    let analyzer = StalenessAnalyzer::new(dir.path());
+    let paths = vec!["quiet.txt".to_string(), "loud.txt".to_string()];
+
+    let (_, cut_short) = analyzer.git_factor_for(&paths, &root_sha, Instant::now());
+    assert!(
+        cut_short.is_none(),
+        "an expired deadline must leave the baseline where it was"
+    );
+
+    let (_, complete) = analyzer.git_factor_for(&paths, &root_sha, far_deadline());
+    assert!(complete.is_some(), "a pass that saw every path advances it");
+}
+
+/// `affected_files` may hold a glob. git resolves paths, not patterns, so a
+/// glob can only return "not in tree" — it must not consume the pass or count
+/// against completeness.
+#[test]
+fn glob_entries_are_skipped_not_measured() {
+    let dir = TempDir::new().unwrap();
+    let repo = git2::Repository::init(dir.path()).unwrap();
+    let root_sha = commit_file(&repo, "a.txt", "v0\n");
+    for v in 1..=6 {
+        commit_file(&repo, "a.txt", &format!("v{v}\n"));
+    }
+    let analyzer = StalenessAnalyzer::new(dir.path());
+
+    let (glob_only, sha) =
+        analyzer.git_factor_for(&["src/payments/**".to_string()], &root_sha, far_deadline());
+    assert_eq!(glob_only, 0.0, "a glob names no blob");
+    assert!(
+        sha.is_none(),
+        "nothing was measured, so nothing to baseline"
+    );
+
+    let (mixed, _) = analyzer.git_factor_for(
+        &["src/payments/**".to_string(), "a.txt".to_string()],
+        &root_sha,
+        far_deadline(),
+    );
+    assert!(mixed > 0.0, "the real path beside a glob is still measured");
 }
 
 // ── dep_factor tests ────────────────────────────────────────────────────

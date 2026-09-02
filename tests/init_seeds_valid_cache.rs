@@ -8,9 +8,12 @@
 //! knowledge write.
 //!
 //! `#[ignore]` because it spawns subprocesses and a daemon. Run with a short
-//! `MATI_HOME` — a long tempdir path exceeds the ~104-byte Unix socket limit and
-//! the daemon silently fails to bind:
-//!   MATI_HOME=/tmp/mati-it cargo nextest run --test init_seeds_valid_cache \
+//! `MATI_TEST_HOME` — it sets the parent of the per-process home, and a long
+//! one exceeds the ~104-byte Unix socket limit, after which the daemon silently
+//! fails to bind. `MATI_HOME` is no longer the lever: `common::mati_home`
+//! ignores an inherited value so an exported one cannot merge every test into
+//! one store.
+//!   MATI_TEST_HOME=/tmp/mati-it cargo nextest run --test init_seeds_valid_cache \
 //!     --run-ignored all
 
 use std::path::Path;

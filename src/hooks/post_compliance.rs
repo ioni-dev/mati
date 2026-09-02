@@ -1,69 +1,12 @@
 /// post-read-compliance.sh — compliance monitoring (M-09-C).
 ///
 /// PostToolUse — fires after Read/Glob/Grep (not Bash; pre-bash hook covers that).
-/// Checks if the file was consulted via mati before being read. No JSON output required.
+/// Thin wrapper that delegates to `mati hook-decide claude-post-read-compliance`.
+/// All logic lives in Rust (`cli::hook_decide::run_post_read_compliance`).
+/// No JSON output: PostToolUse carries no permission decision.
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
-# mati post-read compliance monitor (M-09-C)
-# Fires for Read/Glob/Grep only — Bash is covered by the pre-bash PreToolUse hook.
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-# The root mati_home_opt() resolves — $MATI_HOME wins, ~/.mati is the default.
-# Writing to a different root than the reader would make every fail-open
-# record below invisible to `mati stats`.
-MATI_DIR="${MATI_HOME:-${HOME}/.mati}"
-mkdir -p "$MATI_DIR" 2>/dev/null || true
-
-# Record a bypass in the same shape cli::hook_decide::log_fail_open_named
-# writes, so shell and Rust fail-opens read back as one series.
-# Args: hook, file, reason.
-mati_fail_open() {
-  echo "[mati] WARNING: enforcement bypassed for $2 — $3" >&2
-  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) FAIL_OPEN hook=$1 file=$2 reason=$3" >> "$MATI_DIR/fail_open.log"; } 2>/dev/null || true
-}
-
-INPUT=$(cat)
-
-# Guard: jq required
-if ! command -v jq >/dev/null 2>&1; then
-  mati_fail_open "$(basename "$0")" "<unparsed>" "jq not on PATH - compliance monitoring skipped"
-  exit 0
-fi
-
-# Extract file path from tool input (Read/Glob/Grep have file_path or path)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // .tool_input.path // ""' 2>/dev/null || echo "")
-[ -z "$FILE_PATH" ] && exit 0
-
-# Convert absolute path to repo-relative (same as pre-read.sh)
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-if [ -n "$REPO_ROOT" ]; then
-  REL_PATH="${FILE_PATH#$REPO_ROOT/}"
-else
-  REL_PATH="$FILE_PATH"
-fi
-
-# Skip obvious non-file paths, but keep extensionless real files like Dockerfile.
-case "$REL_PATH" in
-  *.*|*/*) ;;  # extension or directory separator — likely a file path
-  *)
-    if [ -e "$FILE_PATH" ]; then
-      :
-    elif [ -n "$REPO_ROOT" ] && [ -e "$REPO_ROOT/$REL_PATH" ]; then
-      :
-    else
-      exit 0
-    fi
-    ;;
-esac
-
-# Guard: mati must be reachable
-if ! mati ping --daemon-only &>/dev/null; then
-  mati_fail_open "$(basename "$0")" "${REL_PATH:-unknown}" "daemon not running"
-  exit 0
-fi
-
-# Check if this file was consulted via mati before being read
-CONSULTED=$(mati session-check-consulted "file:$REL_PATH" 2>/dev/null || echo "false")
-if [ "$CONSULTED" = "false" ]; then
-  mati log-compliance-miss "file:$REL_PATH" &>/dev/null &
-fi
+command -v mati >/dev/null 2>&1 || exit 0
+exec mati hook-decide claude-post-read-compliance
 "#;

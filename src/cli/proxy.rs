@@ -194,19 +194,17 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(s) => s.get(key).await,
             ProxyInner::Socket { root } => {
-                match daemon_result(root, "get", json!({ "key": key })).await {
-                    DaemonResult::Ok(v) => {
-                        let data = &v["data"];
-                        if data.is_null() {
-                            Ok(None)
-                        } else {
-                            Ok(Some(
-                                serde_json::from_value(data.clone())
-                                    .context("proxy get: failed to deserialize record")?,
-                            ))
-                        }
-                    }
-                    other => Err(socket_read_error("get", other)),
+                let data = socket_read_data(
+                    "get",
+                    daemon_result(root, "get", json!({ "key": key })).await,
+                )?;
+                if data.is_null() {
+                    Ok(None)
+                } else {
+                    Ok(Some(
+                        serde_json::from_value(data)
+                            .context("proxy get: failed to deserialize record")?,
+                    ))
                 }
             }
         }
@@ -217,17 +215,15 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(s) => s.scan_prefix(prefix).await,
             ProxyInner::Socket { root } => {
-                match daemon_result(root, "scan_prefix", json!({ "prefix": prefix })).await {
-                    DaemonResult::Ok(v) => {
-                        let data = &v["data"];
-                        if data.is_null() {
-                            Ok(vec![])
-                        } else {
-                            Ok(serde_json::from_value(data.clone())
-                                .context("proxy scan_prefix: failed to deserialize records")?)
-                        }
-                    }
-                    other => Err(socket_read_error("scan_prefix", other)),
+                let data = socket_read_data(
+                    "scan_prefix",
+                    daemon_result(root, "scan_prefix", json!({ "prefix": prefix })).await,
+                )?;
+                if data.is_null() {
+                    Ok(vec![])
+                } else {
+                    Ok(serde_json::from_value(data)
+                        .context("proxy scan_prefix: failed to deserialize records")?)
                 }
             }
         }
@@ -243,17 +239,15 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(s) => s.scan_keys(prefix).await,
             ProxyInner::Socket { root } => {
-                match daemon_result(root, "scan_keys", json!({ "prefix": prefix })).await {
-                    DaemonResult::Ok(v) => {
-                        let data = &v["data"];
-                        if data.is_null() {
-                            Ok(vec![])
-                        } else {
-                            Ok(serde_json::from_value(data.clone())
-                                .context("proxy scan_keys: failed to deserialize keys")?)
-                        }
-                    }
-                    other => Err(socket_read_error("scan_keys", other)),
+                let data = socket_read_data(
+                    "scan_keys",
+                    daemon_result(root, "scan_keys", json!({ "prefix": prefix })).await,
+                )?;
+                if data.is_null() {
+                    Ok(vec![])
+                } else {
+                    Ok(serde_json::from_value(data)
+                        .context("proxy scan_keys: failed to deserialize keys")?)
                 }
             }
         }
@@ -280,27 +274,19 @@ impl StoreProxy {
                 .await
             }
             ProxyInner::Socket { root } => {
-                match daemon_result(
+                let result = daemon_result(
                     root,
                     "scan_enforcement_events_with_skips",
                     json!({ "since_seq": since_seq, "until_seq": until_seq }),
                 )
-                .await
-                {
-                    DaemonResult::Ok(v) => {
-                        let data = &v["data"];
-                        if data.is_null() {
-                            Ok(Default::default())
-                        } else {
-                            Ok(serde_json::from_value(data.clone()).context(
-                                "proxy scan_enforcement_events_with_skips: failed to deserialize scan",
-                            )?)
-                        }
-                    }
-                    other => Err(socket_read_error(
-                        "scan_enforcement_events_with_skips",
-                        other,
-                    )),
+                .await;
+                let data = socket_read_data("scan_enforcement_events_with_skips", result)?;
+                if data.is_null() {
+                    Ok(Default::default())
+                } else {
+                    Ok(serde_json::from_value(data).context(
+                        "proxy scan_enforcement_events_with_skips: failed to deserialize scan",
+                    )?)
                 }
             }
         }
@@ -322,17 +308,15 @@ impl StoreProxy {
                 .await
             }
             ProxyInner::Socket { root } => {
-                match daemon_result(
+                let result = daemon_result(
                     root,
                     "scan_enforcement_events_since_ms",
                     json!({ "since_ms": since_ms, "until_ms": until_ms }),
                 )
-                .await
-                {
-                    DaemonResult::Ok(v) => serde_json::from_value(v["data"].clone())
-                        .context("proxy scan_enforcement_events_since_ms: invalid result"),
-                    other => Err(socket_read_error("scan_enforcement_events_since_ms", other)),
-                }
+                .await;
+                let data = socket_read_data("scan_enforcement_events_since_ms", result)?;
+                serde_json::from_value(data)
+                    .context("proxy scan_enforcement_events_since_ms: invalid result")
             }
         }
     }
@@ -523,14 +507,22 @@ impl StoreProxy {
 
     /// Record a consultation receipt for a key.
     pub async fn log_hit(&self, key: &str) -> Result<()> {
+        // Scope the receipt to the caller's worktree so it satisfies the
+        // worktree-scoped file gate, which derives the same tag from its cwd.
+        // No agent_id at the CLI layer — this is a main-thread consultation.
+        let scope = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| mati_core::store::session::worktree_scope_tag(&cwd));
         match &self.inner {
-            ProxyInner::Direct(store) => mati_core::store::session::log_hit(store, key).await,
+            ProxyInner::Direct(store) => {
+                mati_core::store::session::log_hit(store, key, scope.as_deref()).await
+            }
             ProxyInner::Socket { root } => {
                 let cmd = mati_core::mcp::protocol::Command::ConsultationHit(
                     mati_core::mcp::protocol::ConsultationHitInput {
                         key: key.to_string(),
                         capture_fingerprint: true,
-                        actor: None,
+                        actor: scope,
                         session_id: None,
                         agent_id: None,
                         decision_basis_hash: None,
@@ -1220,14 +1212,12 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(s) => s.history(key, limit),
             ProxyInner::Socket { root } => {
-                match daemon_result(root, "history", json!({ "key": key, "limit": limit })).await {
-                    DaemonResult::Ok(v) => {
-                        let data = &v["data"];
-                        Ok(serde_json::from_value(data.clone())
-                            .context("proxy history: failed to deserialize entries")?)
-                    }
-                    other => Err(socket_read_error("history", other)),
-                }
+                let data = socket_read_data(
+                    "history",
+                    daemon_result(root, "history", json!({ "key": key, "limit": limit })).await,
+                )?;
+                Ok(serde_json::from_value(data)
+                    .context("proxy history: failed to deserialize entries")?)
             }
         }
     }
@@ -1242,20 +1232,15 @@ impl StoreProxy {
         match &self.inner {
             ProxyInner::Direct(s) => s.history_since(key, since_ts, limit),
             ProxyInner::Socket { root } => {
-                match daemon_result(
+                let result = daemon_result(
                     root,
                     "history_since",
                     json!({ "key": key, "since_ts": since_ts, "limit": limit }),
                 )
-                .await
-                {
-                    DaemonResult::Ok(v) => {
-                        let data = &v["data"];
-                        Ok(serde_json::from_value(data.clone())
-                            .context("proxy history_since: failed to deserialize entries")?)
-                    }
-                    other => Err(socket_read_error("history_since", other)),
-                }
+                .await;
+                let data = socket_read_data("history_since", result)?;
+                Ok(serde_json::from_value(data)
+                    .context("proxy history_since: failed to deserialize entries")?)
             }
         }
     }
@@ -1394,6 +1379,28 @@ async fn open_store_with_lock_retry(cwd: &Path) -> Result<Store> {
     }
 }
 
+/// Extract the `data` value from a read's daemon result, turning a daemon-side
+/// error envelope (`{ok:false}`) into an `Err` instead of a silent null/empty
+/// read. A legitimate "record not found" comes back as `{ok:true, data:null}`
+/// (socket_dispatch's `get` arm), so only a real error reaches the bail — this
+/// is what keeps a `session_mismatch` from masquerading as "not found".
+fn socket_read_data(op: &str, result: DaemonResult) -> Result<serde_json::Value> {
+    match result {
+        DaemonResult::Ok(v) => {
+            if v.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("internal");
+                let message = v
+                    .get("error")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown error");
+                anyhow::bail!("mati daemon returned an error for '{op}' read [{code}]: {message}");
+            }
+            Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
+        }
+        other => Err(socket_read_error(op, other)),
+    }
+}
+
 fn socket_read_error(op: &str, result: DaemonResult) -> anyhow::Error {
     let detail = match result {
         DaemonResult::NotRunning => "daemon stopped",
@@ -1483,6 +1490,35 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("daemon policy_write failed: boom"));
+    }
+
+    #[test]
+    fn socket_read_data_surfaces_daemon_error_envelope() {
+        // A daemon-side error ({ok:false}) must become an Err, not a silent
+        // null read — otherwise a session_mismatch reads back as "not found".
+        let err = socket_read_data(
+            "get",
+            DaemonResult::Ok(serde_json::json!({
+                "ok": false, "v": 2, "code": "session_mismatch", "error": "boom"
+            })),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("get"), "op named: {msg}");
+        assert!(msg.contains("session_mismatch"), "code surfaced: {msg}");
+        assert!(msg.contains("boom"), "message surfaced: {msg}");
+    }
+
+    #[test]
+    fn socket_read_data_passes_through_null_not_found() {
+        // A legitimate "record not found" is {ok:true, data:null} and must
+        // stay a null read, not become an error.
+        let data = socket_read_data(
+            "get",
+            DaemonResult::Ok(serde_json::json!({"ok": true, "v": 2, "data": null})),
+        )
+        .unwrap();
+        assert!(data.is_null(), "not-found stays a null read, got {data:?}");
     }
 
     #[test]

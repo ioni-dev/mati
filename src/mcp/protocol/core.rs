@@ -183,6 +183,11 @@ pub enum Command {
     #[serde(rename = "session_check_consulted_recent")]
     SessionCheckConsultedRecent(SessionCheckConsultedRecentInput),
 
+    /// Tier 1 session lockdown: the file this actor was denied and has not
+    /// consulted since, if any.
+    #[serde(rename = "session_owed_receipt")]
+    SessionOwedReceipt(SessionOwedReceiptInput),
+
     /// BM25 text search or graph traversal.
     #[serde(rename = "mem_query")]
     MemQuery(MemQueryInput),
@@ -291,7 +296,7 @@ pub enum Command {
 
     /// Archive session, run promotions, collect stale reviews.
     #[serde(rename = "session_harvest")]
-    SessionHarvest,
+    SessionHarvest(SessionHarvestInput),
 
     /// Clear all consult receipts (PostCompact: force re-block after compaction).
     #[serde(rename = "session_clear_consults")]

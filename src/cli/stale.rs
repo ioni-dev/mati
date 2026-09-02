@@ -155,14 +155,19 @@ pub(crate) async fn cached_stale_summary(proxy: &StoreProxy) -> Option<StaleSumm
     if entry.write_seq != current_seq {
         return None;
     }
+    Some(summarize(&entry.records, entry.drift.len()))
+}
+
+/// Tally tiers for a set of already-filtered stale records.
+fn summarize(records: &[Record], drift: usize) -> StaleSummary {
     let mut s = StaleSummary {
-        total: entry.records.len(),
+        total: records.len(),
         stale: 0,
         liability: 0,
         tombstone: 0,
-        drift: entry.drift.len(),
+        drift,
     };
-    for r in &entry.records {
+    for r in records {
         match r.staleness.tier {
             StalenessTier::Stale => s.stale += 1,
             StalenessTier::Liability => s.liability += 1,
@@ -170,7 +175,60 @@ pub(crate) async fn cached_stale_summary(proxy: &StoreProxy) -> Option<StaleSumm
             _ => {}
         }
     }
-    Some(s)
+    s
+}
+
+/// Scan for stale records and content drift — the same work `mati stale` does,
+/// shared so the command and `mati doctor` can never disagree.
+pub(crate) async fn scan_stale(proxy: &StoreProxy) -> Result<(Vec<Record>, Vec<DriftedGotcha>)> {
+    let (gotchas, decisions, files, notes) = tokio::try_join!(
+        proxy.scan_prefix("gotcha:"),
+        proxy.scan_prefix("decision:"),
+        proxy.scan_prefix("file:"),
+        proxy.scan_prefix("dev_note:"),
+    )?;
+
+    // Both sides are disk digests — `confirmed_content` hashed at confirm time,
+    // the current side hashed here — so a stale `file:*` index can neither hide
+    // drift nor invent it.
+    let drift = detect_drift(&gotchas, &disk_content_hashes(proxy.repo_root(), &gotchas));
+
+    let mut stale: Vec<Record> = gotchas
+        .into_iter()
+        .chain(decisions)
+        .chain(files)
+        .chain(notes)
+        .filter(|r| {
+            matches!(
+                r.staleness.tier,
+                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
+            )
+        })
+        .collect();
+
+    stale.sort_by(|a, b| {
+        effective_staleness(b)
+            .partial_cmp(&effective_staleness(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok((stale, drift))
+}
+
+/// Stale counts for `mati doctor`, cache-first but never cache-only.
+///
+/// The cache cannot be written while the daemon owns the store: `StoreProxy::put`
+/// rejects `analytics:*` in socket mode (it refuses to fabricate a record from an
+/// unrecognised prefix) and `mati stale` discards that error with `let _`. So in
+/// normal operation the cache is always empty and a cache-only reader reported
+/// "unknown" forever. Falling back to the scan costs a few milliseconds — the
+/// scan is what `mati stale` itself runs on every invocation.
+pub(crate) async fn stale_summary(proxy: &StoreProxy) -> Option<StaleSummary> {
+    if let Some(cached) = cached_stale_summary(proxy).await {
+        return Some(cached);
+    }
+    let (stale, drift) = scan_stale(proxy).await.ok()?;
+    Some(summarize(&stale, drift.len()))
 }
 
 // ── Args ─────────────────────────────────────────────────────────────────────
@@ -205,38 +263,8 @@ pub async fn run(args: StaleArgs) -> Result<()> {
         }
     }
 
-    // ── Cache miss: scan all four prefixes concurrently ───────────────────────
-    let (gotchas, decisions, files, notes) = tokio::try_join!(
-        proxy.scan_prefix("gotcha:"),
-        proxy.scan_prefix("decision:"),
-        proxy.scan_prefix("file:"),
-        proxy.scan_prefix("dev_note:"),
-    )?;
-
-    // Content drift. Both sides are disk digests — `confirmed_content` hashed
-    // at confirm time, the current side hashed here — so a stale `file:*` index
-    // can neither hide drift nor invent it.
-    let drift = detect_drift(&gotchas, &disk_content_hashes(proxy.repo_root(), &gotchas));
-
-    let mut stale: Vec<Record> = gotchas
-        .into_iter()
-        .chain(decisions)
-        .chain(files)
-        .chain(notes)
-        .filter(|r| {
-            matches!(
-                r.staleness.tier,
-                StalenessTier::Stale | StalenessTier::Liability | StalenessTier::Tombstone
-            )
-        })
-        .collect();
-
-    // Sort by staleness descending
-    stale.sort_by(|a, b| {
-        effective_staleness(b)
-            .partial_cmp(&effective_staleness(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // ── Cache miss: scan ──────────────────────────────────────────────────────
+    let (mut stale, drift) = scan_stale(&proxy).await?;
 
     // Write cache (full sorted list, before limit)
     let cache_entry = StaleCache {
@@ -256,14 +284,29 @@ pub async fn run(args: StaleArgs) -> Result<()> {
     Ok(())
 }
 
+/// Headline for a run that found nothing stale by tier.
+///
+/// Drift is not a staleness tier, so it can be the only thing to report — and
+/// an unqualified "No stale records." printed directly above a drift warning
+/// contradicts it, since that block says a confirmed rule may now be wrong.
+/// The two answer different questions: the tier measures churn since the last
+/// harvest, drift measures whether the code moved since a human signed off.
+/// Scope the claim to the axis it actually measures.
+fn no_stale_headline(drift: usize) -> String {
+    if drift == 0 {
+        "No stale records.".to_string()
+    } else {
+        "No records stale by age.".to_string()
+    }
+}
+
 fn display_stale(stale: &[Record], drift: &[DriftedGotcha], verbose: bool) {
     if stale.is_empty() {
+        println!("{}", no_stale_headline(drift.len()));
         if drift.is_empty() {
-            println!("No stale records.");
             return;
         }
-        // Drift is not a staleness tier, so it can be the only thing to report.
-        println!("No stale records.\n");
+        println!();
         display_drift(drift, std::io::stdout().is_terminal());
         return;
     }
@@ -679,6 +722,38 @@ mod tests {
     }
 
     // ── content drift ────────────────────────────────────────────────────────
+
+    /// `summarize` is the one tally both the cached and the scanned paths use,
+    /// so a divergence here would let `mati stale` and `mati doctor` disagree.
+    #[test]
+    fn summarize_counts_each_tier_and_carries_drift_separately() {
+        let records = [
+            make_record("file:stale.rs", Category::File, StalenessTier::Stale),
+            make_record("file:liab.rs", Category::File, StalenessTier::Liability),
+            make_record("file:tomb.rs", Category::File, StalenessTier::Tombstone),
+        ];
+        let s = summarize(&records, 2);
+        assert_eq!((s.total, s.stale, s.liability, s.tombstone), (3, 1, 1, 1));
+        assert_eq!(s.drift, 2, "drift is counted apart from the tier total");
+
+        let empty = summarize(&[], 1);
+        assert_eq!(empty.total, 0);
+        assert_eq!(
+            empty.drift, 1,
+            "drift alone must survive an empty tier list"
+        );
+    }
+
+    /// The headline must not claim freshness the drift block contradicts.
+    #[test]
+    fn headline_scopes_its_claim_when_only_drift_was_found() {
+        assert_eq!(no_stale_headline(0), "No stale records.");
+        assert!(
+            !no_stale_headline(1).contains("No stale records"),
+            "an unqualified 'No stale records' above a drift warning is a contradiction"
+        );
+        assert_eq!(no_stale_headline(1), no_stale_headline(9));
+    }
 
     /// Drift is not a staleness tier, so it must not be described in tier
     /// language. It also must not claim enforcement stopped — a drifted gotcha

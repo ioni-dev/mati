@@ -964,7 +964,7 @@ async fn confirm_paths_diverge_only_where_pinned() {
         .expect("seed");
         // A receipt minted before confirmation — the bypass token the daemon
         // path invalidates and the direct path does not.
-        crate::store::session::log_hit(&store, "file:src/a.rs")
+        crate::store::session::log_hit(&store, "file:src/a.rs", None)
             .await
             .expect("seed receipt");
 

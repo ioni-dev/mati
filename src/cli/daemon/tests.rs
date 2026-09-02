@@ -149,6 +149,115 @@ async fn daemon_get_returns_none_without_socket() {
     assert!(result.is_none());
 }
 
+/// Bind `sock_path` and answer each connection with one canned JSON line.
+async fn spawn_canned_responder(
+    sock_path: std::path::PathBuf,
+    responses: Vec<serde_json::Value>,
+) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind responder socket");
+    tokio::spawn(async move {
+        for resp in responses {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+            let _ = tokio::io::AsyncBufReadExt::read_line(&mut buf_reader, &mut line).await;
+            let mut bytes = serde_json::to_vec(&resp).unwrap();
+            bytes.push(b'\n');
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &bytes).await;
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+        }
+    })
+}
+
+/// A daemon restart between the CLI's metadata read and dispatch rotates the
+/// session UUID; dispatch_v2's fence then returns `session_mismatch`.
+/// `daemon_result` must re-read metadata and retry once, so the caller sees the
+/// second attempt's success — not the mismatch envelope, which carries no
+/// `data` and reads back as a spurious "record not found".
+#[tokio::test]
+async fn daemon_result_retries_on_session_mismatch() {
+    use mati_core::mcp::metadata::{DaemonMetadata, DaemonOwner};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let sock_path = root.join("mati.sock");
+
+    let publish = |session: uuid::Uuid| {
+        mati_core::mcp::metadata::publish_metadata(
+            &root,
+            &DaemonMetadata {
+                pid: std::process::id(),
+                session,
+                owner: DaemonOwner::Daemon,
+                version: String::new(),
+                build: String::new(),
+            },
+        )
+        .unwrap();
+    };
+
+    publish(uuid::Uuid::new_v4());
+
+    let responder = spawn_canned_responder(
+        sock_path.clone(),
+        vec![
+            serde_json::json!({
+                "v": 2, "id": uuid::Uuid::new_v4(),
+                "status": "err", "code": "session_mismatch",
+                "message": "session mismatch: re-read daemon metadata and retry",
+            }),
+            serde_json::json!({
+                "v": 2, "id": uuid::Uuid::new_v4(),
+                "status": "ok", "data": "pong",
+            }),
+        ],
+    )
+    .await;
+
+    // Rotate metadata during the 100ms retry settle — what a real restart does.
+    let root_for_rotate = root.clone();
+    let rotate = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        mati_core::mcp::metadata::publish_metadata(
+            &root_for_rotate,
+            &DaemonMetadata {
+                pid: std::process::id(),
+                session: uuid::Uuid::new_v4(),
+                owner: DaemonOwner::Daemon,
+                version: String::new(),
+                build: String::new(),
+            },
+        )
+        .unwrap();
+    });
+
+    // Bound the call: without the retry, only the first responder is dialed and
+    // the second canned response hangs the test — the timeout makes that a
+    // deterministic failure instead.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        daemon_result(&root, "ping", serde_json::json!({})),
+    )
+    .await
+    .expect("daemon_result should resolve within 5s — retry path appears wedged");
+
+    rotate.await.unwrap();
+    responder.abort();
+
+    match result {
+        DaemonResult::Ok(v) => assert_eq!(
+            v.get("ok"),
+            Some(&serde_json::Value::Bool(true)),
+            "second attempt should succeed after metadata rotation, got {v:?}"
+        ),
+        _ => panic!("expected Ok envelope after retry"),
+    }
+}
+
 #[test]
 fn parse_sentinel_roundtrip() {
     let s = format_sentinel(1234567890, 42);

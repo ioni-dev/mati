@@ -449,6 +449,7 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
     checks.push(collect_policy_check(cwd).await);
     checks.push(collect_binary_parity_check(cwd, root));
     checks.push(collect_gating_check(cwd).await);
+    checks.push(collect_seal_check(cwd, root).await);
 
     // Lifecycle log tail.
     let lifecycle = read_lifecycle_tail(root, 5);
@@ -486,9 +487,12 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
 /// never phones home"): an auditor running `mati doctor` sees the posture
 /// directly instead of having to read the CI workflow. It is a *compile-time*
 /// attestation, deliberately NOT a runtime probe — a probe would itself be a
-/// network call, contradicting the very property being attested. The hard proof
-/// lives in CI (the build-time dep-ban + the runtime syscall audit); this row
-/// reports which build you are running.
+/// network call, contradicting the very property being attested. The proof is
+/// the `zero_network` module in `src/invariants.rs`, which scans the source for
+/// IP-socket and HTTP APIs, asserts the daemon transport is a Unix socket, and
+/// checks the default build's resolved dependency graph. That is static
+/// analysis; a syscall-level audit would be the runtime proof and does not
+/// exist. This row reports which build you are running.
 ///
 /// Accurate via `cfg!(feature = "semantic")`: the default (enforcement) build
 /// links no network/HTTP-client crate; the opt-in `semantic` feature is the one
@@ -513,9 +517,10 @@ fn collect_network_attestation() -> CheckResult {
             name: "network",
             status: Status::Pass,
             detail: "no network/HTTP-client dependency linked in this build; the \
-                     enforcement path makes no outbound connection (verified in \
-                     CI: build-time dep-ban + runtime syscall audit). mati never \
-                     phones home."
+                     enforcement path makes no outbound connection (checked by the \
+                     zero_network tests: source scan, Unix-socket transport, and \
+                     the default build's dependency graph — static analysis, not a \
+                     runtime probe). mati never phones home."
                 .into(),
             fix: None,
         }
@@ -793,8 +798,20 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
             };
         }
     };
-    let summary = crate::cli::stale::cached_stale_summary(&proxy).await;
+    let summary = crate::cli::stale::stale_summary(&proxy).await;
     let _ = proxy.close().await;
+    freshness_result(summary)
+}
+
+/// The `knowledge/freshness` verdict, split out so every branch is testable
+/// without a store.
+///
+/// Drift gets its own arm. Folding it into the general Warn arm rendered
+/// "0 stale record(s) (0 stale, 0 liability, 0 tombstone); 1 confirmed
+/// gotcha(s) describe changed code" — a count of zero followed by a real
+/// problem — and offered `mati reparse`, which cannot clear drift. Only
+/// re-confirming can.
+fn freshness_result(summary: Option<crate::cli::stale::StaleSummary>) -> CheckResult {
     match summary {
         None => CheckResult {
             section: "knowledge",
@@ -809,6 +826,16 @@ async fn collect_freshness_check(cwd: &Path) -> CheckResult {
             status: Status::Pass,
             detail: "no stale records".to_string(),
             fix: None,
+        },
+        Some(s) if s.total == 0 => CheckResult {
+            section: "knowledge",
+            name: "freshness",
+            status: Status::Warn,
+            detail: format!(
+                "no records stale by age; {} confirmed gotcha(s) describe changed code",
+                s.drift
+            ),
+            fix: Some("mati gotcha confirm <key>  (after re-reading the file)"),
         },
         Some(s) => CheckResult {
             section: "knowledge",
@@ -949,6 +976,88 @@ async fn collect_gating_check(cwd: &Path) -> CheckResult {
     }
 }
 
+/// Tier 2 read floor: what `mati seal` is holding at mode `000` right now.
+///
+/// Inventory only. `seal::inventory` stats each manifest row and never hashes,
+/// so running `mati doctor` cannot open a sealed file — the one privileged read
+/// Tier 2 grants belongs to the post-Bash sweep, which has already seen the
+/// bytes move before it takes it.
+///
+/// A lifted row is reported, never accused. Deciding whether a lowered floor
+/// was a live receipt or a bypass needs a receipt question against the daemon,
+/// and that is the sweep's job. Doctor reports the bypasses the sweep already
+/// recorded instead of re-deriving them.
+async fn collect_seal_check(cwd: &Path, root: &Path) -> CheckResult {
+    let row = |status, detail: String, fix| CheckResult {
+        section: "enforcement",
+        name: "seal",
+        status,
+        detail,
+        fix,
+    };
+
+    let inv = mati_core::seal::inventory(&mati_core::seal::manifest_in(root));
+    if inv.total() == 0 {
+        return row(Status::Info, "no files sealed".to_string(), None);
+    }
+
+    let bypasses = seal_bypasses_recorded(cwd).await;
+    let mut notes: Vec<String> = Vec::new();
+    if inv.lifted > 0 {
+        notes.push(format!("{} currently readable", inv.lifted));
+    }
+    if inv.missing > 0 {
+        notes.push(format!("{} gone from disk", inv.missing));
+    }
+    let detail = format!(
+        "{} file(s) sealed, {} at mode 000{}",
+        inv.total(),
+        inv.at_floor,
+        if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join(", "))
+        }
+    );
+
+    if bypasses > 0 {
+        return row(
+            Status::Warn,
+            format!("{detail}; {bypasses} bypass(es) recorded on sealed files"),
+            Some("mati seal list, and mati verify-chain for the recorded events"),
+        );
+    }
+    if inv.missing > 0 {
+        return row(
+            Status::Warn,
+            detail,
+            Some("mati seal remove <path>  (drops the row for a file that is gone)"),
+        );
+    }
+    row(Status::Pass, detail, None)
+}
+
+/// Sum every retained `compliance:seal_bypass_*` daily aggregate.
+///
+/// A prefix scan rather than seven dated `get`s: the window that matters is
+/// "has the floor ever been bypassed in this repo", and retention already
+/// bounds how far back the rows go.
+async fn seal_bypasses_recorded(cwd: &Path) -> u64 {
+    let Ok(proxy) = crate::cli::proxy::StoreProxy::open(cwd).await else {
+        return 0;
+    };
+    let total = match proxy.scan_prefix("compliance:seal_bypass_").await {
+        Ok(records) => records
+            .iter()
+            .filter_map(|r| r.payload_as::<mati_core::store::session::DailyAgg>())
+            .map(|a| a.count)
+            .sum(),
+        Err(_) => 0,
+    };
+    let _ = proxy.close().await;
+    total
+}
+
 /// Do the hooks and the daemon run the same mati build?
 ///
 /// They resolve independently. `mati init` pins `.claude/hooks/mati` (and the
@@ -1012,6 +1121,14 @@ fn collect_binary_parity_check(cwd: &Path, root: &Path) -> CheckResult {
     };
 
     if hook_version == server_version {
+        if let Some(detail) = build_skew(&wrapper, root) {
+            return check(
+                "binary parity",
+                Status::Warn,
+                detail,
+                Some("mati daemon stop  (the next call restarts it from the current binary)"),
+            );
+        }
         check(
             "binary parity",
             Status::Pass,
@@ -1030,6 +1147,40 @@ fn collect_binary_parity_check(cwd: &Path, root: &Path) -> CheckResult {
             Some("mati init  (re-pins the hook wrapper to this binary)"),
         )
     }
+}
+
+/// Same version string, two different binaries — the skew `version` cannot
+/// see. `cargo install` twice off one tree leaves a daemon serving the old
+/// code while hooks exec the new, and both answer `--version` identically.
+/// `None` when there is nothing to compare: no running daemon, metadata from a
+/// binary that recorded no build, or an unreadable wrapper target.
+fn build_skew(wrapper: &Path, root: &Path) -> Option<String> {
+    let daemon_build = mati_core::mcp::metadata::read_metadata(root)
+        .map(|m| m.build)
+        .filter(|b| !b.is_empty())?;
+    let target = wrapper_exec_target(wrapper)?;
+    let hook_build = mati_core::mcp::metadata::build_id_of(&target)?;
+    if hook_build == daemon_build {
+        return None;
+    }
+    Some(format!(
+        "hooks and the daemon both report {}, but are different builds \
+         (hooks {}, daemon {}) — the daemon is still serving the code it \
+         started with, so a rebuilt gate is not the one being enforced",
+        env!("CARGO_PKG_VERSION"),
+        &hook_build[..12],
+        &daemon_build[..12],
+    ))
+}
+
+/// The absolute binary a hook wrapper execs. The wrapper is a fixed four-line
+/// bash script written by `scaffold::write_mati_wrapper`, so the target is the
+/// quoted word on the `exec` line.
+fn wrapper_exec_target(wrapper: &Path) -> Option<PathBuf> {
+    let body = std::fs::read_to_string(wrapper).ok()?;
+    let rest = body.lines().find_map(|l| l.strip_prefix("exec \""))?;
+    let (bin, _) = rest.split_once('"')?;
+    Some(PathBuf::from(bin))
 }
 
 /// The binary wrapper a host's hooks exec, if one is installed.
@@ -1533,6 +1684,67 @@ mod tests {
         }
     }
 
+    /// A wrapper in the real `exec "<bin>" "$@"` shape, pointing at `target`.
+    fn fake_wrapper_execing(cwd: &Path, target: &Path) {
+        let dir = cwd.join(".claude/hooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mati");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/usr/bin/env bash\nexec \"{}\" \"$@\"\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Two builds of one version compare equal on the version string, so the
+    /// daemon keeps serving the old code while hooks exec the new one. The
+    /// recorded build hash is what separates them.
+    #[test]
+    fn binary_parity_names_a_same_version_build_skew() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mati-bin");
+        std::fs::write(&target, "#!/bin/sh\necho 'mati 0.1.4'\n").unwrap();
+        fake_wrapper_execing(dir.path(), &target);
+        fake_daemon(dir.path(), "0.1.4");
+        // The daemon started from a different build of the same version.
+        let mut meta = mati_core::mcp::metadata::read_metadata(dir.path()).unwrap();
+        meta.build = "0".repeat(64);
+        mati_core::mcp::metadata::publish_metadata(dir.path(), &meta).unwrap();
+
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Warn), "{}", result.detail);
+        assert!(
+            result.detail.contains("different builds"),
+            "must name the skew, got: {}",
+            result.detail
+        );
+    }
+
+    /// Same version AND same build is the only clean state.
+    #[test]
+    fn binary_parity_passes_when_the_build_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mati-bin");
+        std::fs::write(&target, "#!/bin/sh\necho 'mati 0.1.4'\n").unwrap();
+        fake_wrapper_execing(dir.path(), &target);
+        fake_daemon(dir.path(), "0.1.4");
+        let mut meta = mati_core::mcp::metadata::read_metadata(dir.path()).unwrap();
+        meta.build = mati_core::mcp::metadata::build_id_of(&target).unwrap();
+        mati_core::mcp::metadata::publish_metadata(dir.path(), &meta).unwrap();
+
+        let result = collect_binary_parity_check(dir.path(), dir.path());
+        assert!(matches!(result.status, Status::Pass), "{}", result.detail);
+    }
+
     fn fake_daemon(root: &Path, version: &str) {
         let mut meta = mati_core::mcp::metadata::DaemonMetadata::new(
             mati_core::mcp::metadata::DaemonOwner::Daemon,
@@ -1597,7 +1809,7 @@ mod tests {
     /// `version: 2` schema must keep both stable.
     ///
     /// `attestation/network` holds index 13, `enforcement/policy` index 14, and
-    /// `enforcement/binary parity` index 15.
+    /// `enforcement/binary parity` index 15. `enforcement/seal` appends at 17.
     /// Policy was added later (75bec3a) and originally landed before `network`,
     /// which pushed a published index. New checks append at the end so an
     /// index a consumer already relies on never moves.
@@ -1634,17 +1846,94 @@ mod tests {
                 ("enforcement", "policy"),
                 ("enforcement", "binary parity"),
                 ("knowledge", "gating"),
+                ("enforcement", "seal"),
             ],
             "doctor JSON check sequence must be the enforcement probes \
              (git_repo → mati_on_path → awk_float_math → agent_host → \
              claude_hooks → claude_config → codex_hooks → codex_config) then \
              ping → dirty_marker → drift → chain → freshness → network → policy \
-             → binary parity → gating (new checks append at the end so an index a \
-             consumer already relies on never moves)"
+             → binary parity → gating → seal (new checks append at the end so an \
+             index a consumer already relies on never moves)"
         );
         assert_eq!(report.version, 2);
     }
 
+    /// A manifest row whose file is gone strands the seal: the mode is lost
+    /// with the inode, so the row can only be dropped, never restored.
+    #[tokio::test]
+    async fn seal_row_warns_when_a_sealed_file_is_gone() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // Written as JSON, not through `write_manifest`, so the test reads the
+        // manifest the same way doctor does — off disk, in its on-disk form.
+        std::fs::write(
+            mati_core::seal::manifest_in(root.path()),
+            serde_json::json!({
+                "files": [{
+                    "path": repo.path().join("gone.rs").to_string_lossy(),
+                    "mode": "644",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let r = collect_seal_check(repo.path(), root.path()).await;
+        assert!(matches!(r.status, Status::Warn), "detail: {}", r.detail);
+        assert!(r.detail.contains("gone from disk"), "detail: {}", r.detail);
+        assert!(r.fix.unwrap().contains("mati seal remove"));
+    }
+
+    #[tokio::test]
+    async fn seal_row_is_info_when_nothing_is_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = collect_seal_check(dir.path(), dir.path()).await;
+        assert!(matches!(r.status, Status::Info));
+        assert_eq!(r.detail, "no files sealed");
+    }
+
+    fn summary(total: usize, drift: usize) -> crate::cli::stale::StaleSummary {
+        crate::cli::stale::StaleSummary {
+            total,
+            stale: total,
+            liability: 0,
+            tombstone: 0,
+            drift,
+        }
+    }
+
+    /// Drift alone must not render as a zero count. The general Warn arm used
+    /// to print "0 stale record(s) (0 stale, 0 liability, 0 tombstone)" above
+    /// a real drift finding, and pointed at `mati reparse`, which cannot clear
+    /// drift.
+    #[test]
+    fn freshness_reports_drift_without_claiming_a_zero_stale_count() {
+        let r = freshness_result(Some(summary(0, 1)));
+        assert!(matches!(r.status, Status::Warn));
+        assert!(
+            !r.detail.contains("0 stale record(s)"),
+            "detail was: {}",
+            r.detail
+        );
+        assert!(r
+            .detail
+            .contains("1 confirmed gotcha(s) describe changed code"));
+        assert!(r.fix.unwrap().contains("gotcha confirm"));
+    }
+
+    /// The clean and the stale-records paths are unchanged by the new arm.
+    #[test]
+    fn freshness_keeps_its_other_verdicts() {
+        let clean = freshness_result(Some(summary(0, 0)));
+        assert!(matches!(clean.status, Status::Pass));
+        assert_eq!(clean.detail, "no stale records");
+
+        let stale = freshness_result(Some(summary(3, 0)));
+        assert!(matches!(stale.status, Status::Warn));
+        assert!(stale.detail.contains("3 stale record(s)"));
+
+        assert!(matches!(freshness_result(None).status, Status::Info));
+    }
     /// Content drift rides on the existing `knowledge/freshness` detail rather
     /// than adding a check, so the `--json` array stays index-stable and does
     /// not collide with `integrity/drift`, which means derived-index drift.

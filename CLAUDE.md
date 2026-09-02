@@ -169,10 +169,12 @@ confidence < 0.3 OR quality < 0.4                            → allow, no injec
 
 Staleness tier gates injection, not the gotcha deny above — a qualifying
 gotcha denies at any tier, including `liability` and `tombstone`. The only
-enforcement bypass is a literal `FileDeleted` staleness signal: allow
-unconditionally, no injection. Absent that signal, `liability` degrades
-injection to a warning and `tombstone` excludes it, but the gotcha check
-still runs first.
+enforcement bypass is a literal `FileDeleted` staleness signal AND a caller
+that did not observe the path back on disk: allow, no injection. A caller
+that stats the path and finds it present falls through to the ordinary gotcha
+check instead of bypassing. Absent that signal, `liability` degrades injection
+to a warning and `tombstone` excludes it, but the gotcha check still runs
+first.
 
 Design principles (full set in ARCHITECTURE.md section 2): hook enforcement is primary
 (P1); inject nothing by default, pull on demand (P2); four MCP tools max (P3);
@@ -203,15 +205,22 @@ never block Claude on a mati outage — hooks fail open (P9).
   field is in seconds and defaults to 600 for command hooks.
 - **The bash `cat` bypass is a known, accepted miss (~2–5%).** `pre-bash.sh`
   catches `cat <file>` but not variable expansion, process substitution, or
-  unusual quoting (C9 in ARCHITECTURE.md section 24). Do not chase 100%.
+  unusual quoting (C9 in ARCHITECTURE.md section 24). The `Unobserved (no
+  path)` row in `mati stats` is an upper bound on it, not a measurement. Do
+  not chase 100%.
 - **Codex `apply_patch` edits are gated** by the `codex-pre-apply-patch` hook
   (ARCHITECTURE.md section 10.3): editing a file with an unconsulted confirmed gotcha
   is denied (exit 2) until `mem_get`. It parses the patch envelope for exact
   paths, so unlike the `cat` path it is immune to the wrapper/quoting bypass
   above. This rests on a documented Codex contract: `PreToolUse` intercepts
-  `apply_patch` and reports `tool_name: "apply_patch"`. Codex now has near-full
-  hook parity with Claude Code and supports `updatedInput`, which mati does not
-  use. It still fires no hook for its native file-read tool.
+  `apply_patch` and reports `tool_name: "apply_patch"`. Codex documents 11 hook
+  events and supports `updatedInput`, which mati does not use. This is NOT hook
+  parity with Claude Code: `PreToolUse` fires for four tools only — `shell`,
+  `unified_exec`, `apply_patch`, `mcp`. The docs table claims "other local
+  function tools" are covered; `openai/codex#20204` (open, checked 2026-08-31)
+  says they are not. Cite the tracker, not the table. Codex reads are gated
+  only through the shell path, for a sharper reason than "no hook on its read
+  tool" — ARCHITECTURE.md section 10.3 carries the measured account.
   Claude edits are covered PRIMARILY by the read gate (transitively): Claude
   Code's own read-before-edit rule forces a prior read, which the read gate gates,
   so a *naive* blind edit is stopped by Claude Code's "File must be read first"
@@ -237,6 +246,13 @@ never block Claude on a mati outage — hooks fail open (P9).
   `file:*.gotcha_keys` and `graph:edge:*:has_gotcha:*` are rebuilt from canonical
   `gotcha:*` records. If they disagree with the gotcha's `affected_files`, the
   gotcha record wins.
+- **`file:*` keys are worktree-relative, keyed off the discovering worktree.**
+  The file gate strips the cwd worktree's root off the accessed path. An
+  absolute read into a *sibling* linked worktree of the same clone is re-keyed
+  by `cross_worktree_rel_key` (`cli::hook_decide::path`): it canonicalizes and
+  strips the accessed worktree's root, then looks the repo-relative key up in
+  the unchanged (shared-slug) store. A symlink into a sibling worktree still
+  misses. See ARCHITECTURE.md 10.1a.
 - **The always-on `.claude/CLAUDE.md` stub carries only the read-gate.** It
   loads every session, so only proactive every-turn guidance belongs there
   (mem_get-before-read + a `/mati-enrich` pointer, ~130 tokens). Episodic

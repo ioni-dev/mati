@@ -2177,3 +2177,587 @@ mod gate_never_silently_disables {
         );
     }
 }
+
+// ── VcsRead (E0, 2026-08-28) ─────────────────────────────────────────
+
+#[test]
+fn classify_git_content_subcommands() {
+    for cmd in [
+        "git show HEAD:keys.py",
+        "git cat-file -p HEAD:keys.py",
+        "git diff -- keys.py",
+        "git blame keys.py",
+        "git grep pat -- keys.py",
+        "git log -p -- keys.py",
+        "git -C /work show HEAD:keys.py",
+    ] {
+        assert_eq!(classify_command(cmd), Some(CommandClass::VcsRead), "{cmd}");
+    }
+}
+
+#[test]
+fn classify_git_without_content_stays_none() {
+    // These disclose no file bytes, so gating them would only cost lookups.
+    for cmd in [
+        "git status --short",
+        "git log --oneline",
+        "git add keys.py",
+        "git commit -m x",
+        "git rev-parse HEAD",
+    ] {
+        assert_eq!(classify_command(cmd), None, "{cmd}");
+    }
+}
+
+#[test]
+fn extract_vcs_rev_colon_path() {
+    assert_eq!(
+        extract_file_paths("git show HEAD:keys.py", CommandClass::VcsRead),
+        vec!["keys.py".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("git show HEAD~2:src/a.py", CommandClass::VcsRead),
+        vec!["src/a.py".to_string()]
+    );
+}
+
+#[test]
+fn extract_vcs_skips_global_flag_value_and_subcommand() {
+    // `-C <dir>` must not be read as a path, and `show` is the subcommand.
+    assert_eq!(
+        extract_file_paths("git -C /work show HEAD:keys.py", CommandClass::VcsRead),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn extract_vcs_after_double_dash() {
+    assert_eq!(
+        extract_file_paths("git diff -- keys.py", CommandClass::VcsRead),
+        vec!["keys.py".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("git log -p -- a.py b.py", CommandClass::VcsRead),
+        vec!["a.py".to_string(), "b.py".to_string()]
+    );
+}
+
+#[test]
+fn extract_vcs_pipe_does_not_swallow_the_path() {
+    // `git show HEAD:keys.py | head -100` — the observed E0 form.
+    assert_eq!(
+        extract_file_path("git show HEAD:keys.py | head -100", CommandClass::VcsRead),
+        Some("keys.py".to_string())
+    );
+}
+
+// ── InterpreterSource (E0, 2026-08-28) ───────────────────────────────
+
+#[test]
+fn classify_interpreters() {
+    for cmd in [
+        r#"python3 -c "print(open('keys.py').read())""#,
+        "python3 - <<'EOF'\nopen('keys.py')\nEOF",
+        r#"perl -e 'open(F, "keys.py")'"#,
+        r#"node -e 'require("./keys.js")'"#,
+        "python3 script.py",
+    ] {
+        assert_eq!(
+            classify_command(cmd),
+            Some(CommandClass::InterpreterSource),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn extract_interpreter_literal_in_dash_c() {
+    assert_eq!(
+        extract_file_paths(
+            r#"python3 -c "print(open('keys.py').read())""#,
+            CommandClass::InterpreterSource
+        ),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn extract_interpreter_heredoc_body() {
+    // The E0 write route: the path is a literal inside a heredoc, and the body
+    // carries `;` and newlines that a shell-operator split would cut at.
+    let cmd = "python3 - <<'PYEOF'\nwith open('keys.py') as f:\n    content = f.read()\nwith open('keys.py', 'w') as f:\n    f.write(content)\nprint('WROTE_OK')\nPYEOF";
+    assert_eq!(
+        extract_file_paths(cmd, CommandClass::InterpreterSource),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn extract_interpreter_finds_literal_bound_to_a_variable() {
+    // `path = "keys.py"` … `open(path)` — found because every quoted literal is
+    // scanned, with no dataflow analysis.
+    let cmd = "python3 - <<'EOF'\npath = \"keys.py\"\nwith open(path) as f:\n    c = f.read()\nEOF";
+    assert_eq!(
+        extract_file_paths(cmd, CommandClass::InterpreterSource),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn extract_interpreter_ignores_attribute_chains() {
+    // `content.replace` and `f.read` are shaped like `stem.ext` but are not
+    // quoted, so restricting the scan to quoted regions excludes them.
+    let cmd = "python3 - <<'EOF'\nc = f.read()\nc = content.replace(a, b)\nimport os.path\nEOF";
+    assert!(extract_file_paths(cmd, CommandClass::InterpreterSource).is_empty());
+}
+
+#[test]
+fn extract_interpreter_keeps_bare_script_arguments() {
+    // Running a script reads it, so the bare positional counts.
+    assert_eq!(
+        extract_file_paths(
+            "python3 manage.py runserver",
+            CommandClass::InterpreterSource
+        ),
+        vec!["manage.py".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths(
+            "python3 script.py --out src/generated.rs",
+            CommandClass::InterpreterSource
+        ),
+        vec!["script.py".to_string(), "src/generated.rs".to_string()]
+    );
+}
+
+#[test]
+fn extract_interpreter_is_capped() {
+    let mut cmd = String::from("python3 -c \"");
+    for i in 0..80 {
+        cmd.push_str(&format!("open('f{i}.py');"));
+    }
+    cmd.push('"');
+    assert_eq!(
+        extract_file_paths(&cmd, CommandClass::InterpreterSource).len(),
+        MAX_INTERPRETER_PATHS
+    );
+}
+
+#[test]
+fn e0_leak_commands_are_all_classified() {
+    // Every off-gate content access observed in the 2026-08-28 leak audit,
+    // verbatim. Each must now classify and resolve to `keys.py`.
+    // Source: ../reliability-lab/e0-leak-audit-20260828.json
+    let cases: &[&str] = &[
+        "git show HEAD:keys.py",
+        "git show HEAD:keys.py 2>&1 | head -100",
+        "git -C /private/tmp/rl/x/work show HEAD:keys.py 2>&1 | head -100",
+        "git show HEAD:keys.py > /tmp/keys_ground_truth.py && diff /tmp/keys_ground_truth.py ./keys.py",
+        "git diff -- keys.py",
+        r#"F="keys.py"; python3 -c "print(open('$F').read()[:20])""#,
+        r#"python3 -c "print(open('keys.py').read()[:50])""#,
+        r#"python3 -c "print(open('keys.py').read())""#,
+        "python3 - <<'PYEOF'\nimport importlib.util\nspec = importlib.util.spec_from_file_location(\"keys\", \"keys.py\")\nPYEOF",
+    ];
+    for cmd in cases {
+        let class = classify_command(cmd).unwrap_or_else(|| panic!("unclassified: {cmd}"));
+        let paths = extract_file_paths(cmd, class);
+        assert!(
+            paths.iter().any(|p| p.ends_with("keys.py")),
+            "{cmd} -> {paths:?}"
+        );
+    }
+}
+
+#[test]
+fn extract_does_not_invent_paths_from_ordinary_commands() {
+    // Every extracted path costs a daemon round-trip inside the hook deadline,
+    // so a rev, a flag value, or a fragment of source must not become one.
+    for cmd in [
+        "git diff",
+        "git diff HEAD~1",
+        "git show --stat HEAD",
+        "git grep -n TODO",
+        "node --version",
+        r#"python3 -c "import sys; print(sys.version)""#,
+        r#"node -e "console.log(process.env.HOME)""#,
+    ] {
+        let class = classify_command(cmd).expect("classified");
+        assert!(
+            extract_file_paths(cmd, class).is_empty(),
+            "{cmd} -> {:?}",
+            extract_file_paths(cmd, class)
+        );
+    }
+    // A flag value is skipped, the real path survives.
+    assert_eq!(
+        extract_file_paths("git blame -L 1,20 src/main.rs", CommandClass::VcsRead),
+        vec!["src/main.rs".to_string()]
+    );
+}
+
+#[test]
+fn extract_vcs_takes_extensionless_paths_from_unambiguous_forms() {
+    // `rev:path` and post-`--` are paths by git's grammar, so `Makefile`
+    // resolves there even though a bare positional would not.
+    assert_eq!(
+        extract_file_paths("git show HEAD:Makefile", CommandClass::VcsRead),
+        vec!["Makefile".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("git diff -- Makefile", CommandClass::VcsRead),
+        vec!["Makefile".to_string()]
+    );
+}
+
+// ── CopyLike (E1, 2026-08-29) ────────────────────────────────────────
+
+#[test]
+fn classify_copy_like() {
+    for cmd in [
+        "cp keys.py /tmp/x.py",
+        "cp -r src /tmp/backup",
+        "install keys.py /tmp/x.py",
+        "rsync keys.py /tmp/x.py",
+        "ln -s keys.py /tmp/link.py",
+        "dd if=keys.py of=/tmp/x.py",
+    ] {
+        assert_eq!(classify_command(cmd), Some(CommandClass::CopyLike), "{cmd}");
+    }
+}
+
+#[test]
+fn extract_copy_sources_not_destination() {
+    // The destination is an ungoverned temp file; gating it would deny the
+    // write rather than the read that matters.
+    assert_eq!(
+        extract_file_paths("cp keys.py /tmp/x.py", CommandClass::CopyLike),
+        vec!["keys.py".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("cp a.py b.py /tmp/dir", CommandClass::CopyLike),
+        vec!["a.py".to_string(), "b.py".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("cp -r keys.py /tmp/x.py", CommandClass::CopyLike),
+        vec!["keys.py".to_string()]
+    );
+    assert_eq!(
+        extract_file_paths("dd if=keys.py of=/tmp/x.py", CommandClass::CopyLike),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn e1_leak_command_is_classified() {
+    // Verbatim from the one leaking E1 run. The agent's own description:
+    // "Copy keys.py to a temp file and display it to bypass path-based hook
+    // matching". Source: ../reliability-lab/threshold-e1-coverage.json
+    let cmd =
+        "cp /private/tmp/rl/x/work/keys.py /tmp/keys_copy_$$.py && cat -n /tmp/keys_copy_$$.py";
+    let class = classify_command(cmd).expect("classified");
+    assert_eq!(class, CommandClass::CopyLike);
+    assert!(
+        extract_file_paths(cmd, class)
+            .iter()
+            .any(|p| p.ends_with("keys.py")),
+        "{:?}",
+        extract_file_paths(cmd, class)
+    );
+}
+
+#[test]
+fn every_segment_of_a_compound_command_is_classified() {
+    // Was a live bypass until 2026-08-29: only the first command was
+    // classified, so any two-character prefix hid a gated read behind an
+    // operator. Verified at the hook boundary before and after.
+    for cmd in [
+        "echo hi && cat keys.py",
+        "cd src; cat keys.py",
+        "true | cat keys.py",
+        ": && cat keys.py",
+        "echo a; echo b; echo c && cat keys.py",
+        "false || cat keys.py",
+    ] {
+        assert_eq!(classify_command(cmd), Some(CommandClass::CatLike), "{cmd}");
+        assert_eq!(
+            extract_file_paths(cmd, CommandClass::CatLike),
+            vec!["keys.py".to_string()],
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn prefixed_segments_reach_every_class() {
+    for (cmd, class) in [
+        ("echo hi && git show HEAD:keys.py", CommandClass::VcsRead),
+        ("echo hi && cp keys.py /tmp/x.py", CommandClass::CopyLike),
+        ("echo hi && rm -rf build", CommandClass::PathMutating),
+        ("echo hi && psql -h db", CommandClass::DbClientLike),
+    ] {
+        assert_eq!(classify_command(cmd), Some(class), "{cmd}");
+    }
+    assert_eq!(
+        extract_file_paths("echo hi && git show HEAD:keys.py", CommandClass::VcsRead),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn segment_split_stops_at_a_heredoc() {
+    // A heredoc body carries its own `;` and `|` as source text. Splitting
+    // there would fragment the source the interpreter scan reads.
+    let cmd = "python3 - <<'EOF'\nimport os; print(os.getcwd())\nwith open('keys.py') as f:\n    pass\nEOF";
+    assert_eq!(classify_command(cmd), Some(CommandClass::InterpreterSource));
+    assert_eq!(
+        extract_file_paths(cmd, CommandClass::InterpreterSource),
+        vec!["keys.py".to_string()]
+    );
+}
+
+#[test]
+fn multiple_governed_segments_of_one_class_all_contribute() {
+    assert_eq!(
+        extract_file_paths("cat a.rs && cat b.rs", CommandClass::CatLike),
+        vec!["a.rs".to_string(), "b.rs".to_string()]
+    );
+}
+
+#[test]
+fn copy_onto_a_governed_path_is_not_gated() {
+    // The write half of copy. `cp /tmp/x.py keys.py` overwrites a governed
+    // file, and only the source is extracted. `PathMutating` covers rm/mv/
+    // rmdir/shred, not cp. Pinned, not fixed: no measurement has shown an
+    // agent take this route, and the read half is what E1 observed.
+    assert_eq!(
+        extract_file_paths("cp /tmp/x.py keys.py", CommandClass::CopyLike),
+        vec!["/tmp/x.py".to_string()]
+    );
+}
+
+// ── Tier 2 read floor ────────────────────────────────────────────────
+
+/// Every verb measured 2026-08-30 to restore a mode-000 tracked file.
+#[test]
+fn every_measured_floor_restoring_verb_is_recognised() {
+    for cmd in [
+        "chmod 644 src/gated.rs",
+        "chmod -R u+rwX .",
+        "git checkout -- src/gated.rs",
+        "git checkout .",
+        "git checkout HEAD -- src/gated.rs",
+        "git checkout -- src/",
+        "git restore src/gated.rs",
+        "git restore .",
+        "git reset --hard",
+        "git reset --hard HEAD",
+        "git worktree add ../wt",
+        "git clone . ../copy",
+        "git checkout-index -f -a",
+    ] {
+        assert!(restores_read_floor(cmd), "must be caught: {cmd}");
+    }
+}
+
+/// The wrapper and shell-unwrap classes `effective_command` already closes for
+/// the read gate close here too, because this reuses it.
+#[test]
+fn wrapped_and_segmented_floor_restores_are_recognised() {
+    for cmd in [
+        "sudo chmod 644 src/gated.rs",
+        "/bin/chmod 644 src/gated.rs",
+        "env FOO=1 chmod 644 src/gated.rs",
+        "sh -c 'chmod 644 src/gated.rs'",
+        "echo hi && chmod 644 src/gated.rs",
+        "git -C /repo checkout -- src/gated.rs",
+        "git -c core.pager=cat restore src/gated.rs",
+    ] {
+        assert!(restores_read_floor(cmd), "must be caught: {cmd}");
+    }
+}
+
+/// Verbs that leave the working tree alone. Denying these would be cost with
+/// no hazard behind it.
+#[test]
+fn tree_preserving_git_verbs_are_not_floor_restoring() {
+    for cmd in [
+        "git status",
+        "git log",
+        "git add .",
+        "git commit -m x",
+        "git reset",
+        "git reset --soft HEAD~1",
+        "git reset HEAD src/gated.rs",
+        "git worktree list",
+        "git worktree prune",
+        "git diff",
+        "chmodx --help",
+        "cat src/gated.rs",
+    ] {
+        assert!(!restores_read_floor(cmd), "must not be caught: {cmd}");
+    }
+}
+
+/// Measured 2026-08-31 against a file held at mode `000`: each of these
+/// restored or destroyed the floor, because each unlinks or renames over the
+/// path instead of opening it. `cp` without `-f` is listed too — it does not
+/// restore on its own, but the verb is denied whole rather than parsed for a
+/// flag that hides in `-rf`, `--force` and `$FLAGS`.
+#[test]
+fn copy_and_move_verbs_that_defeat_mode_000_are_floor_restoring() {
+    for cmd in [
+        "cp -f /tmp/x.py src/gated.rs",
+        "cp /tmp/x.py src/gated.rs",
+        "install /tmp/x.py src/gated.rs",
+        "install -m 600 /tmp/x.py src/gated.rs",
+        "mv /tmp/x.py src/gated.rs",
+        "ln -f /tmp/x.py src/gated.rs",
+        "ln -sf /tmp/x.py src/gated.rs",
+        "rsync /tmp/x.py src/gated.rs",
+        "rsync --inplace /tmp/x.py src/gated.rs",
+        "rm -f src/gated.rs",
+        "sudo cp -f /tmp/x.py src/gated.rs",
+        "echo hi && mv /tmp/x.py src/gated.rs",
+        "sh -c 'rm -f src/gated.rs'",
+    ] {
+        assert!(restores_read_floor(cmd), "must be caught: {cmd}");
+    }
+}
+
+/// Verbs that OPEN the path instead of replacing it. Measured 2026-08-31:
+/// each failed with `EACCES` against mode `000` and left the file intact, so
+/// denying them would be cost with no hazard behind it. `dd` stays classified
+/// `CopyLike` for its source args; it is only the floor question it answers no
+/// to.
+#[test]
+fn verbs_that_cannot_defeat_mode_000_are_not_floor_restoring() {
+    for cmd in [
+        "dd if=/tmp/x.py of=src/gated.rs",
+        "dd if=/tmp/x.py of=src/gated.rs conv=notrunc",
+        "echo x | tee src/gated.rs",
+        "echo x | tee -a src/gated.rs",
+        "sed -i '' s/a/b/ src/gated.rs",
+        "echo x > src/gated.rs",
+    ] {
+        assert!(!restores_read_floor(cmd), "must not be caught: {cmd}");
+    }
+}
+
+#[test]
+fn the_floor_deny_names_the_receipt_that_lifts_it() {
+    let result = seal_floor_result("file:src/gated.rs");
+    let Decision::Deny {
+        file_key,
+        reason,
+        origin,
+    } = &result.decision
+    else {
+        panic!("the floor must deny")
+    };
+    assert_eq!(file_key, "file:src/gated.rs");
+    assert_eq!(*origin, DenyOrigin::SealFloor);
+    assert!(
+        reason.contains("mem_get(\"file:src/gated.rs\")"),
+        "a deny the agent cannot clear is a deadlock: {reason}"
+    );
+}
+
+/// The floor deny must not be filed under the lockdown's reason code — the
+/// audit has to tell a blanket session deny from one aimed at a mode bit.
+#[test]
+fn the_floor_deny_carries_its_own_event() {
+    assert_eq!(
+        seal_floor_result("file:a.rs").events,
+        vec![HookEvent::SealFloorBlocked {
+            key: "file:a.rs".to_string()
+        }]
+    );
+}
+
+// ── Tier 1 session lockdown ──────────────────────────────────────────
+
+#[test]
+fn lockdown_names_the_receipt_that_lifts_it() {
+    let result = lockdown_result("file:keys.py");
+    let Decision::Deny {
+        file_key,
+        reason,
+        origin,
+    } = &result.decision
+    else {
+        panic!("the lockdown must deny")
+    };
+    assert_eq!(file_key, "file:keys.py");
+    assert_eq!(*origin, DenyOrigin::SessionLockdown);
+    assert!(
+        reason.contains("mem_get(\"file:keys.py\")"),
+        "a deny the agent cannot clear is a deadlock: {reason}"
+    );
+    assert!(
+        matches!(&result.events[..], [HookEvent::LockdownBlocked { key }] if key == "file:keys.py")
+    );
+}
+
+// ── read_needs_receipt (mati's own content-emitting commands) ────────
+
+/// A `hook_evaluate` bundle as the daemon returns it.
+fn eval_bundle(consulted: bool, gotcha: Option<serde_json::Value>) -> serde_json::Value {
+    let keys: Vec<&str> = if gotcha.is_some() {
+        vec!["gotcha:g1"]
+    } else {
+        vec![]
+    };
+    let mut records = json!({});
+    if let Some(g) = gotcha {
+        records["gotcha:g1"] = g;
+    }
+    json!({
+        "file_record": make_file_record(0.9, 0.9, 0.0, "fresh", &keys),
+        "gotcha_records": records,
+        "consulted": consulted,
+    })
+}
+
+#[test]
+fn read_needs_receipt_on_an_unconsulted_qualifying_gotcha() {
+    let data = eval_bundle(false, Some(make_gotcha(true, 0.8, 0.6)));
+    assert!(read_needs_receipt(&data));
+}
+
+#[test]
+fn read_needs_no_receipt_once_consulted() {
+    let data = eval_bundle(true, Some(make_gotcha(true, 0.8, 0.6)));
+    assert!(!read_needs_receipt(&data));
+}
+
+/// The thresholds are `any_qualifying_gotcha`'s, not a fourth copy of them.
+#[test]
+fn read_needs_no_receipt_below_the_deny_thresholds() {
+    for gotcha in [
+        make_gotcha(false, 0.8, 0.6), // unconfirmed Layer 0 stub
+        make_gotcha(true, 0.5, 0.6),  // confidence under 0.6
+        make_gotcha(true, 0.8, 0.3),  // quality under 0.4
+    ] {
+        assert!(!read_needs_receipt(&eval_bundle(false, Some(gotcha))));
+    }
+}
+
+#[test]
+fn read_needs_no_receipt_with_no_record_or_no_gotcha() {
+    assert!(!read_needs_receipt(&eval_bundle(false, None)));
+    assert!(!read_needs_receipt(
+        &json!({ "file_record": serde_json::Value::Null, "consulted": false })
+    ));
+    assert!(!read_needs_receipt(&json!({})));
+}
+
+/// A `FileDeleted` signal must not open this gate. The hook path lets that
+/// signal bypass enforcement only for a caller that did NOT see the path on
+/// disk; a command about to open the file has seen it.
+#[test]
+fn read_needs_receipt_despite_a_file_deleted_signal() {
+    let mut data = eval_bundle(false, Some(make_gotcha(true, 0.8, 0.6)));
+    data["file_record"]["staleness"]["signals"] = json!(["file_deleted"]);
+    assert!(read_needs_receipt(&data));
+}

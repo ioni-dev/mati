@@ -68,6 +68,16 @@ pub(super) async fn dispatch_session_side(
                 protocol::SessionEvent::PolicySteered => "analytics:policy_steer_",
                 protocol::SessionEvent::WrappedDbClientMiss => "compliance:wrapped_db_client_miss_",
                 protocol::SessionEvent::TombstoneBypassedDeny => "compliance:tombstone_bypass_",
+                // A lockdown deny IS a deny; the distinction lives in the
+                // event's decision_reason_code (session_lockdown).
+                protocol::SessionEvent::LockdownBlocked => "compliance:miss_",
+                // Same for the Tier 2 floor deny (seal_floor_restore).
+                protocol::SessionEvent::SealFloorBlocked => "compliance:miss_",
+                protocol::SessionEvent::SealBypassDetected => "compliance:seal_bypass_",
+                // Not a compliance outcome — nothing was denied and nothing
+                // was consulted. `analytics:` keeps it out of the hit/miss
+                // rate, whose denominator is accesses a gate actually saw.
+                protocol::SessionEvent::PathlessAllow => "analytics:pathless_allow_",
             };
             let agg_key = sess::today_key(agg_prefix);
 
@@ -335,6 +345,48 @@ pub(super) async fn dispatch_session_side(
                     )
                     .await;
                 }
+                protocol::SessionEvent::LockdownBlocked => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "session_lockdown".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::SealFloorBlocked => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::Deny,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "seal_floor_restore".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
+                protocol::SessionEvent::SealBypassDetected => {
+                    let _ = crate::store::enforcement::record_event_with_session(
+                        store,
+                        crate::store::enforcement::EnforcementEventType::BypassDetected,
+                        crate::store::enforcement::SubjectKind::File,
+                        input.key.clone(),
+                        "claude".to_string(),
+                        None,
+                        "seal_bypass".to_string(),
+                        input.decision_basis_hash.clone(),
+                        input.session_id.clone(),
+                    )
+                    .await;
+                }
                 // Record-only signal; reuse BypassDetected so the frozen hash
                 // contract needs no new EnforcementEventType or schema bump.
                 protocol::SessionEvent::UnclassifiedPolicyLiteralBypass => {
@@ -352,6 +404,25 @@ pub(super) async fn dispatch_session_side(
                     .await;
                 }
                 _ => {}
+            }
+
+            // Tier 1: arm the session lockdown. Every event here is a deny a
+            // consultation clears, so the marker names a key `mem_get` can
+            // settle. Best-effort, like the enforcement event above — a
+            // missing marker costs the lockdown, never the deny itself.
+            if matches!(
+                input.event,
+                protocol::SessionEvent::ComplianceMiss
+                    | protocol::SessionEvent::CodexShellBlocked
+                    | protocol::SessionEvent::EditBlocked
+                    | protocol::SessionEvent::FloorConsultMiss
+                    | protocol::SessionEvent::SealFloorBlocked
+                    // A detected bypass is stronger evidence than a deny: the
+                    // floor was actually crossed. The key it names is a file
+                    // key, so `mem_get` still clears the lockdown it arms.
+                    | protocol::SessionEvent::SealBypassDetected
+            ) {
+                let _ = sess::record_owed_receipt(store, &input.key, input.actor.as_deref()).await;
             }
 
             Response::ok(request_id, serde_json::Value::Null)
@@ -522,11 +593,14 @@ pub(super) async fn dispatch_session_side(
             Response::ok(request_id, serde_json::Value::Null)
         }
 
-        Command::SessionHarvest => {
+        Command::SessionHarvest(input) => {
             // SessionHarvest is inherently cross-tree (promotes gotchas in
             // knowledge, archives sessions). Delegate to existing logic which
             // commits its own per-step transactions, then write session-side audit.
-            let result = sess::session_harvest(store, &ctx.repo_root).await;
+            // `input.worktree` scopes the receipt cleanup to the ending worktree;
+            // `ctx.repo_root` is the daemon's, which may name a sibling worktree.
+            let result =
+                sess::session_harvest(store, &ctx.repo_root, input.worktree.as_deref()).await;
             let (accepted, error_code) = match &result {
                 Ok(()) => (true, None),
                 Err(_) => (false, Some(ErrorCode::StoreError)),
@@ -554,6 +628,15 @@ pub(super) async fn dispatch_session_side(
             // Silent scan+delete — no audit entry by design. Compaction wipes the
             // agent's memory, so clearing receipts is a maintenance action, not a
             // semantic mutation worth auditing. Fail-open on error (log, not crash).
+            //
+            // Tier 2 re-arms first, never after: a crash between the two must
+            // leave the file sealed with a live receipt, not open with none.
+            // This is also the session-boundary re-arm — `mati watch-paths`
+            // fires this command when the manifest is non-empty.
+            let rearmed = crate::seal::rearm_all(&store.root);
+            if !rearmed.is_empty() {
+                tracing::info!("re-armed {} sealed file(s) on receipt clear", rearmed.len());
+            }
             match sess::session_clear_consults(store).await {
                 Ok(()) => Response::ok(request_id, serde_json::Value::Null),
                 Err(e) => {

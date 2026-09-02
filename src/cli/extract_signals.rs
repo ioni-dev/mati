@@ -45,6 +45,8 @@ pub struct ExtractSignalsArgs {
 }
 
 pub async fn run(args: ExtractSignalsArgs) -> Result<()> {
+    crate::cli::consult_gate::require_consultation(&args.file).await?;
+
     let language = match args.language.as_deref() {
         Some(label) => parse_language_label(label)?,
         None => detect_language(&args.file),

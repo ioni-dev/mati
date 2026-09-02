@@ -247,7 +247,7 @@ pub fn db_client_host_glob_universe<'a>(
 }
 
 /// Clean repo-relative form: forward slashes, no leading `./` or `/`.
-fn normalize_rel(p: &str) -> String {
+pub(super) fn normalize_rel(p: &str) -> String {
     p.replace('\\', "/")
         .trim_start_matches("./")
         .trim_start_matches('/')
@@ -257,7 +257,7 @@ fn normalize_rel(p: &str) -> String {
 /// Files a gotcha covers beyond `target` (normalized) — the blast radius of
 /// (un)protecting through its per-gotcha crown-jewel tag. Empty for a
 /// single-file gotcha; callers require `--yes` when it is non-empty.
-fn blast_radius(target: &str, affected_files: &[String]) -> Vec<String> {
+pub(super) fn blast_radius(target: &str, affected_files: &[String]) -> Vec<String> {
     affected_files
         .iter()
         .map(|f| normalize_rel(f))
@@ -268,7 +268,7 @@ fn blast_radius(target: &str, affected_files: &[String]) -> Vec<String> {
 /// Resolve a repo-relative path to an absolute, canonical path UNDER `repo_root`.
 /// Returns `None` if it resolves outside the repo (safety: a gotcha must never
 /// deny `~` / `/etc` and brick the agent's shell).
-fn resolve_under_repo(repo_root: &Path, rel: &str) -> Option<PathBuf> {
+pub(super) fn resolve_under_repo(repo_root: &Path, rel: &str) -> Option<PathBuf> {
     let resolved = canonicalize_lenient(&repo_root.join(rel))?;
     resolved.starts_with(repo_root).then_some(resolved)
 }
@@ -1091,7 +1091,7 @@ fn settings_array<'a>(root: &'a Value, path: &[&str], key: &str) -> Option<&'a V
     cur.get(key)?.as_array()
 }
 
-fn add_tags(tags: &mut Vec<String>, add: &[&str]) {
+pub(super) fn add_tags(tags: &mut Vec<String>, add: &[&str]) {
     for t in add {
         if !tags.iter().any(|x| x == t) {
             tags.push((*t).to_string());
@@ -1099,7 +1099,7 @@ fn add_tags(tags: &mut Vec<String>, add: &[&str]) {
     }
 }
 
-fn remove_tags(tags: &mut Vec<String>, rm: &[&str]) {
+pub(super) fn remove_tags(tags: &mut Vec<String>, rm: &[&str]) {
     tags.retain(|t| !rm.iter().any(|r| r == t));
 }
 

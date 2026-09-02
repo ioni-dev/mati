@@ -1919,3 +1919,151 @@ fn watched_rel_path_falls_back_for_a_missing_leaf() {
         Some("src/gone.rs")
     );
 }
+
+// ── Tier 1 session lockdown ─────────────────────────────────────────────────
+
+#[test]
+fn a_lockdown_deny_is_recorded_as_its_own_event() {
+    use mati_core::mcp::protocol as p;
+    let cmd = session_command(
+        &HookEvent::LockdownBlocked {
+            key: "file:keys.py".into(),
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("a lockdown deny must be recorded");
+    match cmd {
+        p::Command::SessionLog(input) => {
+            assert_eq!(input.event, p::SessionEvent::LockdownBlocked);
+            assert_eq!(input.key, "file:keys.py");
+        }
+        other => panic!("expected SessionLog, got {other:?}"),
+    }
+}
+
+#[test]
+fn codex_records_a_lockdown_deny_as_a_codex_block() {
+    // Attribution outranks reason-code granularity: SessionEvent is the only
+    // thing that tells the audit chain which platform blocked, and a deny
+    // attributed to the wrong agent is a falsified chain.
+    let events = vec![HookEvent::LockdownBlocked {
+        key: "file:keys.py".into(),
+    }];
+    let decision = decide::lockdown_result("file:keys.py").decision;
+    let result = platform_events(HookVariant::CodexPreBash, &decision, events);
+    assert!(matches!(
+        &result[..],
+        [HookEvent::CodexShellBlocked { key }] if key == "file:keys.py"
+    ));
+}
+
+#[test]
+fn the_bash_gate_denies_under_lockdown_and_says_how_to_lift_it() {
+    let decision = decide::lockdown_result("file:keys.py").decision;
+    let (stdout, _stderr, exit_code) =
+        format_decision(HookVariant::ClaudePreBash, &decision, "file:keys.py");
+    assert_eq!(exit_code, 0);
+    assert!(stdout.contains(r#""permissionDecision":"deny""#));
+    assert!(stdout.contains(r#"mem_get(\"file:keys.py\")"#));
+
+    // Codex denies on the exit code, and needs the same instruction on stderr.
+    let (_stdout, stderr, exit_code) =
+        format_decision(HookVariant::CodexPreBash, &decision, "file:keys.py");
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("mem_get(\"file:keys.py\")"));
+}
+
+#[test]
+fn the_read_gate_denies_under_lockdown_and_keeps_the_event() {
+    // `Grep`/`Glob` disclose a denied file's content without naming it, so the
+    // lockdown covers the read gate too — deny on stdout, event kept for the chain.
+    let result = decide::lockdown_result("file:keys.py");
+    let (stdout, stderr, exit_code) =
+        format_decision(HookVariant::ClaudePreRead, &result.decision, "file:keys.py");
+    assert_eq!(exit_code, 0);
+    assert!(stderr.is_empty());
+    assert!(stdout.contains(r#""permissionDecision":"deny""#));
+    assert!(stdout.contains(r#"mem_get(\"file:keys.py\")"#));
+
+    let events = platform_events(HookVariant::ClaudePreRead, &result.decision, result.events);
+    assert!(matches!(
+        &events[..],
+        [HookEvent::LockdownBlocked { key }] if key == "file:keys.py"
+    ));
+}
+
+// ── PathlessAllow ───────────────────────────────────────────────────────────
+
+/// The event exists to measure the surface enforcement never saw, so it must
+/// reach the daemon as its own `SessionEvent` rather than folding into `Miss`
+/// (which counts lookups a gate did make).
+#[test]
+fn a_pathless_allow_records_its_own_session_event() {
+    let cmd = session_command(
+        &decide::HookEvent::PathlessAllow {
+            key: "pathless:claude-bash".into(),
+        },
+        Some("sess-1"),
+        None,
+        Some("wt-abc"),
+        Some("basis-hash"),
+    );
+    let Some(mati_core::mcp::protocol::Command::SessionLog(input)) = cmd else {
+        panic!("a path-less allow must record a SessionLog, got {cmd:?}");
+    };
+    assert_eq!(
+        input.event,
+        mati_core::mcp::protocol::SessionEvent::PathlessAllow
+    );
+    assert_eq!(input.key, "pathless:claude-bash");
+    assert_eq!(input.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(input.actor.as_deref(), Some("wt-abc"));
+    // No file record was read, so there is no gotcha state to digest. A hash
+    // here would claim a decision basis the gate never had.
+    assert_eq!(input.decision_basis_hash, None);
+}
+
+/// The key names the surface, not the command. Low cardinality is the point:
+/// the daily aggregate caps its key list, and the question is which tool
+/// escapes the file gate.
+#[test]
+fn the_pathless_key_names_the_surface_not_the_command() {
+    for (variant, want) in [
+        (HookVariant::ClaudePreBash, "pathless:claude-bash"),
+        (HookVariant::CodexPreBash, "pathless:codex-bash"),
+        (HookVariant::ClaudePreRead, "pathless:claude-read"),
+    ] {
+        assert_eq!(flows::pathless_surface_key(variant), want, "{variant:?}");
+    }
+}
+
+/// The extensionless guard the bash `case` block carried: `Dockerfile` is a
+/// real file and must still be checked, while a bare word that is not on disk
+/// was never a path and must not reach the daemon.
+#[test]
+fn an_extensionless_name_counts_only_when_it_is_really_on_disk() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    std::fs::write(repo.path().join("Dockerfile"), "FROM rust:1.80").expect("write");
+
+    assert!(flows::names_a_file(
+        "Dockerfile",
+        repo.path(),
+        Some(repo.path())
+    ));
+    assert!(!flows::names_a_file(
+        "notafile",
+        repo.path(),
+        Some(repo.path())
+    ));
+    assert!(
+        flows::names_a_file("src/main.rs", repo.path(), Some(repo.path())),
+        "a separator alone makes it a path"
+    );
+    assert!(
+        flows::names_a_file("Cargo.toml", repo.path(), Some(repo.path())),
+        "an extension alone makes it a path"
+    );
+}

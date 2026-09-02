@@ -10,6 +10,15 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_mati")
 }
 
+/// Run `mati` with daemon auto-spawn off, forcing `StoreProxy` down its
+/// direct-open branch (the same lever `tests/suggest_cli.rs` uses).
+///
+/// Without it `mati ls` spawns a daemon and waits on `ensure_daemon`, whose
+/// `Wedged` threshold is 15s. Under a loaded suite that spawn misses the
+/// window, `ls` exits 1 with empty stdout, and a count over that stdout reads
+/// as "no candidate" — a dead read wearing an idempotency failure's clothes.
+/// `init` opens the store directly and never spawns, so nothing here needs a
+/// daemon at all; the store is the only thing under test.
 fn run_in(dir: &Path, args: &[&str]) -> std::process::Output {
     // Redirect the store off the developer's real ~/.mati (inherited by the
     // spawned `mati`). Set before the first spawn; idempotent thereafter.
@@ -17,8 +26,24 @@ fn run_in(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         .args(args)
         .current_dir(dir)
+        .env("MATI_DISABLE_AUTO_SPAWN", "1")
         .output()
         .expect("run mati")
+}
+
+/// `mati ls gotchas`, with the exit status checked.
+///
+/// Counting matches in the stdout of an unchecked `ls` cannot tell "the record
+/// is absent" from "the read failed", and the two want opposite fixes.
+fn list_gotchas(dir: &Path) -> String {
+    let out = run_in(dir, &["ls", "gotchas"]);
+    assert!(
+        out.status.success(),
+        "`mati ls gotchas` failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn git(dir: &Path, args: &[&str]) -> bool {
@@ -34,9 +59,8 @@ fn git(dir: &Path, args: &[&str]) -> bool {
 fn init_proposes_codeowners_candidate_idempotently() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
-    // Panic-safety net: the explicit `daemon stop` calls below are a
-    // functional requirement (re-init needs the store lock released), not
-    // just cleanup, so a panic between them would still leak a daemon.
+    // Nothing below spawns a daemon, but a leaked one would hold the store
+    // lock and break every later run against this home, so keep the net.
     common::isolate_mati_home();
     let _daemon_guard = common::DaemonGuard::for_mati_home(dir, common::mati_home());
     if !git(dir, &["init", "-q"]) {
@@ -67,34 +91,33 @@ fn init_proposes_codeowners_candidate_idempotently() {
         return;
     }
 
-    let ls = run_in(dir, &["ls", "gotchas"]);
-    assert!(ls.status.success());
-    let listed = String::from_utf8_lossy(&ls.stdout);
+    let listed = list_gotchas(dir);
     let count = listed.matches("codeowners:src/payments/**").count();
     assert_eq!(
         count, 1,
         "init should propose exactly one CODEOWNERS candidate; got:\n{listed}"
     );
 
-    // `ls gotchas` above went through StoreProxy -> ensure_daemon, which
-    // spawned a daemon that now holds the store's exclusive lock. `init`
-    // needs exclusive access (SurrealKV is single-writer), so it refuses
-    // while that daemon is up — stop it first, same remediation `mati init`
-    // itself prints when it detects the lock.
-    assert!(run_in(dir, &["daemon", "stop"]).status.success());
+    // Touch the owned file so the second init's mtime check re-parses it.
+    // Without this, `Mtime+parse (incremental)` skips all 3 files, the repo
+    // file list reaches `build_codeowners_candidates` empty, and no candidate
+    // is generated at all — so the assertion below would hold no matter what
+    // the de-duplication does.
+    std::fs::write(dir.join("src/payments/stripe.rs"), "fn charge(n: u32) {}\n").unwrap();
 
-    // Re-init must not duplicate it.
+    // Re-init must not duplicate it. No `daemon stop` in between: with
+    // auto-spawn disabled the `ls` above direct-opened the store and released
+    // the lock when it exited, so `init` still gets exclusive access.
     let reinit = run_in(dir, &["init"]);
     assert!(
         reinit.status.success(),
         "re-init failed: {}",
         String::from_utf8_lossy(&reinit.stderr)
     );
-    let again = run_in(dir, &["ls", "gotchas"]);
-    let count2 = String::from_utf8_lossy(&again.stdout)
-        .matches("codeowners:src/payments/**")
-        .count();
-    assert_eq!(count2, 1, "re-init must be idempotent (no duplicate)");
-
-    let _ = run_in(dir, &["daemon", "stop"]);
+    let again = list_gotchas(dir);
+    let count2 = again.matches("codeowners:src/payments/**").count();
+    assert_eq!(
+        count2, 1,
+        "re-init must be idempotent (no duplicate); got:\n{again}"
+    );
 }

@@ -19,6 +19,43 @@ const DB_CLIENT_LIKE: &[&str] = &[
 ];
 const PATH_MUTATING: &[&str] = &["rm", "mv", "rmdir", "shred"];
 
+/// Git subcommands that put file content in front of the agent. `status`,
+/// bare `log`, and `add` disclose none and stay unclassified. Measured
+/// 2026-08-28: `git show` was 41% of all off-gate content reads.
+const VCS_CONTENT_SUBCOMMANDS: &[&str] = &["show", "cat-file", "diff", "blame", "grep"];
+
+/// Git global flags that consume the following token, so it is not the
+/// subcommand: `git -C dir show …`, `git -c k=v show …`.
+pub(super) const GIT_VALUE_FLAGS: &[&str] =
+    &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+
+/// Commands whose SOURCE arguments are reads. Measured 2026-08-29 (E1): an
+/// agent copied a gated file to /tmp and read the copy, describing it as "to
+/// bypass path-based hook matching". `cp` was already named in the design as a
+/// WRITE onto a governed path; the source side is the half that leaked.
+const COPY_LIKE: &[&str] = &["cp", "install", "ln", "rsync", "dd"];
+
+/// Copy- and move-like verbs that return a sealed file to a readable state.
+///
+/// Measured 2026-08-31 against a file held at mode `000`: `cp -f`, `install`,
+/// `mv`, `ln -f`, `ln -sf`, `rsync` (plain, `-I` and `--inplace`) and `rm`
+/// each restored or destroyed the floor, because each one unlinks or renames
+/// over the path rather than opening it. Plain `cp`, `cp -p`, `cp -a`, `dd`
+/// (including `conv=notrunc`), `tee`, `tee -a`, `sed -i`, a `>` redirect and
+/// `open(p, "w")` all failed with `EACCES` and are deliberately absent.
+///
+/// `cp` restores only with `-f`, but the verb is denied whole rather than
+/// parsed for a flag: `-f` hides in `-rf`, `--force` and `$FLAGS`, and the
+/// cost of the false positive is one `mem_get`.
+const FLOOR_RESTORING_COPY: &[&str] = &["cp", "install", "ln", "mv", "rsync", "rm"];
+
+/// Interpreters that read a file named by a string literal in their source
+/// rather than by an argument. Measured 2026-08-28: 47% of off-gate content
+/// accesses went through `python3`.
+const INTERPRETER_WORDS: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "php",
+];
+
 pub(super) const ACTION_TOOL_DB_CLIENT: &str = "db_client";
 pub(super) const ACTION_TOOL_FILE_READ: &str = "file_read";
 pub(super) const ACTION_TOOL_PATH: &str = "path";
@@ -205,8 +242,44 @@ pub fn effective_command_for_fuzzing(cmd: &str) -> String {
     effective_command(cmd)
 }
 
+/// Does this `git` invocation run a content-disclosing subcommand? Walks the
+/// global flags to find the subcommand word. `log` counts only with a patch
+/// flag, since bare `git log` shows messages, not content.
+fn is_content_disclosing_git(eff: &str) -> bool {
+    let tokens = shell_tokens(eff);
+    let mut i = 1;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if GIT_VALUE_FLAGS.contains(&tok) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if tok == "log" {
+            return tokens[i + 1..]
+                .iter()
+                .any(|t| t == "-p" || t == "-u" || t == "--patch" || t.starts_with("-U"));
+        }
+        return VCS_CONTENT_SUBCOMMANDS.contains(&tok);
+    }
+    false
+}
+
 /// Classify a bash command string. Returns `None` for non-file-read commands.
+///
+/// Every shell segment is classified, and the first governed one wins: a gated
+/// read hidden behind `echo hi &&` is caught (measured 2026-08-29). Escalate-
+/// only — a command with several governed segments reports the first class,
+/// and [`extract_file_paths`] then gathers paths from every segment of it.
 pub fn classify_command(cmd: &str) -> Option<CommandClass> {
+    shell_segments(cmd).into_iter().find_map(classify_segment)
+}
+
+/// Classify ONE shell segment.
+fn classify_segment(cmd: &str) -> Option<CommandClass> {
     let eff = effective_command(cmd);
     let trimmed = eff.as_str();
     for &word in CAT_LIKE {
@@ -229,7 +302,89 @@ pub fn classify_command(cmd: &str) -> Option<CommandClass> {
             return Some(CommandClass::PathMutating);
         }
     }
+    if matches_command_word(trimmed, "git") && is_content_disclosing_git(trimmed) {
+        return Some(CommandClass::VcsRead);
+    }
+    for &word in INTERPRETER_WORDS {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::InterpreterSource);
+        }
+    }
+    for &word in COPY_LIKE {
+        if matches_command_word(trimmed, word) {
+            return Some(CommandClass::CopyLike);
+        }
+    }
     None
+}
+
+/// Git subcommands that return a sealed file to a readable state, or
+/// materialise a second readable copy of the worktree.
+///
+/// Measured 2026-08-30 against a tracked file held at mode `000`: each of
+/// these restored access. `git checkout -- <path>`, `git checkout .`,
+/// `git checkout HEAD -- <path>`, `git checkout -- <dir>`, `git restore
+/// <path>`, `git restore .` and `git reset --hard` all rewrote the file at
+/// its committed mode; `git worktree add` and `git clone` produced a second
+/// tree whose copy was readable. `git checkout-index -f -a` was found by
+/// probing the list itself and restored too — it is a separate command word,
+/// so `checkout` alone did not cover it.
+///
+/// Two forms that do NOT restore are denied anyway, because both already fail
+/// on their own and the deny only substitutes a clear message for a confusing
+/// one: a bare `git checkout <branch>` aborts with "local changes to the
+/// following files would be overwritten", whether or not the branches differ
+/// on the file, and `git stash` fails with `open(...): Permission denied`.
+const FLOOR_RESTORING_GIT: &[&str] = &["checkout", "checkout-index", "restore", "clone"];
+
+/// Does this command return a sealed file to a readable state?
+///
+/// Asks about the verb only, never about which path the verb will touch. The
+/// path question is undecidable in the direction that matters — `chmod -R
+/// u+rwX .` names no sealed file and restores every one of them — so the gate
+/// that consumes this asks the decidable question instead: is anything sealed
+/// whose receipt is outstanding. Same reasoning as [`super::lockdown_result`].
+pub fn restores_read_floor(cmd: &str) -> bool {
+    shell_segments(cmd).iter().any(|s| segment_restores(s))
+}
+
+fn segment_restores(cmd: &str) -> bool {
+    let eff = effective_command(cmd);
+    if matches_command_word(&eff, "chmod") {
+        return true;
+    }
+    if FLOOR_RESTORING_COPY
+        .iter()
+        .any(|w| matches_command_word(&eff, w))
+    {
+        return true;
+    }
+    if !matches_command_word(&eff, "git") {
+        return false;
+    }
+    let tokens = shell_tokens(&eff);
+    let mut i = 1;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if GIT_VALUE_FLAGS.contains(&tok) {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        return match tok {
+            // `--soft` and `--mixed` leave the working tree alone; only a
+            // tree-updating reset restores. `--merge` and `--keep` also update
+            // it and were not probed, so they are left out rather than guessed.
+            "reset" => tokens[i + 1..].iter().any(|t| t == "--hard"),
+            // Only `add` materialises a tree; `list`, `prune`, `remove` do not.
+            "worktree" => tokens.get(i + 1).is_some_and(|t| t == "add"),
+            other => FLOOR_RESTORING_GIT.contains(&other),
+        };
+    }
+    false
 }
 
 /// Return whether a command performs an allowlisted database schema

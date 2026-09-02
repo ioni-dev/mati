@@ -478,8 +478,9 @@ impl StalenessAnalyzer {
         // ── 5-factor computation ────────────────────────────────────────────
         let time_f = time_factor(record, self.now);
 
+        let git_paths = Self::git_paths_for(record);
         let (git_f, new_sha) =
-            self.git_factor_for(&record.key, &record.staleness.last_record_sha, deadline);
+            self.git_factor_for(&git_paths, &record.staleness.last_record_sha, deadline);
 
         let semantic_f = semantic_factor();
 
@@ -553,7 +554,7 @@ impl StalenessAnalyzer {
     /// A poisoned lock yields no git signal rather than a panic.
     pub(super) fn git_factor_for(
         &self,
-        key: &str,
+        paths: &[String],
         last_record_sha: &str,
         deadline: Instant,
     ) -> (f32, Option<String>) {
@@ -563,8 +564,65 @@ impl StalenessAnalyzer {
         let Ok(repo) = mutex.lock() else {
             return (0.0, None);
         };
-        let path = key.strip_prefix("file:").unwrap_or(key);
-        self.git_factor(&repo, path, last_record_sha, deadline)
+
+        // Worst path wins: a rule is as stale as the most-churned file it
+        // describes. Averaging would let one quiet file mask a rewritten one.
+        //
+        // The baseline may only advance on a pass that actually looked at every
+        // path. Advancing it after a deadline cut the loop short would move
+        // `last_record_sha` to HEAD while some file's churn was never examined,
+        // and the next pass would diff from the new baseline — erasing that
+        // churn permanently rather than merely undercounting it once.
+        let mut worst = 0.0_f32;
+        let mut baseline = None;
+        let mut complete = true;
+        let mut seen = 0usize;
+        for path in paths.iter().filter(|p| !Self::is_glob(p)) {
+            let (factor, new_sha) = self.git_factor(&repo, path, last_record_sha, deadline);
+            worst = worst.max(factor);
+            seen += 1;
+            if baseline.is_none() {
+                baseline = new_sha;
+            }
+            // Saturated: no remaining path can raise the factor, so the pass is
+            // as complete as it needs to be.
+            if worst >= 1.0 {
+                return (worst, baseline);
+            }
+            if Instant::now() >= deadline {
+                complete = seen == paths.iter().filter(|p| !Self::is_glob(p)).count();
+                break;
+            }
+        }
+        (worst, if complete { baseline } else { None })
+    }
+
+    /// `affected_files` may hold a glob (`src/payments/**`). git resolves a
+    /// path, not a pattern, so a glob can only ever return "not in tree" —
+    /// skip it rather than spend a lookup and count it toward completeness.
+    fn is_glob(path: &str) -> bool {
+        path.contains(['*', '?', '['])
+    }
+
+    /// The files a record's git factor is measured against.
+    ///
+    /// A `file:` key IS its path; a gotcha names the files its rule describes.
+    /// Deriving the path from the key alone handed git the literal string
+    /// `gotcha:<slug>`, which is in no tree, so the 0.35-weighted factor was
+    /// silently 0.0 for every gotcha no matter how hard its file churned.
+    ///
+    /// Everything else yields no paths and so no git signal: `dep:` and
+    /// `dev_note:` carry none, and a `decision:` record — which does carry
+    /// `affected_files` — has no `rule`/`reason`/`severity`, so it cannot
+    /// deserialize as a `GotchaRecord` and stays at 0.0 as it did before.
+    pub(super) fn git_paths_for(record: &Record) -> Vec<String> {
+        if let Some(path) = record.key.strip_prefix("file:") {
+            return vec![path.to_string()];
+        }
+        record
+            .payload_as::<GotchaRecord>()
+            .map(|g| g.affected_files)
+            .unwrap_or_default()
     }
 
     /// Two-phase git factor:

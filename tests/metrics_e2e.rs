@@ -44,12 +44,13 @@ impl Drop for ChildGuard {
     }
 }
 
-// CI-QUARANTINED (WI-21): this races deterministically on the CI runners —
-// `mati doctor --internal --json` is queried before the daemon's metrics
-// snapshot is initialized, so `version` comes back `None`. Excluded from the
-// gating "Ignored integration tests" job via `-E` in ci.yml until the test
-// waits for metrics readiness before snapshotting. Still runs (and passes)
-// locally.
+// History: two earlier fragilities, both now closed. (1) `version` came back
+// `None` because the snapshot was queried before `metrics::init()` — post-γ,
+// init runs before the accept loop (start.rs), so a served request always sees
+// an initialized snapshot. (2) The pings raced the daemon's session fence
+// during the bind-before-publish window, inflating the count and error total;
+// the fence now serves a nil request session (dispatch_v2), so a just-bound
+// daemon answers cleanly. Left `#[ignore]` (spawns subprocesses, writes ~/).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn metrics_snapshot_reflects_dispatch_traffic() {
@@ -167,10 +168,15 @@ async fn metrics_snapshot_reflects_dispatch_traffic() {
         .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("ping"))
         .expect("ping command must appear in the snapshot");
 
-    assert_eq!(
-        ping.get("count").and_then(|v| v.as_u64()),
-        Some(PING_COUNT),
-        "ping count must match the number of pings we fired",
+    // At least the pings we fired — never exactly. `mati serve` startup runs
+    // `ensure_daemon`, whose readiness/reachability probe pings the daemon over
+    // the same socket, and that ping is recorded too. Asserting `== PING_COUNT`
+    // is a rigid assumption that the harness fires the only pings; assert the
+    // floor, matching the `total_calls > PING_COUNT` check above.
+    let ping_count = ping.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+    assert!(
+        ping_count >= PING_COUNT,
+        "ping count must be at least the {PING_COUNT} pings we fired (got {ping_count})",
     );
     assert_eq!(
         ping.get("error_count").and_then(|v| v.as_u64()),

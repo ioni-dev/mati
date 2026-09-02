@@ -18,6 +18,7 @@ impl Command {
             Self::HistorySince(_) => "history_since",
             Self::SessionCheckConsulted(_) => "session_check_consulted",
             Self::SessionCheckConsultedRecent(_) => "session_check_consulted_recent",
+            Self::SessionOwedReceipt(_) => "session_owed_receipt",
             Self::MemQuery(_) => "mem_query",
             Self::ScanEnforcementEvents(_) => "scan_enforcement_events",
             Self::ScanEnforcementEventsWithSkips(_) => "scan_enforcement_events_with_skips",
@@ -42,7 +43,7 @@ impl Command {
             Self::ConsultationHit(_) => "consultation_hit",
             Self::PolicyShadowObserve(_) => "policy_shadow_observe",
             Self::SessionFlush => "session_flush",
-            Self::SessionHarvest => "session_harvest",
+            Self::SessionHarvest(_) => "session_harvest",
             Self::SessionClearConsults => "session_clear_consults",
             Self::SubagentHarvest(_) => "subagent_harvest",
             Self::SubagentSpawned(_) => "subagent_spawned",
@@ -85,12 +86,13 @@ impl Command {
             Self::SandboxAudit(i) => &i.setting,
             Self::Ping
             | Self::Metrics
+            | Self::SessionOwedReceipt(_)
             | Self::MemBootstrap(_)
             | Self::ScanEnforcementEvents(_)
             | Self::ScanEnforcementEventsWithSkips(_)
             | Self::ScanEnforcementEventsSinceMs(_)
             | Self::SessionFlush
-            | Self::SessionHarvest
+            | Self::SessionHarvest(_)
             | Self::SessionClearConsults
             | Self::SubagentHarvest(_)
             | Self::SubagentSpawned(_)
@@ -129,7 +131,7 @@ impl Command {
             | Self::ConfigSet(_)
             | Self::SandboxAudit(_)
             | Self::SessionFlush
-            | Self::SessionHarvest
+            | Self::SessionHarvest(_)
             | Self::SessionClearConsults
             | Self::SubagentHarvest(_)
             | Self::SubagentSpawned(_)
@@ -211,11 +213,14 @@ pub fn v1_to_v2_command(cmd: &str, args: &serde_json::Value) -> serde_json::Valu
             "since_ts": args.get("since_ts").and_then(|v| v.as_u64()).unwrap_or(0),
             "limit": args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50),
         }),
-        "session_check_consulted" => json!({"type": "session_check_consulted", "key": args["key"]}),
+        "session_check_consulted" => {
+            json!({"type": "session_check_consulted", "key": args["key"], "actor": args["actor"]})
+        }
         "session_check_consulted_recent" => json!({
             "type": "session_check_consulted_recent",
             "key": args["key"],
             "ttl_secs": args.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(900),
+            "actor": args["actor"],
         }),
         "mem_query" => json!({
             "type": "mem_query",

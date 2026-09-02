@@ -115,6 +115,12 @@ fn classify_confirm_elicitation(
 #[derive(Clone)]
 pub struct MatiServer {
     root: PathBuf,
+    /// The repository working directory this session was launched in, kept so
+    /// the decision path can check whether a file carrying a `FileDeleted`
+    /// signal is actually back on disk. `root` is `~/.mati/<slug>/` and cannot
+    /// answer that. Computed once from `mati serve`'s launch cwd, which never
+    /// changes afterward — the same assumption `worktree_tag` already makes.
+    repo_root: PathBuf,
     /// This process's worktree scope, computed once from `mati serve`'s own
     /// launch cwd (see `worktree_scope_tag`). `None` outside a git repo.
     worktree_tag: Option<String>,
@@ -123,9 +129,14 @@ pub struct MatiServer {
 
 impl MatiServer {
     /// Construct a socket-backed proxy rooted at `~/.mati/<slug>/`.
-    pub fn with_socket_root(root: PathBuf, worktree_tag: Option<String>) -> Self {
+    pub fn with_socket_root(
+        root: PathBuf,
+        repo_root: PathBuf,
+        worktree_tag: Option<String>,
+    ) -> Self {
         Self {
             root,
+            repo_root,
             worktree_tag,
             tool_router: Self::tool_router(),
         }
@@ -283,7 +294,7 @@ impl MatiServer {
         .to_string()
     }
 
-    fn hook_decision_body(eval: serde_json::Value) -> String {
+    fn hook_decision_body(&self, eval: serde_json::Value) -> String {
         let file_key = eval
             .get("file_key")
             .and_then(|v| v.as_str())
@@ -304,7 +315,15 @@ impl MatiServer {
                 .get("consulted")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
-            file_exists: None,
+            // Only stat when the record actually carries the signal — the
+            // common path must pay nothing. `Err` stays `None` so an
+            // ambiguous stat fails open into the signal-alone behaviour
+            // rather than inventing a new one, matching
+            // `cli::hook_decide::path::file_exists_for_deleted_signal`.
+            file_exists: eval
+                .get("file_record")
+                .filter(|fr| decide::has_file_deleted_signal(fr))
+                .and_then(|_| self.repo_root.join(rel_path).try_exists().ok()),
         };
         let reason = match decide::evaluate(&input).decision {
             Decision::Deny { reason, .. } => Some(reason),
@@ -364,7 +383,7 @@ impl MatiServer {
                 .await;
             return Ok(
                 match eval.and_then(|body| serde_json::from_str(&body).map_err(|e| e.to_string())) {
-                    Ok(data) => Self::hook_decision_body(data),
+                    Ok(data) => self.hook_decision_body(data),
                     Err(_) => Self::hook_allow(),
                 },
             );

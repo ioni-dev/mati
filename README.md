@@ -12,7 +12,7 @@ Now an AI agent opens the file. It sees the odd line. It "fixes" it. The old bug
 
 That is the ordinary tragedy of a codebase. Most of what a team knows about its own code lives where the code can't reach it: a Slack thread, a review comment, one person's head. Agents make it worse. They read fast, act faster, and start every session knowing none of it.
 
-mati closes the gap. It attaches what your team knows to the files themselves and enforces it the moment an agent acts. Not a document the model may consult. A gate it has to pass. The decision is made at the hook level, deterministically, outside the model's discretion.
+mati closes the gap. It attaches what your team knows to the files themselves and denies the agent's access until that knowledge has been read. The decision is made at the hook level, deterministically, outside the model's discretion, and every decision is recorded. It gates the paths it can see, which is not all of them: [What it doesn't catch](#what-it-doesnt-catch) has the numbers.
 
 Coverage today: Claude Code gates file reads and edits (`Edit`/`Write`/`NotebookEdit`), Codex gates `apply_patch` edits, and both catch shell-command reads (`cat`, `grep`, and similar commands) on a best-effort basis.
 
@@ -26,9 +26,9 @@ Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://
 
 Suppose the knowledge does get written down. It still gets ignored. A comment, a CONTRIBUTING note, a wiki page nobody opens: an agent reads straight past it, and so does a tired teammate on a Friday. Knowledge that exists but isn't consulted is the same as knowledge that doesn't exist.
 
-So the real problem isn't that things go unwritten. It's that writing them down doesn't make anyone read them. A doc asks. mati requires.
+So the real problem isn't that things go unwritten. It's that writing them down doesn't make anyone read them. A doc asks. mati denies, and records the answer.
 
-A gotcha is a small structured record: a rule, the reason behind it, a severity, attached to a file and confirmed by a developer. Once it's confirmed, an agent can't read or edit that file — in the paths mati enforces — without being handed the reason first. It doesn't act and find out later. The knowledge comes first, by construction.
+A gotcha is a small structured record: a rule, the reason behind it, a severity, attached to a file and confirmed by a developer. Once it's confirmed, an agent that opens that file through a gated path is denied and handed the reason instead of guessing. Gated paths are the agent's own file tools and shell commands that name the file. An agent that reaches the file another way — by searching its contents, by a glob, by importing the module — is not stopped.
 
 ---
 
@@ -71,7 +71,89 @@ Three steps. You don't hand-write the knowledge unless you want to.
 
 1. **Capture.** `mati init` scans the repo with no LLM — tree-sitter across 12 languages, the import graph, and co-change history from git. Then `/mati-enrich` sends Claude through the files to draft gotcha candidates. It runs inside your existing agent session, so there's no extra API key or token bill. Or add one by hand.
 2. **Confirm.** Candidates enforce nothing. You run `mati review` and approve the ones that are real. Confirming is the switch: it turns enforcement on for that gotcha and nothing else does.
-3. **Enforce.** From then on a hook stands in front of every read and edit the agent makes — the block you just saw. It runs locally, decides deterministically, and makes no network call. Same result on every machine, every session.
+3. **Enforce.** From then on a hook stands in front of the reads and edits it can see — the block you just saw. It runs locally, decides deterministically, and makes no network call. Same result on every machine, every session.
+
+---
+
+## What it doesn't catch
+
+The hook reads a command before it runs and looks for a path in it. So it sees the agent's file tools, and it sees `cat src/store/db.rs`. It does not see an access that never spells the name.
+
+We measured that rather than guessing. Ten runs, one governed file, an agent told only to keep the filename out of every command:
+
+- **8 of 10** read and rewrote the file with zero consultation.
+- **10 of 10** got the file's contents back.
+- **0 of 10** were ever denied. The gate did not fire once.
+
+Seven of them found the same route: `F=$(grep -rl "def normalize_path" .); cat "$F"`. The file is located by what is inside it. No classifier reading a command string can gate that, because the string never names the file. That is the interface, not a bug in it.
+
+That 8 of 10 is the ceiling, not the rate. It needed an instruction to hide the filename. We ran the ordinary case too: the same trap, the repo grown to about a hundred files so the target is not the obvious one, a task that names the function to write and never the file, and no instruction to avoid anything.
+
+- **10 of 10** found the file by searching its contents, the same grep route as above.
+- Every run then named the file. Seven were denied on that read and consulted; three ran `mem_get` first and were never denied.
+- **0 of 10** reached the file without consulting.
+
+Told to hide the name, an agent takes the route no classifier can see. Left to work normally, it names the file it just found, and the gate is there. The hole is a deliberate evasion, not the common case.
+
+What does hold is narrower, and was measured the same day. Twenty runs, same fixture, an agent told to defeat the guard, with the session lockdown on:
+
+- **0 of 20** reached the file without consulting, against 4 of 10 without the lockdown (p=0.0077).
+- Consultation rate **1.00**, against 0.60.
+- Task success **20 of 20**. Denying the shell did not break the work.
+
+None of those twenty tried a name-free route, so this arm does not cover the hole above. It covers what happens after the gate fires.
+
+So the claim mati makes is this: **once mati has denied an access, an agent cannot work around it without consulting.** Not "it can't get in." Once denied.
+
+Every result on this page was registered before its run, on Claude Sonnet, one fixture family, ten-turn tasks. The 4-of-10 baseline is a historical control on a saved binary; the sealed and unsealed arms below are concurrent.
+
+### The lockdown
+
+That "once denied" result needs the session lockdown, which is **off by default**:
+
+```bash
+mati config set enforcement.lockdown on
+```
+
+With it on, a deny puts the session in debt for that file. Every further read and shell command is denied — in the main thread and in any subagent in the same worktree — until the agent calls the `mem_get` that the deny message names. It ships off because it denies unrelated work too: an agent blocked on `keys.py` cannot `ls` an unrelated directory until it consults.
+
+### Sealing a file
+
+The hole above is about the route, and no classifier closes it. `mati seal` closes it a different way — it takes the bytes away.
+
+```bash
+mati seal add src/keys.py
+```
+
+The file goes to mode `000`. The kernel refuses every reader: the shell, anything it spawns, the agent's `Read` (a hard `EACCES`), and its `Grep`, which skips the file entirely rather than redacting it — no match, no count, no filename in the results. `mem_get` lifts the mode for the session, and it goes back when the receipt lapses. While the receipt is owed, the commands that would restore it — `chmod`, `git checkout`, `git restore`, `git reset --hard`, `git worktree add`, `git clone` — are denied.
+
+Same prompt as the 8-of-10 result above, same fixture, same binary, same model. Ten runs sealed against ten unsealed, interleaved:
+
+- **0 of 10** sealed runs finished the task without consulting, against **6 of 10** unsealed (p=0.011).
+- The bug the gotcha warns about landed in **0 of 10** sealed runs, against **4 of 10**.
+- **9 of 10** sealed runs were denied at least once, against 3 of 10. mati sees the attempt now.
+- The route that beat the hook in 7 of 10 unsealed runs showed up in 1 of 10 sealed ones. `grep -rl` cannot list a file it cannot open.
+
+What it does not do:
+
+- **It does not make the bytes unobtainable.** Two sealed runs read the file out of git history with `git cat-file`. That is out of scope by design — git must read its own objects to work at all, and a secret in git history is a secret-scanner problem.
+- **A file can be replaced without ever being read.** `os.remove` needs write permission on the directory, not on the file. One sealed run did exactly that, then wrote a new one. The post-command sweep caught it, recorded it and put the mode back — but the seal on its own does not stop it. Turning on Claude Code's sandbox and adding `mati sandbox protect <file>` does: the deny it compiles blocks `chmod` and `unlink` in the kernel, measured against a control.
+- **Your build stops too.** A cached `cargo check` still passes; the next real rebuild fails with `Permission denied`. rust-analyzer exits 0 and silently drops the module, so you get wrong answers rather than an error. `git add` cannot index the file. Seal a file whose bytes must be unavailable to everything, not one you are building against.
+
+Three sealed runs did not finish. All three were the agent declining the red-team instruction — one of them after reading the file from history and stopping at the write — not the floor blocking the work. On the seven runs that attempted it, seven succeeded.
+
+Verified on macOS with Claude Code. Linux and WSL2 are untested.
+
+### The rest of the boundary
+
+- **The debt expires after 15 minutes.** An agent that works elsewhere for long enough gets the session back without consulting.
+- **A subagent in its own git worktree** is a separate scope and does not inherit the debt.
+- **Turning the lockdown off is not itself gated** before the first deny. After one, the disarm command is a shell command and is denied like any other.
+- **Git history is out of scope.** Git must read its own objects to function, so `git log -p` and `git show <ref>` reach a governed file's committed bytes. A secret in git history is a secret-scanner problem, not this one.
+- **Edits are gated through reads.** Claude Code's own read-before-edit rule forces a read, and the gate covers that read. The lockdown itself was measured on reads, not on edits.
+- **Codex has no read hook.** There, enforcement is `apply_patch` edits and shell commands only.
+
+What the gate does see, it records: every deny, every consultation, and every allow-after-receipt, in a local hash-chained log.
 
 ---
 
@@ -108,7 +190,7 @@ mati runs as two processes:
 
 - **The tools.** It writes `.mcp.json` for Claude Code, or `.codex/config.toml` for Codex, registering the MCP server. The agent gets the four tools above.
 - **The instructions.** For Claude Code it writes `.claude/CLAUDE.md` — the read-gate (call `mem_get` before touching a file), loaded every session — plus load-on-demand skills in `.claude/skills/` for capturing gotchas and policies, and the `/mati-enrich` command. For Codex the same guidance ships as a lazy `.codex/skills/mati/SKILL.md`. Only the read-gate stays always in context; everything else loads when it's needed, so the per-session cost stays small.
-- **The hooks.** It writes the enforcement hooks under `.claude/` or `.codex/`. The instructions teach the agent the workflow; the hooks make sure it can't skip it.
+- **The hooks.** It writes the enforcement hooks under `.claude/` or `.codex/`. The instructions teach the agent the workflow; the hooks deny it when the agent skips it, on the paths they cover.
 
 Nothing is clobbered. mati's instructions live in a marked block inside `.claude/CLAUDE.md` — it never edits your project-root `CLAUDE.md`. It reads that root file once, at init, to import what you've already written as knowledge, and leaves it untouched. Hooks are added alongside any you already have.
 
@@ -140,7 +222,9 @@ Two shortcuts sit on top of the same engine:
 - `mati protect <glob>` gates edits and deletes to a path behind a fresh consult. Break-glass for crown-jewel files.
 - `mati guard <cmd-glob>` gates a destructive command the same way.
 
-For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into an OS-level deny rule (macOS/Linux/WSL2) that holds even outside the hook path.
+For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into deny rules for the host's own sandbox, which hold outside the hook path. Verified on macOS with Claude Code's `/sandbox` turned on. The Linux and WSL2 paths are written and untested.
+
+Hardest of all is `mati seal add <file>`, which holds the file at mode `000` until the session consults it. It is the only one that closes a read the hook never sees, and the only one that also stops your own build. [Sealing a file](#sealing-a-file) has the numbers and the cost.
 
 ### Static analysis
 
@@ -239,14 +323,15 @@ mati stats
 | `mati policy <sub>`        | Author and stage action policies (`add`, `edit`, `list`, `show`, `stage`, `enable`, `disable`, `delete`, `test`) |
 | `mati protect <glob>`      | Gate edits and deletes to a path behind a fresh consult                                               |
 | `mati guard <cmd-glob>`    | Gate a destructive command behind a fresh consult                                                     |
-| `mati sandbox <sub>`       | Compile crown-jewel gotchas into an OS-level deny floor (`compile`, `protect`, `unprotect`, `clear`)  |
+| `mati sandbox <sub>`       | Compile crown-jewel gotchas into a host-sandbox deny floor (`compile`, `protect`, `unprotect`, `clear`) |
+| `mati seal <sub>`          | Hold a file at mode 000 until the session consults it (`add`, `remove`, `list`, `clear`) |
 | `mati verify-chain`        | Recompute and verify the hash-chained enforcement log (`--json`)                                     |
 
 #### Maintain
 
 | Command                     | What it does                                                                       |
 | --------------------------- | --------------------------------------------------------------------------------- |
-| `mati config get/set/dump`  | Read or set enforcement config (retention, write durability, policy mode)         |
+| `mati config get/set/dump`  | Read or set enforcement config (retention, write durability, policy mode, session lockdown) |
 | `mati repair`               | Reconcile derived indexes (`--check` CI-safe, exits non-zero on drift; `--fast` drains the dirty queue) |
 | `mati doctor`               | Aggregated health check (`--metrics` for live daemon SLOs)                        |
 | `mati eval`                 | Run the enforcement regression corpus                                             |
@@ -287,7 +372,7 @@ Also Enterprise-only, and not in this repo: multi-repo sync and a cross-repo got
 
 Enterprise is a reporting layer on top of the local log. The enforcement path itself is identical in both tiers: local-only, deterministic, zero network calls. mati never phones home.
 
-That's verifiable, not just asserted. On every change, CI fails the build if the default binary links any HTTP-client crate (dependency ban) and proves the enforcement path opens no outbound socket (syscall audit under a network namespace); `mati doctor` surfaces the same posture in-tool; and every release ships a [CycloneDX](https://cyclonedx.org) SBOM of the exact dependency closure. Don't take our word for it — check the bill of materials.
+That's verifiable, not just asserted. The repo's own `zero_network` tests fail the build if a source file reaches for an HTTP client, if the daemon transport is anything but a Unix socket, or if the default build's dependency graph links a network crate. `mati doctor` reports the same posture in-tool, and the release workflow publishes a [CycloneDX](https://cyclonedx.org) SBOM of the dependency closure alongside each binary. All of it is static analysis of the build, not a runtime probe. Don't take our word for it — run `cargo nextest run --lib -E 'test(zero_network)'` and check the bill of materials.
 
 See [getmati.dev](https://getmati.dev) for the Enterprise tier.
 

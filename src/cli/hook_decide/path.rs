@@ -87,6 +87,8 @@ pub(crate) fn extract_path(input: &serde_json::Value, variant: HookVariant) -> O
         // Handled by `run_file_changed` before the single-path pipeline; its
         // `file_path` is absolute and needs repo-relative resolution.
         HookVariant::ClaudeFileChanged => None,
+        // Handled by `run_post_read_compliance` before the single-path pipeline.
+        HookVariant::ClaudePostReadCompliance => None,
     }
 }
 
@@ -113,6 +115,56 @@ pub(crate) fn discover_repo_root(cwd: &Path) -> Option<PathBuf> {
 pub(crate) fn discover_repo_root_for(ident: &mati_core::store::RepoIdent) -> Option<PathBuf> {
     let root = ident.workdir.as_ref()?.to_str()?;
     Some(PathBuf::from(root))
+}
+
+/// The repo-relative key for an absolute path that lands in a LINKED WORKTREE
+/// of the same clone as `cwd_ident` (ARCHITECTURE.md 10.1a), or `None`.
+///
+/// An absolute path into a sibling worktree normalizes to an absolute
+/// (non-matching) key against the cwd worktree's root, so the file gate misses
+/// a governed file the sibling shares. This re-roots it to the repo-relative key
+/// (`src/foo.rs`), which the caller looks up in the UNCHANGED cwd store — the
+/// same store, since linked worktrees share a slug.
+///
+/// `None` unless the accessed path sits in a *different* worktree of the *same*
+/// clone: a shared `commondir` proves same clone (linked worktrees share it,
+/// submodules and unrelated repos do not — see [`mati_core::store::RepoIdent`]),
+/// a differing `workdir` proves it is a sibling, not the cwd worktree the caller
+/// already handled. A missing parent, no repo, a submodule, or an unrelated repo
+/// all yield `None`, leaving the path absolute and unmatched.
+///
+/// Every comparison and the final strip go through `canonicalize_lenient`: a
+/// worktree's git-recorded paths and `current_dir()` resolve symlinks
+/// differently (macOS `/var` vs `/private/var`, a symlinked checkout), so the
+/// raw strings can differ for one directory and defeat a lexical compare. This
+/// canonicalization is local to the key computation — it never feeds a slug
+/// (see `store::db::slug`, which must NOT canonicalize `commondir`).
+pub(crate) fn cross_worktree_rel_key(
+    raw_path: &str,
+    cwd_ident: &mati_core::store::RepoIdent,
+) -> Option<String> {
+    let dir = Path::new(raw_path).parent()?;
+    let access = mati_core::store::RepoIdent::discover(dir);
+
+    // Same clone: shared git-dir. Cheap early-out for a non-repo/out-of-repo
+    // path (commondir `None`) before any canonicalize.
+    let access_common = super::sandbox::canonicalize_lenient(access.commondir.as_ref()?)?;
+    let cwd_common = super::sandbox::canonicalize_lenient(cwd_ident.commondir.as_ref()?)?;
+    if access_common != cwd_common {
+        return None;
+    }
+
+    // Different worktree: the accessed root is not the cwd root.
+    let access_workdir = super::sandbox::canonicalize_lenient(access.workdir.as_ref()?)?;
+    let cwd_workdir = super::sandbox::canonicalize_lenient(cwd_ident.workdir.as_ref()?)?;
+    if access_workdir == cwd_workdir {
+        return None;
+    }
+
+    // Strip the accessed worktree root off the accessed path, both canonical.
+    let canon_access = super::sandbox::canonicalize_lenient(Path::new(raw_path))?;
+    let rel = canon_access.strip_prefix(&access_workdir).ok()?;
+    Some(decide::normalize_path(rel.to_str()?, None))
 }
 
 /// WI-20: compute the CANONICAL repo-relative key for the symlink-bypass
@@ -179,7 +231,7 @@ pub(crate) fn canonical_rel_path(
 /// hook process resolves a bare relative shell argument. Same rule
 /// `canonical_rel_path` uses for `abs_access`, without the symlink
 /// resolution — an existence check doesn't need it.
-pub(super) fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
+pub(crate) fn resolve_access_path(accessed_path: &str, cwd: &Path) -> PathBuf {
     let raw = Path::new(accessed_path);
     if raw.is_absolute() {
         raw.to_path_buf()

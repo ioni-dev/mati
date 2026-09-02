@@ -3,10 +3,11 @@
 /// This module tests two things:
 ///
 /// 1. **Wrapper execution** (Category 1) — the thin shell wrappers (`pre_read`,
-///    `pre_bash`, `codex_pre_bash`, `codex_post_bash`) correctly delegate to
-///    `mati hook-decide <variant>` with stdin passthrough and exit-code propagation.
+///    `pre_bash`, `codex_pre_bash`, `codex_post_bash`, `post_compliance`)
+///    correctly delegate to `mati hook-decide <variant>` with stdin passthrough
+///    and exit-code propagation.
 ///
-/// 2. **Lifecycle contracts** (Category 3) — post-compliance, post-edit,
+/// 2. **Lifecycle contracts** (Category 3) — post-edit,
 ///    pre-compact, session-end, codex-session-start, codex-user-prompt, and
 ///    codex-stop hooks invoke the correct daemon commands in the right order.
 ///
@@ -107,18 +108,6 @@ impl HookTestHarness {
     fn for_pre_bash() -> Self {
         Self {
             script_content: pre_bash::SCRIPT.to_string(),
-            mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
-            mock_responses: HashMap::new(),
-            exclude_binaries: Vec::new(),
-            mock_ping_exit_code: 0,
-            mock_recent_consulted: false,
-            mock_extra_cases: String::new(),
-        }
-    }
-
-    fn for_post_compliance() -> Self {
-        Self {
-            script_content: post_compliance::SCRIPT.to_string(),
             mock_dir: TempDir::new().expect("failed to create temp dir for harness"),
             mock_responses: HashMap::new(),
             exclude_binaries: Vec::new(),
@@ -305,7 +294,7 @@ case "$1" in
     doc-capture)
         cat >/dev/null
         echo "$@" >> "{log_file}" ;;
-    log-miss|log-hit|log-compliance-miss|log-compliance-hit|log-codex-shell-miss|log-bootstrap|log-prompt-nudge|edit-hook|session-flush|session-harvest)
+    log-miss|log-hit|log-compliance-miss|log-compliance-hit|log-codex-shell-miss|log-bootstrap|log-prompt-nudge|edit-hook|session-flush|session-harvest|post-read-compliance)
         echo "$@" >> "{log_file}" ;;
     reparse)
         exit 0 ;;
@@ -681,6 +670,33 @@ fn codex_prebash_wrapper_executes_hook_decide_with_correct_variant() {
 }
 
 #[test]
+fn post_compliance_wrapper_executes_hook_decide_with_correct_variant() {
+    let h = WrapperHarness::new();
+    h.write_mock("", "", 0);
+    let out = h.run(
+        post_compliance::SCRIPT,
+        r#"{"tool_input":{"file_path":"src/main.rs"}}"#,
+    );
+
+    assert_eq!(out.exit_code, 0, "a PostToolUse hook must always exit 0");
+    assert!(
+        out.stdout.is_empty(),
+        "PostToolUse carries no decision — stdout must stay empty, got: {}",
+        out.stdout
+    );
+
+    let log = h.invocation_log();
+    assert!(
+        log.contains("ARGS: hook-decide claude-post-read-compliance"),
+        "wrapper must pass variant claude-post-read-compliance, log: {log}"
+    );
+    assert!(
+        log.contains(r#"STDIN: {"tool_input":{"file_path":"src/main.rs"}}"#),
+        "wrapper must pass stdin through, log: {log}"
+    );
+}
+
+#[test]
 fn codex_postbash_wrapper_executes_hook_decide_with_correct_variant() {
     let h = WrapperHarness::new();
     h.write_mock("", "", 0);
@@ -833,26 +849,6 @@ fn preread_wrapper_no_mati_in_path_fails_cleanly() {
 // Category 3: Post/Lifecycle Hook Contracts (10 tests)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// 3.01 — post-read compliance logs extensionless root-level files.
-#[test]
-fn post_compliance_logs_extensionless_root_file_miss() {
-    let harness = HookTestHarness::for_post_compliance();
-    let root_file = harness.mock_dir.path().join("Dockerfile");
-    std::fs::write(&root_file, "FROM rust:1.80").expect("failed to write Dockerfile");
-
-    let input = serde_json::json!({
-        "tool_input": { "path": "Dockerfile" }
-    })
-    .to_string();
-    let output = harness.run(&input);
-    assert_eq!(output.exit_code, 0);
-    assert!(
-        harness.wait_for_log_contains("log-compliance-miss file:Dockerfile"),
-        "extensionless file should still be tracked as a compliance miss, log: {}",
-        harness.read_log()
-    );
-}
-
 /// 3.02 — post-edit invokes both doc-capture and edit-hook.
 #[test]
 fn post_edit_invokes_doc_capture_and_edit_hook() {
@@ -932,46 +928,6 @@ fn post_edit_records_fail_open_when_jq_is_missing() {
     assert!(
         !harness.read_log().contains("edit-hook"),
         "no jq means no edit tracking — that is the skip being recorded"
-    );
-}
-
-/// 3.01a — same for post-read compliance: with no jq the whole consultation
-/// check is skipped, so the skip itself is the only thing left to record.
-#[test]
-fn post_compliance_records_fail_open_when_jq_is_missing() {
-    let harness = HookTestHarness::for_post_compliance().exclude_binary("jq");
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-
-    assert_eq!(output.exit_code, 0, "a missing dependency must fail open");
-    assert_canonical_fail_open_line(&harness.fail_open_log(), "jq not on PATH");
-    assert!(
-        output.stderr.contains("enforcement bypassed"),
-        "the skip must warn on stderr, got: {}",
-        output.stderr
-    );
-    assert!(
-        !harness.mock_dir.path().join(".mati/fail_open.log").exists(),
-        "the record must follow $MATI_HOME, not $HOME/.mati"
-    );
-    assert!(
-        !harness.read_log().contains("log-compliance-miss"),
-        "no jq means no compliance check — that is the skip being recorded"
-    );
-}
-
-/// 3.01b — the daemon-unreachable bypass uses the same writer, so it must
-/// produce the same canonical record instead of a second ad-hoc format.
-#[test]
-fn post_compliance_records_canonical_fail_open_when_daemon_is_down() {
-    let harness = HookTestHarness::for_post_compliance().with_ping_failure();
-    let output = harness.run(r#"{"tool_input":{"file_path":"src/main.rs"}}"#);
-
-    assert_eq!(output.exit_code, 0);
-    assert_canonical_fail_open_line(&harness.fail_open_log(), "daemon not running");
-    assert!(
-        harness.fail_open_log().contains("file=src/main.rs"),
-        "the daemon bypass knows the path — it must name it: {}",
-        harness.fail_open_log()
     );
 }
 

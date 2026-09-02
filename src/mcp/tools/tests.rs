@@ -125,7 +125,18 @@ async fn call_mem_get(
     graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
     key: &str,
 ) -> String {
-    let ctx = handler_test_ctx();
+    call_mem_get_rooted(graph_arc, key, std::path::Path::new("")).await
+}
+
+/// `call_mem_get` against a daemon whose repo root is `repo_root` — the only
+/// thing that resolves a `file:` key to a path on disk.
+async fn call_mem_get_rooted(
+    graph_arc: &std::sync::Arc<tokio::sync::RwLock<crate::graph::Graph>>,
+    key: &str,
+    repo_root: &std::path::Path,
+) -> String {
+    let mut ctx = handler_test_ctx();
+    ctx.repo_root = repo_root.to_path_buf();
     let input = crate::mcp::protocol::MemGetInput {
         key: key.to_string(),
         actor: None,
@@ -197,6 +208,57 @@ async fn mem_get_returns_null_for_nonexistent_key() {
 
     let result = call_mem_get(&graph_arc, "file:nonexistent.rs").await;
     assert_eq!(result, "null");
+}
+
+/// Task 8: the receipt `mem_get` mints is what lifts the Tier 2 floor, so a
+/// sealed file becomes readable by consulting it and not by any other route.
+#[tokio::test]
+async fn mem_get_lifts_the_tier_2_floor_on_the_file_it_mints_a_receipt_for() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let store_root = store.root.clone();
+
+    let rel = "src/gated.rs";
+    let abs = dir.path().join(rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, b"secret").unwrap();
+    let key = format!("file:{rel}");
+    let record = make_record(&key, "gated file", Category::File, 0.8);
+    store.put(&key, &record).await.unwrap();
+
+    // Seal it the way `mati seal add` does: manifest row first, then chmod.
+    let mut manifest = crate::seal::Manifest::default();
+    manifest.files.push(crate::seal::SealedFile {
+        path: std::fs::canonicalize(&abs)
+            .unwrap()
+            .to_string_lossy()
+            .into(),
+        mode: "644".to_string(),
+        ..Default::default()
+    });
+    crate::seal::write_manifest(&crate::seal::manifest_in(&store_root), &manifest).unwrap();
+    std::fs::set_permissions(
+        &abs,
+        std::fs::Permissions::from_mode(crate::seal::SEALED_MODE),
+    )
+    .unwrap();
+    assert!(
+        std::fs::read(&abs).is_err(),
+        "sealed file must be unreadable"
+    );
+
+    let graph = Graph::load(store).await.unwrap();
+    let graph_arc = std::sync::Arc::new(tokio::sync::RwLock::new(graph));
+
+    // A receipt for another file leaves the floor standing.
+    call_mem_get_rooted(&graph_arc, "file:src/other.rs", dir.path()).await;
+    assert!(std::fs::read(&abs).is_err());
+
+    let result = call_mem_get_rooted(&graph_arc, &key, dir.path()).await;
+    assert!(result.contains(&key));
+    assert_eq!(std::fs::read(&abs).unwrap(), b"secret");
 }
 
 #[tokio::test]
@@ -2219,6 +2281,16 @@ fn hook_allow_emits_expected_shape() {
     );
 }
 
+/// A server whose repo root is an empty path: no test here carries a
+/// `FileDeleted` signal, so the existence check never runs.
+fn decision_server() -> MatiServer {
+    MatiServer::with_socket_root(
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        Some("wt-tag".to_string()),
+    )
+}
+
 #[test]
 fn hook_decision_body_denies_for_qualifying_confirmed_gotcha() {
     // Shape matches hooks::decide's own EnforcementInput fixtures
@@ -2243,7 +2315,7 @@ fn hook_decision_body_denies_for_qualifying_confirmed_gotcha() {
         },
         "consulted": false
     });
-    let body = MatiServer::hook_decision_body(eval);
+    let body = decision_server().hook_decision_body(eval);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -2258,7 +2330,8 @@ fn hook_decision_body_denies_for_qualifying_confirmed_gotcha() {
 
 #[test]
 fn hook_decision_body_allows_when_no_record() {
-    let body = MatiServer::hook_decision_body(serde_json::json!({ "file_key": "file:none.rs" }));
+    let body =
+        decision_server().hook_decision_body(serde_json::json!({ "file_key": "file:none.rs" }));
     assert_eq!(body, MatiServer::hook_allow());
 }
 
@@ -2284,8 +2357,88 @@ fn hook_decision_body_allows_when_gotcha_does_not_qualify() {
         },
         "consulted": false
     });
-    let body = MatiServer::hook_decision_body(eval);
+    let body = decision_server().hook_decision_body(eval);
     assert_eq!(body, MatiServer::hook_allow());
+}
+
+/// A `FileDeleted` signal is a stale snapshot — it is cleared only by the
+/// staleness sweep, so it outlives a delete-then-restore. The MCP decision
+/// path hard-coded `file_exists: None`, so on that transport the bypass was
+/// genuinely unconditional and a restored file with a qualifying gotcha was
+/// allowed through. It must stat the path and deny like the CLI adapter does.
+#[test]
+fn hook_decision_body_denies_when_a_file_deleted_signal_is_stale() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/back.rs"), "// restored\n").unwrap();
+
+    let eval = serde_json::json!({
+        "file_key": "file:src/back.rs",
+        "file_record": {
+            "value": "restored module",
+            "confidence": { "value": 0.9 },
+            "quality": { "value": 0.9 },
+            "staleness": { "value": 0.95, "tier": "tombstone", "signals": ["file_deleted"] },
+            "payload": { "gotcha_keys": ["gotcha:back"] }
+        },
+        "gotcha_records": {
+            "gotcha:back": {
+                "value": "Never bypass the restored check",
+                "confidence": { "value": 0.8 },
+                "quality": { "value": 0.8 },
+                "payload": { "confirmed": true }
+            }
+        },
+        "consulted": false
+    });
+
+    let server = MatiServer::with_socket_root(
+        std::path::PathBuf::new(),
+        dir.path().to_path_buf(),
+        Some("wt-tag".to_string()),
+    );
+    let v: serde_json::Value = serde_json::from_str(&server.hook_decision_body(eval)).unwrap();
+    assert_eq!(
+        v["hookSpecificOutput"]["permissionDecision"], "deny",
+        "a path that is back on disk must not ride the FileDeleted bypass"
+    );
+}
+
+/// The other half of the same guard: a path that really is gone still
+/// bypasses, so the fix does not turn a deleted file into an unliftable deny.
+#[test]
+fn hook_decision_body_allows_when_the_file_is_really_gone() {
+    let dir = TempDir::new().unwrap();
+    let eval = serde_json::json!({
+        "file_key": "file:src/gone.rs",
+        "file_record": {
+            "value": "deleted module",
+            "confidence": { "value": 0.9 },
+            "quality": { "value": 0.9 },
+            "staleness": { "value": 0.95, "tier": "tombstone", "signals": ["file_deleted"] },
+            "payload": { "gotcha_keys": ["gotcha:gone"] }
+        },
+        "gotcha_records": {
+            "gotcha:gone": {
+                "value": "Never bypass the gone check",
+                "confidence": { "value": 0.8 },
+                "quality": { "value": 0.8 },
+                "payload": { "confirmed": true }
+            }
+        },
+        "consulted": false
+    });
+
+    let server = MatiServer::with_socket_root(
+        std::path::PathBuf::new(),
+        dir.path().to_path_buf(),
+        Some("wt-tag".to_string()),
+    );
+    assert_eq!(
+        server.hook_decision_body(eval),
+        MatiServer::hook_allow(),
+        "a genuinely deleted file still bypasses"
+    );
 }
 
 // ── decision actor scope (F11 second half) ──────────────────────────────
@@ -2306,8 +2459,11 @@ fn hook_decision_body_allows_when_gotcha_does_not_qualify() {
 
 #[test]
 fn decision_actor_treats_interpolated_empty_agent_id_as_none() {
-    let server =
-        MatiServer::with_socket_root(std::path::PathBuf::new(), Some("wt-tag".to_string()));
+    let server = MatiServer::with_socket_root(
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        Some("wt-tag".to_string()),
+    );
     // "${agent_id}" interpolates to "" on the main thread, never absent.
     assert_eq!(server.decision_actor(Some("")), Some("wt-tag".to_string()));
     assert_eq!(server.decision_actor(None), Some("wt-tag".to_string()));
@@ -2315,8 +2471,11 @@ fn decision_actor_treats_interpolated_empty_agent_id_as_none() {
 
 #[test]
 fn decision_actor_combines_worktree_and_subagent_id() {
-    let server =
-        MatiServer::with_socket_root(std::path::PathBuf::new(), Some("wt-tag".to_string()));
+    let server = MatiServer::with_socket_root(
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        Some("wt-tag".to_string()),
+    );
     assert_eq!(
         server.decision_actor(Some("agentA")),
         Some("wt-tag:agentA".to_string())
@@ -2325,8 +2484,11 @@ fn decision_actor_combines_worktree_and_subagent_id() {
 
 #[test]
 fn decision_actor_distinguishes_two_subagents() {
-    let server =
-        MatiServer::with_socket_root(std::path::PathBuf::new(), Some("wt-tag".to_string()));
+    let server = MatiServer::with_socket_root(
+        std::path::PathBuf::new(),
+        std::path::PathBuf::new(),
+        Some("wt-tag".to_string()),
+    );
     // The pre-fix bug: both calls sent the same bare worktree actor, so one
     // subagent's receipt (or the main thread's) satisfied every other
     // subagent's gate. Distinct agent ids must now produce distinct scopes.

@@ -133,6 +133,11 @@ fn default_history_limit() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct SessionCheckConsultedInput {
     pub key: String,
+    /// Receipt scope to check at. Receipts are minted actor-scoped and have no
+    /// actor-to-global fallback, so a check that omits this asks about a key
+    /// the gate never writes and always answers "not consulted".
+    #[serde(default)]
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,6 +146,26 @@ pub struct SessionCheckConsultedRecentInput {
     pub key: String,
     #[serde(default = "default_ttl_secs")]
     pub ttl_secs: u64,
+    /// Receipt scope to check at — see [`SessionCheckConsultedInput::actor`].
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// Ask whether an actor still owes a consultation receipt for a file it was
+/// denied — the Tier 1 session lockdown's only input.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOwedReceiptInput {
+    /// Receipt scope of the caller, exactly as the gate evaluates it. This is
+    /// what settles the debt: a receipt is per context window, so only this
+    /// actor's own consultation lifts the lockdown for it.
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// Worktree tag the debt is scoped to, so a deny by any actor in this
+    /// worktree binds the others. Absent from an older hook binary, which
+    /// leaves the scan at the actor scope it used to run at.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 fn default_ttl_secs() -> u64 {
@@ -393,7 +418,7 @@ pub struct DevNoteUpsertInput {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionLogInput {
-    /// The event type (closed enum, 14 variants).
+    /// The event type (closed enum, 15 variants).
     pub event: SessionEvent,
     /// The record key this event pertains to.
     pub key: String,
@@ -476,6 +501,25 @@ pub enum SessionEvent {
     /// An unclassified command mentioned a meaningful literal from an active
     /// policy trigger; records a bypass signal without changing the decision.
     UnclassifiedPolicyLiteralBypass,
+    /// Tier 1 session lockdown DENIED a Bash command because the session still
+    /// owes a receipt on the keyed file. Records `Deny` with reason
+    /// `session_lockdown`, distinct from the gotcha deny that armed it.
+    LockdownBlocked,
+    /// Tier 2 DENIED a command that would have returned the keyed sealed file
+    /// to a readable state. Records `Deny` with reason `seal_floor_restore`,
+    /// distinct from the lockdown so the audit can tell a blanket session deny
+    /// from a deny aimed at one file's mode bit.
+    SealFloorBlocked,
+    /// The post-Bash sweep found the keyed sealed file's floor down, or its
+    /// bytes moved, with no receipt to explain it. Records `BypassDetected`
+    /// with reason `seal_bypass`. Unlike the deny events, this one is written
+    /// AFTER the fact — the sweep detects and repairs, it does not prevent.
+    SealBypassDetected,
+    /// An access that reached no file gate at all was ALLOWED — a Bash command
+    /// naming no path, or a `Grep`/`Glob` with none. Not an enforcement
+    /// outcome: it measures the surface enforcement never saw, so a repo can
+    /// report its own unobserved rate instead of quoting a constant.
+    PathlessAllow,
     Bootstrap,
     PromptNudge,
     /// Post-bash observed a command that passed `is_schema_introspection` but
@@ -521,6 +565,21 @@ pub struct ConsultationHitInput {
 
 fn default_capture_fingerprint() -> bool {
     true
+}
+
+/// Input for `Command::SessionHarvest`. Written by the `SessionEnd` hook.
+/// `worktree` is the ending session's worktree tag (`worktree_scope_tag` of the
+/// hook's cwd), used to scope the receipt/lockdown cleanup to the worktree that
+/// is ending — the daemon serves every sibling worktree of a shared-slug clone,
+/// so a store-wide wipe would lift a sibling's lockdown. Defaults to `None` so
+/// an older hook binary talking to a newer daemon still decodes (it then wipes
+/// store-wide, the prior behavior).
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHarvestInput {
+    /// The ending session's worktree tag, or `None` outside a git repo.
+    #[serde(default)]
+    pub worktree: Option<String>,
 }
 
 /// Input for `Command::SubagentHarvest`. Written by the `SubagentStop` hook

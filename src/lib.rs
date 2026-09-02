@@ -20,5 +20,6 @@ mod invariants;
 pub mod mcp;
 pub mod policy;
 pub mod scaffold;
+pub mod seal;
 pub mod search;
 pub mod store;
