@@ -136,9 +136,17 @@ pub(crate) async fn dispatch_v2(
 
         // 1b. Session fence — reject requests from stale clients whose cached
         // daemon metadata predates a daemon restart. The client should re-read
-        // DaemonMetadata and retry once. Nil session on the request is tolerated
-        // only when the daemon itself has a nil session (test / legacy fallback).
-        if req.session != ctx.daemon_session {
+        // DaemonMetadata and retry once.
+        //
+        // A nil request session is not a stale client. It means the client
+        // connected in the window after the socket was bound but before the
+        // daemon published its session (cold start binds first, publishes
+        // metadata next), so `read_metadata` found nothing and the client sent
+        // `Uuid::nil`. Serve it: it holds no opinion about which instance it
+        // reached, and rejecting it both forces a client retry and records a
+        // phantom error in the metrics ring. A genuinely stale client after a
+        // restart sends its OLD non-nil session, which still mismatches here.
+        if !req.session.is_nil() && req.session != ctx.daemon_session {
             let resp = Response::err(
                 req.id,
                 ErrorCode::SessionMismatch,

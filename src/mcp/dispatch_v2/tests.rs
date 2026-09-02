@@ -2022,6 +2022,35 @@ async fn v2_matching_session_passes_fence() {
     }
 }
 
+/// A nil request session is a client that connected before the daemon
+/// published its metadata (cold-start bind-before-publish window), not a stale
+/// client from before a restart. The fence must serve it, or the first CLI
+/// call against a just-bound daemon is rejected and counted as an error.
+#[tokio::test]
+async fn v2_nil_session_passes_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).await.unwrap();
+    let graph = Graph::load(store).await.unwrap();
+    let graph = Arc::new(tokio::sync::RwLock::new(graph));
+    let ctx = test_ctx(dir.path());
+
+    let req = Request {
+        v: PROTOCOL_VERSION,
+        id: Uuid::new_v4(),
+        session: Uuid::nil(), // client had not yet read published metadata
+        agent: None,
+        cmd: Command::Ping,
+    };
+    let resp = dispatch_v2(&graph, &ctx, req).await;
+
+    match resp {
+        Response::Ok { data, .. } => assert_eq!(data, serde_json::json!("pong")),
+        Response::Err { code, message, .. } => {
+            panic!("nil session must pass the fence, got {code:?}: {message}")
+        }
+    }
+}
+
 /// An edit is not a consultation. Minting a receipt here let an edit that
 /// slipped through a fail-open suppress every later deny on that file, and
 /// kept refreshing the TTL the `claude-pre-edit` backstop keys on.
