@@ -278,11 +278,50 @@ fn parse_priority(value: &str) -> Result<Priority> {
     }
 }
 
+/// Reject a `--requires via` list naming a receipt source this binary does not
+/// know. serde silently coerces an unknown string to `ReceiptSource::Unknown`,
+/// which no `via` check accepts — the policy is then authored dead on arrival,
+/// and on Codex a block gate degrades to a silent steer. Catch the typo at
+/// authoring time; loading a policy written by a newer mati still tolerates
+/// Unknown, so this validation lives here, not in the deserializer.
+fn validate_requires_via(requires_json: &str) -> Result<()> {
+    const KNOWN: &[&str] = &[
+        "mem_get",
+        "hook_context",
+        "command_observed",
+        "db_introspection",
+    ];
+    let value: serde_json::Value =
+        serde_json::from_str(requires_json).context("parsing --requires JSON")?;
+    let Some(via) = value.get("via").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+    for item in via {
+        let Some(source) = item.as_str() else {
+            continue;
+        };
+        if !KNOWN.contains(&source) {
+            let hint = if source.starts_with("command") {
+                " Did you mean 'command_observed'?"
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "--requires via has an unrecognized receipt source '{source}'. \
+                 Valid sources: {}.{hint}",
+                KNOWN.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn add(args: AddArgs) -> Result<()> {
     let slug = slugify!(&args.slug);
     if slug.is_empty() {
         anyhow::bail!("policy slug cannot be empty");
     }
+    validate_requires_via(&args.requires)?;
     let policy = PolicyRecord {
         name: args.name,
         rule: args.rule,
@@ -374,6 +413,7 @@ async fn edit(args: EditArgs) -> Result<()> {
         policy.trigger = parse_trigger(&value)?;
     }
     if let Some(value) = args.requires {
+        validate_requires_via(&value)?;
         policy.requires =
             serde_json::from_str::<PolicyRequires>(&value).context("parsing --requires JSON")?;
     }
@@ -1155,5 +1195,30 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["matched"], false);
         assert_eq!(value["persisted"], false);
+    }
+
+    #[test]
+    fn validate_requires_via_rejects_unknown_source_with_hint() {
+        // 'command' is the common typo for 'command_observed'; serde would coerce
+        // it to ReceiptSource::Unknown and author a dead policy. Reject at add time.
+        let err = validate_requires_via(
+            r#"{"key":"tests-ran","via":["command"],"freshness":{"ttl_secs":900}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unrecognized receipt source 'command'"),
+            "{err}"
+        );
+        assert!(err.contains("command_observed"), "expected the hint: {err}");
+    }
+
+    #[test]
+    fn validate_requires_via_accepts_known_and_empty() {
+        validate_requires_via(
+            r#"{"key":"k","via":["command_observed","mem_get"],"freshness":{"ttl_secs":900}}"#,
+        )
+        .unwrap();
+        validate_requires_via(r#"{"key":"","via":[],"freshness":{"ttl_secs":900}}"#).unwrap();
     }
 }

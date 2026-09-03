@@ -7,6 +7,9 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- `mati policy add`/`edit` reject an unrecognized `--requires via` receipt source instead of silently coercing it to `Unknown` — which authored a policy no receipt could satisfy (and degraded to a silent steer on Codex). The error names the bad value and the valid sources (`mem_get`, `hook_context`, `command_observed`, `db_introspection`).
+
 ## [0.1.5] - 2026-09-02
 
 Enforcement moves from advisory gating to session lockdown, and the policy
