@@ -9,6 +9,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 - `mati policy add`/`edit` reject an unrecognized `--requires via` receipt source instead of silently coercing it to `Unknown` — which authored a policy no receipt could satisfy (and degraded to a silent steer on Codex). The error names the bad value and the valid sources (`mem_get`, `hook_context`, `command_observed`, `db_introspection`).
+- `mati policy add`/`edit` no longer fail with `store: Empty key` when authoring a deny-only policy (`deny_if` / content / `require` with no consult requirement). The empty `requires.key` backing-record lookup is now guarded.
 
 ## [0.1.5] - 2026-09-02
 

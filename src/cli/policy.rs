@@ -967,6 +967,14 @@ fn render_test_output_with_warnings(
 }
 
 async fn has_backing_record(proxy: &StoreProxy, key: &str) -> Result<bool> {
+    // An empty requires.key means the policy gates on nothing to consult, so
+    // there is no backing record to check for. Guard it: the daemon rejects a
+    // get on an empty key ("store: Empty key"), which otherwise fails `policy
+    // add`/`edit` for every deny-only policy (deny_if / content / require with
+    // no consult requirement).
+    if key.is_empty() {
+        return Ok(false);
+    }
     Ok(proxy
         .get(key)
         .await?
