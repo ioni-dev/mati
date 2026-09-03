@@ -9,9 +9,12 @@ repository  = "https://github.com/ioni-dev/mati"
 homepage    = "https://getmati.dev"
 keywords    = ["ai", "mcp", "claude", "codex", "developer-tools"]
 categories  = ["command-line-utilities", "development-tools"]
-# Only the vendored real-world corpora are excluded. tests/fixtures/eval/* are
-# embedded via include_str! in src/eval.rs, so they must ship in the crate.
-exclude     = [".claude/", "docs/", "*.md", "fuzz/", "tests/fixtures/real_world/", "benches/"]
+# Vendored real-world corpora and distribution descriptors are excluded — the
+# latter (Homebrew formula, npm/pip packaging, registry manifests) are channel
+# metadata, not library sources, and must not ship stale versions/licenses to
+# crates.io. tests/fixtures/eval/* are embedded via include_str! in src/eval.rs,
+# so they must ship in the crate.
+exclude     = [".claude/", "docs/", "*.md", "fuzz/", "tests/fixtures/real_world/", "benches/", "Formula/", "packages/", "mati.json", "mati-mcp.json"]
 
 [lints.rust]
 # `cargo fuzz` sets --cfg fuzzing automatically; see src/hooks/decide.rs.

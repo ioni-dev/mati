@@ -7,6 +7,9 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Excluded stale distribution descriptors (Homebrew formula, npm/pip packaging, registry manifests) from the published crate, and corrected their version and license — they had drifted to 0.1.0/0.1.1 and a wrong `MIT` claim (the project is Apache-2.0).
+
 ### Fixed
 - `mati policy add`/`edit` reject an unrecognized `--requires via` receipt source instead of silently coercing it to `Unknown` — which authored a policy no receipt could satisfy (and degraded to a silent steer on Codex). The error names the bad value and the valid sources (`mem_get`, `hook_context`, `command_observed`, `db_introspection`).
 - `mati policy add`/`edit` no longer fail with `store: Empty key` when authoring a deny-only policy (`deny_if` / content / `require` with no consult requirement). The empty `requires.key` backing-record lookup is now guarded.

@@ -17,10 +17,10 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.6"
 
 _REPO = "ioni-dev/mati"
-_VERSION = "0.1.0"
+_VERSION = "0.1.6"
 
 # Prefer ~/.local/bin so the binary is on PATH for other tools too.
 # Fall back to the package's own bin/ directory.

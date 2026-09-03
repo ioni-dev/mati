@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.6';
 const REPO = 'ioni-dev/mati';
 
 function getTarget() {

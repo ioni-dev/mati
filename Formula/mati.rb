@@ -1,8 +1,8 @@
 class Mati < Formula
   desc "Enforcement layer that gates what AI agents read and edit in your code"
   homepage "https://github.com/ioni-dev/mati"
-  version "0.1.1"
-  license "MIT"
+  version "0.1.6"
+  license "Apache-2.0"
 
   on_macos do
     on_arm do
