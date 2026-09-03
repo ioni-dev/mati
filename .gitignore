@@ -40,6 +40,7 @@ PENDING\ WORK/
 !tests/fixtures/real_world/**
 
 # Public OSS-release docs — override the *.md ignore above
+!CHANGELOG.md
 !CONTRIBUTING.md
 !TRADEMARK.md
 !ARCHITECTURE.md

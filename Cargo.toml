@@ -1,13 +1,13 @@
 [package]
 name        = "mati"
-version     = "0.1.4"
+version     = "0.1.5"
 edition     = "2021"
 rust-version = "1.82"
 description = "An enforcement layer for codebase knowledge: confirmed gotchas gate what AI agents read and edit at the hook level. Not a passive memory store."
 license     = "Apache-2.0"
 repository  = "https://github.com/ioni-dev/mati"
 homepage    = "https://getmati.dev"
-keywords    = ["ai", "mcp", "claude", "knowledge", "developer-tools"]
+keywords    = ["ai", "mcp", "claude", "codex", "developer-tools"]
 categories  = ["command-line-utilities", "development-tools"]
 # Only the vendored real-world corpora are excluded. tests/fixtures/eval/* are
 # embedded via include_str! in src/eval.rs, so they must ship in the crate.

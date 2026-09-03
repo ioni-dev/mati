@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema};
 use rmcp::service::{ElicitationError, ElicitationMode};
 use rmcp::{tool_router, Peer, RoleServer};
 use serde_json::json;
@@ -49,12 +50,34 @@ use mem_set_command::build_mem_set_command;
 /// client renders `confirm` as an accept/decline control; the accept action
 /// alone is not enough — the developer must set `confirm=true` to vouch for
 /// the rule (P4). Any other outcome leaves the gotcha an unconfirmed draft.
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 struct GotchaConfirmDecision {
-    /// Set true to confirm this gotcha and activate hook enforcement.
     confirm: bool,
 }
-rmcp::elicit_safe!(GotchaConfirmDecision);
+
+/// Map an rmcp elicitation round-trip onto the `Result<Option<T>, ElicitationError>`
+/// shape `classify_confirm_elicitation` consumes — the same mapping
+/// `Peer::elicit_with_timeout` does internally, reproduced here because the confirm
+/// gate sends a hand-built (title-less) schema via `create_elicitation_with_timeout`
+/// instead of deriving one from the type. See `confirm_gotcha_via_elicitation`.
+fn map_elicit_result(
+    result: Result<ElicitResult, rmcp::ServiceError>,
+) -> Result<Option<GotchaConfirmDecision>, ElicitationError> {
+    let elicit = result.map_err(ElicitationError::from)?;
+    match elicit.action {
+        ElicitationAction::Accept => match elicit.content {
+            Some(value) => match serde_json::from_value::<GotchaConfirmDecision>(value.clone()) {
+                Ok(decision) => Ok(Some(decision)),
+                Err(error) => Err(ElicitationError::ParseError { error, data: value }),
+            },
+            None => Err(ElicitationError::NoContent),
+        },
+        ElicitationAction::Decline => Err(ElicitationError::UserDeclined),
+        ElicitationAction::Cancel => Err(ElicitationError::UserCancelled),
+        // Unknown/future action — fail closed, treat as a cancel (P4).
+        _ => Err(ElicitationError::UserCancelled),
+    }
+}
 
 /// Whether a gotcha-confirm elicitation resulted in a confirm or a rejection.
 #[derive(Debug)]
@@ -214,10 +237,36 @@ impl MatiServer {
             None => format!("Confirm gotcha `{key}` and activate hook enforcement?"),
         };
 
-        let outcome = peer
-            .elicit_with_timeout::<GotchaConfirmDecision>(message, Some(confirm_elicit_timeout()))
+        // Build the elicitation schema by hand rather than deriving it from
+        // GotchaConfirmDecision. schemars stamps a root `title` (the type name)
+        // that Codex's elicitation-schema parser rejects, which broke every
+        // confirm on Codex; the builder omits it. Verified by
+        // `confirm_elicitation_schema_has_no_root_title`.
+        let requested_schema = match ElicitationSchema::builder()
+            .required_bool_with("confirm", |b| {
+                b.description("Set true to confirm this gotcha and activate hook enforcement.")
+            })
+            .build()
+        {
+            Ok(schema) => schema,
+            Err(e) => {
+                return Err(json!({
+                    "error": format!("internal: elicitation schema build failed: {e}")
+                })
+                .to_string());
+            }
+        };
+        let result = peer
+            .create_elicitation_with_timeout(
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message,
+                    requested_schema,
+                },
+                Some(confirm_elicit_timeout()),
+            )
             .await;
-        match classify_confirm_elicitation(key, outcome) {
+        match classify_confirm_elicitation(key, map_elicit_result(result)) {
             ConfirmOutcome::Confirm => {
                 self.socket_call_typed(Command::GotchaConfirm(GotchaConfirmInput {
                     key: key.to_string(),

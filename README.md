@@ -152,6 +152,8 @@ Verified on macOS with Claude Code. Linux and WSL2 are untested.
 - **Git history is out of scope.** Git must read its own objects to function, so `git log -p` and `git show <ref>` reach a governed file's committed bytes. A secret in git history is a secret-scanner problem, not this one.
 - **Edits are gated through reads.** Claude Code's own read-before-edit rule forces a read, and the gate covers that read. The lockdown itself was measured on reads, not on edits.
 - **Codex has no read hook.** There, enforcement is `apply_patch` edits and shell commands only.
+- **Codex trusts hooks per project.** Codex ignores a project's `.codex/` hooks until you trust them — the prompt on your first interactive session in the repo, which persists. A fresh scaffold is untrusted, so a headless or CI Codex run enforces nothing until trusted, or until you pass `--dangerously-bypass-hook-trust`. This is Codex's security model; mati can't pre-seed the trust.
+- **On Codex, the `Bypasses` count can over-report.** A shell read that follows an MCP `mem_get` consult may still be tallied as a miss, because the receipt's actor scope and the shell post-hook's differ. It inflates the audit summary; it does not mean an unconsulted read reached the file — the gate still denies deterministically.
 
 What the gate does see, it records: every deny, every consultation, and every allow-after-receipt, in a local hash-chained log.
 

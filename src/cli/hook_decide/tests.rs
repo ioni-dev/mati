@@ -591,7 +591,9 @@ fn codex_deny_translates_to_shell_blocked() {
 }
 
 #[test]
-fn codex_advisory_suppresses_hit() {
+fn codex_advisory_keeps_hit() {
+    // Codex now injects advisory context via additionalContext (format_decision),
+    // so the Hit consultation receipt is earned — kept, matching Claude.
     let events = vec![HookEvent::Hit {
         key: "file:src/main.rs".into(),
     }];
@@ -599,14 +601,12 @@ fn codex_advisory_suppresses_hit() {
         context: "test".into(),
     };
     let result = platform_events(HookVariant::CodexPreBash, &decision, events);
-    assert!(
-        result.is_empty(),
-        "Codex should not mint receipts for silent outcomes"
-    );
+    assert_eq!(result.len(), 1);
+    assert!(matches!(&result[0], HookEvent::Hit { .. }));
 }
 
 #[test]
-fn codex_liability_suppresses_hit() {
+fn codex_liability_keeps_hit() {
     let events = vec![HookEvent::Hit {
         key: "file:src/main.rs".into(),
     }];
@@ -615,7 +615,8 @@ fn codex_liability_suppresses_hit() {
         context: "test".into(),
     };
     let result = platform_events(HookVariant::CodexPreBash, &decision, events);
-    assert!(result.is_empty());
+    assert_eq!(result.len(), 1);
+    assert!(matches!(&result[0], HookEvent::Hit { .. }));
 }
 
 #[test]
@@ -630,6 +631,28 @@ fn codex_already_consulted_suppresses_hit() {
     };
     let result = platform_events(HookVariant::CodexPreBash, &decision, events);
     assert!(result.is_empty());
+}
+
+#[test]
+fn codex_advisory_injects_additional_context() {
+    // Parity with Claude: an advisory outcome on Codex injects context via
+    // hookSpecificOutput.additionalContext (exit 0), never a permissionDecision —
+    // force-allow is forbidden on permission-required tools. Codex 0.152 honors
+    // this shape (measured 2026-09-02).
+    let decision = Decision::Advisory {
+        context: "pool max_size must stay >= 16".into(),
+    };
+    let (stdout, stderr, code) = format_decision(HookVariant::CodexPreBash, &decision, "src/db.rs");
+    assert_eq!(code, 0);
+    assert!(stderr.is_empty());
+    assert!(
+        stdout.contains("additionalContext") && stdout.contains("pool max_size"),
+        "advisory must inject context on Codex; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("permissionDecision"),
+        "must not force-allow a permission-required tool; got: {stdout}"
+    );
 }
 
 #[test]
@@ -785,7 +808,7 @@ fn e2e_claude_deny_json_output_and_blocked_event() {
 }
 
 #[test]
-fn e2e_codex_advisory_silent_no_hit() {
+fn e2e_codex_advisory_injects_context() {
     let data = json!({
         "file_key": "file:src/lib.rs",
         "file_record": {
@@ -804,12 +827,25 @@ fn e2e_codex_advisory_silent_no_hit() {
     let result = process_eval_response(HookVariant::CodexPreBash, "src/lib.rs", &data, None);
 
     assert_eq!(result.exit_code, 0);
-    assert!(result.stdout.is_empty(), "Codex advisory must be silent");
-    assert!(result.stderr.is_empty());
-    // Advisory emits Hit in the core, but Codex suppresses it.
+    let json: serde_json::Value =
+        serde_json::from_str(&result.stdout).expect("Codex advisory stdout must be valid JSON");
     assert!(
-        result.events.is_empty(),
-        "Codex must NOT mint consultation receipt for advisory, got: {:?}",
+        json.pointer("/hookSpecificOutput/additionalContext")
+            .is_some(),
+        "Codex advisory must inject additionalContext, got: {}",
+        result.stdout
+    );
+    assert!(
+        json.pointer("/hookSpecificOutput/permissionDecision")
+            .is_none(),
+        "must not force-allow a permission-required tool, got: {}",
+        result.stdout
+    );
+    assert!(result.stderr.is_empty());
+    // Advisory emits Hit; Codex now KEEPS it (context delivered), matching Claude.
+    assert!(
+        !result.events.is_empty(),
+        "Codex must mint the consultation receipt now that context is delivered, got: {:?}",
         result.events
     );
     assert!(matches!(result.decision, Decision::Advisory { .. }));
@@ -1142,7 +1178,14 @@ fn codex_db_client_policy_gates_cover_fileless_file_bearing_and_introspection() 
     let steered = decide::evaluate_policy_verdicts(std::slice::from_ref(&exempt_verdict), true);
     let (stdout, stderr, exit_code) =
         format_decision(HookVariant::CodexPreBash, &steered.decision, "<policy>");
-    assert!(stdout.is_empty());
+    // A steered (non-blocking) policy verdict is advisory: Codex now injects its
+    // guidance via additionalContext, matching Claude — the context reaches the
+    // model instead of being dropped.
+    assert!(
+        stdout.contains("additionalContext"),
+        "steered policy must inject context on Codex; got: {stdout}"
+    );
+    assert!(!stdout.contains("permissionDecision"));
     assert!(stderr.is_empty());
     assert_eq!(exit_code, 0);
 }

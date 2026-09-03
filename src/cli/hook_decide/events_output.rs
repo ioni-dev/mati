@@ -53,14 +53,16 @@ fn iso_utc_now() -> String {
 ///
 /// Codex pre-bash:
 ///   - Deny → CodexShellBlocked (not generic BlockedUnconsultedRead)
-///   - Advisory/Liability are silent → suppress Hit (no receipt)
+///   - Advisory/Liability inject context (additionalContext) → keep Hit
 ///   - AlreadyConsulted → suppress ComplianceHit (codex-post-bash records it)
 ///   - NoRecord → Miss (keep)
 ///
 /// Claude pre-read/pre-bash: keep all events as-is.
 pub(crate) fn platform_events(
     variant: HookVariant,
-    decision: &Decision,
+    // No longer consulted — Codex advisory/liability now keep their Hit like
+    // Claude. Kept in the signature so callers need not change.
+    _decision: &Decision,
     events: Vec<HookEvent>,
 ) -> Vec<HookEvent> {
     match variant {
@@ -78,17 +80,10 @@ pub(crate) fn platform_events(
                 // the cost; mis-attributing the agent would be the worse one.
                 HookEvent::LockdownBlocked { key } => Some(HookEvent::CodexShellBlocked { key }),
                 HookEvent::SealFloorBlocked { key } => Some(HookEvent::SealFloorBlocked { key }),
-                HookEvent::Hit { .. } => {
-                    // Suppress Hit for outcomes where Codex receives no context.
-                    // Minting a consultation receipt without delivering context
-                    // would incorrectly downgrade future deny decisions.
-                    // `evaluate()` emits Hit only for Advisory and Liability;
-                    // AlreadyConsulted emits ComplianceHit (handled below).
-                    match decision {
-                        Decision::Advisory { .. } | Decision::Liability { .. } => None,
-                        _ => Some(e),
-                    }
-                }
+                // Advisory/Liability now inject context on Codex too (via
+                // additionalContext, see `format_decision`), so their Hit
+                // consultation receipt is earned — keep it, matching Claude.
+                HookEvent::Hit { .. } => Some(e),
                 HookEvent::ComplianceHit { .. } => {
                     // codex-post-bash owns ComplianceHit/AllowAfterReceipt
                     // for shell commands — suppress from pre-bash to avoid
@@ -769,6 +764,17 @@ pub(crate) fn format_decision(
                 };
                 (String::new(), stderr, 2)
             }
+            // Advisory/Liability inject context via additionalContext with NO
+            // permissionDecision — never force-allow a permission-required tool.
+            // Codex 0.152 honors hookSpecificOutput.additionalContext on PreToolUse
+            // stdout, the same shape Claude uses (measured 2026-09-02), so this
+            // reaches the model. AlreadyConsulted stays silent here — codex-post-bash
+            // owns its compliance recording.
+            Decision::Advisory { context } | Decision::Liability { context, .. } => (
+                format_context_only(&format!("[mati] {context}")),
+                String::new(),
+                0,
+            ),
             _ => (String::new(), String::new(), 0),
         },
         HookVariant::CodexPostBash

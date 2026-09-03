@@ -2497,3 +2497,28 @@ fn decision_actor_distinguishes_two_subagents() {
         server.decision_actor(Some("agentB"))
     );
 }
+
+#[test]
+fn confirm_elicitation_schema_has_no_root_title() {
+    // Codex's elicitation-schema parser (codex_app_server, 0.152) rejects a root
+    // `title`, which schemars stamps from the type name — it broke every gotcha
+    // confirm on Codex. The #[schemars(transform = strip_root_title)] on
+    // GotchaConfirmDecision must strip it. `from_type` is the exact path rmcp uses
+    // to build the wire requestedSchema, so this asserts what goes over the wire.
+    let schema = rmcp::model::ElicitationSchema::builder()
+        .required_bool_with("confirm", |b| {
+            b.description("Set true to confirm this gotcha and activate hook enforcement.")
+        })
+        .build()
+        .expect("elicitation schema builds");
+    let json = serde_json::to_value(&schema).expect("serialize schema");
+    assert!(
+        json.get("title").is_none(),
+        "elicitation requestedSchema must not carry a root title (Codex rejects it); got: {json}"
+    );
+    // Sanity: the confirm property (and its doc-derived description) survive.
+    assert!(
+        json["properties"]["confirm"].is_object(),
+        "confirm property must survive the transform; got: {json}"
+    );
+}
