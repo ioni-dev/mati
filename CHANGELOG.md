@@ -7,6 +7,8 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-03
+
 ### Changed
 - Excluded stale distribution descriptors (Homebrew formula, npm/pip packaging, registry manifests) from the published crate, and corrected their version and license — they had drifted to 0.1.0/0.1.1 and a wrong `MIT` claim (the project is Apache-2.0).
 
@@ -80,7 +82,8 @@ Initial foundation.
 - Layer 0 static analysis: parallel file walker, tree-sitter parser, git history mining, dependency parsing.
 - MCP stdio server and the CLI surface.
 
-[Unreleased]: https://github.com/ioni-dev/mati/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/ioni-dev/mati/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/ioni-dev/mati/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ioni-dev/mati/compare/v0.1.3...v0.1.5
 [0.1.3]: https://github.com/ioni-dev/mati/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/ioni-dev/mati/compare/v0.1.1...v0.1.2
