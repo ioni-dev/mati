@@ -52,9 +52,7 @@ yanked = "warn"
 #   zip 7.x (8 IDs below) — pulled only by candle-core under the `semantic`
 #   feature (off by default); no mati code calls candle or zip. Needs zip 9.
 #   chrono, pin-utils — unmaintained, not vulnerable.
-#   RUSTSEC-2026-0452 (surrealkv) is deliberately NOT ignored: the live store
-#   reaches it on a corrupt store file and only surrealkv 1.2 fixes it. It
-#   stays failing as the trigger for the 1.x store migration.
+#   RUSTSEC-2026-0452 (surrealkv) is fixed, not ignored: surrealkv 1.4.0.
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is transitive (candle stack) and feature-frozen; no upstream migration target yet" },
     { id = "RUSTSEC-2025-0119", reason = "number_prefix is transitive (indicatif) and stable; no replacement target" },

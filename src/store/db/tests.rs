@@ -2362,3 +2362,224 @@ async fn transact_sessions_raw_accepts_valid_session_keys() {
         .await
         .expect("valid session keys must succeed");
 }
+
+/// Every store write is a blind write. Concurrent writers to one key (daemon
+/// connections bumping the same analytics or session key) must all land, last
+/// writer wins, the way they did before surrealkv started rejecting them as
+/// write conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_blind_writes_to_one_key_all_succeed() {
+    let dir = TempDir::new().unwrap();
+    let store = std::sync::Arc::new(Store::open(dir.path()).await.unwrap());
+    let mut handles = Vec::new();
+    for i in 0..64 {
+        let s = store.clone();
+        handles.push(tokio::spawn(async move {
+            s.put(
+                "analytics:shared",
+                &make_record_v("analytics:shared", &format!("v{i}")),
+            )
+            .await?;
+            s.put_raw("enforcement:shared_raw", format!("r{i}").as_bytes())
+                .await
+        }));
+    }
+    let mut failures = Vec::new();
+    for h in handles {
+        if let Err(e) = h.await.expect("task join") {
+            failures.push(e.to_string());
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of 64 writers failed: {:?}",
+        failures.len(),
+        failures.first()
+    );
+    assert!(store.get("analytics:shared").await.unwrap().is_some());
+}
+
+// ─── surrealkv 0.21 → 1.x migration ────────────────────────────────────────
+
+/// A store written by surrealkv 0.21 (mati 0.1.5): one confirmed gotcha,
+/// edited once, so it carries version history.
+fn legacy_fixture_root() -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("store");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/store-surrealkv-0.21");
+    crate::store::migrations::copy_dir_recursive(&fixture, &root).unwrap();
+    (dir, root)
+}
+
+fn manifest_version(db: &Path) -> [u8; 2] {
+    let bytes = std::fs::read(db.join("manifest/00000000000000000000.manifest")).unwrap();
+    [bytes[0], bytes[1]]
+}
+
+fn store_at(root: &Path) -> Store {
+    Store {
+        knowledge: open_knowledge_tree(root.join("knowledge.db")).unwrap(),
+        sessions: open_sessions_tree(root.join("sessions.db")).unwrap(),
+        search: OnceCell::new(),
+        root: root.to_path_buf(),
+        index_needs_rebuild: false,
+    }
+}
+
+#[tokio::test]
+async fn legacy_store_is_backed_up_then_migrated_with_its_data() {
+    let (_dir, root) = legacy_fixture_root();
+    assert_eq!(
+        manifest_version(&root.join("knowledge.db")),
+        [0, 1],
+        "fixture must be 0.21"
+    );
+
+    let store = store_at(&root);
+    for db in ["knowledge.db", "sessions.db"] {
+        let backup = root.join(format!("{db}.bak-0.21"));
+        assert_eq!(
+            manifest_version(&backup),
+            [0, 1],
+            "{db} backup must be the untouched 0.21 store"
+        );
+        assert_ne!(
+            manifest_version(&root.join(db)),
+            [0, 1],
+            "{db} must be migrated"
+        );
+        assert!(!root.join(format!("{db}.bak-0.21.tmp")).exists());
+    }
+
+    let gotcha = store
+        .get("gotcha:keep-the-idempotency-check")
+        .await
+        .unwrap()
+        .expect("gotcha survives");
+    assert_eq!(
+        gotcha.value,
+        "Keep the idempotency check in charge() because retries double-charge"
+    );
+    let history = store
+        .history("gotcha:keep-the-idempotency-check", 10)
+        .unwrap();
+    assert!(
+        history.len() >= 2,
+        "version history must survive, got {}",
+        history.len()
+    );
+}
+
+#[tokio::test]
+async fn reopening_a_migrated_store_keeps_the_first_backup() {
+    let (_dir, root) = legacy_fixture_root();
+    store_at(&root).close().await.unwrap();
+    let backup = root.join("knowledge.db.bak-0.21");
+    let stamp = std::fs::metadata(backup.join("manifest/00000000000000000000.manifest"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let store = store_at(&root);
+    store
+        .put(
+            "decision:after",
+            &make_record_v("decision:after", "post-migration write"),
+        )
+        .await
+        .unwrap();
+    store.close().await.unwrap();
+    let again = std::fs::metadata(backup.join("manifest/00000000000000000000.manifest"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        stamp, again,
+        "the backup is taken once, before the first migration"
+    );
+    assert_eq!(manifest_version(&backup), [0, 1]);
+}
+
+#[tokio::test]
+async fn a_current_store_gets_no_backup() {
+    let (_store, dir) = temp_store();
+    let root = dir.path().join("mati_test");
+    assert!(!root.join("knowledge.db.bak-0.21").exists());
+    assert!(!root.join("sessions.db.bak-0.21").exists());
+}
+
+/// Another process holding the lock means the copy may have caught a store
+/// mid-write. The open fails, so the fresh backup must not survive as a
+/// rollback point; the next successful open takes a clean one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_open_discards_the_backup_it_just_took() {
+    use std::os::fd::AsRawFd;
+    let (_dir, root) = legacy_fixture_root();
+    let db = root.join("knowledge.db");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(db.join("LOCK"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    assert!(
+        open_knowledge_tree(db.clone()).is_err(),
+        "a held lock must fail the open"
+    );
+    assert!(
+        !root.join("knowledge.db.bak-0.21").exists(),
+        "the suspect backup is removed"
+    );
+    assert_eq!(
+        manifest_version(&db),
+        [0, 1],
+        "the store itself is untouched"
+    );
+
+    drop(lock);
+    let tree = open_knowledge_tree(db).unwrap();
+    tree.close().await.unwrap();
+    assert_eq!(
+        manifest_version(&root.join("knowledge.db.bak-0.21")),
+        [0, 1]
+    );
+}
+
+/// A store whose `sessions.db` is locked by someone else must not leave its
+/// own `knowledge.db` locked behind it. surrealkv 1.x keeps a dropped tree's
+/// lock until `close()`, so the direct-open retry loop in `StoreProxy` was
+/// failing against a lock it held itself until its 15 s budget ran out.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_open_does_not_leave_knowledge_locked() {
+    use std::os::fd::AsRawFd;
+    let dir = TempDir::new().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    Store::open(&repo).await.unwrap().close().await.unwrap();
+    let root = crate::store::mati_home().unwrap().join(derive_slug(&repo));
+
+    let lock = std::fs::File::open(root.join("sessions.db/LOCK")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(
+        Store::open(&repo).await.is_err(),
+        "sessions.db is locked elsewhere"
+    );
+    drop(lock);
+
+    let reopened = Store::open(&repo).await;
+    assert!(
+        reopened.is_ok(),
+        "knowledge.db stayed locked by the failed open: {:#}",
+        reopened.err().unwrap()
+    );
+    reopened.unwrap().close().await.unwrap();
+}

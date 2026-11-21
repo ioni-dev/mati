@@ -7,6 +7,13 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Upgraded surrealkv from 0.21.0 to 1.4.0, which fixes RUSTSEC-2026-0452. The first open converts an existing store in place. The conversion is one-way, so an older mati cannot read the store afterwards. Before converting, mati copies `knowledge.db` and `sessions.db` to `knowledge.db.bak-0.21` and `sessions.db.bak-0.21`. To roll back, restore those copies and reinstall the older mati. Stop any running mati daemon before upgrading.
+
+### Fixed
+- Concurrent first writes to the enforcement log could each store a different installation id, so events were stamped with an id the store no longer held.
+- Concurrent writes to one key, such as two hook calls updating the same analytics counter, no longer fail on surrealkv 1.x.
+
 ## [0.1.6] - 2026-09-03
 
 ### Changed

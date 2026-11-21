@@ -75,13 +75,13 @@ impl Store {
         );
         let durability = Durability::for_key(key);
         let tree = self.tree_for(key);
-        let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
-        txn.set_durability(skv_durability(durability));
-
-        let bytes = rmps::to_vec_named(record)
-            .with_context(|| format!("failed to serialize record for key '{key}'"))?;
-        txn.set(key.as_bytes(), bytes)?;
-        txn.commit().await?;
+        commit_blind(tree, skv_durability(durability), |txn| {
+            let bytes = rmps::to_vec_named(record)
+                .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+            txn.set(key.as_bytes(), bytes)?;
+            Ok(())
+        })
+        .await?;
 
         // Crash-fence: written after KV commit, removed after tantivy commit.
         // If the process dies between these two points, open_and_rebuild sees
@@ -151,24 +151,26 @@ impl Store {
             }
         }
         if !immediate.is_empty() {
-            let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
-            txn.set_durability(SkvDurability::Immediate);
-            for (key, record) in &immediate {
-                let bytes = rmps::to_vec_named(record)
-                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
-                txn.set(key.as_bytes(), bytes)?;
-            }
-            txn.commit().await?;
+            commit_blind(&self.knowledge, SkvDurability::Immediate, |txn| {
+                for (key, record) in &immediate {
+                    let bytes = rmps::to_vec_named(record)
+                        .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                    txn.set(key.as_bytes(), bytes)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
         if !eventual.is_empty() {
-            let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
-            txn.set_durability(SkvDurability::Eventual);
-            for (key, record) in &eventual {
-                let bytes = rmps::to_vec_named(record)
-                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
-                txn.set(key.as_bytes(), bytes)?;
-            }
-            txn.commit().await?;
+            commit_blind(&self.sessions, SkvDurability::Eventual, |txn| {
+                for (key, record) in &eventual {
+                    let bytes = rmps::to_vec_named(record)
+                        .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                    txn.set(key.as_bytes(), bytes)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
         if records.iter().any(|(k, _)| is_knowledge_key(k)) {
             self.bump_write_seq();
@@ -211,25 +213,27 @@ impl Store {
         }
 
         if !immediate.is_empty() {
-            let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
-            txn.set_durability(SkvDurability::Immediate);
-            for (key, record) in &immediate {
-                let bytes = rmps::to_vec_named(record)
-                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
-                txn.set(key.as_bytes(), bytes)?;
-            }
-            txn.commit().await?;
+            commit_blind(&self.knowledge, SkvDurability::Immediate, |txn| {
+                for (key, record) in &immediate {
+                    let bytes = rmps::to_vec_named(record)
+                        .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                    txn.set(key.as_bytes(), bytes)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         if !eventual.is_empty() {
-            let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
-            txn.set_durability(SkvDurability::Eventual);
-            for (key, record) in &eventual {
-                let bytes = rmps::to_vec_named(record)
-                    .with_context(|| format!("failed to serialize record for key '{key}'"))?;
-                txn.set(key.as_bytes(), bytes)?;
-            }
-            txn.commit().await?;
+            commit_blind(&self.sessions, SkvDurability::Eventual, |txn| {
+                for (key, record) in &eventual {
+                    let bytes = rmps::to_vec_named(record)
+                        .with_context(|| format!("failed to serialize record for key '{key}'"))?;
+                    txn.set(key.as_bytes(), bytes)?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         let has_knowledge = records.iter().any(|(k, _)| is_knowledge_key(k));
@@ -279,10 +283,11 @@ impl Store {
     /// Delete a record by key. No-op if the key does not exist.
     pub async fn delete(&self, key: &str) -> Result<()> {
         let tree = self.tree_for(key);
-        let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
-        txn.set_durability(skv_durability(Durability::for_key(key)));
-        txn.delete(key.as_bytes())?;
-        txn.commit().await?;
+        commit_blind(tree, skv_durability(Durability::for_key(key)), |txn| {
+            txn.delete(key.as_bytes())?;
+            Ok(())
+        })
+        .await?;
 
         if is_knowledge_key(key) {
             let _ = std::fs::write(self.root.join(SEARCH_SYNC_PENDING), b"");
@@ -459,10 +464,11 @@ impl Store {
         );
         let durability = Durability::for_key(key);
         let tree = self.tree_for(key);
-        let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
-        txn.set_durability(skv_durability(durability));
-        txn.set(key.as_bytes(), value.to_vec())?;
-        txn.commit().await?;
+        commit_blind(tree, skv_durability(durability), |txn| {
+            txn.set(key.as_bytes(), value.to_vec())?;
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 
@@ -485,21 +491,23 @@ impl Store {
         }
 
         if !immediate.is_empty() {
-            let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
-            txn.set_durability(SkvDurability::Immediate);
-            for (key, value) in &immediate {
-                txn.set(key.as_bytes(), value.to_vec())?;
-            }
-            txn.commit().await?;
+            commit_blind(&self.knowledge, SkvDurability::Immediate, |txn| {
+                for (key, value) in &immediate {
+                    txn.set(key.as_bytes(), value.to_vec())?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         if !eventual.is_empty() {
-            let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
-            txn.set_durability(SkvDurability::Eventual);
-            for (key, value) in &eventual {
-                txn.set(key.as_bytes(), value.to_vec())?;
-            }
-            txn.commit().await?;
+            commit_blind(&self.sessions, SkvDurability::Eventual, |txn| {
+                for (key, value) in &eventual {
+                    txn.set(key.as_bytes(), value.to_vec())?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         Ok(())
@@ -541,22 +549,24 @@ impl Store {
         // Collect Records for tantivy sync before committing (we need &Record refs).
         let mut record_refs: Vec<&Record> = Vec::new();
 
-        let mut txn = self.knowledge.begin_with_mode(Mode::WriteOnly)?;
-        txn.set_durability(SkvDurability::Immediate);
-        for op in ops {
-            match op {
-                KnowledgeWriteOp::PutRecord { key, record } => {
-                    let bytes = rmps::to_vec_named(record)
-                        .with_context(|| format!("failed to serialize record for key '{key}'"))?;
-                    txn.set(key.as_bytes(), bytes)?;
-                    record_refs.push(record);
-                }
-                KnowledgeWriteOp::PutRaw { key, value } => {
-                    txn.set(key.as_bytes(), value.to_vec())?;
+        commit_blind(&self.knowledge, SkvDurability::Immediate, |txn| {
+            for op in ops {
+                match op {
+                    KnowledgeWriteOp::PutRecord { key, record } => {
+                        let bytes = rmps::to_vec_named(record).with_context(|| {
+                            format!("failed to serialize record for key '{key}'")
+                        })?;
+                        txn.set(key.as_bytes(), bytes)?;
+                        record_refs.push(record);
+                    }
+                    KnowledgeWriteOp::PutRaw { key, value } => {
+                        txn.set(key.as_bytes(), value.to_vec())?;
+                    }
                 }
             }
-        }
-        txn.commit().await?;
+            Ok(())
+        })
+        .await?;
 
         // Crash-fence + tantivy sync (same pattern as put/put_batch).
         let has_knowledge = ops.iter().any(|op| {
@@ -609,12 +619,13 @@ impl Store {
             }
         }
 
-        let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
-        txn.set_durability(SkvDurability::Eventual);
-        for (key, value) in entries {
-            txn.set(key.as_bytes(), value.to_vec())?;
-        }
-        txn.commit().await?;
+        commit_blind(&self.sessions, SkvDurability::Eventual, |txn| {
+            for (key, value) in entries {
+                txn.set(key.as_bytes(), value.to_vec())?;
+            }
+            Ok(())
+        })
+        .await?;
         Ok(())
     }
 

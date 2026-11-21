@@ -38,18 +38,60 @@ pub(super) fn lock_error_hint(err: anyhow::Error, db_path: &std::path::Path) -> 
     }
 }
 
+/// Copy a surrealkv 0.x store to `<db>.bak-0.21` before 1.x converts it.
+///
+/// The conversion runs on open and is one-way: an older mati cannot read the
+/// result, and surrealkv's own `_surrealkv_v0_backup/` is not a rollback
+/// point. A 0.x store has a version-1 manifest; an interrupted conversion
+/// leaves `MIGRATING`. The copy lands under a temporary name first, so a copy
+/// cut short is never mistaken for a backup. Returns whether a copy was made.
+fn backup_legacy_store(db: &std::path::Path) -> Result<bool> {
+    let manifest = db.join("manifest/00000000000000000000.manifest");
+    let legacy = std::fs::read(&manifest).is_ok_and(|b| b.starts_with(&[0, 1]))
+        || db.join("MIGRATING").exists();
+    let name = db.file_name().and_then(|n| n.to_str()).unwrap_or("store");
+    let backup = db.with_file_name(format!("{name}.bak-0.21"));
+    if !legacy || backup.exists() {
+        return Ok(false);
+    }
+    let partial = db.with_file_name(format!("{name}.bak-0.21.tmp"));
+    let _ = std::fs::remove_dir_all(&partial);
+    crate::store::migrations::copy_dir_recursive(db, &partial)
+        .and_then(|()| std::fs::rename(&partial, &backup))
+        .with_context(|| {
+            format!(
+                "refusing to upgrade {} without a backup: could not copy it to {}",
+                db.display(),
+                backup.display()
+            )
+        })?;
+    Ok(true)
+}
+
+/// Build a tree, backing a 0.x store up first. A failed open (another process
+/// holds the lock) drops the fresh backup: it may have been copied mid-write.
+fn build_tree(opts: Options, path: &std::path::Path, what: &str) -> Result<Tree> {
+    let backed_up = backup_legacy_store(path)?;
+    let built = TreeBuilder::with_options(opts)
+        .build()
+        .with_context(|| format!("failed to open {what}"));
+    if built.is_err() && backed_up {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("store");
+        let _ = std::fs::remove_dir_all(path.with_file_name(format!("{name}.bak-0.21")));
+    }
+    built
+}
+
 pub(super) fn open_knowledge_tree(path: PathBuf) -> Result<Tree> {
     // vlog_value_threshold must be 0 when versioning is enabled — SurrealKV
     // requires all values to be in the VLog for time-travel to work.
     let opts = Options::new()
-        .with_path(path)
+        .with_path(path.clone())
         .with_versioning(true, 0) // indefinite retention
         .with_enable_vlog(true)
         .with_vlog_value_threshold(0)
         .with_vlog_checksum_verification(VLogChecksumLevel::Full);
-    TreeBuilder::with_options(opts)
-        .build()
-        .context("failed to open knowledge.db")
+    build_tree(opts, &path, "knowledge.db")
 }
 
 pub(super) fn open_sessions_tree(path: PathBuf) -> Result<Tree> {
@@ -57,11 +99,9 @@ pub(super) fn open_sessions_tree(path: PathBuf) -> Result<Tree> {
     // VLogChecksumLevel is intentionally omitted — session writes are high-frequency
     // and acceptable to lose on crash. Do not add checksum verification here.
     let opts = Options::new()
-        .with_path(path)
+        .with_path(path.clone())
         .with_versioning(true, SESSIONS_RETENTION_NS)
         .with_enable_vlog(true)
         .with_vlog_value_threshold(0);
-    TreeBuilder::with_options(opts)
-        .build()
-        .context("failed to open sessions.db")
+    build_tree(opts, &path, "sessions.db")
 }

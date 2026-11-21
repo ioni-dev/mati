@@ -74,18 +74,27 @@ pub(crate) async fn shared_writer(
         return Ok(writer);
     }
 
-    // Slow path: build the writer (async I/O) OUTSIDE the registry lock, then
-    // insert. Double-checked — a concurrent caller may have inserted first, in
-    // which case we keep theirs and drop ours (both loaded the same head).
+    // Slow path: one builder at a time. `EnforcementEventWriter::new` persists
+    // the installation id, so racing builders each stored their own id and the
+    // surviving writer could stamp events with one the store no longer held.
+    static INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _init = INIT.lock().await;
+    if let Some(writer) = registry
+        .lock()
+        .expect("enforcement writer registry poisoned")
+        .get(&store.root)
+        .cloned()
+    {
+        return Ok(writer);
+    }
     let writer = Arc::new(tokio::sync::Mutex::new(
         EnforcementEventWriter::new(store).await?,
     ));
-    Ok(registry
+    registry
         .lock()
         .expect("enforcement writer registry poisoned")
-        .entry(store.root.clone())
-        .or_insert(writer)
-        .clone())
+        .insert(store.root.clone(), writer.clone());
+    Ok(writer)
 }
 
 /// Record a single enforcement event through the store's serialized writer.

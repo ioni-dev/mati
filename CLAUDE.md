@@ -187,6 +187,12 @@ never block Claude on a mati outage — hooks fail open (P9).
 - **`with_versioning(true, 0)` means indefinite retention.** `0` is not
   "disabled" — it retains all versions forever. Intentional for `knowledge.db`;
   `sessions.db` uses the 90-day value.
+- **surrealkv 1.x rejects overlapping commits to one key.** Every store write
+  goes through `store::db::commit_blind`, which serializes commits. Never open
+  a write transaction elsewhere. Opening a tree needs a Tokio runtime, and
+  dropping a `Store` does not release its `LOCK`: call `close().await` before
+  reopening in the same process. A 0.21 store converts on first open, one-way,
+  after `store::db::tree` copies it to `<db>.bak-0.21`.
 - **petgraph is in-memory only.** Edges load from a `graph:edge:*` scan at
   startup; mutations must write back to SurrealKV immediately or they are lost on
   restart.
