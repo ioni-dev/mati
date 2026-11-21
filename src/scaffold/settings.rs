@@ -299,8 +299,6 @@ pub enum InstallResult {
     Installed {
         /// Number of hook scripts written.
         scripts: usize,
-        /// Missing runtime dependencies required by the installed hooks.
-        missing_deps: Vec<&'static str>,
     },
     /// `.claude/` directory doesn't exist — user isn't using Claude Code.
     NoClaude,
@@ -357,11 +355,8 @@ pub fn install_hooks_with_options(
     // Write mati binary wrapper so hooks resolve the same binary as MCP.
     super::write_mati_wrapper(&hooks_dir)?;
 
-    let missing_deps = missing_hook_dependencies();
-
     Ok(InstallResult::Installed {
         scripts: HOOK_SCRIPTS.len(),
-        missing_deps,
     })
 }
 
@@ -552,34 +547,6 @@ fn write_mcp_json(path: &Path, _project_root: &Path) -> Result<()> {
     let output = serde_json::to_string_pretty(&mcp_config)?;
     write_if_changed(path, &output)?;
     Ok(())
-}
-
-fn command_available(cmd: &str) -> bool {
-    std::process::Command::new(cmd)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn missing_hook_dependencies() -> Vec<&'static str> {
-    missing_hook_dependencies_with(command_available)
-}
-
-fn missing_hook_dependencies_with<F>(mut has_cmd: F) -> Vec<&'static str>
-where
-    F: FnMut(&str) -> bool,
-{
-    let mut missing = Vec::new();
-    if !has_cmd("jq") {
-        missing.push("jq");
-    }
-    if !has_cmd("awk") {
-        missing.push("awk");
-    }
-    missing
 }
 
 use super::{make_executable, write_if_changed};
@@ -811,15 +778,6 @@ mod tests {
         assert_eq!(parsed["mcpServers"]["other-tool"]["command"], "other");
         assert_eq!(parsed["mcpServers"]["mati"]["command"], "mati");
         assert_eq!(parsed["mcpServers"]["mati"]["args"][0], "serve");
-    }
-
-    #[test]
-    fn detects_all_hook_runtime_dependencies() {
-        let missing = missing_hook_dependencies_with(|cmd| cmd == "jq");
-        assert_eq!(missing, vec!["awk"]);
-
-        let missing = missing_hook_dependencies_with(|_| false);
-        assert_eq!(missing, vec!["jq", "awk"]);
     }
 
     #[test]

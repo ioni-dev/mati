@@ -98,9 +98,11 @@ struct HomeGuard {
 }
 
 impl HomeGuard {
+    /// `MATI_HOME`, not `HOME`: cargo runs set `MATI_REQUIRE_EXPLICIT_HOME`,
+    /// which ignores a `HOME`-derived root.
     fn set(temp_home: &Path) -> Self {
-        let original = std::env::var_os("HOME");
-        std::env::set_var("HOME", temp_home);
+        let original = std::env::var_os("MATI_HOME");
+        std::env::set_var("MATI_HOME", temp_home);
         Self { original }
     }
 }
@@ -108,8 +110,8 @@ impl HomeGuard {
 impl Drop for HomeGuard {
     fn drop(&mut self) {
         match self.original.take() {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+            Some(value) => std::env::set_var("MATI_HOME", value),
+            None => std::env::remove_var("MATI_HOME"),
         }
     }
 }

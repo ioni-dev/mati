@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rmcp::model::{CacheScope, DiscoverResult, ServerCapabilities, ServerConfig};
+use rmcp::model::{CacheScope, DiscoverResult, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::service::{MaybeSendFuture, RequestContext, RoleServer};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,7 @@ impl ServerHandler for MatiServer {
                 .enable_tool_list_changed()
                 .build(),
         )
+        .with_server_info(Implementation::new("mati", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "mati is a persistent engineering knowledge store for the current \
                  codebase. Use mem_get for direct record lookup, mem_query for \

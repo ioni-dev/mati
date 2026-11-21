@@ -429,13 +429,13 @@ async fn run_inner(args: HookDecideArgs) -> Result<()> {
                     consulted_flag(&canon_eval, include_recent),
                     consult_globs.as_ref(),
                 );
-                // Only ESCALATE: adopt the canonical result solely when it denies.
-                // A non-deny canonical outcome never downgrades the lexical
-                // decision (e.g. a lexical Advisory must survive). The canonical
+                // Adopt the canonical result when it denies, or when the lexical
+                // key named no record (see `adopt_canonical`). A non-deny canonical
+                // outcome never downgrades a real lexical one. The canonical
                 // adapter is self-contained — its deny reason and audit events
                 // already key on `canon_rel` (the real target) — so swapping the
                 // adapter alone re-points output + events at the resolved file.
-                if matches!(canon_adapter.decision, Decision::Deny { .. }) {
+                if adopt_canonical(&adapter.decision, &canon_adapter.decision) {
                     adapter = canon_adapter;
                 }
             }

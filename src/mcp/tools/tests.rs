@@ -2522,3 +2522,52 @@ fn confirm_elicitation_schema_has_no_root_title() {
         "confirm property must survive the transform; got: {json}"
     );
 }
+
+/// Fallback decisions (no graph link to the requested file) only spend the
+/// budget gotchas leave over, so they can never push a gotcha out.
+#[tokio::test]
+async fn fallback_decisions_never_crowd_out_gotchas() {
+    async fn gotchas_in_packet(with_decisions: bool) -> (usize, bool) {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        // ~150 tokens each: 30 of them overflow the budget with few fsync'd writes.
+        let filler = "padding that keeps this rule long enough to fill the budget fast ".repeat(9);
+        for i in 0..30 {
+            let record = make_gotcha_record(
+                &format!("gotcha:test-{i:03}"),
+                &format!("Gotcha rule number {i}: {filler}"),
+                true,
+                0.8,
+            );
+            store.put(&record.key, &record).await.unwrap();
+        }
+        if with_decisions {
+            for i in 0..5 {
+                let key = format!("decision:policy-{i}");
+                let record = make_record(&key, "Protected path: other/**", Category::Decision, 0.9);
+                store.put(&key, &record).await.unwrap();
+            }
+        }
+        let graph = Graph::load(store).await.unwrap();
+        let packet = assemble_context_packet(graph.store(), &graph, &[])
+            .await
+            .unwrap();
+        let text = &packet.injection_string;
+        (
+            text.matches("gotcha:test-").count(),
+            text.contains("## Decisions"),
+        )
+    }
+
+    let (alone, _) = gotchas_in_packet(false).await;
+    let (with_decisions, decisions_shown) = gotchas_in_packet(true).await;
+    assert!(
+        alone > 0 && alone < 30,
+        "fixture must overflow the budget, got {alone}"
+    );
+    assert_eq!(alone, with_decisions, "decisions displaced gotchas");
+    assert!(
+        decisions_shown,
+        "leftover budget still carries the fallback decisions"
+    );
+}

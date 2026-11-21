@@ -421,11 +421,7 @@ async fn finish_gotcha_add(
     };
     let key = choose_manual_gotcha_key(proxy, &slug, &gotcha).await?;
 
-    let value = if reason.is_empty() {
-        rule.to_string()
-    } else {
-        format!("{rule} because {reason}")
-    };
+    let value = mati_core::store::gotcha_ops::gotcha_value(rule, reason);
 
     let device_id = mati_core::store::stable_device_id();
     let mut record = Record {
@@ -604,11 +600,8 @@ async fn run_gotcha_edit_inner(proxy: &StoreProxy, key: &str) -> Result<()> {
         confirmed_content: old_gotcha.confirmed_content.clone(),
     };
 
-    let value = if reason.is_empty() {
-        rule
-    } else {
-        format!("{} because {}", updated_gotcha.rule, updated_gotcha.reason)
-    };
+    let value =
+        mati_core::store::gotcha_ops::gotcha_value(&updated_gotcha.rule, &updated_gotcha.reason);
 
     record.value = value;
     record.payload = serde_json::to_value(&updated_gotcha).ok();

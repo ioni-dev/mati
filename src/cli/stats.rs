@@ -1362,8 +1362,8 @@ struct FailOpenStats {
     count_7d: u64,
     /// Seconds since the most recent event (0 = no events).
     last_ago_secs: u64,
-    /// Distinct `reason=` values in the window, count-descending. A missing
-    /// daemon and a missing `jq` both fail open; only the reason tells them
+    /// Distinct `reason=` values in the window, count-descending. A down
+    /// daemon and a blown deadline both fail open; only the reason tells them
     /// apart, and the remedies are different.
     by_reason: Vec<(String, u64)>,
 }
@@ -1869,74 +1869,6 @@ mod tests {
             stats.last_ago_secs <= 10,
             "last fail-open event should be recent; got last_ago_secs={}",
             stats.last_ago_secs
-        );
-    }
-
-    /// The other writer of `fail_open.log` is a bash hook, not Rust. When jq
-    /// is missing, `post-edit.sh` skips edit tracking and doc capture, and its
-    /// only trace is the line it appends here — so that line must land under
-    /// `$MATI_HOME` (what this reader resolves) and parse. If it does not, a
-    /// machine with no jq reports 0 fail-open events while enforcing nothing.
-    #[test]
-    fn shell_hook_fail_open_round_trips_into_the_scanner() {
-        use std::io::Write as _;
-        use std::os::unix::fs::PermissionsExt as _;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let mati_home = dir.path().join("mati_home");
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&bin).unwrap();
-
-        // A PATH with the few tools the guard needs and definitely no jq.
-        for tool in ["cat", "date", "basename", "dirname", "mkdir"] {
-            for base in ["/usr/bin", "/bin"] {
-                let src = std::path::PathBuf::from(base).join(tool);
-                if src.exists() {
-                    std::os::unix::fs::symlink(&src, bin.join(tool)).ok();
-                    break;
-                }
-            }
-        }
-
-        let script = dir.path().join("post-edit.sh");
-        std::fs::write(&script, mati_core::hooks::post_edit::SCRIPT).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let now_before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("test wall clock must be post-epoch")
-            .as_secs();
-
-        // Absolute: `bin` deliberately holds no shell, and Command resolves
-        // the program through the PATH we hand the child.
-        let mut child = std::process::Command::new("/bin/bash")
-            .arg(&script)
-            .env("PATH", &bin)
-            .env("HOME", &home)
-            .env("MATI_HOME", &mati_home)
-            .current_dir(dir.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn hook");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(br#"{"tool_input":{"file_path":"src/main.rs"}}"#)
-            .unwrap();
-        let status = child.wait().expect("hook must terminate");
-        assert!(status.success(), "the hook must fail open, got {status}");
-
-        let stats = scan_fail_open_log_at(&mati_home.join("fail_open.log"), now_before + 5);
-        assert_eq!(
-            stats.count_7d, 1,
-            "the shell hook's jq-missing record must be readable here — 0 means \
-             the hook wrote a format or a directory this scanner does not read"
         );
     }
 }

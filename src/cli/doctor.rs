@@ -311,13 +311,22 @@ async fn collect(cwd: &Path, root: &Path) -> Report {
             detail: "stale socket detected and cleaned up".into(),
             fix: None,
         }),
-        DaemonResult::NotRunning => checks.push(CheckResult {
-            section: "daemon",
-            name: "ping",
-            status: Status::Info,
-            detail: "not running (OK if no agent session is active)".into(),
-            fix: None,
-        }),
+        DaemonResult::NotRunning => match crate::cli::daemon::socket_path_problem(root) {
+            Some(problem) => checks.push(CheckResult {
+                section: "daemon",
+                name: "ping",
+                status: Status::Fail,
+                detail: problem.lines().next().unwrap_or_default().to_string(),
+                fix: Some("set MATI_HOME to a shorter directory"),
+            }),
+            None => checks.push(CheckResult {
+                section: "daemon",
+                name: "ping",
+                status: Status::Info,
+                detail: "not running (OK if no agent session is active)".into(),
+                fix: None,
+            }),
+        },
     }
 
     // Integrity: dirty_marker + drift.

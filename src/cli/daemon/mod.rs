@@ -230,3 +230,18 @@ use serve::serve_loop_graceful;
 pub use serve::{daemon_result, daemon_v2};
 pub use start::run_daemon_start;
 pub use stop::{run_daemon_status, run_daemon_stop};
+
+/// Why no daemon can ever bind under `mati_root`: a socket path past the Unix
+/// limit. Every hook then fails open, so callers must say so loudly.
+pub fn socket_path_problem(mati_root: &std::path::Path) -> Option<String> {
+    let sock = mati_root.join("mati.sock");
+    let len = sock.as_os_str().len();
+    (len > UNIX_SOCK_PATH_MAX).then(|| {
+        format!(
+            "socket path too long ({len} > {UNIX_SOCK_PATH_MAX} bytes): {}\n\
+             No daemon can start, so every hook would fail open. \
+             Set MATI_HOME to a shorter directory.",
+            sock.display()
+        )
+    })
+}

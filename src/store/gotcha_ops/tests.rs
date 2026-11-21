@@ -1090,3 +1090,71 @@ async fn tombstone_writes_negative_exemplar_per_unique_dirname() {
 
     store.close().await.unwrap();
 }
+
+#[test]
+fn gotcha_value_joins_rule_and_reason_once() {
+    let rule = "Never remove the check";
+    assert_eq!(
+        gotcha_value(rule, "it double-charges"),
+        "Never remove the check because it double-charges"
+    );
+    assert_eq!(
+        gotcha_value(rule, "Because it double-charges"),
+        "Never remove the check because it double-charges"
+    );
+    assert_eq!(
+        gotcha_value(rule, "because: it double-charges"),
+        "Never remove the check because it double-charges"
+    );
+    assert_eq!(
+        gotcha_value(rule, "  BECAUSE,  it double-charges "),
+        "Never remove the check because it double-charges"
+    );
+    assert_eq!(
+        gotcha_value(rule, "Becausewise is not a word"),
+        "Never remove the check because Becausewise is not a word"
+    );
+    assert_eq!(gotcha_value(rule, ""), rule);
+    assert_eq!(gotcha_value(rule, "   "), rule);
+    assert_eq!(gotcha_value(rule, "Because"), rule);
+}
+
+#[test]
+fn legacy_value_fix_repairs_only_the_old_doubled_join() {
+    let with = |reason: &str, value: &str| {
+        let mut record = make_gotcha_record("gotcha:g", &["a.rs"]);
+        let mut g: GotchaRecord = record.payload_as().unwrap();
+        g.rule = "Keep the check".into();
+        g.reason = reason.into();
+        record.payload = serde_json::to_value(&g).ok();
+        record.value = value.into();
+        record
+    };
+    let doubled = with(
+        "Because it double-charges",
+        "Keep the check because Because it double-charges",
+    );
+    assert_eq!(
+        legacy_value_fix(&doubled).as_deref(),
+        Some("Keep the check because it double-charges")
+    );
+
+    let trailing = with("", "Keep the check because ");
+    assert_eq!(
+        legacy_value_fix(&trailing).as_deref(),
+        Some("Keep the check")
+    );
+
+    let healthy = with(
+        "it double-charges",
+        "Keep the check because it double-charges",
+    );
+    assert_eq!(legacy_value_fix(&healthy), None);
+
+    // Hand-edited text that is not the old join is never touched.
+    let edited = with(
+        "Because it double-charges",
+        "Keep it: duplicate charges otherwise",
+    );
+    assert_eq!(legacy_value_fix(&edited), None);
+}

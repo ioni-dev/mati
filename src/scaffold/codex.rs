@@ -313,10 +313,7 @@ pub const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexInstallResult {
-    Installed {
-        scripts: usize,
-        missing_deps: Vec<&'static str>,
-    },
+    Installed { scripts: usize },
     NoCodex,
 }
 
@@ -354,7 +351,6 @@ pub fn install_codex(project_root: &Path, create_if_missing: bool) -> Result<Cod
 
     Ok(CodexInstallResult::Installed {
         scripts: CODEX_HOOK_SCRIPTS.len(),
-        missing_deps: missing_hook_dependencies(),
     })
 }
 
@@ -550,12 +546,6 @@ fn merge_config_toml(path: &Path, skill_path: &str, project_root: &Path) -> Resu
     }
 
     write_if_changed(path, &doc.to_string())
-}
-
-fn missing_hook_dependencies() -> Vec<&'static str> {
-    // Codex hooks are thin wrappers that exec `mati hook-decide`.
-    // No jq/awk dependency — all JSON parsing is in Rust.
-    Vec::new()
 }
 
 use super::{make_executable, write_if_changed};

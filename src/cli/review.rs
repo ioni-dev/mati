@@ -872,11 +872,7 @@ async fn edit_candidate(
             confirmed_content: Default::default(),
         };
 
-        record.value = if reason.is_empty() {
-            rule
-        } else {
-            format!("{} because {}", updated.rule, updated.reason)
-        };
+        record.value = mati_core::store::gotcha_ops::gotcha_value(&updated.rule, &updated.reason);
         record.payload = serde_json::to_value(&updated).ok();
         record.updated_at = now;
         record.version.logical_clock += 1;

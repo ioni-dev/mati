@@ -167,6 +167,9 @@ fn mcp_stdio_all_four_tools() {
         init_response.get("result").is_some(),
         "initialize response missing 'result' field: {init_response}"
     );
+    let server_info = &init_response["result"]["serverInfo"];
+    assert_eq!(server_info["name"], "mati", "serverInfo: {server_info}");
+    assert_eq!(server_info["version"], env!("CARGO_PKG_VERSION"));
 
     // Send the `initialized` notification as required by the MCP protocol.
     send(

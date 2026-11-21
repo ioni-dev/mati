@@ -31,6 +31,13 @@ pub async fn run(args: InitArgs) -> Result<()> {
     }
     println!();
 
+    // Hooks that can never reach a daemon only fail open; refuse before writing them.
+    if let Some(problem) =
+        crate::cli::daemon::socket_path_problem(&crate::cli::daemon::mati_root_for(&root)?)
+    {
+        anyhow::bail!(problem);
+    }
+
     // ── 0. Scaffold: agent hooks (no store access needed) ───────────────
     // Install hooks BEFORE any store operations so they succeed even when
     // the daemon holds the store lock. Hooks only write files to disk.
@@ -48,29 +55,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 let owner = crate::cli::daemon::read_pid_file(&mati_root)
                     .map(|(_, o)| o)
                     .unwrap_or_else(|| "unknown".to_string());
-                if owner == "mcp" {
-                    if claude_installed || codex_installed {
-                        println!("  Hook scaffold updated successfully.");
-                        println!();
-                    }
-                    anyhow::bail!(
-                        "mati daemon is running and holds the store lock.\n\
-                         The socket is owned by the active MCP server (mati serve).\n\
-                         Hook scaffold was updated. To run a full re-init, close your\n\
-                         Claude Code / Codex session first, then re-run:\n\n  \
-                         mati init\n"
-                    );
+                let remedy = if owner == "mcp" {
+                    "close your Claude Code / Codex session, then run `mati init`"
                 } else {
-                    if claude_installed || codex_installed {
-                        println!("  Hook scaffold updated successfully.");
-                        println!();
-                    }
-                    anyhow::bail!(
-                        "mati daemon is running and holds the store lock.\n\
-                         Hook scaffold was updated. To run a full re-init, stop the daemon first:\n\n  \
-                         mati daemon stop && mati init\n"
-                    );
+                    "mati daemon stop && mati init"
+                };
+                // `--claude`/`--codex` asked for the scaffold, and it is written.
+                if claude_installed || codex_installed {
+                    println!("  Hook scaffold updated. Store not re-scanned: the mati daemon holds the lock.");
+                    println!("  To re-scan: {remedy}");
+                    println!();
+                    return Ok(());
                 }
+                anyhow::bail!(
+                    "mati daemon is running and holds the store lock.\nTo re-init: {remedy}\n"
+                );
             }
             DaemonResult::Unresponsive | DaemonResult::PermissionDenied => {
                 if claude_installed || codex_installed {
@@ -414,6 +413,39 @@ pub async fn run(args: InitArgs) -> Result<()> {
                      `mati sandbox compile --apply --force` to move the deny floor"
                 );
             }
+        }
+    }
+
+    // ── 8b-value. Repair values stored as "<rule> because Because <reason>" ──
+    {
+        let mut repaired = 0;
+        for rec in all_gotchas.iter_mut() {
+            // The write path forces `Active`; a tombstone must stay one.
+            if !matches!(rec.lifecycle, RecordLifecycle::Active) {
+                continue;
+            }
+            let Some(value) = mati_core::store::gotcha_ops::legacy_value_fix(rec) else {
+                continue;
+            };
+            let files = rec
+                .payload_as::<GotchaRecord>()
+                .map(|g| g.affected_files)
+                .unwrap_or_default();
+            rec.value = value;
+            rec.updated_at = now;
+            rec.version.logical_clock += 1;
+            rec.version.wall_clock = now;
+            match mati_core::store::gotcha_ops::apply_gotcha_write(
+                &store, &root, rec, &files, &files, false,
+            )
+            .await
+            {
+                Ok(()) => repaired += 1,
+                Err(e) => tracing::warn!("init: value repair failed for {}: {e}", rec.key),
+            }
+        }
+        if repaired > 0 {
+            println!("  Repaired gotcha wording...     {repaired:>4} gotchas");
         }
     }
 
@@ -1307,13 +1339,23 @@ pub async fn run(args: InitArgs) -> Result<()> {
     };
     let review_cmd = "mati review".to_string();
     let status_cmd = "mati status".to_string();
+    let hooks_cmd = "mati init --claude".to_string();
+    let no_enforcement = !claude_installed && !codex_installed && !args.no_hooks;
 
     // Compute column width from the longest command + 2 spaces padding
     let col = explain_cmd
         .len()
         .max(review_cmd.len())
         .max(status_cmd.len())
+        .max(hooks_cmd.len())
         + 2;
+
+    if no_enforcement {
+        println!(
+            "    {white}{hooks_cmd:<col$}{reset}{yellow}← no hooks installed, so nothing is enforced (or --codex){reset}",
+            col = col
+        );
+    }
 
     if !explain_cmd.is_empty() {
         let desc = if top_file.is_some() {
