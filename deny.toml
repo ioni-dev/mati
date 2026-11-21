@@ -50,6 +50,16 @@ yanked = "warn"
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is transitive (candle stack) and feature-frozen; no upstream migration target yet" },
     { id = "RUSTSEC-2025-0119", reason = "number_prefix is transitive (indicatif) and stable; no replacement target" },
+    { id = "RUSTSEC-2026-0367", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0545", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0546", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0547", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 7.x via candle-core (semantic feature): no mati code calls candle or zip; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; timestamps only, no replacement chosen yet; ADR-007 update 2026-11-21" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; transitive via hyper (semantic feature); ADR-007 update 2026-11-21" },
 ]
 
 [bans]
