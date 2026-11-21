@@ -1736,29 +1736,33 @@ fn make_budget_eating_record(key: &str, now: u64, links: usize) -> Record {
 /// and finish the store, not restart at `file:` and starve the tail again.
 #[tokio::test]
 async fn a_truncated_pass_parks_a_cursor_and_the_next_pass_finishes_the_store() {
-    let dir = TempDir::new().unwrap();
-    let store = Store::open(dir.path()).await.unwrap();
     let now = 20_000_000u64;
-
-    let mut keys = seed_one_record_per_prefix(&store, now).await;
     // Sorts first inside `file:`, so it is what a truncated pass spends
     // its whole budget on.
     let hog = "file:aaa_expensive.rs";
-    let record = make_budget_eating_record(hog, now, 20_000);
-    store.put(hog, &record).await.unwrap();
-    keys.push(hog.to_string());
 
-    let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+    // How many links outlast a 5 ms budget depends on the machine and the
+    // storage engine, so grow the hog until a pass truncates on it.
+    let mut truncated = None;
+    for links in [20_000, 80_000, 320_000] {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).await.unwrap();
+        let mut keys = seed_one_record_per_prefix(&store, now).await;
+        let record = make_budget_eating_record(hog, now, links);
+        store.put(hog, &record).await.unwrap();
+        keys.push(hog.to_string());
 
-    let deadline = Instant::now() + std::time::Duration::from_millis(5);
-    let first = analyzer.analyze_until(&store, deadline).await.unwrap();
+        let analyzer = StalenessAnalyzer::new_with_now(dir.path(), now);
+        let deadline = Instant::now() + std::time::Duration::from_millis(5);
+        let first = analyzer.analyze_until(&store, deadline).await.unwrap();
+        if first.scanned < keys.len() as u32 {
+            truncated = Some((dir, store, keys, analyzer, first));
+            break;
+        }
+        store.close().await.unwrap();
+    }
+    let (_dir, store, keys, analyzer, first) = truncated.expect("no hog size outlasted the budget");
     assert!(first.scanned >= 1, "a pass must make progress");
-    assert!(
-        first.scanned < keys.len() as u32,
-        "the budget did not truncate: scanned {} of {}",
-        first.scanned,
-        keys.len()
-    );
     assert_eq!(
         read_cursor(&store).await.as_deref(),
         Some(hog),
