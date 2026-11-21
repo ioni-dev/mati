@@ -71,7 +71,9 @@ semantic = [
 # --- Storage (P1 — structural enforcement foundation) ---
 # Pure-Rust LSM-tree KV. MVCC, ACID, time-travel, single file.
 # Selected over redb: native versioning + time-travel queries.
-surrealkv = "0.21"
+# Exact pin: 0.21.4 drops events under concurrent writes
+# (store::enforcement::tests::concurrent_record_event_keeps_chain_intact).
+surrealkv = "=0.21.0"
 
 # --- Graph (in-memory, edges persisted to SurrealKV) ---
 # Layer 0 builds 800-1200 edges at init.

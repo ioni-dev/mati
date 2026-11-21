@@ -590,10 +590,14 @@ fn slug_differs_for_different_paths() {
 /// SHA-256(`https://github.com/ioni-dev/mati.git`)[..4], and its `.git` is a
 /// real directory (the common case, not a gitlink). If this fails, the slug
 /// algorithm moved and the change must stop here, not land.
+///
+/// Built on a scratch repo with that remote rather than this checkout: CI's
+/// `actions/checkout` adds the remote without `.git`, which hashes differently.
 #[test]
 fn this_repos_own_slug_is_pinned() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert_eq!(derive_slug(manifest_dir), "7b63ddee");
+    let dir = tempfile::TempDir::new().unwrap();
+    init_repo_with_remote(dir.path(), "https://github.com/ioni-dev/mati.git");
+    assert_eq!(derive_slug(dir.path()), "7b63ddee");
 }
 
 /// A real repo (not a hand-rolled `.git/config`) with a real remote, set via
