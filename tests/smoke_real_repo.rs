@@ -447,21 +447,24 @@ mod tests {
             .expect("repo has at least one commit")
             .to_string();
 
-        // Every tracked source file, baselined at the root commit.
-        let mut seeded = 0u32;
-        for entry in ignore::Walk::new(root.join("src")).flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|x| x != "rs") {
-                continue;
-            }
-            let rel = path.strip_prefix(&root).unwrap().to_string_lossy();
-            let key = format!("file:{rel}");
-            let mut record = make_file_record(&key);
-            record.staleness.last_record_sha = root_commit.clone();
-            store.put(&key, &record).await.expect("seed failed");
-            seeded += 1;
-        }
-        assert!(seeded > 50, "expected a real corpus, seeded {seeded}");
+        // Every tracked file, baselined at the root commit: nearly all of them
+        // changed since then, so nearly all reach the revwalk. `src/` alone
+        // (~255 files) was small enough for a fast runner to finish in budget.
+        let index = repo.index().expect("repo index");
+        let records: Vec<(String, Record)> = index
+            .iter()
+            .filter_map(|entry| String::from_utf8(entry.path).ok())
+            .map(|rel| {
+                let key = format!("file:{rel}");
+                let mut record = make_file_record(&key);
+                record.staleness.last_record_sha = root_commit.clone();
+                (key, record)
+            })
+            .collect();
+        let batch: Vec<(&str, &Record)> = records.iter().map(|(k, r)| (k.as_str(), r)).collect();
+        store.put_batch(&batch).await.expect("seed failed");
+        let seeded = records.len() as u32;
+        assert!(seeded > 500, "expected a real corpus, seeded {seeded}");
 
         let analyzer = StalenessAnalyzer::new(&root);
         let start = Instant::now();
@@ -471,16 +474,20 @@ mod tests {
             .expect("analyze_all failed");
         let elapsed = start.elapsed();
 
-        // Primary invariant: the 2000ms budget must STOP the pass. With every
-        // record baselined at the root commit, each one revwalks the full
-        // history, so a pass that respects the budget cannot finish the corpus.
-        // This is the robust check — it proves the deadline engaged without
-        // depending on wall-clock timing.
-        assert!(
-            report.scanned < seeded,
-            "budget did not truncate the pass: scanned {} of {seeded} seeded records",
-            report.scanned
-        );
+        // Primary invariant: the 2000ms budget bounds the pass. Normally the
+        // corpus outlasts it and the deadline cuts the pass short. A runner
+        // fast enough to finish everything never needed the deadline, so it
+        // must have finished inside the budget; a full pass that ran over is
+        // the regression this test exists for.
+        if report.scanned == seeded {
+            assert!(
+                elapsed.as_millis() < 2000,
+                "pass finished all {seeded} records but took {:.2}s, past its 2000ms \
+                 budget: the deadline never engaged",
+                elapsed.as_secs_f64()
+            );
+        }
+        assert!(report.scanned >= 1, "a pass must make progress");
 
         // Secondary runaway guard, not a tight budget assertion. The per-record,
         // per-path, and per-revwalk-iteration deadline checks bound the pass, but
