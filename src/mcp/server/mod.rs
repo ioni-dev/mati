@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use rmcp::model::{CacheScope, DiscoverResult, ServerCapabilities, ServerInfo};
+use rmcp::model::{CacheScope, DiscoverResult, ServerCapabilities, ServerConfig};
 use rmcp::service::{MaybeSendFuture, RequestContext, RoleServer};
 use rmcp::{tool_handler, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
@@ -64,8 +64,8 @@ const LIST_TOOLS_TTL_MS: u64 = 3_600_000;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MatiServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()

@@ -307,8 +307,9 @@ BASH_RC=$?
 assert_lacks "unrelated Bash path is not denied" "$OUT" 'permissionDecision":"deny"'
 
 # ── 8b. Codex Bash db_client parity ─────────────────────────────────────────
-# Codex policy denies are exit 2 with a remedy on stderr, while a steer is
-# silent. Keep explicit status checks so empty output cannot mask a skipped hook.
+# Codex policy denies are exit 2 with a remedy on stderr, while a steer exits 0
+# and only adds context (stdout additionalContext, no permissionDecision).
+# Keep explicit status checks so empty output cannot mask a skipped hook.
 step "8b. Codex Bash db_client policies"
 add_block_policy codex-bash '*prod-codex-smoke*' 'schema:codex-bash' 'mem_get'
 mati_p policy enable codex-bash >/dev/null
@@ -339,7 +340,8 @@ assert_lacks "Codex non-matching host is not denied" "$OUT" 'mati:'
 OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.prod-codex-smoke.internal -c \"\\d inventory\""')")"
 CODEX_RC=$?
 [ "$CODEX_RC" -eq 0 ] && pass "Codex introspection exits 0" || fail "Codex introspection exits 0" "rc=$CODEX_RC output=$OUT"
-[ -z "$OUT" ] && pass "Codex introspection steer is silent" || fail "Codex introspection steer is silent" "output=$OUT"
+assert_lacks "Codex introspection steer does not deny" "$OUT" 'permissionDecision'
+assert_has "Codex introspection steer reaches the model as context" "$OUT" '"additionalContext"'
 
 # A block policy whose requires.via names only db_introspection can never be
 # satisfied in Codex: its PostToolUse payload has no exit status, so
@@ -357,7 +359,8 @@ mati_p policy enable codex-degrade >/dev/null
 OUT="$(codex_hook codex-pre-bash "$(pre_bash '"psql -h db.degrade-smoke.internal -c \"select 1\""')")"
 CODEX_RC=$?
 [ "$CODEX_RC" -eq 0 ] && pass "Codex-unsatisfiable policy does not deny on Codex" || fail "Codex-unsatisfiable policy does not deny on Codex" "rc=$CODEX_RC output=$OUT"
-assert_lacks "Codex-unsatisfiable policy emits no deny text" "$OUT" 'mati:'
+assert_lacks "Codex-unsatisfiable policy does not deny" "$OUT" 'permissionDecision'
+assert_has "Codex-unsatisfiable policy explains it only steers" "$OUT" 'steering only here'
 OUT="$(hook claude-pre-bash "$(pre_bash '"psql -h db.degrade-smoke.internal -c \"select 1\""')")"
 assert_has "same policy still denies on Claude" "$OUT" 'schema:codex-degrade'
 
@@ -555,10 +558,10 @@ OUT="$(mati_p policy add file-read-scoped --name file-read-scoped --rule "Consul
   --reason "Read context changes because the repository evolves." --mode block \
   --trigger '{"tool":"file_read","target_path_glob":"**/*.sql"}' \
   --requires '{"key":"decision:file-read-scoped","via":["mem_get"],"freshness":{"ttl_secs":900}}')"
-assert_has "file_read policy warns about missing adapter" "$OUT" 'has no enforcing adapter'
+assert_has "file_read policy names the ungoverned Codex read" "$OUT" 'is enforced for the Claude Read tool'
 assert_lacks "file_read policy is a recognized category" "$OUT" 'not a recognized governable category'
 mati_p policy enable file-read-scoped >/dev/null
-assert_has "doctor repeats file_read adapter warning" "$(mati_p doctor)" 'file_read.*no enforcing adapter'
+assert_has "doctor repeats the file_read coverage note" "$(mati_p doctor)" 'file_read.*is enforced for the Claude Read tool'
 assert_lacks "doctor does not call file_read unknown" "$(mati_p doctor)" 'file_read.*not a recognized governable category'
 OUT="$(mati_p policy add unknown-tool --name unknown-tool --rule "Consult first." \
   --reason "Context changes because the repository evolves." --mode block \
