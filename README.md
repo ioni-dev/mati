@@ -224,7 +224,7 @@ Two shortcuts sit on top of the same engine:
 - `mati protect <glob>` gates edits and deletes to a path behind a fresh consult. Break-glass for crown-jewel files.
 - `mati guard <cmd-glob>` gates a destructive command the same way.
 
-For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into deny rules for the host's own sandbox, which hold outside the hook path. Verified on macOS with Claude Code's `/sandbox` turned on. The Linux and WSL2 paths are written and untested.
+For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into deny rules for the host's own sandbox, which hold outside the hook path. Verified on macOS with Claude Code's `/sandbox` turned on. On Linux, the rules it writes were run through Claude Code's sandbox runtime (`@anthropic-ai/sandbox-runtime` 0.0.83, bubblewrap 0.12.0): shell reads, reads through a symlink and writes were denied, and `unprotect` lifted them. Claude Code itself was not run on Linux. WSL2 is untested.
 
 Hardest of all is `mati seal add <file>`, which holds the file at mode `000` until the session consults it. It is the only one that closes a read the hook never sees, and the only one that also stops your own build. [Sealing a file](#sealing-a-file) has the numbers and the cost.
 
