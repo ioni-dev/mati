@@ -167,6 +167,14 @@ pub(crate) fn cross_worktree_rel_key(
     Some(decide::normalize_path(rel.to_str()?, None))
 }
 
+/// Whether the canonical (symlink-resolved) evaluation replaces the lexical
+/// one. A canonical deny always does. Otherwise only a lexical `NoRecord` is
+/// replaced: that key named nothing, as when the repo sits under a symlinked
+/// directory, so the real file's outcome and context are the true ones.
+pub(crate) fn adopt_canonical(lexical: &Decision, canonical: &Decision) -> bool {
+    matches!(canonical, Decision::Deny { .. }) || matches!(lexical, Decision::NoRecord)
+}
+
 /// WI-20: compute the CANONICAL repo-relative key for the symlink-bypass
 /// fallback, or `None` if the canonical resolution can't be trusted.
 ///

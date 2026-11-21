@@ -234,7 +234,7 @@ async fn upsert_commit_once(
     };
 
     // Apply fields.
-    record.value = format!("{} because {}", input.rule, input.reason);
+    record.value = crate::store::gotcha_ops::gotcha_value(&input.rule, &input.reason);
     record.category = Category::Gotcha;
     record.lifecycle = RecordLifecycle::Active;
     record.priority = map_priority(&input.priority);

@@ -28,6 +28,9 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 async fn open_store(dir: &Path) -> Store {
+    // `Store::open` treats `dir` as a repo and roots its store under MATI_HOME;
+    // keep that inside the temp dir, never the developer's real ~/.mati.
+    std::env::set_var("MATI_HOME", dir.join(".mati-home"));
     Store::open(dir).await.unwrap()
 }
 

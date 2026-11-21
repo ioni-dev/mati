@@ -295,11 +295,7 @@ fn memory_to_record(
 
     let (rule, reason) = rule_and_reason(parsed);
 
-    let value = if reason.is_empty() {
-        rule
-    } else {
-        format!("{rule} because {reason}")
-    };
+    let value = crate::store::gotcha_ops::gotcha_value(&rule, &reason);
 
     let mut tags = vec!["source:auto-memory".to_string()];
     if let Some(t) = parsed.memo_type.as_deref().filter(|t| !t.is_empty()) {

@@ -119,10 +119,11 @@ fn rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Open a store in a temp directory (not the real ~/.mati/).
-/// Store::open expects a repo root and derives ~/.mati/<slug>/ from it.
-/// For benchmarks we use each temp dir as a unique "repo root".
+/// Open a store for a temp dir used as a unique "repo root". `Store::open`
+/// roots the store under MATI_HOME, so point that inside the temp dir too:
+/// otherwise every run writes into the developer's real ~/.mati.
 async fn open_store(dir: &Path) -> Store {
+    std::env::set_var("MATI_HOME", dir.join(".mati-home"));
     Store::open(dir).await.unwrap()
 }
 

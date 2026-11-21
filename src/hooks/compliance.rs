@@ -294,6 +294,9 @@ case "$1" in
     doc-capture)
         cat >/dev/null
         echo "$@" >> "{log_file}" ;;
+    post-edit)
+        cat > "{log_file}.stdin"
+        echo "$@" >> "{log_file}" ;;
     log-miss|log-hit|log-compliance-miss|log-compliance-hit|log-codex-shell-miss|log-bootstrap|log-prompt-nudge|edit-hook|session-flush|session-harvest|post-read-compliance)
         echo "$@" >> "{log_file}" ;;
     reparse)
@@ -849,9 +852,10 @@ fn preread_wrapper_no_mati_in_path_fails_cleanly() {
 // Category 3: Post/Lifecycle Hook Contracts (10 tests)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// 3.02 — post-edit invokes both doc-capture and edit-hook.
+/// 3.02 — post-edit hands the untouched payload to `mati post-edit`, which
+/// parses it in Rust. Doc capture and edit tracking are unit-tested there.
 #[test]
-fn post_edit_invokes_doc_capture_and_edit_hook() {
+fn post_edit_forwards_payload_to_mati() {
     let harness = HookTestHarness::for_post_edit();
     let input = serde_json::json!({
         "tool_input": {
@@ -862,51 +866,19 @@ fn post_edit_invokes_doc_capture_and_edit_hook() {
     .to_string();
     let output = harness.run(&input);
     assert_eq!(output.exit_code, 0);
-    // post-edit fires background processes (`&`) — allow extra time under parallel load.
-    let bg_timeout = std::time::Duration::from_secs(5);
     assert!(
-        harness.wait_for_log_contains_timeout("doc-capture src/main.rs", bg_timeout),
-        "post-edit should invoke doc-capture, log: {}",
+        harness.wait_for_log_contains_timeout("post-edit", std::time::Duration::from_secs(5)),
+        "post-edit should invoke mati post-edit, log: {}",
         harness.read_log()
     );
-    assert!(
-        harness.wait_for_log_contains_timeout("edit-hook src/main.rs", bg_timeout),
-        "post-edit should invoke edit-hook, log: {}",
-        harness.read_log()
-    );
+    let forwarded = std::fs::read_to_string(harness.mock_dir.path().join("mati_log.txt.stdin"))
+        .expect("post-edit must pipe the payload to mati");
+    assert_eq!(forwarded, input);
 }
 
-/// Assert one `fail_open.log` line carries every field `cli::stats`'s scanner
-/// and a human reader need: an ISO timestamp it can parse, the FAIL_OPEN
-/// marker, and the hook/file/reason triple the Rust writer emits.
-fn assert_canonical_fail_open_line(log: &str, reason_fragment: &str) {
-    let line = log
-        .lines()
-        .find(|l| l.contains("FAIL_OPEN"))
-        .unwrap_or_else(|| panic!("no FAIL_OPEN line recorded, log: {log:?}"));
-    let ts = line.split_whitespace().next().unwrap_or("");
-    // `cli::stats::parse_iso_timestamp` needs >= 19 chars of YYYY-MM-DDTHH:MM:SSZ.
-    assert!(
-        ts.len() >= 19 && ts.as_bytes()[10] == b'T' && ts.ends_with('Z'),
-        "timestamp must be the ISO shape cli::stats parses, got {ts:?}"
-    );
-    for field in ["hook=", "file=", "reason="] {
-        assert!(
-            line.contains(field),
-            "fail-open line is missing {field} — drifted from log_fail_open_named: {line:?}"
-        );
-    }
-    assert!(
-        line.contains(reason_fragment),
-        "fail-open line must name the cause {reason_fragment:?}: {line:?}"
-    );
-}
-
-/// 3.02a — no jq means post-edit tracks nothing. The skip must be recorded
-/// under $MATI_HOME, the root `mati stats` scans, or an installation with no
-/// jq looks identical to a working one.
+/// 3.02a — post-edit tracks edits on a machine with no jq.
 #[test]
-fn post_edit_records_fail_open_when_jq_is_missing() {
+fn post_edit_works_without_jq() {
     let harness = HookTestHarness::for_post_edit().exclude_binary("jq");
     let input = serde_json::json!({
         "tool_input": { "file_path": "src/main.rs", "content": "/// Doc\nfn main() {}\n" }
@@ -914,21 +886,18 @@ fn post_edit_records_fail_open_when_jq_is_missing() {
     .to_string();
     let output = harness.run(&input);
 
-    assert_eq!(output.exit_code, 0, "a missing dependency must fail open");
-    assert_canonical_fail_open_line(&harness.fail_open_log(), "jq not on PATH");
+    assert_eq!(output.exit_code, 0);
     assert!(
-        output.stderr.contains("enforcement bypassed"),
-        "the skip must warn on stderr, got: {}",
+        harness.wait_for_log_contains_timeout("post-edit", std::time::Duration::from_secs(5)),
+        "post-edit should invoke mati post-edit, log: {}",
+        harness.read_log()
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "no warning expected, got: {}",
         output.stderr
     );
-    assert!(
-        !harness.mock_dir.path().join(".mati/fail_open.log").exists(),
-        "the record must follow $MATI_HOME, not $HOME/.mati"
-    );
-    assert!(
-        !harness.read_log().contains("edit-hook"),
-        "no jq means no edit tracking — that is the skip being recorded"
-    );
+    assert!(harness.fail_open_log().is_empty(), "nothing failed open");
 }
 
 /// 3.03 — pre-compact flushes session state synchronously.
@@ -968,6 +937,23 @@ fn codex_session_start_emits_active_sentinel() {
         "session-start should emit compact sentinel, got: {}",
         output.stdout
     );
+}
+
+/// 3.05b — a failed Codex daemon bootstrap is logged under $MATI_HOME, the
+/// root `mati stats` reads, not $HOME/.mati.
+#[test]
+fn codex_session_start_logs_under_mati_home() {
+    let harness = HookTestHarness::for_codex_session_start().with_ping_failure();
+    let output = harness.run("{}");
+    assert_eq!(output.exit_code, 0);
+    assert!(
+        harness
+            .fail_open_log()
+            .contains("AUTO_START hook=session-start result=failed"),
+        "log: {:?}",
+        harness.fail_open_log()
+    );
+    assert!(!harness.mock_dir.path().join(".mati/fail_open.log").exists());
 }
 
 /// 3.05a — SessionStart passes `mati watch-paths` JSON through untouched.
