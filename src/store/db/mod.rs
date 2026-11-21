@@ -212,6 +212,28 @@ fn test_home() -> PathBuf {
     .clone()
 }
 
+/// Commit a write-only transaction built by `fill`, one commit at a time.
+///
+/// surrealkv 1.x rejects a commit that overlaps another commit to the same key,
+/// even an in-flight one, and has no switch to turn that off. mati's writes are
+/// all blind (nothing reads inside the transaction) and one process owns a
+/// store (surrealkv's lock file), so serializing commits here restores
+/// last-writer-wins without retries. `fill` is synchronous, so the lock is
+/// never held across another store call.
+async fn commit_blind(
+    tree: &Tree,
+    durability: SkvDurability,
+    fill: impl FnOnce(&mut Transaction) -> Result<()>,
+) -> Result<()> {
+    static COMMITS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _commit = COMMITS.lock().await;
+    let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
+    txn.set_durability(durability);
+    fill(&mut txn)?;
+    txn.commit().await?;
+    Ok(())
+}
+
 impl Store {
     /// Open (or create) both trees for the project rooted at `repo_root`.
     ///
@@ -231,8 +253,15 @@ impl Store {
 
         let knowledge = open_knowledge_tree(root.join("knowledge.db"))
             .map_err(|e| lock_error_hint(e, &root.join("knowledge.db")))?;
-        let sessions = open_sessions_tree(root.join("sessions.db"))
-            .map_err(|e| lock_error_hint(e, &root.join("sessions.db")))?;
+        // surrealkv 1.x keeps a dropped tree's LOCK until `close()`; an early
+        // return here would lock this process out of its own retry.
+        let sessions = match open_sessions_tree(root.join("sessions.db")) {
+            Ok(tree) => tree,
+            Err(e) => {
+                let _ = knowledge.close().await;
+                return Err(lock_error_hint(e, &root.join("sessions.db")));
+            }
+        };
 
         // Tantivy is NOT initialized here — it is lazily created on first use
         // via `ensure_search()`. This saves ~30-50ms for hook commands that
@@ -252,7 +281,10 @@ impl Store {
         // this is a single `Store::get` and returns in microseconds.
         // Migrations refuse to open the store on detected downgrade,
         // which propagates the error up to the caller via `?`.
-        super::migrations::migrate(&store).await?;
+        if let Err(e) = super::migrations::migrate(&store).await {
+            let _ = store.close().await;
+            return Err(e);
+        }
 
         Ok(store)
     }
@@ -268,7 +300,19 @@ impl Store {
     /// can be detected and recovered from before any queries are issued.
     pub async fn open_and_rebuild(repo_root: &Path) -> Result<Self> {
         let mut store = Self::open(repo_root).await?;
+        match store.prepare_search().await {
+            Ok(()) => Ok(store),
+            Err(e) => {
+                let _ = store.close().await;
+                Err(e)
+            }
+        }
+    }
 
+    /// The search half of [`Self::open_and_rebuild`]: wipe a stale or corrupt
+    /// index and rebuild it from KV.
+    async fn prepare_search(&mut self) -> Result<()> {
+        let store = self;
         let search_path = store.root.join("search_index");
         let stale_marker = store.root.join(SEARCH_STALE_MARKER);
         let has_sync_pending = store.root.join(SEARCH_SYNC_PENDING).exists();
@@ -335,7 +379,7 @@ impl Store {
                 let _ = std::fs::remove_file(&stale_marker);
             }
         }
-        Ok(store)
+        Ok(())
     }
 
     /// True when the search index was corrupt or missing on open.
@@ -469,10 +513,11 @@ impl Store {
 
         let sentinel_key = "analytics:ping_probe";
         let ts = start.to_string();
-        let mut txn = self.sessions.begin_with_mode(Mode::WriteOnly)?;
-        txn.set_durability(SkvDurability::Eventual);
-        txn.set(sentinel_key.as_bytes(), ts.as_bytes())?;
-        txn.commit().await?;
+        commit_blind(&self.sessions, SkvDurability::Eventual, |txn| {
+            txn.set(sentinel_key.as_bytes(), ts.as_bytes())?;
+            Ok(())
+        })
+        .await?;
 
         let txn = self.sessions.begin_with_mode(Mode::ReadOnly)?;
         let result = txn.get(sentinel_key.as_bytes())?;

@@ -1319,3 +1319,40 @@ async fn scan_since_ms_matches_legacy_scan_then_retain() {
         bounded.scanned_keys
     );
 }
+
+/// Concurrent first calls must share one writer whose installation id is the
+/// one persisted. Building writers outside the registry lock let every racer
+/// generate and store its own id, so the surviving writer could stamp events
+/// with an id the store no longer holds (and newer surrealkv rejects the
+/// racing writes outright).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_shared_writer_calls_agree_on_installation_id() {
+    use std::sync::Arc;
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(Store::open(dir.path()).await.unwrap());
+
+    let handles: Vec<_> = (0..64)
+        .map(|_| {
+            let s = store.clone();
+            tokio::spawn(async move { shared_writer(&s).await.expect("shared_writer") })
+        })
+        .collect();
+    let mut writers = Vec::new();
+    for h in handles {
+        writers.push(h.await.expect("task join"));
+    }
+
+    let stored = store
+        .get_raw_bytes(INSTALLATION_ID_KEY)
+        .await
+        .unwrap()
+        .map(|b| String::from_utf8(b).unwrap())
+        .expect("installation id persisted");
+    for w in &writers {
+        assert!(
+            Arc::ptr_eq(w, &writers[0]),
+            "all callers must share one writer"
+        );
+    }
+    assert_eq!(writers[0].lock().await.installation_id(), stored);
+}
