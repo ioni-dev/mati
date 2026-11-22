@@ -18,6 +18,8 @@ Coverage today: Claude Code gates file reads and edits (`Edit`/`Write`/`Notebook
 
 Single Rust binary. MCP stdio server. Claude Code and Codex integration.
 
+In Claude Code, install the plugin with `/plugin install mati --marketplace ioni-dev/mati`, then run `/mati:setup` in your project. It needs the `mati` binary; see [Quick start](#quick-start).
+
 Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://getmati.dev)).
 
 ---
