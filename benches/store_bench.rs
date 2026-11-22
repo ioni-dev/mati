@@ -60,7 +60,7 @@ fn make_record(i: usize, category: Category, prefix: &str) -> (String, Record) {
         ],
         created_at: now,
         updated_at: now,
-        ref_url: if i % 5 == 0 {
+        ref_url: if i.is_multiple_of(5) {
             Some(format!("https://github.com/example/pr/{i}"))
         } else {
             None

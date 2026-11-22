@@ -652,7 +652,7 @@ async fn poll_until_exit(
         // Cheap zombie check on a sub-rate to avoid spawning ps on every
         // 50ms tick. State only ever transitions toward `Z` from running
         // states (R/S/T), never back.
-        if iter % ZOMBIE_CHECK_INTERVAL == 0 {
+        if iter.is_multiple_of(ZOMBIE_CHECK_INTERVAL) {
             if let Some(state) = ps_field(pid, "state") {
                 if state.starts_with('Z') {
                     return true;

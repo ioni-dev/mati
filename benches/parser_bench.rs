@@ -197,7 +197,7 @@ mod synth {
             }
 
             // unsafe blocks (0-3 across file)
-            if j < 3 && (i + j) % 4 == 0 {
+            if j < 3 && (i + j).is_multiple_of(4) {
                 writeln!(s, "    unsafe {{").unwrap();
                 writeln!(s, "        let ptr = input.as_ptr();").unwrap();
                 writeln!(s, "        let _ = *ptr;").unwrap();
@@ -211,7 +211,7 @@ mod synth {
             }
 
             // panic!()
-            if j == fn_count - 1 && i % 3 == 0 {
+            if j == fn_count - 1 && i.is_multiple_of(3) {
                 writeln!(s, "    if input == \"fatal\" {{").unwrap();
                 writeln!(s, "        panic!(\"unrecoverable for {i}\");").unwrap();
                 writeln!(s, "    }}").unwrap();
@@ -309,7 +309,7 @@ mod synth {
         }
 
         // @ts-ignore
-        if i % 3 == 0 {
+        if i.is_multiple_of(3) {
             writeln!(s, "// @ts-ignore").unwrap();
             writeln!(s, "const legacy{i} = null;").unwrap();
         }
