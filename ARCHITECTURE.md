@@ -763,9 +763,14 @@ Known holes:
   composition note below.
 - **History.** See the scope paragraph above. In a repo where the sealed file
   is committed, its bytes are one `git cat-file` away.
-- **macOS only.** Every filesystem and native-tool probe above is macOS, uid
-  501, non-root, Claude Code. Linux and WSL2 are untested, and Codex fires no
-  hook for its native read tool at all.
+- **Agent probes are macOS only.** Every filesystem and native-tool probe
+  above is macOS, uid 501, non-root, Claude Code. On Linux, the full test
+  suite, seal tests included, passes as a non-root user. `mati sandbox` deny
+  rules were run through Claude Code's sandbox runtime
+  (`@anthropic-ai/sandbox-runtime` 0.0.83, bubblewrap 0.12.0): shell reads,
+  reads through a symlink and writes were denied. No agent runs were made on
+  Linux. WSL2 is untested, and Codex fires no hook for its native read tool
+  at all.
 
 **With the host sandbox on, the shell route is prevented, not just recorded.**
 Claude Code compiles each `sandbox.filesystem.denyWrite` entry to `(deny
