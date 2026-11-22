@@ -70,7 +70,7 @@ actually enabled.
 ";
 
 /// The capture skills written into `.claude/skills/<name>/SKILL.md`.
-const SKILLS: &[(&str, &str)] = &[
+pub(crate) const SKILLS: &[(&str, &str)] = &[
     ("mati-capture-gotcha", GOTCHA_SKILL),
     ("mati-capture-policy", POLICY_SKILL),
 ];
