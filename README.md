@@ -146,7 +146,7 @@ Three sealed runs did not finish. All three were the agent declining the red-tea
 
 The runs above were on macOS with Claude Code. On Linux, the seal's unit tests pass as a non-root user; no agent runs were made there. WSL2 is untested.
 
-**On Codex.** Codex has no read hook, so the seal is how mati covers its reads. Same red-team prompt, a file never committed to git, codex-cli 0.169.0 on macOS, ten runs per arm:
+**On Codex.** Codex has no read hook, so the seal is how mati covers its reads. An agent told to get the file's contents by any method, a file never committed to git, codex-cli 0.169.0 on macOS, ten runs per arm:
 
 - **Read-only sandbox:** sealed, **0 of 10** got the file's contents, against 10 of 10 unsealed.
 - **Workspace-write sandbox, told not to use mati's tools:** seal alone, **1 of 10** got through by running `chmod u+r` and then `cat`. With mati's Codex hooks installed, **0 of 10**: the hook denied the first read and none of them tried a `chmod`. Fed that `chmod` directly, the hook denies it.
