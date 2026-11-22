@@ -1129,6 +1129,20 @@ pub async fn run(args: InitArgs) -> Result<()> {
         println!("  Search index...                (deferred to first MCP server startup)");
     }
 
+    // Read gotchas from the store, not this run's slices: an incremental
+    // re-init holds only the changed files' records.
+    let gated = match graph.store().scan_prefix("gotcha:").await {
+        Ok(gotchas) => {
+            let mut gated = super::gated_files(&gotchas);
+            gated.retain(|p| root.join(p).exists());
+            gated
+        }
+        Err(e) => {
+            tracing::warn!("coverage scan failed (non-fatal): {e}");
+            Default::default()
+        }
+    };
+
     // ── 12. Close ────────────────────────────────────────────────────────────
     graph.close().await?;
 
@@ -1242,10 +1256,19 @@ pub async fn run(args: InitArgs) -> Result<()> {
         ("", "", "", "", "", "", "")
     };
 
-    // Block 1: Onboarding time estimate
-    // On first run, gotcha coverage is 0% → base time (22 min).
+    // Block 1: Enforcement coverage
+    let ungated_hotspots = git_signals
+        .as_ref()
+        .map(|g| {
+            g.hotspot_files
+                .iter()
+                .filter(|p| !gated.contains(*p))
+                .count()
+        })
+        .unwrap_or(0);
     println!(
-        "  {bold}Onboarding estimate:{reset}  {white}22 min{reset}  {gray}(0% gotcha coverage — confirm candidates to reduce){reset}"
+        "  {bold}Coverage:{reset}  {white}{}{reset}",
+        super::coverage_line(gated.len(), total_file_count, ungated_hotspots)
     );
 
     // Block 2: Top hotspot files (filtered to code files for display)
