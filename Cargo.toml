@@ -1,6 +1,6 @@
 [package]
 name        = "mati"
-version     = "0.1.6"
+version     = "0.2.0"
 edition     = "2021"
 rust-version = "1.89"
 description = "An enforcement layer for codebase knowledge: confirmed gotchas gate what AI agents read and edit at the hook level. Not a passive memory store."

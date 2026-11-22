@@ -7,8 +7,17 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
+### Upgrading
+- **The store upgrade is one-way.** The first run converts `knowledge.db` and `sessions.db` in place, and 0.1.x cannot read them afterwards. mati copies both to `*.bak-0.21` first.
+- Stop the daemon in each project before you upgrade: `mati daemon stop`.
+- To roll back, stop the daemon, restore the `*.bak-0.21` copies over the converted files, and reinstall 0.1.6.
+- Building from source needs Rust 1.89 or later.
+
 ### Added
 - `mati demo` runs deny, consult and allow on a throwaway repo under its own `MATI_HOME`.
+- The README Quick Start lists the prebuilt binaries, the Homebrew tap and the install script, and starts with `mati demo`.
 
 ### Changed
 - Upgraded surrealkv from 0.21.0 to 1.4.0, which fixes RUSTSEC-2026-0452. The first open converts an existing store in place. The conversion is one-way, so an older mati cannot read the store afterwards. Before converting, mati copies `knowledge.db` and `sessions.db` to `knowledge.db.bak-0.21` and `sessions.db.bak-0.21`. To roll back, restore those copies and reinstall the older mati. Stop any running mati daemon before upgrading.
@@ -105,7 +114,8 @@ Initial foundation.
 - Layer 0 static analysis: parallel file walker, tree-sitter parser, git history mining, dependency parsing.
 - MCP stdio server and the CLI surface.
 
-[Unreleased]: https://github.com/ioni-dev/mati/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/ioni-dev/mati/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ioni-dev/mati/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/ioni-dev/mati/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ioni-dev/mati/compare/v0.1.3...v0.1.5
 [0.1.3]: https://github.com/ioni-dev/mati/compare/v0.1.2...v0.1.3
