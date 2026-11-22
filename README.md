@@ -77,6 +77,8 @@ Three steps. You don't hand-write the knowledge unless you want to.
 
 ## What it doesn't catch
 
+**Once mati has denied an access, an agent cannot work around it without consulting.** That is a narrower claim than "it can't get in." Here is the measurement.
+
 The hook reads a command before it runs and looks for a path in it. So it sees the agent's file tools, and it sees `cat src/store/db.rs`. It does not see an access that never spells the name.
 
 We measured that rather than guessing. Ten runs, one governed file, an agent told only to keep the filename out of every command:
@@ -102,8 +104,6 @@ What does hold is narrower, and was measured the same day. Twenty runs, same fix
 - Task success **20 of 20**. Denying the shell did not break the work.
 
 None of those twenty tried a name-free route, so this arm does not cover the hole above. It covers what happens after the gate fires.
-
-So the claim mati makes is this: **once mati has denied an access, an agent cannot work around it without consulting.** Not "it can't get in." Once denied.
 
 Every result on this page was registered before its run, on Claude Sonnet, one fixture family, ten-turn tasks. The 4-of-10 baseline is a historical control on a saved binary; the sealed and unsealed arms below are concurrent.
 
@@ -142,7 +142,7 @@ What it does not do:
 
 Three sealed runs did not finish. All three were the agent declining the red-team instruction — one of them after reading the file from history and stopping at the write — not the floor blocking the work. On the seven runs that attempted it, seven succeeded.
 
-Verified on macOS with Claude Code. Linux and WSL2 are untested.
+The runs above were on macOS with Claude Code. On Linux, the seal's unit tests pass as a non-root user; no agent runs were made there. WSL2 is untested.
 
 ### The rest of the boundary
 
