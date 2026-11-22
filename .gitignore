@@ -38,6 +38,7 @@ PENDING\ WORK/
 
 *.md
 !tests/fixtures/real_world/**
+!plugins/**
 
 # Public OSS-release docs — override the *.md ignore above
 !CHANGELOG.md

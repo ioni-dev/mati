@@ -14,7 +14,7 @@ categories  = ["command-line-utilities", "development-tools"]
 # metadata, not library sources, and must not ship stale versions/licenses to
 # crates.io. tests/fixtures/eval/* are embedded via include_str! in src/eval.rs,
 # so they must ship in the crate.
-exclude     = [".claude/", "docs/", "*.md", "fuzz/", "tests/fixtures/real_world/", "benches/", "Formula/", "packages/", "mati.json", "mati-mcp.json"]
+exclude     = [".claude/", "docs/", "*.md", "fuzz/", "tests/fixtures/real_world/", "benches/", "Formula/", "packages/", "mati.json", "mati-mcp.json", ".claude-plugin/", "plugins/", "examples/"]
 
 [lints.rust]
 # `cargo fuzz` sets --cfg fuzzing automatically; see src/hooks/decide.rs.
