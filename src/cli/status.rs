@@ -458,7 +458,7 @@ pub async fn run(_args: StatusArgs) -> Result<()> {
         conf_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let avg = conf_values.iter().sum::<f32>() / conf_values.len() as f32;
         let n = conf_values.len();
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (conf_values[n / 2 - 1] + conf_values[n / 2]) / 2.0
         } else {
             conf_values[n / 2]

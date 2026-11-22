@@ -7,10 +7,26 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `mati demo` runs deny, consult and allow on a throwaway repo under its own `MATI_HOME`.
+
 ### Changed
 - Upgraded surrealkv from 0.21.0 to 1.4.0, which fixes RUSTSEC-2026-0452. The first open converts an existing store in place. The conversion is one-way, so an older mati cannot read the store afterwards. Before converting, mati copies `knowledge.db` and `sessions.db` to `knowledge.db.bak-0.21` and `sessions.db.bak-0.21`. To roll back, restore those copies and reinstall the older mati. Stop any running mati daemon before upgrading.
+- Minimum Rust version is now 1.89, up from 1.82. surrealkv 1.4.0 needs it.
+- Post-edit parses its payload in Rust (`mati post-edit`). No hook needs `jq` now, and `init` no longer warns about `jq` or `awk`.
+- `--help` describes mati as an enforcement layer, matching the crate description.
+- `mati ls` accepts singular categories: `gotcha`, `file`, `decision`.
+- MCP `serverInfo` reports `mati` and the crate version instead of `rmcp`.
+- `init` without hooks says in Next steps that nothing is enforced.
 
 ### Fixed
+- A reason starting with "because" rendered as "because Because". `init` repairs values stored that way; tombstoned records are left alone.
+- `init --claude` exits 0 when a running daemon holds the store lock, and says the re-scan was skipped.
+- `init` refuses a `MATI_HOME` whose socket path exceeds the Unix limit, instead of writing hooks that can only fail open. `doctor` reports it.
+- A repo reached through a symlinked directory, such as macOS `/tmp`, lost gotcha context after a valid consult and logged a false compliance miss.
+- Post-edit runs edit tracking before doc capture. Run together on Linux, the reparse overwrote the captured purpose.
+- Codex session-start logs under `MATI_HOME`.
+- `graph_bench`, `layer0_bench` and `store_bench` wrote into the real `~/.mati` under `cargo test --all-targets`. They now use a temp `MATI_HOME`.
 - Concurrent first writes to the enforcement log could each store a different installation id, so events were stamped with an id the store no longer held.
 - Concurrent writes to one key, such as two hook calls updating the same analytics counter, no longer fail on surrealkv 1.x.
 
