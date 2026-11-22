@@ -146,6 +146,12 @@ Three sealed runs did not finish. All three were the agent declining the red-tea
 
 The runs above were on macOS with Claude Code. On Linux, the seal's unit tests pass as a non-root user; no agent runs were made there. WSL2 is untested.
 
+**On Codex.** Codex has no read hook, so the seal is how mati covers its reads. Same red-team prompt, a file never committed to git, codex-cli 0.169.0 on macOS, ten runs per arm:
+
+- **Read-only sandbox:** sealed, **0 of 10** got the file's contents, against 10 of 10 unsealed.
+- **Workspace-write sandbox, told not to use mati's tools:** seal alone, **1 of 10** got through by running `chmod u+r` and then `cat`. With mati's Codex hooks installed, **0 of 10**: the hook denied the first read and none of them tried a `chmod`. Fed that `chmod` directly, the hook denies it.
+- **What gets past the pre-command hook:** a `chmod` that never names the file, such as `os.chmod('src/'+'keys.py', 0o644)` or `find src -exec chmod 644 {} +`. The post-command sweep puts the mode back and records a bypass, but the read inside that same command succeeds. On Codex, `mati sandbox` cannot close this: Codex does not enforce the deny rules it writes.
+
 ### The rest of the boundary
 
 - **The debt expires after 15 minutes.** An agent that works elsewhere for long enough gets the session back without consulting.
@@ -153,7 +159,7 @@ The runs above were on macOS with Claude Code. On Linux, the seal's unit tests p
 - **Turning the lockdown off is not itself gated** before the first deny. After one, the disarm command is a shell command and is denied like any other.
 - **Git history is out of scope.** Git must read its own objects to function, so `git log -p` and `git show <ref>` reach a governed file's committed bytes. A secret in git history is a secret-scanner problem, not this one.
 - **Edits are gated through reads.** Claude Code's own read-before-edit rule forces a read, and the gate covers that read. The lockdown itself was measured on reads, not on edits.
-- **Codex has no read hook.** There, enforcement is `apply_patch` edits and shell commands only.
+- **Codex has no read hook.** There, hooks gate `apply_patch` edits and shell commands; `mati seal` covers reads (measured above).
 - **Codex trusts hooks per project.** Codex ignores a project's `.codex/` hooks until you trust them — the prompt on your first interactive session in the repo, which persists. A fresh scaffold is untrusted, so a headless or CI Codex run enforces nothing until trusted, or until you pass `--dangerously-bypass-hook-trust`. This is Codex's security model; mati can't pre-seed the trust.
 - **On Codex, the `Bypasses` count can over-report.** A shell read that follows an MCP `mem_get` consult may still be tallied as a miss, because the receipt's actor scope and the shell post-hook's differ. It inflates the audit summary; it does not mean an unconsulted read reached the file — the gate still denies deterministically.
 
