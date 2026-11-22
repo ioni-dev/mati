@@ -48,14 +48,9 @@ jobs:
 
   # MSRV CI gate intentionally NOT enforced.
   #
-  # ADR-008 documents MSRV at 1.82 as project intent. However, transitive
-  # deps in the Rust ecosystem (notably clap_lex 1.1.0+) ship Cargo.toml
-  # manifests using syntax newer than the 1.82 Cargo can parse, so a
-  # `runs-on: rust-toolchain@1.82.0` check fails on manifest parsing
-  # before reaching mati's own source. The MSRV declaration in Cargo.toml
-  # remains advisory documentation; enforcement would require either
-  # (a) pinning specific transitive versions (brittle) or (b) bumping
-  # MSRV and updating ADR-008.
+  # ADR-008 sets MSRV at 1.89, the floor surrealkv 1.4.0 needs through
+  # aes 0.9.4. Checked by hand with `cargo +1.89.0 check --locked
+  # --all-targets`; no job pins that toolchain.
 
   test:
     name: Test (${{ matrix.os }})

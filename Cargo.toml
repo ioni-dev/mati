@@ -2,7 +2,7 @@
 name        = "mati"
 version     = "0.1.6"
 edition     = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 description = "An enforcement layer for codebase knowledge: confirmed gotchas gate what AI agents read and edit at the hook level. Not a passive memory store."
 license     = "Apache-2.0"
 repository  = "https://github.com/ioni-dev/mati"
