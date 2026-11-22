@@ -784,3 +784,51 @@ async fn migration_flags_a_sandbox_tagged_gotcha() {
 
     store.close().await.unwrap();
 }
+
+#[test]
+fn gated_files_counts_only_deny_capable_gotchas() {
+    let mut gating = make_gotcha("gotcha:a", &["src/a.rs", "src/b.rs"], true);
+    gating.confidence.value = 0.6;
+    gating.quality.value = 0.4;
+    let unconfirmed = make_gotcha("gotcha:b", &["src/c.rs"], false);
+    let mut low_quality = make_gotcha("gotcha:c", &["src/d.rs"], true);
+    low_quality.quality.value = 0.39;
+    let mut low_confidence = make_gotcha("gotcha:d", &["src/e.rs"], true);
+    low_confidence.confidence.value = 0.59;
+    let mut tombstoned = make_gotcha("gotcha:e", &["src/f.rs"], true);
+    tombstoned.lifecycle = RecordLifecycle::Superseded {
+        by_key: "gotcha:a".into(),
+    };
+
+    let gated = gated_files(&[gating, unconfirmed, low_quality, low_confidence, tombstoned]);
+
+    assert_eq!(
+        gated.into_iter().collect::<Vec<_>>(),
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+    );
+}
+
+#[test]
+fn coverage_line_says_nothing_is_denied_when_no_file_is_gated() {
+    let line = coverage_line(0, 3, 1);
+    assert_eq!(
+        line,
+        "0 of 3 files gated. Nothing is denied until a file has a confirmed gotcha (mati review)."
+    );
+}
+
+#[test]
+fn coverage_line_reports_gated_files_and_bare_hotspots() {
+    assert_eq!(
+        coverage_line(2, 3, 1),
+        "2 of 3 files gated by a confirmed gotcha. 1 hotspot file has none."
+    );
+    assert_eq!(
+        coverage_line(1, 3, 0),
+        "1 of 3 files gated by a confirmed gotcha."
+    );
+    assert_eq!(
+        coverage_line(1, 9, 2),
+        "1 of 9 files gated by a confirmed gotcha. 2 hotspot files have none."
+    );
+}

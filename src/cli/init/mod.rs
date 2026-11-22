@@ -37,7 +37,7 @@ pub use run::run;
 pub use scaffold::{install_scaffold, run_hooks, HooksArgs};
 
 pub(super) use super::{colors, sandbox, stale, stats};
-pub(super) use display::is_code_file;
+pub(super) use display::{coverage_line, gated_files, is_code_file};
 pub(super) use generated_gotchas::{
     build_cochange_gotchas, build_codeowners_candidates, build_ownership_gotchas,
     build_revert_gotchas, stale_dependency_keys, CoChangeGotcha, OwnershipGotcha, RevertGotcha,

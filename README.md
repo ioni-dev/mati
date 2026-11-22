@@ -209,6 +209,21 @@ mati exposes exactly four tools. That's a hard constraint: every tool definition
 | `mem_query`     | Search and traversal — text (BM25), tags, 1-hop graph, directory gotchas, opt-in semantic |
 | `mem_set`       | Writes a record, or confirms/deletes one (`action`)             |
 
+The same operations from your shell:
+
+| Agent calls                    | You run                                   |
+| ------------------------------ | ----------------------------------------- |
+| `mem_set` write `gotcha:*`     | `mati gotcha add <file>` / `mati gotcha edit <key>` |
+| `mem_set` confirm `gotcha:*`   | `mati gotcha confirm <key>`, or `mati review` |
+| `mem_set` delete `gotcha:*`    | `mati gotcha delete <key>`                |
+| `mem_set` write `dev_note:*`   | `mati note <text>`                        |
+| `mem_set` write `policy:*`     | `mati policy add`                         |
+| `mem_set` write `decision:*`   | No CLI command; agent only                |
+| `mem_get file:<path>`          | `mati explain <path>`. Like `mem_get`, it records a consultation and lifts the deny |
+| `mem_get <key>`                | `mati show <key>`. Read-only: it does not record a consultation |
+| `mem_query`                    | `mati search <query>`, `mati ls <category>` |
+| `mem_bootstrap`                | No CLI command                            |
+
 ### Records and gotchas
 
 Every file gets a `file:<path>` record: a purpose summary, entry points, and the keys of any attached gotchas. Gotchas are the core unit, each one a rule, a reason, a severity, and a `confirmed` flag.
