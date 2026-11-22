@@ -238,10 +238,24 @@ Layer 1 enrichment runs through your agent, not as a standalone CLI job. The `/m
 
 ## Quick start
 
-```bash
-# Install
-cargo install mati
+Install a prebuilt binary (macOS and Linux, arm64 and x86_64), or build from source:
 
+```bash
+brew install ioni-dev/tap/mati
+# or: curl -fsSL https://github.com/ioni-dev/mati/releases/latest/download/install.sh | bash
+# or: cargo install mati
+```
+
+See it work first. `mati demo` runs deny, consult and allow on a throwaway repo
+and deletes it after. It takes a few seconds and touches nothing else:
+
+```bash
+mati demo
+```
+
+Then set it up on your project:
+
+```bash
 # Initialize a project and install the agent integration. Runs the Layer 0
 # scan, then installs the MCP server (.mcp.json) and the enforcement hooks
 # (.claude/settings.json). Use --codex for the Codex integration instead.
