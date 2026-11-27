@@ -342,9 +342,14 @@ impl ParallelVisitor for FileVisitor {
             return WalkState::Continue;
         }
 
+        let rel_path = make_rel_path(&self.root, path);
+        if crate::scaffold::is_generated_file(&rel_path) {
+            return WalkState::Continue;
+        }
+
         self.local.push(WalkedFile {
             abs_path: path.to_path_buf(),
-            rel_path: make_rel_path(&self.root, path),
+            rel_path,
             language: detect_language(path),
             size_bytes,
             mtime_secs,
@@ -516,6 +521,41 @@ mod tests {
         let files = Walker::new(dir.path()).walk().unwrap();
         assert_eq!(files.len(), 1);
         assert!(!files[0].rel_path.starts_with('/'));
+    }
+
+    #[test]
+    fn walk_skips_files_mati_init_writes() {
+        let dir = TempDir::new().unwrap();
+        for f in [
+            "src/a.rs",
+            ".claude/hooks/pre-read.sh",
+            ".claude/hooks/mati",
+            ".claude/skills/mati-capture-gotcha/SKILL.md",
+            ".claude/commands/mati-enrich.md",
+            ".codex/hooks/pre-bash.sh",
+            ".codex/skills/mati/SKILL.md",
+            ".claude/hooks/my-own-hook.sh",
+            ".claude/commands/deploy.md",
+            ".claude/settings.json",
+            ".claude/CLAUDE.md",
+            ".mcp.json",
+        ] {
+            write(dir.path(), f, "x");
+        }
+
+        let files = Walker::new(dir.path()).walk().unwrap();
+
+        assert_eq!(
+            rel_paths(&files),
+            vec![
+                ".claude/CLAUDE.md",
+                ".claude/commands/deploy.md",
+                ".claude/hooks/my-own-hook.sh",
+                ".claude/settings.json",
+                ".mcp.json",
+                "src/a.rs",
+            ]
+        );
     }
 
     #[test]

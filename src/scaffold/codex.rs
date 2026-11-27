@@ -291,7 +291,7 @@ For each verified candidate:
   and suppresses recall without improving precision.
 "#;
 
-const SKILL_CONFIG_PATH: &str = ".codex/skills/mati/SKILL.md";
+pub(crate) const SKILL_CONFIG_PATH: &str = ".codex/skills/mati/SKILL.md";
 
 pub const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
     (
