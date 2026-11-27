@@ -7,7 +7,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-21
+## [0.2.0] - 2026-11-27
 
 ### Upgrading
 - **The store upgrade is one-way.** The first run converts `knowledge.db` and `sessions.db` in place, and 0.1.x cannot read them afterwards. mati copies both to `*.bak-0.21` first.
@@ -18,6 +18,9 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - `mati demo` runs deny, consult and allow on a throwaway repo under its own `MATI_HOME`.
 - The README Quick Start lists the prebuilt binaries, the Homebrew tap and the install script, and starts with `mati demo`.
+- Claude Code plugin: `.claude-plugin/marketplace.json` and `plugins/mati/`, with a `/mati:setup` skill.
+- `init` ends with a coverage line: how many files a confirmed gotcha gates.
+- `mati repair` reports `file:` records for files `mati init` wrote, and `--purge-orphans` tombstones them. Stores indexed by 0.1.x hold about 22 of these.
 
 ### Changed
 - Upgraded surrealkv from 0.21.0 to 1.4.0, which fixes RUSTSEC-2026-0452. The first open converts an existing store in place. The conversion is one-way, so an older mati cannot read the store afterwards. Before converting, mati copies `knowledge.db` and `sessions.db` to `knowledge.db.bak-0.21` and `sessions.db.bak-0.21`. To roll back, restore those copies and reinstall the older mati. Stop any running mati daemon before upgrading.
@@ -37,6 +40,7 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Codex session-start logs under `MATI_HOME`.
 - `graph_bench`, `layer0_bench` and `store_bench` wrote into the real `~/.mati` under `cargo test --all-targets`. They now use a temp `MATI_HOME`.
 - Concurrent first writes to the enforcement log could each store a different installation id, so events were stamped with an id the store no longer held.
+- The walker no longer indexes the hooks, skills and command `mati init` writes. A 3-file repo had 28 file records; it now has 6. Your own files under `.claude/` are still indexed.
 - Concurrent writes to one key, such as two hook calls updating the same analytics counter, no longer fail on surrealkv 1.x.
 
 ## [0.1.6] - 2026-09-03

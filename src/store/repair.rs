@@ -34,7 +34,9 @@
 //! derived indexes agree with the canonical records, the file is simply gone.
 //! It still inflates every coverage denominator, so [`find_orphaned_files`]
 //! reports it, split into [`OrphanKind::OutsideRepo`] (another tree's paths)
-//! and [`OrphanKind::DeletedInRepo`] (this project's own history).
+//! and [`OrphanKind::DeletedInRepo`] (this project's own history), plus
+//! [`OrphanKind::Scaffold`] (files `mati init` wrote, indexed before the walker
+//! skipped them).
 //! [`purge_orphaned_files`] tombstones them behind `--purge-orphans`, and
 //! refuses above [`ORPHAN_PURGE_MAX_SHARE`].
 //!
@@ -185,6 +187,9 @@ pub enum OrphanKind {
     /// Repo-relative and plausible, but gone from the working tree. Real
     /// project history: a file a refactor removed.
     DeletedInRepo,
+    /// A file `mati init` wrote. The walker skips these now; stores indexed
+    /// before that still hold records for them, whether or not they exist.
+    Scaffold,
 }
 
 /// A `file:*` record naming a path that is not in the repo any more.
@@ -573,6 +578,19 @@ pub struct OrphanScan {
     pub active_files: usize,
 }
 
+impl OrphanScan {
+    /// True when the orphan share says the root is wrong. Scaffold orphans are
+    /// matched by name, not by resolving against the root, so they don't count.
+    pub fn looks_like_wrong_root(&self) -> bool {
+        let unresolved = self
+            .orphans
+            .iter()
+            .filter(|o| o.kind != OrphanKind::Scaffold)
+            .count();
+        unresolved as f64 > self.active_files as f64 * ORPHAN_PURGE_MAX_SHARE
+    }
+}
+
 /// Result of [`purge_orphaned_files`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurgeOutcome {
@@ -604,12 +622,16 @@ pub async fn find_orphaned_files<R: RepairReader>(reader: &R, root: &Path) -> Re
         active_files += 1;
 
         let path = record.key.strip_prefix("file:").unwrap_or_default();
-        if path.is_empty() || root.join(path).exists() {
+        let kind = if crate::scaffold::is_generated_file(path) {
+            OrphanKind::Scaffold
+        } else if path.is_empty() || root.join(path).exists() {
             continue;
-        }
+        } else {
+            classify_orphan(root, path)
+        };
         orphans.push(OrphanEntry {
             key: record.key.clone(),
-            kind: classify_orphan(root, path),
+            kind,
         });
     }
 
@@ -646,7 +668,7 @@ fn classify_orphan(root: &Path, path: &str) -> OrphanKind {
 /// `gotcha_keys` entries and its `HasGotcha` edges go. `derive_desired_state`
 /// stops wanting links to a tombstoned file record, so the run verifies clean.
 pub async fn purge_orphaned_files(store: &Store, scan: &OrphanScan) -> Result<PurgeOutcome> {
-    if scan.orphans.len() as f64 > scan.active_files as f64 * ORPHAN_PURGE_MAX_SHARE {
+    if scan.looks_like_wrong_root() {
         return Ok(PurgeOutcome::Refused {
             orphans: scan.orphans.len(),
             active_files: scan.active_files,
@@ -667,8 +689,11 @@ pub async fn purge_orphaned_files(store: &Store, scan: &OrphanScan) -> Result<Pu
             unlinked += 1;
         }
         set_gotcha_keys(&mut record, vec![]);
-        let dead =
-            crate::store::gotcha_ops::tombstoned_copy(&record, TombstoneReason::FileDeleted, now);
+        let reason = match orphan.kind {
+            OrphanKind::Scaffold => TombstoneReason::MigrationRepair,
+            _ => TombstoneReason::FileDeleted,
+        };
+        let dead = crate::store::gotcha_ops::tombstoned_copy(&record, reason, now);
         store.put(&dead.key, &dead).await?;
         tombstoned += 1;
     }
@@ -1553,11 +1578,17 @@ mod tests {
         seed_repo(dir.path());
         let store = Store::open(dir.path()).await.unwrap();
 
+        std::fs::create_dir_all(dir.path().join(".claude/hooks")).unwrap();
+        std::fs::write(dir.path().join(".claude/hooks/pre-read.sh"), "").unwrap();
+        std::fs::write(dir.path().join(".claude/hooks/mine.sh"), "").unwrap();
+
         for path in [
             "src/a.rs",
             "src/gone.rs",
             "hclsyntax/parser.go",
             "/tmp/scratchpad/notes.md",
+            ".claude/hooks/pre-read.sh",
+            ".claude/hooks/mine.sh",
         ] {
             store
                 .put(&format!("file:{path}"), &make_file(path, &[]))
@@ -1566,7 +1597,7 @@ mod tests {
         }
 
         let scan = find_orphaned_files(&store, dir.path()).await.unwrap();
-        assert_eq!(scan.active_files, 4);
+        assert_eq!(scan.active_files, 6);
 
         let kind = |key: &str| scan.orphans.iter().find(|o| o.key == key).map(|o| o.kind);
         assert_eq!(kind("file:src/a.rs"), None, "the file is right there");
@@ -1579,6 +1610,16 @@ mod tests {
         assert_eq!(
             kind("file:/tmp/scratchpad/notes.md"),
             Some(OrphanKind::OutsideRepo)
+        );
+        assert_eq!(
+            kind("file:.claude/hooks/pre-read.sh"),
+            Some(OrphanKind::Scaffold),
+            "mati wrote it, so it is not project code even though it exists"
+        );
+        assert_eq!(
+            kind("file:.claude/hooks/mine.sh"),
+            None,
+            "the user's own hook"
         );
 
         // The scan is read-only.
@@ -1683,6 +1724,41 @@ mod tests {
 
         let untouched = store.get("file:src/gone0.rs").await.unwrap().unwrap();
         assert!(matches!(untouched.lifecycle, RecordLifecycle::Active));
+
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn purge_removes_scaffold_records_even_when_they_are_most_of_the_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        seed_repo(dir.path());
+        let store = Store::open(dir.path()).await.unwrap();
+
+        store
+            .put("file:src/a.rs", &make_file("src/a.rs", &[]))
+            .await
+            .unwrap();
+        let scaffold: Vec<String> = crate::scaffold::settings::HOOK_SCRIPTS
+            .iter()
+            .map(|(name, _)| format!(".claude/hooks/{name}"))
+            .collect();
+        for path in &scaffold {
+            store
+                .put(&format!("file:{path}"), &make_file(path, &[]))
+                .await
+                .unwrap();
+        }
+
+        let scan = find_orphaned_files(&store, dir.path()).await.unwrap();
+        assert_eq!(
+            purge_orphaned_files(&store, &scan).await.unwrap(),
+            PurgeOutcome::Purged {
+                tombstoned: scaffold.len(),
+                unlinked: 0
+            }
+        );
+        let real = store.get("file:src/a.rs").await.unwrap().unwrap();
+        assert!(matches!(real.lifecycle, RecordLifecycle::Active));
 
         store.close().await.unwrap();
     }
