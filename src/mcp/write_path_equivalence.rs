@@ -602,7 +602,7 @@ fn manual_add_record(key: &str, rule: &str, reason: &str, files: &[&str]) -> Rec
     };
     let mut record = Record {
         key: key.into(),
-        value: format!("{rule} because {reason}"),
+        value: crate::store::gotcha_ops::gotcha_value(rule, reason),
         payload: serde_json::to_value(&gotcha).ok(),
         category: Category::Gotcha,
         priority: Priority::High,
@@ -856,7 +856,7 @@ async fn edit_paths_diverge_only_where_pinned() {
             let mut g = edited.payload_as::<GotchaRecord>().unwrap();
             g.rule = "Always close the store handle".into();
             g.affected_files = vec!["src/b.rs".into()];
-            edited.value = format!("{} because {}", g.rule, g.reason);
+            edited.value = crate::store::gotcha_ops::gotcha_value(&g.rule, &g.reason);
             edited.payload = serde_json::to_value(&g).ok();
             edited.version.logical_clock += 1;
             edited.quality = crate::health::quality::analyze(&edited);

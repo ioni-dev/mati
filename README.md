@@ -18,6 +18,8 @@ Coverage today: Claude Code gates file reads and edits (`Edit`/`Write`/`Notebook
 
 Single Rust binary. MCP stdio server. Claude Code and Codex integration.
 
+In Claude Code, install the plugin with `/plugin install mati --marketplace ioni-dev/mati`, then run `/mati:setup` in your project. It needs the `mati` binary; see [Quick start](#quick-start).
+
 Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://getmati.dev)).
 
 ---
@@ -77,6 +79,8 @@ Three steps. You don't hand-write the knowledge unless you want to.
 
 ## What it doesn't catch
 
+**Once mati has denied an access, an agent cannot work around it without consulting.** That is a narrower claim than "it can't get in." Here is the measurement.
+
 The hook reads a command before it runs and looks for a path in it. So it sees the agent's file tools, and it sees `cat src/store/db.rs`. It does not see an access that never spells the name.
 
 We measured that rather than guessing. Ten runs, one governed file, an agent told only to keep the filename out of every command:
@@ -102,8 +106,6 @@ What does hold is narrower, and was measured the same day. Twenty runs, same fix
 - Task success **20 of 20**. Denying the shell did not break the work.
 
 None of those twenty tried a name-free route, so this arm does not cover the hole above. It covers what happens after the gate fires.
-
-So the claim mati makes is this: **once mati has denied an access, an agent cannot work around it without consulting.** Not "it can't get in." Once denied.
 
 Every result on this page was registered before its run, on Claude Sonnet, one fixture family, ten-turn tasks. The 4-of-10 baseline is a historical control on a saved binary; the sealed and unsealed arms below are concurrent.
 
@@ -142,7 +144,13 @@ What it does not do:
 
 Three sealed runs did not finish. All three were the agent declining the red-team instruction — one of them after reading the file from history and stopping at the write — not the floor blocking the work. On the seven runs that attempted it, seven succeeded.
 
-Verified on macOS with Claude Code. Linux and WSL2 are untested.
+The runs above were on macOS with Claude Code. On Linux, the seal's unit tests pass as a non-root user; no agent runs were made there. WSL2 is untested.
+
+**On Codex.** Codex has no read hook, so the seal is how mati covers its reads. An agent told to get the file's contents by any method, a file never committed to git, codex-cli 0.169.0 on macOS, ten runs per arm:
+
+- **Read-only sandbox:** sealed, **0 of 10** got the file's contents, against 10 of 10 unsealed.
+- **Workspace-write sandbox, told not to use mati's tools:** seal alone, **1 of 10** got through by running `chmod u+r` and then `cat`. With mati's Codex hooks installed, **0 of 10**: the hook denied the first read and none of them tried a `chmod`. Fed that `chmod` directly, the hook denies it.
+- **What gets past the pre-command hook:** a `chmod` that never names the file, such as `os.chmod('src/'+'keys.py', 0o644)` or `find src -exec chmod 644 {} +`. The post-command sweep puts the mode back and records a bypass, but the read inside that same command succeeds. On Codex, `mati sandbox` cannot close this: Codex does not enforce the deny rules it writes.
 
 ### The rest of the boundary
 
@@ -151,7 +159,7 @@ Verified on macOS with Claude Code. Linux and WSL2 are untested.
 - **Turning the lockdown off is not itself gated** before the first deny. After one, the disarm command is a shell command and is denied like any other.
 - **Git history is out of scope.** Git must read its own objects to function, so `git log -p` and `git show <ref>` reach a governed file's committed bytes. A secret in git history is a secret-scanner problem, not this one.
 - **Edits are gated through reads.** Claude Code's own read-before-edit rule forces a read, and the gate covers that read. The lockdown itself was measured on reads, not on edits.
-- **Codex has no read hook.** There, enforcement is `apply_patch` edits and shell commands only.
+- **Codex has no read hook.** There, hooks gate `apply_patch` edits and shell commands; `mati seal` covers reads (measured above).
 - **Codex trusts hooks per project.** Codex ignores a project's `.codex/` hooks until you trust them — the prompt on your first interactive session in the repo, which persists. A fresh scaffold is untrusted, so a headless or CI Codex run enforces nothing until trusted, or until you pass `--dangerously-bypass-hook-trust`. This is Codex's security model; mati can't pre-seed the trust.
 - **On Codex, the `Bypasses` count can over-report.** A shell read that follows an MCP `mem_get` consult may still be tallied as a miss, because the receipt's actor scope and the shell post-hook's differ. It inflates the audit summary; it does not mean an unconsulted read reached the file — the gate still denies deterministically.
 
@@ -207,6 +215,21 @@ mati exposes exactly four tools. That's a hard constraint: every tool definition
 | `mem_query`     | Search and traversal — text (BM25), tags, 1-hop graph, directory gotchas, opt-in semantic |
 | `mem_set`       | Writes a record, or confirms/deletes one (`action`)             |
 
+The same operations from your shell:
+
+| Agent calls                    | You run                                   |
+| ------------------------------ | ----------------------------------------- |
+| `mem_set` write `gotcha:*`     | `mati gotcha add <file>` / `mati gotcha edit <key>` |
+| `mem_set` confirm `gotcha:*`   | `mati gotcha confirm <key>`, or `mati review` |
+| `mem_set` delete `gotcha:*`    | `mati gotcha delete <key>`                |
+| `mem_set` write `dev_note:*`   | `mati note <text>`                        |
+| `mem_set` write `policy:*`     | `mati policy add`                         |
+| `mem_set` write `decision:*`   | No CLI command; agent only                |
+| `mem_get file:<path>`          | `mati explain <path>`. Like `mem_get`, it records a consultation and lifts the deny |
+| `mem_get <key>`                | `mati show <key>`. Read-only: it does not record a consultation |
+| `mem_query`                    | `mati search <query>`, `mati ls <category>` |
+| `mem_bootstrap`                | No CLI command                            |
+
 ### Records and gotchas
 
 Every file gets a `file:<path>` record: a purpose summary, entry points, and the keys of any attached gotchas. Gotchas are the core unit, each one a rule, a reason, a severity, and a `confirmed` flag.
@@ -224,7 +247,7 @@ Two shortcuts sit on top of the same engine:
 - `mati protect <glob>` gates edits and deletes to a path behind a fresh consult. Break-glass for crown-jewel files.
 - `mati guard <cmd-glob>` gates a destructive command the same way.
 
-For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into deny rules for the host's own sandbox, which hold outside the hook path. Verified on macOS with Claude Code's `/sandbox` turned on. The Linux and WSL2 paths are written and untested.
+For a harder floor, `mati sandbox` compiles confirmed crown-jewel gotchas into deny rules for the host's own sandbox, which hold outside the hook path. Verified on macOS with Claude Code's `/sandbox` turned on. On Linux, the rules it writes were run through Claude Code's sandbox runtime (`@anthropic-ai/sandbox-runtime` 0.0.83, bubblewrap 0.12.0): shell reads, reads through a symlink and writes were denied, and `unprotect` lifted them. Claude Code itself was not run on Linux. WSL2 is untested.
 
 Hardest of all is `mati seal add <file>`, which holds the file at mode `000` until the session consults it. It is the only one that closes a read the hook never sees, and the only one that also stops your own build. [Sealing a file](#sealing-a-file) has the numbers and the cost.
 
@@ -238,10 +261,24 @@ Layer 1 enrichment runs through your agent, not as a standalone CLI job. The `/m
 
 ## Quick start
 
-```bash
-# Install
-cargo install mati
+Install a prebuilt binary (macOS and Linux, arm64 and x86_64), or build from source:
 
+```bash
+brew install ioni-dev/tap/mati
+# or: curl -fsSL https://github.com/ioni-dev/mati/releases/latest/download/install.sh | bash
+# or: cargo install mati
+```
+
+See it work first. `mati demo` runs deny, consult and allow on a throwaway repo
+and deletes it after. It takes a few seconds and touches nothing else:
+
+```bash
+mati demo
+```
+
+Then set it up on your project:
+
+```bash
 # Initialize a project and install the agent integration. Runs the Layer 0
 # scan, then installs the MCP server (.mcp.json) and the enforcement hooks
 # (.claude/settings.json). Use --codex for the Codex integration instead.

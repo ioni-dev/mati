@@ -122,6 +122,40 @@ pub fn is_auto_gotcha(key: &str) -> bool {
         || key.starts_with("gotcha:ownership:")
 }
 
+/// The record value for a gotcha: `<rule> because <reason>`, or the bare rule
+/// when there is no reason. A reason that already opens with "because" is not
+/// given a second one.
+pub fn gotcha_value(rule: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    let reason = match reason.get(..7) {
+        Some(head) if head.eq_ignore_ascii_case("because") => {
+            let rest = &reason[7..];
+            if rest.is_empty() || rest.starts_with([' ', ':', ',']) {
+                rest.trim_start_matches([' ', ':', ','])
+            } else {
+                reason
+            }
+        }
+        _ => reason,
+    };
+    if reason.is_empty() {
+        rule.to_string()
+    } else {
+        format!("{rule} because {reason}")
+    }
+}
+
+/// The corrected value for a gotcha stored before [`gotcha_value`] existed:
+/// one whose reason opened with "because", or was empty, and so read
+/// "because Because" or ended in a bare "because". `None` unless the stored
+/// value is exactly that old join, so hand-edited text is never rewritten.
+pub fn legacy_value_fix(record: &Record) -> Option<String> {
+    let g = record.payload_as::<crate::store::GotchaRecord>()?;
+    let old = format!("{} because {}", g.rule, g.reason);
+    let fixed = gotcha_value(&g.rule, &g.reason);
+    (record.value == old && fixed != old).then_some(fixed)
+}
+
 mod edges;
 mod links;
 mod mutation;

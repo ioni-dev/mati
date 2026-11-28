@@ -85,9 +85,9 @@ pub async fn run_ls(args: LsArgs) -> Result<()> {
     let limit = args.limit;
 
     match args.category.as_deref() {
-        Some("files") => ls_files(&store, use_color, limit).await?,
-        Some("gotchas") => ls_gotchas(&store, use_color).await?,
-        Some("decisions") => ls_decisions(&store, use_color).await?,
+        Some("files") | Some("file") => ls_files(&store, use_color, limit).await?,
+        Some("gotchas") | Some("gotcha") => ls_gotchas(&store, use_color).await?,
+        Some("decisions") | Some("decision") => ls_decisions(&store, use_color).await?,
         Some("notes") | Some("note") | Some("dev_note") | Some("dev_notes") => {
             ls_notes(&store, use_color).await?
         }

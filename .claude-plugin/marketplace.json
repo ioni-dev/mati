@@ -1,0 +1,12 @@
+{
+  "name": "mati",
+  "description": "mati: enforcement for codebase knowledge in Claude Code",
+  "owner": { "name": "ioni-dev", "url": "https://github.com/ioni-dev" },
+  "plugins": [
+    {
+      "name": "mati",
+      "source": "./plugins/mati",
+      "description": "Set up mati in a project: denies an agent's read or edit of a file until it has consulted the confirmed gotcha on it"
+    }
+  ]
+}

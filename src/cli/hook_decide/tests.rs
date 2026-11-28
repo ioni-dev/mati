@@ -2110,3 +2110,27 @@ fn an_extensionless_name_counts_only_when_it_is_really_on_disk() {
         "an extension alone makes it a path"
     );
 }
+
+#[test]
+fn canonical_result_replaces_a_lexical_key_that_named_nothing() {
+    let deny = Decision::Deny {
+        file_key: "file:a.rs".into(),
+        reason: "r".into(),
+        origin: decide::DenyOrigin::Gotcha,
+    };
+    let consulted = Decision::AlreadyConsulted {
+        context: "⚠ rule".into(),
+    };
+    let advisory = Decision::Advisory {
+        context: "lexical context".into(),
+    };
+    // A canonical deny always escalates.
+    assert!(adopt_canonical(&Decision::Allow, &deny));
+    assert!(adopt_canonical(&advisory, &deny));
+    // A path through a symlinked directory: the lexical key names no record,
+    // so the real file's consulted context must not be dropped.
+    assert!(adopt_canonical(&Decision::NoRecord, &consulted));
+    // A real lexical outcome is never downgraded by a non-deny canonical one.
+    assert!(!adopt_canonical(&advisory, &consulted));
+    assert!(!adopt_canonical(&Decision::Allow, &Decision::NoRecord));
+}

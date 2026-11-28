@@ -1,0 +1,19 @@
+{
+  "name": "mati",
+  "version": "0.2.0",
+  "description": "Set up mati in a project: denies an agent's read or edit of a file until it has consulted the confirmed gotcha on it",
+  "author": {
+    "name": "ioni-dev",
+    "url": "https://github.com/ioni-dev"
+  },
+  "homepage": "https://getmati.dev",
+  "repository": "https://github.com/ioni-dev/mati",
+  "license": "Apache-2.0",
+  "keywords": [
+    "guardrails",
+    "hooks",
+    "enforcement",
+    "mcp",
+    "audit"
+  ]
+}

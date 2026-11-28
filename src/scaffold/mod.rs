@@ -17,6 +17,22 @@ pub use commands::write_mati_enrich_command;
 pub use settings::install_hooks;
 pub use skills::write_capture_skills;
 
+/// Files `mati init` writes and owns, by repo-relative path. The walker skips
+/// them so a scan counts the project, not mati's own scaffold.
+pub fn is_generated_file(rel: &str) -> bool {
+    if let Some(name) = rel.strip_prefix(".claude/hooks/") {
+        return name == "mati" || settings::HOOK_SCRIPTS.iter().any(|(n, _)| *n == name);
+    }
+    if let Some(name) = rel.strip_prefix(".codex/hooks/") {
+        return name == "mati" || codex::CODEX_HOOK_SCRIPTS.iter().any(|(n, _)| *n == name);
+    }
+    rel == ".claude/commands/mati-enrich.md"
+        || rel == codex::SKILL_CONFIG_PATH
+        || skills::SKILLS
+            .iter()
+            .any(|(name, _)| rel == format!(".claude/skills/{name}/SKILL.md"))
+}
+
 /// Resolve the absolute path to the running mati binary.
 ///
 /// Used by scaffold installers to pin both MCP config and hook scripts to the

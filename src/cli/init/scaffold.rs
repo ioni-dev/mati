@@ -89,7 +89,7 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
 
         let t = Instant::now();
         match install_hooks_with_options(root, args.claude_mcp_tool) {
-            Ok(InstallResult::Installed { missing_deps, .. }) => {
+            Ok(InstallResult::Installed { .. }) => {
                 claude_installed = true;
                 println!(
                     "  Installing Claude integration...                    {:>3}ms",
@@ -131,15 +131,6 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                         );
                     }
                 }
-                if !missing_deps.is_empty() {
-                    eprintln!();
-                    eprintln!(
-                        "  WARNING: Claude hook runtime dependencies missing: {}",
-                        missing_deps.join(", ")
-                    );
-                    eprintln!("  Claude hook enforcement will fail open until they are installed.");
-                    eprintln!();
-                }
             }
             Ok(InstallResult::NoClaude) => println!(
                 "  Installing Claude integration...                    {:>3}ms",
@@ -160,7 +151,7 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
     if install_codex_integration {
         let t = Instant::now();
         match install_codex(root, args.codex) {
-            Ok(CodexInstallResult::Installed { missing_deps, .. }) => {
+            Ok(CodexInstallResult::Installed { .. }) => {
                 codex_installed = true;
                 println!(
                     "  Installing Codex integration...                     {:>3}ms",
@@ -192,15 +183,6 @@ pub fn install_scaffold(root: &std::path::Path, args: &InitArgs) -> Result<(bool
                         codex_hooks.join(", ")
                     );
                     println!("    {g}.codex/skills/mati/            skill instructions for agent guidance{r}");
-                }
-                if !missing_deps.is_empty() {
-                    eprintln!();
-                    eprintln!(
-                        "  WARNING: Codex hook runtime dependencies missing: {}",
-                        missing_deps.join(", ")
-                    );
-                    eprintln!("  Codex Bash enforcement will fail open until they are installed.");
-                    eprintln!();
                 }
             }
             Ok(CodexInstallResult::NoCodex) => println!(

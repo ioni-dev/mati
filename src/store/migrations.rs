@@ -634,7 +634,7 @@ async fn snapshot_knowledge_tree(store: &Store, target_version: u32) -> Result<P
 /// matters because SurrealKV's LSM tree append-only files would otherwise
 /// remain shared between live and backup directories via hardlink inode
 /// reuse, and a future compaction could rewrite them in place.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;

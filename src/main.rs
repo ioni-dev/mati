@@ -26,10 +26,12 @@ mod cli;
     name = "mati",
     version,
     about = "Engineering knowledge that survives turnover",
-    long_about = "mati is a persistent, queryable knowledge store for codebases.\n\
+    long_about = "mati is an enforcement layer for codebase knowledge.\n\
+                  Confirmed gotchas gate what AI agents read and edit, at the hook level.\n\
                   Exposed to agents via MCP stdio, with Claude and Codex integration paths.\n\n\
                   Core workflow:\n  \
                     mati init              build project memory\n  \
+                    mati gotcha add <file> record a rule agents must consult first\n  \
                     mati explain <file>    file briefing before editing\n  \
                     mati diff <range>      pre-merge check against knowledge store\n  \
                     mati status            project memory dashboard"
@@ -51,6 +53,8 @@ enum Commands {
     /// File briefing — gotchas, decisions, and co-changes before editing
     #[command(visible_alias = "e")]
     Explain(cli::explain::ExplainArgs),
+    /// Watch a confirmed gotcha deny a read, then allow it once consulted
+    Demo,
     /// Pre-merge check — surface gotchas for files in a diff range
     #[command(visible_alias = "d")]
     Diff(cli::diff::DiffArgs),
@@ -225,6 +229,9 @@ enum Commands {
     /// Emit SessionStart hook JSON — register the files FileChanged should report on.
     #[command(hide = true, name = "watch-paths")]
     WatchPaths,
+    /// PostToolUse edit hook: reads the payload on stdin.
+    #[command(hide = true, name = "post-edit")]
+    PostEdit,
     #[command(hide = true)]
     EditHook {
         /// Repo-relative file path
@@ -372,6 +379,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::Import(args) => cli::show::run_import(args).await,
         Commands::Review(args) => cli::review::run(args).await,
         Commands::Explain(args) => cli::explain::run(args).await,
+        Commands::Demo => cli::demo::run(),
         Commands::Diff(args) => cli::diff::run(args).await,
         Commands::Stale(args) => cli::stale::run(args).await,
         Commands::Repair(args) => cli::repair::run(args).await,
@@ -485,6 +493,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },
         Commands::SessionClearConsults => match cli::hooks::run_session_clear_consults().await? {
+            cli::hook_decide::HookRunOutcome::Continue => Ok(()),
+            cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
+        },
+        Commands::PostEdit => match cli::hooks::run_post_edit().await? {
             cli::hook_decide::HookRunOutcome::Continue => Ok(()),
             cli::hook_decide::HookRunOutcome::Terminate(exit_code) => std::process::exit(exit_code),
         },

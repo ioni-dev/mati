@@ -6,7 +6,9 @@
 pub const SCRIPT: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)" && export PATH="$HOOKS_DIR:$PATH"
-mkdir -p "${HOME}/.mati" 2>/dev/null || true
+# The root `mati stats` reads: $MATI_HOME wins, ~/.mati is the default.
+MATI_DIR="${MATI_HOME:-${HOME}/.mati}"
+mkdir -p "$MATI_DIR" 2>/dev/null || true
 
 if ! mati ping --daemon-only >/dev/null 2>&1; then
   mati daemon start </dev/null >/dev/null 2>&1 &
@@ -17,10 +19,10 @@ if ! mati ping --daemon-only >/dev/null 2>&1; then
   done
   if [ "$READY" = "false" ]; then
     echo "[mati] WARNING: daemon bootstrap failed — PreToolUse hooks will retry independently." >&2
-    { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start result=failed" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+    { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start result=failed" >> "$MATI_DIR/fail_open.log"; } 2>/dev/null || true
     exit 0
   fi
-  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start result=ok" >> "${HOME}/.mati/fail_open.log"; } 2>/dev/null || true
+  { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) AUTO_START hook=session-start result=ok" >> "$MATI_DIR/fail_open.log"; } 2>/dev/null || true
 fi
 
 mati log-bootstrap "__codex_session__" >/dev/null 2>&1 || true

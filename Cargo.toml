@@ -1,8 +1,8 @@
 [package]
 name        = "mati"
-version     = "0.1.6"
+version     = "0.2.0"
 edition     = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 description = "An enforcement layer for codebase knowledge: confirmed gotchas gate what AI agents read and edit at the hook level. Not a passive memory store."
 license     = "Apache-2.0"
 repository  = "https://github.com/ioni-dev/mati"
@@ -14,7 +14,7 @@ categories  = ["command-line-utilities", "development-tools"]
 # metadata, not library sources, and must not ship stale versions/licenses to
 # crates.io. tests/fixtures/eval/* are embedded via include_str! in src/eval.rs,
 # so they must ship in the crate.
-exclude     = [".claude/", "docs/", "*.md", "fuzz/", "tests/fixtures/real_world/", "benches/", "Formula/", "packages/", "mati.json", "mati-mcp.json"]
+exclude     = [".claude/", "docs/", "*.md", "fuzz/", "tests/fixtures/real_world/", "benches/", "Formula/", "packages/", "mati.json", "mati-mcp.json", ".claude-plugin/", "plugins/", "examples/"]
 
 [lints.rust]
 # `cargo fuzz` sets --cfg fuzzing automatically; see src/hooks/decide.rs.
@@ -71,7 +71,10 @@ semantic = [
 # --- Storage (P1 — structural enforcement foundation) ---
 # Pure-Rust LSM-tree KV. MVCC, ACID, time-travel, single file.
 # Selected over redb: native versioning + time-travel queries.
-surrealkv = "0.21"
+# Exact pin. 1.x converts a 0.21 store on open, one-way; store::db::tree
+# backs it up first. 1.x also rejects overlapping commits to one key, so
+# store::db::commit_blind serializes commits.
+surrealkv = "=1.4.0"
 
 # --- Graph (in-memory, edges persisted to SurrealKV) ---
 # Layer 0 builds 800-1200 edges at init.

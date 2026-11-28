@@ -5,8 +5,7 @@ use clap::Args;
 
 use mati_core::store::repair::{
     check_gotcha_indexes, find_orphaned_files, is_dirty, purge_orphaned_files,
-    repair_gotcha_indexes, OrphanEntry, OrphanKind, OrphanScan, PurgeOutcome, RepairMode,
-    RepairReport, ORPHAN_PURGE_MAX_SHARE,
+    repair_gotcha_indexes, OrphanKind, OrphanScan, PurgeOutcome, RepairMode, RepairReport,
 };
 use mati_core::store::{RepoIdent, Store};
 
@@ -95,7 +94,7 @@ pub async fn run(args: RepairArgs) -> Result<()> {
         if args.purge_orphans {
             purge_orphans(&store, &scan, &ident, args.json).await?;
         } else if !args.json {
-            print_orphan_summary(&scan.orphans, scan.active_files, use_color);
+            print_orphan_summary(&scan, use_color);
         }
         scan.orphans
     } else {
@@ -394,7 +393,11 @@ fn print_check_report(report: &RepairReport, active_files: usize, use_color: boo
     } else {
         print_drift_summary(report, use_color);
     }
-    print_orphan_summary(&report.orphaned_files, active_files, use_color);
+    let scan = OrphanScan {
+        orphans: report.orphaned_files.clone(),
+        active_files,
+    };
+    print_orphan_summary(&scan, use_color);
     println!();
 }
 
@@ -406,7 +409,8 @@ fn print_check_report(report: &RepairReport, active_files: usize, use_color: boo
 /// points at a re-init instead of a purge. It cannot say why — a subtree init,
 /// a foreign checkout and a wholesale rename all look identical from the
 /// orphan set alone — but re-indexing is the remedy for all three.
-fn print_orphan_summary(orphans: &[OrphanEntry], active_files: usize, use_color: bool) {
+fn print_orphan_summary(scan: &OrphanScan, use_color: bool) {
+    let orphans = &scan.orphans;
     if orphans.is_empty() {
         return;
     }
@@ -416,15 +420,15 @@ fn print_orphan_summary(orphans: &[OrphanEntry], active_files: usize, use_color:
         ("", "", "", "")
     };
 
-    let outside = orphans
-        .iter()
-        .filter(|o| o.kind == OrphanKind::OutsideRepo)
-        .count();
-    let deleted = orphans.len() - outside;
+    let count = |kind| orphans.iter().filter(|o| o.kind == kind).count();
+    let outside = count(OrphanKind::OutsideRepo);
+    let deleted = count(OrphanKind::DeletedInRepo);
+    let scaffold = count(OrphanKind::Scaffold);
 
     println!(
         "\n  {yellow}Orphaned file records:{reset} {white}{}{reset}  \
-         {gray}({outside} outside the repo, {deleted} deleted in it){reset}",
+         {gray}({outside} outside the repo, {deleted} deleted in it, \
+         {scaffold} written by mati init){reset}",
         orphans.len()
     );
     for entry in orphans.iter().take(5) {
@@ -434,8 +438,7 @@ fn print_orphan_summary(orphans: &[OrphanEntry], active_files: usize, use_color:
         println!("    ... and {} more", orphans.len() - 5);
     }
 
-    let wrong_root = orphans.len() as f64 > active_files as f64 * ORPHAN_PURGE_MAX_SHARE;
-    if wrong_root {
+    if scan.looks_like_wrong_root() {
         println!(
             "  {yellow}Nearly every file record is orphaned.{reset} {gray}Either these keys \
              were written against a different root — most often `mati init --path <subdir>` \

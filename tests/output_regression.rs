@@ -207,7 +207,8 @@ fn help_workflow_framing() {
     let out = strip_ansi(&stdout);
 
     // Product identity (long_about shown with --help)
-    assert_contains(&out, "persistent, queryable knowledge store");
+    assert_contains(&out, "enforcement layer for codebase knowledge");
+    assert_contains(&out, "mati gotcha add");
 
     // Core workflow commands must appear
     assert_contains(&out, "mati init");
@@ -805,4 +806,111 @@ fn history_enforcement_help_lists_event_types() {
             "history --help should mention type label {label}:\n{clean}"
         );
     }
+}
+
+// ── Audit follow-ups: first-run friction ────────────────────────────────────
+
+#[test]
+fn ls_accepts_singular_categories() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
+    init_repo(&bin, repo_dir.path(), home_dir.path());
+    for category in ["gotcha", "file", "decision", "note"] {
+        let (stdout, stderr, ok) = run(&bin, repo_dir.path(), home_dir.path(), &["ls", category]);
+        assert!(
+            ok,
+            "mati ls {category} failed:\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn init_without_platform_says_nothing_is_enforced() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
+    let (stdout, stderr, ok) = run(&bin, repo_dir.path(), home_dir.path(), &["init"]);
+    assert!(ok, "mati init failed:\nstdout: {stdout}\nstderr: {stderr}");
+    let out = strip_ansi(&stdout);
+    let next_steps = &out[out.find("Next steps").expect("Next steps section")..];
+    assert_contains(next_steps, "mati init --claude");
+    assert_contains(next_steps, "nothing is enforced");
+}
+
+#[test]
+fn init_no_hooks_does_not_nag_about_enforcement() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
+    let stdout = strip_ansi(&init_repo(&bin, repo_dir.path(), home_dir.path()));
+    assert!(
+        !stdout.contains("nothing is enforced"),
+        "--no-hooks is an explicit choice; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn init_claude_succeeds_while_the_daemon_runs() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
+    let (repo, home) = (repo_dir.path(), home_dir.path());
+    std::fs::create_dir_all(repo.join(".claude")).expect("mkdir .claude");
+    let (stdout, stderr, ok) = run(&bin, repo, home, &["init", "--claude"]);
+    assert!(ok, "first init failed:\nstdout: {stdout}\nstderr: {stderr}");
+
+    let daemon = Command::new(&bin)
+        .args(["daemon", "start"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("MATI_HOME", home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !run(&bin, repo, home, &["daemon", "status"])
+        .0
+        .contains("is running")
+    {
+        assert!(std::time::Instant::now() < deadline, "daemon never came up");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let (stdout, stderr, ok) = run(&bin, repo, home, &["init", "--claude"]);
+    drop(daemon);
+    assert!(
+        ok,
+        "re-init with a running daemon must succeed:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_contains(&stdout, "not re-scanned");
+    assert_contains(&stdout, "mati daemon stop && mati init");
+
+    // Plain `mati init` asked only for the scan, which could not run.
+    let (_, stderr, ok) = run(&bin, repo, home, &["init", "--no-hooks"]);
+    assert!(!ok, "a scan-only init blocked by the daemon must fail");
+    assert_contains(&stderr, "holds the store lock");
+}
+
+#[test]
+fn init_refuses_a_home_whose_socket_path_is_too_long() {
+    let bin = mati_bin();
+    let (repo_dir, home_dir, _daemon_guard) = setup_repo();
+    let repo = repo_dir.path();
+    std::fs::create_dir_all(repo.join(".claude")).expect("mkdir .claude");
+    let long_home = home_dir.path().join("x".repeat(110));
+    std::fs::create_dir_all(&long_home).expect("mkdir long home");
+
+    let (stdout, stderr, ok) = run(&bin, repo, &long_home, &["init", "--claude"]);
+    assert!(
+        !ok,
+        "init must fail when no daemon can ever bind:\nstdout: {stdout}"
+    );
+    assert_contains(&stderr, "socket path too long");
+    assert_contains(&stderr, "MATI_HOME");
+    assert!(
+        !repo.join(".claude/hooks/pre-read.sh").exists(),
+        "no hooks may be installed that can only fail open"
+    );
+
+    let (stdout, _, _) = run(&bin, repo, &long_home, &["doctor"]);
+    assert_contains(&strip_ansi(&stdout), "socket path too long");
 }

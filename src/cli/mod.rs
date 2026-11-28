@@ -4,6 +4,7 @@ pub mod colors;
 pub mod config;
 pub mod consult_gate;
 pub mod daemon;
+pub mod demo;
 pub mod diff;
 pub mod doctor;
 pub mod enrich;

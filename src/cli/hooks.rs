@@ -477,7 +477,7 @@ pub async fn run_session_clear_consults() -> Result<HookRunOutcome> {
 }
 
 /// Combined log-hit + reparse in a single daemon round-trip.
-/// Called by post-edit.sh hook to avoid two separate process spawns.
+/// Kept as a command for post-edit.sh scripts installed before `mati post-edit`.
 pub async fn run_edit_hook(path: &str) -> Result<()> {
     hook_fire_v2(mati_core::mcp::protocol::Command::FileEditHook(
         mati_core::mcp::protocol::FileEditHookInput {
@@ -499,6 +499,64 @@ pub async fn run_doc_capture(path: &str) -> Result<()> {
             path: repo_relative_path_here(path),
         },
     ))
+    .await
+}
+
+/// The edited path in a PostToolUse payload, and whether the tool sent new
+/// content to scan for a doc comment. MultiEdit carries neither field.
+fn post_edit_target(payload: &str) -> Option<(String, bool)> {
+    let payload: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let input = payload.get("tool_input")?;
+    let path = input.get("file_path")?.as_str().filter(|p| !p.is_empty())?;
+    let has_content = ["content", "new_string"].iter().any(|k| {
+        input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+    });
+    Some((path.to_string(), has_content))
+}
+
+/// PostToolUse(Edit/Write/MultiEdit): doc capture plus edit tracking.
+pub async fn run_post_edit() -> Result<HookRunOutcome> {
+    use mati_core::mcp::protocol as p;
+    const POST_EDIT_DEADLINE_MS: u64 = 2500;
+
+    let mut buf = String::new();
+    if std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).is_err() {
+        return Ok(HookRunOutcome::Terminate(0));
+    }
+    let Some((raw_path, has_content)) = post_edit_target(&buf) else {
+        return Ok(HookRunOutcome::Terminate(0));
+    };
+    let path = repo_relative_path_here(&raw_path);
+
+    // Sequential: the edit hook reparses and rewrites the file record, so run
+    // concurrently it can overwrite the purpose doc capture just stored.
+    let send = async {
+        hook_fire_v2(p::Command::FileEditHook(p::FileEditHookInput {
+            path: path.clone(),
+        }))
+        .await?;
+        if has_content {
+            let input = p::DocCaptureInput { path: path.clone() };
+            hook_fire_v2(p::Command::DocCapture(input)).await?;
+        }
+        anyhow::Ok(())
+    };
+    run_with_deadline(
+        "post-edit",
+        &path,
+        POST_EDIT_DEADLINE_MS,
+        "post-edit exceeded internal deadline",
+        async {
+            // Outside a mati project there is no root to send to; that is not an error.
+            if let Err(e) = send.await {
+                tracing::debug!("mati post-edit: {e:#}");
+            }
+            Ok(())
+        },
+    )
     .await
 }
 
@@ -578,6 +636,26 @@ mod tests {
     use mati_core::store::session::*;
     use mati_core::store::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn post_edit_target_reads_path_and_whether_content_arrived() {
+        use super::post_edit_target as target;
+        let write = r#"{"tool_input":{"file_path":"/r/a.rs","content":"/// Doc\nfn a() {}"}}"#;
+        assert_eq!(target(write), Some(("/r/a.rs".to_string(), true)));
+
+        let edit = r#"{"tool_input":{"file_path":"a.rs","old_string":"x","new_string":"y"}}"#;
+        assert_eq!(target(edit), Some(("a.rs".to_string(), true)));
+
+        let deletion = r#"{"tool_input":{"file_path":"a.rs","old_string":"x","new_string":""}}"#;
+        assert_eq!(target(deletion), Some(("a.rs".to_string(), false)));
+
+        let multi_edit = r#"{"tool_input":{"file_path":"a.rs","edits":[{"new_string":"y"}]}}"#;
+        assert_eq!(target(multi_edit), Some(("a.rs".to_string(), false)));
+
+        assert_eq!(target(r#"{"tool_input":{"file_path":""}}"#), None);
+        assert_eq!(target(r#"{"tool_input":{}}"#), None);
+        assert_eq!(target("not json"), None);
+    }
 
     fn extract_confirmed(record: &Record) -> bool {
         if record.category != Category::Gotcha {

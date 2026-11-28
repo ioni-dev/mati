@@ -7,6 +7,42 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-27
+
+### Upgrading
+- **The store upgrade is one-way.** The first run converts `knowledge.db` and `sessions.db` in place, and 0.1.x cannot read them afterwards. mati copies both to `*.bak-0.21` first.
+- Stop the daemon in each project before you upgrade: `mati daemon stop`.
+- To roll back, stop the daemon, restore the `*.bak-0.21` copies over the converted files, and reinstall 0.1.6.
+- Building from source needs Rust 1.89 or later.
+
+### Added
+- `mati demo` runs deny, consult and allow on a throwaway repo under its own `MATI_HOME`.
+- The README Quick Start lists the prebuilt binaries, the Homebrew tap and the install script, and starts with `mati demo`.
+- Claude Code plugin: `.claude-plugin/marketplace.json` and `plugins/mati/`, with a `/mati:setup` skill.
+- `init` ends with a coverage line: how many files a confirmed gotcha gates.
+- `mati repair` reports `file:` records for files `mati init` wrote, and `--purge-orphans` tombstones them. Stores indexed by 0.1.x hold about 22 of these.
+
+### Changed
+- Upgraded surrealkv from 0.21.0 to 1.4.0, which fixes RUSTSEC-2026-0452. The first open converts an existing store in place. The conversion is one-way, so an older mati cannot read the store afterwards. Before converting, mati copies `knowledge.db` and `sessions.db` to `knowledge.db.bak-0.21` and `sessions.db.bak-0.21`. To roll back, restore those copies and reinstall the older mati. Stop any running mati daemon before upgrading.
+- Minimum Rust version is now 1.89, up from 1.82. surrealkv 1.4.0 needs it.
+- Post-edit parses its payload in Rust (`mati post-edit`). No hook needs `jq` now, and `init` no longer warns about `jq` or `awk`.
+- `--help` describes mati as an enforcement layer, matching the crate description.
+- `mati ls` accepts singular categories: `gotcha`, `file`, `decision`.
+- MCP `serverInfo` reports `mati` and the crate version instead of `rmcp`.
+- `init` without hooks says in Next steps that nothing is enforced.
+
+### Fixed
+- A reason starting with "because" rendered as "because Because". `init` repairs values stored that way; tombstoned records are left alone.
+- `init --claude` exits 0 when a running daemon holds the store lock, and says the re-scan was skipped.
+- `init` refuses a `MATI_HOME` whose socket path exceeds the Unix limit, instead of writing hooks that can only fail open. `doctor` reports it.
+- A repo reached through a symlinked directory, such as macOS `/tmp`, lost gotcha context after a valid consult and logged a false compliance miss.
+- Post-edit runs edit tracking before doc capture. Run together on Linux, the reparse overwrote the captured purpose.
+- Codex session-start logs under `MATI_HOME`.
+- `graph_bench`, `layer0_bench` and `store_bench` wrote into the real `~/.mati` under `cargo test --all-targets`. They now use a temp `MATI_HOME`.
+- Concurrent first writes to the enforcement log could each store a different installation id, so events were stamped with an id the store no longer held.
+- The walker no longer indexes the hooks, skills and command `mati init` writes. A 3-file repo had 28 file records; it now has 6. Your own files under `.claude/` are still indexed.
+- Concurrent writes to one key, such as two hook calls updating the same analytics counter, no longer fail on surrealkv 1.x.
+
 ## [0.1.6] - 2026-09-03
 
 ### Changed
@@ -82,7 +118,8 @@ Initial foundation.
 - Layer 0 static analysis: parallel file walker, tree-sitter parser, git history mining, dependency parsing.
 - MCP stdio server and the CLI surface.
 
-[Unreleased]: https://github.com/ioni-dev/mati/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/ioni-dev/mati/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ioni-dev/mati/compare/v0.1.6...v0.2.0
 [0.1.6]: https://github.com/ioni-dev/mati/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/ioni-dev/mati/compare/v0.1.3...v0.1.5
 [0.1.3]: https://github.com/ioni-dev/mati/compare/v0.1.2...v0.1.3

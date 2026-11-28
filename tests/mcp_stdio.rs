@@ -167,6 +167,9 @@ fn mcp_stdio_all_four_tools() {
         init_response.get("result").is_some(),
         "initialize response missing 'result' field: {init_response}"
     );
+    let server_info = &init_response["result"]["serverInfo"];
+    assert_eq!(server_info["name"], "mati", "serverInfo: {server_info}");
+    assert_eq!(server_info["version"], env!("CARGO_PKG_VERSION"));
 
     // Send the `initialized` notification as required by the MCP protocol.
     send(
@@ -1168,9 +1171,9 @@ fn mcp_stdio_server_discover_is_cacheable() {
 /// mati's tool set is a compile-time constant, so the list never changes within
 /// a running binary. rmcp's `#[tool_handler]` default marks it `Public` but with
 /// `ttlMs = 0` (revalidate every call); mati overrides `list_tools` to raise the
-/// TTL. The client must negotiate 2026-07-28 in `initialize` for the cache
-/// fields to appear — this test does the full handshake, unlike the stateless
-/// `server/discover` probe above.
+/// TTL. Protocol 2026-07-28 has no `initialize` handshake: the client names
+/// the version in each request's `_meta`, and only then do the cache fields
+/// appear.
 #[test]
 fn mcp_stdio_tools_list_is_cacheable() {
     let project_dir = TempDir::new().expect("failed to create tempdir for MCP test");
@@ -1197,21 +1200,7 @@ fn mcp_stdio_tools_list_is_cacheable() {
 
     send(
         &mut stdin,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}"#,
-    );
-    let init_response = read_until_id(&rx, 1);
-    assert!(
-        init_response.get("error").is_none(),
-        "initialize should not return an error: {init_response}"
-    );
-    send(
-        &mut stdin,
-        r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#,
-    );
-
-    send(
-        &mut stdin,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test","version":"0.1"},"io.modelcontextprotocol/clientCapabilities":{}}}}"#,
     );
     let resp = read_until_id(&rx, 2);
 
