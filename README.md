@@ -18,7 +18,7 @@ Coverage today: Claude Code gates file reads and edits (`Edit`/`Write`/`Notebook
 
 Single Rust binary. MCP stdio server. Claude Code and Codex integration.
 
-In Claude Code, install the plugin with `/plugin install mati --marketplace ioni-dev/mati`, then run `/mati:setup` in your project. It needs the `mati` binary; see [Quick start](#quick-start).
+In Claude Code, add the plugin with `/plugin marketplace add ioni-dev/mati` and `/plugin install mati@mati`, then run `/mati:setup` in your project. It needs the `mati` binary; see [Quick start](#quick-start).
 
 Compliance and audit exports live in the Enterprise tier ([getmati.dev](https://getmati.dev)).
 
@@ -269,6 +269,11 @@ brew install ioni-dev/tap/mati
 # or: cargo install mati
 ```
 
+Upgrading from 0.1.x: stop the daemon in each project first (`mati daemon stop`).
+The first run converts the store in place, one-way, and keeps a `*.bak-0.21` copy.
+Then run `mati repair --purge-orphans` to drop the file records 0.1.x made for
+mati's own hook and skill files. See [CHANGELOG.md](CHANGELOG.md).
+
 See it work first. `mati demo` runs deny, consult and allow on a throwaway repo
 and deletes it after. It takes a few seconds and touches nothing else:
 
@@ -371,7 +376,7 @@ mati stats
 | Command                     | What it does                                                                       |
 | --------------------------- | --------------------------------------------------------------------------------- |
 | `mati config get/set/dump`  | Read or set enforcement config (retention, write durability, policy mode, session lockdown) |
-| `mati repair`               | Reconcile derived indexes (`--check` CI-safe, exits non-zero on drift; `--fast` drains the dirty queue) |
+| `mati repair`               | Reconcile derived indexes (`--check` CI-safe, exits non-zero on drift; `--fast` drains the dirty queue; `--purge-orphans` drops file records for deleted files and mati's own scaffold) |
 | `mati doctor`               | Aggregated health check (`--metrics` for live daemon SLOs)                        |
 | `mati eval`                 | Run the enforcement regression corpus                                             |
 
